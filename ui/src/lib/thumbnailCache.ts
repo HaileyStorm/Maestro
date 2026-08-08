@@ -100,13 +100,13 @@ function captureVideoFrame(videoUrl: string, timeSeconds = 0.1): Promise<string>
 // This ensures visible thumbnails get captured before off-screen ones.
 type QueueItem = {
   videoUrl: string
-  name: string
+  key: string
   resolve: (dataUrl: string | null) => void
   timestamp: number
 }
 
 const queue: QueueItem[] = []
-const pending = new Map<string, QueueItem[]>() // name -> list of resolvers waiting
+const pending = new Map<string, QueueItem[]>() // identity key -> resolvers waiting
 let processing = false
 
 async function processQueue() {
@@ -117,14 +117,14 @@ async function processQueue() {
     // Process newest request first (priority = most recently visible)
     queue.sort((a, b) => b.timestamp - a.timestamp)
     const item = queue.shift()!
-    const name = item.name
+    const key = item.key
 
     // Gather all resolvers waiting for this same thumbnail
-    const waiters = pending.get(name) || []
-    pending.delete(name)
-    // Remove any remaining duplicates for this name from the queue
+    const waiters = pending.get(key) || []
+    pending.delete(key)
+    // Remove remaining duplicates for this exact workspace/name/revision.
     for (let i = queue.length - 1; i >= 0; i--) {
-      if (queue[i].name === name) {
+      if (queue[i].key === key) {
         waiters.push(queue[i])
         queue.splice(i, 1)
       }
@@ -134,14 +134,14 @@ async function processQueue() {
 
     try {
       // Check cache first
-      const cached = await getCachedThumbnail(name)
+      const cached = await getCachedThumbnail(key)
       if (cached) {
         for (const r of allResolvers) r.resolve(cached)
         continue
       }
       // Capture and cache
       const dataUrl = await captureVideoFrame(item.videoUrl)
-      await setCachedThumbnail(name, dataUrl)
+      await setCachedThumbnail(key, dataUrl)
       for (const r of allResolvers) r.resolve(dataUrl)
     } catch {
       for (const r of allResolvers) r.resolve(null)
@@ -156,10 +156,10 @@ async function processQueue() {
  * or queues a sequential capture with priority (newest requests first).
  * Deduplicates requests for the same file.
  */
-export function requestThumbnail(videoUrl: string, name: string): Promise<string | null> {
+export function requestThumbnail(videoUrl: string, key: string): Promise<string | null> {
   // Fast path: check if already in cache synchronously via the queue check
   return new Promise((resolve) => {
-    queue.push({ videoUrl, name, resolve, timestamp: Date.now() })
+    queue.push({ videoUrl, key, resolve, timestamp: Date.now() })
     processQueue()
   })
 }

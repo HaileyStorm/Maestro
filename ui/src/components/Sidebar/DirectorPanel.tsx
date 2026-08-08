@@ -57,6 +57,7 @@ export function DirectorPanel() {
   const referenceImage = useStore(s => s.directorReferenceImage)
   const clipImages = useStore(s => s.directorClipImages)
   const imageGenProgress = useStore(s => s.directorImageGenProgress)
+  const pipelineStatus = useStore(s => s.pipelineStatus)
   const uploadAndAnalyze = useStore(s => s.directorUploadAndAnalyze)
   const setEnergyBias = useStore(s => s.directorSetEnergyBias)
   const confirmStructure = useStore(s => s.directorConfirmStructure)
@@ -95,7 +96,7 @@ export function DirectorPanel() {
       }
     }
     return samples
-  }, [analysis?.lyrics])
+  }, [analysis])
 
   const [dragOver, setDragOver] = useState(false)
   const [localBias, setLocalBias] = useState<number | null>(null)
@@ -121,6 +122,15 @@ export function DirectorPanel() {
     () => plannedClips.length > 0 ? plannedClips[plannedClips.length - 1].end : 0,
     [plannedClips]
   )
+  const videoTelemetry = pipelineStatus?.status === 'running'
+    && pipelineStatus.phase === 'generating_video'
+    ? pipelineStatus.progress
+    : null
+  const videoStep = videoTelemetry?.window_step ?? videoTelemetry?.step ?? 0
+  const videoTotalSteps = videoTelemetry?.window_total_steps ?? videoTelemetry?.total_steps ?? 0
+  const videoStepPct = videoTotalSteps > 0
+    ? Math.max(0, Math.min(100, videoStep / videoTotalSteps * 100))
+    : Math.max(0, Math.min(100, videoTelemetry?.window_progress ?? 0))
 
   // Beat count distribution summary
   const beatDistribution = useMemo(() => {
@@ -688,6 +698,38 @@ export function DirectorPanel() {
       {/* Step 6: Review video prompts (phase 2) */}
       {step === 'review_video' && (
         <div className="space-y-2">
+          {videoTelemetry && (
+            <div className="space-y-1.5 rounded-lg border border-accent-blue/30 bg-bg-secondary p-2">
+              <div className="flex items-center justify-between text-[10px] text-text-secondary">
+                <span>Director video · overall</span>
+                <span>{Math.round(videoTelemetry.overall_progress ?? 0)}%</span>
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-bg-tertiary">
+                <div
+                  className="h-full rounded-full bg-accent-blue transition-all"
+                  style={{ width: `${Math.max(0, Math.min(100, videoTelemetry.overall_progress ?? 0))}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-2 text-[10px] text-text-secondary">
+                <span className="truncate">{videoTelemetry.message || 'Preparing video generation'}</span>
+                <span className="shrink-0">
+                  {(videoTelemetry.window_total ?? 0) > 1
+                    ? `Segment ${videoTelemetry.window_current || 1}/${videoTelemetry.window_total}${videoTotalSteps > 0 ? ` · Step ${videoStep}/${videoTotalSteps}` : ''}`
+                    : videoTotalSteps > 0 ? `Step ${videoStep}/${videoTotalSteps}` : 'Preparing'}
+                </span>
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-bg-tertiary">
+                {videoTelemetry.indeterminate || videoTotalSteps <= 0 ? (
+                  <div className="h-full w-full animate-pulse rounded-full bg-accent-green/60" />
+                ) : (
+                  <div
+                    className="h-full rounded-full bg-accent-green transition-all"
+                    style={{ width: `${videoStepPct}%` }}
+                  />
+                )}
+              </div>
+            </div>
+          )}
           <div className="flex items-center justify-between">
             <label className="text-[11px] text-text-muted uppercase tracking-wider">Video Prompts</label>
             <button

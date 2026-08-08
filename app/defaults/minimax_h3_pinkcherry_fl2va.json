@@ -1,0 +1,80 @@
+{
+    "model": {
+        "name": "PinkCherry H3 FL2VA (Explicit)",
+        "architecture": "minimax_h3",
+        "description": "Explicit-mode MiniMax H3 FL2VA checkpoint for text, first-frame, and first/last-frame video with synchronized stereo audio. FL2VA only; semantic image/video/audio references continue to use MiniMax H3 Ref2VA.",
+        "URLs": [
+            "https://huggingface.co/SexGod1979/PinkCherry_MiniMax-H3/resolve/fcd03fbaed78c268c1dc36c21b2ad6f0202fc50a/alpha-0.2-testing/PinkCherry_h3_fl2va_int8_convrot_v0.2-alpha.safetensors"
+        ],
+        "text_encoder_URLs": [
+            "https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot/resolve/e8967f6a39ea5b4939a1aff81be3e8706490c0e8/qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
+        ],
+        "text_encoder_folder": "minimax_h3",
+        "text_encoder_quantization": "int8",
+        "nsfw_only": true,
+        "preferred_explicit_fl2va": true,
+        "preferred_explicit_conditioner": true,
+        "model_update": {
+            "enabled": true,
+            "provider": "huggingface",
+            "repo_id": "SexGod1979/PinkCherry_MiniMax-H3",
+            "file_pattern": "alpha-[0-9.]+-testing/PinkCherry_h3_fl2va_int8_convrot_v(?P<version>[0-9.]+)-alpha\\.safetensors",
+            "check_interval_hours": 24,
+            "auto_replace": true,
+            "compatibility": {
+                "quantization_family": "h3_int8_convrot",
+                "required_tensors": {
+                    "blocks.0.attn.out_proj.comfy_quant": {"dtype": "U8"},
+                    "blocks.0.attn.out_proj.weight": {"dtype": "I8", "shape": [5376, 7168]},
+                    "blocks.0.attn.out_proj.weight_scale": {"dtype": "F32", "shape": [5376, 1]},
+                    "blocks.0.adaln_proj.linear.weight": {
+                        "variants": [
+                            {"dtype": "I8", "shape": [96768, 2688]},
+                            {"dtypes": ["F16", "BF16"], "shape": [96768, 8]}
+                        ]
+                    }
+                }
+            }
+        },
+        "component_updates": [
+            {
+                "id": "conditioning_encoder",
+                "enabled": true,
+                "provider": "huggingface",
+                "repo_id": "ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot",
+                "path": "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors",
+                "url_field": "text_encoder_URLs",
+                "check_interval_hours": 24,
+                "auto_replace": true,
+                "compatibility": {
+                    "quantization_family": "h3_int8_convrot",
+                    "required_tensors": {
+                        "model.embed_tokens.comfy_quant": {
+                            "dtype": "U8",
+                            "json_fields": {"format": "int8_tensorwise"}
+                        },
+                        "model.embed_tokens.weight": {"dtype": "I8", "shape": [151936, 5120]},
+                        "model.embed_tokens.weight_scale": {
+                            "dtype": "F32",
+                            "shapes": [[], [1], [151936], [151936, 1]],
+                            "finite_positive": true
+                        }
+                    }
+                }
+            }
+        ]
+    },
+    "prompt": "A cinematic scene with expressive adult performers, natural motion, clear synchronized dialogue, and detailed environmental sound.",
+    "num_inference_steps": 20,
+    "video_length": 124,
+    "resolution": "1344x768",
+    "guidance_scale": 1.0,
+    "custom_settings": {"h3_attention_engine": "sol_attn"},
+    "tea_cache": 0,
+    "activated_loras": [],
+    "loras_multipliers": "",
+    "spatial_upsampling": "",
+    "delivery_resolution": "",
+    "delivery_fit": "",
+    "image_prompt_type": ""
+}

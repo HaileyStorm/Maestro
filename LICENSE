@@ -2,56 +2,62 @@ Maestro License Notice
 ======================
 
 Maestro is built on top of WanGP (https://github.com/deepbeepmeep/Wan2GP)
-and is distributed under the same terms: the **WanGP Non-Commercial
-Evaluation License 1.1**. The full text of that license is included with
-the upstream project at `app/LICENSE.txt` in this repository.
+and distributes WanGP-owned implementation under the
+**WanGP Community License 2.0**. The exact, authoritative license text
+received with the reviewed WanGP 12.44 source is included at
+`app/LICENSE.txt`.
 
-Summary
--------
+Summary (non-binding)
+---------------------
 
-You MAY:
-  * Use, copy, modify, and redistribute Maestro for **non-commercial**
-    purposes (personal projects, research, education, evaluation).
-  * Use the **outputs** you generate (images, videos, audio) for any
-    purpose, including commercial sale, provided that:
-      - the outputs were generated with a properly licensed copy of the
-        software, and
-      - any commercial distribution of the outputs includes a clear
-        notice that they were produced, in whole or in part, using
-        WanGP, with a hyperlink to the WanGP repository or About tab.
+Subject to the full license and applicable third-party terms, you MAY:
 
-You MAY NOT:
-  * Sell, sublicense, rent, lease, or otherwise distribute Maestro or
-    any derivative of it for a fee or other consideration.
-  * Offer Maestro, or any derivative of it, as part of a paid product,
-    hosted service, API, headless deployment, or integration.
-  * Use Maestro to provide cloud-based, backend, embedded, automated,
-    or other end-user-accessible services where users access, invoke,
-    or pay for those services.
+  * Use and modify Maestro for personal, research, educational, internal
+    company, studio, agency, client, evaluation, and other Free Use.
+  * Use private APIs, automation, queues, scripts, plugins, and headless or
+    local-service modes for Free Use.
+  * Redistribute modified or unmodified builds for Free Use when you include
+    the license, preserve required notices and third-party terms, and identify
+    your modifications and their date.
+  * Use, publish, sell, and license lawful outputs. WanGP credit is required by
+    the license only for a Direct Output Sale; see Section 6 for its definition
+    and the accepted forms of credit.
+
+Without a separate written reseller or commercial license, you MAY NOT:
+
+  * Sell, rent, sublicense, or otherwise monetize access to Maestro or its
+    WanGP-owned implementation.
+  * Offer paid, metered, sponsored, ad-supported, subscription, hosted,
+    managed, API, SaaS, white-label, OEM, embedded, marketplace, or similar
+    access where the software is a material feature or value.
+  * Charge separately to unlock, host, enable, bundle, or provide access to
+    the software.
+
+Internal company use, client/studio production work, reasonable labor fees for
+installation or support, compliant free integrations, and permitted output use
+are not Restricted Commercialization merely because money is involved. The
+binding definitions and conditions are in `app/LICENSE.txt`.
 
 Third-party components
 ----------------------
 
-Maestro depends on numerous third-party models, weights, and libraries
-(LTX-Video, Wan 2.1/2.2, Flux, Qwen, Gemma, SAM, MMAudio, PyTorch,
-xformers, and others). Each of these has its own license. You are
-responsible for reviewing and complying with those licenses before
-redistributing Maestro or any output that incorporates them.
+Maestro contains or depends on third-party code, models, weights, datasets,
+and libraries. Those materials retain their separate licenses and terms; the
+WanGP Community License does not narrow rights granted by those terms. When
+redistributing bundled third-party materials, preserve every notice, license,
+attribution, and patent notice their terms require.
 
 Commercial licensing
 --------------------
 
-If you wish to use Maestro (or its underlying WanGP pipeline) for any
-commercial purpose, you must obtain a separate commercial license from
-the WanGP licensor. Contact deepbeepmeep@yahoo.com for terms.
+For reseller, OEM, embedded, hosting, API, or other commercial licensing of
+the WanGP-owned implementation, contact deepbeepmeep@yahoo.com or use the
+official WanGP Discord linked from its GitHub repository.
 
-Disclaimer
-----------
+Acceptable use and disclaimer
+-----------------------------
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
-FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN
-CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-For the full and authoritative license text, see app/LICENSE.txt.
+Section 10 of the authoritative license prohibits illegal and specified
+seriously abusive uses. The software is provided "AS IS", without warranty;
+the complete warranty, liability, termination, and general terms are in
+`app/LICENSE.txt`.

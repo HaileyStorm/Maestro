@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-08",
+  "scope": {
+    "model_types": [
+      "minimax_h3"
+    ],
+    "profiles": [
+      "draft",
+      "fast"
+    ],
+    "evidence_resolutions": {
+      "draft": "608x352",
+      "fast": "864x480"
+    },
+    "frame_count": 124,
+    "audio_required": true
+  },
+  "engine": {
+    "repository": "https://github.com/thu-ml/SageAttention.git",
+    "version": "2.2.0",
+    "revision": "eb615cf6cf4d221338033340ee2de1c37fbdba4a",
+    "distribution_sha256": "081f5bcb3695416a0ece908245d10b318e02f5db45ab362303894450679d41b8"
+  },
+  "runtime": {
+    "torch": "2.7.0+cu128",
+    "torch_cuda": "12.8",
+    "triton": "3.3.1",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "compute_capability": [
+      12,
+      0
+    ]
+  },
+  "model": {
+    "repository": "Comfy-Org/MiniMax-H3",
+    "revision": "0543966fbdce5ba05709a8f2031c94bdba629b4a",
+    "checkpoint": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"
+  },
+  "turbo": {
+    "profile_id": "h3_turbo_v4",
+    "lora_sha256": "5f3a626cd72c93a8b9318d6760c510bc5092d2ab13aaba1f932c5bab07a416d3",
+    "grid_sha256": "30eb3c2cc7fb6b470d9717ff840d359313ac27cd64b705e32da1baa10f72d6a8"
+  },
+  "kernel_execution": {
+    "effective_engine": "sage2",
+    "sage2_calls": 3100,
+    "fallbacks": 0,
+    "errors": 0
+  },
+  "review": {
+    "method": "explicit_human_visual_audio_review",
+    "output_success_alone_sufficient": false,
+    "visual_coherence": true,
+    "audio_valid": true
+  },
+  "cases": {
+    "native_20": {
+      "accelerator": "native",
+      "steps": 20,
+      "samples": 1,
+      "resolution": "608x352",
+      "frame_count": 124,
+      "audio_valid": true,
+      "resident_seconds": 39.43690263410099,
+      "baseline_engine": "sol_attn_exact_dense",
+      "baseline_seconds": 45.170668327016756,
+      "representative_frame_ssim": {
+        "minimum": 0.959,
+        "maximum": 0.976
+      },
+      "benchmark_spec_sha256": "37786cd5fd0a1174802b829930d91f12a8a7889e2d9a3a8ee5ff4363a1dfd55f",
+      "passed": true
+    },
+    "turbo_4": {
+      "accelerator": "turbo",
+      "steps": 4,
+      "samples": 2,
+      "resolution": "608x352",
+      "frame_count": 124,
+      "audio_valid": true,
+      "resident_seconds": 17.36909652990289,
+      "baseline_engine": "sdpa",
+      "baseline_seconds": 18.224408095004037,
+      "representative_frame_ssim": {
+        "minimum": 0.825,
+        "maximum": 0.882
+      },
+      "benchmark_spec_sha256": "4c096da071897b1e0af92d2c8a0fc09ea79f895339ece449083cabd9bb8321f3",
+      "passed": true
+    },
+    "turbo_8": {
+      "accelerator": "turbo",
+      "steps": 8,
+      "samples": 2,
+      "resolution": "608x352",
+      "frame_count": 124,
+      "audio_valid": true,
+      "resident_seconds": 24.118048115400597,
+      "baseline_engine": "sdpa",
+      "baseline_seconds": 26.18427780084312,
+      "representative_frame_ssim": {
+        "minimum": 0.859,
+        "maximum": 0.931
+      },
+      "benchmark_spec_sha256": "c057a900adf1c65e4ad0764a593d18caf943fa3b2183a38afe59fb3cf3395b06",
+      "passed": true
+    },
+    "fast_864_turbo_8": {
+      "accelerator": "turbo",
+      "steps": 8,
+      "samples": 1,
+      "resolution": "864x480",
+      "frame_count": 124,
+      "duration_seconds": 5.167,
+      "audio_valid": true,
+      "resident_generation_seconds": 44.18505083397031,
+      "runner_wall_seconds": 47.428,
+      "baseline_engine": "sdpa",
+      "baseline_model_load_state": "cold",
+      "baseline_generation_seconds": 317.9597219589632,
+      "baseline_runner_wall_seconds": 320.195,
+      "timing_comparable": false,
+      "timing_note": "The SDPA pair loaded the model cold, so its wall time is retained as provenance but not used as a speed claim.",
+      "representative_frame_ssim": {
+        "start": 0.876082,
+        "middle": 0.9065,
+        "end": 0.922613,
+        "minimum": 0.876082,
+        "maximum": 0.922613
+      },
+      "benchmark_spec_sha256": "bcbefc0e6c83be2bd70dd81dfacfb6f2c3ad03b19fd3265551cf4fbc3dc61f55",
+      "baseline_benchmark_spec_sha256": "cb470b38f6ba914011575b48daf616da86b2004a88cee0eefc51dca1608deed2",
+      "visual_review": {
+        "coherent_start_middle_end": true,
+        "stable_robot_colors_and_motion": true,
+        "no_collapse_or_artifact": true
+      },
+      "passed": true
+    }
+  }
+}

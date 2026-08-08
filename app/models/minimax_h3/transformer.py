@@ -7,12 +7,15 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""MMGP-native MiniMax H3 transformer for the compact consumer checkpoints.
+"""MMGP-native MiniMax H3 transformer for compact and full checkpoints.
 
 The released Comfy-Org checkpoints replace H3's large timestep MLP and AdaLN
-inputs with a sampled eight-dimensional curve.  This implementation keeps its
-grouped QKV and SwiGLU projections fused; full head-interleaved checkpoints can
-be split into independent streamable weights without expanding the transformer.
+inputs with a sampled eight-dimensional curve.  This implementation keeps the
+checkpoint's fused QKV and SwiGLU projections intact so Maestro's FP8 loader can
+stream them without first expanding or dequantizing the 21 GB transformer.
+Full-width community checkpoints retain the original sinusoidal timestep MLP
+and 2688-dimensional AdaLN input; that architecture is selected from the
+checkpoint header before MMGP allocates the model.
 
 Packing, modality tags, schedules, and rotary coordinates follow the official
 Diffusers MiniMax H3 implementation pinned in ``UPSTREAM.md``.
@@ -21,13 +24,13 @@ Diffusers MiniMax H3 implementation pinned in ``UPSTREAM.md``.
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 MODALITY_VIDEO = 0
 MODALITY_TEXT = 1
@@ -40,106 +43,6 @@ MODALITY_COUNT = 3
 # token-wise, so bounded chunks are mathematically equivalent and leave room
 # for attention plus MMGP's streamed transformer blocks on consumer GPUs.
 MINIMAX_H3_ACTIVATION_CHUNK_TOKENS = 8192
-MINIMAX_H3_ADAPTIVE_CHUNK_MAX_TOKENS = 32768
-MINIMAX_H3_LARGE_SEQUENCE_TOKENS = 80000
-
-
-def _activation_chunk_tokens(
-    length: int,
-    input_width: int,
-    output_width: int,
-) -> int:
-    """Choose a larger, allocation-bounded token chunk for H3 projections.
-
-    The historical fixed 8,192-token chunk is safe but makes a native H3
-    sequence execute each QKV/MLP projection through roughly thirteen small
-    launches. WanGP's current H3 path sizes a chunk so its largest expanded
-    projection is about one packed-hidden-state buffer. Keep the fixed value
-    as a floor and explicit test/user override, then apply the same bounded
-    principle with a conservative 32K ceiling.
-    """
-
-    length = max(1, int(length))
-    configured = max(1, int(MINIMAX_H3_ACTIVATION_CHUNK_TOKENS))
-    # Tests and advanced overrides intentionally replace the historical
-    # constant. Honor those values exactly instead of silently adapting them.
-    if configured != 8192:
-        return min(length, configured)
-    if length <= configured:
-        return length
-    # A measured 1280x704 / 345-frame request packs about 91K rows. Expanding
-    # its fused QKV chunk from 8K to ~23K consumed the last allocator
-    # headroom on a 24 GB RTX 4090 before denoising step zero. Keep the
-    # known-safe chunk for that class of full-duration sequence; shorter
-    # windows still receive the adaptive launch-count optimization below.
-    if length >= MINIMAX_H3_LARGE_SEQUENCE_TOKENS:
-        return min(length, configured)
-    input_width = max(1, int(input_width))
-    output_width = max(1, int(output_width))
-    bounded = max(1, (length * input_width) // output_width)
-    bounded = max(
-        configured,
-        min(MINIMAX_H3_ADAPTIVE_CHUNK_MAX_TOKENS, bounded),
-    )
-    # Stable launch sizes reduce allocator churn between blocks.
-    bounded = max(configured, (bounded // 256) * 256)
-    return min(length, bounded)
-
-
-def _split_contiguous_qkv(src, dim, split_sizes, _context):
-    """Split grouped ``[Q, K, V]`` rows without aliasing their storage.
-
-    ``torch.split`` returns views.  MMGP's residency profiler correctly treats
-    parameters sharing storage as tied weights, so passing those views through
-    makes the independently streamed Q, K, and V projections alias one
-    another.  Clone each slice because these projections are distinct model
-    weights even though they originated in one fused checkpoint tensor.
-    """
-
-    return [
-        part.clone(memory_format=torch.contiguous_format)
-        for part in torch.split(src, split_sizes, dim=dim)
-    ]
-
-
-def _split_interleaved_qkv(src, dim, split_sizes, context):
-    """Split official ``[head, qkv, channel]`` H3 rows into Q, K, and V."""
-
-    info = context["info"]
-    heads = int(info["num_attention_heads"])
-    head_dim = int(info["attention_head_dim"])
-    grouped = src.reshape(heads, 3, head_dim, *src.shape[1:])
-    return [
-        grouped[:, index]
-        .reshape(split_sizes[index], *src.shape[1:])
-        .clone(memory_format=torch.contiguous_format)
-        for index in range(3)
-    ]
-
-
-def get_linear_split_map(
-    inner_size: int,
-    *,
-    interleaved: bool = False,
-    num_attention_heads: int = 56,
-    attention_head_dim: int = 128,
-) -> dict[str, dict[str, object]]:
-    """Map H3's fused QKV checkpoint rows to independently streamed modules."""
-
-    info: dict[str, object] = {
-        "mapped_modules": ["q_proj", "k_proj", "v_proj"],
-        "split_sizes": [inner_size, inner_size, inner_size],
-    }
-    split_handler = _split_interleaved_qkv if interleaved else _split_contiguous_qkv
-    info["split_handlers"] = {"weight": split_handler}
-    if interleaved:
-        info.update(
-            {
-                "num_attention_heads": num_attention_heads,
-                "attention_head_dim": attention_head_dim,
-            }
-        )
-    return {"qkv_proj": info}
 
 
 @dataclass
@@ -167,75 +70,6 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     sin = sin.to(dtype=x.dtype, device=x.device)[None, :, None]
     rotary = rotary * cos + rotated * sin
     return torch.cat((rotary, passthrough), dim=-1)
-
-
-def _apply_rope_inplace(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    """Apply H3 split-half RoPE with one bounded scratch tensor."""
-
-    if torch.is_grad_enabled():
-        return _apply_rope(x, cos, sin)
-    rotary_dim = int(cos.shape[-1])
-    half = rotary_dim // 2
-    if half <= 0:
-        return x
-    cosine = cos.to(dtype=x.dtype, device=x.device)[None, :, None]
-    sine = sin.to(dtype=x.dtype, device=x.device)[None, :, None]
-    first = x[..., :half]
-    second = x[..., half:rotary_dim]
-    scratch = first.clone()
-    first.mul_(cosine[..., :half]).addcmul_(
-        second,
-        sine[..., :half],
-        value=-1,
-    )
-    second.mul_(cosine[..., half:rotary_dim]).addcmul_(
-        scratch,
-        sine[..., half:rotary_dim],
-    )
-    return x
-
-
-def _run_h3_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-) -> torch.Tensor:
-    """Use Maestro's selected fast attention backend when applicable."""
-
-    # Shared Sage/Flash implementations operate on CUDA half/bfloat16. Keep
-    # CPU and FP32 numerical tests on PyTorch SDPA. Packed H3 production
-    # sequences have no padding, so their normal path reaches Sage2; a real
-    # mask intentionally makes the shared wrapper use SDPA.
-    if query.device.type == "cuda" and query.dtype in {
-        torch.float16,
-        torch.bfloat16,
-    }:
-        from shared.attention import pay_attention
-
-        qkv = [query, key, value]
-        return pay_attention(
-            qkv,
-            attention_mask=attention_mask,
-            recycle_q=True,
-        )
-
-    query = query.transpose(1, 2)
-    key = key.transpose(1, 2)
-    value = value.transpose(1, 2)
-    attended = F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=attention_mask,
-        dropout_p=0.0,
-        is_causal=False,
-    )
-    return attended.transpose(1, 2)
 
 
 def _index_runs(indices: torch.Tensor) -> tuple[tuple[int, int, int], ...]:
@@ -286,6 +120,46 @@ def _scale_by_runs(
     return output
 
 
+def _h3_turbo_lora_delta(
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    silu_t_emb: torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the upstream curve-mode update ``(B @ A @ silu(t_emb).T).T``."""
+
+    # CUDA's BF16 matmuls preserve the authored LoRA precision without
+    # materializing each very tall B matrix in FP32. CPU is only used by
+    # model-free regressions and lacks consistent BF16 GEMM support.
+    compute_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    a = lora_a.to(device=device, dtype=compute_dtype)
+    b = lora_b.to(device=device, dtype=compute_dtype)
+    temb = silu_t_emb.to(device=device, dtype=compute_dtype)
+    from services.h3_turbo import h3_turbo_adaln_delta
+
+    return h3_turbo_adaln_delta(a, b, temb)
+
+
+def _make_h3_turbo_residual_hook(lora_a: torch.Tensor, lora_b: torch.Tensor):
+    """Activation-space LoRA that is independent of packed/INT8 base weights."""
+    def hook(_module, args, output):
+        if not args or not torch.is_tensor(output):
+            raise RuntimeError("H3 Turbo residual hook expected one tensor input/output")
+        input_tensor = args[0]
+        compute_dtype = torch.bfloat16 if output.device.type == "cuda" else torch.float32
+        from services.h3_turbo import h3_turbo_residual_delta
+
+        delta = h3_turbo_residual_delta(
+            input_tensor.to(dtype=compute_dtype),
+            lora_a.to(device=output.device, dtype=compute_dtype),
+            lora_b.to(device=output.device, dtype=compute_dtype),
+        )
+        return output + delta.to(device=output.device, dtype=output.dtype)
+
+    return hook
+
+
 class MiniMaxH3RotaryEmbedding(nn.Module):
     def __init__(self, freq_dim: int = 16, theta: float = 10000.0):
         super().__init__()
@@ -303,14 +177,15 @@ class MiniMaxH3RotaryEmbedding(nn.Module):
 
 
 class MiniMaxH3TimeEmbedder(nn.Module):
-    """Full-33B H3 timestep MLP (replaced by curves in pruned checkpoints)."""
+    """Original full-width H3 sinusoidal timestep projection."""
 
     def __init__(
         self,
         input_dim: int,
         hidden_dim: int,
         output_dim: int,
-        dtype: torch.dtype,
+        *,
+        dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -344,71 +219,22 @@ class MiniMaxH3Attention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor | list[torch.Tensor],
+        hidden_states: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
+        acceleration: dict | None = None,
     ) -> torch.Tensor:
-        # Internal inference callers can transfer ownership in a one-item
-        # list. Popping it lets the normalized packed sequence be released as
-        # soon as Q/K/V are projected instead of retaining another ~1 GB copy
-        # through SDPA on a native 768p full-duration request. Direct tensor
-        # calls remain supported for tests and downstream integrations.
-        if isinstance(hidden_states, list):
-            if len(hidden_states) != 1:
-                raise ValueError("MiniMax H3 attention expects one owned input tensor")
-            hidden_states = hidden_states.pop()
         batch, length, _ = hidden_states.shape
-        projection_width = (
-            self.heads * self.head_dim
-            if hasattr(self, "q_proj")
-            else self.heads * self.head_dim * 3
-        )
-        chunk_size = _activation_chunk_tokens(
-            length,
-            hidden_states.shape[-1],
-            projection_width,
-        )
-        if hasattr(self, "q_proj"):
-            # MMGP can now stream Q, K, and V independently instead of
-            # materializing the checkpoint's 3x fused projection.  Preserve
-            # the existing token chunk bound as well; the three final tensors
-            # are required by attention, but no fused 3x temporary survives.
-            shape = (batch, length, self.heads, self.head_dim)
-
-            def project_rows(projection, normalization=None, rope=None):
-                output = None
-                for start in range(0, length, chunk_size):
-                    end = min(length, start + chunk_size)
-                    rows = projection(hidden_states[:, start:end]).view(
-                        batch, end - start, self.heads, self.head_dim
-                    )
-                    if normalization is not None:
-                        rows = normalization(rows)
-                    if rope is not None:
-                        cos, sin = rope
-                        rows = _apply_rope_inplace(
-                            rows,
-                            cos[start:end],
-                            sin[start:end],
-                        )
-                    if output is None:
-                        output = torch.empty(shape, device=rows.device, dtype=rows.dtype)
-                    output[:, start:end].copy_(rows)
-                return output
-
-            query = project_rows(self.q_proj, self.q_norm, rotary)
-            key = project_rows(self.k_proj, self.k_norm, rotary)
-            value = project_rows(self.v_proj)
-            qkv = None
-        elif length <= chunk_size:
+        chunk_size = max(1, int(MINIMAX_H3_ACTIVATION_CHUNK_TOKENS))
+        if length <= chunk_size:
             qkv = self.qkv_proj(hidden_states)
             query, key, value = qkv.chunk(3, dim=-1)
             query = self.q_norm(query.view(batch, length, self.heads, self.head_dim))
             key = self.k_norm(key.view(batch, length, self.heads, self.head_dim))
             value = value.view(batch, length, self.heads, self.head_dim)
             if rotary is not None:
-                query = _apply_rope_inplace(query, *rotary)
-                key = _apply_rope_inplace(key, *rotary)
+                query = _apply_rope(query, *rotary)
+                key = _apply_rope(key, *rotary)
         else:
             # Keep only Q/K/V themselves resident.  The fused projection,
             # normalization, and RoPE temporaries are bounded to one chunk.
@@ -428,16 +254,8 @@ class MiniMaxH3Attention(nn.Module):
                 v_chunk = v_chunk.view(batch, chunk_length, self.heads, self.head_dim)
                 if rotary is not None:
                     cos, sin = rotary
-                    q_chunk = _apply_rope_inplace(
-                        q_chunk,
-                        cos[start:end],
-                        sin[start:end],
-                    )
-                    k_chunk = _apply_rope_inplace(
-                        k_chunk,
-                        cos[start:end],
-                        sin[start:end],
-                    )
+                    q_chunk = _apply_rope(q_chunk, cos[start:end], sin[start:end])
+                    k_chunk = _apply_rope(k_chunk, cos[start:end], sin[start:end])
                 if query is None:
                     query = torch.empty(shape, device=q_chunk.device, dtype=q_chunk.dtype)
                     key = torch.empty(shape, device=k_chunk.device, dtype=k_chunk.dtype)
@@ -447,18 +265,47 @@ class MiniMaxH3Attention(nn.Module):
                 value[:, start:end].copy_(v_chunk)
             assert query is not None and key is not None and value is not None
             qkv = q_chunk = k_chunk = v_chunk = None
-        # All projections are complete. Drop our final input reference before
-        # allocating the attention result; owned callers have already removed
-        # theirs from the transfer list.
-        hidden_states = None
-        if attention_mask is not None:
-            attention_mask = attention_mask[None, None].to(device=query.device)
-        attended = _run_h3_attention(
-            query,
-            key,
-            value,
-            attention_mask,
-        )
+        attended = None
+        engine = acceleration.get("engine") if isinstance(acceleration, dict) else None
+        if engine == "sage2":
+            from services.h3_acceleration import maybe_sage2_attention
+            attended = maybe_sage2_attention(
+                query,
+                key,
+                value,
+                attention_mask=attention_mask,
+                tensor_layout="NHD",
+                is_causal=False,
+                allow_sdpa_fallback=False,
+            )
+        elif engine == "sol_attn":
+            from services.h3_acceleration import maybe_sol_attention
+            attended = maybe_sol_attention(
+                query, key, value,
+                attention_mask=attention_mask,
+                step_index=int(acceleration.get("step_index", 0)),
+                block_index=int(acceleration.get("block_index", 0)),
+                tau=float(acceleration.get("tau", 1.0)),
+                dense_steps=int(acceleration.get("dense_steps", 10)),
+                dense_blocks=int(acceleration.get("dense_blocks", 2)),
+                min_tokens=int(acceleration.get("min_tokens", 4096)),
+                sink_tokens=int(acceleration.get("sink_tokens", 0)),
+            )
+        if attended is None:
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            if attention_mask is not None:
+                attention_mask = attention_mask[None, None].to(device=query.device)
+            attended = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            attended = attended.transpose(1, 2)
         query = key = value = qkv = None
         attended = attended.reshape(batch, length, self.heads * self.head_dim)
         return self.out_proj(attended)
@@ -483,29 +330,14 @@ class MiniMaxH3MLP(nn.Module):
             return self.fc2(value * F.silu(gate))
 
         length = hidden_states.shape[1]
-        chunk_size = _activation_chunk_tokens(
-            length,
-            hidden_states.shape[-1],
-            self.fc1.out_features,
-        )
+        chunk_size = max(1, int(MINIMAX_H3_ACTIVATION_CHUNK_TOKENS))
         if length <= chunk_size:
             return project(hidden_states)
 
-        # Each token is independent in the MLP. During inference this input is
-        # the freshly normalized/modulated branch, so recycle its storage for
-        # the projected rows just as the current upstream H3 implementation
-        # does. This removes one full sequence x hidden allocation. Preserve
-        # an ordinary output tensor when autograd is active.
-        output = (
-            torch.empty_like(hidden_states)
-            if torch.is_grad_enabled()
-            else hidden_states
-        )
+        output = torch.empty_like(hidden_states)
         for start in range(0, length, chunk_size):
             end = min(length, start + chunk_size)
-            projected = project(hidden_states[:, start:end])
-            output[:, start:end].copy_(projected)
-            del projected
+            output[:, start:end].copy_(project(hidden_states[:, start:end]))
         return output
 
 
@@ -532,31 +364,43 @@ class MiniMaxH3AdaLNProjection(nn.Module):
         # error coherently through all 50 transformer blocks.
         self.linear._lock_dtype = dtype
 
-    def forward(self, curve: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def forward(
+        self,
+        curve: torch.Tensor,
+        turbo_silu_t_emb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         if self.apply_silu:
             curve = F.silu(curve)
-        if self.apply_silu:
-            # The full 33B checkpoint has a 2,688-wide timestep embedding.
-            # Upcasting each enormous AdaLN projection to FP32 would create a
-            # roughly 1 GB temporary in every transformer block.  Evaluate
-            # that path in the checkpoint's native BF16/FP16 dtype.  Calling
-            # the module is essential: the full INT8 ConvRot checkpoint
-            # replaces this Linear with QLinearInt8ConvRot, whose forward
-            # rotates the activation before applying its grouped weights.
-            # Bypassing it with F.linear silently corrupts every block's
-            # modulation values and produces colored video/audio noise.
-            projected = self.linear(
-                curve.to(
-                    device=curve.device,
-                    dtype=_weight_dtype(self.linear, curve.dtype),
-                )
+        # Full-width INT8 ConvRot checkpoints replace this nn.Linear with a
+        # specialized kernel module.  Calling it is essential: directly
+        # passing its packed INT8 weight to F.linear is neither correct nor
+        # supported. Compact curve checkpoints retain the precision-island
+        # FP32 math below.
+        if not isinstance(self.linear, nn.Linear):
+            projected = self.linear(curve)
+            projected = projected.view(
+                curve.shape[0] * self.modalities,
+                self.outputs * self.hidden_size,
             )
-        else:
-            weight = self.linear.weight.to(device=curve.device, dtype=torch.float32)
-            bias = self.linear.bias
-            if bias is not None:
-                bias = bias.to(device=curve.device, dtype=torch.float32)
-            projected = F.linear(curve.to(dtype=torch.float32), weight, bias)
+            return projected.chunk(self.outputs, dim=-1)
+        weight = self.linear.weight.to(device=curve.device, dtype=torch.float32)
+        bias = self.linear.bias
+        if bias is not None:
+            bias = bias.to(device=curve.device, dtype=torch.float32)
+        projected = F.linear(curve.to(dtype=torch.float32), weight, bias)
+        turbo_lora = getattr(self, "_h3_turbo_lora", None)
+        if turbo_lora is not None:
+            if turbo_silu_t_emb is None:
+                raise RuntimeError("H3 Turbo AdaLN weights are active without the timestep grid")
+            lora_a, lora_b = turbo_lora
+            projected.add_(
+                _h3_turbo_lora_delta(
+                    lora_a,
+                    lora_b,
+                    turbo_silu_t_emb,
+                    device=projected.device,
+                ).to(dtype=projected.dtype)
+            )
         projected = projected.view(curve.shape[0] * self.modalities, self.outputs * self.hidden_size)
         return projected.chunk(self.outputs, dim=-1)
 
@@ -607,8 +451,8 @@ class MiniMaxH3Block(nn.Module):
         curve_dim: int,
         eps: float,
         dtype: torch.dtype,
-        *,
-        compressed_modulation: bool,
+        adaln_dtype: torch.dtype = torch.float16,
+        apply_adaln_silu: bool = False,
     ):
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden_size, eps=eps, dtype=dtype)
@@ -616,71 +460,40 @@ class MiniMaxH3Block(nn.Module):
         self.attn = MiniMaxH3Attention(hidden_size, heads, head_dim, eps, dtype)
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_dim, dtype)
         self.adaln_proj = MiniMaxH3AdaLNProjection(
-            curve_dim,
-            hidden_size,
-            6,
-            MODALITY_COUNT,
-            torch.float16 if compressed_modulation else dtype,
-            apply_silu=not compressed_modulation,
+            curve_dim, hidden_size, 6, MODALITY_COUNT, adaln_dtype,
+            apply_silu=apply_adaln_silu,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         curve: torch.Tensor,
+        turbo_silu_t_emb: torch.Tensor | None,
         adaln_runs: tuple[tuple[int, int, int], ...],
         rotary: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        residual_signature_elements: int = 0,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(curve)
-        # Transfer the attention input rather than retaining it in this stack
-        # frame through the packed SDPA call. Attention empties the list once
-        # it owns the tensor and releases the storage after Q/K/V projection.
-        attention_input = [
-            _modulate_by_runs(
-                self.norm1(hidden_states),
-                shift_attn,
-                scale_attn,
-                adaln_runs,
-            )
-        ]
+        acceleration: dict | None = None,
+    ) -> torch.Tensor:
+        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(
+            curve, turbo_silu_t_emb
+        )
+        normed = _modulate_by_runs(self.norm1(hidden_states), shift_attn, scale_attn, adaln_runs)
         attn_output = _scale_by_runs(
-            self.attn(attention_input, rotary, attention_mask),
+            self.attn(normed, rotary, attention_mask, acceleration),
             gate_attn,
             adaln_runs,
         )
-        signature = None
-        signature_stride = 0
-        if residual_signature_elements:
-            signature_stride = max(
-                1,
-                math.ceil(hidden_states.numel() / residual_signature_elements),
-            )
-            signature = attn_output.reshape(-1)[::signature_stride].clone()
         if not torch.is_grad_enabled():
             hidden_states.add_(attn_output)
         else:
             hidden_states = hidden_states + attn_output
-        del attention_input, attn_output
+        del normed, attn_output
         normed = _modulate_by_runs(self.norm2(hidden_states), shift_mlp, scale_mlp, adaln_runs)
         mlp_output = _scale_by_runs(self.mlp(normed), gate_mlp, adaln_runs)
-        if signature is not None:
-            signature.add_(mlp_output.reshape(-1)[::signature_stride])
         if not torch.is_grad_enabled():
             hidden_states.add_(mlp_output)
-            del normed, mlp_output
-            return (
-                (hidden_states, signature)
-                if signature is not None
-                else hidden_states
-            )
-        hidden_states = hidden_states + mlp_output
-        return (
-            (hidden_states, signature)
-            if signature is not None
-            else hidden_states
-        )
+            return hidden_states
+        return hidden_states + mlp_output
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -692,18 +505,14 @@ class MiniMaxH3FinalLayer(nn.Module):
         audio_dim: int,
         eps: float,
         dtype: torch.dtype,
-        *,
-        compressed_modulation: bool,
+        adaln_dtype: torch.dtype = torch.float16,
+        apply_adaln_silu: bool = False,
     ):
         super().__init__()
         self.norm = nn.RMSNorm(hidden_size, eps=eps, dtype=dtype)
         self.adaln_proj = MiniMaxH3AdaLNProjection(
-            curve_dim,
-            hidden_size,
-            2,
-            1,
-            torch.float16 if compressed_modulation else dtype,
-            apply_silu=not compressed_modulation,
+            curve_dim, hidden_size, 2, 1, adaln_dtype,
+            apply_silu=apply_adaln_silu,
         )
         self.video_out = nn.Linear(hidden_size, video_dim, bias=True, dtype=torch.float32)
         self.audio_out = nn.Linear(hidden_size, audio_dim, bias=True, dtype=torch.float32)
@@ -715,15 +524,16 @@ class MiniMaxH3FinalLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         curve: torch.Tensor,
+        turbo_silu_t_emb: torch.Tensor | None,
         timestep_runs: tuple[tuple[int, int, int], ...],
     ) -> torch.Tensor:
-        shift, scale = self.adaln_proj(curve)
+        shift, scale = self.adaln_proj(curve, turbo_silu_t_emb)
         normed = self.norm(hidden_states)
         return _modulate_by_runs(normed, shift, scale, timestep_runs)
 
 
 class MiniMaxH3Transformer(nn.Module):
-    """MiniMax H3 transformer supporting both full and pruned checkpoints."""
+    """MiniMax H3 transformer with checkpoint-selected timestep geometry."""
 
     def __init__(
         self,
@@ -747,18 +557,16 @@ class MiniMaxH3Transformer(nn.Module):
     ):
         super().__init__()
         video_patch_dim = video_channels * math.prod(patch_size)
-        self.use_adaln_curves = curve_grid is not None
         self.config = SimpleNamespace(
             hidden_size=hidden_size,
             num_layers=num_layers,
-            num_attention_heads=num_attention_heads,
-            attention_head_dim=attention_head_dim,
             patch_size=patch_size,
             in_channels=video_channels,
             audio_in_channels=audio_channels,
             text_dim=text_dim,
             curve_grid=curve_grid,
             curve_dim=curve_dim,
+            full_timestep=curve_grid is None,
         )
         self.video_patch_proj = nn.Linear(video_patch_dim, hidden_size, bias=True, dtype=torch.float32)
         self.audio_patch_proj = nn.Linear(audio_channels, hidden_size, bias=True, dtype=torch.float32)
@@ -766,6 +574,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.video_patch_proj._lock_dtype = torch.float32
         self.audio_patch_proj._lock_dtype = torch.float32
         self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True, dtype=dtype)
+        self.use_adaln_curves = curve_grid is not None
         if self.use_adaln_curves:
             self.register_buffer(
                 "adaln_t_table",
@@ -777,7 +586,7 @@ class MiniMaxH3Transformer(nn.Module):
                 timestep_input_dim,
                 time_embed_hidden_size,
                 curve_dim,
-                torch.float32,
+                dtype=torch.float32,
             )
         self.rope = MiniMaxH3RotaryEmbedding(rope_freq_dim)
         self.token_refiner = MiniMaxH3TokenRefiner(
@@ -789,6 +598,8 @@ class MiniMaxH3Transformer(nn.Module):
             eps,
             dtype,
         )
+        adaln_dtype = torch.float16 if self.use_adaln_curves else dtype
+        apply_adaln_silu = not self.use_adaln_curves
         self.blocks = nn.ModuleList(
             [
                 MiniMaxH3Block(
@@ -799,7 +610,8 @@ class MiniMaxH3Transformer(nn.Module):
                     curve_dim,
                     eps,
                     dtype,
-                    compressed_modulation=self.use_adaln_curves,
+                    adaln_dtype,
+                    apply_adaln_silu,
                 )
                 for _ in range(num_layers)
             ]
@@ -811,57 +623,237 @@ class MiniMaxH3Transformer(nn.Module):
             audio_channels,
             eps,
             dtype,
-            compressed_modulation=self.use_adaln_curves,
+            adaln_dtype,
+            apply_adaln_silu,
         )
         self._interrupt = False
+        # Plain attributes intentionally keep the managed LoRA/grid outside the
+        # module state tree. MMGP owns backbone adapter streaming; registering
+        # these large AdaLN B matrices would make profile unload restore paths
+        # that do not exist on the compact base.
+        object.__setattr__(self, "_h3_turbo_prepared", False)
+        object.__setattr__(self, "_h3_turbo_active", False)
+        object.__setattr__(self, "_h3_turbo_grid", None)
+        object.__setattr__(self, "_h3_turbo_pending_adaln", None)
+        object.__setattr__(self, "_h3_turbo_managed_lora_index", 0)
+        object.__setattr__(self, "_h3_turbo_preprocess_call_index", 0)
+        object.__setattr__(self, "_h3_turbo_managed_seen", False)
+        object.__setattr__(self, "_h3_turbo_backbone_mode", "mmgp")
+        object.__setattr__(self, "_h3_turbo_pending_residual", None)
+        object.__setattr__(self, "_h3_turbo_residual_handles", [])
+
+    def clear_h3_turbo(self) -> None:
+        for handle in getattr(self, "_h3_turbo_residual_handles", []):
+            handle.remove()
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3AdaLNProjection):
+                object.__setattr__(module, "_h3_turbo_lora", None)
+        object.__setattr__(self, "_h3_turbo_prepared", False)
+        object.__setattr__(self, "_h3_turbo_active", False)
+        object.__setattr__(self, "_h3_turbo_grid", None)
+        object.__setattr__(self, "_h3_turbo_pending_adaln", None)
+        object.__setattr__(self, "_h3_turbo_managed_lora_index", 0)
+        object.__setattr__(self, "_h3_turbo_preprocess_call_index", 0)
+        object.__setattr__(self, "_h3_turbo_managed_seen", False)
+        object.__setattr__(self, "_h3_turbo_backbone_mode", "mmgp")
+        object.__setattr__(self, "_h3_turbo_pending_residual", None)
+        object.__setattr__(self, "_h3_turbo_residual_handles", [])
+
+    def prepare_h3_turbo(
+        self,
+        grid_path: str,
+        *,
+        lora_path: str | None = None,
+        backbone_mode: str = "mmgp",
+        managed_lora_index: int = 0,
+    ) -> None:
+        self.clear_h3_turbo()
+        if backbone_mode not in {"mmgp", "residual_output"}:
+            raise RuntimeError(f"Unknown H3 Turbo backbone mode: {backbone_mode}")
+        if managed_lora_index < 0:
+            raise RuntimeError("H3 Turbo managed LoRA index must be non-negative")
+        object.__setattr__(self, "_h3_turbo_backbone_mode", backbone_mode)
+        object.__setattr__(self, "_h3_turbo_managed_lora_index", int(managed_lora_index))
+        if self.use_adaln_curves:
+            from safetensors.torch import load_file
+
+            grid_state = load_file(grid_path, device="cpu")
+            if set(grid_state) != {"silu_t_emb_grid"}:
+                raise RuntimeError("H3 Turbo timestep grid tensor key is invalid")
+            grid = grid_state["silu_t_emb_grid"]
+            if grid.dtype != torch.bfloat16 or tuple(grid.shape) != (1025, 2688):
+                raise RuntimeError("H3 Turbo timestep grid must be BF16 [1025, 2688]")
+            object.__setattr__(self, "_h3_turbo_grid", grid)
+        if backbone_mode == "residual_output":
+            if not lora_path:
+                raise RuntimeError("H3 Turbo residual-output mode requires the managed LoRA path")
+            try:
+                from mmgp import safetensors2
+                state_dict = safetensors2.torch_load_file(lora_path, writable_tensors=False)
+            except ImportError:
+                from safetensors.torch import load_file
+                state_dict = load_file(lora_path, device="cpu")
+            from services.h3_turbo import strip_and_capture_adaln, validate_runtime_state_dict
+
+            validate_runtime_state_dict(state_dict)
+            captured_adaln = strip_and_capture_adaln(state_dict) if self.use_adaln_curves else None
+            residual = {}
+            module_names = sorted({name.rsplit(".lora_", 1)[0] for name in state_dict})
+            for module_name in module_names:
+                residual[module_name] = (
+                    state_dict.pop(f"{module_name}.lora_A.weight"),
+                    state_dict.pop(f"{module_name}.lora_B.weight"),
+                )
+            if state_dict:
+                raise RuntimeError("H3 Turbo residual-output capture left unexpected tensors")
+            object.__setattr__(self, "_h3_turbo_pending_adaln", captured_adaln)
+            object.__setattr__(self, "_h3_turbo_pending_residual", residual)
+            object.__setattr__(self, "_h3_turbo_managed_seen", True)
+        object.__setattr__(self, "_h3_turbo_prepared", True)
+
+    def _ordinary_lora_module_specs(self):
+        from .lora_affine import LoraModuleSpec
+
+        specs = {}
+        for name, module in self.named_modules():
+            in_features = getattr(module, "in_features", None)
+            out_features = getattr(module, "out_features", None)
+            if not name or in_features is None or out_features is None:
+                continue
+            specs[name] = LoraModuleSpec(
+                out_features=int(out_features),
+                in_features=int(in_features),
+                has_bias=getattr(module, "bias", None) is not None,
+            )
+        return specs
+
+    def _preprocess_ordinary_lora(self, model_type: str, state_dict: dict) -> dict:
+        from .lora_affine import normalize_h3_lora_state_dict
+
+        return normalize_h3_lora_state_dict(
+            model_type,
+            state_dict,
+            target_table=self.adaln_t_table if self.use_adaln_curves else None,
+            module_specs=self._ordinary_lora_module_specs(),
+        )
 
     def preprocess_loras(self, model_type: str, state_dict: dict) -> dict:
-        """Adapt AdaLN width while keeping logical grouped ``[Q, K, V]``.
+        if self._h3_turbo_prepared:
+            if self._h3_turbo_backbone_mode == "residual_output":
+                # Residual-output Turbo owns the complete managed LoRA itself;
+                # request validation forbids stacking ordinary adapters here.
+                return state_dict
+            call_index = self._h3_turbo_preprocess_call_index
+            object.__setattr__(self, "_h3_turbo_preprocess_call_index", call_index + 1)
+            if call_index == self._h3_turbo_managed_lora_index:
+                # This exact managed branch intentionally precedes all ordinary
+                # name/shape conversion. Its 518-key validator and compact
+                # AdaLN capture must observe the authored Turbo state verbatim.
+                from services.h3_turbo import (
+                    strip_and_capture_adaln,
+                    validate_runtime_state_dict,
+                )
 
-        Raw full-model checkpoints may need a head-interleaved-to-split loader,
-        but LoRAs target the already-instantiated H3 module used for training.
-        Its fused projection is consumed with ``qkv.chunk(3)``, so adapter B
-        rows are already grouped and MMGP's contiguous Q/K/V split is correct.
-        Reordering those rows here corrupts all attention adapters. Full and
-        Pruned checkpoints do use different AdaLN input widths, so convert only
-        that projection with WanGP's revision-pinned affine fit.
-        """
+                try:
+                    validate_runtime_state_dict(state_dict)
+                    captured = strip_and_capture_adaln(state_dict) if self.use_adaln_curves else None
+                except Exception:
+                    self.clear_h3_turbo()
+                    raise
+                object.__setattr__(self, "_h3_turbo_pending_adaln", captured)
+                object.__setattr__(self, "_h3_turbo_managed_seen", True)
+                return state_dict
+        return self._preprocess_ordinary_lora(model_type, state_dict)
 
-        from .lora_affine import convert_adaln_loras
+    def activate_h3_turbo(self) -> None:
+        pending = self._h3_turbo_pending_adaln
+        if not self._h3_turbo_prepared or not self._h3_turbo_managed_seen:
+            self.clear_h3_turbo()
+            raise RuntimeError("The managed H3 Turbo LoRA was not seen by the MMGP loader")
+        if self._h3_turbo_backbone_mode == "residual_output":
+            residual = self._h3_turbo_pending_residual
+            if not residual:
+                self.clear_h3_turbo()
+                raise RuntimeError("H3 Turbo residual-output tensors are missing")
+            modules = dict(self.named_modules())
+            handles = []
+            for module_name, (lora_a, lora_b) in residual.items():
+                module = modules.get(module_name)
+                if module is None:
+                    for handle in handles:
+                        handle.remove()
+                    self.clear_h3_turbo()
+                    raise RuntimeError(f"H3 Turbo residual target is missing: {module_name}")
+                handles.append(module.register_forward_hook(_make_h3_turbo_residual_hook(lora_a, lora_b)))
+            object.__setattr__(self, "_h3_turbo_residual_handles", handles)
+        if not self.use_adaln_curves:
+            # Original/full H3 keeps 2688-wide AdaLN projections. MMGP can own
+            # all 259 pairs on ordinary weights; quantized residual-output mode
+            # instead hooks each linear, including AdaLN. Neither needs the grid.
+            object.__setattr__(self, "_h3_turbo_active", True)
+            return
+        if self._h3_turbo_grid is None or not pending:
+            self.clear_h3_turbo()
+            raise RuntimeError("H3 Turbo compact AdaLN tensors or timestep grid are missing")
+        modules = dict(self.named_modules())
+        for linear_name, weights in pending.items():
+            projection_name = linear_name.removesuffix(".linear")
+            projection = modules.get(projection_name)
+            if not isinstance(projection, MiniMaxH3AdaLNProjection):
+                self.clear_h3_turbo()
+                raise RuntimeError(f"H3 Turbo AdaLN target is missing: {projection_name}")
+            object.__setattr__(projection, "_h3_turbo_lora", weights)
+        object.__setattr__(self, "_h3_turbo_active", True)
 
-        converted = dict(state_dict)
-        started = time.perf_counter()
-        count, architecture, source_width, target_width = convert_adaln_loras(
-            model_type,
-            converted,
-            self.adaln_t_table if self.use_adaln_curves else None,
+    def h3_turbo_runtime_state(self) -> dict[str, int | bool]:
+        attached = sum(
+            isinstance(module, MiniMaxH3AdaLNProjection)
+            and getattr(module, "_h3_turbo_lora", None) is not None
+            for module in self.modules()
         )
-        if count:
-            source = (
-                f"full AdaLN width {source_width}"
-                if source_width == 2688
-                else f"{architecture.upper()} pruned AdaLN width {source_width}"
-            )
-            target = (
-                f"full AdaLN width {target_width}"
-                if target_width == 2688
-                else f"{architecture.upper()} pruned AdaLN width {target_width}"
-            )
-            print(
-                f"[MiniMax H3 LoRA] Converted {count} AdaLN adapter(s) "
-                f"from {source} to {target} in "
-                f"{time.perf_counter() - started:.2f}s."
-            )
-        return converted
+        return {
+            "prepared": bool(self._h3_turbo_prepared),
+            "active": bool(self._h3_turbo_active),
+            "adaln_modules": int(attached),
+            "curve_mode": bool(self.use_adaln_curves),
+            "backbone_mode": str(self._h3_turbo_backbone_mode),
+            "residual_modules": len(getattr(self, "_h3_turbo_residual_handles", [])),
+        }
 
     def _curve_at(self, timestep: torch.Tensor, device: torch.device) -> torch.Tensor:
         if not self.use_adaln_curves:
-            return self.time_embedder(timestep.to(device=device, dtype=torch.float32))
+            return self.time_embedder(timestep.to(device=device))
         table = self.adaln_t_table.to(device=device, dtype=torch.float32)
         position = timestep.to(device=device, dtype=torch.float32).clamp_(0.0, 1.0) * (table.shape[0] - 1)
         lower = position.floor().long().clamp_(max=table.shape[0] - 2)
         fraction = (position - lower).unsqueeze(-1)
         return torch.lerp(table.index_select(0, lower), table.index_select(0, lower + 1), fraction)
+
+    def _turbo_silu_t_emb_at(
+        self,
+        timestep: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if not self._h3_turbo_active:
+            return None
+        if not self.use_adaln_curves:
+            return None
+        grid = self._h3_turbo_grid
+        if grid is None:
+            raise RuntimeError("H3 Turbo is active without its pinned timestep grid")
+        # LarryVRH's companion grid is sampled at linspace(0, 1, 1025).
+        # Interpolate in FP32 exactly like the pinned upstream node, then cast
+        # only the few selected rows to the LoRA's authored BF16 precision.
+        grid = grid.to(device=device)
+        position = timestep.to(device=device, dtype=torch.float32).clamp(0.0, 1.0) * (grid.shape[0] - 1)
+        lower = position.floor().long().clamp(max=grid.shape[0] - 2)
+        fraction = (position - lower).unsqueeze(-1)
+        selected = torch.lerp(
+            grid.index_select(0, lower).float(),
+            grid.index_select(0, lower + 1).float(),
+            fraction,
+        )
+        return selected.to(torch.bfloat16)
 
     def forward(
         self,
@@ -876,8 +868,6 @@ class MiniMaxH3Transformer(nn.Module):
         audio_indices: torch.Tensor,
         text_indices: torch.Tensor,
         return_dict: bool = True,
-        first_block_cache=None,
-        target_start_index: int | None = None,
         **_kwargs,
     ) -> MiniMaxH3TransformerOutput | tuple[torch.Tensor, torch.Tensor] | None:
         if self._interrupt:
@@ -908,6 +898,7 @@ class MiniMaxH3Transformer(nn.Module):
         packed.index_copy_(1, audio_indices, audio_embeds.to(packed.dtype))
 
         curve = self._curve_at(timestep, device)
+        turbo_silu_t_emb = self._turbo_silu_t_emb_at(timestep, device)
         adaln_indices = timestep_indices * MODALITY_COUNT + token_tags.clamp_min(0)
         adaln_runs = _index_runs(adaln_indices)
         timestep_runs = _index_runs(timestep_indices)
@@ -917,69 +908,37 @@ class MiniMaxH3Transformer(nn.Module):
         if bool(padding.any()):
             attention_mask = padding[:, None] == padding[None, :]
 
-        if first_block_cache is None:
-            for block in self.blocks:
-                if self._interrupt:
-                    return None
-                packed = block(
-                    packed,
-                    curve,
-                    adaln_runs,
-                    rotary,
-                    attention_mask,
-                )
-        else:
+        acceleration = None
+        attention_engine = str(_kwargs.get("h3_attention_engine") or "sdpa")
+        if attention_engine == "sage2":
+            acceleration = {"engine": "sage2"}
+        elif attention_engine == "sol_attn":
+            acceleration = {
+                "engine": "sol_attn",
+                "step_index": int(_kwargs.get("h3_step_index") or 0),
+                "tau": float(_kwargs.get("h3_sol_tau") or 1.0),
+                "dense_steps": int(_kwargs.get("h3_sol_dense_steps") or 10),
+                "dense_blocks": int(_kwargs.get("h3_sol_dense_blocks") or 2),
+                "min_tokens": int(_kwargs.get("h3_sol_min_tokens") or 4096),
+                "sink_tokens": int(_kwargs.get("h3_sol_sink_tokens") or 0),
+            }
+
+        for block_index, block in enumerate(self.blocks):
             if self._interrupt:
                 return None
-            packed, signature = self.blocks[0](
+            if acceleration is not None:
+                acceleration["block_index"] = block_index
+            packed = block(
                 packed,
                 curve,
+                turbo_silu_t_emb,
                 adaln_runs,
                 rotary,
                 attention_mask,
-                residual_signature_elements=(
-                    first_block_cache.MAX_SIGNATURE_ELEMENTS
-                ),
+                acceleration,
             )
-            if target_start_index is None:
-                # Backward-compatible direct calls have no reference-row
-                # counts, so fall back to the first media row. Production
-                # callers pass the exact start of generated audio/video.
-                target_starts = []
-                if audio_indices.numel():
-                    target_starts.append(int(audio_indices[0].item()))
-                if video_indices.numel():
-                    target_starts.append(int(video_indices[0].item()))
-                target_start = min(target_starts) if target_starts else 0
-            else:
-                target_start = max(
-                    0,
-                    min(sequence_length, int(target_start_index)),
-                )
-            if first_block_cache.should_compute(signature):
-                head_output = first_block_cache.capture_head_output(
-                    packed[:, target_start:]
-                )
-                for block in self.blocks[1:]:
-                    if self._interrupt:
-                        return None
-                    packed = block(
-                        packed,
-                        curve,
-                        adaln_runs,
-                        rotary,
-                        attention_mask,
-                    )
-                first_block_cache.store_tail_residual(
-                    packed[:, target_start:],
-                    head_output,
-                )
-            else:
-                first_block_cache.apply_tail_residual(
-                    packed[:, target_start:]
-                )
 
-        packed = self.final_layer(packed, curve, timestep_runs)
+        packed = self.final_layer(packed, curve, turbo_silu_t_emb, timestep_runs)
         video_activations = packed.index_select(1, video_indices).to(torch.float32)
         audio_activations = packed.index_select(1, audio_indices).to(torch.float32)
         video_output = self.final_layer.video_out(video_activations)

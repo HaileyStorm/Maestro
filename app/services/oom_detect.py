@@ -16,21 +16,37 @@ permanent-fix button.
 """
 from __future__ import annotations
 
-from typing import Optional
+import re
+from typing import Iterable, Mapping, Optional
 
 
-# Substrings that reliably appear in CUDA OOM tracebacks. We match on
-# the stringified exception (str(e)) AND the exception type name to
-# catch both raised `torch.cuda.OutOfMemoryError` and string-wrapped
-# variants ("CUDA error: out of memory", etc.) that some library
-# layers re-raise as RuntimeError.
-_OOM_SIGNATURES = (
-    "out of memory",          # the canonical message in CUDA OOMs
-    "cuda out of memory",     # explicit CUDA prefix variant
-    "outofmemoryerror",       # the exception class name (lowercased)
-    "cublas_status_alloc",    # cuBLAS allocator failure (sometimes wraps OOM)
-    "cudnn_status_alloc",     # cuDNN allocator failure (same)
+# Only device-qualified allocator signatures are accepted.  A bare "out of
+# memory" can describe CPU RAM, a child ffmpeg process, or an application
+# message and must never turn into a VRAM diagnosis.
+_GPU_OOM_SIGNATURES = (
+    "cuda out of memory",
+    "cuda error: out of memory",
+    "hip out of memory",
+    "cublas_status_alloc_failed",
+    "cudnn_status_alloc_failed",
 )
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_FAILURE_STAGES = {
+    "denoise", "vae_decode", "segment_checkpoint", "concat", "audio_mux",
+    "postprocess", "flashvsr", "delivery", "publication", "generation",
+}
+_STAGE_DETAILS = {
+    "denoise": "Generation failed during denoising.",
+    "vae_decode": "Generation failed while decoding the rendered segment.",
+    "segment_checkpoint": "The rendered segment could not be sealed for recovery.",
+    "concat": "Rendered segments could not be joined into the final output.",
+    "audio_mux": "The rendered output could not be combined with audio.",
+    "postprocess": "The rendered output failed during post-processing.",
+    "flashvsr": "The rendered output failed during FlashVSR processing.",
+    "delivery": "The requested delivery output could not be produced.",
+    "publication": "The completed output could not be published safely.",
+    "generation": "Generation failed.",
+}
 
 
 def _suggest_lower_coefficient(current: float) -> Optional[float]:
@@ -46,6 +62,223 @@ def _suggest_lower_coefficient(current: float) -> Optional[float]:
     return max(suggested, 0.50)
 
 
+def is_oom(exception: Exception) -> bool:
+    """Return whether ``exception`` has a device-qualified OOM signature."""
+    current = exception
+    seen: set[int] = set()
+    for _ in range(8):
+        if not isinstance(current, BaseException) or id(current) in seen:
+            break
+        seen.add(id(current))
+        err_str = str(current).lower()
+        err_type = type(current).__name__.lower()
+        err_module = type(current).__module__.lower()
+        if any(signature in err_str for signature in _GPU_OOM_SIGNATURES):
+            return True
+        if (
+            err_type == "outofmemoryerror"
+            and (
+                err_module.startswith("torch")
+                or "cuda" in err_str
+                or "hip" in err_str
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def safe_allocator_facts() -> dict:
+    """Return path-free current CUDA allocator counters when available."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {}
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        facts = {
+            "device_type": "cuda",
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+        }
+        if any(value < 0 for key, value in facts.items() if key.endswith("_bytes")):
+            return {}
+        return facts
+    except Exception:
+        return {}
+
+
+def _position(current, total, *, variant=None) -> Optional[dict]:
+    try:
+        current_value = max(0, int(current or 0))
+        total_value = max(0, int(total or 0))
+    except (TypeError, ValueError):
+        return None
+    if current_value <= 0 and total_value <= 0:
+        return None
+    result = {"current": current_value, "total": total_value}
+    if variant is not None:
+        try:
+            result["variant"] = max(1, int(variant or 1))
+        except (TypeError, ValueError):
+            result["variant"] = 1
+    return result
+
+
+def build_failure_details(
+    exception: Exception,
+    *,
+    stage: str = "generation",
+    code: str | None = None,
+    segment: Mapping[str, object] | None = None,
+    window: Mapping[str, object] | None = None,
+    step: Mapping[str, object] | None = None,
+    allocator: Mapping[str, object] | None = None,
+) -> dict:
+    """Build one remotely safe, path/content-free failure envelope.
+
+    Raw exception text is intentionally excluded. The complete traceback stays
+    machine-local at the call site; remote status receives only a class token,
+    a stable stage/code, bounded numeric progress, and allocator counters.
+    """
+    declared_stage = getattr(exception, "stage", stage)
+    normalized_stage = (
+        str(declared_stage)
+        if str(declared_stage) in _FAILURE_STAGES else "generation"
+    )
+    detected_oom = is_oom(exception)
+    declared_code = str(getattr(exception, "code", code or ""))
+    normalized_code = (
+        declared_code
+        if _SAFE_TOKEN_RE.fullmatch(declared_code)
+        else ("cuda_oom" if detected_oom else f"{normalized_stage}_failed")
+    )
+    identity = exception
+    seen: set[int] = set()
+    for _ in range(8):
+        child = identity.__cause__ or identity.__context__
+        if not isinstance(child, BaseException) or id(child) in seen:
+            break
+        seen.add(id(identity))
+        identity = child
+    exception_type = type(identity).__name__
+    if _SAFE_TOKEN_RE.fullmatch(exception_type) is None:
+        exception_type = "Exception"
+    details = {
+        "code": "cuda_oom" if detected_oom else normalized_code,
+        "stage": normalized_stage,
+        "detail": _STAGE_DETAILS[normalized_stage],
+        "exception_type": exception_type,
+        "is_oom": detected_oom,
+    }
+    for name, value in (("segment", segment), ("window", window), ("step", step)):
+        if not isinstance(value, Mapping):
+            continue
+        position = _position(
+            value.get("current"), value.get("total"),
+            variant=value.get("variant") if name == "segment" else None,
+        )
+        if position is not None:
+            details[name] = position
+    allocator_value = dict(allocator or {}) if detected_oom else {}
+    if detected_oom and not allocator_value:
+        allocator_value = safe_allocator_facts()
+    safe_allocator = {
+        key: value
+        for key, value in allocator_value.items()
+        if (
+            key == "device_type" and value in {"cuda", "hip"}
+        ) or (
+            key in {
+                "free_bytes", "total_bytes", "allocated_bytes", "reserved_bytes",
+            }
+            and type(value) is int and value >= 0
+        )
+    }
+    if safe_allocator:
+        details["allocator"] = safe_allocator
+    return details
+
+
+def oom_info_from_failure_details(
+    details: Mapping[str, object],
+    current_coefficient: float,
+) -> Optional[dict]:
+    """Return the legacy OOM banner shape from a confident safe envelope."""
+    if details.get("is_oom") is not True:
+        return None
+    suggested = _suggest_lower_coefficient(current_coefficient)
+    result = {
+        "is_oom": True,
+        "stage": str(details.get("stage") or "generation"),
+        "current_coefficient": current_coefficient,
+        "suggested_coefficient": suggested,
+        "message": "The operation ran out of GPU memory.",
+    }
+    allocator = details.get("allocator")
+    if isinstance(allocator, Mapping):
+        result["allocator"] = dict(allocator)
+    return result
+
+
+def normalize_failure_details(
+    value: Mapping[str, object],
+    *,
+    segment: Mapping[str, object] | None = None,
+    window: Mapping[str, object] | None = None,
+    step: Mapping[str, object] | None = None,
+) -> dict:
+    """Validate an internal producer envelope before remote publication."""
+    stage = str(value.get("stage") or "generation")
+    if stage not in _FAILURE_STAGES:
+        stage = "generation"
+    is_oom_value = value.get("is_oom") is True
+    code = str(value.get("code") or "")
+    if _SAFE_TOKEN_RE.fullmatch(code) is None:
+        code = "cuda_oom" if is_oom_value else f"{stage}_failed"
+    exception_type = str(value.get("exception_type") or "Exception")
+    if _SAFE_TOKEN_RE.fullmatch(exception_type) is None:
+        exception_type = "Exception"
+    details = {
+        "code": "cuda_oom" if is_oom_value else code,
+        "stage": stage,
+        "detail": _STAGE_DETAILS[stage],
+        "exception_type": exception_type,
+        "is_oom": is_oom_value,
+    }
+    for name, fallback in (
+        ("segment", segment), ("window", window), ("step", step),
+    ):
+        raw = value.get(name)
+        raw = raw if isinstance(raw, Mapping) else fallback
+        if isinstance(raw, Mapping):
+            position = _position(
+                raw.get("current"), raw.get("total"),
+                variant=raw.get("variant") if name == "segment" else None,
+            )
+            if position is not None:
+                details[name] = position
+    allocator = value.get("allocator")
+    if is_oom_value and isinstance(allocator, Mapping):
+        safe_allocator = {
+            key: item
+            for key, item in allocator.items()
+            if (
+                key == "device_type" and item in {"cuda", "hip"}
+            ) or (
+                key in {
+                    "free_bytes", "total_bytes", "allocated_bytes", "reserved_bytes",
+                }
+                and type(item) is int and item >= 0
+            )
+        }
+        if safe_allocator:
+            details["allocator"] = safe_allocator
+    return details
+
+
 def detect_oom(exception: Exception, current_coefficient: float = 0.80) -> Optional[dict]:
     """Inspect an exception and return OOM info if it looks like a CUDA OOM.
 
@@ -55,18 +288,14 @@ def detect_oom(exception: Exception, current_coefficient: float = 0.80) -> Optio
         "is_oom": True,
         "current_coefficient": 0.80,
         "suggested_coefficient": 0.70,  # or None if already at floor
-        "message": str(exception)[:300],   # truncated for UI display
+        "message": "The operation ran out of GPU memory.",
       }
 
     The current_coefficient parameter should be sourced from
     server_config["vram_safety_coefficient"] at the call site so the
     UI can display the actual current value.
     """
-    err_str = str(exception).lower()
-    err_type = type(exception).__name__.lower()
-    haystack = err_str + " " + err_type
-
-    if not any(sig in haystack for sig in _OOM_SIGNATURES):
+    if not is_oom(exception):
         return None
 
     suggested = _suggest_lower_coefficient(current_coefficient)
@@ -74,7 +303,52 @@ def detect_oom(exception: Exception, current_coefficient: float = 0.80) -> Optio
         "is_oom": True,
         "current_coefficient": current_coefficient,
         "suggested_coefficient": suggested,
-        # Truncate to keep UI banners readable. Full traceback is
-        # already in the server log via traceback.print_exc().
-        "message": str(exception)[:300],
+        # Raw exceptions can contain local paths, arguments, and credentials.
+        # The machine-local traceback is retained by the caller.
+        "message": "The operation ran out of GPU memory.",
+    }
+
+
+def delivery_oom_info(
+    exception: Exception,
+    current_coefficient: float,
+    *,
+    requested_target: str,
+    native_available: bool,
+    retry_count: int,
+    actions: Iterable[str] = (),
+) -> Optional[dict]:
+    """Build path-free, remotely safe recovery facts for delivery OOMs.
+
+    Delivery failures deliberately do not echo ``str(exception)``. ffmpeg,
+    CUDA, and bridge exceptions may contain host paths; status responses are a
+    remote multi-user surface. The retained native artifact is described only
+    as an availability boolean and remains server-owned.
+    """
+    if not is_oom(exception):
+        return None
+    suggested = _suggest_lower_coefficient(current_coefficient)
+    target = str(requested_target or "").strip().lower()
+    if target not in {"1920x1080", "2688x1536", "3840x2160"}:
+        target = ""
+    return {
+        "is_oom": True,
+        "stage": "h3_delivery",
+        "requested_target": target,
+        "native_available": bool(native_available),
+        "retry_count": max(0, min(1, int(retry_count))),
+        "recoverable": bool(native_available),
+        "actions": [
+            str(action)[:64]
+            for action in actions
+            if isinstance(action, str) and action
+        ][:8],
+        "current_coefficient": current_coefficient,
+        "suggested_coefficient": suggested,
+        "message": (
+            "Delivery ran out of GPU memory after native generation completed. "
+            "The private native result is still available for recovery."
+            if native_available
+            else "Delivery ran out of GPU memory."
+        ),
     }

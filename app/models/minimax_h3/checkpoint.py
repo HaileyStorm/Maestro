@@ -32,7 +32,7 @@ VIDEO_VAE_HEAD_DIM = 64
 
 
 def preprocess_conditioner_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Validate and expose Comfy's row-scaled INT8 Qwen embedding.
+    """Validate and expose Comfy's scaled INT8 Qwen embedding.
 
     MMGP handles the checkpoint's NVFP4 linear layers separately.  The token
     table is the sole ``int8_tensorwise`` layer and is consumed directly by
@@ -47,7 +47,12 @@ def preprocess_conditioner_state_dict(state_dict: dict[str, torch.Tensor]) -> di
     scale = state_dict.get(scale_key)
 
     if marker is None:
-        if weight is not None and torch.is_floating_point(weight) and scale is None:
+        if (
+            weight is not None
+            and weight.ndim == 2
+            and torch.is_floating_point(weight)
+            and scale is None
+        ):
             state_dict[scale_key] = torch.ones(
                 (weight.shape[0], 1),
                 dtype=torch.float32,
@@ -56,11 +61,15 @@ def preprocess_conditioner_state_dict(state_dict: dict[str, torch.Tensor]) -> di
         return state_dict
 
     try:
-        raw_marker = bytes(marker.detach().to("cpu").tolist()).rstrip(b"\0")
+        if not isinstance(marker, torch.Tensor) or marker.dtype != torch.uint8:
+            raise TypeError("quantization marker must be a U8 tensor")
+        raw_marker = bytes(marker.detach().to("cpu").reshape(-1).tolist()).rstrip(b"\0")
         descriptor = json.loads(raw_marker.decode("utf-8"))
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
         raise ValueError("MiniMax H3 Qwen embedding has invalid quantization metadata.") from exc
 
+    if not isinstance(descriptor, dict):
+        raise ValueError("MiniMax H3 Qwen embedding has invalid quantization metadata.")
     if descriptor.get("format") != "int8_tensorwise":
         raise ValueError(
             "MiniMax H3 Qwen embedding uses unsupported quantization format "
@@ -69,15 +78,23 @@ def preprocess_conditioner_state_dict(state_dict: dict[str, torch.Tensor]) -> di
     if weight is None or weight.dtype != torch.int8 or weight.ndim != 2:
         raise ValueError("MiniMax H3 Qwen embedding must be a two-dimensional INT8 tensor.")
     if scale is None or not torch.is_floating_point(scale):
-        raise ValueError("MiniMax H3 Qwen embedding is missing its floating-point row scales.")
-    if scale.ndim == 1 and scale.shape[0] == weight.shape[0]:
-        scale = scale.unsqueeze(-1)
-        state_dict[scale_key] = scale
-    if tuple(scale.shape) != (weight.shape[0], 1):
+        raise ValueError("MiniMax H3 Qwen embedding is missing its floating-point scales.")
+    row_count = weight.shape[0]
+    if scale.ndim == 0 or (scale.ndim == 1 and scale.numel() == 1):
+        scale = scale.reshape(1, 1).expand(row_count, 1).contiguous()
+    elif tuple(scale.shape) == (row_count,):
+        scale = scale.reshape(row_count, 1).contiguous()
+    elif tuple(scale.shape) == (row_count, 1):
+        scale = scale.contiguous()
+    else:
         raise ValueError(
-            "MiniMax H3 Qwen embedding row scales have shape "
-            f"{tuple(scale.shape)}; expected {(weight.shape[0], 1)}."
+            "MiniMax H3 Qwen embedding scale has shape "
+            f"{tuple(scale.shape)}; expected a scalar or per-row scale for "
+            f"{(row_count, 1)}."
         )
+    if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
+        raise ValueError("MiniMax H3 Qwen embedding scales must be finite and positive.")
+    state_dict[scale_key] = scale
     return state_dict
 
 

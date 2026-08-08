@@ -1,11 +1,32 @@
 import { useState, useEffect } from 'react'
 import { Play, AlertTriangle } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import { H3EstimateBadge } from './H3PerformanceProfiles'
 
 export function GenerateButton() {
   const jobs = useStore(s => s.jobs)
   const startGeneration = useStore(s => s.startGeneration)
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
+  const modelOptionsLoading = useStore(s => s.modelOptionsLoading)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const isH3 = useStore(s => (
+    s.generationMode === 'video'
+    && (
+      s.params.model_type.startsWith('minimax_h3')
+      || String(s.modelOptions?.architecture || '').startsWith('minimax_h3')
+    )
+  ))
+  const h3Estimate = useStore(s => s.h3CurrentEstimate)
+  const h3EstimateLoading = useStore(s => s.h3EstimateLoading)
+  const h3DownloadRequired = useStore(s => {
+    if (s.models.find(model => model.model_type === s.params.model_type)?.is_downloaded === false) return true
+    const turboProfile = (s.params.custom_settings || {}).h3_turbo_profile
+    return !!turboProfile && s.h3PerformanceProfiles.some(profile => (
+      profile.download_required
+      && profile.settings.model_type === s.params.model_type
+      && profile.settings.custom_settings.h3_turbo_profile === turboProfile
+    ))
+  })
   const [cooldown, setCooldown] = useState(false)
 
   // Check if i2v-only model needs a start image. Video mode only: edit
@@ -13,16 +34,8 @@ export function GenerateButton() {
   // SCAIL-2 against a source video + reference image, no start image).
   const generationMode = useStore(s => s.generationMode)
   const isI2vOnly = useStore(s => s.modelOptions?.i2v_class && !s.modelOptions?.t2v_class)
-  const isOmniReference = useStore(s => s.modelOptions?.omni_reference === true)
-  const hasOmniVisualReference = useStore(s =>
-    s.params.minimax_h3_references?.some(
-      reference => reference.type === 'image' || reference.type === 'video',
-    ) === true,
-  )
   const hasStartImage = useStore(s => !!(s.startImage || s.params.image_start))
-  const needsImage = generationMode === 'video' && isI2vOnly && !isOmniReference && !hasStartImage
-  const needsReference = generationMode === 'video' && isOmniReference
-    && !hasOmniVisualReference
+  const needsImage = generationMode === 'video' && isI2vOnly && !hasStartImage
   const editSubMode = useStore(s => s.editSubMode)
   const editVideoPath = useStore(s => s.editVideoPath)
   const outpaintVideoBox = useStore(s => s.outpaintVideoBox)
@@ -35,7 +48,8 @@ export function GenerateButton() {
     || outpaintVideoBox.y + outpaintVideoBox.h < 0.9995
   )
   const needsOutpaintArea = isOutpaint && !!editVideoPath && !hasOutpaintArea
-  const blocked = needsImage || needsReference || needsOutpaintSource || needsOutpaintArea
+  const needsProject = !activeWorkspace
+  const blocked = modelOptionsLoading || needsProject || needsImage || needsOutpaintSource || needsOutpaintArea
 
   // Brief gray flash after clicking
   useEffect(() => {
@@ -51,49 +65,61 @@ export function GenerateButton() {
     setSidebarOpen(false)
   }
 
-  const queueCount = jobs.length
+  const queueCount = jobs.filter(job =>
+    job.status === 'queued' || job.status === 'running'
+  ).length
 
   if (blocked) {
-    const label = needsImage
+    const label = modelOptionsLoading
+      ? 'Loading model'
+      : needsProject
+      ? 'Select project'
+      : needsImage
       ? 'Need image'
-      : needsReference
-        ? 'Need reference'
       : needsOutpaintSource
         ? 'Need source'
         : 'Choose canvas'
-    const title = needsOutpaintArea
+    const title = modelOptionsLoading
+      ? 'Loading this model\'s supported duration, window, steps, and reference controls.'
+      : needsOutpaintArea
       ? 'Choose a larger output aspect or resize the source to create an area for Outpaint to generate.'
-      : needsReference
-        ? 'Add at least one image or video reference. Audio cannot be the only reference.'
-        : undefined
+      : needsProject
+      ? 'Select or create a password-protected project from the project picker first.'
+      : undefined
     return (
-      <button
-        disabled
-        title={title}
-        className="px-4 py-2 rounded-lg flex items-center gap-1.5 bg-amber-500/20 text-indicator-warning cursor-not-allowed text-xs font-medium whitespace-nowrap"
-      >
-        <AlertTriangle size={13} />
-        {label}
-      </button>
+      <div className="flex flex-col items-end gap-0.5">
+        <button
+          disabled
+          title={title}
+          className="px-4 py-2 rounded-lg flex items-center gap-1.5 bg-amber-500/20 text-indicator-warning cursor-not-allowed text-xs font-medium whitespace-nowrap"
+        >
+          <AlertTriangle size={13} />
+          {label}
+        </button>
+        {isH3 && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
+      </div>
     )
   }
 
   return (
-    <button
-      onClick={handleClick}
-      disabled={cooldown}
-      className={`px-4 py-2 rounded-lg flex items-center gap-1.5 font-medium text-xs transition-all whitespace-nowrap ${
-        cooldown
-          ? 'bg-bg-active text-text-muted cursor-not-allowed'
-          // Default theme: bg-cta resolves to a flat accent-blue (both
-          // gradient stops point at --color-accent-blue). Golden Hour:
-          // resolves to a red→orange sunset gradient. shadow-accent-glow
-          // is empty in default and a warm bloom in Golden Hour.
-          : 'bg-cta hover:brightness-110 shadow-accent-glow text-white'
-      }`}
-    >
-      <Play size={13} fill={cooldown ? 'currentColor' : 'white'} />
-      {cooldown ? 'Queued' : queueCount > 0 ? `Go (${queueCount})` : 'Generate'}
-    </button>
+    <div className="flex flex-col items-end gap-0.5">
+      <button
+        onClick={handleClick}
+        disabled={cooldown}
+        className={`px-4 py-2 rounded-lg flex items-center gap-1.5 font-medium text-xs transition-all whitespace-nowrap ${
+          cooldown
+            ? 'bg-bg-active text-text-muted cursor-not-allowed'
+            // Default theme: bg-cta resolves to a flat accent-blue (both
+            // gradient stops point at --color-accent-blue). Golden Hour:
+            // resolves to a red→orange sunset gradient. shadow-accent-glow
+            // is empty in default and a warm bloom in Golden Hour.
+            : 'bg-cta hover:brightness-110 shadow-accent-glow text-white'
+        }`}
+      >
+        <Play size={13} fill={cooldown ? 'currentColor' : 'white'} />
+        {cooldown ? 'Queued' : queueCount > 0 ? `Go (${queueCount})` : 'Generate'}
+      </button>
+      {isH3 && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
+    </div>
   )
 }

@@ -1,10 +1,17 @@
 import { useState, useRef, useEffect, useCallback, type CSSProperties } from 'react'
-import { Play, Pencil, RefreshCw, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked } from 'lucide-react'
+import { Play, Pencil, RefreshCw, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked, EyeOff, Share2, Link2Off } from 'lucide-react'
 import { SaveRecipeDialog } from '../Recipes/SaveRecipeDialog'
 import { useStore } from '../../stores/useStore'
-import { getUploadUrl, fetchOutputMetadata, getFileUrl, moveOutput, uploadImage } from '../../api/client'
+import { createOutputShare, deleteOutputComponents, getUploadUrl, fetchOutputMetadata, getFileUrl, moveOutput, revokeOutputShare, uploadImage } from '../../api/client'
 import type { OutputFile, OutputMetadata } from '../../types'
 import { modelDisplayName } from '../../lib/modelDisplay'
+import {
+  hidePrivatePreview as forgetPrivatePreviewReveal,
+  privatePreviewIdentity,
+  privatePreviewWasRevealed,
+  revealPrivatePreview as rememberPrivatePreviewReveal,
+  subscribePrivatePreviewReveal,
+} from '../../lib/privatePreview'
 
 interface Props {
   file: OutputFile
@@ -31,11 +38,6 @@ function RetryImage({ url, alt }: { url: string; alt: string }) {
   const [src, setSrc] = useState(url)
   const retries = useRef(0)
   const maxRetries = 5
-
-  useEffect(() => {
-    retries.current = 0
-    setSrc(url)
-  }, [url])
 
   const scheduleRetry = useCallback(() => {
     if (retries.current < maxRetries) {
@@ -86,7 +88,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   const openRetakeDialog = useStore(s => s.openRetakeDialog)
   const generationMode = useStore(s => s.generationMode)
   const workspaces = useStore(s => s.workspaces)
-  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const accessContext = useStore(s => s.accessContext)
   // Virtual Uploads view: browse-only. Move/favorite/delete resolve
   // against the active OUTPUT workspace server-side, so they can't act
   // on upload files — hide them. Download + send-to-input still work
@@ -97,6 +99,9 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   // human-readable display name (e.g. "LTX-2.3 Distilled 1.1 22B")
   // via modelDisplayName().
   const models = useStore(s => s.models)
+  const gallerySelectionMode = useStore(s => s.gallerySelectionMode)
+  const selectedOutputKeys = useStore(s => s.selectedOutputKeys)
+  const toggleOutputSelection = useStore(s => s.toggleOutputSelection)
 
   const saveRecipeFromOutput = useStore(s => s.saveRecipeFromOutput)
   const nsfwMode = useStore(s => !!s.servicesConfig?.nsfw_mode)
@@ -104,6 +109,9 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   const [meta, setMeta] = useState<OutputMetadata | null>(null)
   const [metaLoaded, setMetaLoaded] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [confirmCleanup, setConfirmCleanup] = useState(false)
+  const [cleaningComponents, setCleaningComponents] = useState(false)
+  const [cleanupError, setCleanupError] = useState('')
   const [showSaveRecipe, setShowSaveRecipe] = useState(false)
   const confirmRef = useRef(false)
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
@@ -112,9 +120,39 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   const [sentToInput, setSentToInput] = useState(false)
   const [showMoveMenu, setShowMoveMenu] = useState(false)
   const [moving, setMoving] = useState(false)
+  const privateRevealKey = privatePreviewIdentity(file.workspace, file.name, file.revision)
+  const [revealedPrivateKey, setRevealedPrivateKey] = useState(() =>
+    file.private && privatePreviewWasRevealed(privateRevealKey) ? privateRevealKey : '',
+  )
+  const privateRevealed = file.private && revealedPrivateKey === privateRevealKey
+  const [shareUrl, setShareUrl] = useState('')
+  const [sharing, setSharing] = useState(false)
+  const [shareMessage, setShareMessage] = useState('')
   const moveRef = useRef<HTMLDivElement>(null)
   const itemRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+
+  useEffect(() => () => {
+    clearTimeout(timeoutRef.current)
+  }, [])
+
+  useEffect(() => {
+    const syncReveal = (revealed = privatePreviewWasRevealed(privateRevealKey)) => {
+      setRevealedPrivateKey(file.private && revealed ? privateRevealKey : '')
+    }
+    syncReveal()
+    return subscribePrivatePreviewReveal(privateRevealKey, syncReveal)
+  }, [file.private, privateRevealKey])
+
+  const revealPrivatePreview = () => {
+    rememberPrivatePreviewReveal(privateRevealKey)
+    setRevealedPrivateKey(privateRevealKey)
+  }
+
+  const hidePrivatePreview = () => {
+    forgetPrivatePreviewReveal(privateRevealKey)
+    setRevealedPrivateKey('')
+  }
 
   // Measure actual height and report to parent
   useEffect(() => {
@@ -153,14 +191,14 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
       (entries) => {
         if (entries[0].isIntersecting) {
           setMetaLoaded(true)
-          fetchOutputMetadata(file.name).then(setMeta).catch(() => {})
+          fetchOutputMetadata(file.name, file.workspace).then(setMeta).catch(() => {})
         }
       },
       { threshold: 0.1 }
     )
     observer.observe(el)
     return () => observer.disconnect()
-  }, [file.name, metaLoaded])
+  }, [file.workspace, file.name, file.revision, metaLoaded])
 
   // Pause video when scrolled out of view (but don't auto-play when scrolled in)
   useEffect(() => {
@@ -171,7 +209,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   }, [isActive])
 
   const params = meta?.params as Record<string, unknown> | null
-  const uploadFilenames = meta?.upload_filenames as Record<string, string> | undefined
+  const uploadFilenames = meta?.upload_filenames
 
   const prompt = (params?._tts_original_prompt as string) || (params?.prompt as string) || ''
   const modelType = (params?.model_type as string) || ''
@@ -180,6 +218,33 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   const resolution = isAudio ? '' : ((params?.resolution as string) || '')
   const seed = params?.seed as number | undefined
   const generationTime = meta?.generation_time
+  const activatedLoras = Array.isArray(params?.activated_loras)
+    ? params.activated_loras.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    : []
+  const loraMultipliers = typeof params?.loras_multipliers === 'string'
+    ? params.loras_multipliers.split(/\s+/).filter(Boolean)
+    : []
+  const loraProvenance = activatedLoras.map((value, loraIndex) => ({
+    name: value.replace(/\\/g, '/').split('/').pop() || value,
+    weight: loraMultipliers[loraIndex]?.split(';')[0] || '1',
+  }))
+  const referenceCount = (value: unknown) => Array.isArray(value)
+    ? value.filter(Boolean).length
+    : value ? 1 : 0
+  const semanticReferenceKinds: Array<[string, number]> = [
+    ['image', Math.max(referenceCount(params?.image_refs), referenceCount(uploadFilenames?.image_refs))] as [string, number],
+    ['video', Math.max(
+      referenceCount(params?.video_guide) + referenceCount(params?.video_guide2) + referenceCount(params?.video_guide3) + referenceCount(params?.video_source),
+      referenceCount(uploadFilenames?.video_guide) + referenceCount(uploadFilenames?.video_guide2) + referenceCount(uploadFilenames?.video_guide3) + referenceCount(uploadFilenames?.video_source),
+    )] as [string, number],
+    ['audio', Math.max(
+      referenceCount(params?.audio_guide) + referenceCount(params?.audio_guide2) + referenceCount(params?.audio_guide3),
+      referenceCount(uploadFilenames?.audio_guide) + referenceCount(uploadFilenames?.audio_guide2) + referenceCount(uploadFilenames?.audio_guide3),
+    )] as [string, number],
+  ].filter(([, count]) => count > 0)
+  const semanticReferenceTotal = semanticReferenceKinds.reduce((total, [, count]) => total + count, 0)
+  const selectionKey = `${file.workspace}\0${file.name}`
+  const isSelected = selectedOutputKeys.includes(selectionKey)
 
   const multiClipInfo = params?.multi_clip_info as { group_id: string; index: number; total: number } | undefined
   const groupId = multiClipInfo?.group_id
@@ -239,6 +304,62 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
     }
   }
 
+  const copyText = async (value: string) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value)
+      return
+    }
+    const area = document.createElement('textarea')
+    area.value = value
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    document.execCommand('copy')
+    document.body.removeChild(area)
+  }
+
+  const handleShare = async () => {
+    if (sharing) return
+    if (!shareUrl && (file.private || file.explicit) && !window.confirm(
+      "Anyone with this high-entropy link can view this one output without the project password. Creating the link does not change the output's Private preview flag. Continue?",
+    )) return
+    setSharing(true)
+    setShareMessage('')
+    try {
+      let url = shareUrl
+      let publicOrigin = true
+      if (!url) {
+        const result = await createOutputShare(file.name, file.workspace, file.revision)
+        publicOrigin = result.configured_public_origin
+        url = result.public_url || new URL(result.share_path, window.location.origin).toString()
+        setShareUrl(url)
+      }
+      await copyText(url)
+      setShareMessage(publicOrigin || !accessContext?.cloudflare_enabled
+        ? 'Share link copied'
+        : 'Link copied from this local address; it also works through your Cloudflare address. Configure a public share address in Maestro for one-click links.')
+    } catch (error) {
+      setShareMessage(error instanceof Error ? error.message : 'Could not create share link')
+    } finally {
+      setSharing(false)
+    }
+  }
+
+  const handleRevokeShare = async () => {
+    if (sharing) return
+    setSharing(true)
+    try {
+      await revokeOutputShare(file.name, file.workspace)
+      setShareUrl('')
+      setShareMessage('Share link revoked')
+    } catch (error) {
+      setShareMessage(error instanceof Error ? error.message : 'Could not revoke share link')
+    } finally {
+      setSharing(false)
+    }
+  }
+
   const handleDelete = async () => {
     if (!confirmRef.current) {
       confirmRef.current = true
@@ -259,9 +380,36 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
       videoRef.current.removeAttribute('src')
       videoRef.current.load()
     }
-    setSelectedOutput(index)
-    // Small delay to let the browser release the file handle
-    setTimeout(() => deleteOutput(), 200)
+    // The backend serves videos with share-delete semantics and handles any
+    // remaining lock itself. Delete immediately with the workspace captured
+    // by this item so a workspace switch cannot redirect a delayed action to
+    // a same-named output elsewhere.
+    await deleteOutput(file.name, file.workspace)
+  }
+
+  const handleComponentCleanup = async () => {
+    if (!confirmCleanup) {
+      setConfirmCleanup(true)
+      setTimeout(() => setConfirmCleanup(false), 3000)
+      return
+    }
+    setConfirmCleanup(false)
+    setCleaningComponents(true)
+    setCleanupError('')
+    try {
+      const result = await deleteOutputComponents(file.name, file.workspace)
+      if (result.failed.length) {
+        setCleanupError(
+          `${result.failed.length} linked artifact(s) could not be removed; the final output was preserved.`,
+        )
+      }
+    } catch (e) {
+      console.error('Failed to clean linked components:', e)
+      setCleanupError(e instanceof Error ? e.message : 'Component cleanup failed')
+    } finally {
+      await useStore.getState().loadOutputs()
+      setCleaningComponents(false)
+    }
   }
 
   const handleRejoin = async () => {
@@ -288,7 +436,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
     setMoving(true)
     setShowMoveMenu(false)
     try {
-      await moveOutput(file.name, targetWs)
+      await moveOutput(file.name, targetWs, file.workspace)
       // Immediately remove from local state (source may still exist during deferred cleanup)
       const store = useStore.getState()
       const filtered = store.outputs.filter(o => o.name !== file.name)
@@ -303,7 +451,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   const handleSendToInput = async () => {
     if (file.type !== 'image') return
     try {
-      const res = await fetch(getFileUrl(file.name))
+      const res = await fetch(getFileUrl(file.name, file.workspace))
       const blob = await res.blob()
       const imageFile = new File([blob], file.name, { type: blob.type || 'image/png' })
       if (generationMode === 'image') {
@@ -327,9 +475,9 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
     try {
       let video = videoRef.current
       if (!video || video.videoWidth === 0) {
-        // Preview not loaded (never hovered) — decode frame 0 offscreen.
+        // Preview has not decoded enough pixels yet — decode frame 0 offscreen.
         video = document.createElement('video')
-        video.src = getFileUrl(file.name)
+        video.src = getFileUrl(file.name, file.workspace)
         video.muted = true
         await new Promise<void>((resolve, reject) => {
           video!.onloadeddata = () => resolve()
@@ -358,7 +506,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   const handleContinueFrom = async () => {
     if (file.type !== 'video') return
     try {
-      const res = await fetch(getFileUrl(file.name))
+      const res = await fetch(getFileUrl(file.name, file.workspace))
       const blob = await res.blob()
       const videoFile = new File([blob], file.name, { type: blob.type || 'video/mp4' })
       const url = URL.createObjectURL(videoFile)
@@ -408,7 +556,24 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
       onClick={handleSelect}
     >
       {/* Media player — bg-media-canvas keeps the letterbox dark even on light themes */}
-      <div className="w-full aspect-video flex items-center justify-center bg-media-canvas relative">
+      <div className="w-full aspect-video flex items-center justify-center bg-media-canvas relative overflow-hidden">
+        {gallerySelectionMode && (
+          <label
+            className="absolute left-2 top-2 z-30 flex cursor-pointer items-center gap-1.5 rounded-full bg-black/70 px-2 py-1 text-[10px] text-white"
+            onClick={event => event.stopPropagation()}
+          >
+            <input
+              type="checkbox"
+              checked={isSelected}
+              onChange={() => toggleOutputSelection(file)}
+              className="accent-blue-500"
+            />
+            Select
+          </label>
+        )}
+        <div className={`w-full h-full flex items-center justify-center transition-[filter] duration-200 ${
+          file.private && !privateRevealed ? 'blur-2xl' : ''
+        }`} inert={file.private && !privateRevealed}>
         {file.type === 'video' ? (
           <video
             ref={videoRef}
@@ -428,7 +593,29 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
             <audio key={file.url} src={file.url} controls className="w-64" />
           </div>
         ) : (
-          <RetryImage url={file.url} alt={file.name} />
+          <RetryImage key={file.url} url={file.url} alt={file.name} />
+        )}
+        </div>
+        {file.private && !privateRevealed && (
+          <button
+            type="button"
+            onClick={(event) => { event.stopPropagation(); revealPrivatePreview() }}
+            className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/25 text-white"
+            title="Click, tap, or press Enter to reveal for this browser session"
+          >
+            <EyeOff size={24} />
+            <span className="rounded-full bg-black/60 px-3 py-1 text-[11px]">Private preview — click to reveal</span>
+          </button>
+        )}
+        {file.private && privateRevealed && (
+          <button
+            type="button"
+            onClick={(event) => { event.stopPropagation(); hidePrivatePreview() }}
+            className="absolute right-2 top-2 z-10 rounded-full bg-black/65 p-1.5 text-white/80 hover:text-white"
+            title="Blur this private preview again"
+          >
+            <EyeOff size={13} />
+          </button>
         )}
       </div>
 
@@ -466,6 +653,35 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
               {prompt && (
                 <div className="text-[11px] text-text-muted truncate mt-0.5" title={prompt}>
                   {prompt}
+                </div>
+              )}
+              {(loraProvenance.length > 0 || semanticReferenceTotal > 0) && (
+                <div className="mt-1 flex flex-wrap items-center gap-1 text-[9px]">
+                  {loraProvenance.slice(0, 2).map(lora => (
+                    <span
+                      key={`${lora.name}:${lora.weight}`}
+                      className="max-w-44 truncate rounded bg-fuchsia-500/10 px-1.5 py-0.5 text-fuchsia-200"
+                      title={`LoRA ${lora.name} · weight ${lora.weight}`}
+                    >
+                      LoRA · {lora.name} ×{lora.weight}
+                    </span>
+                  ))}
+                  {loraProvenance.length > 2 && (
+                    <span
+                      className="rounded bg-fuchsia-500/10 px-1.5 py-0.5 text-fuchsia-200"
+                      title={loraProvenance.map(lora => `${lora.name} ×${lora.weight}`).join(', ')}
+                    >
+                      +{loraProvenance.length - 2} LoRA
+                    </span>
+                  )}
+                  {semanticReferenceTotal > 0 && (
+                    <span
+                      className="rounded bg-violet-500/10 px-1.5 py-0.5 text-violet-200"
+                      title={`Semantic references: ${semanticReferenceKinds.map(([kind, count]) => `${count} ${kind}`).join(', ')}`}
+                    >
+                      Refs · {semanticReferenceKinds.map(([kind, count]) => `${count} ${kind}`).join(' · ')}
+                    </span>
+                  )}
                 </div>
               )}
             </>
@@ -568,7 +784,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
             onClick={(e) => {
               e.stopPropagation()
               const link = document.createElement('a')
-              link.href = getFileUrl(file.name)
+              link.href = getFileUrl(file.name, file.workspace)
               link.download = file.name
               document.body.appendChild(link)
               link.click()
@@ -579,6 +795,32 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
           >
             <Download size={13} />
           </button>
+          {!browsingUploads && (
+            <>
+              <button
+                onClick={(event) => { event.stopPropagation(); void handleShare() }}
+                disabled={sharing}
+                className={`p-1.5 rounded-lg transition-colors ${
+                  shareUrl
+                    ? 'text-accent-green hover:bg-bg-hover'
+                    : 'hover:bg-bg-hover text-text-secondary hover:text-accent-blue'
+                } disabled:opacity-50`}
+                title={shareUrl ? 'Copy this output’s share link again' : 'Create and copy a read-only link to only this output'}
+              >
+                {sharing ? <Loader2 size={13} className="animate-spin" /> : shareUrl ? <Check size={13} /> : <Share2 size={13} />}
+              </button>
+              {shareUrl && (
+                <button
+                  onClick={(event) => { event.stopPropagation(); void handleRevokeShare() }}
+                  disabled={sharing}
+                  className="p-1.5 rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-red-400 disabled:opacity-50"
+                  title="Revoke this output’s share link"
+                >
+                  <Link2Off size={13} />
+                </button>
+              )}
+            </>
+          )}
           {/* Move to workspace */}
           {!browsingUploads && (
           <div className="relative" ref={moveRef}>
@@ -598,7 +840,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
                   <span className="text-[9px] text-text-muted uppercase tracking-wider">Move to</span>
                 </div>
                 <div className="max-h-[150px] overflow-y-auto">
-                  {workspaces.filter(ws => ws.name !== activeWorkspace).map(ws => (
+                  {workspaces.filter(ws => ws.name !== file.workspace).map(ws => (
                     <button
                       key={ws.name}
                       onClick={() => handleMove(ws.name)}
@@ -607,13 +849,36 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
                       {ws.name}
                     </button>
                   ))}
-                  {workspaces.filter(ws => ws.name !== activeWorkspace).length === 0 && (
+                  {workspaces.filter(ws => ws.name !== file.workspace).length === 0 && (
                     <div className="px-3 py-2 text-[10px] text-text-muted">No other workspaces</div>
                   )}
                 </div>
               </div>
             )}
           </div>
+          )}
+          {!browsingUploads && (
+          file.artifact_class === 'final' && file.linked_component_count > 0 && (
+          <>
+          <button
+            onClick={(e) => { e.stopPropagation(); handleComponentCleanup() }}
+            disabled={cleaningComponents}
+            className={`px-2 py-1.5 rounded-lg transition-colors text-[10px] font-medium ${
+              confirmCleanup
+                ? 'bg-amber-500/20 text-amber-300'
+                : 'hover:bg-bg-hover text-text-secondary hover:text-amber-300'
+            }`}
+            title={confirmCleanup ? 'Click again to delete linked components' : 'Delete linked component, window, and temporary outputs'}
+          >
+            {cleaningComponents ? 'Cleaning…' : confirmCleanup ? 'Clean?' : `Clean ${file.linked_component_count}`}
+          </button>
+          {cleanupError && (
+            <span className="max-w-40 truncate text-[9px] text-red-400" title={cleanupError}>
+              Cleanup incomplete
+            </span>
+          )}
+          </>
+          )
           )}
           {!browsingUploads && (
           <button
@@ -636,11 +901,24 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
                 ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
                 : 'hover:bg-bg-hover text-text-secondary hover:text-red-400'
             }`}
-            title={confirmDelete ? 'Click again to confirm delete' : 'Delete output'}
+            title={confirmDelete
+              ? file.linked_component_count > 0
+                ? `Click again to delete this output and ${file.linked_component_count} linked parts`
+                : 'Click again to confirm delete'
+              : 'Delete output'}
           >
             <Trash2 size={13} />
-            {confirmDelete && <span className="text-[11px] font-medium">Delete?</span>}
+            {confirmDelete && (
+              <span className="text-[11px] font-medium">
+                {file.linked_component_count > 0 ? `Delete + ${file.linked_component_count}?` : 'Delete?'}
+              </span>
+            )}
           </button>
+          )}
+          {shareMessage && (
+            <span className="max-w-56 truncate text-[9px] text-text-muted" title={shareMessage}>
+              {shareMessage}
+            </span>
           )}
         </div>
       </div>

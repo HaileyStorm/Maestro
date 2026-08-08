@@ -1,13 +1,10 @@
+const { runtimeSecretEnv } = require("./launcher_secret_env")
+
 module.exports = async (kernel) => {
   let port = await kernel.port()
-  // SERVER_NAME intentionally not set — wgp.py defaults to "localhost"
-  // when SERVER_NAME isn't in the env. The classic UI is the legacy
-  // secondary surface (Gradio); we don't surface a PINOKIO_SHARE_LOCAL
-  // path here because (a) it would require patching upstream wgp.py
-  // (intrusive / conflict risk on every Wan2GP sync) and (b) the
-  // canonical UI is launch.py which DOES honor PINOKIO_SHARE_LOCAL
-  // properly. Users who need LAN-shared classic can use the listen
-  // flag manually via the Pinokio CLI.
+  // Keep the standalone classic surface aligned with the canonical server:
+  // loopback by default, and 0.0.0.0 only after explicit LAN opt-in. The
+  // per-app ENVIRONMENT is available through Pinokio's script template here.
   return {
     requires: {
       bundle: "ai",
@@ -19,7 +16,9 @@ module.exports = async (kernel) => {
         params: {
           venv: "env",
           env: {
-            SERVER_PORT: port
+            ...runtimeSecretEnv,
+            SERVER_PORT: port,
+            SERVER_NAME: "{{env.PINOKIO_SHARE_LOCAL === 'true' ? '0.0.0.0' : '127.0.0.1'}}"
           },
           path: "app",
           message: [
@@ -34,7 +33,8 @@ module.exports = async (kernel) => {
       {
         method: "local.set",
         params: {
-          url: "{{input.event[1]}}"
+          url: "{{input.event[1]}}",
+          sharing: "{{env.PINOKIO_SHARE_CLOUDFLARE === 'true' ? 'Cloudflare sharing enabled' : (env.PINOKIO_SHARE_LOCAL === 'true' ? 'LAN sharing enabled' : 'Localhost only')}}"
         }
       }
     ]

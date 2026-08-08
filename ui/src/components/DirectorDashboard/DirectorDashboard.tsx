@@ -20,7 +20,7 @@ class DashboardErrorBoundary extends Component<{ children: ReactNode }, { error:
     if (this.state.error) {
       return (
         <div className="p-4 text-center">
-          <p className="text-red-400 text-sm mb-2">Dashboard render error: {this.state.error}</p>
+          <p className="text-red-400 text-sm mb-2">This panel couldn&apos;t be displayed. Try again.</p>
           <button onClick={() => this.setState({ error: null })}
             className="text-xs text-accent-blue hover:underline">Try again</button>
         </div>
@@ -89,12 +89,12 @@ function LlmPassView({ pass: p, index }: { pass: { pass: string; system_prompt: 
 
   return (
     <div className="border border-border rounded p-2 space-y-1.5">
-      <div className="text-[10px] font-medium text-text-primary">Pass {index + 1}: {label}</div>
+      <div className="text-[10px] font-medium text-text-primary">Step {index + 1}: {label}</div>
 
       <button onClick={() => setShowSystem(!showSystem)}
         className="flex items-center gap-1 text-[9px] text-text-secondary hover:text-text-primary w-full text-left">
         {showSystem ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-        System Prompt ({p.system_prompt?.length || 0} chars)
+        Planner instructions
       </button>
       {showSystem && (
         <pre className="text-[8px] text-text-muted bg-bg-tertiary rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono">
@@ -111,7 +111,7 @@ function LlmPassView({ pass: p, index }: { pass: { pass: string; system_prompt: 
           <button onClick={() => setShowUser(!showUser)}
             className="flex items-center gap-1 text-[9px] text-text-secondary hover:text-text-primary w-full text-left">
             {showUser ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-            User Prompt ({p.user_prompt?.length || 0} chars)
+            Your prompt
           </button>
           {showUser && (
             <pre className="text-[8px] text-text-muted bg-bg-tertiary rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono">
@@ -126,7 +126,7 @@ function LlmPassView({ pass: p, index }: { pass: { pass: string; system_prompt: 
           <button onClick={() => setShowThinking(!showThinking)}
             className="flex items-center gap-1 text-[9px] text-indicator-warning hover:text-indicator-warning/80 w-full text-left">
             {showThinking ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-            <Sparkles size={8} /> Thinking ({p.thinking_text.length} chars)
+            <Sparkles size={8} /> Model reasoning
           </button>
           {showThinking && (
             <pre className="text-[8px] text-text-muted bg-bg-tertiary rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono">
@@ -139,7 +139,7 @@ function LlmPassView({ pass: p, index }: { pass: { pass: string; system_prompt: 
       <button onClick={() => setShowResponse(!showResponse)}
         className="flex items-center gap-1 text-[9px] text-text-secondary hover:text-text-primary w-full text-left">
         {showResponse ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-        Response ({p.response_text?.length || 0} chars)
+        Planner result
       </button>
       {showResponse && (
         <pre className="text-[8px] text-text-muted bg-bg-tertiary rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono">
@@ -152,9 +152,9 @@ function LlmPassView({ pass: p, index }: { pass: { pass: string; system_prompt: 
 
 function LlmLogPanel({ pipeline }: { pipeline: SavedPipelineState }) {
   const log = pipeline.llm_log
-  if (!log) return <p className="text-xs text-text-muted italic">No LLM log captured</p>
+  if (!log) return <p className="text-xs text-text-muted italic">No planning details available</p>
 
-  const passes = (log as any).passes as Array<{ pass: string; system_prompt: string; user_prompt?: string; response_text: string; thinking_text?: string | null }> | undefined
+  const passes = log.passes
 
   return (
     <div className="space-y-2">
@@ -259,7 +259,7 @@ function ClipCard({ clip, pipeline, busy = false, onTag, onRerunImage, onRerunVi
           {/* Thumbnail */}
           <div className="w-20 h-20 shrink-0 rounded overflow-hidden bg-bg-tertiary border border-border">
             {clip.start_image_filename ? (
-              <img src={getFileUrl(clip.start_image_filename)} alt={`Shot ${clip.index + 1}`}
+              <img src={getFileUrl(clip.start_image_filename, pipeline.workspace)} alt={`Shot ${clip.index + 1}`}
                 className="w-full h-full object-cover" loading="lazy" />
             ) : clip.video_filename ? (
               <video
@@ -321,7 +321,7 @@ function ClipCard({ clip, pipeline, busy = false, onTag, onRerunImage, onRerunVi
             <div className="flex gap-1.5 overflow-x-auto">
               {clip.keyframe_filenames?.map((kf, ki) => (
                 <div key={ki} className="shrink-0">
-                  <img src={getFileUrl(kf)} alt={`KF ${ki + 1}`}
+                  <img src={getFileUrl(kf, pipeline.workspace)} alt={`KF ${ki + 1}`}
                     className="w-14 h-14 object-cover rounded border border-border" loading="lazy" />
                   {clip.keyframe_prompts?.[ki] && (
                     <p className="text-[8px] text-text-muted mt-0.5 w-14 truncate" title={safeStr(clip.keyframe_prompts[ki])}>
@@ -597,6 +597,7 @@ function DirectorDashboardInner() {
   const pipelineTerminal = !!selectedPipeline && [
     'completed', 'failed', 'crashed', 'cancelled',
   ].includes(selectedPipeline.status)
+  const canResumeRecovery = selectedPipeline?.recovery_actions?.includes('resume') === true
   const showRepairAction = hasMissing || repairActive || repairRetryable || pipelineTerminal
 
   const generateMissing = async () => {
@@ -647,7 +648,16 @@ function DirectorDashboardInner() {
             <span className="text-text-muted">
               / {totalClips} clips
             </span>
-            {(selectedPipeline.status === 'crashed' || selectedPipeline.status === 'failed') && (
+            {selectedPipeline.recovery_reason_text && (
+              <span
+                className="flex items-center gap-1 px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-indicator-warning"
+                title={selectedPipeline.recovery_reason_text}
+              >
+                <AlertTriangle size={10} />
+                {selectedPipeline.recovery_reason_text}
+              </span>
+            )}
+            {canResumeRecovery && (
               <button
                 onClick={async () => {
                   if (!selectedPipeline) return
@@ -662,7 +672,7 @@ function DirectorDashboardInner() {
                 }}
                 disabled={resuming || loading || repairBusy}
                 className="flex items-center gap-1 px-2 py-1 text-[10px] bg-green-500/10 border border-green-500/30 rounded text-indicator-success hover:bg-green-500/20 disabled:opacity-40 transition-colors"
-                title="Re-run this pipeline from where it crashed — reuses the planning and start images that already completed"
+                title="Resume this recovered Director pipeline after restoring its authorized project access"
               >
                 <Play size={10} />
                 {resuming ? 'Resuming…' : 'Resume'}
@@ -723,7 +733,7 @@ function DirectorDashboardInner() {
             {repair?.status === 'completed' && (
               repair.result_filename ? (
                 <a
-                  href={getFileUrl(repair.result_filename)}
+                  href={getFileUrl(repair.result_filename, selectedPipeline.workspace)}
                   target="_blank"
                   rel="noreferrer"
                   className="flex items-center gap-1 px-2 py-1 text-[10px] bg-green-500/10 border border-green-500/30 rounded text-indicator-success hover:bg-green-500/20 transition-colors"
@@ -842,7 +852,7 @@ function DirectorDashboardInner() {
 
             {/* LLM Log */}
             <div className="bg-bg-secondary rounded-lg border border-border p-3">
-              <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium mb-2">LLM Planning Log</h3>
+              <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium mb-2">Planning details</h3>
               <LlmLogPanel pipeline={selectedPipeline} />
             </div>
 

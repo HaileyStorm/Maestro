@@ -20,7 +20,6 @@ from typing import Any
 
 ROLLING_WINDOW = "rolling_window"
 BOUNDED_START_END = "bounded_start_end"
-OMNI_REFERENCE = "omni_reference"
 
 DIRECTOR_VIDEO_EXECUTION_PROFILE_VERSION = 1
 
@@ -129,7 +128,6 @@ def _recommended_director_h3_profile(
     except (TypeError, ValueError):
         total_vram_gb = 0.0
 
-    full_checkpoint = bool(model_def.get("minimax_h3_full_checkpoint", False))
     policy = (
         model_def.get("director_memory_policy")
         or model_def.get("sliding_window_memory_policy")
@@ -144,7 +142,6 @@ def _recommended_director_h3_profile(
             "gpu_vram_gb": total_vram_gb,
             "resolution": normalized_resolution,
             "pixels": pixels,
-            "checkpoint": "full" if full_checkpoint else "pruned",
         }
 
     for band in policy.get("resolution_bands") or []:
@@ -162,7 +159,6 @@ def _recommended_director_h3_profile(
                     "gpu_vram_gb": total_vram_gb,
                     "resolution": normalized_resolution,
                     "pixels": pixels,
-                    "checkpoint": "full" if full_checkpoint else "pruned",
                 }
         break
     return {
@@ -172,7 +168,6 @@ def _recommended_director_h3_profile(
         "gpu_vram_gb": total_vram_gb,
         "resolution": normalized_resolution,
         "pixels": pixels,
-        "checkpoint": "full" if full_checkpoint else "pruned",
     }
 
 
@@ -201,13 +196,13 @@ def build_director_video_execution_profile(
     model_def = dict(model_def or {})
     video_params = dict(video_params or {})
     hardware = dict(hardware or {})
-    strategy = video_strategy(model_def)
     architecture = str(
         model_def.get("architecture")
         or model_def.get("base_model_type")
         or model_type
         or ""
     )
+    strategy = video_strategy(model_def, architecture=architecture)
     architecture_lower = architecture.lower()
     model_type_lower = str(model_type or "").lower()
     is_h3 = (
@@ -243,8 +238,6 @@ def build_director_video_execution_profile(
     normalized_resolution = requested_resolution
     recommendation: dict[str, Any] | None = None
     recommended_maximum = architectural_maximum
-    checkpoint = "full" if model_def.get("minimax_h3_full_checkpoint") else "pruned"
-
     if is_h3:
         recommendation = _recommended_director_h3_profile(
             hardware.get("gpu_vram_gb", 0.0),
@@ -315,9 +308,7 @@ def build_director_video_execution_profile(
         "model_type": str(model_type or ""),
         "architecture": architecture,
         "video_strategy": strategy,
-        "checkpoint": checkpoint if is_h3 else None,
         "is_minimax_h3": is_h3,
-        "omni_reference": strategy == OMNI_REFERENCE,
         "requested_resolution": requested_resolution,
         "normalized_resolution": normalized_resolution,
         "resolution_preset": str(resolution_preset or ""),
@@ -340,10 +331,6 @@ def build_director_video_execution_profile(
         ),
         "fallback_resolution": (
             (recommendation or {}).get("fallback_resolution")
-        ),
-        "turbo_mode": bool(video_params.get("minimax_h3_turbo_mode")),
-        "activated_lora_count": len(
-            video_params.get("activated_loras") or []
         ),
     }
 
@@ -571,13 +558,27 @@ def apply_independent_shot_context(
     return plans
 
 
-def video_strategy(model_def: Mapping[str, Any] | None) -> str:
+def video_strategy(
+    model_def: Mapping[str, Any] | None,
+    *,
+    architecture: str = "",
+) -> str:
     """Return the Director rendering strategy declared by a model."""
 
     if not isinstance(model_def, Mapping):
         return ROLLING_WINDOW
+    architecture = str(
+        architecture
+        or model_def.get("architecture")
+        or model_def.get("base_model_type")
+        or ""
+    ).lower()
+    if architecture.startswith("minimax_h3"):
+        return BOUNDED_START_END
+    if architecture.startswith("ltx2"):
+        return ROLLING_WINDOW
     explicit = str(model_def.get("director_video_strategy") or "").strip()
-    if explicit in {ROLLING_WINDOW, BOUNDED_START_END, OMNI_REFERENCE}:
+    if explicit in {ROLLING_WINDOW, BOUNDED_START_END}:
         return explicit
     return ROLLING_WINDOW
 

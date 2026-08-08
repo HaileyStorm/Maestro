@@ -51,6 +51,34 @@ _STORE_PATH = os.path.join(_ROOT, "ui", "src", "stores", "useStore.ts")
 _INPUTS_PATH = os.path.join(
     _ROOT, "ui", "src", "components", "Sidebar", "InputsPanel.tsx",
 )
+_ADVANCED_SETTINGS_PATH = os.path.join(
+    _ROOT, "ui", "src", "components", "Sidebar", "AdvancedSettings.tsx",
+)
+_SIDEBAR_PATH = os.path.join(
+    _ROOT, "ui", "src", "components", "Sidebar", "Sidebar.tsx",
+)
+_DURATION_SLIDER_PATH = os.path.join(
+    _ROOT, "ui", "src", "components", "Sidebar", "DurationSlider.tsx",
+)
+_H3_PROFILES_PATH = os.path.join(
+    _ROOT,
+    "ui",
+    "src",
+    "components",
+    "Sidebar",
+    "H3PerformanceProfiles.tsx",
+)
+_RESOLUTION_PRESETS_PATH = os.path.join(
+    _ROOT,
+    "ui",
+    "src",
+    "components",
+    "Sidebar",
+    "ResolutionPresets.tsx",
+)
+_GENERATE_BUTTON_PATH = os.path.join(
+    _ROOT, "ui", "src", "components", "Sidebar", "GenerateButton.tsx",
+)
 _OUTPAINT_CONTROLS_PATH = os.path.join(
     _ROOT,
     "ui",
@@ -246,16 +274,7 @@ class TestOutpaintTimingAndWindowUI(unittest.TestCase):
                 "DurationSlider.tsx",
             )
         )
-        advanced = _read(
-            os.path.join(
-                _ROOT,
-                "ui",
-                "src",
-                "components",
-                "Sidebar",
-                "AdvancedSettings.tsx",
-            )
-        )
+        sidebar = _read(_SIDEBAR_PATH)
         self.assertIn("Math.ceil(selectedDuration) + 1", controls)
         self.assertIn("setWindowSize(nextWindow)", controls)
         self.assertIn(
@@ -265,7 +284,7 @@ class TestOutpaintTimingAndWindowUI(unittest.TestCase):
         )
         self.assertIn(
             "!isOutpaint && !modelOptions?.hide_resolution_presets",
-            advanced,
+            sidebar,
         )
 
 
@@ -2702,6 +2721,142 @@ class TestFramesControlVideoAudio(unittest.TestCase):
         self.assertIn("rawControlProcess", source)
         self.assertNotIn("supportsSoundtrack && !hasControlVid", source)
         self.assertNotIn("supportsControlVid && !hasSoundtrack", source)
+
+
+class TestStudioPrimaryInferenceSteps(unittest.TestCase):
+    def test_primary_steps_remain_visible_for_multistage_locked_models(self):
+        source = _read(_ADVANCED_SETTINGS_PATH)
+        self.assertIn("const showInferenceSteps = !isAudioOnly", source)
+        self.assertIn("'Stage 1 / Primary Steps (Fixed)'", source)
+        self.assertIn("const minimumInferenceSteps = isH3 ? 2 : 1", source)
+        self.assertIn('type="range" min={minimumInferenceSteps} max={50}', source)
+        self.assertIn("Math.max(minimumInferenceSteps, Math.min(50", source)
+        self.assertIn("Select an editable non-distilled model", source)
+        self.assertIn(
+            "disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}",
+            source,
+        )
+        self.assertNotIn(
+            "&& (isScailEdit || !modelOptions?.lock_inference_steps)",
+            source,
+        )
+
+
+class TestH3PerformanceProfileUI(unittest.TestCase):
+    def test_profiles_are_non_locking_last_selection_wins_bundles(self):
+        store = _read(_STORE_PATH)
+        profile_block = store.split(
+            "async function _applyH3ServerProfile(", 1,
+        )[1].split("const defaultParams:", 1)[0]
+        public_action = store.split(
+            "applyH3PerformanceProfile: async (id) => {", 1,
+        )[1].split("loadModelOptions: async", 1)[0]
+        self.assertIn("const seq = ++_h3ProfileApplySeq", public_action)
+        self.assertIn("_applyH3ServerProfile(profile, id, seq, get, set)", public_action)
+        self.assertIn("if (seq !== _h3ProfileApplySeq) return", profile_block)
+        self.assertIn("Promise.all([", profile_block)
+        self.assertIn("model_type: target", profile_block)
+        self.assertIn("num_inference_steps: settings.num_inference_steps", profile_block)
+        self.assertIn("resolution: settings.resolution", profile_block)
+        self.assertIn("custom_settings: { ...settings.custom_settings }", profile_block)
+        self.assertIn("activated_loras: [...settings.activated_loras]", profile_block)
+        self.assertIn("loraWeights: { ...settings.lora_weights }", profile_block)
+        self.assertIn("tea_cache: settings.tea_cache", profile_block)
+        self.assertIn("'h3_turbo_profile'", store)
+        # Profiles remain editable bundles, but choosing one that contains a
+        # mature model/LoRA must apply the same safe per-job defaults as the
+        # direct selectors.
+        self.assertIn("_modelTypeIsMature(state, target)", profile_block)
+        self.assertIn("explicitOutput: true, privateOutput: true", profile_block)
+        self.assertNotIn("nsfw_mode:", profile_block)
+
+    def test_plan_checkpoint_reconciliation_refreshes_pending_submission(self):
+        store = _read(_STORE_PATH)
+        dialog = _read(os.path.join(
+            _ROOT, "ui", "src", "components", "H3GenerationPlanDialog.tsx",
+        ))
+        self.assertIn("const reconciled = await selectModel(model)", dialog)
+        self.assertIn("_copyH3ProfileParamsIntoSubmission(", store)
+        self.assertLess(
+            store.index("_copyH3ProfileParamsIntoSubmission(", store.index("if (!decision) return")),
+            store.index("params.h3_segment_overrides = decision.segmentOverrides"),
+        )
+
+    def test_estimates_refresh_for_all_material_profile_inputs(self):
+        component = _read(_H3_PROFILES_PATH)
+        store = _read(_STORE_PATH)
+        client = _read(_CLIENT_PATH)
+        for token in (
+            "state.params.model_type",
+            "state.params.num_inference_steps",
+            "state.params.resolution",
+            "state.params.custom_settings",
+            "state.params.activated_loras",
+            "state.durationSeconds",
+            "state.slidingWindowSeconds",
+            "state.slidingWindowOverlap",
+            "state.imageRefs.length",
+        ):
+            self.assertIn(token, component)
+        self.assertIn("window.setTimeout(() => { void refresh() }, 250)", component)
+        self.assertIn("const seq = ++_h3EstimateSeq", store)
+        self.assertIn("if (seq !== _h3EstimateSeq) return", store)
+        self.assertIn("estimateLabel(profile.estimate)", component)
+        self.assertIn("H3EstimateBadge", _read(_GENERATE_BUTTON_PATH))
+        self.assertIn("h3_estimate?: import('../types').H3PerformanceEstimate", client)
+        self.assertIn("const { job_id, h3_estimate }", store)
+        self.assertIn("h3Estimate: submittedEstimate", store)
+        self.assertIn("_h3EstimateTotalSeconds(submittedEstimate)", store)
+        self.assertIn("previous?.etaSeconds", store)
+
+    def test_estimate_failure_disables_stale_profiles_and_load_is_separate(self):
+        component = _read(_H3_PROFILES_PATH)
+        store = _read(_STORE_PATH)
+        estimate_catch = store.split(
+            "refreshH3PerformanceEstimates: async () => {", 1,
+        )[1].split("applyH3PerformanceProfile: async", 1)[0]
+        self.assertIn("h3PerformanceProfiles: []", estimate_catch)
+        self.assertIn("h3CurrentEstimate: null", estimate_catch)
+        self.assertIn("h3SelectedProfile: 'custom'", estimate_catch)
+        self.assertIn("modelLoadSuffix", component)
+        self.assertIn("model_load_seconds", component)
+        self.assertIn("model/adapter download", component)
+        self.assertIn("profile.estimate", component)
+
+    def test_h3_benchmark_collection_is_continuous_not_checkbox_gated(self):
+        advanced = _read(_ADVANCED_SETTINGS_PATH)
+        store = _read(_STORE_PATH)
+        self.assertNotIn("h3_benchmark_capture", advanced)
+        self.assertNotIn("h3_benchmark_capture", store)
+        self.assertIn("continuously refine privacy-safe timing estimates", advanced)
+
+    def test_resolution_is_main_and_h3_uses_native_canvases(self):
+        sidebar = _read(_SIDEBAR_PATH)
+        advanced = _read(_ADVANCED_SETTINGS_PATH)
+        duration = _read(_DURATION_SLIDER_PATH)
+        resolution = _read(_RESOLUTION_PRESETS_PATH)
+        self.assertIn("<H3PerformanceProfiles />", sidebar)
+        self.assertLess(
+            sidebar.index("<H3PerformanceProfiles />"),
+            sidebar.index("<DurationSlider />"),
+        )
+        self.assertIn("<ResolutionPresets />", sidebar)
+        self.assertIn("!isOutpaint && !modelOptions?.hide_resolution_presets", sidebar)
+        self.assertNotIn("<ResolutionPresets />", advanced)
+        self.assertNotIn("<AspectRatioGrid />", advanced)
+        self.assertNotIn("'Inference steps'", duration)
+        self.assertIn("'Inference Steps'", advanced)
+        self.assertIn("const nativeResolutions = h3OptionsReady ? (modelOptions?.resolutions || []) : []", resolution)
+        self.assertIn("exact H3-native canvas", resolution)
+        self.assertIn("setH3NativeResolution(event.target.value)", resolution)
+        store = _read(_STORE_PATH)
+        native_resolution = store.split(
+            "setH3NativeResolution: (resolution) => {", 1,
+        )[1].split("settingsOpen:", 1)[0]
+        self.assertIn("delivery_resolution: undefined", native_resolution)
+        self.assertIn("delivery_fit: undefined", native_resolution)
+        self.assertIn("spatialUpsampling: ''", native_resolution)
+        self.assertIn("h3SelectedProfile: 'custom'", native_resolution)
 
 
 if __name__ == "__main__":

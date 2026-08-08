@@ -133,7 +133,7 @@ export function InpaintControls() {
           <div className="space-y-1">
             <p className="font-medium text-text-primary">Inpaint requires SAM 3.1 (not installed)</p>
             <p className="text-text-secondary">
-              {samStatusError || "Open the Pinokio menu and click 'Install Inpaint Support (SAM 3.1)' to enable inpainting. ~5 min one-time setup."}
+              {samStatusError || "Open the Pinokio menu and click 'Install Inpaint Support (SAM 3.1)' to enable inpainting. Complete setup on this host before using Inpaint."}
             </p>
           </div>
         </div>

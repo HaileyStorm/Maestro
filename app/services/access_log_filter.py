@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 
 
-# These endpoints are read-only UI heartbeats/status feeds. Successful polls
-# add no diagnostic value and can fire multiple times per second. Their errors
-# remain visible because QuietPollingAccessFilter only drops status < 400.
+# Poll inventory adapted from official Maestro v1.6.5 commit
+# d500f58e0c2be948800c757fd106c5254c70b605. Local access, share, and
+# capability routes remain visible even if a future poll pattern overlaps them.
 QUIET_POLL_PATHS = frozenset(
     {
         "/health",
@@ -31,9 +31,36 @@ QUIET_POLL_PREFIXES = (
     "/api/v1/status/",
 )
 
+_ALWAYS_VISIBLE_PATHS = frozenset(
+    {
+        "/api/v1/access-context",
+        "/api/v1/output-shares",
+        "/api/v1/workspaces",
+    }
+)
+
+_ALWAYS_VISIBLE_PREFIXES = (
+    "/api/v1/access-context/",
+    "/api/v1/jobs/",
+    "/api/v1/output-shares/",
+    "/api/v1/workspaces/",
+    "/share/",
+)
+
+
+def _normalized_path(path: str) -> str:
+    return path.split("?", 1)[0]
+
+
+def _is_always_visible_path(path: str) -> bool:
+    normalized = _normalized_path(path)
+    return normalized in _ALWAYS_VISIBLE_PATHS or any(
+        normalized.startswith(prefix) for prefix in _ALWAYS_VISIBLE_PREFIXES
+    )
+
 
 def _is_quiet_poll_path(path: str) -> bool:
-    normalized = str(path or "").split("?", 1)[0]
+    normalized = _normalized_path(path)
     return normalized in QUIET_POLL_PATHS or any(
         normalized.startswith(prefix) for prefix in QUIET_POLL_PREFIXES
     )
@@ -43,20 +70,29 @@ class QuietPollingAccessFilter(logging.Filter):
     """Drop only successful read-only polls from Uvicorn's access logger."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        # Uvicorn access records use:
+        # Uvicorn access records use exactly:
         # (client_addr, method, full_path, http_version, status_code).
         args = record.args
-        if not isinstance(args, tuple) or len(args) < 5:
+        if not isinstance(args, tuple) or len(args) != 5:
             return True
 
-        method = str(args[1]).upper()
-        path = str(args[2])
-        try:
-            status_code = int(args[4])
-        except (TypeError, ValueError):
+        client_addr, method, path, http_version, status_code = args
+        if (
+            not isinstance(client_addr, str)
+            or not isinstance(method, str)
+            or not isinstance(path, str)
+            or not isinstance(http_version, str)
+            or not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+        ):
             return True
 
-        if method not in {"GET", "HEAD"} or status_code >= 400:
+        if (
+            method.upper() not in {"GET", "HEAD"}
+            or status_code < 200
+            or status_code >= 400
+            or _is_always_visible_path(path)
+        ):
             return True
         return not _is_quiet_poll_path(path)
 

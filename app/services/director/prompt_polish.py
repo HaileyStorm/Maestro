@@ -1073,6 +1073,10 @@ def get_video_guide(video_model: str, mode: str = "full") -> str:
         guide = _load_file(os.path.join(_ENHANCE_DIR, f"{base}.md"))
     else:
         guide = _load_file(os.path.join(_DIALECT_DIR, f"{base}.md"))
+        # A model-specific full guide is safer than silently dropping all
+        # dialect rules when a newer target has no condensed guide yet.
+        if not guide:
+            guide = _load_file(os.path.join(_ENHANCE_DIR, f"{base}.md"))
     if guide:
         print(f"[PromptPolish] Loaded {mode} video guide: {base}.md")
     return guide or ""
@@ -1224,12 +1228,7 @@ def build_polish_block(video_model: str, image_model: str, mode: str,
 
 
 def should_polish_director_video_prompts(video_model: str) -> bool:
-    """Return whether Director should creatively rewrite video prompts."""
-
-    # MiniMax H3 has a dedicated native planner and a deterministic final
-    # compiler. A second creative rewrite adds drift without adding a missing
-    # model dialect. Image prompts remain a separate decision because they are
-    # consumed by the selected image model, not H3 itself.
+    """Return whether Director may creatively rewrite video prompts."""
     return not str(video_model or "").lower().startswith("minimax_h3")
 
 
@@ -1272,65 +1271,21 @@ def polish_prompts_third_pass(
             for the polish system prompt. Without this, the polish LLM
             substitutes generic descriptors like "the woman" for unrecognized
             names — catastrophic when the named character is e.g. a unicorn.
-        preserve_video_character_names: Keep proper names already present in
-            video prompts. Used by H3 prompt-only/direct-reference workflows,
-            where a trained identity such as ``Dwight from The Office`` is
-            meaningful conditioning rather than an opaque image-model label.
-            Image and keyframe prompts still use visible descriptions.
-        polish_video_prompts: Whether to send video prompts through the
-            creative enhance LLM. ``None`` selects the model-aware default:
-            MiniMax H3 keeps its native Pass 2 video prompts unchanged, while
-            other architectures retain third-pass video polishing.
-        polish_image_prompts: Whether to spend LLM calls polishing image and
-            keyframe prompts. Prompt-only/direct-reference H3 projects retain
-            the planner's visual notes for the Dashboard but do not generate
-            those artifacts, so polishing them is unnecessary.
 
     Returns:
         clip_plans with polished prompts (modified in-place).
     """
-    if polish_video_prompts is None:
-        polish_video_prompts = should_polish_director_video_prompts(
-            video_model
-        )
-
-    if not polish_video_prompts and not polish_image_prompts:
-        print(
-            "[PromptPolish] Model-aware routing skipped third-pass LLM "
-            "polish; native MiniMax H3 video prompts and unused image "
-            "prompts were left unchanged."
-        )
-        return clip_plans
-
-    total = sum(
-        1
-        for plan in clip_plans
-        if (
-            polish_video_prompts
-            and (plan.get("video_prompt") or plan.get("window_prompts"))
-        )
-        or (
-            polish_image_prompts
-            and (plan.get("image_prompt") or plan.get("keyframe_prompts"))
-        )
-    )
-    if total == 0:
-        print(
-            "[PromptPolish] Model-aware routing found no eligible prompts "
-            "for third-pass LLM polish."
-        )
-        return clip_plans
-
     from services import llm_service
 
-    polished = 0
-
-    if not polish_video_prompts:
-        print(
-            "[PromptPolish] Model-aware routing preserved native MiniMax H3 "
-            "video prompts; only generated image/keyframe prompts are "
-            "eligible for third-pass polish."
+    if polish_video_prompts is None:
+        polish_video_prompts = should_polish_director_video_prompts(
+            video_model,
         )
+    if not polish_video_prompts and not polish_image_prompts:
+        return clip_plans
+
+    total = sum(1 for p in clip_plans if p.get("video_prompt") or p.get("image_prompt"))
+    polished = 0
 
     # ── Per-shot character context ─────────────────────────────────────
     # The character mapping is built PER SHOT, not globally, because the
@@ -1637,9 +1592,10 @@ def polish_prompts_third_pass(
             pass
         return ""
 
+    _is_h3_video = (video_model or "").lower().startswith("minimax_h3")
     video_lora_hints = (
-        _build_lora_hints(video_loras or [], video_model)
-        if polish_video_prompts else ""
+        "" if _is_h3_video
+        else _build_lora_hints(video_loras or [], video_model)
     )
     image_lora_hints = _build_lora_hints(image_loras or [], image_model)
 
@@ -1742,41 +1698,6 @@ def polish_prompts_third_pass(
         "your output must come from the INPUT prompt — if something is "
         "not in the input, it does not appear in the output.\n\n"
     )
-    if preserve_video_character_names:
-        _video_name_job_rule = (
-            "- Preserve every proper character/person name, series, film, and "
-            "franchise already present in the input exactly as written; keep "
-            "useful visible traits alongside the named identity\n\n"
-        )
-        _video_name_do_not_rules = (
-            "- Replace or generalize a proper name already in the input (for "
-            "example, keep 'Dwight from The Office' rather than reducing it "
-            "to 'the man')\n"
-            "- Invent a character name, series, film, or franchise that is not "
-            "already in the input\n"
-        )
-        _video_scene_rule = (
-            "- Remove setting, appearance, or continuity details already in "
-            "the input — H3 may need to construct the shot without a fixed "
-            "start image\n"
-        )
-    else:
-        _video_name_job_rule = (
-            "- In narrative prose ONLY: when a character name listed in the "
-            "CHARACTER NAME REPLACEMENT block below appears in the input, "
-            "replace it with the matching descriptor; never substitute a "
-            "generic 'the woman' / 'the man' for a non-human character\n\n"
-        )
-        _video_name_do_not_rules = (
-            "- Invent character names that aren't in the input or in the mapping block\n"
-            "- Replace a descriptor like 'the tall man in a red jacket' with "
-            "a name like 'Blaine' (the mapping arrow is one-way: name → "
-            "descriptor, NEVER reverse)\n"
-        )
-        _video_scene_rule = (
-            "- Re-describe the setting — a start image already shows the scene to the video model\n"
-        )
-
     _video_system_base = (
         "You are refining an already-detailed video prompt for the generation model. "
         "The prompt was written by a Director AI and is already complete.\n\n"
@@ -1787,14 +1708,15 @@ def polish_prompts_third_pass(
         "- Align the prompt structure to the model's expected format (present tense, flowing paragraph)\n"
         + _video_lora_line +
         "- Fix any awkward phrasing or redundancy in NARRATIVE PROSE ONLY (never inside quotes)\n"
-        + _video_name_job_rule +
+        "- In narrative prose ONLY: when a character name listed in the CHARACTER NAME REPLACEMENT block below appears in the input, replace it with the matching descriptor; never substitute a generic 'the woman' / 'the man' for a non-human character\n\n"
         "DO NOT:\n"
         "- Modify any text inside single or double quotes — dialogue is preserved verbatim\n"
         "- Replace character names INSIDE quoted dialogue with descriptors\n"
-        + _video_name_do_not_rules +
+        "- Invent character names that aren't in the input or in the mapping block\n"
+        "- Replace a descriptor like 'the tall man in a red jacket' with a name like 'Blaine' (the mapping arrow is one-way: name → descriptor, NEVER reverse)\n"
         "- Replace pronouns (he/she/they/his/her/their/him/her/them) with names or descriptors — pronouns stay as pronouns\n"
         "- Add scene details (lighting, colors, atmosphere, clothing) that aren't in the original\n"
-        + _video_scene_rule +
+        "- Re-describe the setting — a start image already shows the scene to the video model\n"
         "- Make the prompt longer — keep it the same length or shorter\n"
         "- Invent actions, dialogue, or camera movements not in the original\n"
         "- Add style tags, emphasis phrases, or mood descriptions the original didn't have (no 'ultra-detailed', 'cinematic intensity', 'dramatic close-up', 'extreme realism')\n"
@@ -1803,7 +1725,6 @@ def polish_prompts_third_pass(
         "- Use markdown formatting of any kind. NO **bold**, NO *italics*, NO headers, NO code blocks. Plain text only.\n\n"
         "Output ONLY the refined prompt. No explanation, no labels."
     )
-
     _image_system_base = (
         "You are refining an already-detailed image prompt for the generation model. "
         "The prompt was written by a Director AI and is already complete. "
@@ -1885,20 +1806,6 @@ def polish_prompts_third_pass(
         r"(?<![A-Za-z])'(.*?)'(?![A-Za-z])",
         _re.DOTALL,
     )
-    _H3_DIALOGUE_TAG_RE = _re.compile(
-        r"<d>.*?</d>", _re.IGNORECASE | _re.DOTALL,
-    )
-    _H3_VOCAL_SECTION_RE = _re.compile(
-        r"\b(?:DIALOGUE AND VOCAL PERFORMANCE|"
-        r"SILENCE AND VOCAL PERFORMANCE)\s*:.*?"
-        r"(?=\b(?:FINAL BLOCKING|overall_soundscape|"
-        r"non_diegetic_music)\s*:|$)",
-        _re.IGNORECASE | _re.DOTALL,
-    )
-
-    def _normalized_vocal_section(text: str) -> str:
-        match = _H3_VOCAL_SECTION_RE.search(text or "")
-        return _re.sub(r"\s+", " ", match.group(0)).strip() if match else ""
 
     def _iter_quoted_spans(text: str):
         """Yield (quote_char, content, start, end) for every quoted span
@@ -1930,8 +1837,6 @@ def polish_prompts_third_pass(
         text: str,
         descriptor_to_name: dict[str, str],
         name_to_descriptor: dict[str, str],
-        *,
-        preserve_narrative_names: bool = False,
     ) -> tuple[str, int, int]:
         """Apply bidirectional name/descriptor normalization:
 
@@ -1973,8 +1878,6 @@ def polish_prompts_third_pass(
         def _replace_outside_quotes(seg: str) -> str:
             """Outside quotes: name → descriptor (apply rule polish missed)."""
             nonlocal replaces
-            if preserve_narrative_names:
-                return seg
             for name, desc in name_to_descriptor.items():
                 pattern = _re.compile(r"\b" + _re.escape(name) + r"\b")
                 if pattern.search(seg):
@@ -2064,7 +1967,16 @@ def polish_prompts_third_pass(
         out_parts.append(after[pos:])
         return "".join(out_parts), reverts
 
-    def _enhance_video(prompt: str, system_prompt: str, desc_to_name: dict, name_to_desc: dict) -> str:
+    def _enhance_video(
+        prompt: str, system_prompt: str, desc_to_name: dict,
+        name_to_desc: dict, duration_seconds=None,
+    ) -> str:
+        if _is_h3_video:
+            # Passes 1-2 already author the complete H3 Context-IR. Any textual
+            # rewrite can change identity, dialogue, timing, sound, or music in
+            # ways that cannot be proven semantically equivalent, so H3's third
+            # pass is deliberately a zero-cost exact passthrough.
+            return prompt
         # Storyboard format guard: when the input prompt is Format B
         # (contains "Shot N (Camera, Xs):" blocks for the IC-LoRA),
         # SKIP polish entirely. The polish LLM otherwise rewrites the
@@ -2092,15 +2004,12 @@ def polish_prompts_third_pass(
             nsfw=nsfw, model_type=video_model,
             system_override=system_prompt,
             lora_system_hint=video_lora_hints,
+            duration_seconds=duration_seconds,
+            preserve_global_timeline=_is_h3_video,
         )
         if out:
             cleaned = _strip_markdown(out)
-            cleaned, reverts, replaces = _normalize_names_descriptors(
-                cleaned,
-                desc_to_name,
-                name_to_desc,
-                preserve_narrative_names=preserve_video_character_names,
-            )
+            cleaned, reverts, replaces = _normalize_names_descriptors(cleaned, desc_to_name, name_to_desc)
             if reverts:
                 print(f"[PromptPolish] Reverted {reverts} dialogue substitution(s) — polish put known descriptors inside quoted dialogue")
             if replaces:
@@ -2139,27 +2048,6 @@ def polish_prompts_third_pass(
             cleaned, art_pron = _collapse_article_pronoun(cleaned)
             if art_pron:
                 print(f"[PromptPolish] Collapsed {art_pron} article+pronoun pair(s)")
-            # H3 native-audio prompts must never lose or rewrite their exact
-            # speech contract during stylistic polish.  If the enhancer drops
-            # a <d> line, changes its words/order, or removes the explicit
-            # silence guard, retain the complete pre-polish prompt instead of
-            # sending H3 an underspecified scene that produces gibberish.
-            before_tags = _H3_DIALOGUE_TAG_RE.findall(prompt)
-            after_tags = _H3_DIALOGUE_TAG_RE.findall(cleaned)
-            before_vocal = _normalized_vocal_section(prompt)
-            after_vocal = _normalized_vocal_section(cleaned)
-            if before_tags != after_tags:
-                print(
-                    "[PromptPolish] Rejected video polish because it changed "
-                    "MiniMax H3 tagged dialogue; preserving the exact Pass 2 prompt."
-                )
-                return prompt
-            if before_vocal and before_vocal != after_vocal:
-                print(
-                    "[PromptPolish] Rejected video polish because it changed "
-                    "the MiniMax H3 vocal/silence contract; preserving Pass 2."
-                )
-                return prompt
             return cleaned
         return out
 
@@ -2317,8 +2205,6 @@ def polish_prompts_third_pass(
         # polish LLM saw "Blaine → strong man in black" in the system
         # prompt and inserted "Blaine" into output that had no name.
         def _build_video_system_for(text: str) -> str:
-            if preserve_video_character_names:
-                return _video_system_base
             return _video_system_base + _build_filtered_char_block(text, shot_name_to_desc)
 
         def _build_image_system_for(text: str) -> str:
@@ -2326,13 +2212,17 @@ def polish_prompts_third_pass(
 
         wps = plan.get("window_prompts", [])
         has_windows = bool(wps and len(wps) > 1)
+        plan_duration = plan.get("duration_sec", plan.get("duration"))
 
         # Polish video prompt (skip if window_prompts exist — video_prompt is unused)
         if polish_video_prompts and not has_windows and not polish_aborted:
             vp = plan.get("video_prompt", "")
             if vp and vp.strip():
                 try:
-                    enhanced = _enhance_video(vp, _build_video_system_for(vp), shot_desc_to_name, shot_name_to_desc)
+                    enhanced = _enhance_video(
+                        vp, _build_video_system_for(vp), shot_desc_to_name,
+                        shot_name_to_desc, plan_duration,
+                    )
                     _count_outcome(vp, enhanced)
                     if enhanced and enhanced.strip() and enhanced.strip() != vp.strip():
                         plan["video_prompt"] = enhanced.strip()
@@ -2341,8 +2231,15 @@ def polish_prompts_third_pass(
                     failed += 1
                     print(f"[PromptPolish] Video polish failed: {e}")
 
+        # Older Director plans can still carry several prompt entries. H3's
+        # Context-IR is authored as one global timeline; refining those entries
+        # independently would misrepresent each as the complete Duration and
+        # could rebase authored timing. Preserve them verbatim and let the H3
+        # long-form preparation path consume their existing global timing.
+        if has_windows and _is_h3_video:
+            plan["window_prompts"] = list(wps)
         # Polish window prompts (each with context of the other windows)
-        if polish_video_prompts and has_windows and not polish_aborted:
+        elif polish_video_prompts and has_windows and not polish_aborted:
             polished_wps = []
             for wi, wp in enumerate(wps):
                 if polish_aborted:
@@ -2385,7 +2282,10 @@ def polish_prompts_third_pass(
                             context += "Re-establish any ongoing state (crowd still cheering, rain still falling) before new action — the video model has no memory beyond the last few frames."
                         context += "]\n\n"
                         full_text = context + wp
-                        enhanced = _enhance_video(full_text, _build_video_system_for(full_text), shot_desc_to_name, shot_name_to_desc)
+                        enhanced = _enhance_video(
+                            full_text, _build_video_system_for(full_text),
+                            shot_desc_to_name, shot_name_to_desc, plan_duration,
+                        )
                         _count_outcome(wp, enhanced)
                         if enhanced and enhanced.strip() and enhanced.strip() != wp.strip():
                             polished_wps.append(enhanced.strip())

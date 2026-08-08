@@ -19,10 +19,10 @@ export interface DirectorModelCompatibility {
   supports_audio_input: boolean
   generates_audio: boolean
   supports_voice_reference: boolean
-  voice_reference_mode?: 'none' | 'id_lora' | 'native_reference'
-  video_strategy?: 'rolling_window' | 'bounded_start_end' | 'omni_reference'
-  audio_input_mode?: 'none' | 'generic_audio_guide' | 'reference_manifest'
-  reference_mode?: 'none' | 'start_frame' | 'start_end' | 'omni_manifest'
+  voice_reference_mode?: 'none' | 'id_lora'
+  video_strategy?: 'rolling_window' | 'bounded_start_end'
+  audio_input_mode?: 'none' | 'generic_audio_guide'
+  reference_mode?: 'none' | 'start_frame' | 'start_end'
   shot_image_support?: 'required' | 'optional' | 'direct_references'
   supports_endpoint_continuity?: boolean
   clip_min_frames?: number | null
@@ -57,11 +57,93 @@ export interface ModelDef {
   // store auto-adds these models to enabledModels so they appear in
   // selectors without the user having to enable each one manually.
   nsfw_only?: boolean
+  preferred_explicit_fl2va?: boolean
+  update_status?: string
 }
 
 export interface Resolution {
   label: string
   value: string
+}
+
+export type H3PerformanceProfileId = 'draft' | 'fast' | 'quality' | 'high' | '1080p_delivery' | 'ultra' | '4k_delivery'
+export type H3EstimateConfidence = 'calibrating' | 'low' | 'medium' | 'high'
+
+export interface H3PerformanceEstimate {
+  seconds: number
+  generation_seconds?: number
+  postprocess_seconds?: number
+  delivery_resolution?: string
+  postprocess_method?: string | null
+  range_seconds: { low: number; high: number }
+  confidence: H3EstimateConfidence
+  sample_count: number
+  source: string
+  model_load_seconds: number | null
+  model_load_state: 'resident' | 'cold' | 'unknown'
+  download_seconds: null
+  matched_factors: string[]
+  uncertainty_reasons: string[]
+}
+
+export interface H3PerformanceProfileSettings {
+  model_type: string
+  num_inference_steps: number
+  resolution: string
+  custom_settings: Record<string, unknown>
+  activated_loras: string[]
+  loras_multipliers: string
+  lora_weights: Record<string, number[]>
+  tea_cache?: number
+  spatial_upsampling: string
+  delivery_resolution: string
+  delivery_fit: string
+}
+
+export interface H3PerformanceProfile {
+  id: H3PerformanceProfileId
+  label: string
+  description: string
+  available: boolean
+  fallback_reason: string | null
+  /** Server-authored first higher compatible profile for an unavailable
+   *  selection. Null when this profile is already available or no safe
+   *  higher fallback exists. */
+  fallback_profile_id: H3PerformanceProfileId | null
+  download_required: boolean
+  download_components?: string[]
+  delivery_resolution?: string
+  settings: H3PerformanceProfileSettings
+  estimate: H3PerformanceEstimate
+}
+
+export interface H3EstimateRequest {
+  model_type: string
+  duration_seconds: number
+  window_seconds: number
+  window_overlap: number
+  num_inference_steps: number
+  resolution: string
+  custom_settings: Record<string, unknown>
+  activated_loras: string[]
+  loras_multipliers: string
+  tea_cache?: number
+  spatial_upsampling: string
+  delivery_resolution?: string
+  delivery_fit?: string
+  reference_shape: {
+    has_start: boolean
+    has_end: boolean
+    image_count: number
+    video_count: number
+    audio_count: number
+  }
+  explicit_output: boolean
+}
+
+export interface H3EstimateResponse {
+  current: { estimate: H3PerformanceEstimate }
+  profiles: H3PerformanceProfile[]
 }
 
 export interface GenerateParams {
@@ -84,14 +166,19 @@ export interface GenerateParams {
   multi_prompts_gen_type?: number
   sliding_window_size?: number
   sliding_window_overlap?: number
-  /** Explicitly honor a manually locked window above the model's VRAM-aware recommendation. */
-  sliding_window_memory_override?: boolean
-  /** Optional model-specific transformer step cache. */
-  skip_steps_cache_type?: '' | 'first_block'
-  /** First Block Cache residual-change threshold. */
-  skip_steps_multiplier?: number
-  /** Percentage of denoising steps to run before caching may begin. */
-  skip_steps_start_step_perc?: number
+  sliding_window_discard_last_frames?: number
+  /** Automatically choose FL2VA frame anchoring vs Ref2VA semantic/temporal
+   * continuity per H3 segment. Enabled by default for long Studio videos. */
+  h3_adaptive_conditioning?: boolean
+  /** Explicit acknowledgement required whenever the effective plan loads the
+   * separately licensed Ref2VA checkpoint. Filled from the local terms UI. */
+  h3_ref2va_terms_accepted?: boolean
+  h3_segment_overrides?: Array<{
+    model_type: 'minimax_h3' | 'minimax_h3_pinkcherry_fl2va' | 'minimax_h3_w4a8_fl2va' | 'minimax_h3_ref2va'
+    drop_semantic_refs?: boolean
+    reason?: string
+  }>
+  h3_boundary_overrides?: Array<{ type: H3SegmentBoundary['type'] }>
   guidance_phases?: number
   video_prompt_type?: string
   audio_prompt_type?: string
@@ -99,8 +186,13 @@ export interface GenerateParams {
   input_video_strength?: number
   flow_shift?: number
   audio_guide?: string
+  audio_guide2?: string
+  audio_guide3?: string
   audio_scale?: number
   video_guide?: string
+  video_guide2?: string
+  video_guide3?: string
+  force_fps?: string
   image_refs?: string[]
   frames_positions?: string
   injection_strength?: number
@@ -111,11 +203,14 @@ export interface GenerateParams {
   per_clip_frames?: number[]
   remove_background_images_ref?: number
   // TTS-specific
-  audio_guide2?: string
   duration_seconds?: number
   pause_seconds?: number
   temperature?: number
   custom_settings?: Record<string, unknown>
+  tea_cache?: number
+  spatial_upsampling?: string
+  delivery_resolution?: string
+  delivery_fit?: string
   // Loose params: backend accepts additional optional fields. Declared
   // explicitly here so TypeScript narrows JSX children correctly (an
   // index signature widens explicit fields to `unknown` in some contexts).
@@ -157,86 +252,43 @@ export interface GenerateParams {
   tts_comp_release?: number
   tts_comp_makeup?: number
   tts_voice_count?: number
-  // MiniMax H3 Ref2VA ordered Omni-reference manifest.
-  minimax_h3_references?: MiniMaxH3Reference[]
-  minimax_h3_reference_detail?: 'match' | 'max'
-  minimax_h3_text_encoder?: 'nvfp4_awq' | 'gguf_q2_k' | 'gguf_q4_k_m' | 'int8' | 'bf16'
-  /** One-click managed H3 Turbo recipe for Full or Pruned H3. */
-  minimax_h3_turbo_mode?: boolean
-  /** Automatically expand one long H3 concept into window-local prompts. */
-  minimax_h3_window_storyboard?: boolean
-  /** Compiled Context-IR prompts, one per continuation pass. */
-  h3_window_prompts?: string[]
-  h3_window_plan_signature?: string
-  h3_window_plan?: H3WindowPlan
 }
 
-export type MiniMaxH3ReferenceType = 'image' | 'video' | 'audio'
-export type MiniMaxH3AudioIntent = 'voice' | 'drive' | 'style'
-
-export interface MiniMaxH3Reference {
-  id: string
-  type: MiniMaxH3ReferenceType
-  path: string
-  filename: string
-  url?: string
-  role?: string
-  audio_intent?: MiniMaxH3AudioIntent
-  include_audio?: boolean
-  has_audio?: boolean
-  audio_path?: string
-  audio_filename?: string
-  audio_duration_seconds?: number | null
-  duration_seconds?: number | null
-}
-
-export interface H3WindowPlanWindow {
-  index: number
-  title: string
-  start_frame: number
-  end_frame: number
-  start_seconds: number
-  end_seconds: number
-  opening_state: string
-  closing_state: string
-  prompt: string
-}
-
-export interface H3WindowPlan {
-  source_prompt: string
-  signature: string
-  planned_by: 'llm' | 'deterministic_fallback' | 'not_needed'
-  total_frames: number
-  window_frames: number
-  effective_window_frames?: number
-  window_count: number
-  resolution: string
-  model_type: string
-  subject_continuity?: string
-  setting_continuity?: string
-  windows: H3WindowPlanWindow[]
-  window_prompts: string[]
-}
-
-/** OOM (out-of-VRAM) failure metadata. Set on jobs and pipelines that
- *  failed with a CUDA OutOfMemoryError. The OomRecoveryBanner watches
- *  for this on the latest failure and surfaces a "Lower VRAM headroom?"
- *  banner with a one-click permanent-fix button. Backend logic in
- *  app/services/oom_detect.py. */
+/** OOM recovery metadata returned with failed jobs and pipelines.
+ *  Generation OOMs omit `stage`; H3 delivery OOMs use path-safe fields to
+ *  identify the completed native generation and delivery recovery state. */
 export interface OomInfo {
   is_oom: true
+  /** Present for an OOM in H3 delivery after native generation completed. */
+  stage?: 'h3_delivery'
   /** The vram_safety_coefficient value in effect when the OOM happened. */
   current_coefficient: number
-  /** Suggested next-lower coefficient (current - 0.10), or null if
-   *  current is already at the 0.50 floor — at that point coefficient
-   *  can't help and the user needs a smaller model / lower resolution. */
+  /** Suggested next-lower coefficient (current - 0.10), or null when the
+   *  current coefficient is already at the 0.50 floor. */
   suggested_coefficient: number | null
   /** Truncated stringified exception for UI display (≤300 chars). */
   message: string
+  /** Validated exact-delivery target. Empty when the backend cannot safely
+   *  represent the requested target. */
+  requested_target?: string
+  /** Whether Maestro still owns a private native result for recovery. */
+  native_available?: boolean
+  /** Number of automatic identical delivery retries already attempted. */
+  retry_count?: number
+  /** Present on a failed postprocess-only recovery child. The original
+   *  source job remains the authority for refreshed recovery actions. */
+  manual_retry_count?: number
+  /** Whether a preserved native result makes the failure recoverable. */
+  recoverable?: boolean
+  /** Path-free backend recovery facts/capabilities. Unknown values must not
+   *  be rendered as user actions. */
+  actions?: string[]
 }
 
 export interface GenerationJob {
   id: string
+  /** Server creation time in epoch seconds when known. */
+  createdAt?: number
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   progress: number
   step: number
@@ -245,10 +297,91 @@ export interface GenerationJob {
   message: string
   outputFiles: string[]
   error: string | null
-  /** Present only on failed jobs that look like CUDA OOMs (see OomInfo). */
+  /** Present on failed generation or delivery jobs that ran out of VRAM. */
   oomInfo?: OomInfo | null
-  /** Exact prompts assigned to an in-flight H3 sliding-window generation. */
-  h3WindowPlan?: H3WindowPlan | null
+  promptPreview?: string
+  activeWindowPrompt?: string
+  modelType?: string
+  generationMode?: string
+  workspace?: string
+  windowCurrent?: number
+  windowTotal?: number
+  windowStep?: number
+  windowTotalSteps?: number
+  windowProgress?: number
+  overallProgress?: number
+  /** True when the active named phase has no truthful numeric denominator. */
+  progressIndeterminate?: boolean
+  queueWaitReason?: import('../api/client').QueueWaitReason | null
+  h3SegmentPlan?: H3SegmentPlan | null
+  currentSegmentModel?: string
+  currentSegmentReason?: string
+  currentSegmentBoundary?: H3SegmentBoundary | null
+  etaSeconds?: number | null
+  subtaskEtaSeconds?: number | null
+  /** Frozen privacy-safe estimate returned at submission/status time. Kept
+   *  until live step timing provides a more precise ETA. */
+  h3Estimate?: H3PerformanceEstimate | null
+  /** Generic restart recovery is intentionally separate from delivery-only
+   *  H3 OOM recovery. These values are bounded, path-free server facts. */
+  recoveryState?: import('../api/client').QueueRecoveryState | null
+  recoveryInterrupted?: boolean
+  recoveryBlocked?: boolean
+  recoveryAttempt?: number
+  recoveryAttemptLimit?: number
+  recoveryRerunsDenoise?: boolean
+  recoveryReason?: import('../api/client').QueueRecoveryReason | null
+  recoveryReasonText?: string | null
+  recoveryActionable?: boolean
+  recoveryActions?: import('../api/client').QueueRecoveryAction[]
+  /** Frozen estimate shown only as work expected after a safe resume. */
+  estimateAfterResume?: H3PerformanceEstimate | null
+  logEvents?: import('../api/client').JobLogEvent[]
+}
+
+export interface H3SegmentBoundary {
+  type: 'continuous' | 'precut' | 'cut' | 'transition'
+  at_seconds: number
+  source: string
+  event?: string
+}
+
+export interface H3SegmentPlanItem {
+  index: number
+  frames: number
+  duration_seconds: number
+  model_type: 'minimax_h3' | 'minimax_h3_pinkcherry_fl2va' | 'minimax_h3_w4a8_fl2va' | 'minimax_h3_ref2va'
+  model_reason: string
+  edge_anchor_locked: boolean
+  switch_from_previous: boolean
+  boundary_from_previous: H3SegmentBoundary | null
+  prompt_preview: string
+}
+
+export interface H3SegmentPlan {
+  kind: 'h3_segments'
+  clip_count: number
+  requested_frames: number
+  planned_frames: number
+  adaptive_conditioning: boolean
+  checkpoint_switches: number
+  segments: H3SegmentPlanItem[]
+}
+
+export interface H3GenerationRequirements {
+  models: Array<{
+    model_type: H3SegmentPlanItem['model_type']
+    is_downloaded: boolean
+    terms_required: boolean
+    auto_download: boolean
+  }>
+  ref2va_terms_required: boolean
+  all_downloaded: boolean
+}
+
+export interface H3PlanDecision {
+  segmentOverrides: NonNullable<GenerateParams['h3_segment_overrides']>
+  boundaryOverrides: NonNullable<GenerateParams['h3_boundary_overrides']>
 }
 
 export interface OutputFile {
@@ -261,14 +394,32 @@ export interface OutputFile {
    *  Edits filter checks this to identify edit-mode outputs regardless of
    *  the parent `mode`, since e.g. outpaint endpoints write mode='video'. */
   edit_sub_mode?: EditSubMode | null
+  artifact_class: ArtifactClass
+  linked_component_count: number
   favorite: boolean
   size: number
   created_at: number
+  /** Backend identity token covering both media bytes and sidecar metadata. */
+  revision: string
+  workspace: string
+  private: boolean
+  explicit: boolean
+}
+
+export interface OutputSearchFilters {
+  model?: string
+  lora?: string
+  seed?: string
+  reference?: '' | 'with' | 'without'
+  after?: string
+  before?: string
 }
 
 export type MediaFilter = 'all' | 'images' | 'videos' | 'audio' | 'avatars' | 'multiclip' | 'favorites'
+export type ArtifactClass = 'final' | 'component' | 'window' | 'temporary'
+export type OutputArtifactScope = 'final' | 'all' | 'components' | 'component' | 'window' | 'temporary'
 export type AspectRatio = 'auto' | '16:9' | '9:16' | '1:1' | '4:3' | '3:4'
-export type ResolutionPreset = 'auto' | '480p' | '540p' | '720p' | '768p' | '1080p'
+export type ResolutionPreset = 'auto' | '480p' | '540p' | '720p' | '1080p'
 export type ScailResolutionProfile = '480p' | '512p' | '704p'
 /** Backward-compatible name for saved Recast/API callers. */
 export type RecastResolutionProfile = ScailResolutionProfile
@@ -311,35 +462,15 @@ export interface ChoiceConfig {
   letters_filter?: string
 }
 
-export interface SlidingWindowMemoryPolicy {
-  checkpoint?: 'full' | 'pruned'
-  manual_override?: boolean
-  auto_resolution_pixels?: Record<string, number>
-  resolution_bands: Array<{
-    min_pixels: number
-    vram_tiers: Array<{
-      max_vram_gb?: number
-      frames: number | null
-      fallback_resolution?: string
-    }>
-  }>
-}
-
 export interface ModelOptions {
   model_type: string
   architecture: string
   guidance_max_phases: number
   lock_guidance_phases: boolean
   sliding_window: boolean
-  video_continuation?: boolean
   motion_amplitude: boolean
   flow_shift: boolean
   tea_cache: boolean
-  first_block_cache?: boolean
-  skip_steps_multiplier_choices?: [string, number][] | null
-  skip_steps_multiplier_label?: string
-  default_skip_steps_multiplier?: number
-  default_skip_steps_start_step_perc?: number
   returns_audio: boolean
   any_audio_prompt: boolean
   audio_scale_name: string
@@ -350,46 +481,52 @@ export interface ModelOptions {
   t2v_class: boolean
   image_outputs: boolean
   supports_end_frame: boolean
-  omni_reference?: boolean
-  omni_reference_limits?: {
-    image: number
-    video: number
-    audio: number
-    total: number
-  } | null
-  omni_reference_detail_choices?: [string, 'match' | 'max'][] | null
-  omni_reference_detail_default?: 'match' | 'max'
-  minimax_h3_text_encoder_choices?: {
-    value: string
-    label: string
-    size_hint: string
-    recommended?: boolean
-  }[] | null
-  minimax_h3_text_encoder_default?: string
-  minimax_h3_turbo?: {
-    filename: string
-    label: string
-    experimental: boolean
-    steps: number
-    weight: number
-    guide: string
-  } | null
-  minimax_h3_runtime_advisory?: {
-    level: 'warning' | 'info'
-    title: string
-    message: string
-    reasons: Array<{
-      code: 'triton_unavailable' | 'system_ram_low' | string
-      message: string
-    }>
-    recommended_model_type?: string
-    recommended_turbo?: boolean
-    estimated_pipeline_ram_gb?: number
-    minimum_system_ram_gb?: number
-    detected_ram_gb?: number | null
-    supports_triton?: boolean | null
-    blocking: boolean
-  } | null
+  guide_preprocessing: ChoiceConfig | null
+  guide_custom_choices: ChoiceConfig | null
+  image_ref_choices: ChoiceConfig | null
+  audio_prompt_type_sources: ChoiceConfig | null
+  background_removal_label: string | null
+  max_image_refs?: number | null
+  minimax_h3_reference_mode?: boolean
+  minimax_h3_conditioning_mode?: 'semantic_references' | 'first_last_frames'
+  minimax_h3_conditioning_modes_mutually_exclusive?: boolean
+  reference_image_max_count?: number
+  reference_video_max_count?: number
+  reference_audio_max_count?: number
+  mixed_reference_max_count?: number
+  semantic_reference_limits?: {
+    image_count: number
+    video_count: number
+    audio_count: number
+    mixed_file_count: number
+    output_duration_seconds: { min: number; max: number }
+    reference_video_duration_seconds: { min: number; max: number; total_max: number }
+    reference_audio_duration_seconds: { min: number; max: number; total_max: number }
+  }
+  sample_solvers: [string, string][] | null
+  self_refiner: boolean
+  self_refiner_max_plans: number
+  sliding_window_defaults: Record<string, number> | null
+  // LTX-2 Dev pipeline capabilities (guidance controls in Advanced Settings)
+  perturbation?: boolean
+  reference_pipeline?: boolean
+  cfg_star?: boolean
+  adaptive_projected_guidance?: boolean
+  audio_guidance?: boolean
+  prompt_enhancer_model?: string | null
+  fps: number
+  frames_minimum: number
+  frames_steps: number
+  latent_size: number
+  frames_maximum?: number | null
+  frame_alignment_modulus?: number
+  frame_alignment_remainder?: number
+  frame_alignment_mode?: 'floor' | 'ceil' | 'nearest'
+  default_num_inference_steps: number | null
+  default_guidance_scale: number | null
+  default_video_length?: number | null
+  default_sliding_window_size?: number | null
+  hide_resolution_presets: boolean
   resolution_presets?: Partial<Record<ResolutionPreset, {
     label: string
     experimental?: boolean
@@ -398,34 +535,9 @@ export interface ModelOptions {
   }>> | null
   resolution_preset_order?: ResolutionPreset[] | null
   supports_auto_aspect?: boolean
-  guide_preprocessing: ChoiceConfig | null
-  guide_custom_choices: ChoiceConfig | null
-  image_ref_choices: ChoiceConfig | null
-  audio_prompt_type_sources: ChoiceConfig | null
-  background_removal_label: string | null
-  max_image_refs?: number | null
-  sample_solvers: [string, string][] | null
-  self_refiner: boolean
-  self_refiner_max_plans: number
-  sliding_window_defaults: Record<string, number> | null
-  sliding_window_auto_prompt_pacing?: boolean
-  sliding_window_memory_policy?: SlidingWindowMemoryPolicy | null
-  /** Native one-pass policy used by Director. Omni publishes this without
-   * exposing Studio sliding-window controls. */
-  director_memory_policy?: SlidingWindowMemoryPolicy | null
-  // LTX-2 Dev pipeline capabilities (guidance controls in Advanced Settings)
-  perturbation?: boolean
-  reference_pipeline?: boolean
-  cfg_star?: boolean
-  adaptive_projected_guidance?: boolean
-  audio_guidance?: boolean
-  fps: number
-  frames_minimum: number
-  frames_steps: number
-  frames_maximum?: number | null
-  default_num_inference_steps: number | null
-  default_guidance_scale: number | null
-  hide_resolution_presets: boolean
+  /** Model-native legal canvases. H3 uses these exact values rather than
+   *  generic 480p/720p aspect-ratio approximations. */
+  resolutions?: Resolution[]
   input_video_strength_label: string
   vae_upsampler_modes: number[]
   // TTS-specific
@@ -472,7 +584,9 @@ export interface ModelFolderCandidate {
 export interface OutputMetadata {
   source: 'sidecar' | 'embedded' | 'none'
   params: Record<string, unknown> | null
-  upload_filenames?: Record<string, string>
+  private?: boolean
+  explicit?: boolean
+  upload_filenames?: Record<string, string | string[]>
   job_id?: string
   generation_time?: number
   created_at?: number
@@ -698,8 +812,6 @@ export interface LoraInfo {
   preview_url: string | null
   civitai_model_id: number | null
   recommended_weights: LoraRecommendedWeights | null
-  /** Managed choices may be listed before their first-use download. */
-  managed?: boolean
   has_guide: boolean
   guide?: string | null
   /** NSFW flag from the .civitai.json sidecar (or inferred from filename/tags).
@@ -746,7 +858,40 @@ export interface LlmStatus {
   loaded: boolean
   model_id: string | null
   device: string | null
+  requested_device?: string | null
   provider: string
+  vision_available?: boolean
+  backend?: string | null
+  loading?: boolean
+  loading_model_id?: string | null
+  loading_phase?: string | null
+  download?: {
+    model_id?: string
+    filename?: string
+    phase?: string | null
+    downloaded_bytes?: number
+    total_bytes?: number | null
+    seconds_since_progress?: number | null
+  } | null
+  runtime?: {
+    backend?: string | null
+    build?: number | null
+    devices?: string[]
+    effective_profile?: Record<string, unknown>
+    timings?: Record<string, number>
+    speed?: LlmSpeedEstimate
+    fallback_reason?: string | null
+  }
+}
+
+export interface LlmSpeedEstimate {
+  prompt_tokens_per_second: number | null
+  generation_tokens_per_second: number | null
+  source: 'measured' | 'calibrated' | 'heuristic' | 'unavailable'
+  confidence: 'measured' | 'high' | 'medium' | 'low' | 'unavailable'
+  reason: string
+  sample_count: number
+  backend: string
 }
 
 /** Live hardware telemetry for the sidebar status indicators.
@@ -774,6 +919,62 @@ export interface LlmModelOption {
   id: string
   label: string
   size_hint: string
+  source?: string
+  provider?: string
+  installed?: boolean
+  downloaded?: boolean
+  current?: boolean
+  configured?: boolean
+  loaded?: boolean
+  loading?: boolean
+  loading_phase?: string | null
+  backend?: string
+  effective_device?: string | null
+  vision_capable?: boolean
+  vision_available?: boolean | null
+  projector_available?: boolean
+  native_vision?: boolean
+  speed?: LlmSpeedEstimate
+  download?: {
+    phase?: string | null
+    downloaded_bytes?: number
+    total_bytes?: number | null
+    seconds_since_progress?: number | null
+  } | null
+  runtime_profile?: {
+    backend?: string
+    device?: string
+    gpu_layers?: number | string
+    threads?: number
+    threads_batch?: number
+    context_size?: number
+    batch_size?: number
+    ubatch_size?: number
+    flash_attention?: boolean | string
+    cache_type_k?: string
+    cache_type_v?: string
+    slots?: number
+    prompt_cache?: boolean
+    projector_offload?: boolean
+  }
+  description?: string
+}
+
+export interface LlmPromptGuideOption {
+  id: string
+  label: string
+  description?: string
+  target_mode?: 'video'
+  target_model_prefixes?: string[]
+}
+
+export interface LlmChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+  attachments?: Array<{
+    kind: 'image'
+    name: string
+  }>
 }
 
 export interface AudioBeat {
@@ -949,7 +1150,7 @@ export interface ShotPlan {
   ending_beat: string
   constraints?: string[]
   continuity_refs?: string[]
-  metadata?: Record<string, any>
+  metadata?: Record<string, unknown>
 }
 
 export interface CharacterProfile {
@@ -1034,6 +1235,8 @@ export interface PipelineRepairState {
   clip_index: number | null
   message: string
   error: string | null
+  error_code?: string | null
+  failure_details?: Record<string, unknown> | null
   cancel_requested?: boolean
   started_at: number
   updated_at: number
@@ -1041,7 +1244,30 @@ export interface PipelineRepairState {
   result_filename: string | null
 }
 
-export interface SavedPipelineState {
+export type DirectorRecoveryState =
+  | 'blocked_input_changed'
+  | 'blocked_remote_reauth'
+  | 'interrupted'
+  | 'paused'
+  | 'retrying'
+  | 'terminal'
+
+export type DirectorRecoveryReason =
+  | 'input_missing_or_changed'
+  | 'owner_reauthentication_required'
+
+export type DirectorRecoveryAction = 'resume' | 'continue'
+
+export interface DirectorRecoveryMetadata {
+  phase?: string
+  recovery_state?: DirectorRecoveryState | null
+  recovery_blocked?: boolean
+  recovery_reason?: DirectorRecoveryReason | null
+  recovery_reason_text?: string | null
+  recovery_actions?: DirectorRecoveryAction[]
+}
+
+export interface SavedPipelineState extends DirectorRecoveryMetadata {
   version: number
   pipeline_id: string
   created_at: number
@@ -1049,6 +1275,7 @@ export interface SavedPipelineState {
   status: string
   pipeline_type: string
   scene_description: string
+  workspace: string
   reference_image_path: string | null
   auto_mode: boolean
   seamless: boolean
@@ -1064,7 +1291,7 @@ export interface SavedPipelineState {
   repair?: PipelineRepairState | null
 }
 
-export interface PipelineListItem {
+export interface PipelineListItem extends DirectorRecoveryMetadata {
   id: string
   status: string
   pipeline_type: string

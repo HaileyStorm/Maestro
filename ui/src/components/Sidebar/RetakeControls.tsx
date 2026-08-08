@@ -113,13 +113,13 @@ export function RetakeControls() {
             className={`flex-1 px-2 py-1.5 text-[10px] rounded transition-colors ${
               editRetakeEngine === 'legacy' ? 'bg-accent-blue text-white' : 'bg-bg-tertiary text-text-secondary hover:text-text-primary'
             }`}>
-            Legacy
+            Compatibility
           </button>
         </div>
         <p className="text-[9px] text-text-muted mt-0.5">
           {editRetakeEngine === 'native'
             ? 'Lightricks denoise_mask — preserves source identity'
-            : 'MaskInjection — strength-controlled blending'}
+            : 'Classic strength-controlled mask blending'}
         </p>
       </div>
     </div>

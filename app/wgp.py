@@ -69,6 +69,7 @@ import shutil
 import glob
 import cv2
 import html
+import stat
 try:
     from gradio_rangeslider import RangeSlider
 except ImportError:
@@ -84,7 +85,12 @@ from shared.utils.plugins import PluginManager, WAN2GPApplication, SYSTEM_PLUGIN
 from shared.llm_engines.nanovllm.vllm_support import resolve_lm_decoder_engine
 from shared import model_dropdowns
 from collections import defaultdict
-from services.job_lifecycle import call_with_sticky_interrupt
+from services.job_lifecycle import (
+    call_with_sticky_interrupt,
+    invalidate_residency_state,
+    make_residency_key,
+    note_residency_state,
+)
 
 # import torch._dynamo as dynamo
 # dynamo.config.recompile_limit = 2000   # default is 256
@@ -98,7 +104,7 @@ AUTOSAVE_ERROR_FILENAME = "error_queue.zip"
 AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
-target_mmgp_version = "3.7.6"
+target_mmgp_version = "3.7.12"
 WanGP_version = "10.9875"
 settings_version = 2.57
 max_source_video_frames = 15000  # raised to support frame injection in long sliding-window videos (e.g. 9 windows × 20s × 25fps = 4500 frames)
@@ -111,7 +117,7 @@ lm_decoder_engine = ""
 enable_int8_kernels = 0
 # All media attachment keys for queue save/load
 ATTACHMENT_KEYS = ["image_start", "image_end", "image_refs", "image_guide", "image_mask",
-                   "video_guide",  "video_mask", "video_source", "video_end", "audio_guide", "audio_guide2", "audio_guide3", "audio_guide4", "audio_guide5", "audio_guide6", "audio_source", "custom_guide"]
+                   "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source", "video_end", "audio_guide", "audio_guide2", "audio_guide3", "audio_guide4", "audio_guide5", "audio_guide6", "audio_source", "custom_guide"]
 
 from importlib.metadata import version
 mmgp_version = version("mmgp")
@@ -125,6 +131,9 @@ unique_id = 0
 unique_id_lock = threading.Lock()
 offloadobj = enhancer_offloadobj = wan_model = None
 reload_needed = True
+_loaded_model_configuration = None
+_loaded_residency_base_key = None
+_loaded_residency_affinity_key = None
 # Remembers the VAE-upsampling kwarg last passed to load_models. Used as the
 # fallback comparison target for models whose vae object doesn't expose an
 # upsampling_set attribute (LTX-2, etc.) — without this the VAE check at
@@ -135,7 +144,6 @@ _HANDLER_MODULES = [
     "shared.qtypes.nvfp4",
     "shared.qtypes.nunchaku_int4",
     "shared.qtypes.nunchaku_fp4",
-    "shared.qtypes.int8_convrot",
     "shared.qtypes.gguf",
 ]
 quant_router.unregister_handler(".fp8_quanto_bridge")
@@ -143,6 +151,85 @@ for handler in _HANDLER_MODULES:
     quant_router.register_handler(handler)
 from shared.qtypes import gguf as gguf_handler
 quant_router.register_file_extension("gguf", gguf_handler)
+
+
+class PostDecodeStageError(RuntimeError):
+    """Machine-local post-decode error carrying a safe public stage/code."""
+
+    def __init__(self, message, *, stage, code):
+        super().__init__(message)
+        self.stage = stage
+        self.code = code
+
+
+def structured_generation_failure(exception, task, state, *, stage=None, code=None):
+    """Return a path/content-free failure while leaving traceback logging local."""
+    from services.oom_detect import build_failure_details, safe_allocator_facts
+
+    gen = get_gen_info(state)
+    phase = gen.get("progress_phase")
+    phase_text = str(phase[0] if isinstance(phase, tuple) and phase else phase or "")
+    stage = stage or getattr(exception, "stage", None)
+    code = code or getattr(exception, "code", None)
+    phase_folded = phase_text.casefold()
+    if code is None:
+        for marker, phase_code in (
+            ("encoding h3 native boundary history", "h3_boundary_encode_failed"),
+            ("encoding h3 keyframes", "h3_keyframe_encode_failed"),
+            ("encoding h3 references", "h3_reference_encode_failed"),
+            ("encoding h3 prompt", "h3_prompt_encode_failed"),
+            ("preparing h3 denoising schedule", "h3_schedule_failed"),
+            ("running first h3 denoising step", "h3_transformer_warmup_failed"),
+            ("h3 denoising", "h3_denoise_failed"),
+            ("decoding h3 video", "h3_video_decode_failed"),
+            ("decoding h3 audio", "h3_audio_decode_failed"),
+        ):
+            if marker in phase_folded:
+                code = phase_code
+                break
+    if stage is None:
+        stage = (
+            "vae_decode"
+            if "vae decod" in phase_folded or "decoding h3" in phase_folded
+            else "denoise"
+        )
+    params = task.get("params") if isinstance(task, dict) else {}
+    params = params if isinstance(params, dict) else {}
+    clip = params.get("multi_clip_info")
+    segment = None
+    if isinstance(clip, dict):
+        try:
+            segment = {
+                "current": max(1, int(clip.get("index", 0) or 0) + 1),
+                "total": max(1, int(clip.get("total", 1) or 1)),
+                "variant": max(1, int(clip.get("output_index", 0) or 0) + 1),
+            }
+        except (TypeError, ValueError):
+            segment = None
+    try:
+        window = {
+            "current": max(0, int(gen.get("window_no") or 0)),
+            "total": max(0, int(gen.get("total_windows") or 0)),
+        }
+    except (TypeError, ValueError):
+        window = None
+    try:
+        step_current = int(phase[1]) if isinstance(phase, tuple) and len(phase) > 1 else 0
+        step = {
+            "current": max(0, step_current),
+            "total": max(0, int(gen.get("num_inference_steps") or 0)),
+        }
+    except (TypeError, ValueError):
+        step = None
+    return build_failure_details(
+        exception,
+        stage=stage,
+        code=code,
+        segment=segment,
+        window=window,
+        step=step,
+        allocator=safe_allocator_facts(),
+    )
 from shared.kernels.quanto_int8_inject import maybe_enable_quanto_int8_kernel, disable_quanto_int8_kernel
 
 
@@ -177,19 +264,60 @@ def clear_gen_cache():
         del offload.shared_state["_cache"]
 
 
+def _invalidate_loaded_model_state():
+    """Invalidate WGP and scheduler identity before fallible load/release work."""
+    global reload_needed, _loaded_model_configuration
+    global _loaded_residency_base_key, _loaded_residency_affinity_key
+    reload_needed = True
+    _loaded_model_configuration = None
+    _loaded_residency_base_key = None
+    _loaded_residency_affinity_key = None
+    invalidate_residency_state()
+
+
 
 def release_model():
-    global wan_model, offloadobj, reload_needed
+    global wan_model, offloadobj
+    # Invalidate before any best-effort cleanup. A failed Turbo/MMGP release
+    # must never leave the old load budget advertised as reusable.
+    _invalidate_loaded_model_state()
+    owned_wan_model = wan_model
+    owned_offloadobj = offloadobj
+    # Detach both owners before any fallible backend hook.  Callers may safely
+    # attempt a different model load even when cleanup itself reports a fault.
     wan_model = None
-    clear_gen_cache()
-    if "_cache" in offload.shared_state:
-        del offload.shared_state["_cache"]
-    if offloadobj is not None:
-        offloadobj.release()
-        offloadobj = None
-    offload.flush_torch_caches()
-    gc.collect()
-    reload_needed = True
+    offloadobj = None
+    if owned_wan_model is not None:
+        try:
+            from services.h3_turbo import clear_h3_turbo_runtime
+            clear_h3_turbo_runtime(get_transformer_model(owned_wan_model))
+        except Exception:
+            # Non-H3 handlers need no custom cleanup; release remains best-effort.
+            pass
+    release_error = None
+    try:
+        if owned_offloadobj is not None:
+            owned_offloadobj.release()
+    except Exception as error:
+        release_error = error
+    finally:
+        # Delivery postprocessing depends on allocator cleanup even when a
+        # backend-specific release hook fails. Identity and ownership were
+        # already invalidated above, so no stale H3 object remains reusable.
+        try:
+            clear_gen_cache()
+        except Exception as error:
+            if release_error is None:
+                release_error = error
+        try:
+            offload.flush_torch_caches()
+        except Exception as error:
+            if release_error is None:
+                release_error = error
+        finally:
+            gc.collect()
+    if release_error is not None:
+        raise release_error
 def get_unique_id():
     global unique_id  
     with unique_id_lock:
@@ -772,11 +900,7 @@ def validate_settings(state, model_type, single_prompt, inputs):
     model_def = get_model_def(model_type)
     model_handler = get_model_handler(model_type)
     image_outputs = inputs["image_mode"] > 0
-    any_steps_skipping = (
-        model_def.get("tea_cache", False)
-        or model_def.get("mag_cache", False)
-        or model_def.get("first_block_cache", False)
-    )
+    any_steps_skipping = model_def.get("tea_cache", False) or model_def.get("mag_cache", False)
     model_type = get_base_model_type(model_type)
 
     model_filename = get_model_filename(model_type)  
@@ -821,9 +945,6 @@ def validate_settings(state, model_type, single_prompt, inputs):
     resolution = inputs["resolution"]
     # Resolve auto resolution early — compute from reference image before validation
     if not resolution or "x" not in resolution or resolution.startswith("auto"):
-        _resolution_hint = str(resolution or "auto")
-        _auto_budgets = model_def.get("auto_resolution_budgets") or {}
-        _auto_fallbacks = model_def.get("auto_resolution_fallbacks") or {}
         _val_refs = inputs.get("image_refs")
         _val_start = inputs.get("image_start")
         _val_ref_path = None
@@ -844,14 +965,7 @@ def validate_settings(state, model_type, single_prompt, inputs):
             _ri.close()
 
         if _rw and _rh:
-            if _resolution_hint in _auto_budgets:
-                _budget = int(_auto_budgets[_resolution_hint])
-            elif "1080" in _resolution_hint:
-                _budget = 1920 * 1088
-            elif "480" in _resolution_hint:
-                _budget = 848 * 480
-            else:
-                _budget = 1280 * 720
+            _budget = 1920 * 1088 if "1080" in str(resolution) else (848 * 480 if "480" in str(resolution) else 1280 * 720)
             _bs = model_def.get("block_size", 16)
             _sc = (_budget / (_rw * _rh)) ** 0.5
             _aw = int(round(_rw * _sc / _bs)) * _bs
@@ -860,10 +974,7 @@ def validate_settings(state, model_type, single_prompt, inputs):
             inputs["resolution"] = resolution
             print(f"[Auto Resolution] {_rw}x{_rh} ref → {_aw}x{_ah} output")
         else:
-            resolution = _auto_fallbacks.get(
-                _resolution_hint,
-                "1280x720",
-            )
+            resolution = "1280x720"
             inputs["resolution"] = resolution
             print(f"[Auto Resolution] No ref image found, using fallback {resolution}")
     width, height = resolution.split("x")
@@ -885,6 +996,8 @@ def validate_settings(state, model_type, single_prompt, inputs):
     audio_guide6 = inputs.get("audio_guide6")
     audio_source = inputs["audio_source"]
     video_guide = inputs["video_guide"]
+    video_guide2 = inputs.get("video_guide2")
+    video_guide3 = inputs.get("video_guide3")
     image_guide = inputs["image_guide"]
     video_mask = inputs["video_mask"]
     image_mask = inputs["image_mask"]
@@ -972,36 +1085,7 @@ def validate_settings(state, model_type, single_prompt, inputs):
     else:
         model_switch_phase = 1
         
-    if not any_steps_skipping:
-        skip_steps_cache_type = ""
-    supported_cache_types = {""}
-    if model_def.get("tea_cache", False):
-        supported_cache_types.add("tea")
-    if model_def.get("mag_cache", False):
-        supported_cache_types.add("mag")
-    if model_def.get("first_block_cache", False):
-        supported_cache_types.add("first_block")
-    if skip_steps_cache_type not in supported_cache_types:
-        gr.Info(
-            f"This model does not support step-skipping type "
-            f"'{skip_steps_cache_type}'."
-        )
-        return ret()
-    if skip_steps_cache_type == "first_block":
-        try:
-            cache_threshold = float(inputs.get("skip_steps_multiplier", 0.08))
-        except (TypeError, ValueError):
-            cache_threshold = -1
-        thresholds = {
-            float(value)
-            for value in model_def.get("first_block_cache_thresholds", ())
-        }
-        if cache_threshold not in thresholds:
-            gr.Info(
-                f"Unsupported First Block Cache threshold "
-                f"'{cache_threshold}'."
-            )
-            return ret()
+    if not any_steps_skipping: skip_steps_cache_type = ""
     if not model_def.get("lock_inference_steps", False) and model_type in ["ltxv_13B"] and num_inference_steps < 20:
         gr.Info("The minimum number of steps should be 20") 
         return ret()
@@ -1095,6 +1179,12 @@ def validate_settings(state, model_type, single_prompt, inputs):
             return ret()
     else:
         audio_guide2 = None
+    if "C" in audio_prompt_type:
+        if audio_guide3 == None:
+            gr.Info("You must provide a third Audio Source")
+            return ret()
+    else:
+        audio_guide3 = None
     if not all_letters(audio_prompt_type, "AB"):
         audio_prompt_type = del_in_sequence(audio_prompt_type, "N")
 
@@ -1134,6 +1224,14 @@ def validate_settings(state, model_type, single_prompt, inputs):
             if video_guide is None:
                 gr.Info("You must provide a Control Video")
                 return ret()
+            if model_def.get("minimax_h3_reference_mode", False):
+                requested_reference_videos = 1 + video_prompt_type.count("+")
+                if requested_reference_videos >= 2 and video_guide2 is None:
+                    gr.Info("You must provide a second Reference Video")
+                    return ret()
+                if requested_reference_videos >= 3 and video_guide3 is None:
+                    gr.Info("You must provide a third Reference Video")
+                    return ret()
         if "A" in video_prompt_type and not "U" in video_prompt_type:             
             if image_outputs:
                 if image_mask is None:
@@ -1169,6 +1267,8 @@ def validate_settings(state, model_type, single_prompt, inputs):
             return ret()
     else:
         video_guide = None
+        video_guide2 = None
+        video_guide3 = None
         image_guide = None
         video_mask = None
         image_mask = None
@@ -1239,11 +1339,7 @@ def validate_settings(state, model_type, single_prompt, inputs):
 
     if test_any_sliding_window(model_type) and image_mode == 0:
         if video_length > sliding_window_size:
-            if (
-                test_class_t2v(model_type)
-                and not model_def.get("video_continuation", False)
-                and not "G" in video_prompt_type
-            ):
+            if test_class_t2v(model_type) and not "G" in video_prompt_type :
                 gr.Info(f"You have requested to Generate Sliding Windows with a Text to Video model. Unless you use the Video to Video feature this is useless as a t2v model doesn't see past frames and it will generate the same video in each new window.") 
                 return ret()
             full_video_length = video_length if video_source is None else video_length +  sliding_window_overlap -1
@@ -1289,6 +1385,8 @@ def validate_settings(state, model_type, single_prompt, inputs):
         "audio_guide6": audio_guide6,
         "audio_source": audio_source,
         "video_guide": video_guide,
+        "video_guide2": video_guide2,
+        "video_guide3": video_guide3,
         "image_guide": image_guide,
         "video_mask": video_mask,
         "image_mask": image_mask,
@@ -2917,23 +3015,14 @@ def get_model_min_frames_and_step(model_type):
     latent_size = model_def.get("latent_size", frames_steps)
     return frames_minimum, frames_steps, latent_size 
 
-def align_model_frame_count(
-    frame_count,
-    model_def,
-    for_generation=False,
-    clamp_maximum=True,
-):
+def align_model_frame_count(frame_count, model_def, for_generation=False):
     """Align a requested frame count to a model's native temporal grid."""
     frame_count = int(frame_count)
     modulus = int(model_def.get("frame_alignment_modulus", 0) or 0)
     if modulus > 0:
         remainder = int(model_def.get("frame_alignment_remainder", 1)) % modulus
         minimum = int(model_def.get("frames_minimum", 1))
-        maximum = (
-            model_def.get("frames_maximum", None)
-            if clamp_maximum
-            else None
-        )
+        maximum = model_def.get("frames_maximum", None)
         frame_count = max(minimum, frame_count)
         if maximum is not None:
             frame_count = min(int(maximum), frame_count)
@@ -2958,47 +3047,6 @@ def align_model_frame_count(
     if for_generation:
         return (frame_count // latent_size) * latent_size + 1
     return (frame_count - 1) // latent_size * latent_size + 1
-
-
-def normalize_model_total_frame_count(frame_count, model_def):
-    """Normalize an output timeline without treating a window cap as total."""
-
-    frame_count = int(frame_count)
-    maximum = model_def.get("frames_maximum", None)
-    if (
-        model_def.get("sliding_window_exact_total_frames", False)
-        and maximum is not None
-        and frame_count > int(maximum)
-    ):
-        return max(int(model_def.get("frames_minimum", 1)), frame_count)
-    return align_model_frame_count(frame_count, model_def)
-
-
-def compute_next_sliding_window_length(
-    remaining_with_context,
-    sliding_window_size,
-    latent_size,
-    model_def,
-):
-    """Size a continuation pass without ever exceeding its window cap.
-
-    Models such as MiniMax H3 keep the requested joined duration exact while
-    requiring every individual pass to land on a model-native frame grid.  A
-    previous exact-duration branch aligned the *entire remaining timeline*
-    but forgot to reapply ``sliding_window_size``.  The first 1080p H3 pass
-    could therefore use the intended 124 frames while pass two silently grew
-    to 226 frames and exhausted VRAM.
-    """
-
-    if model_def.get("sliding_window_exact_total_frames", False):
-        candidate = align_model_frame_count(
-            remaining_with_context,
-            model_def,
-            for_generation=True,
-        )
-    else:
-        candidate = (remaining_with_context // latent_size) * latent_size + 1
-    return min(int(sliding_window_size), int(candidate))
     
 def get_model_fps(model_type):
     model_def = get_model_def(model_type)
@@ -3289,6 +3337,14 @@ def fix_settings(model_type, ui_defaults, min_settings_version = 0):
     image_prompt_type = ui_defaults.get("image_prompt_type", "")
     if len(image_prompt_type) > 0:
         image_prompt_types_allowed = model_def.get("image_prompt_types_allowed","")
+        if (
+            base_model_type == "minimax_h3_ref2va"
+            and ui_defaults.get("h3_native_boundary_conditioning") is True
+        ):
+            image_prompt_types_allowed = model_def.get(
+                "minimax_h3_native_boundary_image_prompt_types_allowed",
+                image_prompt_types_allowed,
+            )
         image_prompt_type = filter_letters(image_prompt_type, image_prompt_types_allowed)
     ui_defaults["image_prompt_type"] = image_prompt_type
 
@@ -4126,6 +4182,158 @@ def get_default_profile(output_type):
 def compute_profile(override_profile, output_type="video"):
     return override_profile if override_profile != -1 else get_default_profile(output_type)
 
+
+def _model_load_environment_signature(model_type, profile):
+    """Resolve model/enhancer settings that are fixed at load/profile time."""
+    model_def = get_model_def(model_type) or {}
+    resolved_decoder = resolve_lm_decoder_engine(
+        lm_decoder_engine, model_def.get("lm_engines", []),
+    )
+    if resolved_decoder in ("cg", "vllm") and int(profile) not in (1, 3):
+        resolved_decoder = "legacy"
+
+    model_compile_override = model_def.get("compile", None)
+    if model_compile_override is False:
+        compile_modules = False
+    elif model_compile_override:
+        compile_modules = model_compile_override
+    elif len(compile) > 0:
+        compile_modules = compile
+    else:
+        compile_modules = ""
+
+    enhancer_mode = server_config.get("enhancer_mode", 1)
+    attached_enhancer = None
+    if enhancer_mode == 0:
+        attached_enhancer = {
+            "enabled": server_config.get("enhancer_enabled", 0),
+            "quantization": server_config.get(
+                "prompt_enhancer_quantization", "quanto_int8",
+            ),
+            "decoder_engine": server_config.get("lm_decoder_engine", ""),
+        }
+    return {
+        "global_compile": compile,
+        "compile_modules": compile_modules,
+        "lm_decoder_engine": resolved_decoder,
+        "enhancer_mode": enhancer_mode,
+        "attached_prompt_enhancer": attached_enhancer,
+    }
+
+
+def _model_load_configuration(
+    vram_safety_coefficient,
+    profile,
+    output_type,
+    vae_setting,
+    vae_config_setting,
+    load_environment=None,
+):
+    """Return the effective MMGP/offload inputs that require a safe reload."""
+    try:
+        coefficient = float(vram_safety_coefficient)
+    except (TypeError, ValueError):
+        coefficient = vram_safety_coefficient
+    return (
+        coefficient,
+        profile,
+        vae_setting or None,
+        vae_config_setting,
+        load_environment,
+    )
+
+
+def _model_load_configuration_matches(loaded, requested):
+    """Compare load configurations, tolerating only numeric input noise."""
+    if loaded is None or requested is None or len(loaded) != len(requested):
+        return False
+    loaded_coefficient, requested_coefficient = loaded[0], requested[0]
+    try:
+        coefficient_matches = math.isclose(
+            float(loaded_coefficient),
+            float(requested_coefficient),
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        )
+    except (TypeError, ValueError):
+        coefficient_matches = loaded_coefficient == requested_coefficient
+    return coefficient_matches and loaded[1:] == requested[1:]
+
+
+def _release_for_model_reprofile(
+    current_model,
+    loaded_configuration,
+    requested_configuration,
+    release_callback,
+):
+    """Release once when MMGP's immutable load configuration is stale."""
+    if current_model is None or _model_load_configuration_matches(
+        loaded_configuration,
+        requested_configuration,
+    ):
+        return False
+    release_callback()
+    return True
+
+
+def get_requested_residency_identity(
+    model_type,
+    override_profile=-1,
+    output_type="video",
+    vae_setting=None,
+    affinity_components=None,
+    vram_safety_coefficient=None,
+):
+    """Build opaque base/optional affinity keys from load-relevant settings.
+
+    ``affinity_components`` is reserved for stable model overlays such as the
+    resolved LoRA set. It must never contain prompt, workspace, path, or seed
+    data; the returned key itself is always an opaque digest.
+    """
+    if model_type is None:
+        return None, None
+    profile = compute_profile(override_profile, output_type)
+    effective_coefficient = (
+        args.vram_safety_coefficient
+        if vram_safety_coefficient is None
+        else vram_safety_coefficient
+    )
+    configuration = _model_load_configuration(
+        effective_coefficient,
+        profile,
+        output_type,
+        vae_setting,
+        vae_config,
+        _model_load_environment_signature(model_type, profile),
+    )
+    base_key = make_residency_key(
+        "wgp-generation-v1",
+        model_type,
+        get_base_model_type(model_type),
+        configuration,
+        transformer_quantization,
+        transformer_dtype_policy,
+        text_encoder_quantization,
+        attention_mode,
+        getattr(args, "gpu", ""),
+        server_config.get("vae_precision", "16"),
+        server_config.get("mixed_precision", "0"),
+    )
+    affinity_key = None
+    if affinity_components is not None:
+        affinity_key = make_residency_key(
+            "wgp-affinity-v1", base_key, affinity_components,
+        )
+    return base_key, affinity_key
+
+
+def get_current_residency_identity():
+    """Return the trusted loaded identity, or no identity after invalidation."""
+    if wan_model is None or offloadobj is None or reload_needed:
+        return None, None
+    return _loaded_residency_base_key, _loaded_residency_affinity_key
+
+
 def get_output_type_for_model(model_type, image_mode=0):
     model_def = get_model_def(model_type)
     if model_def is not None and model_def.get("audio_only", False):
@@ -4219,8 +4427,19 @@ def setup_prompt_enhancer(pipe, kwargs):
 
 
 
-def load_models(model_type, override_profile = -1, output_type="video", **model_kwargs):
-    global transformer_type, loaded_profile
+def load_models(
+    model_type,
+    override_profile=-1,
+    output_type="video",
+    load_status_callback=None,
+    **model_kwargs,
+):
+    global transformer_type, loaded_profile, reload_needed
+    global _loaded_model_configuration, _loaded_residency_base_key
+    global _loaded_residency_affinity_key
+    # A replacement load is not resident until MMGP profiling completes. If
+    # any download/load/profile step raises, the invalid state remains durable.
+    _invalidate_loaded_model_state()
     base_model_type = get_base_model_type(model_type)
     model_def = get_model_def(model_type)
     save_quantized = args.save_quantized and model_def != None
@@ -4295,21 +4514,7 @@ def load_models(model_type, override_profile = -1, output_type="video", **model_
 
 
     model_type_handler = model_types_handlers[base_model_type]
-    text_encoder_variants = model_def.get("minimax_h3_text_encoder_variants", {}) if model_def else {}
-    requested_text_encoder_variant = str(
-        model_kwargs.get("minimax_h3_text_encoder")
-        or (model_def or {}).get("minimax_h3_text_encoder_default", "")
-    )
-    if text_encoder_variants:
-        text_encoder_spec = text_encoder_variants.get(requested_text_encoder_variant)
-        if text_encoder_spec is None:
-            raise ValueError(
-                f"Unknown MiniMax H3 text encoder '{requested_text_encoder_variant}'. "
-                f"Choose one of: {', '.join(text_encoder_variants)}."
-            )
-        text_encoder_URLs = text_encoder_spec.get("URLs", [])
-    else:
-        text_encoder_URLs= get_model_recursive_prop(model_type, "text_encoder_URLs", return_list= True)
+    text_encoder_URLs= get_model_recursive_prop(model_type, "text_encoder_URLs", return_list= True)
     if text_encoder_URLs is not None:
         # Per-model override: a model_def can force a specific text encoder
         # quantization regardless of the user's global setting. Used by
@@ -4339,15 +4544,29 @@ def load_models(model_type, override_profile = -1, output_type="video", **model_
 
 
     profile = compute_profile(override_profile, output_type)
-    lm_decoder_engine_obtained = resolve_lm_decoder_engine(lm_decoder_engine, model_def.get("lm_engines", []) )
-    if lm_decoder_engine_obtained in ("cg", "vllm") and int(profile) not in [ 1, 3]:
-        print(f"Unable to use LM Engine '{lm_decoder_engine_obtained}' as it requires a Memory Profile such as 1,3 or 3+ that loads entirely the Main Models in VRAM. Switching to Legacy LM Engine...")
+    load_environment = _model_load_environment_signature(model_type, profile)
+    lm_decoder_engine_obtained = load_environment["lm_decoder_engine"]
+    requested_lm_decoder_engine = resolve_lm_decoder_engine(
+        lm_decoder_engine, model_def.get("lm_engines", []),
+    )
+    if (
+        requested_lm_decoder_engine in ("cg", "vllm")
+        and lm_decoder_engine_obtained == "legacy"
+    ):
+        print(f"Unable to use LM Engine '{requested_lm_decoder_engine}' as it requires a Memory Profile such as 1,3 or 3+ that loads entirely the Main Models in VRAM. Switching to Legacy LM Engine...")
         lm_decoder_engine_obtained = "legacy"
     torch.set_default_device('cpu')    
+    if callable(load_status_callback) and base_model_type != "minimax_h3":
+        load_status_callback("Loading model checkpoint")
+    handler_model_kwargs = dict(model_kwargs)
+    if base_model_type == "minimax_h3":
+        handler_model_kwargs["load_status_callback"] = load_status_callback
     wan_model, pipe = model_type_handler.load_model(
                 local_model_file_list, model_type, base_model_type, model_def, quantizeTransformer = quantizeTransformer, text_encoder_quantization = text_encoder_quantization,
-                dtype = transformer_dtype, VAE_dtype = VAE_dtype, mixed_precision_transformer = mixed_precision_transformer, save_quantized = save_quantized, submodel_no_list   = model_submodel_no_list, text_encoder_filename = text_encoder_filename, profile=profile, lm_decoder_engine=lm_decoder_engine_obtained, **model_kwargs )
+                dtype = transformer_dtype, VAE_dtype = VAE_dtype, mixed_precision_transformer = mixed_precision_transformer, save_quantized = save_quantized, submodel_no_list   = model_submodel_no_list, text_encoder_filename = text_encoder_filename, profile=profile, lm_decoder_engine=lm_decoder_engine_obtained, **handler_model_kwargs )
 
+    if callable(load_status_callback):
+        load_status_callback("Preparing model pipeline")
     kwargs = {}
     if "pipe" in pipe:
         kwargs = pipe
@@ -4362,6 +4581,8 @@ def load_models(model_type, override_profile = -1, output_type="video", **model_
     if "transformer2" in pipe:
         loras_transformer += ["transformer2"]
     if len(compile) > 0 and hasattr(wan_model, "custom_compile"):
+        if callable(load_status_callback):
+            load_status_callback("Compiling model runtime")
         wan_model.custom_compile(backend= "inductor", mode ="default")
     # model_def can declare compile policy with three modes:
     #   not present       → use user's global compile setting (default)
@@ -4374,31 +4595,41 @@ def load_models(model_type, override_profile = -1, output_type="video", **model_
     # Use `None` as the "no override" sentinel so we can distinguish from
     # an explicit `False` opt-out. The original upstream logic only knew
     # truthy/falsy, which conflated "no override" with "opt out".
-    model_compile_override = model_def.get("compile", None)
-    if model_compile_override is False:
-        compile_modules = False
-    elif model_compile_override:
-        compile_modules = model_compile_override
-    elif len(compile) > 0:
-        compile_modules = compile
-    else:
-        compile_modules = ""
+    compile_modules = load_environment["compile_modules"]
     if compile_modules == False:
         print("Pytorch compilation is not supported for this Model")
     # kwargs["pinnedMemory"] = "text_encoder"
+    if callable(load_status_callback):
+        load_status_callback("Profiling model offload")
     offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, **kwargs)  
-    # Let the job-level memory planner tell whether a resident model was
-    # profiled with enough activation headroom for a later, heavier request
-    # (notably H3 Ref2VA with a video reference).  A lower coefficient remains
-    # safe for lighter jobs and does not force an unnecessary reload.
-    try:
-        wan_model._maestro_profile_vram_coefficient = float(vram_safety_coefficient)
-    except Exception:
-        pass
+    if callable(load_status_callback):
+        load_status_callback("Model runtime ready")
     if len(args.gpu) > 0:
         torch.set_default_device(args.gpu)
     transformer_type = model_type
     loaded_profile = profile
+    loaded_vae_setting = model_kwargs.get("VAE_upsampling")
+    _loaded_model_configuration = _model_load_configuration(
+        vram_safety_coefficient,
+        profile,
+        output_type,
+        loaded_vae_setting,
+        vae_config,
+        load_environment,
+    )
+    _loaded_residency_base_key, _loaded_residency_affinity_key = (
+        get_requested_residency_identity(
+            model_type,
+            override_profile,
+            output_type,
+            loaded_vae_setting,
+        )
+    )
+    reload_needed = False
+    note_residency_state(
+        _loaded_residency_base_key,
+        _loaded_residency_affinity_key,
+    )
     return wan_model, offloadobj 
 
 if not "P" in preload_model_policy:
@@ -5314,15 +5545,8 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
             video_skip_steps_multiplier = configs.get("skip_steps_multiplier", 0)
             video_skip_steps_cache_start_step_perc = configs.get("skip_steps_start_step_perc", 0)
             if len(video_skip_steps_cache_type) > 0:
-                video_skip_steps_cache = {
-                    "tea": "TeaCache",
-                    "mag": "MagCache",
-                    "first_block": "First Block Cache",
-                }.get(video_skip_steps_cache_type, video_skip_steps_cache_type)
-                if video_skip_steps_cache_type == "first_block":
-                    video_skip_steps_cache += f" threshold {video_skip_steps_multiplier}"
-                else:
-                    video_skip_steps_cache += f" x{video_skip_steps_multiplier}"
+                video_skip_steps_cache = "TeaCache" if video_skip_steps_cache_type == "tea" else "MagCache"
+                video_skip_steps_cache += f" x{video_skip_steps_multiplier }"
                 if video_skip_steps_cache_start_step_perc >0:  video_skip_steps_cache += f", Start from {video_skip_steps_cache_start_step_perc}%"
                 values += [ video_skip_steps_cache ]
                 labels += [ "Skip Steps" ]
@@ -5398,6 +5622,48 @@ def get_resampled_video(video_in, start_frame, max_frames, target_fps, bridge='t
     frames_list = reader.get_batch(frame_nos)
     # print(f"frame nos: {frame_nos}")
     return frames_list
+
+
+def prepare_semantic_reference_video(video_in, target_fps, model_def):
+    """Decode one arbitrary Ref2VA video without making it a control clip."""
+    max_reference_frames = int(model_def.get("reference_video_max_frames", 15 * target_fps))
+    frames = get_resampled_video(video_in, 0, max_reference_frames, target_fps)
+    if frames is None or len(frames) == 0:
+        raise ValueError(f"Unable to decode MiniMax H3 reference video: {video_in}")
+
+    # H3's video VAE accepts 17*n+5 frames. Floor so multiple references
+    # cannot exceed their original total duration; pad only at the 2-second
+    # lower boundary where the first legal tensor is 56 frames at 24 fps.
+    modulus = int(model_def.get("frame_alignment_modulus", 17) or 17)
+    remainder = int(model_def.get("frame_alignment_remainder", 5)) % modulus
+    minimum_frames = int(math.ceil(2.0 * float(target_fps)))
+    first_legal = remainder
+    while first_legal < minimum_frames:
+        first_legal += modulus
+    maximum_legal = remainder + max(0, (max_reference_frames - remainder) // modulus) * modulus
+    source_frames = int(frames.shape[0])
+    aligned_frames = remainder + max(0, (source_frames - remainder) // modulus) * modulus
+    aligned_frames = min(maximum_legal, max(first_legal, aligned_frames))
+    if source_frames < aligned_frames:
+        pad = frames[-1:].repeat(aligned_frames - source_frames, 1, 1, 1)
+        frames = torch.cat([frames, pad], dim=0)
+    else:
+        frames = frames[:aligned_frames]
+
+    video = frames.permute(3, 0, 1, 2).float().div_(127.5).sub_(1.0)
+    max_height, max_width = model_def.get("reference_video_max_size", (768, 1344))
+    source_height, source_width = int(video.shape[-2]), int(video.shape[-1])
+    scale = min(1.0, float(max_height) / source_height, float(max_width) / source_width)
+    target_height = max(32, int(round(source_height * scale / 32.0)) * 32)
+    target_width = max(32, int(round(source_width * scale / 32.0)) * 32)
+    if (target_height, target_width) != (source_height, source_width):
+        video = torch.nn.functional.interpolate(
+            video.unsqueeze(0),
+            size=(aligned_frames, target_height, target_width),
+            mode="trilinear",
+            align_corners=False,
+        ).squeeze(0)
+    return video
 
 # def get_resampled_video(video_in, start_frame, max_frames, target_fps):
 #     from torchvision.io import VideoReader
@@ -5475,7 +5741,7 @@ def get_preprocessor(process_type, inpaint_color, pre_video_guide=None):
         variant = server_config.get("depth_anything_v2_variant", "vitl")
         cfg_dict = {
             # REST jobs provision this before the main LTX model is loaded so
-            # the one-time download is visible in the job tile. Keep this
+            # a needed host download is visible in the job tile. Keep this
             # fallback here for Classic UI, CLI, and direct API callers.
             "PRETRAINED_MODEL": ensure_video_depth_checkpoint(variant),
             'MODEL_VARIANT': variant,
@@ -5921,7 +6187,7 @@ def perform_spatial_upsampling(sample, spatial_upsampling, seed=0, abort_callbac
     # FlashVSR (DiT super-resolution) dispatch — ported from upstream Wan2GP.
     # When spatial_upsampling is a "flashvsr"/"flashvsr2pass" method, route to
     # the model-based upscaler instead of the Lanczos path below. The bridge
-    # auto-downloads the FlashVSR weights on first use.
+    # downloads missing FlashVSR weights into the host cache when needed.
     edit_upsampler = find_edit_spatial_upsampler(spatial_upsampling)
     if edit_upsampler is not None:
         # Sync the user's FlashVSR settings (stored under server_config["services"]
@@ -6471,9 +6737,114 @@ def _trim_video_tail(clip_path, trim_frames, fps):
             os.remove(tmp_path)
 
 
+def seal_multi_clip_segment_before_concat(
+    clip_path, multi_clip_info, after_segment_output,
+):
+    """Durably hand off the final rendered component before concat starts."""
+    if not isinstance(multi_clip_info, dict) or not callable(after_segment_output):
+        return clip_path
+    try:
+        segment_index = max(0, int(multi_clip_info.get("index", 0) or 0))
+        segment_total = max(1, int(multi_clip_info.get("total", 1) or 1))
+    except (TypeError, ValueError):
+        raise PostDecodeStageError(
+            "The rendered segment identity is invalid",
+            stage="segment_checkpoint",
+            code="segment_identity_invalid",
+        ) from None
+    if segment_index + 1 != segment_total:
+        return clip_path
+    try:
+        replacement = after_segment_output(
+            clip_path, dict(multi_clip_info),
+        )
+    except PostDecodeStageError:
+        raise
+    except Exception as error:
+        raise PostDecodeStageError(
+            "The rendered segment could not be sealed for recovery",
+            stage="segment_checkpoint",
+            code="segment_checkpoint_failed",
+        ) from error
+    if not isinstance(replacement, str) or not replacement:
+        raise PostDecodeStageError(
+            "The rendered segment checkpoint returned no component",
+            stage="segment_checkpoint",
+            code="segment_checkpoint_invalid",
+        )
+    return replacement
+
+
+def load_h3_native_boundary_inputs(descriptor):
+    """Verify and decode one private H3 AV boundary without a temp file."""
+
+    from services.h3_boundary_policy import (
+        H3_NATIVE_AUDIO_SAMPLE_RATE,
+        H3_NATIVE_FPS,
+        H3_NATIVE_HISTORY_FRAMES,
+        H3_NATIVE_OVERLAP_FRAMES,
+        verify_boundary_file,
+    )
+
+    if not isinstance(descriptor, dict):
+        raise ValueError("H3 native boundary descriptor is invalid")
+    expected = {
+        "fps": H3_NATIVE_FPS,
+        "audio_sample_rate": H3_NATIVE_AUDIO_SAMPLE_RATE,
+        "audio_channels": 2,
+        "overlap_frames": H3_NATIVE_OVERLAP_FRAMES,
+        "discard_frames": H3_NATIVE_HISTORY_FRAMES,
+    }
+    if any(int(descriptor.get(key) or 0) != value for key, value in expected.items()):
+        raise ValueError("H3 native boundary metadata is invalid")
+    path = verify_boundary_file(descriptor)
+    source_fps, _, _, source_frames = get_video_info(path)
+    if (
+        abs(float(source_fps or 0) - H3_NATIVE_FPS) > 1e-6
+        or int(source_frames or 0) != H3_NATIVE_OVERLAP_FRAMES
+    ):
+        raise ValueError("H3 native boundary video geometry changed")
+    video = get_resampled_video(
+        path, 0, H3_NATIVE_OVERLAP_FRAMES, H3_NATIVE_FPS,
+    )
+    if (
+        video is None
+        or video.ndim != 4
+        or int(video.shape[0]) != H3_NATIVE_OVERLAP_FRAMES
+        or int(video.shape[-1]) not in {3, 4}
+    ):
+        raise ValueError("H3 native boundary video could not be decoded exactly")
+    # get_resampled_video returns THWC uint8; MiniMax consumes normalized
+    # CTHW. Keep this conversion identical to semantic reference decoding.
+    video = video[..., :3].permute(3, 0, 1, 2).float().div_(127.5).sub_(1.0)
+
+    expected_samples = round(
+        H3_NATIVE_OVERLAP_FRAMES / H3_NATIVE_FPS
+        * H3_NATIVE_AUDIO_SAMPLE_RATE
+    )
+    ffmpeg_bin = os.environ.get("FFMPEG_BINARY", "ffmpeg")
+    completed = subprocess.run(
+        [
+            ffmpeg_bin, "-v", "error", "-nostdin", "-i", path,
+            "-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le",
+            "-af", (
+                f"apad=whole_len={expected_samples},"
+                f"atrim=end_sample={expected_samples}"
+            ),
+            "-ar", str(H3_NATIVE_AUDIO_SAMPLE_RATE), "-ac", "2", "-",
+        ],
+        capture_output=True, timeout=60,
+    )
+    audio = np.frombuffer(completed.stdout, dtype="<f4")
+    if completed.returncode != 0 or audio.size != expected_samples * 2:
+        raise ValueError("H3 native boundary audio could not be decoded exactly")
+    return video, audio.reshape(expected_samples, 2).copy()
+
+
 def concatenate_multi_clip_videos(
     clip_paths, output_path, audio_path=None, audio_start_sec=0.0,
     abort_callback=None, pad_audio=False, audio_duration_sec=None,
+    clip_start_frames=None,
 ):
     """Concatenate video clips into one video, optionally adding a full audio track.
 
@@ -6488,16 +6859,20 @@ def concatenate_multi_clip_videos(
     ffmpeg's filter buffers before the concat video is flushed.
     """
     import subprocess
+    import json
     import math
     import time
     output_path = os.path.abspath(output_path)
     output_path_ffmpeg = output_path.replace("\\", "/")
     ffmpeg_bin = os.environ.get("FFMPEG_BINARY", "ffmpeg")
 
-    n = len(clip_paths)
-    if n == 0:
+    requested_count = len(clip_paths)
+    if requested_count == 0:
         print("[Multi-Clip] No clips to concatenate")
-        return False
+        raise PostDecodeStageError(
+            "No rendered segments were available for concatenation",
+            stage="concat", code="concat_input_missing",
+        )
 
     # Validate that all clip files exist and have content
     valid_paths = []
@@ -6512,9 +6887,35 @@ def concatenate_multi_clip_videos(
 
     if not valid_paths:
         print("[Multi-Clip] No valid clip files found")
-        return False
+        raise PostDecodeStageError(
+            "No valid rendered segments were available for concatenation",
+            stage="concat", code="concat_input_invalid",
+        )
+
+    if len(valid_paths) != requested_count:
+        raise PostDecodeStageError(
+            "One or more rendered segments were unavailable for concatenation",
+            stage="concat", code="concat_input_incomplete",
+        )
 
     n = len(valid_paths)
+    if clip_start_frames is None:
+        clip_start_frames = [0] * n
+    if (
+        not isinstance(clip_start_frames, (list, tuple))
+        or len(clip_start_frames) != n
+    ):
+        raise PostDecodeStageError(
+            "Segment overlap trim metadata is invalid",
+            stage="concat", code="concat_overlap_invalid",
+        )
+    try:
+        clip_start_frames = [max(0, int(value or 0)) for value in clip_start_frames]
+    except (TypeError, ValueError):
+        raise PostDecodeStageError(
+            "Segment overlap trim metadata is invalid",
+            stage="concat", code="concat_overlap_invalid",
+        ) from None
 
     try:
         audio_start_sec = float(audio_start_sec or 0)
@@ -6563,6 +6964,24 @@ def concatenate_multi_clip_videos(
                 pass
 
     use_clip_audio = clips_have_audio and not audio_path
+    detected_audio_sample_rate = None
+    if use_clip_audio:
+        try:
+            audio_probe = subprocess.run(
+                [
+                    ffprobe_bin, "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=sample_rate", "-of", "csv=p=0",
+                    valid_paths[0].replace("\\", "/"),
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            detected_audio_sample_rate = int(audio_probe.stdout.strip())
+            if detected_audio_sample_rate <= 0:
+                detected_audio_sample_rate = None
+        except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+            detected_audio_sample_rate = None
+    failure_stage = "audio_mux" if audio_path or use_clip_audio else "concat"
+    failure_code_prefix = "audio_mux" if failure_stage == "audio_mux" else "concat"
     audio_label = "with embedded audio" if use_clip_audio else ("with external audio" if audio_path else "video only")
     print(f"[Multi-Clip] Joining {n} clips using concat filter (re-encode, {audio_label})")
     if audio_path and audio_start_sec > 0:
@@ -6573,6 +6992,7 @@ def concatenate_multi_clip_videos(
     # per-clip timing drift (H.264 timebase rounding), which causes the
     # overlaid audio track to progressively desync.
     detected_fps = None
+    exact_output_frames = None
     try:
         ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe")
         fps_probe = subprocess.run(
@@ -6592,6 +7012,50 @@ def concatenate_multi_clip_videos(
     except Exception:
         pass
 
+    frame_counts = []
+    if detected_fps and detected_fps > 0:
+        try:
+            for path in valid_paths:
+                count_probe = subprocess.run(
+                    [
+                        ffprobe_bin, "-v", "error", "-count_frames",
+                        "-select_streams", "v:0", "-show_entries",
+                        "stream=nb_read_frames,nb_frames", "-of", "json",
+                        path.replace("\\", "/"),
+                    ],
+                    capture_output=True, text=True, timeout=30,
+                )
+                streams = json.loads(count_probe.stdout).get("streams") or []
+                stream = streams[0]
+                frame_counts.append(int(
+                    stream.get("nb_read_frames") or stream.get("nb_frames")
+                ))
+        except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+            frame_counts = []
+    valid_frame_counts = (
+        len(frame_counts) == n
+        and all(
+            count > start
+            for count, start in zip(frame_counts, clip_start_frames)
+        )
+    )
+    if any(clip_start_frames):
+        if not detected_fps or detected_fps <= 0:
+            raise PostDecodeStageError(
+                "Clip FPS is required for exact H3 overlap trimming",
+                stage="concat", code="concat_overlap_invalid",
+            )
+        if not valid_frame_counts:
+            raise PostDecodeStageError(
+                "Segment frame counts are required for exact H3 overlap trimming",
+                stage="concat", code="concat_overlap_invalid",
+            )
+    if valid_frame_counts:
+        exact_output_frames = sum(
+            count - start
+            for count, start in zip(frame_counts, clip_start_frames)
+        )
+
     # Build ffmpeg command with concat filter
     cmd = [ffmpeg_bin, "-y"]
     for p in valid_paths:
@@ -6600,16 +7064,77 @@ def concatenate_multi_clip_videos(
         cmd += ["-i", os.path.abspath(audio_path).replace("\\", "/")]
 
     # Build filter_complex string
+    video_labels = []
+    audio_labels = []
+    trim_filters = []
+    for index, start_frame in enumerate(clip_start_frames):
+        if start_frame:
+            trim_filters.append(
+                f"[{index}:v]trim=start_frame={start_frame},setpts=PTS-STARTPTS[v{index}]"
+            )
+            video_labels.append(f"[v{index}]")
+            if use_clip_audio:
+                if not detected_fps or detected_fps <= 0:
+                    raise PostDecodeStageError(
+                        "Clip FPS is required for exact H3 audio overlap trimming",
+                        stage="audio_mux", code="audio_mux_overlap_invalid",
+                    )
+                audio_trim_start = (
+                    f"start_sample={round(start_frame / detected_fps * detected_audio_sample_rate)}"
+                    if detected_audio_sample_rate else
+                    f"start={start_frame / detected_fps:.9f}"
+                )
+                trim_filters.append(
+                    f"[{index}:a]atrim={audio_trim_start},"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                )
+                audio_labels.append(f"[a{index}]")
+        else:
+            video_labels.append(f"[{index}:v]")
+            if use_clip_audio:
+                audio_labels.append(f"[{index}:a]")
+
     if use_clip_audio:
         # Concat both video and audio streams from each clip
-        filter_inputs = "".join(f"[{i}:v][{i}:a]" for i in range(n))
-        filter_str = f"{filter_inputs}concat=n={n}:v=1:a=1[outv][outa]"
+        filter_inputs = "".join(
+            f"{video_labels[i]}{audio_labels[i]}" for i in range(n)
+        )
+        exact_audio = bool(
+            exact_output_frames is not None
+            and detected_fps
+            and detected_fps > 0
+        )
+        audio_output_label = "[joined_audio]" if exact_audio else "[outa]"
+        concat_filter = (
+            f"{filter_inputs}concat=n={n}:v=1:a=1[outv]"
+            f"{audio_output_label}"
+        )
+        filter_str = ";".join([*trim_filters, concat_filter])
+        if exact_audio:
+            if detected_audio_sample_rate:
+                exact_audio_limit = (
+                    "end_sample="
+                    f"{round(exact_output_frames / detected_fps * detected_audio_sample_rate)}"
+                )
+            else:
+                exact_audio_limit = (
+                    f"duration={exact_output_frames / detected_fps:.9f}"
+                )
+            filter_str += (
+                ";[joined_audio]apad,"
+                f"atrim={exact_audio_limit},asetpts=PTS-STARTPTS[outa]"
+            )
         cmd += ["-filter_complex", filter_str]
         cmd += ["-map", "[outv]", "-map", "[outa]"]
+        # AAC inputs can retain encoder-padding timestamps after atrim. The
+        # video frame count is authoritative for H3's exact 17-frame discard.
         cmd += ["-c:a", "aac"]
+        if not exact_audio:
+            cmd += ["-shortest"]
     else:
-        filter_inputs = "".join(f"[{i}:v]" for i in range(n))
-        filter_str = f"{filter_inputs}concat=n={n}:v=1:a=0[outv]"
+        filter_inputs = "".join(video_labels)
+        concat_filter = f"{filter_inputs}concat=n={n}:v=1:a=0[outv]"
+        filter_str = ";".join([*trim_filters, concat_filter])
         if audio_path and (audio_start_sec > 0 or pad_audio):
             audio_filters = []
             if audio_start_sec > 0:
@@ -6648,6 +7173,8 @@ def concatenate_multi_clip_videos(
     # keeping it aligned with the overlaid audio track.
     if detected_fps and detected_fps > 0:
         cmd += ["-r", str(detected_fps), "-vsync", "cfr"]
+    if exact_output_frames is not None:
+        cmd += ["-frames:v", str(exact_output_frames)]
 
     cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-pix_fmt", "yuv420p", output_path_ffmpeg]
@@ -6717,7 +7244,11 @@ def concatenate_multi_clip_videos(
                 tail = err[-1000:] if len(err) > 1000 else err
                 print(tail)
             _remove_partial_output()
-            return False
+            raise PostDecodeStageError(
+                f"ffmpeg concatenation exited with status {returncode}",
+                stage=failure_stage,
+                code=f"{failure_code_prefix}_process_failed",
+            )
 
         # Verify output file has content; an ffmpeg zero-byte success is not a
         # usable artifact and must not survive without ownership metadata.
@@ -6728,18 +7259,32 @@ def concatenate_multi_clip_videos(
         else:
             print(f"[Multi-Clip] Output file missing or empty")
             _remove_partial_output()
-            return False
-    except subprocess.TimeoutExpired:
+            raise PostDecodeStageError(
+                "ffmpeg concatenation produced no complete output",
+                stage=failure_stage,
+                code=f"{failure_code_prefix}_output_invalid",
+            )
+    except subprocess.TimeoutExpired as error:
         print(f"[Multi-Clip] ffmpeg timed out after 1200s")
         if process is not None and process.poll() is None:
             process.kill()
             process.communicate()
         _remove_partial_output()
-        return False
+        raise PostDecodeStageError(
+            "ffmpeg concatenation timed out",
+            stage=failure_stage,
+            code=f"{failure_code_prefix}_timeout",
+        ) from error
+    except PostDecodeStageError:
+        raise
     except Exception as e:
         print(f"[Multi-Clip] Concatenation failed: {e}")
         _remove_partial_output()
-        return False
+        raise PostDecodeStageError(
+            "ffmpeg concatenation raised an exception",
+            stage=failure_stage,
+            code=f"{failure_code_prefix}_exception",
+        ) from e
 
 _AUDIO_TRANSCODE_CACHE = {}
 
@@ -6873,6 +7418,34 @@ def resolve_mux_audio_sampling_rate(default_rate, source_audio_metadata=None, au
         if audio_path:
             sample_rates.append(get_audio_file_sample_rate(audio_path))
     return max(sample_rates)
+
+
+def resolve_mux_audio_contract(
+    base_model_type,
+    generated_audio,
+    default_rate,
+    source_audio_metadata=None,
+    audio_paths=None,
+    native_h3_audio_selected=False,
+):
+    """Return the final sample-rate/channel contract without changing legacy models."""
+    if native_h3_audio_selected:
+        if base_model_type not in {"minimax_h3", "minimax_h3_ref2va"}:
+            raise ValueError("Native H3 audio selection requires a MiniMax H3 model")
+        if generated_audio is None:
+            raise ValueError("Selected MiniMax H3 audio is missing")
+        audio = np.asarray(generated_audio)
+        if audio.ndim != 2 or audio.shape[1] != 2:
+            raise ValueError("MiniMax H3 generated audio must be stereo")
+        return 32000, 2
+    return (
+        resolve_mux_audio_sampling_rate(
+            default_rate,
+            source_audio_metadata,
+            audio_paths,
+        ),
+        1,
+    )
 
 
 def resolve_model_preprocess_all(model_def, **kwargs):
@@ -7239,16 +7812,153 @@ def generate_video(
     outpaint_full_resolution_refine=False,
     # Use Maestro's managed In/Outpaint IC-LoRA stack.
     outpaint_official_stack=False,
-    # MiniMax H3 Ref2VA's ordered image/video/audio manifest and reference
-    # preparation policy. Other model runtimes ignore these kwargs.
-    minimax_h3_references=None,
-    minimax_h3_reference_detail="match",
-    minimax_h3_text_encoder="nvfp4_awq",
-    # Complete Context-IR prompts compiled by Maestro's H3 sliding-window
-    # planner. Kept as a real list so semantic newlines inside each prompt are
-    # never mistaken for prompt boundaries.
-    h3_window_prompts=None,
+    # MiniMax H3 Ref2VA accepts up to three independent semantic video
+    # references. Keep these at the end so legacy positional callers remain
+    # compatible; task dispatch discovers them through signature inspection.
+    video_guide2=None,
+    video_guide3=None,
+    # Opt-in MiniMax H3 native AV boundary conditioning.  Ordinary requests
+    # retain the pre-12.44 path unless this public flag is exactly true; the
+    # private descriptor is injected only by Maestro's recovery-aware server.
+    h3_native_boundary_conditioning=False,
+    _h3_native_boundary=None,
+    # Server-owned capability for the fixed local Ref2VA Turbo visual probe.
+    # HTTP clients cannot set it, and API workers inject it only after media
+    # authorization. It is deliberately a function argument rather than a
+    # custom setting so it cannot be restored from output metadata.
+    _h3_turbo_validation_authorized=False,
+    # API workers use this safe repeat boundary to publish a completed output
+    # before cooperatively yielding the shared generation slot. These private
+    # restart controls stay at the end so legacy positional callers remain
+    # compatible.
+    _recovery_output_directory=None,
+    _recovery_output_prefix="",
+    # Restart-only output offset. Completed ordinary repeats are skipped at
+    # dispatch; interrupted denoising still reruns because the offset advances
+    # only after media+sidecar evidence has been durably checkpointed.
+    repeat_start_offset=0,
+    after_repeat_output=None,
+    after_segment_output=None,
 ):
+
+    # API scheduling needs a model-safe boundary between independent outputs.
+    # Split an ordinary repeat request into complete one-output invocations so
+    # each one runs preparation, inference, publication, and cleanup before the
+    # callback can release the shared generation slot. The private marker keeps
+    # recursive one-output calls on the normal implementation below.
+    split_repeats = (
+        after_repeat_output is not None
+        and not getattr(after_repeat_output, "_maestro_single_repeat", False)
+    )
+    if split_repeats:
+        gen = get_gen_info(state)
+        try:
+            requested_repeats = max(1, int(repeat_generation or 1))
+        except (TypeError, ValueError):
+            requested_repeats = 1
+        try:
+            completed_repeats = max(
+                0, min(requested_repeats, int(repeat_start_offset or 0)),
+            )
+        except (TypeError, ValueError):
+            completed_repeats = 0
+        extra_repeats = 0
+        next_seed = -1 if completed_repeats else seed
+        gen["repeat_no"] = completed_repeats
+        gen["total_generation"] = requested_repeats
+        local_arguments = locals().copy()
+        recursive_arguments = {
+            name: local_arguments[name]
+            for name in inspect.signature(generate_video).parameters
+            if name in local_arguments
+        }
+
+        while not gen.get("abort", False):
+            try:
+                extra_repeats += int(gen.get("extra_orders", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            gen["extra_orders"] = 0
+            total_repeats = max(
+                completed_repeats,
+                requested_repeats + extra_repeats,
+            )
+            if completed_repeats >= total_repeats:
+                break
+
+            def _single_repeat_marker():
+                return True
+
+            _single_repeat_marker._maestro_single_repeat = True
+            _single_repeat_marker.repeat_offset = completed_repeats
+            _single_repeat_marker.repeat_total = total_repeats
+            recursive_arguments.update({
+                "repeat_generation": 1,
+                "seed": next_seed,
+                "after_repeat_output": _single_repeat_marker,
+            })
+            if not generate_video(**recursive_arguments):
+                return False
+
+            completed_repeats += 1
+            next_seed = -1
+            gen["repeat_no"] = completed_repeats
+            gen["total_generation"] = total_repeats
+            if after_repeat_output() is False:
+                gen["abort"] = True
+                return False
+
+        return not gen.get("abort", False)
+
+    durable_output_dir = None
+    durable_output_prefix = ""
+    if _recovery_output_directory is not None or _recovery_output_prefix:
+        candidate = os.path.abspath(str(_recovery_output_directory or ""))
+        expected = os.path.abspath(
+            os.path.join(save_path, ".maestro-recovery", "staging")
+        )
+        durable_output_prefix = str(_recovery_output_prefix or "")
+        if (
+            os.path.realpath(candidate) != os.path.realpath(expected)
+            or not os.path.isdir(candidate)
+            or os.path.islink(candidate)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,180}",
+                durable_output_prefix,
+            ) is None
+        ):
+            raise RuntimeError("Recovery output staging identity is invalid")
+        durable_output_dir = candidate
+
+        # A killed preprocessing pass may leave randomized helper outputs.
+        # Bound cleanup to this exact task's private prefix; continuation and
+        # native media use distinct suffixes and survive until their durable
+        # dependents have completed.
+        stale_prefix = f"{durable_output_prefix}-pre-"
+        removed_stale = 0
+        for entry in sorted(os.scandir(durable_output_dir), key=lambda item: item.name):
+            if removed_stale >= 32 or not entry.name.startswith(stale_prefix):
+                continue
+            try:
+                info = os.lstat(entry.path)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or not entry.is_file(follow_symlinks=False)
+                ):
+                    continue
+                os.unlink(entry.path)
+                removed_stale += 1
+            except OSError:
+                continue
+
+    def _recovery_preprocess_path(label, extension=".wav"):
+        if durable_output_dir is None:
+            return None
+        return os.path.join(
+            durable_output_dir,
+            f"{durable_output_prefix}-pre-{label}{extension}",
+        )
 
 
 
@@ -7291,6 +8001,7 @@ def generate_video(
 
 
     model_def = get_model_def(model_type) 
+    semantic_reference_mode = bool(model_def.get("minimax_h3_reference_mode", False))
     is_image = image_mode > 0
     audio_only = model_def.get("audio_only", False)
     duration_def = model_def.get("duration_slider", None)
@@ -7326,24 +8037,8 @@ def generate_video(
         while wan_model == None:
             time.sleep(1)
     vae_upsampling = model_def.get("vae_upsampler", None)
+    new_vae_upsampling = None
     model_kwargs = {}
-    if str(model_def.get("architecture") or "").startswith("minimax_h3"):
-        requested_h3_text_encoder = str(
-            minimax_h3_text_encoder
-            or model_def.get("minimax_h3_text_encoder_default", "nvfp4_awq")
-        )
-        model_kwargs["minimax_h3_text_encoder"] = requested_h3_text_encoder
-        loaded_h3_text_encoder = getattr(wan_model, "text_encoder_variant", None)
-        if (
-            wan_model is not None
-            and loaded_h3_text_encoder != requested_h3_text_encoder
-        ):
-            print(
-                "[MiniMax H3] Text encoder changed "
-                f"{loaded_h3_text_encoder or 'unknown'} -> {requested_h3_text_encoder}; "
-                "reloading the model profile."
-            )
-            reload_needed = True
     if vae_upsampling is not None:
         new_vae_upsampling = None if image_mode not in vae_upsampling or "vae" not in spatial_upsampling else spatial_upsampling
         # Read back the currently-applied setting to decide whether a reload
@@ -7364,10 +8059,28 @@ def generate_video(
         if new_vae_upsampling: model_kwargs = {"VAE_upsampling": new_vae_upsampling}
     output_type = get_output_type_for_model(model_type, image_mode)
     profile = compute_profile(override_profile, output_type)
+    requested_model_configuration = _model_load_configuration(
+        args.vram_safety_coefficient,
+        profile,
+        output_type,
+        new_vae_upsampling,
+        vae_config,
+        _model_load_environment_signature(model_type, profile),
+    )
+    configuration_reprofiled = _release_for_model_reprofile(
+        wan_model,
+        _loaded_model_configuration,
+        requested_model_configuration,
+        release_model,
+    )
+    # MMGP budgets are established by offload.profile. Reusing the same model
+    # after a coefficient/profile/VAE change would retain the stale budget, so
+    # the helper above goes through the existing safe release path exactly once.
     enhancer_mode = server_config.get("enhancer_mode", 1)
     if model_type != transformer_type or reload_needed or profile != loaded_profile:
-        release_model()
-        # Pre-flight: detect first-use download so the UI can show
+        if not configuration_reprofiled:
+            release_model()
+        # Pre-flight: detect a missing host download so the UI can show
         # "Downloading model..." instead of "Loading model..." while
         # the multi-GB safetensors come down. Heuristic — checks
         # whether the primary weights file exists locally; doesn't
@@ -7376,7 +8089,7 @@ def generate_video(
         # brittle. Edge case: primary file present but a secondary
         # asset missing → we'd show "Loading" while a small download
         # happens. Acceptable trade-off; the dominant case (full
-        # first-time download of a fresh model) is correctly tagged.
+        # download of a model absent from this host) is correctly tagged.
         _model_label = get_model_name(model_type)
         _needs_download = False
         try:
@@ -7393,13 +8106,14 @@ def generate_video(
         except Exception:
             pass  # never let a UX-only check block generation
         if _needs_download:
-            send_cmd("status", f"Downloading model {_model_label} (first use, may take several minutes)...")
+            send_cmd("status", f"Downloading model {_model_label} on this host (may take several minutes)...")
         else:
             send_cmd("status", f"Loading model {_model_label}...")
         wan_model, offloadobj = load_models(
             model_type,
             override_profile,
             output_type=output_type,
+            load_status_callback=lambda stage: send_cmd("status", stage),
             **model_kwargs,
         )
         send_cmd("status", "Model loaded")
@@ -7429,61 +8143,37 @@ def generate_video(
     # Auto resolution: compute from reference image aspect ratio
     if _auto_aspect:
         _auto_resolved = False
-        _resolution_hint = str(resolution or "auto")
-        _h3_auto_budgets = model_def.get("auto_resolution_budgets") or {}
-        _h3_auto_fallbacks = model_def.get("auto_resolution_fallbacks") or {}
         # Determine pixel budget from resolution hint
-        if _resolution_hint in _h3_auto_budgets:
-            _auto_budget = int(_h3_auto_budgets[_resolution_hint])
-        elif "1080" in _resolution_hint:
+        if "1080" in str(resolution):
             _auto_budget = 1920 * 1088
-        elif "480" in _resolution_hint:
+        elif "480" in str(resolution):
             _auto_budget = 848 * 480
         else:
             _auto_budget = 1280 * 720  # default 720p
-        # Check for reference images (image gen), an FL2VA start image, or
-        # the first visual Ref2VA reference. Audio-only references cannot
-        # establish an output aspect ratio.
+        # Check for reference images (image gen) or start image (video gen)
         _auto_ref = None
-        _auto_ref_kind = "image"
         if is_image and image_refs:
             _auto_ref = image_refs[0] if isinstance(image_refs, list) else image_refs
         elif image_start:
             _auto_ref = image_start
-        elif minimax_h3_references:
-            for _reference in minimax_h3_references:
-                if not isinstance(_reference, dict):
-                    continue
-                _reference_kind = str(
-                    _reference.get("type") or _reference.get("kind") or ""
-                ).strip().lower()
-                _reference_path = _reference.get("path")
-                if _reference_kind in {"image", "video"} and _reference_path:
-                    _auto_ref = _reference_path
-                    _auto_ref_kind = _reference_kind
-                    break
-        if isinstance(_auto_ref, (list, tuple)):
-            _auto_ref = _auto_ref[0] if _auto_ref else None
         # Get dimensions — ref could be a file path or PIL Image
         from PIL import Image as _PILImg
         _rw, _rh = None, None
         if isinstance(_auto_ref, _PILImg.Image):
             _rw, _rh = _auto_ref.size
         elif isinstance(_auto_ref, str) and os.path.isfile(_auto_ref):
-            if _auto_ref_kind == "video":
-                _, _rw, _rh, _ = get_video_info(_auto_ref)
-            else:
-                with _PILImg.open(_auto_ref) as _ri:
-                    _rw, _rh = _ri.size
+            _ri = _PILImg.open(_auto_ref)
+            _rw, _rh = _ri.size
+            _ri.close()
         if _rw and _rh:
             _scale = (_auto_budget / (_rw * _rh)) ** 0.5
-            _aw = max(block_size, int(round(_rw * _scale / block_size)) * block_size)
-            _ah = max(block_size, int(round(_rh * _scale / block_size)) * block_size)
+            _aw = int(round(_rw * _scale / block_size)) * block_size
+            _ah = int(round(_rh * _scale / block_size)) * block_size
             resolution = f"{_aw}x{_ah}"
             print(f"[Auto Resolution] {_rw}x{_rh} source → {_aw}x{_ah} output (budget={'1080p' if _auto_budget > 1000000 else '720p'})")
             _auto_resolved = True
         if not _auto_resolved:
-            resolution = _h3_auto_fallbacks.get(_resolution_hint, "1280x720")
+            resolution = "1280x720"  # fallback
 
     width, height = resolution.split("x")
     width, height = int(width) // block_size *  block_size, int(height) // block_size *  block_size
@@ -7598,24 +8288,7 @@ def generate_video(
     trans2 = get_transformer_model(wan_model, 2)
     audio_sampling_rate = 16000
 
-    if (
-        str(model_def.get("architecture") or "").startswith("minimax_h3")
-        and isinstance(h3_window_prompts, (list, tuple))
-        and h3_window_prompts
-    ):
-        prompts = [
-            str(item).strip()
-            for item in h3_window_prompts
-            if isinstance(item, str) and item.strip()
-        ]
-        if not prompts:
-            prompts = [prompt]
-        else:
-            print(
-                f"[MiniMax H3] Using {len(prompts)} explicit "
-                "window-local Context-IR prompts."
-            )
-    elif multi_prompts_gen_type == 2:
+    if multi_prompts_gen_type == 2:
         prompts = [prompt]
     else:
         prompts = prompt.split("\n")
@@ -7642,6 +8315,9 @@ def generate_video(
     # gating on the request value hard-failed every two-phase multiplier.
     # Phases beyond what the run actually uses simply never fire.
     model_def_nb_phases = max(int(model_def.get("guidance_max_phases", guidance_phases) or 1), guidance_phases)
+    loras_selected = []
+    loras_list_mult_choices_nums = []
+    loras_slists = None
     if transformer_loras_filenames != None:
         loras_list_mult_choices_nums, loras_slists, errors =  parse_loras_multipliers(transformer_loras_multipliers, len(transformer_loras_filenames), num_inference_steps, nb_phases = model_def_nb_phases, model_switch_phase= model_switch_phase )
         if len(errors) > 0: raise Exception(f"Error parsing Transformer Loras: {errors}")
@@ -7663,6 +8339,9 @@ def generate_video(
     else:
         print(f"[LoRA] No LoRAs activated for this generation (model_type={model_type})")
 
+    # Handler-specific validation applies only to the ordinary/model/user
+    # adapters. H3 Turbo is a hidden server-owned runtime adapter and is
+    # prepared only after this contract succeeds.
     if hasattr(wan_model, "validate_loras"):
         wan_model.validate_loras(loras_selected)
 
@@ -7671,36 +8350,138 @@ def generate_video(
     else:     
         trans_lora, trans2_lora = trans, trans2
 
+    # H3 Turbo is a hidden managed adapter, never a public/user LoRA. Arm its
+    # compact-AdaLN capture before MMGP preprocesses the file, and append the
+    # backbone as a fixed-strength runtime adapter only after all other LoRA
+    # sources have been proven empty by the fail-closed request validator.
+    from services.h3_turbo import (
+        H3_TURBO_STRENGTH,
+        activate_h3_turbo_runtime,
+        clear_h3_turbo_runtime,
+        prepare_h3_turbo_runtime,
+        turbo_requested,
+        validate_turbo_request,
+    )
+    turbo_runtime_requested = turbo_requested(custom_settings)
+    turbo_assets = None
+    if turbo_runtime_requested:
+        validate_turbo_request(
+            base_model_type=base_model_type,
+            model_def=model_def,
+            custom_settings=custom_settings,
+            authored_steps=num_inference_steps,
+            activated_loras=activated_loras,
+            loras_multipliers=loras_multipliers,
+            skip_steps_cache_type=skip_steps_cache_type,
+            _h3_turbo_validation_authorized=(
+                _h3_turbo_validation_authorized is True
+            ),
+        )
+        turbo_assets = prepare_h3_turbo_runtime(
+            trans_lora,
+            custom_settings=custom_settings,
+            model_def=model_def,
+            managed_lora_index=len(loras_selected),
+        )
+        turbo_runtime_state = trans_lora.h3_turbo_runtime_state()
+        if turbo_runtime_state["backbone_mode"] == "residual_output" and loras_selected:
+            clear_h3_turbo_runtime(trans_lora)
+            raise Exception(
+                "H3 Turbo W4A8/PinkCherry cannot stack model-defined or user LoRAs: "
+                "their packed/INT8 generic adapter path is not dtype-safe"
+            )
+        if turbo_runtime_state["backbone_mode"] == "mmgp":
+            loras_list_mult_choices_nums, loras_slists, errors = parse_loras_multipliers(
+                str(H3_TURBO_STRENGTH),
+                1,
+                num_inference_steps,
+                nb_phases=model_def_nb_phases,
+                merge_slist=loras_slists,
+                model_switch_phase=model_switch_phase,
+            )
+            if len(errors) > 0:
+                clear_h3_turbo_runtime(trans_lora)
+                raise Exception(f"Error preparing H3 Turbo multiplier: {errors}")
+            loras_selected.append(str(turbo_assets.lora_path))
+    else:
+        clear_h3_turbo_runtime(trans_lora)
+
     if len(loras_selected) > 0:
         pinnedLora = loaded_profile !=5  # and transformer_loras_filenames == None False # # # 
         preprocess_target = trans_lora if trans_lora is not None else trans
         split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
-        offload.load_loras_into_model(
-            trans_lora,
-            loras_selected,
-            loras_list_mult_choices_nums,
-            activate_all_loras=True,
-            preprocess_sd=get_loras_preprocessor(preprocess_target, base_model_type),
-            pinnedLora=pinnedLora,
-            maxReservedLoras=server_config.get("max_reserved_loras", -1),
-            split_linear_modules_map=split_linear_modules_map,
-        )
+        try:
+            offload.load_loras_into_model(
+                trans_lora,
+                loras_selected,
+                loras_list_mult_choices_nums,
+                activate_all_loras=True,
+                preprocess_sd=get_loras_preprocessor(preprocess_target, base_model_type),
+                pinnedLora=pinnedLora,
+                maxReservedLoras=server_config.get("max_reserved_loras", -1),
+                split_linear_modules_map=split_linear_modules_map,
+            )
+        except Exception:
+            clear_h3_turbo_runtime(trans_lora)
+            raise
         errors = trans_lora._loras_errors
         if len(errors) > 0:
+            clear_h3_turbo_runtime(trans_lora)
             error_files = [msg for _ ,  msg  in errors]
             raise gr.Error("Error while loading Loras: " + ", ".join(error_files))
         if trans2_lora is not None: 
             offload.sync_models_loras(trans_lora, trans2_lora)
         if hasattr(wan_model, "finalize_loras"):
-            wan_model.finalize_loras()
+            try:
+                wan_model.finalize_loras()
+            except Exception:
+                offload.unload_loras_from_model(trans_lora)
+                clear_h3_turbo_runtime(trans_lora)
+                if trans2_lora is not None:
+                    offload.unload_loras_from_model(trans2_lora)
+                    clear_h3_turbo_runtime(trans2_lora)
+                raise
+    if turbo_assets is not None:
+        try:
+            activate_h3_turbo_runtime(trans_lora)
+        except Exception:
+            offload.unload_loras_from_model(trans_lora)
+            clear_h3_turbo_runtime(trans_lora)
+            if trans2_lora is not None:
+                offload.unload_loras_from_model(trans2_lora)
+                clear_h3_turbo_runtime(trans2_lora)
+            raise
         
     seed = None if seed == -1 else seed
     # negative_prompt = "" # not applicable in the inference
     model_filename = get_model_filename(base_model_type)  
 
     _, _, latent_size = get_model_min_frames_and_step(model_type)
-    video_length = normalize_model_total_frame_count(video_length, model_def)
+    video_length = align_model_frame_count(video_length, model_def)
     published_video_length = video_length
+    h3_native_boundary_video = None
+    h3_native_boundary_audio = None
+    if _h3_native_boundary is not None:
+        if (
+            h3_native_boundary_conditioning is not True
+            or not str(base_model_type).startswith("minimax_h3")
+        ):
+            raise ValueError(
+                "H3 native boundary media requires the opt-in H3 capability"
+            )
+        h3_native_boundary_video, h3_native_boundary_audio = (
+            load_h3_native_boundary_inputs(_h3_native_boundary)
+        )
+        from services.h3_boundary_policy import (
+            H3_NATIVE_HISTORY_FRAMES,
+            H3_NATIVE_OVERLAP_FRAMES,
+        )
+        video_length += H3_NATIVE_HISTORY_FRAMES
+        print(
+            "[MiniMax H3] Native boundary conditioning: "
+            f"{published_video_length} new + {H3_NATIVE_HISTORY_FRAMES} "
+            f"history frames ({video_length} model frames)."
+        )
     recast_warmup_frames = _resolve_scail2_recast_warmup_frames(
         custom_settings, model_def, video_prompt_type, latent_size,
     )
@@ -7712,11 +8493,7 @@ def generate_video(
             f"({published_video_length} published, {video_length} generated)."
         )
     if sliding_window_size !=0:
-        sliding_window_size = align_model_frame_count(
-            sliding_window_size,
-            model_def,
-            for_generation=True,
-        )
+        sliding_window_size = (sliding_window_size -1) // latent_size * latent_size + 1
     # Requantize audio_frame_offset to match the actual quantized video_length per clip.
     # Only recalculate for uniform-duration clips (multi_prompts_gen_type==3).
     # Clips dispatched from the manifest path (launch.py) already carry correct
@@ -7765,7 +8542,15 @@ def generate_video(
                 print(f"No audio track found in Control Video: {video_guide}")
                 audio_guide = None
             else:
-                audio_guide = extract_audio_track_to_wav(video_guide, get_available_filename(save_path, video_guide, suffix="_control_audio", force_extension=".wav"))
+                control_audio_path = _recovery_preprocess_path("control-audio")
+                if control_audio_path is None:
+                    control_audio_path = get_available_filename(
+                        save_path, video_guide,
+                        suffix="_control_audio", force_extension=".wav",
+                    )
+                audio_guide = extract_audio_track_to_wav(
+                    video_guide, control_audio_path,
+                )
                 temp_filenames_list.append(audio_guide)
         except Exception as e:
             print(f"Unable to extract Audio track from Control Video:{e}")
@@ -7785,7 +8570,15 @@ def generate_video(
     # missing audio. The temp file is registered for cleanup later.
     # (Upstream Wan2GP added this in MegaMix commit ecfe88b.)
     if "A" in audio_prompt_type and audio_guide is None:
-        audio_guide = create_silent_wav_file(save_path, current_video_length / fps, audio_sampling_rate)
+        audio_guide = create_silent_wav_file(
+            durable_output_dir or save_path,
+            current_video_length / fps,
+            audio_sampling_rate,
+            prefix=(
+                f"{durable_output_prefix}-pre-null-"
+                if durable_output_dir else "null_audio_"
+            ),
+        )
         temp_filenames_list.append(audio_guide)
 
     reset_control_aligment = "T" in video_prompt_type
@@ -7860,8 +8653,6 @@ def generate_video(
         elif skip_steps_cache_type == "tea":
             def_tea_coefficients = model_def.get("teacache_coefficients", None) if model_def != None else None
             if def_tea_coefficients is not None: skip_steps_cache.coefficients = def_tea_coefficients
-        elif skip_steps_cache_type == "first_block":
-            pass
         else:
             raise Exception(f"unknown cache type {skip_steps_cache_type}")
     trans.cache = skip_steps_cache
@@ -7891,34 +8682,69 @@ def generate_video(
         clean_audio_files = "V" in audio_prompt_type
         if audio_guide2 is not None:
             if "N" in audio_prompt_type:
-                audio_guide, audio_guide2, _ = normalize_audio_pair_volumes_to_temp_files(audio_guide, audio_guide2, output_dir=save_path, prefix="audio_norm_")
+                audio_guide, audio_guide2, _ = normalize_audio_pair_volumes_to_temp_files(
+                    audio_guide,
+                    audio_guide2,
+                    output_dir=durable_output_dir or save_path,
+                    prefix=(
+                        f"{durable_output_prefix}-pre-audio-norm-"
+                        if durable_output_dir else "audio_norm_"
+                    ),
+                )
                 temp_filenames_list += [audio_guide, audio_guide2]
             duration2 = librosa.get_duration(path=audio_guide2)
             if "C" in audio_prompt_type: duration += duration2
             else: duration = min(duration, duration2)
             combination_type = "para" if "P" in audio_prompt_type else "add" 
             if clean_audio_files:
-                audio_guide = get_vocals(original_audio_guide, get_available_filename(save_path, audio_guide, "_clean", ".wav"))
-                audio_guide2 = get_vocals(original_audio_guide2, get_available_filename(save_path, audio_guide2, "_clean2", ".wav"))
+                clean_path = _recovery_preprocess_path("clean-audio-1")
+                clean_path2 = _recovery_preprocess_path("clean-audio-2")
+                if clean_path is None:
+                    clean_path = get_available_filename(
+                        save_path, audio_guide, "_clean", ".wav",
+                    )
+                    clean_path2 = get_available_filename(
+                        save_path, audio_guide2, "_clean2", ".wav",
+                    )
+                audio_guide = get_vocals(original_audio_guide, clean_path)
+                audio_guide2 = get_vocals(original_audio_guide2, clean_path2)
                 temp_filenames_list += [audio_guide, audio_guide2]
         else:
             if "X" in audio_prompt_type: 
                 # dual speaker, voice separation
                 from preprocessing.speakers_separator import extract_dual_audio
                 combination_type = "para"
-                if args.save_speakers:
+                if durable_output_dir:
+                    audio_guide = _recovery_preprocess_path("speaker-1")
+                    audio_guide2 = _recovery_preprocess_path("speaker-2")
+                    temp_filenames_list += [audio_guide, audio_guide2]
+                elif args.save_speakers:
                     audio_guide, audio_guide2  = "speaker1.wav", "speaker2.wav"
                 else:
                     audio_guide, audio_guide2  = get_available_filename(save_path, audio_guide, "_tmp1", ".wav"),  get_available_filename(save_path, audio_guide, "_tmp2", ".wav")
                     temp_filenames_list +=   [audio_guide, audio_guide2]                  
                 if clean_audio_files:
-                    clean_audio_guide = get_vocals(original_audio_guide, get_available_filename(save_path, original_audio_guide, "_clean", ".wav"))
+                    clean_audio_path = _recovery_preprocess_path("speaker-clean")
+                    if clean_audio_path is None:
+                        clean_audio_path = get_available_filename(
+                            save_path, original_audio_guide, "_clean", ".wav",
+                        )
+                    clean_audio_guide = get_vocals(
+                        original_audio_guide, clean_audio_path,
+                    )
                     temp_filenames_list += [clean_audio_guide]
                 extract_dual_audio(clean_audio_guide if clean_audio_files else original_audio_guide, audio_guide, audio_guide2)
 
             elif clean_audio_files:
                 # Single Speaker
-                audio_guide = get_vocals(original_audio_guide, get_available_filename(save_path, audio_guide, "_clean", ".wav"))
+                clean_audio_path = _recovery_preprocess_path("clean-audio")
+                if clean_audio_path is None:
+                    clean_audio_path = get_available_filename(
+                        save_path, audio_guide, "_clean", ".wav",
+                    )
+                audio_guide = get_vocals(
+                    original_audio_guide, clean_audio_path,
+                )
                 temp_filenames_list += [audio_guide]
 
             output_new_audio_filepath = original_audio_guide
@@ -7927,7 +8753,12 @@ def generate_video(
         if audio_frame_offset > 0 and output_new_audio_filepath is not None:
             import soundfile as sf
             offset_sec = float(audio_frame_offset) / float(fps)
-            trimmed_audio_path = get_available_filename(save_path, output_new_audio_filepath, f"_clip_offset", ".wav")
+            trimmed_audio_path = _recovery_preprocess_path("clip-offset")
+            if trimmed_audio_path is None:
+                trimmed_audio_path = get_available_filename(
+                    save_path, output_new_audio_filepath,
+                    "_clip_offset", ".wav",
+                )
             with sf.SoundFile(output_new_audio_filepath) as audio_file:
                 sr = audio_file.samplerate
                 start_sample = int(round(offset_sec * sr))
@@ -7987,8 +8818,10 @@ def generate_video(
         clear_status(state)
         trans.cache = None
         offload.unload_loras_from_model(trans_lora)
+        clear_h3_turbo_runtime(trans_lora)
         if trans2_lora is not None:
             offload.unload_loras_from_model(trans2_lora)
+            clear_h3_turbo_runtime(trans2_lora)
         if trans2 is not None:
             trans2.cache = None
         if control_audio_tracks or source_audio_tracks:
@@ -8011,6 +8844,18 @@ def generate_video(
     os.makedirs(save_path, exist_ok=True)
     os.makedirs(image_save_path, exist_ok=True)
     os.makedirs(audio_save_path, exist_ok=True)
+    if durable_output_dir is not None:
+        # Recheck after preprocessing, immediately before native output. A
+        # replaced staging path must fail closed rather than redirect media.
+        expected = os.path.abspath(os.path.join(
+            save_path, ".maestro-recovery", "staging",
+        ))
+        if (
+            os.path.realpath(durable_output_dir) != os.path.realpath(expected)
+            or not os.path.isdir(durable_output_dir)
+            or os.path.islink(durable_output_dir)
+        ):
+            raise RuntimeError("Recovery output staging identity is invalid")
     gc.collect()
     torch.cuda.empty_cache()
     if gen.get("abort", False):
@@ -8026,7 +8871,22 @@ def generate_video(
     abort = False
     # gen["abort"] = False
     gen["prompt"] = prompt    
+    single_repeat_dispatch = bool(
+        getattr(after_repeat_output, "_maestro_single_repeat", False)
+    )
+    single_repeat_offset = (
+        max(0, int(getattr(after_repeat_output, "repeat_offset", 0) or 0))
+        if single_repeat_dispatch else 0
+    )
+    # Each recursive API dispatch is a fresh native generation invocation, so
+    # its behavioral repeat index must still run 0 -> 1.  The global offset is
+    # display/accounting context only; using it here skips first-repeat image
+    # reference and custom-frame preparation on output two and later.
     repeat_no = 0
+    # A recursive API repeat owns exactly one native output.  Capture its
+    # exclusive stop before entering the loop; deriving it from repeat_no on
+    # every iteration moves the finish line forever (1, 2, 3, ...).
+    single_repeat_target = 1 if single_repeat_dispatch else None
     extra_generation = 0
     initial_total_windows = 0
     discard_last_frames = sliding_window_discard_last_frames
@@ -8038,19 +8898,52 @@ def generate_video(
     else:
         initial_total_windows = 1
 
+    # Studio global-timeline prompts arrive as one structured prompt
+    # (multi_prompts_gen_type=2). Only now do we know the backend's effective
+    # FPS and quantized window/overlap/discard geometry, so this is the first
+    # safe place to clip global timestamps into window-local prompts. Director
+    # and legacy line-per-window flows use other prompt modes and are unchanged.
+    studio_global_timeline = False
+    if sliding_window and multi_prompts_gen_type == 2:
+        timeline_prompts = prompt_parser.build_global_timeline_window_prompts(
+            prompt,
+            total_frames=default_requested_frames_to_generate,
+            fps=fps,
+            window_size=sliding_window_size,
+            discard_last_frames=discard_last_frames,
+            reuse_frames=reuse_frames,
+        )
+        if timeline_prompts is not None:
+            prompts = timeline_prompts
+            studio_global_timeline = True
+            print(
+                f"[Studio Timeline] Mapped one global prompt into "
+                f"{len(prompts)} backend windows at {fps:g} fps"
+            )
+
     first_window_video_length = current_video_length
     original_prompts = prompts.copy()
     gen["sliding_window"] = sliding_window 
     while not abort: 
-        extra_generation += gen.get("extra_orders",0)
-        gen["extra_orders"] = 0
-        total_generation = repeat_generation + extra_generation
-        gen["total_generation"] = total_generation     
+        if not single_repeat_dispatch:
+            extra_generation += gen.get("extra_orders",0)
+            gen["extra_orders"] = 0
+        total_generation = single_repeat_target if single_repeat_dispatch else repeat_generation + extra_generation
+        gen["total_generation"] = (
+            max(
+                total_generation,
+                int(getattr(after_repeat_output, "repeat_total", total_generation) or total_generation),
+            )
+            if single_repeat_dispatch else total_generation
+        )
         gen["header_text"] = ""    
         if repeat_no >= total_generation: break
         repeat_no +=1
-        gen["repeat_no"] = repeat_no
-        src_video = src_video2 = src_mask = src_mask2 = src_faces = sparse_video_image = full_generated_audio =None
+        gen["repeat_no"] = (
+            single_repeat_offset + repeat_no
+            if single_repeat_dispatch else repeat_no
+        )
+        src_video = src_video2 = src_video3 = src_mask = src_mask2 = src_faces = sparse_video_image = full_generated_audio =None
         prefix_video = pre_video_frame = None
         source_video_overlap_frames_count = 0 # number of frames overalapped in source video for first window
         source_video_frames_count = 0  # number of frames to use in source video (processing starts source_video_overlap_frames_count frames before )
@@ -8143,7 +9036,7 @@ def generate_video(
         cached_video_guide_processed = cached_video_mask_processed = cached_video_guide_processed2 = cached_video_mask_processed2 = None
         cached_video_video_start_frame = cached_video_video_end_frame = -1
         start_time = time.time()
-        if prompt_enhancer_image_caption_model != None and prompt_enhancer !=None and len(prompt_enhancer)>0 and enhancer_mode == 0:
+        if not studio_global_timeline and prompt_enhancer_image_caption_model != None and prompt_enhancer !=None and len(prompt_enhancer)>0 and enhancer_mode == 0:
             send_cmd("progress", [0, get_latest_status(state, "Enhancing Prompt")])
             enhanced_prompts = process_prompt_enhancer(model_def, prompt_enhancer, original_prompts,  image_start if image_start is not None else image_end , original_image_refs, is_image, audio_only, seed )
             unload_prompt_enhancer_runtime()
@@ -8167,30 +9060,9 @@ def generate_video(
             sliding_window = sliding_window  or extra_windows > 0
             if sliding_window and window_no > 0:
                 # num_frames_generated -= reuse_frames
-                remaining_output_frames = (
-                    requested_frames_to_generate - num_frames_generated
-                )
-                if remaining_output_frames <= 0:
+                if (requested_frames_to_generate - num_frames_generated) <  latent_size:
                     break
-                if (
-                    remaining_output_frames < latent_size
-                    and not model_def.get(
-                        "sliding_window_exact_total_frames",
-                        False,
-                    )
-                ):
-                    break
-                remaining_with_context = (
-                    remaining_output_frames
-                    + reuse_frames
-                    + discard_last_frames
-                )
-                current_video_length = compute_next_sliding_window_length(
-                    remaining_with_context,
-                    sliding_window_size,
-                    latent_size,
-                    model_def,
-                )
+                current_video_length = min(sliding_window_size, ((requested_frames_to_generate - num_frames_generated + reuse_frames + discard_last_frames) // latent_size) * latent_size + 1 )
 
             total_windows = initial_total_windows + extra_windows
             gen["total_windows"] = total_windows
@@ -8198,6 +9070,11 @@ def generate_video(
                 break
             window_no += 1
             gen["window_no"] = window_no
+            # The API runner publishes this state to Studio's job card. Keep
+            # the exact per-window prompt here (after global-timeline mapping
+            # and prompt preprocessing selection) instead of asking the UI to
+            # guess which timestamp segment is active.
+            gen["current_window_prompt"] = prompt
             return_latent_slice = None 
             frames_relative_positions_list = []
             if reuse_frames > 0:                
@@ -8235,19 +9112,9 @@ def generate_video(
                     source_video_overlap_frames_count = source_video_frames_count = guide_start_frame = 0
             if image_end is not None:
                 image_end_list=  image_end if isinstance(image_end, list) else [image_end]
-                image_end_for_window = None
-                if (
-                    model_def.get("sliding_window_end_image_at_final", False)
-                    and sliding_window
-                    and len(image_end_list) == 1
-                ):
-                    if window_no == total_windows:
-                        image_end_for_window = image_end_list[0]
-                elif len(image_end_list) >= window_no:
-                    image_end_for_window = image_end_list[window_no - 1]
-                if image_end_for_window is not None:
+                if len(image_end_list) >= window_no:
                     new_height, new_width = image_size                    
-                    image_end_tensor, _, _ = calculate_dimensions_and_resize_image(image_end_for_window, new_height, new_width, sample_fit_canvas, fit_crop, block_size = block_size)
+                    image_end_tensor, _, _ = calculate_dimensions_and_resize_image(image_end_list[window_no-1], new_height, new_width, sample_fit_canvas, fit_crop, block_size = block_size)
                     # image_end_tensor =image_end_list[window_no-1].resize((new_width, new_height), resample=Image.Resampling.LANCZOS) 
                     refresh_preview["image_end"] = image_end_tensor 
                     image_end_tensor = convert_image_to_tensor(image_end_tensor)
@@ -8384,7 +9251,7 @@ def generate_video(
 
 
             video_guide_processed = video_mask_processed = video_guide_processed2 = video_mask_processed2 = sparse_video_image = None
-            if video_guide is not None:
+            if video_guide is not None and not semantic_reference_mode:
                 keep_frames_parsed_full, error = parse_keep_frames_video_guide(keep_frames_video_guide, source_video_frames_count -source_video_overlap_frames_count + requested_frames_to_generate)
                 if len(error) > 0:
                     raise gr.Error(f"invalid keep frames {keep_frames_video_guide}")
@@ -8558,7 +9425,7 @@ def generate_video(
                 )
 
             frames_to_inject_parsed = frames_to_inject[ window_start_frame if extract_guide_from_window_start else guide_start_frame: guide_end_frame]
-            if video_guide is not None or len(frames_to_inject_parsed) > 0 or model_def.get("forced_guide_mask_inputs", False): 
+            if (video_guide is not None and not semantic_reference_mode) or len(frames_to_inject_parsed) > 0 or model_def.get("forced_guide_mask_inputs", False):
                 any_mask = video_mask is not None or model_def.get("forced_guide_mask_inputs", False)
                 any_guide_padding = model_def.get("pad_guide_video", False)
                 dont_cat_preguide = extract_guide_from_window_start or model_def.get("dont_cat_preguide", False) or sparse_video_image is not None 
@@ -8660,6 +9527,15 @@ def generate_video(
                 # need their generated history as input_video.
                 input_video_for_model = None if fake_start_image and window_no == 1 else pre_video_guide
                 prefix_frames_count = source_video_overlap_frames_count if window_no <= 1 else reuse_frames
+                if h3_native_boundary_video is not None:
+                    if window_no != 1:
+                        raise ValueError(
+                            "H3 native boundary conditioning requires one server-planned window"
+                        )
+                    input_video_for_model = h3_native_boundary_video
+                    prefix_frames_count = H3_NATIVE_OVERLAP_FRAMES
+                    input_waveform = h3_native_boundary_audio
+                    input_waveform_sample_rate = 32000
                 prefix_video_for_model = prefix_video
                 if prefix_video is not None and prefix_video.dtype == torch.uint8:
                     prefix_video_for_model = prefix_video.float().div_(127.5).sub_(1.0)
@@ -8674,6 +9550,38 @@ def generate_video(
                     custom_settings_for_model[
                         "scail2_recast_warmup_frames"
                     ] = recast_warmup_frames
+                if h3_native_boundary_video is not None:
+                    custom_settings_for_model[
+                        "h3_native_boundary_conditioning"
+                    ] = True
+                if semantic_reference_mode:
+                    reference_paths = [
+                        path for path in (video_guide, video_guide2, video_guide3)
+                        if path is not None
+                    ]
+                    if reference_paths:
+                        send_cmd("progress", [0, get_latest_status(state, "Preparing Semantic References")])
+                    reference_durations = []
+                    for reference_index, path in enumerate(reference_paths, 1):
+                        source_fps, _, _, source_frames = get_video_info(path)
+                        duration = source_frames / source_fps if source_fps else 0
+                        if duration < 2.0 or duration > 15.0:
+                            raise ValueError(
+                                f"MiniMax H3 reference video {reference_index} must be 2-15 seconds; "
+                                f"found {duration:.2f}s."
+                            )
+                        reference_durations.append(duration)
+                    if sum(reference_durations) > 15.0 + 1e-6:
+                        raise ValueError(
+                            "MiniMax H3 reference videos must total at most 15 seconds; "
+                            f"found {sum(reference_durations):.2f}s."
+                        )
+                    prepared_reference_videos = [
+                        prepare_semantic_reference_video(path, fps, model_def)
+                        for path in reference_paths
+                    ]
+                    prepared_reference_videos += [None] * (3 - len(prepared_reference_videos))
+                    src_video, src_video2, src_video3 = prepared_reference_videos[:3]
                 overridden_inputs = None
                 samples = call_with_sticky_interrupt(
                     gen,
@@ -8685,6 +9593,7 @@ def generate_video(
                     image_end = image_end_tensor,
                     input_frames = src_video,
                     input_frames2 = src_video2,
+                    input_frames3 = src_video3,
                     input_ref_images=  src_ref_images,
                     input_ref_masks = src_ref_masks,
                     input_masks = src_mask,
@@ -8774,6 +9683,9 @@ def generate_video(
                     outpaint_mask_preserve=outpaint_mask_preserve,
                     face_arc_embeds = face_arc_embeds,
                     custom_settings=custom_settings_for_model,
+                    _h3_turbo_validation_authorized=(
+                        _h3_turbo_validation_authorized is True
+                    ),
                     save_masks=args.save_masks,
                     temperature=temperature,
                     window_start_frame_no = window_start_frame,
@@ -8820,10 +9732,6 @@ def generate_video(
                     progressive_stage3_sigma=progressive_stage3_sigma,
                     progressive_stage1_image_weight=progressive_stage1_image_weight,
                     progressive_stage3_image_weight=progressive_stage3_image_weight,
-                    **({} if not model_def.get("omni_reference", False) else {
-                        "minimax_h3_references": minimax_h3_references,
-                        "minimax_h3_reference_detail": minimax_h3_reference_detail,
-                    }),
                     # Motion suffix: only passed when the loaded suffix video
                     # is available. Other model handlers (Wan / Flux / Qwen /
                     # Hunyuan) don't accept these kwargs, so we omit them
@@ -8837,6 +9745,7 @@ def generate_video(
                     abort = True
                     break
             except Exception as e:
+                failure_details = structured_generation_failure(e, task, state)
                 if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
                     cleanup_temp_audio_files(control_audio_tracks + source_audio_tracks)
                 remove_temp_filenames(temp_filenames_list)
@@ -8846,8 +9755,10 @@ def generate_video(
                 if trans2 is not None: 
                     trans2.cache = None 
                 offload.unload_loras_from_model(trans_lora)
+                clear_h3_turbo_runtime(trans_lora)
                 if trans2_lora is not None: 
                     offload.unload_loras_from_model(trans2_lora)
+                    clear_h3_turbo_runtime(trans2_lora)
                 skip_steps_cache = None
                 # if compile:
                 #     cache_size = torch._dynamo.config.cache_size_limit                                      
@@ -8856,26 +9767,12 @@ def generate_video(
 
                 gc.collect()
                 torch.cuda.empty_cache()
-                s = str(e)
-                keyword_list = {"CUDA out of memory" : "VRAM", "Tried to allocate":"VRAM", "CUDA error: out of memory": "RAM", "CUDA error: too many resources requested": "RAM"}
-                crash_type = ""
-                for keyword, tp  in keyword_list.items():
-                    if keyword in s:
-                        crash_type = tp 
-                        break
                 state["prompt"] = ""
-                if crash_type == "VRAM":
-                    new_error = "The generation of the video has encountered an error: it is likely that you have unsufficient VRAM and you should therefore reduce the video resolution or its number of frames."
-                elif crash_type == "RAM":
-                    new_error = "The generation of the video has encountered an error: it is likely that you have unsufficient RAM and / or Reserved RAM allocation should be reduced using 'perc_reserved_mem_max' or using a different Profile."
-                else:
-                    new_error =  gr.Error(f"The generation of the video has encountered an error, please check your terminal for more information. '{s}'")
-                tb = traceback.format_exc().split('\n')[:-1] 
-                print('\n'.join(tb))
-                send_cmd("error", new_error)
+                traceback.print_exc()
+                send_cmd("error", failure_details)
                 clear_status(state)
                 return False
-            src_video = src_video2 = src_mask = src_mask2 = None
+            src_video = src_video2 = src_video3 = src_mask = src_mask2 = None
             if skip_steps_cache != None :
                 skip_steps_cache.previous_residual = None
                 skip_steps_cache.previous_modulated_input = None
@@ -8983,38 +9880,6 @@ def generate_video(
                     if generated_audio is not None:
                         generated_audio = truncate_audio( generated_audio, reuse_frames, 0, fps, output_audio_sampling_rate,)
 
-                if (
-                    sliding_window
-                    and model_def.get("sliding_window_trim_to_requested", False)
-                ):
-                    # H3's individual passes must lie on a 17*n+5 grid, but
-                    # the joined Studio duration can be any frame count. The
-                    # final pass may therefore decode a few extra frames (or
-                    # a minimum-size continuation for a very short tail).
-                    # Trim that tail only after removing the shared boundary
-                    # frame so video and native audio keep the exact requested
-                    # joined duration.
-                    remaining_output_frames = max(
-                        0,
-                        requested_frames_to_generate
-                        - frames_already_processed_count,
-                    )
-                    excess_output_frames = max(
-                        0,
-                        int(sample.shape[1]) - remaining_output_frames,
-                    )
-                    if excess_output_frames > 0:
-                        sample = sample[:, :-excess_output_frames]
-                        guide_start_frame -= excess_output_frames
-                        if generated_audio is not None:
-                            generated_audio = truncate_audio(
-                                generated_audio,
-                                0,
-                                excess_output_frames,
-                                fps,
-                                output_audio_sampling_rate,
-                            )
-
                 num_frames_generated = guide_start_frame - (source_video_frames_count - source_video_overlap_frames_count)
                 if generated_audio is not None:
                     if full_generated_audio is None:
@@ -9096,13 +9961,34 @@ def generate_video(
                     container = server_config.get("video_container", "mp4")
                     extension = container
                     output_dir = save_path
+                if durable_output_dir is not None:
+                    output_dir = durable_output_dir
                 inputs = get_function_arguments(generate_video, locals())
+                # Runtime-only authorization must not reach filename
+                # formatting, embedded metadata, saved settings, or sidecars.
+                inputs.pop("_h3_turbo_validation_authorized", None)
+                inputs.pop("_h3_native_boundary", None)
+                inputs.pop("_recovery_output_directory", None)
+                inputs.pop("_recovery_output_prefix", None)
+                inputs.pop("after_repeat_output", None)
+                inputs.pop("after_segment_output", None)
                 if recast_warmup_frames > 0:
                     # The warm-up is an internal conditioning detail, not part
                     # of the duration users see or restore from metadata.
                     inputs["video_length"] = published_video_length
                 if overridden_inputs is not None: inputs.update(overridden_inputs)
-                if len(output_filename):
+                durable_file_stem = None
+                if durable_output_dir is not None:
+                    durable_repeat = (
+                        single_repeat_offset
+                        if single_repeat_dispatch else max(0, repeat_no - 1)
+                    )
+                    durable_file_stem = (
+                        f"{_recovery_output_prefix}-r{durable_repeat}"
+                        f"-w{max(1, int(window_no or 1))}"
+                    )
+                    file_name = f"{durable_file_stem}.{extension}"
+                elif len(output_filename):
                     from shared.utils.filename_formatter import FilenameFormatter
                     file_name = FilenameFormatter.format_filename(output_filename, inputs)                    
                     file_name = f"{sanitize_file_name(truncate_for_filesystem(os.path.splitext(os.path.basename(file_name))[0])).strip()}.{extension}"
@@ -9158,31 +10044,57 @@ def generate_video(
 
                     video_path= new_image_path
                 elif len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0 or output_new_audio_filepath is not None or any_mmaudio or output_new_audio_data is not None or audio_source is not None:
-                    video_path = os.path.join(save_path, file_name)
+                    video_path = os.path.join(output_dir, file_name)
                     save_path_tmp = video_path.rsplit('.', 1)[0] + f"_tmp.{container}"
-                    save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
+                    try:
+                        save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
+                    except Exception as error:
+                        raise PostDecodeStageError(
+                            "The rendered segment could not be encoded",
+                            stage="segment_checkpoint",
+                            code="segment_encode_failed",
+                        ) from error
                     output_new_audio_temp_filepath = None
                     try:
+                        native_h3_audio_selected = False
                         new_audio_added_from_audio_start =  reset_control_aligment or full_generated_audio is not None # if not beginning of audio will be skipped
                         source_audio_duration = source_video_frames_count / fps
                         if any_mmaudio:
                             send_cmd("progress", [0, get_latest_status(state,"MMAudio Soundtrack Generation")])
                             from postprocessing.mmaudio.mmaudio import video_to_audio
-                            output_new_audio_filepath = output_new_audio_temp_filepath = get_available_filename(save_path, f"tmp{time_flag}.wav" )
+                            output_new_audio_filepath = output_new_audio_temp_filepath = (
+                                os.path.join(output_dir, f"{durable_file_stem}-audio-tmp.wav")
+                                if durable_file_stem is not None
+                                else get_available_filename(output_dir, f"tmp{time_flag}.wav")
+                            )
                             video_to_audio(save_path_tmp, prompt = MMAudio_prompt, negative_prompt = MMAudio_neg_prompt, seed = seed, num_steps = 25, cfg_strength = 4.5, duration= output_frame_count / fps, save_path = output_new_audio_filepath, persistent_models = mmaudio_persistence == MMAUDIO_PERSIST_RAM, audio_file_only = True, verboseLevel = verbose_level, model_name = mmaudio_model_name, model_path = mmaudio_model_path)
                             new_audio_added_from_audio_start =  False
                         elif audio_source is not None:
                             output_new_audio_filepath = audio_source
                             new_audio_added_from_audio_start =  True
                         elif output_new_audio_data is not None:
-                            output_new_audio_filepath = output_new_audio_temp_filepath = get_available_filename(save_path, f"tmp{time_flag}.wav" )
+                            native_h3_audio_selected = base_model_type in {
+                                "minimax_h3", "minimax_h3_ref2va",
+                            }
+                            output_new_audio_filepath = output_new_audio_temp_filepath = (
+                                os.path.join(output_dir, f"{durable_file_stem}-audio-tmp.wav")
+                                if durable_file_stem is not None
+                                else get_available_filename(output_dir, f"tmp{time_flag}.wav")
+                            )
                             write_wav_file(output_new_audio_filepath, output_new_audio_data, output_audio_sampling_rate)
                         if output_new_audio_filepath is not None:
                             new_audio_tracks = [output_new_audio_filepath]
                         else:
                             new_audio_tracks = control_audio_tracks
                         if generated_audio is not None: output_new_audio_filepath = None
-                        mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
+                        mux_audio_sampling_rate, mux_audio_channels = resolve_mux_audio_contract(
+                            base_model_type,
+                            output_new_audio_data,
+                            output_audio_sampling_rate,
+                            source_audio_metadata,
+                            new_audio_tracks,
+                            native_h3_audio_selected=native_h3_audio_selected,
+                        )
 
                         combine_and_concatenate_video_with_audio_tracks(
                             video_path,
@@ -9194,8 +10106,17 @@ def generate_video(
                             new_audio_from_start=new_audio_added_from_audio_start,
                             source_audio_metadata=source_audio_metadata,
                             audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
+                            output_audio_channels=mux_audio_channels,
                             verbose=verbose_level >= 2,
                         )
+                    except PostDecodeStageError:
+                        raise
+                    except Exception as error:
+                        raise PostDecodeStageError(
+                            "The rendered output could not be combined with audio",
+                            stage="audio_mux",
+                            code="audio_mux_failed",
+                        ) from error
                     finally:
                         try:
                             os.remove(save_path_tmp)
@@ -9216,7 +10137,14 @@ def generate_video(
                                 print(f"  [WARN] Could not delete temp audio file (locked): {output_new_audio_temp_filepath}")
 
                 else:
-                    save_video( tensor=output_video_frames, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1),  codec_type= server_config.get("video_output_codec", None), container= container)
+                    try:
+                        save_video( tensor=output_video_frames, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1),  codec_type= server_config.get("video_output_codec", None), container= container)
+                    except Exception as error:
+                        raise PostDecodeStageError(
+                            "The rendered segment could not be encoded",
+                            stage="segment_checkpoint",
+                            code="segment_encode_failed",
+                        ) from error
 
                 # Register primary media immediately after its successful
                 # write. Gallery registration happens later, after metadata
@@ -9228,6 +10156,15 @@ def generate_video(
                 )
                 with lock:
                     artifact_list = gen.setdefault("artifact_list", [])
+                    artifact_roles = gen.setdefault("artifact_roles", {})
+                    rendered_role = (
+                        "window"
+                        if sliding_window
+                        and window_no < int(gen.get("total_windows", 1) or 1)
+                        else "component"
+                        if isinstance(multi_clip_info, dict)
+                        else "final"
+                    )
                     for artifact_path in saved_artifacts:
                         if (
                             isinstance(artifact_path, str)
@@ -9235,6 +10172,8 @@ def generate_video(
                             and artifact_path not in artifact_list
                         ):
                             artifact_list.append(artifact_path)
+                        if isinstance(artifact_path, str):
+                            artifact_roles[artifact_path] = rendered_role
 
                 # Alpha-frame ZIPs are deterministic companions of the
                 # registered media. Write them only after the media succeeds;
@@ -9252,6 +10191,8 @@ def generate_video(
                 inputs.pop("send_cmd")
                 inputs.pop("task")
                 inputs.pop("mode")
+                inputs.pop("after_repeat_output", None)
+                inputs.pop("after_segment_output", None)
                 inputs["model_type"] = model_type
                 inputs["model_filename"] = get_model_filename(model_type, transformer_quantization, transformer_dtype_policy)
                 if is_image:
@@ -9522,6 +10463,11 @@ def generate_video(
                         else:
                             file_list.append(path)
                             file_settings_list.append(configs if no > 0 else configs.copy())
+                        gen.setdefault("artifact_roles", {})[path] = (
+                            "component"
+                            if isinstance(multi_clip_info, dict)
+                            else "final"
+                        )
                         gen["last_was_audio"] = audio_only
 
                 embedded_images = None
@@ -9541,6 +10487,12 @@ def generate_video(
                     and not multi_clip_info.get("defer_concat", False)
                 ):
                     clip_path = video_path[0] if isinstance(video_path, list) else video_path
+                    clip_path = seal_multi_clip_segment_before_concat(
+                        clip_path,
+                        multi_clip_info,
+                        after_segment_output,
+                    )
+                    video_path = clip_path
                     clip_store = gen.setdefault("multi_clip_paths", {})
                     group_id = multi_clip_info["group_id"]
                     group = clip_store.setdefault(group_id, {})
@@ -9548,39 +10500,102 @@ def generate_video(
                         "path": clip_path,
                         "prompt": configs.get("prompt", ""),
                         "image_start": image_start or "",
+                        "discard_prefix_frames": int(
+                            multi_clip_info.get(
+                                "boundary_overlap_discard_frames", 0,
+                            )
+                            or 0
+                        ),
+                        "published_frames": int(
+                            multi_clip_info.get("published_frames")
+                            or video_length
+                        ),
                     }
                     if len(group) == multi_clip_info["total"]:
                         # All clips in this group are done — concatenate
                         clip_paths = [group[i]["path"] for i in range(multi_clip_info["total"])]
+                        # Ref2VA's audio_guide is semantic conditioning, not a
+                        # soundtrack. Automatic long H3 clips therefore keep
+                        # their generated embedded audio during concatenation;
+                        # an explicit audio_source remains an intentional
+                        # soundtrack override.
+                        preserve_generated_audio = bool(
+                            multi_clip_info.get("preserve_generated_audio")
+                        )
                         concat_audio = (
-                            multi_clip_info.get("concat_audio_path")
-                            or original_audio_guide
-                            or audio_source
+                            audio_source
+                            if preserve_generated_audio
+                            else (original_audio_guide or audio_source)
                         )
                         concat_ext = os.path.splitext(clip_path)[1]
-                        concat_name = f"{time_flag}_seed{seed}_multiclip{concat_ext}"
-                        concat_path = os.path.join(save_path, concat_name)
+                        concat_name = (
+                            f"{_recovery_output_prefix}-r{single_repeat_offset if single_repeat_dispatch else max(0, repeat_no - 1)}-multiclip{concat_ext}"
+                            if durable_output_dir is not None
+                            else f"{time_flag}_seed{seed}_multiclip{concat_ext}"
+                        )
+                        concat_path = os.path.join(
+                            durable_output_dir or save_path, concat_name,
+                        )
                         print(f"[Multi-Clip] Concatenating {len(clip_paths)} clips into {concat_path}")
-                        if concatenate_multi_clip_videos(
+                        concat_succeeded = concatenate_multi_clip_videos(
                             clip_paths,
                             concat_path,
                             concat_audio,
                             audio_start_sec=multi_clip_info.get("audio_start_sec", 0),
-                        ):
+                            abort_callback=lambda: bool(gen.get("abort", False)),
+                            clip_start_frames=[
+                                group[i]["discard_prefix_frames"]
+                                for i in range(multi_clip_info["total"])
+                            ],
+                        )
+                        if concat_succeeded:
                             print(f"[Multi-Clip] Concatenated video saved: {concat_path}")
                             with lock:
                                 file_list.append(concat_path)
+                                gen.setdefault("artifact_roles", {})[
+                                    concat_path
+                                ] = "final"
                                 concat_configs = configs.copy()
-                                concat_configs["prompt"] = "\n".join(group[i]["prompt"] for i in range(multi_clip_info["total"]))
+                                concat_configs["prompt"] = (
+                                    multi_clip_info.get("global_prompt")
+                                    or "\n".join(
+                                        group[i]["prompt"]
+                                        for i in range(
+                                            multi_clip_info["total"]
+                                        )
+                                    )
+                                )
                                 concat_configs["image_start"] = [group[i]["image_start"] for i in range(multi_clip_info["total"])]
                                 concat_configs["multi_prompts_gen_type"] = 3
-                                concat_configs["video_length"] = multi_clip_info["total"] * video_length
-                                concat_configs["sliding_window_size"] = video_length
-                                if original_audio_guide:
+                                concat_configs["video_length"] = sum(
+                                    int(group[i].get("published_frames") or 0)
+                                    for i in range(multi_clip_info["total"])
+                                )
+                                concat_configs["sliding_window_size"] = (
+                                    0
+                                    if multi_clip_info.get(
+                                        "automatic_h3_longform"
+                                    )
+                                    else video_length
+                                )
+                                if preserve_generated_audio:
+                                    concat_configs.pop("audio_guide", None)
+                                elif original_audio_guide:
                                     concat_configs["audio_guide"] = original_audio_guide
                                 file_settings_list.append(concat_configs)
                             send_cmd("output")
-                        del clip_store[group_id]
+                            del clip_store[group_id]
+                        else:
+                            # Components remain available for diagnosis and a
+                            # later explicit rejoin, but the generation must
+                            # not report success when its requested final was
+                            # never produced (especially with Finals-only as
+                            # the default gallery filter).
+                            raise PostDecodeStageError(
+                                "Unable to concatenate generated segments "
+                                f"for group {group_id}; component clips were retained",
+                                stage="concat", code="concat_cancelled",
+                            )
 
                 # Play notification sound for single video
                 try:
@@ -9596,7 +10611,12 @@ def generate_video(
                 send_cmd("output")
 
         seed = set_seed(-1)
+    pending_extra_orders = gen.get("extra_orders", 0)
     _cleanup_generation_resources()
+    if single_repeat_dispatch:
+        # clear_status() resets the live delta; the outer repeat dispatcher
+        # consumes it only after this complete model task has returned.
+        gen["extra_orders"] = pending_extra_orders
 
     return not gen.get("abort", False)
 
@@ -9885,9 +10905,17 @@ def process_tasks(state):
     release_gen()
 
 
-def validate_task(task, state):
+def validate_task(
+    task,
+    state,
+    *,
+    _h3_turbo_validation_authorized=False,
+):
     """Validate a task's settings. Returns updated params dict or None if invalid."""
     params = task.get('params', {})
+    if "_h3_turbo_validation_authorized" in params:
+        print("  [SKIP] Internal H3 validation state is not accepted in task params")
+        return None
     model_type = params.get('model_type')
     if not model_type:
         print("  [SKIP] No model_type specified")
@@ -9895,6 +10923,8 @@ def validate_task(task, state):
 
     inputs = primary_settings.copy()
     inputs.update(params)
+    if _h3_turbo_validation_authorized is True:
+        inputs["_h3_turbo_validation_authorized"] = True
     inputs['prompt'] = task.get('prompt', '')
     inputs.setdefault('mode', "")
     is_single = inputs.get('multi_prompts_gen_type', 0) in (2,)
@@ -10669,11 +11699,7 @@ def prepare_inputs_dict(target, inputs, model_type = None, model_filename = None
         pop += ["alt_scale"]
 
 
-    if not (
-        model_def.get("tea_cache", False)
-        or model_def.get("mag_cache", False)
-        or model_def.get("first_block_cache", False)
-    ):
+    if not (model_def.get("tea_cache", False) or model_def.get("mag_cache", False)) :
         pop += ["skip_steps_cache_type", "skip_steps_multiplier", "skip_steps_start_step_perc"]
 
     guidance_max_phases = model_def.get("guidance_max_phases", 0)
@@ -12252,7 +13278,6 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
             lock_inference_steps = model_def.get("lock_inference_steps", False) or (audio_only and not inference_steps_enabled)
             any_tea_cache = model_def.get("tea_cache", False)
             any_mag_cache = model_def.get("mag_cache", False)
-            any_first_block_cache = model_def.get("first_block_cache", False)
             recammaster = base_model_type in ["recam_1.3B"]
             vace = test_vace_module(base_model_type)
             multitalk = model_def.get("multitalk_class", False)
@@ -13023,46 +14048,31 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                             allow_custom_value= True,
                         )
                         loras_multipliers = gr.Textbox(label="Loras Multipliers (1.0 by default) separated by Space chars or CR, lines that start with # are ignored", value=launch_multis_str)
-                with gr.Tab(
-                    "Steps Skipping",
-                    visible=(
-                        any_tea_cache
-                        or any_mag_cache
-                        or any_first_block_cache
-                    ),
-                ) as speed_tab:
+                with gr.Tab("Steps Skipping", visible = any_tea_cache or any_mag_cache) as speed_tab:
                     with gr.Column():
-                        gr.Markdown("<B>Step-skipping accelerators avoid selected full transformer evaluations. More skipped evaluations may reduce output quality.</B>")
-                        gr.Markdown("<B>Keep an initial warmup so the accelerator can establish a stable history.</B>")
+                        gr.Markdown("<B>Tea Cache and Mag Cache accelerate the Video Generation by skipping intelligently some steps, the more steps are skipped the lower the quality of the video.</B>")
+                        gr.Markdown("<B>Steps Skipping  consumes also VRAM. It is recommended not to skip at least the first 10% steps.</B>")
                         steps_skipping_choices = [("None", "")]
                         if any_tea_cache: steps_skipping_choices += [("Tea Cache", "tea")]
                         if any_mag_cache: steps_skipping_choices += [("Mag Cache", "mag")]
-                        if any_first_block_cache: steps_skipping_choices += [("First Block Cache", "first_block")]
                         skip_steps_cache_type = gr.Dropdown(
                             choices= steps_skipping_choices,
-                            value="" if not (any_tea_cache or any_mag_cache or any_first_block_cache) else ui_get("skip_steps_cache_type"),
+                            value="" if not (any_tea_cache or any_mag_cache) else ui_get("skip_steps_cache_type"),
                             visible=True,
                             label="Skip Steps Cache Type"
                         )
  
-                        skip_steps_multiplier_choices = model_def.get(
-                            "skip_steps_multiplier_choices",
-                            [
+                        skip_steps_multiplier = gr.Dropdown(
+                            choices=[
                                 ("around x1.5 speed up", 1.5),
                                 ("around x1.75 speed up", 1.75),
                                 ("around x2 speed up", 2.0),
                                 ("around x2.25 speed up", 2.25),
                                 ("around x2.5 speed up", 2.5),
                             ],
-                        )
-                        skip_steps_multiplier = gr.Dropdown(
-                            choices=skip_steps_multiplier_choices,
                             value=float(ui_get("skip_steps_multiplier")),
                             visible=True,
-                            label=model_def.get(
-                                "skip_steps_multiplier_label",
-                                "Skip Steps Cache Global Acceleration",
-                            ),
+                            label="Skip Steps Cache Global Acceleration"
                         )
                         skip_steps_start_step_perc = gr.Slider(0, 100, value=ui_get("skip_steps_start_step_perc"), step=1, label="Skip Steps starting moment in % of generation", show_reset_button= False) 
 

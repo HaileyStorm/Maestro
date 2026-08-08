@@ -347,8 +347,12 @@ def combine_and_concatenate_video_with_audio_tracks(
     new_audio_from_start=False,
     source_audio_metadata=None,
     audio_codec_key="aac_128",
-    verbose = False
+    verbose=False,
+    output_audio_channels=1,
 ):
+    if type(output_audio_channels) is not int or output_audio_channels not in (1, 2):
+        raise ValueError("Output audio must be mono or stereo")
+    output_layout = "stereo" if output_audio_channels == 2 else "mono"
     audio_settings = get_mp4_audio_codec_settings(audio_codec_key)
     audio_codec = audio_settings["codec"]
     audio_bitrate = audio_settings["bitrate"]
@@ -371,7 +375,7 @@ def combine_and_concatenate_video_with_audio_tracks(
                 filters.append(f'[{idx}:a]apad=pad_dur=100[aout{i}]')
                 idx += 1
             else:
-                filters.append(f'anullsrc=r={audio_sampling_rate}:cl=mono,apad=pad_dur=100[aout{i}]')
+                filters.append(f'anullsrc=r={audio_sampling_rate}:cl={output_layout},apad=pad_dur=100[aout{i}]')
         else:
             if s:
                 inputs += ['-i', s]
@@ -379,12 +383,12 @@ def combine_and_concatenate_video_with_audio_tracks(
                 needs_filter = (
                     meta.get('codec') != audio_codec or
                     meta.get('sample_rate') != audio_sampling_rate or
-                    meta.get('channels') != 1 or
+                    meta.get('channels') != output_audio_channels or
                     meta.get('duration', 0) < source_audio_duration
                 )
                 if needs_filter:
                     filters.append(
-                        f'[{idx}:a]aresample={audio_sampling_rate},aformat=channel_layouts=mono,'
+                        f'[{idx}:a]aresample={audio_sampling_rate},aformat=channel_layouts={output_layout},'
                         f'apad=pad_dur={source_audio_duration},atrim=0:{source_audio_duration},asetpts=PTS-STARTPTS[s{i}]')
                 else:
                     filters.append(
@@ -394,13 +398,13 @@ def combine_and_concatenate_video_with_audio_tracks(
                 idx += 1
             else:
                 filters.append(
-                    f'anullsrc=r={audio_sampling_rate}:cl=mono,atrim=0:{source_audio_duration},asetpts=PTS-STARTPTS[s{i}]')
+                    f'anullsrc=r={audio_sampling_rate}:cl={output_layout},atrim=0:{source_audio_duration},asetpts=PTS-STARTPTS[s{i}]')
 
             if n:
                 inputs += ['-i', n]
                 start = '0' if new_audio_from_start else source_audio_duration
                 filters.append(
-                    f'[{idx}:a]aresample={audio_sampling_rate},aformat=channel_layouts=mono,'
+                    f'[{idx}:a]aresample={audio_sampling_rate},aformat=channel_layouts={output_layout},'
                     f'atrim=start={start},asetpts=PTS-STARTPTS[n{i}]')
                 filters.append(f'[s{i}][n{i}]concat=n=2:v=0:a=1[aout{i}]')
                 idx += 1
@@ -410,12 +414,12 @@ def combine_and_concatenate_video_with_audio_tracks(
         maps += ['-map', f'[aout{i}]']
 
     cmd = ['ffmpeg', '-y', *inputs,
-           '-filter_complex', ';'.join(filters),  # ✅ Only change made
+           '-filter_complex', ';'.join(filters),
            *maps, *metadata_args,
            '-c:v', 'copy',
            '-c:a', audio_codec,
            '-ar', str(audio_sampling_rate),
-           '-ac', '1',
+           '-ac', str(output_audio_channels),
            '-shortest', save_path_tmp]
     if audio_bitrate:
         cmd[-6:-6] = ['-b:a', audio_bitrate]
@@ -855,4 +859,3 @@ def read_image_metadata(image_path):
             return None
     except Exception as e:
         print(f"Error reading metadata: {e}"); return None
-

@@ -1,0 +1,24 @@
+# Copy these values into Pinokio's Configure tab. Keep local secrets out of
+# version control. Cloudflare app sharing is enabled by default; LAN binding
+# remains disabled. Remote content stays behind per-project passwords and the
+# backend denies machine-wide controls. An outer Pinokio passcode is optional.
+PINOKIO_SCRIPT_AUTOLAUNCH=
+PINOKIO_SCRIPT_REQUIRES=
+PINOKIO_SHARE_CLOUDFLARE=true
+PINOKIO_SHARE_PASSCODE=
+# Optional stable Cloudflare Workers Free redirect. Provision it with
+# cloudflare/stable-share-worker/provision.mjs. Secrets must stay blank here
+# and live only in the ignored ENVIRONMENT file.
+PINOKIO_STABLE_SHARE_URL=
+PINOKIO_STABLE_SHARE_UPDATE_SECRET=
+PINOKIO_STABLE_SHARE_WORKER_NAME=maestro-stable-share
+CLOUDFLARE_ACCOUNT_ID=
+CLOUDFLARE_API_TOKEN=
+CLOUDFLARE_KV_NAMESPACE_ID=
+CLOUDFLARE_WORKERS_FREE_CONFIRMED=
+PINOKIO_SCRIPT_DEFAULT=true
+GRADIO_TEMP_DIR=./cache/GRADIO_TEMP_DIR
+HF_HOME=
+TORCH_HOME=./cache/TORCH_HOME
+PINOKIO_SHARE_LOCAL=false
+PINOKIO_SHARE_LOCAL_PORT=

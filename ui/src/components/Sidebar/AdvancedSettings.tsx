@@ -4,9 +4,44 @@ import { useStore } from '../../stores/useStore'
 import { PostProcessing } from './PostProcessing'
 import { ControlVideoSection } from './ControlVideoSection'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
-import { ResolutionPresets } from './ResolutionPresets'
-import { AspectRatioGrid } from './AspectRatioGrid'
 import { WindowSettings } from './DurationSlider'
+import {
+  fetchH3AccelerationStatus,
+  fetchH3BenchmarkReport,
+  type H3AccelerationStatus,
+  type H3BenchmarkRecord,
+  type H3BenchmarkReport,
+} from '../../api/client'
+
+interface H3CustomSettings {
+  h3_attention_engine?: 'sdpa' | 'sol_attn' | 'sage2'
+  h3_sol_tau?: number
+  h3_sol_dense_steps?: number
+}
+
+function benchmarkEngineLabel(record: H3BenchmarkRecord): string {
+  const requested = record.spec.engine.id
+  const effective = record.spec.engine.effective_id || requested
+  return effective === requested ? effective : `${requested} → ${effective}`
+}
+
+function customSettingInputValue(
+  settings: Record<string, unknown> | undefined,
+  settingId: string,
+): string {
+  return String(settings?.[settingId] ?? '')
+}
+
+function withNumericCustomSetting(
+  settings: Record<string, unknown> | undefined,
+  settingId: string,
+  input: string,
+): Record<string, unknown> | undefined {
+  const next = { ...(settings || {}) }
+  if (input === '') delete next[settingId]
+  else next[settingId] = Number.parseFloat(input)
+  return Object.keys(next).length > 0 ? next : undefined
+}
 
 function PresetManager() {
   const presets = useStore(s => s.presets)
@@ -109,7 +144,7 @@ function PresetManager() {
 /** Active advanced features as human-readable labels. Drives the badge
  *  count AND its hover tooltip, so a surprising number names its source
  *  instead of sending the user hunting through every section. */
-export function useAdvancedActiveItems(): string[] {
+function useAdvancedActiveItems(): string[] {
   const params = useStore(s => s.params)
   const modelOptions = useStore(s => s.modelOptions)
   const spatialUpsampling = useStore(s => s.spatialUpsampling)
@@ -124,14 +159,6 @@ export function useAdvancedActiveItems(): string[] {
 
   const items: string[] = []
   if (params.seed !== -1) items.push(`Seed ${params.seed}`)
-  if (params.minimax_h3_turbo_mode) items.push('H3 Turbo')
-  if (params.skip_steps_cache_type === 'first_block') {
-    items.push(`H3 cache ${params.skip_steps_multiplier ?? 0.08}`)
-  }
-  if (
-    modelOptions?.sliding_window_auto_prompt_pacing === true
-    && params.minimax_h3_window_storyboard === false
-  ) items.push('H3 window planning off')
   if (
     (params.negative_prompt?.length ?? 0) > 0
     && (!isScailEdit || isScailHq)
@@ -140,15 +167,12 @@ export function useAdvancedActiveItems(): string[] {
   if (!isScailEdit && spatialUpsampling) items.push(`Upscaling (${spatialUpsampling})`)
   if (!isScailEdit && filmGrainIntensity > 0) items.push('Film grain')
   if (!isScailEdit && (params.self_refiner_setting ?? 0) > 0) items.push('Self refiner')
-  if (
-    modelOptions?.minimax_h3_text_encoder_choices?.length
-    && params.minimax_h3_text_encoder
-    && params.minimax_h3_text_encoder !== modelOptions.minimax_h3_text_encoder_default
-  ) {
-    const selected = modelOptions.minimax_h3_text_encoder_choices.find(
-      choice => choice.value === params.minimax_h3_text_encoder
-    )
-    items.push(`H3 encoder: ${selected?.label || params.minimax_h3_text_encoder}`)
+  if ((params.custom_settings as H3CustomSettings | undefined)?.h3_attention_engine === 'sol_attn') {
+    items.push('H3 Sol-Attn (approximate)')
+  } else if ((params.custom_settings as H3CustomSettings | undefined)?.h3_attention_engine === 'sage2') {
+    items.push('H3 SageAttention2++')
+  } else if ((params.custom_settings as H3CustomSettings | undefined)?.h3_attention_engine === 'sdpa') {
+    items.push('H3 dense SDPA override')
   }
   // injection_strength only matters when injected frames actually exist.
   // The persisted snapshot strips image_refs (file paths are ephemeral)
@@ -181,11 +205,6 @@ export function useAdvancedActiveItems(): string[] {
   return items
 }
 
-/** Count active advanced features for the badge */
-export function useAdvancedCount(): number {
-  return useAdvancedActiveItems().length
-}
-
 export function AdvancedSettings() {
   const [open, setOpen] = useState(false)
   const params = useStore(s => s.params)
@@ -194,6 +213,8 @@ export function AdvancedSettings() {
   const generationMode = useStore(s => s.generationMode)
   const editSubMode = useStore(s => s.editSubMode)
   const audioSubMode = useStore(s => s.audioSubMode)
+  const openQueueAfterSubmit = useStore(s => s.openQueueAfterSubmit)
+  const setOpenQueueAfterSubmit = useStore(s => s.setOpenQueueAfterSubmit)
   const isAudio = generationMode === 'audio'
   const isSfx = isAudio && audioSubMode === 'sfx'
   const isAudioOnly = modelOptions?.audio_only || isSfx
@@ -212,14 +233,12 @@ export function AdvancedSettings() {
     )
   )
   const isScailHq = isScailEdit && scailModelType === 'scail2_14B'
-  const h3TurboMode = (
-    params.minimax_h3_turbo_mode === true
-    && modelOptions?.minimax_h3_turbo != null
-  )
-  const showInferenceSteps = (
-    !isAudioOnly
-    && (isScailEdit || !modelOptions?.lock_inference_steps)
-  )
+  // Studio must always expose the primary denoise count. Distilled models
+  // previously hid it behind lock_inference_steps while still showing only
+  // Stage 2/3 refinement counts, which made the Stage 1 schedule invisible.
+  // Unlocked models allow a 1..50 override; locked/distilled schedules stay
+  // read-only but visible so Stage 2/3 never appear to replace Stage 1.
+  const showInferenceSteps = !isAudioOnly
   const showGuidanceScale = (
     !isAudioOnly
     && (
@@ -240,9 +259,39 @@ export function AdvancedSettings() {
   })
   const durationSeconds = useStore(s => s.durationSeconds)
   const setDurationSeconds = useStore(s => s.setDurationSeconds)
+  const selectModel = useStore(s => s.selectModel)
   const panelRef = useRef<HTMLDivElement>(null)
   const advancedItems = useAdvancedActiveItems()
   const advancedCount = advancedItems.length
+  const isH3 = ['minimax_h3', 'minimax_h3_ref2va'].includes(
+    String(modelOptions?.architecture || ''),
+  )
+  const minimumInferenceSteps = isH3 ? 2 : 1
+  const [h3Acceleration, setH3Acceleration] = useState<H3AccelerationStatus | null>(null)
+  const [h3Benchmark, setH3Benchmark] = useState<H3BenchmarkReport | null>(null)
+  const h3Custom = (params.custom_settings || {}) as H3CustomSettings
+  const h3Engine = String(h3Custom.h3_attention_engine || 'sol_attn')
+  const setH3Custom = <Key extends keyof H3CustomSettings>(
+    key: Key,
+    value: H3CustomSettings[Key],
+  ) => {
+    const next = { ...(params.custom_settings || {}) } as Record<string, unknown>
+    if (value === undefined) delete next[key]
+    else next[key] = value
+    setParam('custom_settings', Object.keys(next).length ? next : undefined)
+  }
+
+  useEffect(() => {
+    if (!open || !isH3) return
+    let current = true
+    fetchH3AccelerationStatus(false)
+      .then(status => { if (current) setH3Acceleration(status) })
+      .catch(() => { if (current) setH3Acceleration(null) })
+    fetchH3BenchmarkReport()
+      .then(report => { if (current) setH3Benchmark(report) })
+      .catch(() => { if (current) setH3Benchmark(null) })
+    return () => { current = false }
+  }, [open, isH3])
 
   // Close on escape
   useEffect(() => {
@@ -293,131 +342,154 @@ export function AdvancedSettings() {
 
             {/* Scrollable content */}
             <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5">
-              {/* Recast/Repaint own their output-quality profiles in the main
-                  workflow. Their dedicated endpoints also choose adaptive
-                  windows, so generic controls would be misleading here. */}
-              {!isAudio && !isScailEdit && (
-                <>
-                  {!isOutpaint && !modelOptions?.hide_resolution_presets && <ResolutionPresets />}
-                  {!isAvatar && <AspectRatioGrid />}
-                </>
-              )}
-
-              {/* The Qwen conditioner is shared by every H3 transformer.
-                  Expose it once here instead of multiplying model entries. */}
-              {modelOptions?.minimax_h3_text_encoder_choices?.length ? (
-                <div>
-                  <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
-                    H3 Text Encoder
-                  </label>
-                  <select
-                    value={params.minimax_h3_text_encoder || modelOptions.minimax_h3_text_encoder_default || modelOptions.minimax_h3_text_encoder_choices[0]?.value}
-                    onChange={e => setParam('minimax_h3_text_encoder', e.target.value as any)}
-                    className="w-full bg-bg-tertiary border border-border rounded px-2.5 py-1.5 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
-                  >
-                    {modelOptions.minimax_h3_text_encoder_choices.map(choice => (
-                      <option key={choice.value} value={choice.value}>
-                        {choice.label}
-                      </option>
-                    ))}
-                  </select>
-                  <p className="text-[9px] text-text-muted mt-1">
-                    {modelOptions.minimax_h3_text_encoder_choices.find(
-                      choice => choice.value === (params.minimax_h3_text_encoder || modelOptions.minimax_h3_text_encoder_default)
-                    )?.size_hint || 'Changing this reloads the H3 model.'}
-                  </p>
-                </div>
-              ) : null}
-
-              {modelOptions?.first_block_cache && (
-                <div className="space-y-2 p-2.5 bg-bg-tertiary/40 rounded-lg border border-border/60">
-                  <label className="flex items-center gap-2 cursor-pointer group">
-                    <input
-                      type="checkbox"
-                      checked={params.skip_steps_cache_type === 'first_block'}
-                      onChange={e => {
-                        setParam(
-                          'skip_steps_cache_type',
-                          e.target.checked ? 'first_block' : '',
-                        )
-                        if (e.target.checked && params.skip_steps_multiplier == null) {
-                          setParam(
-                            'skip_steps_multiplier',
-                            modelOptions.default_skip_steps_multiplier ?? 0.08,
-                          )
-                        }
-                      }}
-                      className="accent-accent-blue"
-                    />
-                    <span className="text-[11px] text-text-muted uppercase tracking-wider group-hover:text-text-secondary transition-colors">
-                      First Block Cache
-                    </span>
-                    <span className="text-[9px] text-amber-300/90 border border-amber-400/30 rounded px-1 py-0.5">
-                      Experimental
-                    </span>
-                  </label>
-                  {params.skip_steps_cache_type === 'first_block' && (
-                    <div className="space-y-2 pl-1 border-l border-border ml-1">
-                      <div>
-                        <label className="text-[10px] text-text-muted block mb-1">
-                          {modelOptions.skip_steps_multiplier_label || 'Cache Threshold'}
-                        </label>
-                        <select
-                          value={params.skip_steps_multiplier ?? modelOptions.default_skip_steps_multiplier ?? 0.08}
-                          onChange={e => setParam('skip_steps_multiplier', Number(e.target.value))}
-                          className="w-full bg-bg-tertiary border border-border rounded px-2 py-1.5 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
-                        >
-                          {(modelOptions.skip_steps_multiplier_choices || []).map(([label, value]) => (
-                            <option key={value} value={value}>{label}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <div className="flex items-center justify-between mb-1">
-                          <label className="text-[10px] text-text-muted">Warmup</label>
-                          <span className="text-[10px] text-text-secondary">
-                            {params.skip_steps_start_step_perc ?? modelOptions.default_skip_steps_start_step_perc ?? 25}%
-                          </span>
-                        </div>
-                        <input
-                          type="range"
-                          min={0}
-                          max={75}
-                          step={5}
-                          value={params.skip_steps_start_step_perc ?? modelOptions.default_skip_steps_start_step_perc ?? 25}
-                          onChange={e => setParam('skip_steps_start_step_perc', Number(e.target.value))}
-                          className="w-full"
-                        />
-                      </div>
-                    </div>
-                  )}
-                  <p className="text-[9px] text-text-muted">
-                    Reuses stable transformer work after warmup. Best suited to 15-20 step H3 runs; higher thresholds can change motion or fine detail.
-                  </p>
-                </div>
-              )}
-
               {/* Window Settings */}
               {(isVideo || (isAvatar && !isScailEdit))
                 && modelOptions?.sliding_window
                 && <WindowSettings />}
 
-              {isVideo && modelOptions?.sliding_window_auto_prompt_pacing === true && (
-                <div className="space-y-1">
-                  <label className="flex items-center gap-2 cursor-pointer group">
+              {isH3 && (
+                <div className="space-y-3 rounded-lg border border-border bg-bg-tertiary/35 p-3">
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="text-[11px] text-text-muted uppercase tracking-wider">H3 Performance &amp; Hacks</label>
+                      <span className="text-[9px] text-text-muted">Per generation</span>
+                    </div>
+                    <p className="mt-1 text-[9px] text-text-muted">
+                      Quality uses Sol-Attn, validated Base speed profiles use Sage2, and Ultra uses exact dense SDPA.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[10px] text-text-muted">Attention engine</label>
+                    <select
+                      value={h3Engine}
+                      onChange={event => setH3Custom(
+                        'h3_attention_engine',
+                        event.target.value === 'sdpa'
+                          ? 'sdpa'
+                          : event.target.value === 'sage2' ? 'sage2' : 'sol_attn',
+                      )}
+                      className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs text-text-primary"
+                    >
+                      <option value="sdpa">Dense SDPA · exact override</option>
+                      <option value="sol_attn" disabled={h3Acceleration?.sol_attn.available === false}>
+                        Kijai Sol-Attn · fast default (minimal-loss approximate)
+                      </option>
+                      <option
+                        value="sage2"
+                        disabled={h3Acceleration?.sage2.available !== true || params.model_type !== 'minimax_h3'}
+                      >
+                        Official SageAttention2++ · {h3Acceleration?.sage2.validated ? 'Base validated' : 'unvalidated'}
+                      </option>
+                    </select>
+                    {h3Acceleration?.sol_attn.available === false && (
+                      <p className="mt-1 text-[9px] text-amber-400">
+                        Sol-Attn unavailable: {h3Acceleration.sol_attn.error || (!h3Acceleration.sol_attn.hardware_ok ? 'requires NVIDIA SM80+ and BF16' : 'pinned companion is not installed')}.
+                      </p>
+                    )}
+                    {h3Acceleration?.sage2.available !== true && (
+                      <p className="mt-1 text-[9px] text-amber-400">
+                        SageAttention2++ unavailable: {h3Acceleration?.sage2.reason || 'requires the pinned official Linux CUDA 12.8+ SM120 source build'}.
+                      </p>
+                    )}
+                    {h3Acceleration?.sage2.available === true && params.model_type !== 'minimax_h3' && (
+                      <p className="mt-1 text-[9px] text-amber-400">
+                        SageAttention2++ is release-validated only for Base H3; W4A8, PinkCherry, and Ref2VA remain unavailable here.
+                      </p>
+                    )}
+                    {h3Engine === 'sage2' && (
+                      <p className="mt-2 border-l border-amber-500/30 pl-2 text-[9px] text-amber-300">
+                        Quantized attention, fail-closed so benchmarks cannot be mislabeled after an SDPA fallback. Base Draft at 608×352 and Fast at 864×480 passed exact release/runtime-bound kernel, visual, and audio gates. Other H3 checkpoints remain unvalidated.
+                      </p>
+                    )}
+                    {h3Engine === 'sol_attn' && (
+                      <div className="mt-2 space-y-2 border-l border-amber-500/30 pl-2">
+                        <p className="text-[9px] text-amber-300">
+                          Approximate sparse attention. The first dense steps/blocks and conditioning prefix remain exact; any unsupported call falls back to dense SDPA.
+                        </p>
+                        <div>
+                          <div className="flex justify-between text-[10px] text-text-muted"><span>Routing tau</span><span>{Number(h3Custom.h3_sol_tau ?? 1).toFixed(1)}</span></div>
+                          <input type="range" min={0.5} max={2.5} step={0.1} value={Number(h3Custom.h3_sol_tau ?? 1)} onChange={event => setH3Custom('h3_sol_tau', Number(event.target.value))} className="w-full" />
+                        </div>
+                        <div>
+                          <div className="flex justify-between text-[10px] text-text-muted"><span>Dense warm-up steps</span><span>{Number(h3Custom.h3_sol_dense_steps ?? 10)}</span></div>
+                          <input type="range" min={0} max={20} step={1} value={Number(h3Custom.h3_sol_dense_steps ?? 10)} onChange={event => setH3Custom('h3_sol_dense_steps', Number(event.target.value))} className="w-full" />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded border border-border/70 bg-bg-primary/40 p-2 text-[9px] text-text-muted">
+                    <div className="font-medium text-text-secondary">Required visual-context component</div>
+                    <div className="mt-0.5">
+                      {params.model_type === 'minimax_h3_pinkcherry_fl2va'
+                        ? 'Heretic Qwen3-VL-32B INT8 ConvRot · explicit PinkCherry profile'
+                        : 'Official Qwen3-VL-32B NVFP4-AWQ · base fidelity/performance profile'}
+                    </div>
+                    <div className="mt-1">Supplies reference conditioning; it does not enhance text prompts.</div>
+                  </div>
+
+                  <label className="flex items-start gap-2 text-[10px] text-text-muted">
                     <input
                       type="checkbox"
-                      checked={params.minimax_h3_window_storyboard !== false}
-                      onChange={e => setParam('minimax_h3_window_storyboard', e.target.checked)}
-                      className="accent-accent-blue"
+                      disabled={
+                        h3Acceleration?.w4a8.available !== true
+                        || !['minimax_h3', 'minimax_h3_w4a8_fl2va'].includes(params.model_type)
+                      }
+                      checked={params.model_type === 'minimax_h3_w4a8_fl2va'}
+                      onChange={event => void selectModel(
+                        event.target.checked ? 'minimax_h3_w4a8_fl2va' : 'minimax_h3',
+                      )}
+                      className="mt-0.5"
                     />
-                    <span className="text-[11px] text-text-muted uppercase tracking-wider group-hover:text-text-secondary transition-colors">
-                      Plan Prompt Across Windows
+                    <span>
+                      <span className="block text-text-secondary">Kijai W4A8 FL2VA transformer · experimental / opt-in</span>
+                      <span className="block text-[9px]">{h3Acceleration?.w4a8.reason || 'Checking merged W4A8 runtime…'} Compatible only with base FL2VA text/first/last-frame segments; PinkCherry and Ref2VA use their own weights.</span>
                     </span>
                   </label>
+
                   <p className="text-[9px] text-text-muted">
-                    H3 expands one idea into complete window-local visual and audio prompts. Enhance enables this automatically; disable afterward only to supply manual line-per-window prompts.
+                    {h3Acceleration?.sol_attn.available ? 'Sol-Attn is ready on this machine.' : 'Sol-Attn is unavailable; generations use dense SDPA.'} Published speedups are not this-PC measurements.
                   </p>
+
+                  <div className="space-y-2 border-t border-border pt-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-[10px] font-medium text-text-secondary">Same-PC benchmark</div>
+                        <div className="text-[9px] text-text-muted">608×352 · 124 frames · 4 steps · one measured run</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setParam('resolution', '608x352')
+                          setDurationSeconds(124 / 24)
+                          setParam('video_length', 124)
+                          setParam('num_inference_steps', 4)
+                          setH3Custom('h3_sol_dense_steps', 0)
+                        }}
+                        className="rounded border border-accent-blue/50 px-2 py-1 text-[9px] text-accent-blue hover:bg-accent-blue/10"
+                      >
+                        Apply quick task
+                      </button>
+                    </div>
+                    <p className="text-[9px] text-text-muted">
+                      Successful H3 generations continuously refine privacy-safe timing estimates. Use this normalized task with text only, first frame, first+last, and Ref2VA references when you want directly comparable samples.
+                    </p>
+                    {(h3Benchmark?.records.length || 0) > 0 ? (
+                      <div className="max-h-32 space-y-1 overflow-y-auto">
+                        {h3Benchmark!.records.slice(-8).reverse().map(record => (
+                          <div key={record.cache_key} className="grid grid-cols-[1fr_auto] gap-x-2 rounded bg-bg-primary/50 px-2 py-1 text-[9px]">
+                            <span className="truncate text-text-secondary">{record.spec.case_id.replaceAll('_', ' ')} · {record.spec.model.id} · {benchmarkEngineLabel(record)}</span>
+                            <span className="text-text-primary">{record.generation_wall_time_seconds.toFixed(1)}s · {record.effective_output_fps.toFixed(2)} fps</span>
+                            <span className="text-text-muted">{record.spec.task.profile === 'quick' ? 'normalized quick task' : 'observed job'}</span>
+                            <span className="text-text-muted">{record.normalized_speed_index == null ? 'needs SDPA baseline' : `${record.normalized_speed_index.toFixed(0)} speed index`}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-[9px] text-text-muted">No local measurements yet. Published claims remain separate and are never used as this-PC results.</p>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -496,16 +568,14 @@ export function AdvancedSettings() {
                       <input
                         type="number"
                         placeholder="Empty = disabled"
-                        value={String((params.custom_settings as Record<string, unknown> | undefined)?.[setting.id] ?? '')}
+                        value={customSettingInputValue(params.custom_settings, setting.id)}
                         onChange={e => {
                           const val = e.target.value.trim()
-                          const cs = { ...(params.custom_settings || {}) } as Record<string, unknown>
-                          if (val === '') {
-                            delete cs[setting.id]
-                          } else {
-                            cs[setting.id] = parseFloat(val)
-                          }
-                          setParam('custom_settings', Object.keys(cs).length > 0 ? cs : undefined)
+                          setParam('custom_settings', withNumericCustomSetting(
+                            params.custom_settings,
+                            setting.id,
+                            val,
+                          ))
                         }}
                         className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
                       />
@@ -570,8 +640,7 @@ export function AdvancedSettings() {
               {!isAudio && !isScailEdit && <PostProcessing />}
 
               {/* Seed */}
-              {((
-                <div>
+              <div>
                   <div className="flex items-center justify-between mb-1.5">
                     <label className="text-[11px] text-text-muted uppercase tracking-wider">Seed</label>
                     <button onClick={() => setParam('seed', -1)} className="text-[10px] text-accent-blue hover:text-accent-blue-hover">
@@ -585,11 +654,10 @@ export function AdvancedSettings() {
                     className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
                     placeholder="-1 for random"
                   />
-                </div>
-              ) as any)}
+              </div>
 
               {/* Self Refiner */}
-              {!isScailEdit && modelOptions?.self_refiner && (
+              {!isScailEdit && Boolean(modelOptions?.self_refiner) ? (
                 <div>
                   <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Self Refiner</label>
                   <select
@@ -602,7 +670,7 @@ export function AdvancedSettings() {
                     <option value={2}>Enabled with P2-Norm</option>
                   </select>
                 </div>
-              )}
+              ) : null}
 
               {/* Stage 2 Steps */}
               {/* Pipeline Mode Toggle — distilled LTX models only */}
@@ -760,7 +828,7 @@ export function AdvancedSettings() {
                   2.0/1.5 then off, STG on blocks 14+19 for the first 4
                   steps, RF euler_ancestral). Shown only for models whose
                   def declares reference_pipeline support. */}
-              {!isScailEdit && (modelOptions as Record<string, unknown> | null)?.reference_pipeline && (
+              {!isScailEdit && modelOptions?.reference_pipeline && (
                 <div className="space-y-1">
                   <label className="flex items-center gap-2 cursor-pointer group">
                     <input type="checkbox"
@@ -784,25 +852,32 @@ export function AdvancedSettings() {
               {showInferenceSteps && (
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
-                    <label className="text-[11px] text-text-muted uppercase tracking-wider">Inference Steps</label>
+                    <label className="text-[11px] text-text-muted uppercase tracking-wider">
+                      {modelOptions?.lock_inference_steps && !isScailEdit
+                        ? 'Stage 1 / Primary Steps (Fixed)'
+                        : 'Inference Steps'}
+                    </label>
                     <input
                       type="number"
+                      min={minimumInferenceSteps}
+                      max={50}
                       value={params.num_inference_steps}
-                      disabled={h3TurboMode}
-                      onChange={e => setParam('num_inference_steps', Number(e.target.value))}
-                      className="w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue disabled:cursor-not-allowed disabled:opacity-50"
+                      onChange={e => setParam('num_inference_steps', Math.max(minimumInferenceSteps, Math.min(50, Number(e.target.value) || minimumInferenceSteps)))}
+                      disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}
+                      className="w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue disabled:cursor-not-allowed disabled:opacity-60"
                     />
                   </div>
                   <input
-                    type="range" min={1} max={50} step={1}
+                    type="range" min={minimumInferenceSteps} max={50} step={1}
                     value={params.num_inference_steps}
-                    disabled={h3TurboMode}
                     onChange={e => setParam('num_inference_steps', Number(e.target.value))}
-                    className="w-full disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}
+                    className="w-full disabled:cursor-not-allowed disabled:opacity-60"
                   />
-                  {h3TurboMode && (
+                  {modelOptions?.lock_inference_steps && !isScailEdit && (
                     <p className="text-[9px] text-text-muted mt-0.5">
-                      Turbo mode locks this preset to {modelOptions?.minimax_h3_turbo?.steps} steps.
+                      Fixed at the model&apos;s authored distilled schedule ({modelOptions.default_num_inference_steps ?? params.num_inference_steps} steps).
+                      Select an editable non-distilled model to change the main step count. Stage 2/3 settings add refinement.
                     </p>
                   )}
                   {isScailFast && (
@@ -837,7 +912,7 @@ export function AdvancedSettings() {
               )}
 
               {/* LTX-2 Dev Pipeline Controls — only for models with perturbation/CFG-Star support */}
-              {!isScailEdit && (modelOptions as Record<string, unknown> | null)?.perturbation && (
+              {!isScailEdit && modelOptions?.perturbation && (
                 <>
                   {/* STG Scale */}
                   <div>
@@ -1009,6 +1084,19 @@ export function AdvancedSettings() {
                   className="w-full"
                 />
               </div>}
+
+              <label className="flex items-start gap-2 rounded-lg border border-border bg-bg-tertiary/50 p-2.5 text-[11px] text-text-secondary">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 accent-accent-blue"
+                  checked={openQueueAfterSubmit}
+                  onChange={event => setOpenQueueAfterSubmit(event.target.checked)}
+                />
+                <span>
+                  <span className="font-medium text-text-primary">Open Queue after submit</span>
+                  <span className="mt-0.5 block text-[9px] text-text-muted">Enabled by default. Turn off to stay in the current Gallery view after a job is accepted.</span>
+                </span>
+              </label>
             </div>
           </div>
     </>

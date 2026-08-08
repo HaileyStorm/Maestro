@@ -1,0 +1,20 @@
+{
+    "model": {
+        "name": "Flux 1 Dev + Lustly Uncensored (Mature)",
+        "architecture": "flux",
+        "description": "Mature-mode Flux 1 Dev image generation with the curated Lustly uncensored/NSFW LoRA bundled at its recommended full strength. Hidden unless Explicit mode is enabled; outputs default private.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/Flux/resolve/main/flux1-dev_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/Flux/resolve/main/flux1-dev_quanto_bf16_int8.safetensors"
+        ],
+        "loras": [
+            "https://huggingface.co/lustlyai/Flux_Lustly.ai_Uncensored_nsfw_v1/resolve/f3d088d9b3ecbcb7fd24dac5154b7d8391fbd309/flux_lustly-ai_v1.safetensors"
+        ],
+        "loras_multipliers": [1.0],
+        "image_outputs": true,
+        "nsfw_only": true
+    },
+    "prompt": "A cinematic portrait with natural anatomy, expressive pose, detailed skin, and coherent lighting.",
+    "resolution": "1280x720",
+    "batch_size": 1
+}

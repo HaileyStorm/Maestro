@@ -1,6 +1,8 @@
 // SAM 3.1 Segmentation Service — Install Script
 // Creates a separate Python 3.12 conda env and installs SAM 3.1 + dependencies.
 // Called by install.js and update.js.
+const { runtimeSecretEnv } = require("./launcher_secret_env")
+
 module.exports = {
   run: [
     // Step 1: Clone SAM 3 repo if not already present
@@ -8,6 +10,7 @@ module.exports = {
       when: "{{!exists('app/services/sam/sam3')}}",
       method: "shell.run",
       params: {
+        env: runtimeSecretEnv,
         message: "git clone https://github.com/facebookresearch/sam3.git app/services/sam/sam3"
       }
     },
@@ -16,6 +19,7 @@ module.exports = {
       when: "{{exists('app/services/sam/sam3')}}",
       method: "shell.run",
       params: {
+        env: runtimeSecretEnv,
         path: "app/services/sam/sam3",
         message: "git pull"
       }
@@ -24,6 +28,7 @@ module.exports = {
     {
       method: "shell.run",
       params: {
+        env: runtimeSecretEnv,
         conda: {
           path: "app/services/sam/env",
           python: "3.12"
@@ -37,6 +42,7 @@ module.exports = {
     {
       method: "shell.run",
       params: {
+        env: runtimeSecretEnv,
         conda: {
           path: "app/services/sam/env",
           python: "3.12"

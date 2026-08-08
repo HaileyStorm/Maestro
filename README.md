@@ -19,7 +19,7 @@ The flagship feature. Drop in an audio track or write a story; a local LLM plans
 Detects your GPU, VRAM, and RAM on first launch and picks the right profile, quantization, VAE tiling, and VRAM safety coefficient. No more "Profile 1 vs 2 vs 4.5" guesswork. Power users still have full manual control under "Show advanced settings."
 
 - **OOM recovery banner** auto-suggests lowering the VRAM headroom when a generation runs out, with one-click apply.
-- **Live download status** during model setup ("Downloading transcription model (first use downloads ~300MB)..." instead of a vague spinner).
+- **Live preparation status** during model setup (for example, "Preparing transcription model on this host (downloads ~300MB if needed before loading)..." instead of a vague spinner).
 
 ### 🎨 Studio Mode — full manual control
 Direct access to every model and every knob:
@@ -32,12 +32,48 @@ Direct access to every model and every knob:
 - **Sliding window** for arbitrarily long generations
 - **Spatial upsampling, film grain, codec selection** as post-processing options
 
-### 🤖 Local LLM — built-in, no setup
-Maestro auto-downloads `llama-server` (~600 MB one-time) and your chosen GGUF model on first use. Defaults to **Gemma 4 4B (Recommended)** — fast, capable, and runs comfortably on smaller GPUs. Auto-detects CUDA and binds the LLM to GPU when available.
+MiniMax H3 Studio accepts one coherent global prompt. Authored timestamps stay exact;
+otherwise Maestro's deterministic planner maps the prompt onto legal native shots and can
+choose unequal lengths from action and dialogue density. The plan is an execution artifact,
+not a set of per-window prompts written by an LLM. Prompt Enhance remains optional and
+preserves user-supplied timestamp tokens.
+
+H3 uses server-authored performance profiles: **Draft** is managed four-step Turbo at
+608x352, **Fast** is managed eight-step Turbo at 864x480, **Quality** and **High** are
+20-step native profiles, and the named Delivery profiles disclose their native render and
+upscale/crop path. Turbo is a pinned managed accelerator rather than a public LoRA or a
+separate adjustable model surface. The server validates the exact model, assets, runtime,
+and compatibility matrix and remains authoritative over stale client settings. Maestro does
+not expose First Block Cache as a public H3 control.
+
+The H3 prepared-style selector includes official MiniMax workflows such as papercraft
+stop-motion, paper collage, product ads, music-video typography, and stylized 3D shorts.
+Maestro checks the official H3 skills catalog daily, parses only bounded metadata (never
+executes repository instructions), caches its revision, and retains an offline bundled
+catalog.
+
+### 🤖 LLM Chat and prompting — built in
+The **Chat** tab serves Maestro's local GGUF catalog to local and authorized
+remote projects. Conversations stay in the browser and are separated by
+project. An optional prompting-guide selector can add Maestro's H3 or other
+model-specific guide when a conversation is ready to become a generation
+prompt.
+
+Maestro prepares `llama-server` and the selected GGUF on this host if needed;
+allowed local and remote users reuse the shared host cache.
+Linux NVIDIA systems build the pinned llama.cpp runtime with CUDA when a
+compatible toolkit is available, probe the backend that actually loaded, and
+fall back visibly to the official CPU runtime if acceleration is unavailable.
+Launch settings are tuned per model and host; Chat shows the effective backend,
+projector/vision capability, download state, and measured prompt/decode speed.
 
 - Pre-curated registry: Gemma 4 (2B / 4B / 26B MoE / 31B) and Qwen3.6 27B — uncensored/abliterated instruct variants tuned for creative prompting
 - **External providers** also supported: OpenAI, Anthropic, custom OpenAI-compatible endpoints (currently experimental)
-- **Vision support** so LLMs can enhance prompting based on reference images
+- **Vision Chat and enhancement** with up to four project-authorized images
+  when the selected GGUF has a compatible MMPROJ/native vision path
+- Local owners can select a strict Hugging Face model ID/URL and add read-only
+  Linked Model Folders; remote users can use only the visible catalog and
+  opaque discovered models, including automatic downloads
 - Auto-unloads after 60s idle to free VRAM for video gen
 
 ### 🛒 Built-in CivitAI LoRA browser
@@ -66,6 +102,26 @@ Appearance mode is **Dark / Light / Auto** — Auto follows your system's appear
 ### 📂 Workspaces
 Multiple isolated output directories with a quick switcher in the sidebar. Useful for separating client projects, NSFW vs SFW, or experiments. Pinned and favorited outputs are tracked per workspace.
 
+- Cloudflare access is enabled by default. Remote visitors see project names, then unlock only the project they know the password for; counts, prompts, assets, jobs, and media stay hidden until unlock.
+- Remote visitors cannot change machine settings, start/stop services, browse storage/model folders, or import arbitrary Hugging Face/CivitAI URLs. Curated model weights may still download when their generation needs them.
+- Project passwords protect access through Maestro and its remote-sharing flow.
+- The Project References creation tool makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Studio semantic-reference workflows.
+- Gallery selection supports bulk move, privacy, and deletion. Finals are shown by default; All, Components, Windows, and Temporary views expose intermediate artifacts when needed. Deleting a final can atomically include its linked parts.
+- Read-only single-output share links work for local owners and through the same Cloudflare URL, and are revoked when the output is moved, changed, deleted, or its project is removed.
+
+### 🧭 Generation queue
+
+The Queue is separate from the Gallery and opens after submission by default (configurable
+in Advanced). Queue rows remain owner-only. Waiting positions count only positionable work:
+first place reads “Next in line,” while later places state how many jobs are ahead. Cards include
+the prompt preview, current segment/window versus overall progress, checkpoint/transition plan,
+failure details, a bounded event log, and ETA for the owner's running job. Queued work can be
+held and resumed.
+
+### 🧊 Blender scene guides
+
+The Tools area and Project References dialog include a structured Blender scene tool. It creates primitives/materials, animates the full requested frame range, inspects the scene, and samples multiple frames into protected project references. Pinokio installs a pinned portable Blender runtime plus the official Blender Lab MCP extension, then starts its localhost-only bridge with Maestro. Remote project users can invoke the same hosted tool through Maestro's project-scoped API; they never receive filesystem or machine-control access. Maestro never exposes the upstream arbitrary-Python surface.
+
 ### 🔒 Mature mode + experimental gate
 - **NSFW mode** is opt-in with a disclaimer step. Disabled by default. Gates uncensored model variants, NSFW LoRAs in the CivitAI browser, and the Settings → Services NSFW toggle.
 - **Experimental features gate** hides power-user toggles (external API keys, Voice Reference, Inpaint, Restyle, Wan2GP Enhancer) by default for a focused first-launch experience.
@@ -80,33 +136,33 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 ### v1.6.5 (2026-08-08)
 
 **MiniMax H3 performance and lower-VRAM support**
-- H3 Turbo now works with the recommended Pruned 20B models as well as the optional Full 33B models.
-- Turbo now starts at six steps and LoRA strength 0.50, while keeping the LoRA visible and adjustable in Advanced settings.
+- Added server-authored H3 performance bundles: Draft uses managed four-step Turbo at 608x352, Fast uses managed eight-step Turbo at 864x480, and Quality/High provide 20-step native generation.
+- Added explicit 1080p, Ultra, and 4K Delivery profiles that distinguish native inference from learned upscale, crop, and downsample work.
+- Turbo is now a pinned managed accelerator, not a selectable model or public LoRA. Its exact assets, runtime, model compatibility, and 4/8-step policy are server-authorized and cannot be replaced by client settings.
 - Reworked H3 model residency, activation chunking, and VRAM budgeting to reduce step-zero out-of-memory failures and excessive CPU offloading.
-- Added resolution- and GPU-aware First / Last window recommendations, with clear warnings and a manual override for experimental combinations.
-- Added an optional experimental First Block Cache for faster H3 generations, with selectable quality/speed thresholds.
+- H3 has no public First Block Cache control; acceleration is expressed only through the validated profile surface.
 
 **H3 resolutions and long-video planning**
-- Added a faster model-aligned 720p tier using 1280x704 landscape output and matching portrait, square, and 4:3 canvases.
-- Restored 1080p H3 generation with an experimental note and hardware-aware shorter-window recommendations.
-- Hid the less efficient 768p preset from the main selector while retaining compatibility with existing saved settings and API requests.
-- Added automatic H3 sliding-window storyboarding: one idea is expanded into a complete, editable prompt for every continuation window.
-- Actions, dialogue, camera coverage, sound effects, ambience, and music are distributed across the timeline instead of being completed and repeated in the first window.
-- Each exact window prompt is visible during generation in its own full-height editor, with the active window highlighted and no nested scrollbars.
+- Studio and Director keep one coherent global H3 prompt instead of asking an LLM to write a separate prompt for every continuation window.
+- Authored timestamps are authoritative; untimed prompts use a deterministic native-shot planner that can choose unequal shot lengths from action/dialogue density.
+- The resulting native-shot plan is persisted as reproducible execution metadata while the user's global prompt remains the prompt authority.
 
 **Director H3 workflow improvements**
-- Director now uses the same H3 resolution, VRAM, and native-frame rules as Studio when planning shot lengths and execution profiles.
-- Long scenes are divided before generation to fit the selected model, resolution, GPU, and Turbo configuration instead of being silently shortened at runtime.
-- Added H3 Turbo controls and adjustable per-LoRA strengths directly to Director mode.
+- Director now uses the same server-authored H3 profiles and deterministic native-shot planner as Studio.
+- Long scenes are divided into legal native shots before generation instead of being silently shortened at runtime.
 - Improved independent-shot context so recurring characters, wardrobe, locations, blocking, dialogue, and sound remain self-contained across prompt-only H3 shots.
 
 **MiniMax LoRA discovery and compatibility**
 - Added a MiniMax H3 filter to the CivitAI browser and routed downloaded H3 LoRAs into the correct shared H3 folder.
 - Pasted Hugging Face MiniMax H3 LoRA URLs now use the same correct destination instead of defaulting to LTX.
-- Added automatic H3 LoRA architecture conversion where required so compatible adapters can run on both Pruned and Full checkpoints.
-- Added early validation, pinned support assets, and clearer recommendations for combinations that may exceed available VRAM.
+- Kept user-selected H3 LoRAs separate from the managed Turbo bundle so ordinary LoRA discovery cannot override its pinned compatibility policy.
+- Added early server validation and pinned support assets for every managed Turbo profile.
 
 ### v1.6.1 (2026-08-06)
+
+> Historical release note: the Full-model-only, six-step, adjustable Turbo-LoRA
+> surface below was superseded by v1.6.5's server-managed Draft/Fast 4/8-step
+> profiles. It is retained to document what v1.6.1 shipped.
 
 **MiniMax H3 Turbo mode**
 - Added the H3 Turbo LoRA to the Full H3 model lists as a managed, first-use download.
@@ -116,6 +172,10 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 - User-adjusted Turbo strengths are preserved while duplicate Turbo adapters and incompatible Pruned-model combinations remain blocked.
 
 ### v1.6.0 (2026-08-06)
+
+> Historical release note: the Full/Pruned selectors and adjustable Turbo
+> behavior below predate and are superseded by v1.6.5's curated H3 model and
+> performance-profile contract.
 
 **MiniMax H3 Omni Reference**
 - Added MiniMax H3 Omni for generating new video and synchronized audio from ordered image, video, voice, motion, and sound references.
@@ -161,7 +221,8 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 - H3 generates synchronized 32 kHz stereo audio together with the video instead of requiring a separate audio pass.
 - Added approximately 5-15 second generation at 24 FPS with landscape, portrait, square, native 768p, and lower-VRAM resolution options.
 - Added automatic, revision-pinned provisioning for the compact scaled-FP8 transformer, NVFP4 Qwen3-VL conditioner, video VAE, audio VAE, tokenizer, and processor assets.
-- The initial integration focuses on H3 Base FL2VA; H3 Ref2VA reference-video/audio conditioning and hosted 2K regeneration are not yet included.
+- The current integration includes non-distilled Base FL2VA and Ref2VA, explicit-mode PinkCherry FL2VA, and an experimental Kijai W4A8 Base-FL2VA option. Ref2VA accepts semantic image/video/audio references; FL2VA owns text, first-frame, and first/last-frame segments. Hosted 2K regeneration remains outside this integration.
+- H3's curated default is Quality with Sol-Attn; Ultra uses exact dense SDPA. On the release-bound Linux CUDA 12.8/SM120 runtime, Draft at 608x352 and Fast at 864x480 use the pinned official SageAttention2++ v2.2.0 source build after exact Base kernel, visual, and audio gates passed. Fast's SDPA comparison loaded the model cold, so the record preserves that wall time without presenting it as a speed claim. Explicit Sage requests remain fail-closed, and W4A8, PinkCherry, and Ref2VA remain unvalidated and excluded from Sage profiles.
 
 **H3 prompting and dialogue**
 - Added an H3-specific Context-IR Prompt Enhance workflow using the model's native multimodal description, soundscape, music, speaker-ID, and dialogue-tag structure.
@@ -192,7 +253,7 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 - Added automatic reacquisition when a person first appears later, leaves the frame, or returns after a camera cut.
 - Other people in the scene are now preserved automatically when bystanders are detected.
 - References are automatically isolated from their backgrounds, aligned to the target, and supplemented with a face-detail view when useful.
-- Added optional lighting and shadow matching using Z.ai's official SCAIL-2 Relighting LoRA, downloaded, verified, and converted automatically on first use.
+- Added optional lighting and shadow matching using Z.ai's official SCAIL-2 Relighting LoRA, downloaded, verified, and converted automatically when needed on the host.
 - Added 480p, 512p, and 704p quality profiles with VRAM-aware window sizing; model steps remain independently adjustable.
 - Fixed reference-image backgrounds, white bars, halos, false gray scenes, blurry identity starts, and reference stills appearing at the beginning of output videos.
 - Fixed mismatched reference and control-video aspect ratios causing tensor errors or allowing the character image to control the output canvas.
@@ -310,10 +371,10 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 ### v1.3.2 (2026-07-17)
 
 **New**
-- **Models can be downloaded ahead of time.** In Settings -> System -> Enabled Models, the download icon next to each model is now a real button: click it and Maestro fetches everything that model needs (weights, text encoder, add-on modules, bundled LoRAs) in the background, with progress in the download banner. The row flips to a check mark when it finishes. Generating still auto-downloads on first use as before; this just lets you get the wait out of the way on your schedule.
+- **Models can be downloaded ahead of time.** In Settings -> System -> Enabled Models, the download icon next to each model is now a real button: click it and Maestro fetches everything that model needs (weights, text encoder, add-on modules, bundled LoRAs) in the background, with progress in the download banner. The row flips to a check mark when it finishes. Generating still downloads missing files to the shared host cache when needed; this just lets you get the wait out of the way on your schedule.
 
 **Fixed**
-- **Recast no longer crashes on a fresh install.** The automatic masking step runs before the SCAIL-2 model loads, but its detector checkpoint only downloaded together with the model, so the very first Recast on a clean install failed with "SAM3.1 checkpoint was not found". The masking step now downloads the detector itself on first use.
+- **Recast no longer crashes on a fresh install.** The automatic masking step runs before the SCAIL-2 model loads, but its detector checkpoint only downloaded together with the model, so the very first Recast on a clean install failed with "SAM3.1 checkpoint was not found". The masking step now downloads the detector itself when it is missing from the host cache.
 - **The downloaded check marks tell the truth now.** Models that borrow their weights from a base model (SCAIL-2 14B Fast, the Z-Image ControlNets) always showed as not downloaded, even when they were ready to run. The check now follows those references and also requires add-on modules and bundled accelerator LoRAs, so a check mark means the model generates without downloading anything.
 - Deleting a model now removes only the files that belong to it, so deleting a finetune leaves shared base weights in place for the models that still use them.
 - SCAIL-2's image reference no longer fails when the detection phrase finds nothing in your character image; Maestro automatically falls back to broader phrases ("person", "woman", "man").
@@ -326,7 +387,7 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 
 ### v1.3.0 (2026-07-17)
 
-**New: SCAIL-2 character animation.** Z.ai's follow-up to SCAIL Preview, integrated end to end. It transfers a performance from any video onto any character with no skeleton extraction, and it comes in two flavors: **SCAIL-2 14B** (the full native 40-step model) and **SCAIL-2 14B Fast** (bundled lightx2v distill, 6 steps, and no CFG for rapid animation). Fast is the recommended starting point for Recast, though results can vary by seed. Both are enabled by default. About 16.6 GB downloads on first use, plus a small detector model.
+**New: SCAIL-2 character animation.** Z.ai's follow-up to SCAIL Preview, integrated end to end. It transfers a performance from any video onto any character with no skeleton extraction, and it comes in two flavors: **SCAIL-2 14B** (the full native 40-step model) and **SCAIL-2 14B Fast** (bundled lightx2v distill, 6 steps, and no CFG for rapid animation). Fast is the recommended starting point for Recast, though results can vary by seed. Both are enabled by default. This host may need to download about 16.6 GB, plus a small detector model.
 
 - **Animate (Video tab).** Pick SCAIL-2 in Frames mode, drop a character image as the Start Image and a performance clip on the new Control Video tile, generate. The character performs the clip's motion in their own scene. Output follows the source clip's frame rate (capped at 30fps) and keeps its audio.
 - **Recast (Edit tab).** The headline: replace a person in an existing video with your character. Drop a video, type who to replace ("woman", "man in red"), preview the selection with the eye button, drop the character image, generate. Masking is fully automatic (SAM3 keyword tracking), and the scene, camera, and audio are preserved. The prompt is optional; describing the new character helps identity.
@@ -378,7 +439,7 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 - The Director text entry box grows upward as you type (up to ~11 lines) instead of staying two lines tall, and its scrollbar is actually visible.
 - Director mode keeps the art style of your reference images. Hand-drawn, anime, watercolor and other stylized references now carry their medium into every image prompt instead of coming out photorealistic.
 - Director no longer sneaks subjects from its internal instruction examples into your video (the recurring dragon), and a location you specify in your description is now binding — shot variety comes from camera angles, not invented places.
-- Speaker identification during song analysis now actually runs. It was silently skipped on every install (the model never downloaded without a HuggingFace token); the checkpoints (~30 MB) now download automatically from an ungated mirror on first use. Its clustering is also tuned for singing now: a solo vocalist reads as one speaker and duets as two, instead of one singer splitting into six.
+- Speaker identification during song analysis now actually runs. It was silently skipped on every install (the model never downloaded without a HuggingFace token); the checkpoints (~30 MB) now download automatically from an ungated mirror when missing from the host cache. Its clustering is also tuned for singing now: a solo vocalist reads as one speaker and duets as two, instead of one singer splitting into six.
 - The Load Settings pencil on songs restores everything: the Style / Music Caption (works retroactively on existing songs), the "Describe your song" text and Instrumental toggle (new songs), and it switches to the right Audio sub-tab — Speech, Music, or SFX — instead of leaving whichever was last open.
 
 **Changed**
@@ -399,7 +460,7 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 
 **Added**
 - **Light themes with a Dark / Light / Auto appearance mode.** Every theme family now has a daylight variant: Golden Hour pairs with warm paper and burnt orange, Classic with cool paper and blue, Onyx with light monochrome. Pick your style in Settings > System, then choose Dark, Light, or Auto; Auto follows your system's appearance and switches live when it changes. Warning banners, chips, gauges, and indicators were re-tuned to stay legible on light backgrounds, and video letterboxing stays dark on light themes to avoid glare.
-- **ACE-Step v1.5 XL SFT, the premium music model.** The quality-focused CFG variant of the XL 4B DiT, now the default music model in Studio and Director (available with the 1.7B or 4B LM). Maestro implements the classifier-free guidance sampling path with Adaptive Projected Guidance this model requires, and unlocks the Steps and Guidance controls for it (defaults: 30 steps, guidance 7.0; raise steps toward 50 for maximum quality). Weights download on first use (about 10 GB).
+- **ACE-Step v1.5 XL SFT, the premium music model.** The quality-focused CFG variant of the XL 4B DiT, now the default music model in Studio and Director (available with the 1.7B or 4B LM). Maestro implements the classifier-free guidance sampling path with Adaptive Projected Guidance this model requires, and unlocks the Steps and Guidance controls for it (defaults: 30 steps, guidance 7.0; raise steps toward 50 for maximum quality). This host downloads about 10 GB of weights if needed.
 
 **Fixed**
 - The fast ACE-Step LM decoder (vllm engine) was silently disabled on every Windows install by a faulty runtime check, forcing song planning onto a slow fallback decoder. Planning is dramatically faster after this fix.
@@ -487,18 +548,19 @@ The first video is always the slow one: install is ~10–20 min, then the first 
 3. Click **Install**. The launcher will:
    - Create a Python virtual environment in `app/env/`
    - Install all Python dependencies (torch, xformers, transformers, fastapi, …)
+   - Install and revision-verify the official Blender MCP adapter plus a portable Blender 5.1 runtime
    - Build the React UI in `ui/`
-4. When install finishes, click **Start**. The first generation in each model triggers a one-time weight download.
+4. When install finishes, click **Start**. If a generation needs model files that are not in the shared host cache, Maestro downloads them before loading the model into RAM/VRAM.
 
 The install (without model downloads) typically takes **10–20 minutes** depending on internet speed. SAM 3.1 (used only for the experimental Inpaint feature) is **not installed by default** — install it on demand via Pinokio menu → "Install Inpaint Support (SAM 3.1)" if you want to use Inpaint.
 
 ### Updating
 
-Click **Update** in the launcher menu. This pulls the latest launcher scripts and app code, reinstalls any new Python dependencies, and rebuilds the React UI.
+Click **Update** in the launcher menu. This pulls the latest launcher scripts and app code, reinstalls any new Python dependencies, refreshes pinned Blender/H3 acceleration runtimes, and rebuilds the React UI. At runtime, repositories with a declared safe version policy are checked by immutable revision and replaced only after validation; the official H3 style catalog uses the bounded daily metadata refresh described above.
 
 ### Resetting
 
-Click **Reset** to wipe the install and start over. Removes `app/env/`, `ui/node_modules/`, `ui/dist/`, and the SAM venv if installed. Model checkpoints in `app/ckpts/` are NOT removed by default — delete them manually if you want a true fresh start.
+Click **Reset** to wipe the install and start over. Removes `app/env/`, `ui/node_modules/`, `ui/dist/`, the pinned Blender MCP checkout, and the SAM venv if installed. Model checkpoints in `app/ckpts/` are NOT removed by default — delete them manually if you want a true fresh start.
 
 ## Usage
 
@@ -509,9 +571,48 @@ After clicking **Start**, the launcher shows an **Open Web UI** button once the 
 - **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, NSFW, theme)
 - **Pinokio menu** — Update, Reset, Install Inpaint Support, LoRA folder shortcuts
 
-## Sharing on the local network
+## Remote and local-network sharing
+
+Cloudflare sharing is enabled by default through `PINOKIO_SHARE_CLOUDFLARE=true`. After Maestro starts, the live URL appears both in Pinokio and as **Cloudflare · Copy link** in Maestro's top bar. Give another person that URL; their first visit immediately opens the project chooser, where they can unlock an existing project or create a new password-protected project (minimum 8 characters).
+
+For a reusable address without buying a domain, Maestro includes a minimal Cloudflare Workers Free redirect in [`cloudflare/stable-share-worker`](cloudflare/stable-share-worker/README.md). It keeps Pinokio's existing Quick Tunnel and updates only a KV-stored target after each launch. Maestro displays the `*.workers.dev` address only after an authenticated update plus health/target verification at the updating edge; if that check fails, the current `*.trycloudflare.com` URL remains available. The Worker briefly checks Maestro's minimal public `/health` endpoint before redirecting; while the studio/tunnel is down, browser visits receive a self-contained no-tracking offline page and API requests receive `503` JSON. No media, uploads, prompts, or app responses are proxied or stored. Because Workers KV is eventually consistent across edge locations, another region can briefly retain the prior (normally expired) Quick Tunnel until KV converges. Keep the Worker update secret only in the ignored local `ENVIRONMENT`; the one-time Cloudflare provisioning credential is removed after setup. Do not enable a paid Workers plan for this setup.
+
+Remote access is deliberately not an administration surface. It exposes the app but denies Classic UI, system/storage/model-source settings, arbitrary model links/paths, and service load/unload. New remote projects require a password. LAN binding remains disabled by default.
 
 Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to `false` (in the per-app or global ENVIRONMENT file) to bind the server to loopback only; set to `true` for LAN access. Pinokio's own daemon proxy is a separate concern that may also need to honor the variable depending on your setup.
+
+## API examples
+
+The React UI uses the same project-scoped API. A browser must first unlock a protected project; the signed `maestro_session` cookie then carries that unlock for later requests.
+
+```bash
+# Resolve the stable redirect once. Mutating API calls use the final Quick
+# Tunnel origin so Maestro's same-origin CSRF policy can verify them.
+STABLE='https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev'
+EFFECTIVE=$(curl -fsS -L -c cookies.txt -o /dev/null -w '%{url_effective}' \
+  "$STABLE/api/v1/access-context")
+BASE=${EFFECTIVE%/api/v1/access-context}
+
+# Discover access capabilities without exposing host paths or secrets
+curl -fsS -b cookies.txt "$BASE/api/v1/access-context"
+
+# Unlock a known project, then list only its authorized final outputs
+curl -fsS -b cookies.txt -c cookies.txt -H "Origin: $BASE" \
+  -H 'Content-Type: application/json' \
+  -d '{"password":"PROJECT_PASSWORD"}' \
+  "$BASE/api/v1/workspaces/my-project/unlock"
+curl -fsS -b cookies.txt "$BASE/api/v1/outputs?workspace=my-project&artifact_scope=final"
+
+# Create and animate a bounded Blender scene; no Python/code field is accepted
+curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \
+  -d '{"workspace":"my-project","clear_scene":true,"objects":[{"name":"Block","primitive":"cube","location":[0,0,0]}]}' \
+  "$BASE/api/v1/blender/scene"
+curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \
+  -d '{"workspace":"my-project","frame_start":0,"frame_end":240,"objects":[{"name":"Block","keyframes":[{"frame":0,"location":[0,0,0]},{"frame":240,"location":[4,0,0]}]}]}' \
+  "$BASE/api/v1/blender/animate"
+```
+
+Python and JavaScript clients use the same JSON bodies with their normal cookie-aware HTTP client (`requests.Session` or `fetch(..., {credentials: 'include'})`). Blender preview sampling is `POST /api/v1/blender/render` with `frames` containing 2–32 integers; previews are stamped with project/privacy metadata and registered as project reference candidates by default.
 
 ## Credits
 
@@ -529,6 +630,7 @@ Maestro is built on top of, and indebted to, the following projects:
 - [**CivitAI**](https://civitai.com) — LoRA browser and weight recommendations.
 - [**llama.cpp**](https://github.com/ggml-org/llama.cpp) — local LLM inference engine.
 - [**Pinokio**](https://pinokio.computer) by [@cocktailpeanut](https://github.com/cocktailpeanut) — the launcher framework.
+- [**Blender MCP**](https://projects.blender.org/lab/blender_mcp) by Blender Lab — pinned structured scene/animation/preview integration (GPL-3.0-or-later).
 - The original Pinokio Wan2GP launcher by [@cocktailpeanut](https://github.com/cocktailpeanut), which Maestro forks and extends.
 
 ## License

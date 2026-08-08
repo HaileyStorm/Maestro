@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "maestro-stable-share",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+  "observability": { "enabled": false },
+  "kv_namespaces": [
+    { "binding": "MAESTRO_TARGETS", "id": "" }
+  ]
+}

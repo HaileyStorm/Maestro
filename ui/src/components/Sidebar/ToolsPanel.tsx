@@ -2,6 +2,7 @@ import { useRef, useState } from 'react'
 import { Wrench, Upload, X, Film, Mic, Play } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
+import { BlenderSceneTool } from './BlenderSceneTool'
 
 // Upscale methods — same set as Post Processing's Spatial Upsampling, minus the
 // VAE options (those are tied to the generation pipeline, not a standalone clip).
@@ -81,7 +82,7 @@ export function ToolsPanel() {
         </div>
         {/* Tool selector */}
         <div className="flex bg-bg-tertiary rounded-lg p-0.5 border border-border">
-          {([['upscale', 'Upscale'], ['revoice', 'Revoice']] as const).map(([val, label]) => (
+          {([['upscale', 'Upscale'], ['revoice', 'Revoice'], ['blender', 'Blender']] as const).map(([val, label]) => (
             <button
               key={val}
               onClick={() => setTool(val)}
@@ -94,6 +95,8 @@ export function ToolsPanel() {
           ))}
         </div>
       </div>
+
+      {tool === 'blender' ? <BlenderSceneTool /> : <>
 
       {/* Source clip — upload, or use the clip currently selected in the gallery */}
       <div>
@@ -155,7 +158,7 @@ export function ToolsPanel() {
             </p>
           )}
           <p className="text-[10px] text-text-muted mt-1.5 leading-snug">
-            FlashVSR is model-based super-resolution (sharper, slower; weights download on first use). Lanczos is a fast classic resize. The clip's audio is preserved.
+            FlashVSR is model-based super-resolution (sharper, slower; weights download to the shared host cache if needed). Lanczos is a fast classic resize. The clip's audio is preserved.
           </p>
         </div>
       ) : (
@@ -229,6 +232,7 @@ export function ToolsPanel() {
         <Play size={13} fill={canRun ? 'white' : 'currentColor'} />
         {tool === 'upscale' ? 'Upscale Clip' : 'Replace Voice'}
       </button>
+      </>}
     </div>
   )
 }

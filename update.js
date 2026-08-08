@@ -1,3 +1,5 @@
+const { runtimeSecretEnv } = require("./launcher_secret_env")
+
 module.exports = {
   run: [{
     // Pull the latest launcher + app code (single monorepo, so this one
@@ -8,6 +10,7 @@ module.exports = {
     // UI build.
     method: "shell.run",
     params: {
+      env: runtimeSecretEnv,
       message: "git pull"
     }
   }, {
@@ -25,17 +28,36 @@ module.exports = {
       id: "{{/already up[- ]to[- ]date/i.test(input.stdout) ? 'uptodate' : 'build'}}"
     }
   }, {
+    id: "uptodate",
+    method: "shell.run",
+    params: {
+      env: runtimeSecretEnv,
+      message: "python app/scripts/ensure_environment_defaults.py --file ENVIRONMENT"
+    }
+  }, {
     // Reached ONLY when the repo was already current (the "build" path
     // jumps over this step). Before halting, self-heal the seed-vc
     // component if it's missing (GPL-3.0, cloned from its own repo — see
     // install.js): a failed earlier clone shouldn't leave voice features
     // broken until the next code update.
-    id: "uptodate",
     when: "{{!exists('app/postprocessing/seedvc/__init__.py')}}",
     method: "shell.run",
     params: {
+      env: runtimeSecretEnv,
       message: "git clone --depth 1 --branch v1.0.0 https://github.com/Blizaine/maestro-seedvc app/postprocessing/seedvc"
     }
+  }, {
+    method: "script.start",
+    params: { uri: "blender_mcp_install.js" }
+  }, {
+    method: "script.start",
+    params: { uri: "blender_runtime_install.js" }
+  }, {
+    method: "script.start",
+    params: { uri: "h3_acceleration_install.js" }
+  }, {
+    method: "script.start",
+    params: { uri: "h3_w4a8_runtime_install.js" }
   }, {
     method: "log",
     params: {
@@ -43,24 +65,44 @@ module.exports = {
     },
     next: null
   }, {
+    id: "build",
+    method: "shell.run",
+    params: {
+      env: runtimeSecretEnv,
+      message: "python app/scripts/ensure_environment_defaults.py --file ENVIRONMENT"
+    }
+  }, {
     // Fetch the seed-vc component if missing (GPL-3.0, own repository —
     // see install.js). Runs at the top of the build path so the update
     // that removed the formerly-tracked tree clones it right back, and
     // any later update self-heals a failed clone. Keep the pinned tag in
     // sync with install.js.
-    id: "build",
     when: "{{!exists('app/postprocessing/seedvc/__init__.py')}}",
     method: "shell.run",
     params: {
+      env: runtimeSecretEnv,
       message: "git clone --depth 1 --branch v1.0.0 https://github.com/Blizaine/maestro-seedvc app/postprocessing/seedvc"
     }
   }, {
     method: "shell.run",
     params: {
+      env: runtimeSecretEnv,
       venv: "env",
       path: "app",
       message: "uv pip install -r requirements.txt"
     }
+  }, {
+    method: "script.start",
+    params: { uri: "blender_mcp_install.js" }
+  }, {
+    method: "script.start",
+    params: { uri: "blender_runtime_install.js" }
+  }, {
+    method: "script.start",
+    params: { uri: "h3_acceleration_install.js" }
+  }, {
+    method: "script.start",
+    params: { uri: "h3_w4a8_runtime_install.js" }
   }, {
     // Skip torch.js when the marker file written by torch.js's last
     // successful run is still present — `torch + triton + sage + flash`
@@ -68,7 +110,7 @@ module.exports = {
     // Saves ~60-120s + ~3 GB of redundant downloads on routine updates.
     //
     // When bumping ANY of those package versions inside torch.js, ALSO
-    // bump the `_v1` suffix here AND in torch.js's fs.write step. The
+    // bump the marker suffix here AND in torch.js's fs.write step. The
     // old marker becomes stale, this `!exists(new_marker)` gate evaluates
     // true on the next update, torch.js runs, and the new marker is
     // written. Old marker stays as harmless cruft until reset.js (which
@@ -77,9 +119,9 @@ module.exports = {
     // Recovery path: if torch ever ends up in a broken state (e.g. CPU
     // wheel installed where CUDA is expected) AND the marker is still
     // present, the user can manually delete
-    // `app/env/.maestro_torch_v1.installed` and re-run Update to force
+    // `app/env/.maestro_torch_v2.installed` and re-run Update to force
     // a full reinstall — or run Reset for a clean slate.
-    when: "{{!exists('app/env/.maestro_torch_v1.installed')}}",
+    when: "{{!exists('app/env/.maestro_torch_v2.installed')}}",
     method: "script.start",
     params: {
       uri: "torch.js",
@@ -95,6 +137,7 @@ module.exports = {
     // up to the new behavior without forcing a reinstall.
     method: "shell.run",
     params: {
+      env: runtimeSecretEnv,
       venv: "env",
       path: "app",
       message: "python scripts/install_gguf_kernels.py"
@@ -103,6 +146,7 @@ module.exports = {
     when: "{{exists('ui/package.json')}}",
     method: "shell.run",
     params: {
+      env: runtimeSecretEnv,
       path: "ui",
       message: [
         "npm install",

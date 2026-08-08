@@ -196,7 +196,7 @@ def _download_with_resume(
     if progress:
         initial_pct = int(current_size * 100 / expected_size)
         progress(
-            f"Downloading {label} model (one-time setup)… {initial_pct}%"
+            f"Downloading {label} model on this host… {initial_pct}%"
         )
     print(
         f"[ManagedPreprocessor] {label} not found — downloading {url} "
@@ -242,7 +242,7 @@ def _download_with_resume(
                                 last_pct = pct
                                 progress(
                                     f"Downloading {label} model "
-                                    f"(one-time setup)… {pct}%"
+                                    f"on this host… {pct}%"
                                 )
         finally:
             response.close()

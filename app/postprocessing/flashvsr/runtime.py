@@ -835,6 +835,7 @@ class FlashVSRRuntime:
 _RUNTIME = FlashVSRRuntime()
 
 
+@torch.inference_mode()
 def upscale_video(
     sample: torch.Tensor,
     scale: float,

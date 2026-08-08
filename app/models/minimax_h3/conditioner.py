@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import numpy as np
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, Qwen2VLImageProcessorFast, Qwen3VLVideoProcessor
+from transformers import AutoTokenizer, Qwen2VLImageProcessorFast
 
 from models.ideogram4.qwen3_vl_configuration import Qwen3VLConfig, register_qwen3_vl_config
 from models.ideogram4.qwen3_vl_transformers import Qwen3VLModel, Qwen3VLTextModel, Qwen3VLVisionModel
@@ -17,15 +18,115 @@ VISION_START_TOKEN_ID = 151652
 VISION_END_TOKEN_ID = 151653
 IMAGE_TOKEN_ID = 151655
 VIDEO_TOKEN_ID = 151656
+TEXT_PAD_TOKEN_ID = 151643
 TEXT_ENCODER_LAYERS = 50
 
 
-class MiniMaxH3Int8Embedding(nn.Module):
-    """Row-scaled INT8 embedding used by the Comfy MiniMax H3 checkpoint.
+def _visual_patches(
+    frames: torch.Tensor,
+    *,
+    video: bool = False,
+    patch_size: int = 16,
+    temporal_patch_size: int = 2,
+    merge_size: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert one Qwen image/video pair from THWC RGB into visual patches."""
 
-    The checkpoint keeps the Qwen vocabulary table quantized and stores one
-    floating-point scale per vocabulary row.  Looking up the INT8 rows before
-    dequantizing them avoids materializing the full 1.5 GB BF16 table.
+    if frames.shape[0] == 1:
+        frames = frames.repeat(2, 1, 1, 1)
+    if frames.shape[0] != temporal_patch_size:
+        raise ValueError(
+            f"Qwen visual blocks require {temporal_patch_size} frames, got {frames.shape[0]}."
+        )
+    _, height, width, channels = frames.shape
+    if channels != 3:
+        raise ValueError(f"Qwen visual input must be RGB, got {channels} channels.")
+    factor = patch_size * merge_size
+    min_pixels, max_pixels = ((4096, 25165824) if video else (65536, 16777216))
+    target_height = max(factor, round(height / factor) * factor)
+    target_width = max(factor, round(width / factor) * factor)
+    if target_height * target_width > max_pixels:
+        scale = math.sqrt((height * width) / max_pixels)
+        target_height = max(factor, math.floor(height / scale / factor) * factor)
+        target_width = max(factor, math.floor(width / scale / factor) * factor)
+    elif target_height * target_width < min_pixels:
+        scale = math.sqrt(min_pixels / (height * width))
+        target_height = math.ceil(height * scale / factor) * factor
+        target_width = math.ceil(width * scale / factor) * factor
+
+    images = F.interpolate(
+        frames.permute(0, 3, 1, 2),
+        size=(target_height, target_width),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    )
+    images = images.mul(2.0).sub_(1.0)
+    grid_height, grid_width = target_height // patch_size, target_width // patch_size
+    patches = images.reshape(
+        1,
+        temporal_patch_size,
+        3,
+        grid_height // merge_size,
+        merge_size,
+        patch_size,
+        grid_width // merge_size,
+        merge_size,
+        patch_size,
+    )
+    patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+    flattened = patches.reshape(
+        grid_height * grid_width,
+        3 * temporal_patch_size * patch_size * patch_size,
+    )
+    grid = torch.tensor(
+        [[1, grid_height, grid_width]], dtype=torch.long, device=frames.device
+    )
+    return flattened, grid
+
+
+def _multimodal_rope_positions(visuals: list[dict], sequence_length: int, device) -> torch.Tensor | None:
+    if not visuals:
+        return None
+    positions = torch.zeros((3, sequence_length), dtype=torch.long, device=device)
+    cursor = offset = 0
+    for visual in visuals:
+        start, size, grid = visual["index"], visual["size"], visual["grid"]
+        if cursor < start:
+            positions[:, cursor:start] = torch.arange(cursor + offset, start + offset, device=device)
+        end = start + size
+        max_grid = int(grid.max()) // 2
+        rows = int(grid[0, 1]) // 2
+        columns = int(grid[0, 2]) // 2
+        positions[0, start:end] = start + offset
+        positions[1, start:end] = (
+            torch.arange(start + offset, start + rows + offset, device=device)
+            .unsqueeze(1)
+            .expand(rows, columns)
+            .reshape(-1)[:size]
+        )
+        positions[2, start:end] = (
+            torch.arange(start + offset, start + columns + offset, device=device)
+            .unsqueeze(0)
+            .expand(rows, columns)
+            .reshape(-1)[:size]
+        )
+        offset += max_grid - size
+        cursor = end
+    if cursor < sequence_length:
+        positions[:, cursor:] = torch.arange(
+            cursor + offset, sequence_length + offset, device=device
+        )
+    return positions.unsqueeze(1)
+
+
+class MiniMaxH3Int8Embedding(nn.Module):
+    """Scaled INT8 embedding used by Comfy MiniMax H3 checkpoints.
+
+    Checkpoints may store one tensorwise scale or one scale per vocabulary
+    row. The checkpoint adapter normalizes either representation to row-
+    addressable storage. Looking up INT8 rows before dequantizing avoids
+    materializing the full floating-point table.
     """
 
     def __init__(
@@ -82,42 +183,34 @@ class MiniMaxH3Qwen3VL(nn.Module):
     an identity module.
     """
 
-    def __init__(
-        self,
-        config: Qwen3VLConfig,
-        dtype: torch.dtype | None = None,
-        *,
-        consumer_quantized: bool = True,
-    ):
+    def __init__(self, config: Qwen3VLConfig, dtype: torch.dtype | None = None):
         super().__init__()
         self.config = config
         self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
         self.model = Qwen3VLTextModel(config.text_config)
-        if consumer_quantized:
-            source_embedding = self.model.embed_tokens
-            self.model.embed_tokens = MiniMaxH3Int8Embedding(
-                source_embedding.num_embeddings,
-                source_embedding.embedding_dim,
-                source_embedding.padding_idx,
-                output_dtype=dtype or source_embedding.weight.dtype,
-            )
+        source_embedding = self.model.embed_tokens
+        self.model.embed_tokens = MiniMaxH3Int8Embedding(
+            source_embedding.num_embeddings,
+            source_embedding.embedding_dim,
+            source_embedding.padding_idx,
+            output_dtype=dtype or source_embedding.weight.dtype,
+        )
         self.model.norm = nn.Identity()
-        if consumer_quantized:
-            for layer in self.model.layers:
-                down = layer.mlp.down_proj
-                layer.mlp.down_proj = MiniMaxH3PreScaledLinear(
-                    down.in_features,
-                    down.out_features,
-                    down.bias is not None,
-                    down.weight.dtype,
-                )
-                out = layer.self_attn.o_proj
-                layer.self_attn.o_proj = MiniMaxH3PreScaledLinear(
-                    out.in_features,
-                    out.out_features,
-                    out.bias is not None,
-                    out.weight.dtype,
-                )
+        for layer in self.model.layers:
+            down = layer.mlp.down_proj
+            layer.mlp.down_proj = MiniMaxH3PreScaledLinear(
+                down.in_features,
+                down.out_features,
+                down.bias is not None,
+                down.weight.dtype,
+            )
+            out = layer.self_attn.o_proj
+            layer.self_attn.o_proj = MiniMaxH3PreScaledLinear(
+                out.in_features,
+                out.out_features,
+                out.bias is not None,
+                out.weight.dtype,
+            )
 
     get_rope_index = Qwen3VLModel.get_rope_index
 
@@ -132,11 +225,7 @@ def load_h3_qwen_config(config_path: str) -> Qwen3VLConfig:
 def build_h3_processor(config_dir: str):
     tokenizer = AutoTokenizer.from_pretrained(config_dir, trust_remote_code=False)
     image_processor = Qwen2VLImageProcessorFast.from_pretrained(config_dir)
-    processor = Krea2Qwen3VLProcessor(image_processor, tokenizer)
-    # Ref2VA uses Qwen's dedicated temporal processor. Keep it attached to
-    # the existing lightweight processor wrapper so FL2VA remains unchanged.
-    processor.video_processor = Qwen3VLVideoProcessor.from_pretrained(config_dir)
-    return tokenizer, processor
+    return tokenizer, Krea2Qwen3VLProcessor(image_processor, tokenizer)
 
 
 def _tag_vision_spans(input_ids: torch.Tensor) -> torch.Tensor:
@@ -206,147 +295,142 @@ class MiniMaxH3Conditioner(nn.Module):
         attention_mask = encoded["attention_mask"].bool()
         return input_ids, attention_mask, None, encoded
 
-    @staticmethod
-    def _merge_deepstack(
-        image_mask: torch.Tensor | None,
-        video_mask: torch.Tensor | None,
-        image_deepstack: list[torch.Tensor] | None,
-        video_deepstack: list[torch.Tensor] | None,
-    ) -> tuple[torch.Tensor | None, list[torch.Tensor] | None]:
-        if image_mask is not None and video_mask is not None:
-            visual_mask = image_mask | video_mask
-            image_joint = image_mask[visual_mask]
-            video_joint = video_mask[visual_mask]
-            deepstack = []
-            for image_embed, video_embed in zip(image_deepstack or [], video_deepstack or []):
-                joint = image_embed.new_zeros(
-                    (int(visual_mask.sum().item()), image_embed.shape[-1]),
-                    device=image_embed.device,
+    def _presentation_entries(self, prompt: str, presentation: list[dict]) -> list:
+        entries: list = []
+        counters = {"image": 0, "audio": 0, "video": 0}
+
+        def add_text(text: str) -> None:
+            entries.extend(self.tokenizer(text, add_special_tokens=False)["input_ids"])
+
+        def add_visual(frames: torch.Tensor, *, video: bool = False) -> None:
+            entries.extend((VISION_START_TOKEN_ID, {"frames": frames, "video": video}, VISION_END_TOKEN_ID))
+
+        for item in presentation:
+            kind = item["type"]
+            if kind not in counters:
+                raise ValueError(f"Unsupported MiniMax H3 presentation item {kind!r}.")
+            counters[kind] += 1
+            if kind == "image":
+                add_text(f"<Picture {counters[kind]}>: ")
+                add_visual(item["frames"])
+            elif kind == "audio":
+                add_text(f"<Audio {counters[kind]}>: ")
+            else:
+                add_text(f"<Video {counters[kind]}>: ")
+                frames = item["frames"]
+                timestamps = list(
+                    item.get("timestamps", [index / 2.0 for index in range(frames.shape[0])])
                 )
-                joint[image_joint] = image_embed
-                joint[video_joint] = video_embed
-                deepstack.append(joint)
-            return visual_mask, deepstack
-        if image_mask is not None:
-            return image_mask, image_deepstack
-        if video_mask is not None:
-            return video_mask, video_deepstack
-        return None, None
+                if frames.shape[0] % 2:
+                    frames = torch.cat((frames, frames[-1:]), dim=0)
+                    timestamps.append(timestamps[-1])
+                for index in range(0, frames.shape[0], 2):
+                    add_text(f"<{(timestamps[index] + timestamps[index + 1]) / 2.0:.1f} seconds>")
+                    add_visual(frames[index : index + 2], video=True)
+        add_text(prompt)
+        return entries or [TEXT_PAD_TOKEN_ID]
 
-    @torch.inference_mode()
-    def forward_ref2va(self, prompt: str, device: torch.device, references: list):
-        """Encode the official ordered Ref2VA media presentation."""
+    def _presentation_inputs(self, prompt: str, presentation: list[dict], device: torch.device):
+        entries = self._presentation_entries(prompt, presentation)
+        token_ids: list[int] = []
+        visual_specs: list[dict] = []
+        for entry in entries:
+            if isinstance(entry, int):
+                token_ids.append(entry)
+            else:
+                visual_specs.append(
+                    {
+                        "placeholder": len(token_ids),
+                        "frames": entry["frames"],
+                        "video": entry["video"],
+                    }
+                )
+                token_ids.append(VIDEO_TOKEN_ID if entry["video"] else IMAGE_TOKEN_ID)
 
-        from .ref2va import build_ref2va_presentation, sample_reference_video_frames
-
-        self.qwen.model._interrupt = self._interrupt
-        self.qwen.visual._interrupt = self._interrupt
-        if self._interrupt:
-            return None, None
-
-        merge_size = self.processor.image_processor.merge_size**2
-        pixel_values = image_grid_thw = None
-        image_token_counts: list[int] = []
-        images = [reference.image for reference in references if reference.kind == "image"]
-        if images:
-            vision = self.processor.image_processor(images=images, return_tensors="pt")
-            pixel_values = vision["pixel_values"]
-            image_grid_thw = vision["image_grid_thw"]
-            image_token_counts = [int(grid.prod()) // merge_size for grid in image_grid_thw]
-
-        pixel_values_videos = video_grid_thw = None
-        video_block_token_counts: list[int] = []
-        videos = [reference for reference in references if reference.kind == "video"]
-        if videos:
-            sampled = [sample_reference_video_frames(reference.frames) for reference in videos]
-            for reference, (_, timestamps) in zip(videos, sampled):
-                reference.block_timestamps = timestamps
-            vision = self.processor.video_processor(
-                videos=[np.stack(frames) for frames, _ in sampled],
-                do_sample_frames=False,
-                return_tensors="pt",
+        encoded_visuals: list[dict] = []
+        for spec in visual_specs:
+            if self._interrupt:
+                return None
+            frames = spec["frames"].to(device=device, dtype=torch.float32)
+            flattened, grid = _visual_patches(frames, video=spec["video"])
+            merged, deepstack = self.qwen.visual(flattened, grid_thw=grid)
+            if merged is None or self._interrupt:
+                return None
+            encoded_visuals.append(
+                {
+                    "placeholder": spec["placeholder"],
+                    "merged": merged,
+                    "deepstack": deepstack,
+                    "grid": grid,
+                    "video": spec["video"],
+                }
             )
-            pixel_values_videos = vision["pixel_values_videos"]
-            video_grid_thw = vision["video_grid_thw"]
-            video_block_token_counts = [int(grid[1]) * int(grid[2]) // merge_size for grid in video_grid_thw]
-            for reference, grid in zip(videos, video_grid_thw):
-                if int(grid[0]) != len(reference.block_timestamps):
-                    raise ValueError(
-                        f"The Qwen processor created {int(grid[0])} video blocks, but MiniMax H3 labels "
-                        f"{len(reference.block_timestamps)} blocks for that reference."
-                    )
 
-        token_ids, token_tags = build_ref2va_presentation(
-            self.tokenizer,
-            prompt,
-            references,
-            image_token_counts,
-            video_block_token_counts,
-        )
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        expanded_ids: list[int] = []
+        visuals: list[dict] = []
+        visual_by_placeholder = {item["placeholder"]: item for item in encoded_visuals}
+        for index, token_id in enumerate(token_ids):
+            visual = visual_by_placeholder.get(index)
+            if visual is None:
+                expanded_ids.append(token_id)
+                continue
+            start = len(expanded_ids)
+            size = visual["merged"].shape[0]
+            expanded_ids.extend(
+                [VIDEO_TOKEN_ID if visual["video"] else IMAGE_TOKEN_ID] * size
+            )
+            visual["index"] = start
+            visual["size"] = size
+            visuals.append(visual)
+
+        input_ids = torch.tensor(expanded_ids, dtype=torch.long, device=device).unsqueeze(0)
         inputs_embeds = self.qwen.model.embed_tokens(input_ids)
-
-        image_mask = video_mask = None
-        image_deepstack = video_deepstack = None
-        if pixel_values is not None:
-            image_embeds, image_deepstack = self.qwen.visual(
-                pixel_values.to(device=device, dtype=torch.float32),
-                grid_thw=image_grid_thw.to(device),
-            )
-            if image_embeds is None or self._interrupt:
-                return None, None
-            image_mask = input_ids == IMAGE_TOKEN_ID
-            inputs_embeds = inputs_embeds.masked_scatter(
-                image_mask.unsqueeze(-1).expand_as(inputs_embeds),
-                image_embeds.to(inputs_embeds.dtype),
-            )
-        if pixel_values_videos is not None:
-            video_embeds, video_deepstack = self.qwen.visual(
-                pixel_values_videos.to(device=device, dtype=torch.float32),
-                grid_thw=video_grid_thw.to(device),
-            )
-            if video_embeds is None or self._interrupt:
-                return None, None
-            video_mask = input_ids == VIDEO_TOKEN_ID
-            inputs_embeds = inputs_embeds.masked_scatter(
-                video_mask.unsqueeze(-1).expand_as(inputs_embeds),
-                video_embeds.to(inputs_embeds.dtype),
-            )
-
-        visual_mask, deepstack = self._merge_deepstack(
-            image_mask,
-            video_mask,
-            image_deepstack,
-            video_deepstack,
-        )
-        position_ids, _ = self.qwen.get_rope_index(
-            input_ids,
-            image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(device),
-            video_grid_thw=None if video_grid_thw is None else video_grid_thw.to(device),
-            attention_mask=attention_mask,
-        )
-        outputs = self.qwen.model(
-            input_ids=None,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            visual_pos_masks=visual_mask,
-            deepstack_visual_embeds=deepstack,
-            return_mid_results_layers=[TEXT_ENCODER_LAYERS - 1],
-        )
-        if outputs.last_hidden_state is None or not outputs.mid_results:
-            return None, None
-        return outputs.mid_results[0], torch.tensor(token_tags, dtype=torch.long)
+        visual_mask = torch.zeros((1, inputs_embeds.shape[1]), dtype=torch.bool, device=device)
+        tags = torch.ones(inputs_embeds.shape[1], dtype=torch.long, device=device)
+        deepstack = None
+        for visual in visuals:
+            start, end = visual["index"], visual["index"] + visual["size"]
+            inputs_embeds[0, start:end] = visual["merged"].to(dtype=inputs_embeds.dtype)
+            visual_mask[0, start:end] = True
+            tags[max(0, start - 1) : min(tags.shape[0], end + 1)] = 0
+            if deepstack is None:
+                deepstack = visual["deepstack"]
+            else:
+                deepstack = [
+                    torch.cat((deepstack[index], visual["deepstack"][index]), dim=0)
+                    for index in range(len(deepstack))
+                ]
+        position_ids = _multimodal_rope_positions(visuals, inputs_embeds.shape[1], device)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        return input_ids, attention_mask, position_ids, inputs_embeds, visual_mask, deepstack, tags
 
     @torch.inference_mode()
-    def forward(self, prompt: str, device: torch.device, images: list | None = None):
+    def forward(
+        self,
+        prompt: str,
+        device: torch.device,
+        images: list | None = None,
+        presentation: list[dict] | None = None,
+    ):
         self.qwen.model._interrupt = self._interrupt
         self.qwen.visual._interrupt = self._interrupt
         if self._interrupt:
             return None, None
-        if images:
+        tags = None
+        if presentation:
+            prepared = self._presentation_inputs(prompt, presentation, device)
+            if prepared is None:
+                return None, None
+            (
+                input_ids,
+                attention_mask,
+                position_ids,
+                inputs_embeds,
+                visual_mask,
+                deepstack,
+                tags,
+            ) = prepared
+        elif images:
             input_ids, attention_mask, position_ids, processor_inputs = self._vision_inputs(prompt, images, device)
             grid = processor_inputs["image_grid_thw"]
             pixels = processor_inputs["pixel_values"].to(device=device, dtype=torch.float32)
@@ -382,5 +466,6 @@ class MiniMaxH3Conditioner(nn.Module):
             return None, None
         # The layer snapshot is taken before the (absent) final norm.
         embeddings = outputs.mid_results[0]
-        tags = _tag_vision_spans(input_ids)
+        if tags is None:
+            tags = _tag_vision_spans(input_ids)
         return embeddings, tags

@@ -2,6 +2,26 @@
 
 This page explains how WanGP interprets the main text prompt: how multiline prompts are split or preserved, how prompt lines can be paired with multiple images, how the Prompt Enhancer changes the text, and how macros generate prompt variations.
 
+## Turning a Chat conversation into a model prompt
+
+The **Chat** tab is separate from Studio and Director. It keeps a conversation
+per project in the browser and can use any visible local GGUF model. When an
+idea in the conversation is ready to become a generation prompt, enable
+**Include a prompting guide** and choose the target guide, such as MiniMax H3.
+The guide is added by Maestro on the server; Chat never accepts an arbitrary
+guide path or hidden system prompt from a remote browser.
+
+Vision-capable models can receive up to four images. Attachments are uploaded
+for that one request, authorized against the active project and browser
+session, and are not saved as reusable filesystem paths in conversation
+history. If a GGUF is text-only or its matching projector is unavailable,
+Chat says so before inference rather than ignoring the image.
+
+Local owners may enter a strict Hugging Face repository ID or model URL and can
+add read-only Linked Model Folders in Settings. Remote users can select only
+the visible catalog or opaque linked-folder entries; they cannot provide a URL
+or browse the host filesystem.
+
 ## Prompt Types In Practice
 
 In WanGP, the main prompt is always the text you write in the `prompt` box.
@@ -242,6 +262,58 @@ Use this when:
 Important practical limitation:
 
 - only one `Start Image` is supported in this mode
+
+#### One Detailed Global Timeline Across Automatic Windows
+
+Maestro Studio can also accept one complete long-video prompt whose timestamps
+refer to the final output timeline. Use a range at the start of each timed line:
+
+```text
+Cinematic natural light. Keep the same protagonist, wardrobe, and location.
+[00:00-00:12] Wide establishing shot as the train enters the station.
+[00:12-00:24] Track beside the protagonist walking onto the train.
+[00:24-00:37] The train accelerates through a dark tunnel.
+[00:37-00:45] Arrive in warm morning light; hold on the protagonist.
+```
+
+Accepted range forms include `[00:12-00:24]`, `(12-24s):`, and
+`12 seconds to 24 seconds:`. Existing point cues such as
+`at 20 seconds: the doors close` are also recognized. Seconds may be integer
+or decimal values, and clocks may use `MM:SS.mmm` or `HH:MM:SS.mmm`.
+
+Sectioned H3 prompts are supported directly. Subject definitions, retention
+notes, summaries, and other untimed sections remain global, while shot starts
+are mapped onto the final timeline. These equivalent forms are accepted:
+
+```text
+[Shot 1] The scene opens in a medium shot.
+[Shot 2] At 00:15.000, the camera cuts to a close-up.
+[Shot 3 | 00:27.500] The camera pulls back.
+[00:40.000] Hold on the final composition.
+```
+
+When later H3 shots have explicit start times, an untimed `[Shot 1]` begins at
+zero. Each shot description remains active until the next shot start (or the
+end of the requested video), so it is included in every automatic segment it
+spans. A lone untimed `[Shot 1]` is still treated as ordinary prompt text.
+
+For a video longer than one model window, Maestro automatically:
+
+- keeps untimed lines as global direction in every window
+- clips each timed beat to the windows it intersects
+- rebases timestamps to local window time using the backend's actual FPS,
+  overlap, discarded tail frames, and final partial window
+- preserves beats that cross a boundary in both overlapping windows
+- preserves H3 shot/scene labels while converting their global start times to
+  segment-local ranges
+- leaves the prompt exactly as authored when **Enhance before Generate** is off
+- when enhancement is checked, shows the LLM that will be used, locks every
+  global timestamp token, and rejects the rewrite if the model changes one
+
+This is a Studio workflow. It never sends the prompt through Director. Prompt
+enhancement is optional and is constrained to the authored structure rather
+than asking the LLM to invent a new timeline. Plain multi-line prompts without
+global timestamps continue to use the existing one-line-per-window behavior.
 
 ### 3. All The Lines Are Part Of The Same Prompt
 

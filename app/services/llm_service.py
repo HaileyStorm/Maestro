@@ -1,28 +1,50 @@
-"""Local LLM service using Qwen3.5-0.8B via llama-server subprocess.
+"""Local and OpenAI-compatible LLM service backed by llama-server.
 
-Launches llama-server (from pre-built llama.cpp binaries) as a subprocess
-and communicates via its OpenAI-compatible HTTP API.
-Runs on CPU by default to avoid VRAM conflicts with WanGP.
+Local GGUF models use a hardware-aware llama.cpp runtime with optional linked
+multimodal projectors.  Maestro can use CPU binaries or build its pinned Linux
+CUDA runtime when GPU inference is requested.
 """
 
 import os
 import gc
+import hashlib
+import functools
 import time
 import subprocess
 import threading
 import logging
 import requests
-from typing import Optional
+from urllib.parse import unquote, urlsplit
+from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
 # Singleton state
 _process: Optional[subprocess.Popen] = None
-_lock = threading.Lock()
+_lock = threading.RLock()
+_runtime_status_lock = threading.RLock()
 _model_id: str = ""
 _device: str = ""
 _server_port: int = 0
 _vision_available: bool = False
+_runtime_backend: str = ""
+_runtime_build: Optional[int] = None
+_runtime_devices: list[str] = []
+_runtime_profile: dict = {}
+_runtime_timings: dict = {}
+_requested_device: str = ""
+_runtime_fallback_reason: str = ""
+_runtime_model_size_gb: float = 0.0
+_runtime_timings_multimodal: bool = False
+_runtime_speed_variant_digest: str = ""
+_hardware_cache: Optional[dict] = None
+_nvcc_path_cache: Optional[str] = None
+_speed_observation_lock = threading.Lock()
+_speed_observation_cache: Optional[dict] = None
+_speed_observation_cache_identity: Optional[tuple] = None
+_speed_hardware_identity_cache: dict[str, tuple[str, dict]] = {}
+_SPEED_OBSERVATION_VERSION = 2
+_MAX_SPEED_OBSERVATIONS = 96
 
 # Rolling tail of llama-server's stdout/stderr, drained by a background
 # thread once the server is up. Two jobs: (1) keep the OS pipe from
@@ -38,15 +60,29 @@ _log_reader: Optional[threading.Thread] = None
 _provider: str = "local"
 _remote_url: str = ""       # Base URL for remote/OpenAI-compatible servers
 _api_key: str = ""           # API key for OpenAI/Anthropic
+_loaded_model_key: tuple = ()  # Provider + exact source used by the singleton
 
 # Auto-unload idle timer
 _idle_timer: Optional[threading.Timer] = None
+_idle_timer_generation: int = 0
 _idle_timeout: float = 60.0  # seconds before auto-unload
 
 # Streaming state — accumulates tokens during generation
 _stream_buffer: str = ""
 _stream_done: bool = True
 _stream_lock = threading.Lock()
+_download_state_lock = threading.Lock()
+_download_state: dict = {}
+_loading_model_id: str = ""
+
+
+def _with_model_lease(function):
+    """Keep model load/unload changes out of an active inference request."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        with _lock:
+            return function(*args, **kwargs)
+    return wrapped
 
 # Last call state — for pipeline dashboard capture. The user prompt is
 # captured alongside the system prompt so the Director Dashboard can
@@ -349,6 +385,7 @@ MODEL_REGISTRY = {
         # No mmproj — the upstream repo doesn't publish one, and the
         # supergemma fine-tune fused the vision adapter back into the
         # base weights. Text-only model.
+        "mmproj_file": None,
         "weights_gb": 16.8, "mmproj_gb": 0.0, "arch": "gemma4-26b",
         # Use the embedded jinja template (default behavior — no
         # disable_jinja flag set). Earlier attempts tried forcing
@@ -443,7 +480,7 @@ MODEL_REGISTRY = {
     "paperscarecrow/Gemma-4-31B-it-abliterated-gguf": {
         "label": "Gemma 4 31B Abliterated Q4_K_M (Vision)",
         "gguf_file": "gemma-4-31b-abliterated-Q4_K_M.gguf",
-        "mmproj_file": "mmproj-gemma-4-31B-it-f16.gguf",
+        "mmproj_file": "mmproj-gemma-4-31B-it-BF16.gguf",
         "mmproj_repo": "ggml-org/gemma-4-31B-it-GGUF",  # mmproj from official repo
         "weights_gb": 17.4, "mmproj_gb": 1.12, "arch": "gemma4-27b",
         "thinking_style": "gemma",
@@ -526,6 +563,419 @@ _PUBLIC_MODEL_ORDER = [
     "paperscarecrow/Gemma-4-31B-it-abliterated-gguf",
 ]
 
+CHAT_MAX_MESSAGES = 64
+CHAT_MAX_MESSAGE_CHARS = 32_768
+CHAT_MAX_TOTAL_CHARS = 131_072
+CHAT_MAX_NEW_TOKENS = 8_192
+_DISCOVERED_MODEL_PREFIX = "gguf:"
+_DISCOVERY_MAX_ROOTS = 16
+_DISCOVERY_MAX_DEPTH = 4
+_DISCOVERY_MAX_ENTRIES = 4096
+_HF_PART_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# These are IDs, not paths. The browser may request only one of these fixed
+# entries; callers can never choose an arbitrary guide-loader category/name.
+CHAT_GUIDES = {
+    "minimax_h3_ref2va": {
+        "label": "MiniMax H3 reference video prompting",
+        "category": "enhance", "name": "minimax_h3_ref2va_video",
+        "target_mode": "video",
+        "target_model_prefixes": ("minimax_h3_ref2va",),
+    },
+    "minimax_h3": {
+        "label": "MiniMax H3 video prompting",
+        "category": "enhance", "name": "minimax_h3_video",
+        "target_mode": "video",
+        "target_model_prefixes": ("minimax_h3",),
+    },
+    "ltx2_video": {
+        "label": "LTX-2 video prompting",
+        "category": "enhance", "name": "ltx2_video",
+        "target_mode": "video",
+        "target_model_prefixes": ("ltx2", "ltxv"),
+    },
+    "wan_video": {
+        "label": "Wan video prompting",
+        "category": "enhance", "name": "wan_video",
+        "target_mode": "video",
+        "target_model_prefixes": (
+            "t2v", "i2v", "ti2v", "animate", "wanmove", "ovi", "lucy",
+            "multitalk", "phantom", "fun_inp", "alpha", "fantasy",
+            "chrono", "flf2v", "hunyuan", "heartmula",
+        ),
+    },
+    "flux_image": {
+        "label": "Flux image prompting",
+        "category": "enhance", "name": "flux_image",
+    },
+    "qwen_image": {
+        "label": "Qwen image prompting",
+        "category": "enhance", "name": "qwen_image_gen",
+    },
+    "qwen_image_edit": {
+        "label": "Qwen image editing prompting",
+        "category": "enhance", "name": "qwen_image_edit",
+    },
+}
+
+
+def get_chat_guides() -> list[dict]:
+    guides = []
+    for guide_id, entry in CHAT_GUIDES.items():
+        guide = {"id": guide_id, "label": entry["label"]}
+        if entry.get("target_mode"):
+            guide["target_mode"] = entry["target_mode"]
+            guide["target_model_prefixes"] = list(
+                entry.get("target_model_prefixes", ())
+            )
+        guides.append(guide)
+    return guides
+
+
+def load_chat_guides(guide_ids) -> tuple[list[str], str]:
+    """Resolve curated chat guide IDs to one server-owned system prompt."""
+    if guide_ids is None:
+        return [], ""
+    if not isinstance(guide_ids, list) or len(guide_ids) > 4:
+        raise ValueError("guide_ids must be a list of at most 4 guide IDs")
+    selected = []
+    blocks = []
+    from services.guide_loader import load_guide
+    for raw_id in guide_ids:
+        if not isinstance(raw_id, str) or raw_id not in CHAT_GUIDES:
+            raise ValueError("Unknown chat prompting guide")
+        if raw_id in selected:
+            continue
+        entry = CHAT_GUIDES[raw_id]
+        content = load_guide(entry["category"], entry["name"])
+        if not content:
+            raise RuntimeError(f"Chat prompting guide is unavailable: {raw_id}")
+        selected.append(raw_id)
+        blocks.append(f"PROMPTING GUIDE: {entry['label']}\n\n{content}")
+    return selected, "\n\n---\n\n".join(blocks)
+
+
+def validate_chat_messages(messages) -> list[dict]:
+    """Return a bounded role-preserving user/assistant conversation."""
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("messages must be a non-empty list")
+    if len(messages) > CHAT_MAX_MESSAGES:
+        raise ValueError(f"messages may contain at most {CHAT_MAX_MESSAGES} entries")
+    clean = []
+    total = 0
+    expected = "user"
+    for item in messages:
+        if not isinstance(item, dict) or set(item) - {"role", "content"}:
+            raise ValueError("Each message may contain only role and content")
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"user", "assistant"} or role != expected:
+            raise ValueError("Chat messages must alternate user and assistant roles")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Chat message content must be non-empty text")
+        if len(content) > CHAT_MAX_MESSAGE_CHARS:
+            raise ValueError("A chat message is too large")
+        total += len(content)
+        if total > CHAT_MAX_TOTAL_CHARS:
+            raise ValueError("Chat history is too large")
+        clean.append({"role": role, "content": content})
+        expected = "assistant" if expected == "user" else "user"
+    if clean[-1]["role"] != "user":
+        raise ValueError("The final chat message must be from the user")
+    return clean
+
+
+def normalize_hf_model_source(value: str) -> tuple[str, Optional[str]]:
+    """Normalize a local-owner HF repo ID or main-branch GGUF URL."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("Invalid Hugging Face model source")
+    filename = None
+    if "://" in value:
+        try:
+            parsed = urlsplit(value)
+        except ValueError as error:
+            raise ValueError("Invalid Hugging Face URL") from error
+        try:
+            explicit_port = parsed.port is not None
+        except ValueError as error:
+            raise ValueError("Invalid Hugging Face URL") from error
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() != "huggingface.co"
+            or explicit_port
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or "\\" in parsed.path
+        ):
+            raise ValueError("Only exact https://huggingface.co model URLs are allowed")
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if any(
+            "\\" in part or any(ord(character) < 32 for character in part)
+            for part in parts
+        ):
+            raise ValueError("Invalid Hugging Face URL path")
+        if len(parts) < 2:
+            raise ValueError("Hugging Face URL must identify a repository")
+        repo_parts = parts[:2]
+        if len(parts) > 2:
+            if len(parts) < 5 or parts[2] not in {"blob", "resolve"} or parts[3] != "main":
+                raise ValueError("Hugging Face file URLs must use the main revision")
+            filename = "/".join(parts[4:])
+            if not filename.lower().endswith(".gguf"):
+                raise ValueError("Hugging Face file URL must identify a GGUF file")
+    else:
+        repo_parts = value.split("/")
+        if len(repo_parts) != 2:
+            raise ValueError("Hugging Face model ID must be owner/repository")
+    if any(
+        not _HF_PART_RE.fullmatch(part) or part in {".", ".."}
+        for part in repo_parts
+    ):
+        raise ValueError("Invalid Hugging Face repository ID")
+    if filename:
+        path_parts = filename.split("/")
+        if any(part in {"", ".", ".."} for part in path_parts):
+            raise ValueError("Invalid Hugging Face GGUF filename")
+    return "/".join(repo_parts), filename
+
+
+_PROJECTOR_GENERIC_TOKENS = {
+    "mmproj", "model", "projector", "vision", "f16", "bf16", "fp16",
+    "q8", "q8_0", "q5", "q5_k", "q4", "q4_k", "q4_k_m", "gguf",
+}
+
+
+def _association_tokens(filename: str) -> set[str]:
+    stem = os.path.splitext(os.path.basename(filename))[0].lower()
+    parts = set(filter(None, _re.split(r"[^a-z0-9]+", stem)))
+    return {
+        token for token in parts
+        if token not in _PROJECTOR_GENERIC_TOKENS
+        and not _re.fullmatch(r"(?:q|iq|fp|f|bf)?\d+[a-z0-9]*", token)
+    }
+
+
+def _is_projector_gguf_filename(filename: str) -> bool:
+    """Return whether a GGUF basename uses a conventional projector name."""
+    basename = os.path.basename(filename).lower()
+    if not basename.endswith(".gguf"):
+        return False
+    stem = os.path.splitext(basename)[0]
+    # Preserve the common compact ``mmproj*.gguf`` convention while also
+    # recognizing sidecars named after their model, such as
+    # ``model-name.mmproj-f16.gguf``.  Token boundaries avoid treating an
+    # unrelated model name containing the letters "mmproj" as a projector.
+    return stem.startswith("mmproj") or bool(
+        _re.search(r"(?:^|[^a-z0-9])(?:mmproj|projector)(?:[^a-z0-9]|$)", stem)
+    )
+
+
+def _find_sibling_mmproj(model_path: str) -> Optional[str]:
+    """Resolve a deterministic, contained projector beside a linked GGUF.
+
+    A single conventional ``mmproj*.gguf`` sibling is an unambiguous
+    directory-level association.  If several projector quantizations or model
+    families share a folder, require a unique best filename-token match.
+    Symlinks are intentionally ignored so linked folders cannot escape their
+    approved root through a projector sidecar.
+    """
+    try:
+        requested_path = os.path.abspath(model_path)
+        if os.path.islink(requested_path):
+            return None
+        model_path = os.path.realpath(requested_path)
+        directory = os.path.dirname(model_path)
+        if not os.path.isfile(model_path):
+            return None
+        candidates = []
+        sibling_models = []
+        for entry in os.scandir(directory):
+            lower = entry.name.lower()
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+            if not lower.endswith(".gguf"):
+                continue
+            resolved = os.path.realpath(entry.path)
+            if os.path.commonpath([directory, resolved]) != directory:
+                continue
+            if _is_projector_gguf_filename(entry.name):
+                candidates.append(resolved)
+            else:
+                sibling_models.append(resolved)
+    except (OSError, ValueError):
+        return None
+    candidates.sort(key=lambda path: os.path.basename(path).casefold())
+    if not candidates:
+        return None
+    model_tokens = _association_tokens(model_path)
+    sibling_token_sets = [
+        _association_tokens(path) for path in sibling_models if path != model_path
+    ]
+
+    def belongs_to_current_model(candidate: str) -> bool:
+        if not sibling_token_sets:
+            return True
+        all_families = {frozenset(model_tokens)} | {
+            frozenset(tokens) for tokens in sibling_token_sets
+        }
+        if len(all_families) == 1:
+            # Several quantizations/shards of one model family.
+            return True
+        projector_tokens = _association_tokens(candidate)
+        current_score = len(model_tokens & projector_tokens)
+        return current_score > 0 and all(
+            current_score > len(tokens & projector_tokens)
+            for tokens in sibling_token_sets
+        )
+
+    if len(candidates) == 1:
+        return candidates[0] if belongs_to_current_model(candidates[0]) else None
+    ranked = [
+        (len(model_tokens & _association_tokens(candidate)), candidate)
+        for candidate in candidates
+    ]
+    best_score = max(score for score, _candidate in ranked)
+    winners = [candidate for score, candidate in ranked if score == best_score]
+    if best_score > 0 and len(winners) == 1:
+        return winners[0] if belongs_to_current_model(winners[0]) else None
+    winner_tokens = {frozenset(_association_tokens(candidate)) for candidate in winners}
+    if len(winner_tokens) == 1:
+        # Same family, different projector quantizations. Prefer the compact
+        # Q8 projector for throughput, then BF16/F16, with filename order as a
+        # stable final tiebreaker.
+        def preference(path: str):
+            name = os.path.basename(path).lower()
+            if "q8_0" in name or "q8-0" in name:
+                rank = 0
+            elif "q8" in name:
+                rank = 1
+            elif "bf16" in name:
+                rank = 2
+            elif "f16" in name or "fp16" in name:
+                rank = 3
+            else:
+                rank = 4
+            return rank, name
+        selected = min(winners, key=preference)
+        return selected if belongs_to_current_model(selected) else None
+    return None
+
+
+def get_model_capabilities(
+    model_id: str,
+    *,
+    local_gguf_path: str = "",
+    gguf_file_override: str = "",
+) -> dict:
+    """Return path-free vision/runtime metadata for a catalog model."""
+    entry = MODEL_REGISTRY.get(model_id, {})
+    projector_path = _find_sibling_mmproj(local_gguf_path) if local_gguf_path else None
+    native_vision = bool(entry.get("native_vision", False))
+    declared_projector = bool(entry.get("mmproj_file"))
+    projector_available = bool(projector_path)
+    if declared_projector and not local_gguf_path:
+        repo_basename = model_id.split("/")[-1] if "/" in model_id else model_id
+        model_stem = repo_basename.replace("-GGUF", "")
+        cache_dir = os.path.join(
+            get_model_dir(), entry.get("cache_dir_override") or model_stem,
+        )
+        projector_available = os.path.isfile(
+            os.path.join(cache_dir, entry["mmproj_file"])
+        )
+    vision_capable = native_vision or declared_projector or bool(projector_path)
+    return {
+        "vision_capable": vision_capable,
+        "projector_available": projector_available,
+        "native_vision": native_vision,
+        "runtime_profile": dict(entry.get("runtime_profile") or {}),
+    }
+
+
+def _discovered_gguf_paths(search_roots) -> dict[str, dict]:
+    """Scan explicit roots without following directory or file symlinks."""
+    if not isinstance(search_roots, (list, tuple)):
+        return {}
+    found = {}
+    entries_seen = 0
+    roots_seen = set()
+    for raw_root in list(search_roots)[:_DISCOVERY_MAX_ROOTS]:
+        if not isinstance(raw_root, str) or not raw_root.strip():
+            continue
+        root = os.path.realpath(os.path.abspath(raw_root))
+        root_key = os.path.normcase(root)
+        if root_key in roots_seen or not os.path.isdir(root):
+            continue
+        roots_seen.add(root_key)
+        stack = [(root, 0)]
+        while stack and entries_seen < _DISCOVERY_MAX_ENTRIES:
+            current, depth = stack.pop()
+            try:
+                children = list(os.scandir(current))
+            except OSError:
+                continue
+            for entry in children:
+                entries_seen += 1
+                if entries_seen > _DISCOVERY_MAX_ENTRIES:
+                    break
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < _DISCOVERY_MAX_DEPTH:
+                            stack.append((entry.path, depth + 1))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    lower = entry.name.lower()
+                    if (
+                        not lower.endswith(".gguf")
+                        or _is_projector_gguf_filename(entry.name)
+                    ):
+                        continue
+                    real_path = os.path.realpath(entry.path)
+                    if os.path.commonpath([root, real_path]) != root:
+                        continue
+                    size = entry.stat(follow_symlinks=False).st_size
+                    opaque = _DISCOVERED_MODEL_PREFIX + hashlib.sha256(
+                        real_path.encode("utf-8", errors="surrogatepass")
+                    ).hexdigest()[:24]
+                    found[opaque] = {
+                        "path": real_path,
+                        "label": os.path.splitext(entry.name)[0],
+                        "size_bytes": size,
+                    }
+                except (OSError, ValueError):
+                    continue
+    for entry in found.values():
+        entry["mmproj_path"] = _find_sibling_mmproj(entry["path"])
+    return found
+
+
+def discover_gguf_models(search_roots) -> list[dict]:
+    """Return safe public metadata for GGUFs in owner-linked folders."""
+    models = []
+    for opaque, entry in _discovered_gguf_paths(search_roots).items():
+        models.append({
+            "id": opaque,
+            "label": entry["label"],
+            "size_hint": f"{entry['size_bytes'] / 1e9:.1f} GB installed",
+            "provider": "local",
+            "installed": True,
+            "downloaded": True,
+            "source": "Linked model folder",
+            "vision_capable": bool(entry.get("mmproj_path")),
+            "projector_available": bool(entry.get("mmproj_path")),
+            "native_vision": False,
+        })
+    return sorted(models, key=lambda item: item["label"].casefold())
+
+
+def resolve_discovered_gguf(model_id: str, search_roots) -> Optional[str]:
+    entry = _discovered_gguf_paths(search_roots).get(model_id)
+    return entry["path"] if entry else None
+
 
 def get_available_models(provider: str = "local", remote_url: str = "", api_key: str = "") -> list:
     """Return list of available LLM model options for the UI.
@@ -540,6 +990,14 @@ def get_available_models(provider: str = "local", remote_url: str = "", api_key:
             "label": MODEL_REGISTRY[repo_id]["label"],
             "size_hint": MODEL_REGISTRY[repo_id]["size_hint"],
             "provider": "local",
+            "source": "Maestro catalog",
+            "downloaded": os.path.isfile(os.path.join(
+                get_model_dir(),
+                MODEL_REGISTRY[repo_id].get("cache_dir_override")
+                or repo_id.split("/")[-1].replace("-GGUF", ""),
+                MODEL_REGISTRY[repo_id]["gguf_file"],
+            )),
+            **get_model_capabilities(repo_id),
         }
         for repo_id in _PUBLIC_MODEL_ORDER
         if repo_id in MODEL_REGISTRY
@@ -824,12 +1282,868 @@ def is_loaded() -> bool:
 
 
 def get_status() -> dict:
+    with _download_state_lock:
+        download = dict(_download_state)
+    if download and str(download.get("phase") or "downloading") == "downloading":
+        try:
+            from services import safe_download
+            basename = str(download.get("filename") or "")
+            tracked = safe_download.get_active_downloads()
+            match = next(
+                (
+                    item for item in tracked
+                    if basename and (
+                        os.path.basename(str(item.get("filename") or "")) == basename
+                    )
+                ),
+                None,
+            )
+            if match:
+                download.update({
+                    "downloaded_bytes": int(match.get("downloaded_bytes") or 0),
+                    "total_bytes": match.get("total_bytes"),
+                    "seconds_since_progress": match.get("seconds_since_progress"),
+                })
+        except Exception:
+            pass
+    with _runtime_status_lock:
+        loaded = is_loaded()
+        runtime_snapshot = {
+            "model_id": _model_id,
+            "provider": _provider,
+            "backend": _runtime_backend,
+            "requested_device": _requested_device,
+            "timings": dict(_runtime_timings),
+            "multimodal": _runtime_timings_multimodal,
+        }
+        status_snapshot = {
+            "loaded": loaded,
+            "model_id": _model_id or None,
+            "device": _device if loaded else None,
+            "requested_device": _requested_device or None,
+            "provider": _provider,
+            "vision_available": bool(loaded and _vision_available),
+            "backend": _runtime_backend or None,
+            "runtime_build": _runtime_build,
+            "runtime_devices": list(_runtime_devices),
+            "runtime_profile": dict(_runtime_profile),
+            "runtime_timings": dict(_runtime_timings),
+            "fallback_reason": _runtime_fallback_reason or None,
+            "loading_model_id": _loading_model_id,
+        }
     return {
-        "loaded": is_loaded(),
-        "model_id": _model_id or None,
-        "device": _device if is_loaded() else None,
-        "provider": _provider,
+        "loaded": status_snapshot["loaded"],
+        "model_id": status_snapshot["model_id"],
+        "device": status_snapshot["device"],
+        "requested_device": status_snapshot["requested_device"],
+        "provider": status_snapshot["provider"],
+        "vision_available": status_snapshot["vision_available"],
+        "backend": status_snapshot["backend"],
+        "runtime": {
+            "backend": status_snapshot["backend"],
+            "build": status_snapshot["runtime_build"],
+            "devices": status_snapshot["runtime_devices"],
+            "effective_profile": status_snapshot["runtime_profile"],
+            "timings": status_snapshot["runtime_timings"],
+            "speed": _current_runtime_speed(runtime_snapshot),
+            "fallback_reason": status_snapshot["fallback_reason"],
+        },
+        "loading": bool(download or status_snapshot["loading_model_id"]),
+        "loading_model_id": (
+            status_snapshot["loading_model_id"]
+            or (download.get("model_id") if download else None)
+        ),
+        "loading_phase": (
+            str(download.get("phase") or "downloading")
+            if download
+            else ("loading model" if status_snapshot["loading_model_id"] else None)
+        ),
+        "download": download or None,
     }
+
+
+def vision_available() -> bool:
+    """Return whether the loaded Director model will actually receive images."""
+    return is_loaded() and bool(_vision_available)
+
+
+def _record_response_metrics(data, *, multimodal: bool = False) -> None:
+    """Store only numeric, path-free llama.cpp timing/usage information."""
+    global _runtime_timings, _runtime_timings_multimodal
+    if not isinstance(data, dict):
+        return
+    metrics = {}
+    timings = data.get("timings")
+    if isinstance(timings, dict):
+        allowed = {
+            "prompt_n", "prompt_ms", "prompt_per_second", "predicted_n",
+            "predicted_ms", "predicted_per_second",
+        }
+        for key in allowed:
+            value = timings.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                metrics[key] = value
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        for source, target in (
+            ("prompt_tokens", "prompt_tokens"),
+            ("completion_tokens", "completion_tokens"),
+            ("total_tokens", "total_tokens"),
+        ):
+            value = usage.get(source)
+            if isinstance(value, int) and not isinstance(value, bool):
+                metrics[target] = value
+    persist_metrics = None
+    persist_multimodal = bool(multimodal)
+    if metrics:
+        # Some compatible servers return token usage on a later/final event
+        # without repeating their timing block. Retain the newest actual rates
+        # instead of replacing them with a usage-only payload.
+        with _runtime_status_lock:
+            new_rate_keys = {
+                rate_key
+                for rate_key in ("prompt_per_second", "predicted_per_second")
+                if rate_key in metrics
+            }
+            has_new_rate = bool(new_rate_keys)
+            may_retain_rate = (
+                not has_new_rate
+                or _runtime_timings_multimodal == bool(multimodal)
+            )
+            for rate_key in ("prompt_per_second", "predicted_per_second"):
+                if rate_key not in metrics:
+                    previous_rate = _valid_speed_rate(
+                        _runtime_timings.get(rate_key)
+                    )
+                    if may_retain_rate and previous_rate is not None:
+                        metrics[rate_key] = previous_rate
+            if has_new_rate:
+                _runtime_timings_multimodal = bool(multimodal)
+            _runtime_timings = metrics
+            if _provider == "local" and new_rate_keys:
+                persist_metrics = dict(metrics), set(new_rate_keys)
+    if persist_metrics is not None:
+        persisted_values, observed_keys = persist_metrics
+        _persist_speed_observation(
+            persisted_values,
+            multimodal=persist_multimodal,
+            observed_rate_keys=observed_keys,
+        )
+
+
+def _valid_speed_rate(value) -> Optional[float]:
+    """Return a bounded positive throughput value, or ``None``."""
+    import math
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or not 0.01 <= value <= 100_000:
+        return None
+    return value
+
+
+def _speed_observation_path() -> str:
+    """Private content-free calibration store; never returned by an API."""
+    return os.path.join(get_model_dir(), ".runtime_speed_v2.json")
+
+
+class _SpeedObservationFileLock:
+    """Bounded cross-process lock for the shared calibration sidecar."""
+
+    def __init__(self):
+        self._handle = None
+
+    def __enter__(self):
+        lock_path = _speed_observation_path() + ".lock"
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        self._handle = open(lock_path, "a+b")
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        try:
+            deadline = time.monotonic() + 30
+            if os.name == "nt":
+                import msvcrt
+
+                if os.path.getsize(lock_path) == 0:
+                    self._handle.write(b"\0")
+                    self._handle.flush()
+                self._handle.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(
+                            self._handle.fileno(), msvcrt.LK_NBLCK, 1,
+                        )
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "timed out locking LLM speed observations"
+                            )
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                while True:
+                    try:
+                        fcntl.flock(
+                            self._handle.fileno(),
+                            fcntl.LOCK_EX | fcntl.LOCK_NB,
+                        )
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "timed out locking LLM speed observations"
+                            )
+                        time.sleep(0.05)
+        except Exception:
+            self._handle.close()
+            self._handle = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self._handle is None:
+            return False
+        try:
+            self._handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
+        return False
+
+
+def _speed_hardware_identity(backend: str) -> tuple[str, dict]:
+    """Hash a coarse hardware class so persisted records expose no device name."""
+    import json
+    import platform
+
+    cached = _speed_hardware_identity_cache.get(backend)
+    if cached is not None:
+        return cached[0], dict(cached[1])
+
+    profile = _hardware_profile(probe_gpu=backend == "cuda")
+    coarse = {
+        "backend": backend,
+        "physical_threads": int(profile.get("physical_threads") or 0),
+        "logical_threads": int(profile.get("logical_threads") or 0),
+        "gpu_vram_gb": round(float(profile.get("gpu_vram_gb") or 0), 1),
+    }
+    identity = dict(coarse)
+    identity["machine"] = platform.machine()
+    cpu_model = platform.processor()
+    if os.path.isfile("/proc/cpuinfo"):
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.lower().startswith("model name") and ":" in line:
+                        cpu_model = line.split(":", 1)[1].strip()[:160]
+                        break
+        except OSError:
+            pass
+    identity["cpu_model"] = cpu_model
+    if backend == "cuda":
+        visible_devices = []
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,uuid,name,memory.total,driver_version",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                for line in (result.stdout or "").splitlines():
+                    parts = [part.strip() for part in line.split(",", 4)]
+                    if len(parts) != 5:
+                        continue
+                    index, uuid, name, memory_mib, driver = parts
+                    if _cuda_device_is_visible(index, uuid):
+                        visible_devices.append({
+                            "uuid": uuid,
+                            "name": name,
+                            "memory_mib": memory_mib,
+                            "driver": driver,
+                        })
+        except (OSError, subprocess.SubprocessError):
+            pass
+        identity["visible_devices"] = visible_devices
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    result = hashlib.sha256(encoded.encode("utf-8")).hexdigest(), coarse
+    _speed_hardware_identity_cache[backend] = result
+    return result[0], dict(result[1])
+
+
+def _speed_model_digest(model_id: str) -> str:
+    return hashlib.sha256(str(model_id or "").encode("utf-8")).hexdigest()
+
+
+def _speed_variant_digest(
+    model_id: str,
+    *,
+    local_gguf_path: str = "",
+    gguf_file_override: str = "",
+    device: str = "auto",
+    effective_profile_override: Optional[dict] = None,
+) -> str:
+    """Hash quant/projector/runtime inputs without persisting their names."""
+    import json
+
+    entry = MODEL_REGISTRY.get(model_id, {})
+    model_file = (
+        gguf_file_override
+        or entry.get("gguf_file")
+        or (os.path.basename(local_gguf_path) if local_gguf_path else "")
+    )
+    model_path = local_gguf_path
+    if not model_path and model_file:
+        repo_basename = model_id.split("/")[-1] if "/" in model_id else model_id
+        model_stem = repo_basename.replace("-GGUF", "")
+        cache_dir = os.path.join(
+            get_model_dir(), entry.get("cache_dir_override") or model_stem,
+        )
+        candidate = os.path.join(cache_dir, model_file)
+        if os.path.isfile(candidate):
+            model_path = candidate
+    projector_file = entry.get("mmproj_file")
+    projector_path = None
+    if model_path:
+        projector_path = _find_sibling_mmproj(model_path)
+        if projector_path:
+            projector_file = os.path.basename(projector_path)
+    if not projector_path and projector_file and model_path:
+        candidate = os.path.join(os.path.dirname(model_path), projector_file)
+        if os.path.isfile(candidate):
+            projector_path = candidate
+    if not projector_path and model_id not in MODEL_REGISTRY:
+        projector_file = DEFAULT_MMPROJ_FILE
+    runtime_bin = os.environ.get("MAESTRO_LLAMA_BIN", DEFAULT_BIN_DIR)
+    server_path = os.path.join(
+        runtime_bin, "llama-server.exe" if os.name == "nt" else "llama-server",
+    )
+    effective_profile = dict(effective_profile_override or {})
+    normalized_device = "cuda" if str(device).lower() == "cuda" else "cpu"
+    if model_path and not effective_profile:
+        try:
+            effective_profile = _runtime_profile_for(
+                model_path,
+                projector_path,
+                normalized_device,
+                {"backend": normalized_device},
+                entry,
+            )
+        except (OSError, TypeError, ValueError):
+            effective_profile = {}
+    material = {
+        "model_file": model_file,
+        "model_identity": _safe_file_identity(model_path),
+        "projector_file": projector_file,
+        "projector_identity": _safe_file_identity(projector_path),
+        "server_identity": _safe_file_identity(server_path),
+        "extra_flags": list(entry.get("extra_flags") or []),
+        "runtime_profile": dict(entry.get("runtime_profile") or {}),
+        "effective_profile": effective_profile,
+        "disable_jinja": bool(entry.get("disable_jinja", False)),
+        "runtime_version": globals().get("LLAMA_SERVER_VERSION", ""),
+        "device": str(device or "auto").lower(),
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _speed_observation_key(
+    model_id: str,
+    backend: str,
+    hardware_digest: str,
+    variant_digest: str,
+    multimodal: bool,
+) -> str:
+    material = "\0".join((
+        _speed_model_digest(model_id), backend, hardware_digest, variant_digest,
+        "vision" if multimodal else "text",
+    ))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _load_speed_observations_locked() -> dict:
+    """Load and validate the bounded observation map while holding its lock."""
+    import json
+
+    global _speed_observation_cache, _speed_observation_cache_identity
+    path = _speed_observation_path()
+    file_identity = _safe_file_identity(path)
+    if (
+        _speed_observation_cache is not None
+        and (
+            _speed_observation_cache_identity is None
+            or _speed_observation_cache_identity == file_identity
+        )
+    ):
+        return _speed_observation_cache
+    observations = {}
+    try:
+        if os.path.getsize(path) > 128 * 1024:
+            raise ValueError("speed observation file exceeds its size bound")
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid speed observation root")
+        if payload.get("version") != _SPEED_OBSERVATION_VERSION:
+            raise ValueError("unsupported speed observation version")
+        rows = payload.get("observations")
+        if not isinstance(rows, list):
+            raise ValueError("invalid speed observations")
+        for row in rows[:_MAX_SPEED_OBSERVATIONS]:
+            if not isinstance(row, dict):
+                continue
+            key = row.get("key")
+            backend = row.get("backend")
+            if (
+                not isinstance(key, str) or len(key) != 64
+                or backend not in {"cpu", "cuda"}
+                or not isinstance(row.get("hardware"), str)
+                or len(row["hardware"]) != 64
+                or not isinstance(row.get("model"), str)
+                or len(row["model"]) != 64
+                or not isinstance(row.get("variant"), str)
+                or len(row["variant"]) != 64
+            ):
+                continue
+            prompt_rate = _valid_speed_rate(row.get("prompt_tps"))
+            generation_rate = _valid_speed_rate(row.get("generation_tps"))
+            if prompt_rate is None and generation_rate is None:
+                continue
+            observations[key] = {
+                "key": key,
+                "model": row["model"],
+                "variant": row["variant"],
+                "hardware": row["hardware"],
+                "backend": backend,
+                "multimodal": bool(row.get("multimodal", False)),
+                "model_gb": max(0.1, min(float(row.get("model_gb") or 4), 500)),
+                "prompt_tps": prompt_rate,
+                "generation_tps": generation_rate,
+                "prompt_samples": max(
+                    0, min(int(row.get("prompt_samples") or 0), 10_000)
+                ),
+                "generation_samples": max(
+                    0, min(int(row.get("generation_samples") or 0), 10_000)
+                ),
+                "updated": max(0, int(row.get("updated") or 0)),
+            }
+    except (OSError, ValueError, TypeError, OverflowError, json.JSONDecodeError):
+        observations = {}
+    _speed_observation_cache = observations
+    _speed_observation_cache_identity = _safe_file_identity(path)
+    return observations
+
+
+def _save_speed_observations_locked(observations: dict) -> None:
+    """Atomically persist only hashes and numeric calibration observations."""
+    import json
+    import tempfile
+
+    global _speed_observation_cache_identity
+
+    path = _speed_observation_path()
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    rows = sorted(
+        observations.values(), key=lambda row: int(row.get("updated") or 0),
+        reverse=True,
+    )[:_MAX_SPEED_OBSERVATIONS]
+    payload = {
+        "version": _SPEED_OBSERVATION_VERSION,
+        "observations": rows,
+    }
+    temporary = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix=".runtime-speed-", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = handle.name
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary, path)
+        temporary = ""
+        _speed_observation_cache_identity = _safe_file_identity(path)
+    finally:
+        if temporary:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+
+
+def _catalog_model_size_gb(
+    model_id: str,
+    local_gguf_path: str = "",
+    runtime_snapshot: Optional[dict] = None,
+) -> tuple[float, bool]:
+    """Return a path-free model-size estimate and whether it is authoritative."""
+    if local_gguf_path:
+        try:
+            return max(os.path.getsize(local_gguf_path) / (1024 ** 3), 0.1), True
+        except OSError:
+            pass
+    if runtime_snapshot is None:
+        with _runtime_status_lock:
+            runtime_snapshot = {
+                "model_id": _model_id,
+                "model_size_gb": _runtime_model_size_gb,
+            }
+    if (
+        model_id == runtime_snapshot.get("model_id")
+        and float(runtime_snapshot.get("model_size_gb") or 0) > 0
+    ):
+        return float(runtime_snapshot["model_size_gb"]), True
+    entry = MODEL_REGISTRY.get(model_id, {})
+    try:
+        weights = float(entry.get("weights_gb") or 0)
+    except (TypeError, ValueError):
+        weights = 0
+    if weights > 0:
+        return weights, True
+    return 4.0, False
+
+
+def _persist_speed_observation(
+    metrics: dict,
+    *,
+    multimodal: bool,
+    observed_rate_keys: Optional[set[str]] = None,
+) -> None:
+    """Refine an EMA using content-free llama.cpp timing measurements."""
+    global _speed_observation_cache, _speed_observation_cache_identity
+    if not _model_id or _runtime_backend not in {"cpu", "cuda"}:
+        return
+    observed_rate_keys = observed_rate_keys or {
+        "prompt_per_second", "predicted_per_second",
+    }
+    prompt_rate = (
+        _valid_speed_rate(metrics.get("prompt_per_second"))
+        if "prompt_per_second" in observed_rate_keys else None
+    )
+    generation_rate = (
+        _valid_speed_rate(metrics.get("predicted_per_second"))
+        if "predicted_per_second" in observed_rate_keys else None
+    )
+    if prompt_rate is None and generation_rate is None:
+        return
+    hardware_digest, _hardware = _speed_hardware_identity(_runtime_backend)
+    variant_digest = (
+        _runtime_speed_variant_digest
+        or _speed_variant_digest(_model_id, device=_runtime_backend)
+    )
+    key = _speed_observation_key(
+        _model_id, _runtime_backend, hardware_digest, variant_digest, multimodal,
+    )
+    model_gb, _known_size = _catalog_model_size_gb(_model_id)
+    with _speed_observation_lock:
+        try:
+            with _SpeedObservationFileLock():
+                # Another Maestro process may have committed observations
+                # since our last read. Reload under the interprocess lock,
+                # merge this sample, then atomically replace the sidecar.
+                _speed_observation_cache = None
+                _speed_observation_cache_identity = None
+                observations = _load_speed_observations_locked()
+                previous = observations.get(key, {})
+                prompt_samples = int(previous.get("prompt_samples") or 0)
+                generation_samples = int(
+                    previous.get("generation_samples") or 0
+                )
+
+                def blended(
+                    field: str, latest: Optional[float],
+                ) -> Optional[float]:
+                    old = _valid_speed_rate(previous.get(field))
+                    if latest is None:
+                        return old
+                    if old is None:
+                        return round(latest, 4)
+                    alpha = 0.35
+                    return round((old * (1 - alpha)) + (latest * alpha), 4)
+
+                observations[key] = {
+                    "key": key,
+                    "model": _speed_model_digest(_model_id),
+                    "variant": variant_digest,
+                    "hardware": hardware_digest,
+                    "backend": _runtime_backend,
+                    "multimodal": bool(multimodal),
+                    "model_gb": round(model_gb, 3),
+                    "prompt_tps": blended("prompt_tps", prompt_rate),
+                    "generation_tps": blended(
+                        "generation_tps", generation_rate,
+                    ),
+                    "prompt_samples": min(
+                        prompt_samples + (1 if prompt_rate is not None else 0),
+                        10_000,
+                    ),
+                    "generation_samples": min(
+                        generation_samples
+                        + (1 if generation_rate is not None else 0),
+                        10_000,
+                    ),
+                    "updated": int(time.time()),
+                }
+                if len(observations) > _MAX_SPEED_OBSERVATIONS:
+                    oldest = sorted(
+                        observations,
+                        key=lambda item: int(
+                            observations[item].get("updated") or 0
+                        ),
+                    )[:len(observations) - _MAX_SPEED_OBSERVATIONS]
+                    for old_key in oldest:
+                        observations.pop(old_key, None)
+                _save_speed_observations_locked(observations)
+        except OSError:
+            # Measurements are useful but must never fail a completed response.
+            logger.debug("Unable to persist LLM speed calibration", exc_info=True)
+
+
+def _speed_result(
+    prompt_rate,
+    generation_rate,
+    *,
+    source: str,
+    confidence: str,
+    reason: str,
+    samples: int,
+    backend: str,
+) -> dict:
+    prompt_rate = _valid_speed_rate(prompt_rate)
+    generation_rate = _valid_speed_rate(generation_rate)
+    return {
+        "prompt_tokens_per_second": (
+            round(prompt_rate, 1) if prompt_rate is not None else None
+        ),
+        "generation_tokens_per_second": (
+            round(generation_rate, 1) if generation_rate is not None else None
+        ),
+        "source": source,
+        "confidence": confidence,
+        "reason": reason,
+        "sample_count": max(0, int(samples or 0)),
+        "backend": backend or None,
+    }
+
+
+def _heuristic_speed_estimate(model_gb: float, backend: str) -> tuple[float, float]:
+    """Conservative fallback until this hardware has real observations."""
+    hardware = _hardware_profile(probe_gpu=backend == "cuda")
+    model_gb = max(float(model_gb or 4), 0.1)
+    if backend == "cuda":
+        vram_gb = float(hardware.get("gpu_vram_gb") or 0)
+        generation = 600.0 / model_gb
+        if vram_gb <= 0:
+            generation *= 0.18
+        elif model_gb > vram_gb * 0.75:
+            fit = max((vram_gb * 0.75) / model_gb, 0.1)
+            generation *= max(0.12, fit * fit)
+        generation = max(0.5, min(generation, 160.0))
+        prompt = min(generation * 3.2, 1200.0)
+    else:
+        physical = max(int(hardware.get("physical_threads") or 2), 2)
+        generation = (physical * 2.8) / (model_gb ** 0.75)
+        generation = max(0.4, min(generation, 40.0))
+        prompt = min(generation * 2.4, 300.0)
+    return prompt, generation
+
+
+def _observation_sample_count(row: dict) -> int:
+    counts = []
+    if _valid_speed_rate(row.get("prompt_tps")) is not None:
+        counts.append(int(row.get("prompt_samples") or 0))
+    if _valid_speed_rate(row.get("generation_tps")) is not None:
+        counts.append(int(row.get("generation_samples") or 0))
+    return min(counts) if counts else 0
+
+
+def get_model_speed_estimate(
+    model_id: str,
+    *,
+    local_gguf_path: str = "",
+    gguf_file_override: str = "",
+    device: str = "auto",
+    multimodal: bool = False,
+    use_current_measurement: bool = True,
+) -> dict:
+    """Return path-free measured or calibrated throughput for one catalog item."""
+    with _runtime_status_lock:
+        current = {
+            "model_id": _model_id,
+            "backend": _runtime_backend,
+            "requested_device": _requested_device,
+            "timings": dict(_runtime_timings),
+            "multimodal": _runtime_timings_multimodal,
+            "variant": _runtime_speed_variant_digest,
+            "model_size_gb": _runtime_model_size_gb,
+        }
+    requested = str(device or "auto").lower()
+    if requested not in {"auto", "cpu", "cuda"}:
+        requested = "auto"
+    if requested == "auto":
+        if model_id == current["model_id"] and current["backend"] in {"cpu", "cuda"}:
+            backend = current["backend"]
+        elif current["requested_device"] in {"cpu", "cuda"}:
+            backend = current["requested_device"]
+        else:
+            backend = (
+                "cuda"
+                if _hardware_profile().get("gpu_vram_gb", 0) > 0
+                else "cpu"
+            )
+    else:
+        backend = requested
+
+    variant_digest = _speed_variant_digest(
+        model_id,
+        local_gguf_path=local_gguf_path,
+        gguf_file_override=gguf_file_override,
+        device=backend,
+    )
+    if (
+        use_current_measurement
+        and model_id == current["model_id"]
+        and backend == current["backend"]
+        and bool(multimodal) == bool(current["multimodal"])
+        and variant_digest == current["variant"]
+    ):
+        prompt_rate = _valid_speed_rate(current["timings"].get("prompt_per_second"))
+        generation_rate = _valid_speed_rate(
+            current["timings"].get("predicted_per_second")
+        )
+        if prompt_rate is not None or generation_rate is not None:
+            return _speed_result(
+                prompt_rate, generation_rate,
+                source="measured", confidence="measured",
+                reason="Latest completed request on this model and backend",
+                samples=1, backend=backend,
+            )
+
+    hardware_digest, _hardware = _speed_hardware_identity(backend)
+    key = _speed_observation_key(
+        model_id, backend, hardware_digest, variant_digest, multimodal,
+    )
+    model_gb, known_size = _catalog_model_size_gb(
+        model_id, local_gguf_path, runtime_snapshot=current,
+    )
+    with _speed_observation_lock:
+        observations = dict(_load_speed_observations_locked())
+    exact = observations.get(key)
+    if exact:
+        sample_count = _observation_sample_count(exact)
+        confidence = "high" if sample_count >= 3 else "medium"
+        return _speed_result(
+            exact.get("prompt_tps"), exact.get("generation_tps"),
+            source="calibrated", confidence=confidence,
+            reason=(
+                "Repeated measurements for this model on this hardware"
+                if sample_count >= 3
+                else "Early measurement for this model on this hardware"
+            ),
+            samples=sample_count, backend=backend,
+        )
+
+    comparable = [
+        row for row in observations.values()
+        if row.get("hardware") == hardware_digest
+        and row.get("backend") == backend
+        and bool(row.get("multimodal")) == bool(multimodal)
+    ]
+    if comparable and known_size:
+        import math
+
+        source_row = min(
+            comparable,
+            key=lambda row: abs(
+                math.log(max(float(row.get("model_gb") or 4), 0.1) / model_gb)
+            ),
+        )
+        scale = max(
+            0.12,
+            min((float(source_row.get("model_gb") or 4) / model_gb) ** 0.92, 8.0),
+        )
+        prompt_rate = _valid_speed_rate(source_row.get("prompt_tps"))
+        generation_rate = _valid_speed_rate(source_row.get("generation_tps"))
+        return _speed_result(
+            prompt_rate * scale if prompt_rate is not None else None,
+            generation_rate * scale if generation_rate is not None else None,
+            source="calibrated", confidence="medium",
+            reason="Scaled from measurements on this hardware and backend",
+            samples=_observation_sample_count(source_row), backend=backend,
+        )
+
+    prompt_rate, generation_rate = _heuristic_speed_estimate(model_gb, backend)
+    return _speed_result(
+        prompt_rate, generation_rate,
+        source="heuristic", confidence="low",
+        reason="Conservative hardware and model-size estimate; no comparable measurement yet",
+        samples=0, backend=backend,
+    )
+
+
+def _current_runtime_speed(snapshot: Optional[dict] = None) -> dict:
+    snapshot = dict(snapshot or {})
+    model_id = snapshot.get("model_id", _model_id)
+    provider = snapshot.get("provider", _provider)
+    backend = snapshot.get("backend", _runtime_backend)
+    requested_device = snapshot.get("requested_device", _requested_device)
+    timings = dict(snapshot.get("timings", _runtime_timings))
+    multimodal = bool(snapshot.get("multimodal", _runtime_timings_multimodal))
+    if model_id:
+        prompt_rate = _valid_speed_rate(timings.get("prompt_per_second"))
+        generation_rate = _valid_speed_rate(timings.get("predicted_per_second"))
+        if provider == "local":
+            if prompt_rate is not None or generation_rate is not None:
+                return _speed_result(
+                    prompt_rate, generation_rate,
+                    source="measured", confidence="measured",
+                    reason="Latest completed request on this model and backend",
+                    samples=1, backend=backend,
+                )
+            return get_model_speed_estimate(
+                model_id,
+                device=backend or requested_device or "auto",
+                multimodal=multimodal,
+                use_current_measurement=False,
+            )
+        if prompt_rate is not None or generation_rate is not None:
+            return _speed_result(
+                prompt_rate, generation_rate,
+                source="measured", confidence="measured",
+                reason="Latest completed provider request",
+                samples=1, backend=provider,
+            )
+        return _speed_result(
+            None, None, source="unavailable", confidence="unavailable",
+            reason="Provider has not returned throughput timings",
+            samples=0, backend=provider,
+        )
+    return _speed_result(
+        None, None, source="unavailable", confidence="unavailable",
+        reason="No model is loaded", samples=0, backend="",
+    )
 
 
 def _download_gguf(repo_id: str, filename: str, cache_dir: str) -> str:
@@ -841,11 +2155,22 @@ def _download_gguf(repo_id: str, filename: str, cache_dir: str) -> str:
 
     print(f"[LLM] Downloading {filename} from {repo_id}...")
     from huggingface_hub import hf_hub_download
-    downloaded = hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        local_dir=cache_dir,
-    )
+    with _download_state_lock:
+        _download_state.update({
+            "model_id": repo_id,
+            "filename": os.path.basename(filename),
+            "downloaded_bytes": 0,
+            "total_bytes": None,
+        })
+    try:
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=cache_dir,
+        )
+    finally:
+        with _download_state_lock:
+            _download_state.clear()
     print(f"[LLM] Downloaded to: {downloaded}")
     return downloaded
 
@@ -857,11 +2182,364 @@ def _download_gguf(repo_id: str, filename: str, cache_dir: str) -> str:
 # 'blk.N.ssm_conv1d.weight'". Verified b9632 loads it; b9048 does not. Bump
 # this (and FALLBACK_TAG below) when a newer model needs a newer runtime.
 MIN_LLAMA_BUILD = 9632
+# Linux CUDA releases are not published as ready-to-run artifacts.  Pin this
+# source tag so a CUDA runtime is reproducible and can be audited independently
+# of the moving llama.cpp default branch.
+LLAMA_SERVER_VERSION = "b10289"
+LLAMA_SERVER_BUILD = 10289
+_CUDA_BUILD_ATTEMPTED = False
 
 
-def _llama_server_build(exe_path: str):
-    """Return the installed llama-server's llama.cpp build number, or None if
-    it can't be determined (e.g. unexpected --version format)."""
+def _safe_file_identity(path: Optional[str]) -> tuple:
+    """Return a reload identity that changes when a local artifact is replaced."""
+    if not path:
+        return ()
+    try:
+        link_stat = os.lstat(path)
+        target_stat = os.stat(path)
+        return (
+            int(link_stat.st_dev), int(link_stat.st_ino), int(link_stat.st_size),
+            int(link_stat.st_mtime_ns), int(link_stat.st_ctime_ns),
+            int(target_stat.st_dev), int(target_stat.st_ino), int(target_stat.st_size),
+            int(target_stat.st_mtime_ns), int(target_stat.st_ctime_ns),
+        )
+    except OSError:
+        return ()
+
+
+def _runtime_launch_identity(
+    server_exe: str,
+    extra_flags: Sequence,
+    disable_jinja: bool,
+) -> tuple:
+    """Return command inputs not otherwise represented by the runtime profile."""
+    return (
+        _safe_file_identity(server_exe),
+        tuple(str(flag) for flag in (extra_flags or ())),
+        bool(disable_jinja),
+    )
+
+
+def _discover_nvcc() -> Optional[str]:
+    """Find a usable CUDA compiler, including Pinokio's managed Miniforge."""
+    import json
+    import shutil
+
+    global _nvcc_path_cache
+    if (
+        _nvcc_path_cache
+        and os.path.isfile(_nvcc_path_cache)
+        and os.access(_nvcc_path_cache, os.X_OK)
+    ):
+        return _nvcc_path_cache
+
+    candidates = []
+    for env_name in ("CUDACXX", "CUDA_HOME", "CUDA_PATH"):
+        value = os.environ.get(env_name, "")
+        if not value:
+            continue
+        candidates.append(
+            value if os.path.basename(value) == "nvcc" else os.path.join(value, "bin", "nvcc")
+        )
+    resolved = shutil.which("nvcc")
+    if resolved:
+        candidates.append(resolved)
+    try:
+        with open(os.path.expanduser("~/.pinokio/config.json"), encoding="utf-8") as handle:
+            pinokio_home = json.load(handle).get("home", "")
+        if pinokio_home:
+            candidates.append(os.path.join(pinokio_home, "bin", "miniforge", "bin", "nvcc"))
+    except (OSError, ValueError, TypeError):
+        pass
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        candidates.append(os.path.join(conda_prefix, "bin", "nvcc"))
+
+    seen = set()
+    usable: list[tuple[tuple[int, int], str]] = []
+    for candidate in candidates:
+        candidate = os.path.realpath(os.path.abspath(candidate))
+        if candidate in seen or not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        seen.add(candidate)
+        try:
+            result = subprocess.run(
+                [candidate, "--version"], capture_output=True, text=True, timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0 or "cuda" not in output.lower():
+            continue
+        match = _re.search(r"release\s+(\d+)\.(\d+)", output, _re.IGNORECASE)
+        version = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+        usable.append((version, candidate))
+    if not usable:
+        return None
+    # Prefer the newest compiler. This matters on machines where an older
+    # system toolkit appears before Pinokio's managed toolkit; CUDA 12.0, for
+    # example, cannot target the RTX 50-series compute capability while the
+    # managed CUDA 12.8 compiler can.
+    _, selected = max(usable, key=lambda item: (item[0], item[1]))
+    _nvcc_path_cache = selected
+    return selected
+
+
+def _cuda_process_env(
+    nvcc_path: Optional[str], runtime_bin_dir: Optional[str] = None,
+) -> dict:
+    """Return an environment that can find a managed CUDA toolkit at runtime."""
+    env = os.environ.copy()
+    if not nvcc_path:
+        return env
+    toolkit_root = os.path.dirname(os.path.dirname(os.path.realpath(nvcc_path)))
+    bin_dir = os.path.join(toolkit_root, "bin")
+    library_dirs = [
+        os.path.realpath(runtime_bin_dir or DEFAULT_BIN_DIR),
+        os.path.join(toolkit_root, "lib"),
+        os.path.join(toolkit_root, "lib64"),
+        os.path.join(toolkit_root, "targets", "x86_64-linux", "lib"),
+    ]
+    # A managed nvcc is paired with its compatible host compiler/sysroot. Keep
+    # that toolchain together; the build configuration adds the host driver
+    # library's rpath-link explicitly for Miniforge's isolated linker.
+    env["PATH"] = os.pathsep.join([bin_dir, env.get("PATH", "")])
+    existing = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(
+        [directory for directory in library_dirs if os.path.isdir(directory)]
+        + ([existing] if existing else [])
+    )
+    env["CUDACXX"] = os.path.realpath(nvcc_path)
+    env["CUDA_HOME"] = toolkit_root
+    env["CUDA_PATH"] = toolkit_root
+    return env
+
+
+def _cuda_visible_tokens() -> Optional[set[str]]:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return None
+    return {token.strip() for token in raw.split(",") if token.strip()}
+
+
+def _cuda_device_is_visible(index: str, uuid: str) -> bool:
+    visible = _cuda_visible_tokens()
+    if visible is None:
+        return True
+    if not visible or visible == {"-1"}:
+        return False
+    return any(
+        token == index or uuid == token or uuid.startswith(token)
+        for token in visible
+    )
+
+
+def _cuda_architecture() -> Optional[str]:
+    """Return CMake architectures for every GPU visible to this process."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi", "--query-gpu=index,uuid,compute_cap",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        architectures = set()
+        for line in (result.stdout or "").splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 3:
+                continue
+            index, uuid, capability = parts
+            if not _cuda_device_is_visible(index, uuid):
+                continue
+            if _re.fullmatch(r"\d+\.\d+", capability):
+                architectures.add(int(capability.replace(".", "")))
+        if architectures:
+            return ";".join(str(value) for value in sorted(architectures))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _llama_server_capabilities(exe_path: str, env: Optional[dict] = None) -> dict:
+    """Probe the installed executable and report its actual compute backend."""
+    if env is None:
+        build, runnable = _llama_server_probe(exe_path)
+    else:
+        build, runnable = _llama_server_probe(exe_path, env=env)
+    devices: list[str] = []
+    backend = "unavailable"
+    if runnable:
+        backend = "cpu"
+        try:
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(
+                [exe_path, "--list-devices"], capture_output=True, text=True,
+                timeout=30, env=env, **kwargs,
+            )
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            in_device_list = False
+            for line in output.splitlines():
+                clean = line.strip()
+                if clean.lower() == "available devices:":
+                    in_device_list = True
+                    continue
+                if not in_device_list or not clean or clean.lower() == "(none)":
+                    continue
+                if _re.search(r"\b(?:cuda|nvidia)\b", clean, _re.IGNORECASE):
+                    # Device labels are hardware metadata, not filesystem paths.
+                    devices.append(clean[:160])
+            if result.returncode == 0 and devices:
+                backend = "cuda"
+        except Exception:
+            pass
+    return {
+        "build": build,
+        "runnable": runnable,
+        "backend": backend,
+        "devices": devices,
+    }
+
+
+def _copy_cuda_runtime(build_bin: str, staging_dir: str) -> None:
+    """Copy only llama-server and its sibling shared libraries to staging."""
+    import shutil
+
+    os.makedirs(staging_dir, exist_ok=True)
+    copied_server = False
+    for name in os.listdir(build_bin):
+        source = os.path.join(build_bin, name)
+        if name == "llama-server" or name.startswith("lib") and ".so" in name:
+            target = os.path.join(staging_dir, name)
+            if os.path.islink(source):
+                os.symlink(os.readlink(source), target)
+            elif os.path.isfile(source):
+                shutil.copy2(source, target)
+            copied_server = copied_server or name == "llama-server"
+    if not copied_server:
+        raise FileNotFoundError("CUDA build completed without llama-server")
+    os.chmod(os.path.join(staging_dir, "llama-server"), 0o755)
+    _repair_linux_soname_links(staging_dir)
+
+
+def _atomic_install_runtime(staging_dir: str, bin_dir: str) -> None:
+    """Swap a fully probed staged runtime into place, restoring on failure."""
+    import shutil
+    import uuid
+
+    parent = os.path.dirname(os.path.abspath(bin_dir))
+    os.makedirs(parent, exist_ok=True)
+    backup = os.path.join(parent, f".{os.path.basename(bin_dir)}.backup-{uuid.uuid4().hex}")
+    had_existing = os.path.lexists(bin_dir)
+    installed = False
+    try:
+        if had_existing:
+            os.replace(bin_dir, backup)
+        os.replace(staging_dir, bin_dir)
+        installed = True
+    except Exception:
+        if os.path.lexists(bin_dir):
+            shutil.rmtree(bin_dir, ignore_errors=True)
+        if had_existing and os.path.lexists(backup):
+            os.replace(backup, bin_dir)
+        raise
+    finally:
+        if installed and os.path.lexists(backup):
+            shutil.rmtree(backup, ignore_errors=True)
+
+
+def _build_linux_cuda_runtime(bin_dir: str, nvcc_path: str) -> dict:
+    """Build the pinned official llama.cpp source with CUDA, then install it."""
+    import shutil
+    import sys
+    import tempfile
+
+    parent = os.path.dirname(os.path.abspath(bin_dir))
+    os.makedirs(parent, exist_ok=True)
+    env = _cuda_process_env(nvcc_path)
+    with tempfile.TemporaryDirectory(prefix="maestro-llama-src-") as source_tmp:
+        source_dir = os.path.join(source_tmp, "llama.cpp")
+        subprocess.run(
+            [
+                "git", "clone", "--depth", "1", "--branch", LLAMA_SERVER_VERSION,
+                "https://github.com/ggml-org/llama.cpp.git", source_dir,
+            ],
+            check=True, capture_output=True, text=True, timeout=300, env=env,
+        )
+        build_dir = os.path.join(source_dir, "build")
+        configure = [
+            "cmake", "-S", source_dir, "-B", build_dir,
+            "-DGGML_CUDA=ON", "-DGGML_NATIVE=ON", "-DCMAKE_BUILD_TYPE=Release",
+            "-DLLAMA_BUILD_UI=OFF",
+            f"-DCMAKE_CUDA_COMPILER={os.path.realpath(nvcc_path)}",
+            # A depth-1 tag checkout cannot derive the historical commit count,
+            # so llama.cpp otherwise reports build 1 even for tag b10289.
+            f"-DLLAMA_BUILD_NUMBER={LLAMA_SERVER_BUILD}",
+        ]
+        architecture = _cuda_architecture()
+        if architecture:
+            configure.append(f"-DCMAKE_CUDA_ARCHITECTURES={architecture}")
+        if sys.platform.startswith("linux"):
+            host_driver_dirs = [
+                directory for directory in (
+                    "/lib/x86_64-linux-gnu",
+                    "/usr/lib/x86_64-linux-gnu",
+                )
+                if os.path.isfile(os.path.join(directory, "libcuda.so.1"))
+            ]
+            if host_driver_dirs:
+                link_flags = " ".join(
+                    f"-Wl,-rpath-link,{directory} -L{directory}"
+                    for directory in host_driver_dirs
+                )
+                configure.extend([
+                    f"-DCMAKE_EXE_LINKER_FLAGS={link_flags}",
+                    f"-DCMAKE_SHARED_LINKER_FLAGS={link_flags}",
+                ])
+        subprocess.run(
+            configure, check=True, capture_output=True, text=True, timeout=300, env=env,
+        )
+        subprocess.run(
+            [
+                "cmake", "--build", build_dir, "--config", "Release",
+                "--target", "llama-server", "--parallel", str(min(os.cpu_count() or 2, 16)),
+            ],
+            check=True, capture_output=True, text=True, timeout=1800, env=env,
+        )
+        staging_dir = tempfile.mkdtemp(prefix=".llama-runtime-stage-", dir=parent)
+        try:
+            _copy_cuda_runtime(os.path.join(build_dir, "bin"), staging_dir)
+            capabilities = _llama_server_capabilities(
+                os.path.join(staging_dir, "llama-server"),
+                env=_cuda_process_env(nvcc_path, staging_dir),
+            )
+            if (
+                not capabilities["runnable"]
+                or capabilities["backend"] != "cuda"
+                or capabilities["build"] is None
+                or capabilities["build"] < LLAMA_SERVER_BUILD
+            ):
+                raise RuntimeError("built llama-server failed the CUDA/version probe")
+            _atomic_install_runtime(staging_dir, bin_dir)
+            staging_dir = ""
+            return capabilities
+        finally:
+            if staging_dir:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def _llama_server_probe(exe_path: str, env: Optional[dict] = None):
+    """Return ``(build, runnable)`` for an installed llama-server.
+
+    A successful process with an unfamiliar version string is runnable and
+    should be retained. Exit 127 is different: on Linux the dynamic loader
+    uses it when a required shared-library link is missing, so treating that
+    result as merely "unparseable" leaves a broken runtime installed forever.
+    """
     try:
         import subprocess
         import re
@@ -869,22 +2547,118 @@ def _llama_server_build(exe_path: str):
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         out = subprocess.run(
-            [exe_path, "--version"], capture_output=True, text=True, timeout=20, **kwargs
+            [exe_path, "--version"], capture_output=True, text=True, timeout=20,
+            env=env, **kwargs,
         )
         m = re.search(r"version:\s*(\d+)", (out.stdout or "") + (out.stderr or ""))
         if m:
-            return int(m.group(1))
+            return int(m.group(1)), out.returncode == 0
+        return None, out.returncode == 0
     except Exception:
-        pass
-    return None
+        return None, False
 
 
-def _ensure_llama_server(bin_dir: str) -> None:
+def _repair_linux_soname_links(bin_dir: str) -> list:
+    """Recreate missing SONAME links for flattened llama.cpp Linux releases.
+
+    Release tarballs store links such as ``libllama.so.0`` alongside files
+    such as ``libllama.so.0.0.10289``. Older Maestro extraction copied only
+    regular files, so existing installs can contain every library payload but
+    still fail at process startup. Infer the stable major-version SONAME and
+    point it at the newest matching versioned file without replacing a valid
+    file or link.
+    """
+    if not os.path.isdir(bin_dir):
+        return []
+
+    candidates = {}
+    for name in os.listdir(bin_dir):
+        match = _re.match(r"^(lib.+\.so)\.(\d+)(?:\..+)+$", name)
+        path = os.path.join(bin_dir, name)
+        if match and os.path.isfile(path) and not os.path.islink(path):
+            soname = f"{match.group(1)}.{match.group(2)}"
+            candidates.setdefault(soname, []).append(name)
+
+    def _version_key(name: str):
+        suffix = name.split(".so.", 1)[1]
+        return tuple(
+            (0, int(part)) if part.isdigit() else (1, part)
+            for part in suffix.split(".")
+        )
+
+    repaired = []
+    for soname, names in candidates.items():
+        link_path = os.path.join(bin_dir, soname)
+        if os.path.lexists(link_path):
+            if not (os.path.islink(link_path) and not os.path.exists(link_path)):
+                continue
+            os.unlink(link_path)
+        target_name = max(names, key=_version_key)
+        os.symlink(target_name, link_path)
+        repaired.append(soname)
+    return repaired
+
+
+def _extract_linux_tar(tar, bin_dir: str) -> None:
+    """Flatten a llama.cpp Linux tarball while preserving safe symlinks."""
+    import posixpath
+    import shutil
+
+    members = tar.getmembers()
+    archive_members = {
+        posixpath.normpath(member.name).lstrip("./"): member
+        for member in members
+    }
+
+    # Extract payloads first so restored links never point at a target that
+    # was skipped simply because it appeared later in the archive.
+    for member in members:
+        if not member.isfile():
+            continue
+        flat_name = posixpath.basename(member.name)
+        if not flat_name:
+            continue
+        target = os.path.join(bin_dir, flat_name)
+        src = tar.extractfile(member)
+        if src is None:
+            continue
+        with src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        try:
+            os.chmod(target, member.mode)
+        except OSError:
+            pass
+
+    for member in members:
+        if not member.issym() or posixpath.isabs(member.linkname):
+            continue
+        member_name = posixpath.normpath(member.name).lstrip("./")
+        resolved_target = posixpath.normpath(
+            posixpath.join(posixpath.dirname(member_name), member.linkname)
+        )
+        if resolved_target == ".." or resolved_target.startswith("../"):
+            continue
+        if resolved_target not in archive_members:
+            continue
+        flat_name = posixpath.basename(member_name)
+        flat_target = posixpath.basename(resolved_target)
+        if not flat_name or not flat_target or flat_name == flat_target:
+            continue
+        link_path = os.path.join(bin_dir, flat_name)
+        if os.path.lexists(link_path):
+            os.unlink(link_path)
+        os.symlink(flat_target, link_path)
+
+    _repair_linux_soname_links(bin_dir)
+
+
+def _ensure_llama_server(bin_dir: str, requested_device: str = "cpu") -> dict:
     """Auto-download llama-server from llama.cpp GitHub releases if missing.
 
     Picks the appropriate prebuilt binary for the current platform:
       - Windows + CUDA (default for Maestro on NVIDIA): bin-win-cuda-12.4-x64.zip
-      - Linux: bin-ubuntu-x64.tar.gz (includes CUDA backend if libs are present)
+      - Linux CUDA: pinned official source build via ``GGML_CUDA=ON``
+      - Linux CPU fallback: bin-ubuntu-x64.tar.gz
       - macOS / AMD: not supported by Maestro itself (Pinokio install gates these),
         but if someone gets here, raise with a clear message.
 
@@ -903,22 +2677,93 @@ def _ensure_llama_server(bin_dir: str) -> None:
     import zipfile
     import tarfile
     import shutil
+    import tempfile
     from urllib.request import Request, urlopen
     from urllib.error import URLError, HTTPError
 
+    global _CUDA_BUILD_ATTEMPTED, _runtime_fallback_reason
+
+    requested_device = str(requested_device or "cpu").lower()
+    if requested_device != "cuda":
+        _runtime_fallback_reason = ""
     is_windows = sys.platform.startswith("win")
     is_linux = sys.platform.startswith("linux")
     exe_name = "llama-server.exe" if is_windows else "llama-server"
     exe_path = os.path.join(bin_dir, exe_name)
+
+    # Linux release assets are CPU-only.  A CUDA request therefore has one
+    # reproducible path: build our pinned official source tag with the managed
+    # toolkit, stage and probe it, then atomically replace the old runtime.
+    if is_linux and requested_device == "cuda":
+        if os.path.isfile(exe_path):
+            _repair_linux_soname_links(bin_dir)
+            installed = _llama_server_capabilities(
+                exe_path, env=_cuda_process_env(_discover_nvcc()),
+            )
+            if (
+                installed["runnable"]
+                and installed["backend"] == "cuda"
+                and installed["build"] is not None
+                and installed["build"] >= LLAMA_SERVER_BUILD
+            ):
+                _runtime_fallback_reason = ""
+                return installed
+        if not _CUDA_BUILD_ATTEMPTED:
+            _CUDA_BUILD_ATTEMPTED = True
+            nvcc_path = _discover_nvcc()
+            try:
+                if not nvcc_path:
+                    raise RuntimeError("no compatible CUDA compiler was found")
+                print(
+                    f"[LLM] Building llama-server {LLAMA_SERVER_VERSION} with CUDA "
+                    "on this host..."
+                )
+                with _download_state_lock:
+                    _download_state.update({
+                        "model_id": _loading_model_id or "llama.cpp",
+                        "filename": f"llama-server {LLAMA_SERVER_VERSION} CUDA",
+                        "phase": "building_runtime",
+                        "downloaded_bytes": 0,
+                        "total_bytes": None,
+                    })
+                try:
+                    built = _build_linux_cuda_runtime(bin_dir, nvcc_path)
+                finally:
+                    with _download_state_lock:
+                        if _download_state.get("phase") == "building_runtime":
+                            _download_state.clear()
+                _runtime_fallback_reason = ""
+                return built
+            except Exception as error:
+                # One bounded attempt per Maestro process.  Keep any previously
+                # runnable CPU install intact and be explicit about the fallback.
+                _runtime_fallback_reason = (
+                    f"CUDA runtime build failed; using CPU: {type(error).__name__}"
+                )
+                print(f"[LLM] {_runtime_fallback_reason}")
+        else:
+            _runtime_fallback_reason = (
+                _runtime_fallback_reason
+                or "CUDA runtime unavailable; using CPU"
+            )
+
     if os.path.isfile(exe_path):
-        build = _llama_server_build(exe_path)
+        if is_linux:
+            repaired = _repair_linux_soname_links(bin_dir)
+            if repaired:
+                print(f"[LLM] Repaired llama.cpp library links: {', '.join(repaired)}")
+        build, runnable = _llama_server_probe(exe_path)
         # Keep the existing binary if it's new enough — or if its version is
-        # unparseable (don't risk a re-download loop on an unknown build).
-        # Only a KNOWN-too-old build triggers an upgrade.
-        if build is None or build >= MIN_LLAMA_BUILD:
-            return
-        print(f"[LLM] llama-server build {build} < required {MIN_LLAMA_BUILD}; "
-              "upgrading to the latest llama.cpp release.")
+        # unparseable but runnable (don't risk a re-download loop on an unknown
+        # build). A loader failure/exit 127 is unusable and must be replaced.
+        if runnable and (build is None or build >= MIN_LLAMA_BUILD):
+            return _llama_server_capabilities(exe_path)
+        if runnable:
+            print(f"[LLM] llama-server build {build} < required {MIN_LLAMA_BUILD}; "
+                  "upgrading to the latest llama.cpp release.")
+        else:
+            print("[LLM] Installed llama-server is not runnable; repairing from "
+                  "the latest llama.cpp release.")
         # fall through to re-download (extractall below overwrites in place)
 
     if not (is_windows or is_linux):
@@ -943,8 +2788,8 @@ def _ensure_llama_server(bin_dir: str) -> None:
     #      but a manual install or weird env may not have it on PATH.
     #      Putting them next to llama-server.exe lets it find them
     #      regardless of system state.
-    # Linux: just one asset — bin-ubuntu-x64.tar.gz dynamically links
-    # against CUDA libs, which Pinokio's AI bundle has on Linux too.
+    # Linux: the official ubuntu asset is CPU-only and is used only for CPU
+    # requests or as a truthful fallback after the bounded CUDA build fails.
     #
     # Both assets are matched by:
     #   (must_start_with, must_contain)
@@ -1006,10 +2851,32 @@ def _ensure_llama_server(bin_dir: str) -> None:
             url = f"https://github.com/ggml-org/llama.cpp/releases/download/{tag}/{guess_name}"
         asset_urls.append(url)
 
+    # Windows needs two archives (server + CUDA DLLs).  Assemble both in one
+    # private staging directory so a failed second download/extract cannot
+    # leave the active runtime containing a mixture of old and new files.
+    windows_stage = None
+    runtime_extract_dir = bin_dir
+    if is_windows:
+        parent = os.path.dirname(os.path.abspath(bin_dir))
+        windows_stage = tempfile.TemporaryDirectory(
+            prefix=".llama-runtime-stage-", dir=parent,
+        )
+        runtime_extract_dir = windows_stage.name
+
     # Download + extract each asset in turn.
     for asset_url in asset_urls:
-        print(f"[LLM] Downloading {os.path.basename(asset_url)} (~one-time setup, may take 1-2 min)...")
-        archive_path = os.path.join(bin_dir, f"_llama_download_temp{archive_ext}")
+        print(f"[LLM] Downloading {os.path.basename(asset_url)} on this host (may take 1-2 min)...")
+        archive_path = os.path.join(
+            runtime_extract_dir, f"_llama_download_temp{archive_ext}",
+        )
+        with _download_state_lock:
+            _download_state.update({
+                "model_id": _loading_model_id or "llama.cpp",
+                "filename": os.path.basename(asset_url),
+                "phase": "downloading_runtime",
+                "downloaded_bytes": 0,
+                "total_bytes": None,
+            })
         try:
             # Stream download so the user isn't waiting on full buffering
             with urlopen(asset_url, timeout=600) as r, open(archive_path, "wb") as f:
@@ -1023,6 +2890,9 @@ def _ensure_llama_server(bin_dir: str) -> None:
                         break
                     f.write(chunk)
                     downloaded += len(chunk)
+                    with _download_state_lock:
+                        _download_state["downloaded_bytes"] = downloaded
+                        _download_state["total_bytes"] = total_bytes or None
                     if total_bytes:
                         pct = (downloaded * 100) // total_bytes
                         if pct - last_pct >= 10:
@@ -1043,33 +2913,65 @@ def _ensure_llama_server(bin_dir: str) -> None:
                         flat_name = os.path.basename(member.filename)
                         if not flat_name:
                             continue
-                        target = os.path.join(bin_dir, flat_name)
+                        target = os.path.join(runtime_extract_dir, flat_name)
                         with z.open(member) as src, open(target, "wb") as dst:
                             shutil.copyfileobj(src, dst)
             else:  # tar.gz
-                with tarfile.open(archive_path, "r:gz") as t:
-                    for member in t.getmembers():
-                        if not member.isfile():
-                            continue
-                        flat_name = os.path.basename(member.name)
-                        if not flat_name:
-                            continue
-                        target = os.path.join(bin_dir, flat_name)
-                        src = t.extractfile(member)
-                        if src is None:
-                            continue
-                        with open(target, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                        # Preserve executable bit on Linux
-                        try:
-                            os.chmod(target, member.mode)
-                        except Exception:
-                            pass
+                parent = os.path.dirname(os.path.abspath(bin_dir))
+                staging_dir = tempfile.mkdtemp(
+                    prefix=".llama-runtime-stage-", dir=parent,
+                )
+                try:
+                    with tarfile.open(archive_path, "r:gz") as t:
+                        _extract_linux_tar(t, staging_dir)
+                    staged_exe = os.path.join(staging_dir, exe_name)
+                    staged = _llama_server_capabilities(staged_exe)
+                    if (
+                        not staged["runnable"]
+                        or (
+                            staged["build"] is not None
+                            and staged["build"] < MIN_LLAMA_BUILD
+                        )
+                    ):
+                        raise RuntimeError(
+                            "downloaded llama-server runtime failed validation"
+                        )
+                    _atomic_install_runtime(staging_dir, bin_dir)
+                    staging_dir = ""
+                finally:
+                    if staging_dir:
+                        shutil.rmtree(staging_dir, ignore_errors=True)
+        except Exception:
+            if windows_stage is not None:
+                windows_stage.cleanup()
+                windows_stage = None
+            raise
         finally:
             try:
                 os.remove(archive_path)
             except OSError:
                 pass
+            with _download_state_lock:
+                if _download_state.get("phase") == "downloading_runtime":
+                    _download_state.clear()
+
+    if windows_stage is not None:
+        try:
+            staged_exe = os.path.join(runtime_extract_dir, exe_name)
+            staged = _llama_server_capabilities(staged_exe)
+            if (
+                not staged["runnable"]
+                or (
+                    staged["build"] is not None
+                    and staged["build"] < MIN_LLAMA_BUILD
+                )
+            ):
+                raise RuntimeError(
+                    "downloaded llama-server runtime failed validation"
+                )
+            _atomic_install_runtime(runtime_extract_dir, bin_dir)
+        finally:
+            windows_stage.cleanup()
 
     if not os.path.isfile(exe_path):
         raise FileNotFoundError(
@@ -1077,21 +2979,255 @@ def _ensure_llama_server(bin_dir: str) -> None:
             f"after extraction. Tried: {asset_urls}"
         )
     print(f"[LLM] llama-server installed to {exe_path}")
+    return _llama_server_capabilities(exe_path)
 
 
-def _get_server_exe() -> str:
-    """Find the llama-server executable, downloading it on first use if missing.
+def _get_server_exe(requested_device: str = "cpu") -> str:
+    """Find llama-server, downloading it to the host cache if missing.
 
-    Lazy-download pattern matches the model-weights flow: nothing is
-    fetched until the user actually triggers their first LLM call. The
-    download is one-time (~50-100 MB) and cached in bin_dir, so
-    subsequent loads are instant.
+    Lazy preparation matches the model-weights flow: nothing is fetched
+    until an LLM call needs the runtime. The ~50-100 MB download is cached
+    in bin_dir; an update or interrupted preparation may fetch it again.
     """
     bin_dir = os.environ.get("MAESTRO_LLAMA_BIN", DEFAULT_BIN_DIR)
-    _ensure_llama_server(bin_dir)
+    _ensure_llama_server(bin_dir, requested_device=requested_device)
     if os.name == "nt":
         return os.path.join(bin_dir, "llama-server.exe")
     return os.path.join(bin_dir, "llama-server")
+
+
+def _flag_value(flags: Sequence, aliases: Sequence[str]):
+    flags = list(flags or [])
+    for index, raw in enumerate(flags):
+        value = str(raw)
+        if value in aliases and index + 1 < len(flags):
+            return flags[index + 1]
+        for alias in aliases:
+            if value.startswith(alias + "="):
+                return value.split("=", 1)[1]
+    return None
+
+
+def _has_flag(flags: Sequence, aliases: Sequence[str]) -> bool:
+    return _flag_value(flags, aliases) is not None or any(
+        str(flag) in aliases for flag in (flags or [])
+    )
+
+
+def _strip_flags_with_values(flags: Sequence, aliases: Sequence[str]) -> list:
+    cleaned = []
+    skip_next = False
+    for raw in list(flags or []):
+        if skip_next:
+            skip_next = False
+            continue
+        value = str(raw)
+        if value in aliases:
+            skip_next = True
+            continue
+        if any(value.startswith(alias + "=") for alias in aliases):
+            continue
+        cleaned.append(raw)
+    return cleaned
+
+
+def _hardware_profile(probe_gpu: bool = True) -> dict:
+    """Return cached, non-sensitive compute capacity used for safe tuning."""
+    global _hardware_cache
+    if probe_gpu and _hardware_cache is not None:
+        return dict(_hardware_cache)
+    logical_threads = max(int(os.cpu_count() or 2), 2)
+    physical_threads = max(logical_threads // 2, 2)
+    gpu_vram_gb = 0.0
+    try:
+        if not probe_gpu:
+            raise RuntimeError("hardware probe disabled")
+        result = subprocess.run(
+            [
+                "nvidia-smi", "--query-gpu=index,uuid,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            visible_memory = []
+            for line in (result.stdout or "").splitlines():
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) != 3:
+                    continue
+                index, uuid, memory_mib = parts
+                if _cuda_device_is_visible(index, uuid):
+                    visible_memory.append(float(memory_mib) / 1024)
+            if visible_memory:
+                gpu_vram_gb = min(visible_memory)
+    except Exception:
+        pass
+    profile = {
+        "logical_threads": logical_threads,
+        "physical_threads": physical_threads,
+        "gpu_vram_gb": round(gpu_vram_gb, 1),
+    }
+    if probe_gpu:
+        _hardware_cache = profile
+    return dict(profile)
+
+
+def _runtime_profile_for(
+    model_path: str,
+    projector_path: Optional[str],
+    requested_device: str,
+    capabilities: dict,
+    registry_entry: dict,
+    *,
+    probe_hardware: bool = True,
+) -> dict:
+    """Choose conservative fast llama.cpp flags for this model and host."""
+    hardware = _hardware_profile(probe_gpu=probe_hardware)
+    extra_flags = list(registry_entry.get("extra_flags") or [])
+    overrides = dict(registry_entry.get("runtime_profile") or {})
+    effective_cuda = (
+        requested_device == "cuda" and capabilities.get("backend") == "cuda"
+    )
+    context = _flag_value(extra_flags, ("-c", "--ctx-size"))
+    try:
+        context = int(context)
+    except (TypeError, ValueError):
+        context = 65_536 if registry_entry else 32_768
+
+    physical = hardware["physical_threads"]
+    logical = hardware["logical_threads"]
+    threads = physical if not effective_cuda else min(physical, 16)
+    threads_batch = min(logical, 32)
+    artifact_gb = (
+        os.path.getsize(model_path)
+        + (os.path.getsize(projector_path) if projector_path else 0)
+    ) / (1024 ** 3)
+    if (
+        effective_cuda
+        and hardware["gpu_vram_gb"] >= 12
+        and artifact_gb <= hardware["gpu_vram_gb"] * 0.60
+    ):
+        batch_size, ubatch_size = 2048, 512
+    elif effective_cuda:
+        batch_size, ubatch_size = 1024, 256
+    else:
+        batch_size, ubatch_size = 512, 128
+
+    def configured_int(aliases: Sequence[str], default: int) -> int:
+        value = _flag_value(extra_flags, aliases)
+        try:
+            return max(1, int(value)) if value is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    threads = configured_int(("-t", "--threads"), threads)
+    threads_batch = configured_int(("-tb", "--threads-batch"), threads_batch)
+    batch_size = configured_int(("-b", "--batch-size"), batch_size)
+    ubatch_size = configured_int(("-ub", "--ubatch-size"), ubatch_size)
+
+    flash_attention = _flag_value(extra_flags, ("-fa", "--flash-attn"))
+    if flash_attention is None:
+        flash_attention = "on" if effective_cuda else "auto"
+    cache_k = _flag_value(extra_flags, ("-ctk", "--cache-type-k"))
+    cache_v = _flag_value(extra_flags, ("-ctv", "--cache-type-v"))
+    if cache_k is None:
+        cache_k = "q8_0" if effective_cuda else "f16"
+    if cache_v is None:
+        cache_v = "q8_0" if effective_cuda else "f16"
+
+    gpu_layers = 0
+    if effective_cuda:
+        configured_layers = _flag_value(
+            extra_flags, ("-ngl", "--gpu-layers", "--n-gpu-layers"),
+        )
+        if configured_layers is not None:
+            gpu_layers = configured_layers
+        else:
+            gpu_layers = -1 if artifact_gb <= hardware["gpu_vram_gb"] * 0.82 else "auto"
+
+    profile = {
+        "backend": "cuda" if effective_cuda else "cpu",
+        "context_size": context,
+        "batch_size": batch_size,
+        "ubatch_size": ubatch_size,
+        "threads": max(2, threads),
+        "threads_batch": max(2, threads_batch),
+        "flash_attention": str(flash_attention),
+        "cache_type_k": str(cache_k),
+        "cache_type_v": str(cache_v),
+        "gpu_layers": gpu_layers,
+        "slots": 1,
+        "prompt_cache": True,
+        "projector_offload": bool(projector_path and effective_cuda),
+    }
+    for key in tuple(profile):
+        if key in overrides and key not in {"backend", "slots", "prompt_cache"}:
+            profile[key] = overrides[key]
+    return profile
+
+
+def _build_llama_server_command(
+    server_exe: str,
+    model_path: str,
+    port: int,
+    profile: dict,
+    *,
+    extra_flags: Sequence = (),
+    mmproj_path: Optional[str] = None,
+    disable_jinja: bool = False,
+) -> list:
+    """Build a testable launch command while retaining model-specific flags."""
+    managed_value_aliases = (
+        "-c", "--ctx-size", "-b", "--batch-size", "-ub", "--ubatch-size",
+        "-t", "--threads", "-tb", "--threads-batch", "-np", "--parallel",
+        "-fa", "--flash-attn", "-ctk", "--cache-type-k", "-ctv",
+        "--cache-type-v", "-ngl", "--gpu-layers", "--n-gpu-layers",
+        "-mm", "--mmproj", "--mtmd-batch-max-tokens",
+    )
+    retained = _strip_flags_with_values(extra_flags, managed_value_aliases)
+    retained = [
+        flag for flag in retained
+        if str(flag) not in {
+            "--cache-prompt", "--no-cache-prompt", "--perf", "--no-perf",
+            "--mmproj-offload", "--no-mmproj-offload",
+        }
+    ]
+    cmd = [
+        server_exe, "--model", model_path, "--host", "127.0.0.1",
+        "--port", str(port),
+    ]
+    if not disable_jinja:
+        cmd.append("--jinja")
+    cmd.extend(str(flag) for flag in retained)
+
+    def add(option: str, value, aliases: Sequence[str]):
+        if not _has_flag(retained, aliases):
+            cmd.extend([option, str(value)])
+
+    add("--ctx-size", profile["context_size"], ("-c", "--ctx-size"))
+    add("--batch-size", profile["batch_size"], ("-b", "--batch-size"))
+    add("--ubatch-size", profile["ubatch_size"], ("-ub", "--ubatch-size"))
+    add("--threads", profile["threads"], ("-t", "--threads"))
+    add(
+        "--threads-batch", profile["threads_batch"],
+        ("-tb", "--threads-batch"),
+    )
+    cmd.extend(["--parallel", "1"])
+    add("--flash-attn", profile["flash_attention"], ("-fa", "--flash-attn"))
+    add("--cache-type-k", profile["cache_type_k"], ("-ctk", "--cache-type-k"))
+    add("--cache-type-v", profile["cache_type_v"], ("-ctv", "--cache-type-v"))
+    cmd.extend(["--n-gpu-layers", str(profile["gpu_layers"])])
+    cmd.append("--cache-prompt")
+    cmd.append("--perf")
+    if mmproj_path:
+        cmd.extend(["--mmproj", mmproj_path])
+        if profile.get("projector_offload") is False:
+            cmd.append("--no-mmproj-offload")
+        else:
+            cmd.append("--mmproj-offload")
+        if not _has_flag(retained, ("--mtmd-batch-max-tokens",)):
+            cmd.extend(["--mtmd-batch-max-tokens", "1"])
+    return cmd
 
 
 def load_model(
@@ -1101,6 +3237,8 @@ def load_model(
     provider: str = "local",
     remote_url: str = "",
     api_key: str = "",
+    local_gguf_path: str = "",
+    gguf_file_override: str = "",
 ) -> None:
     """Load an LLM model. Supports local (llama-server), remote (OpenAI-compatible),
     OpenAI API, and Anthropic API providers.
@@ -1114,133 +3252,193 @@ def load_model(
         api_key: API key for openai/anthropic providers
     """
     global _process, _model_id, _device, _server_port, _vision_available
-    global _provider, _remote_url, _api_key
+    global _provider, _remote_url, _api_key, _loaded_model_key
+    global _runtime_backend, _runtime_build, _runtime_devices, _runtime_profile
+    global _runtime_timings, _requested_device, _loading_model_id
+    global _runtime_fallback_reason, _runtime_model_size_gb
+    global _runtime_timings_multimodal, _runtime_speed_variant_digest
+
+    provider = str(provider or "local").lower()
+    local_path_key = (
+        os.path.realpath(os.path.abspath(local_gguf_path))
+        if local_gguf_path else ""
+    )
+    credential_key = (
+        hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        if api_key else ""
+    )
 
     # Handle remote/API providers — no subprocess needed
     if provider in ("remote", "openai", "anthropic"):
+        load_key = (
+            provider, model_id, provider, remote_url.rstrip("/"),
+            credential_key, "", "",
+        )
         with _lock:
-            if is_loaded() and _model_id == model_id and _provider == provider and not force_reload:
+            if is_loaded() and _loaded_model_key == load_key and not force_reload:
                 return
-            if _process is not None:
+            if is_loaded() or _process is not None:
                 _unload_inner()
-            _provider = provider
-            _remote_url = remote_url
-            _api_key = api_key
-            _model_id = model_id
-            _device = provider
-            _vision_available = False
+            with _runtime_status_lock:
+                _provider = provider
+                _remote_url = remote_url
+                _api_key = api_key
+                _model_id = model_id
+                _device = provider
+                _requested_device = provider
+                _vision_available = False
+                _runtime_backend = provider
+                _runtime_build = None
+                _runtime_devices = []
+                _runtime_profile = {}
+                _runtime_timings = {}
+                _runtime_fallback_reason = ""
+                _runtime_model_size_gb = 0.0
+                _runtime_timings_multimodal = False
+                _runtime_speed_variant_digest = ""
+                _loaded_model_key = load_key
             print(f"[LLM] Connected to {provider} provider: model={model_id}, url={remote_url or 'API'}")
             _reset_idle_timer()
         return
 
     repo_id = model_id or DEFAULT_HF_REPO
-    _provider = "local"
-    _remote_url = ""
-    _api_key = ""
+    requested_device = "cuda" if str(device).lower() == "cuda" else "cpu"
 
     with _lock:
-        if is_loaded() and _model_id == repo_id and not force_reload:
-            return
-
-        if is_loaded():
-            _unload_inner()
-
-        print(f"[LLM] Loading model: {repo_id} on {device}")
+        print(f"[LLM] Preparing model: {repo_id} for {requested_device}")
 
         base_cache_dir = get_model_dir()
 
-        # Look up GGUF filename from registry, fall back to convention
+        # Look up GGUF filename from registry, fall back to convention.
+        # A discovered model arrives as a server-resolved local path; the
+        # browser sees only its opaque model ID and can never supply this path.
         repo_basename = repo_id.split("/")[-1] if "/" in repo_id else repo_id
         model_stem = repo_basename.replace("-GGUF", "")
-        if repo_id in MODEL_REGISTRY:
+        if gguf_file_override:
+            gguf_file = gguf_file_override
+        elif repo_id in MODEL_REGISTRY:
             gguf_file = MODEL_REGISTRY[repo_id]["gguf_file"]
         else:
             gguf_file = f"{model_stem}-Q4_K_S.gguf"
 
-        # Use model-specific subdirectory to avoid cache collisions between models
-        dir_override = MODEL_REGISTRY.get(repo_id, {}).get("cache_dir_override")
-        cache_dir = os.path.join(base_cache_dir, dir_override or model_stem)
-        os.makedirs(cache_dir, exist_ok=True)
-
-        gguf_path = _download_gguf(repo_id, gguf_file, cache_dir)
-        gguf_path = os.path.normpath(gguf_path)
+        if local_gguf_path:
+            gguf_path = os.path.realpath(os.path.abspath(local_gguf_path))
+            if not os.path.isfile(gguf_path) or not gguf_path.lower().endswith(".gguf"):
+                raise ValueError("Resolved local LLM is not a GGUF file")
+            cache_dir = os.path.dirname(gguf_path)
+        else:
+            # Use model-specific subdirectory to avoid cache collisions between models
+            dir_override = MODEL_REGISTRY.get(repo_id, {}).get("cache_dir_override")
+            cache_dir = os.path.join(base_cache_dir, dir_override or model_stem)
+            os.makedirs(cache_dir, exist_ok=True)
+            with _runtime_status_lock:
+                _loading_model_id = repo_id
+            gguf_path = _download_gguf(repo_id, gguf_file, cache_dir)
+            gguf_path = os.path.normpath(gguf_path)
 
         # Try to download mmproj for vision support (optional — not all models have it)
+        registered_model = repo_id in MODEL_REGISTRY
         registry_entry = MODEL_REGISTRY.get(repo_id, {})
-        mmproj_file = registry_entry.get("mmproj_file", DEFAULT_MMPROJ_FILE)
+        # Known models have an explicit registry contract: missing/None means
+        # text-only. Preserve the historical best-effort default only for
+        # ad-hoc, unregistered Hugging Face repositories.
+        mmproj_file = (
+            registry_entry.get("mmproj_file")
+            if registered_model
+            else DEFAULT_MMPROJ_FILE
+        )
+        if local_gguf_path:
+            mmproj_file = None
         mmproj_repo = registry_entry.get("mmproj_repo", repo_id)  # allow mmproj from different repo
-        mmproj_path = None
-        try:
-            mmproj_path = _download_gguf(mmproj_repo, mmproj_file, cache_dir)
-            mmproj_path = os.path.normpath(mmproj_path)
-            print(f"[LLM] Vision support: mmproj loaded from {mmproj_repo}")
-        except Exception as e:
-            print(f"[LLM] No mmproj available (vision disabled): {e}")
-
-        _vision_available = mmproj_path is not None or registry_entry.get("native_vision", False)
-
-        server_exe = _get_server_exe()
-
-        _server_port = _find_free_port()
-
-        extra_flags = registry_entry.get("extra_flags", [])
-
-        # Most models ship a sane jinja chat template inside the GGUF and
-        # benefit from --jinja so llama-server honors thinking-mode kwargs
-        # like enable_thinking. A small number of fine-tunes ship a
-        # "neutral"/generic embedded template that breaks the model's
-        # expected role markers — those entries can opt out by setting
-        # `disable_jinja: True` in the registry, typically alongside a
-        # `--chat-template <name>` override in extra_flags to force the
-        # canonical built-in template (e.g. "gemma" for Gemma 4 fine-tunes
-        # with broken embedded templates).
-        cmd = [
-            server_exe,
-            "--model", gguf_path,
-            "--host", "127.0.0.1",
-            "--port", str(_server_port),
-            "--threads", str(max(os.cpu_count() // 2, 2)),
-        ]
-        if not registry_entry.get("disable_jinja", False):
-            cmd.append("--jinja")
-
-        # Use model-specific context size if provided, otherwise default
-        if "-c" in extra_flags:
-            cmd += extra_flags
-        else:
-            cmd += ["--ctx-size", "65536"] + extra_flags
-
+        mmproj_path = _find_sibling_mmproj(gguf_path) if local_gguf_path else None
         if mmproj_path:
-            cmd += ["--mmproj", mmproj_path]
-            # Force ONE image per encode batch. llama-server's
-            # clip_image_batch_encode sizes its output buffer for a single
-            # image, but the mtmd batcher groups same-processed-shape images
-            # from one request into one batch — two identically-sized images
-            # (e.g. Director's start-frame references, both 432x768) then
-            # abort the server ("Output buffer size mismatch", build 9632)
-            # and the client sees a bare connection reset. A cap of 1 token
-            # per batch means every image always exceeds it and is encoded
-            # alone (the batcher always admits at least one image).
-            # Verified against the exact crashing request.
-            if "--mtmd-batch-max-tokens" not in extra_flags:
-                cmd += ["--mtmd-batch-max-tokens", "1"]
-
-        if device == "cuda":
-            # Use -ngl from extra_flags if present, otherwise default to all layers
-            if "-ngl" in extra_flags:
-                pass  # already included via extra_flags
-            else:
-                cmd += ["--n-gpu-layers", "-1"]
+            print("[LLM] Vision support: linked sibling projector selected")
+        elif mmproj_file:
+            try:
+                with _runtime_status_lock:
+                    _loading_model_id = repo_id
+                mmproj_path = _download_gguf(mmproj_repo, mmproj_file, cache_dir)
+                mmproj_path = os.path.normpath(mmproj_path)
+                print(f"[LLM] Vision support: mmproj loaded from {mmproj_repo}")
+            except Exception as e:
+                print(f"[LLM] No mmproj available (vision disabled): {e}")
         else:
-            cmd += ["--n-gpu-layers", "0"]
+            print("[LLM] Model is registered without an mmproj (vision disabled)")
 
-        print(f"[LLM] Starting llama-server on port {_server_port}")
-        _process = subprocess.Popen(
+        vision_enabled = bool(
+            mmproj_path is not None or registry_entry.get("native_vision", False)
+        )
+        server_exe = _get_server_exe(requested_device)
+        runtime_env = _cuda_process_env(
+            _discover_nvcc() if requested_device == "cuda" else None
+        )
+        probe_runtime = os.path.isfile(server_exe)
+        capabilities = (
+            _llama_server_capabilities(server_exe, env=runtime_env)
+            if probe_runtime
+            else {
+                "build": None, "runnable": True, "backend": "cpu", "devices": [],
+            }
+        )
+        extra_flags = registry_entry.get("extra_flags", [])
+        disable_jinja = bool(registry_entry.get("disable_jinja", False))
+        profile = _runtime_profile_for(
+            gguf_path, mmproj_path, requested_device, capabilities, registry_entry,
+            probe_hardware=probe_runtime,
+        )
+        load_key = (
+            "local", repo_id, requested_device, "", "", local_path_key,
+            gguf_file_override, _safe_file_identity(gguf_path),
+            _safe_file_identity(mmproj_path),
+            tuple(sorted(profile.items())), capabilities.get("build"),
+            _runtime_launch_identity(server_exe, extra_flags, disable_jinja),
+        )
+        if is_loaded() and _loaded_model_key == load_key and not force_reload:
+            return
+        if is_loaded() or _process is not None:
+            _unload_inner()
+
+        runtime_model_size_gb = os.path.getsize(gguf_path) / (1024 ** 3)
+        runtime_speed_variant_digest = _speed_variant_digest(
+            repo_id,
+            local_gguf_path=gguf_path,
+            gguf_file_override=gguf_file_override,
+            device=profile["backend"],
+            effective_profile_override=profile,
+        )
+        server_port = _find_free_port()
+        with _runtime_status_lock:
+            _provider = "local"
+            _remote_url = ""
+            _api_key = ""
+            _requested_device = requested_device
+            _runtime_backend = profile["backend"]
+            _runtime_build = capabilities.get("build")
+            _runtime_devices = list(capabilities.get("devices") or [])
+            _runtime_profile = dict(profile)
+            _runtime_timings = {}
+            _runtime_model_size_gb = runtime_model_size_gb
+            _runtime_timings_multimodal = False
+            _runtime_speed_variant_digest = runtime_speed_variant_digest
+            _vision_available = vision_enabled
+            _server_port = server_port
+        cmd = _build_llama_server_command(
+            server_exe, gguf_path, server_port, profile,
+            extra_flags=extra_flags,
+            mmproj_path=mmproj_path,
+            disable_jinja=disable_jinja,
+        )
+
+        print(f"[LLM] Starting llama-server on port {server_port}")
+        process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            env=runtime_env,
         )
+        with _runtime_status_lock:
+            _process = process
 
         # Wait for server to be ready (poll /health)
         # Scale timeout with model size — large models need more time to load
@@ -1252,8 +3450,7 @@ def load_model(
                 # Process exited — read output for error details
                 exit_code = _process.returncode
                 output = _process.stdout.read().decode(errors="replace") if _process.stdout else ""
-                _process = None
-                _model_id = ""
+                _unload_inner()
                 raise RuntimeError(f"llama-server exited with code {exit_code}:\n{output[-2000:]}")
             try:
                 resp = requests.get(f"{_server_url()}/health", timeout=1)
@@ -1299,10 +3496,16 @@ def load_model(
                 f"Server output:\n{server_output}"
             )
 
-        _model_id = repo_id
-        _device = device
+        with _runtime_status_lock:
+            _model_id = repo_id
+            _loading_model_id = ""
+            _device = profile["backend"]
+            _loaded_model_key = load_key
         file_size = os.path.getsize(gguf_path) / 1e6
-        print(f"[LLM] Model loaded: {repo_id} ({file_size:.0f}MB) on {device}, port {_server_port}")
+        print(
+            f"[LLM] Model loaded: {repo_id} ({file_size:.0f}MB) on "
+            f"{profile['backend']}, port {_server_port}"
+        )
 
         # Start draining the server's output now that it's up. Without this
         # the PIPE fills on a long run and the server blocks on write.
@@ -1311,7 +3514,10 @@ def load_model(
 
 def _cancel_idle_timer():
     """Cancel any pending idle-unload timer."""
-    global _idle_timer
+    global _idle_timer, _idle_timer_generation
+    # Invalidate even a callback that has already fired and is waiting for the
+    # model lease. Timer.cancel() alone cannot stop that queued callback.
+    _idle_timer_generation += 1
     if _idle_timer is not None:
         _idle_timer.cancel()
         _idle_timer = None
@@ -1321,18 +3527,24 @@ def _reset_idle_timer():
     """Reset the idle-unload timer. Called after each LLM request."""
     global _idle_timer
     _cancel_idle_timer()
-    _idle_timer = threading.Timer(_idle_timeout, _auto_unload)
+    generation = _idle_timer_generation
+    _idle_timer = threading.Timer(
+        _idle_timeout, _auto_unload, args=(generation,),
+    )
     _idle_timer.daemon = True
     _idle_timer.start()
 
 
-def _auto_unload():
+def _auto_unload(generation: Optional[int] = None):
     """Called by the idle timer to unload the LLM after inactivity."""
     global _idle_timer
-    _idle_timer = None
-    if is_loaded():
-        print("[LLM] Auto-unloading after idle timeout")
-        unload_model()
+    with _lock:
+        if generation is not None and generation != _idle_timer_generation:
+            return
+        _idle_timer = None
+        if is_loaded():
+            print("[LLM] Auto-unloading after idle timeout")
+            _unload_inner()
 
 
 def _start_log_reader(proc: subprocess.Popen) -> None:
@@ -1447,21 +3659,43 @@ def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
 
 def _unload_inner():
     global _process, _model_id, _device, _server_port, _vision_available
+    global _loaded_model_key, _loading_model_id
+    global _provider, _remote_url, _api_key, _requested_device
+    global _runtime_backend, _runtime_build, _runtime_devices, _runtime_profile
+    global _runtime_timings, _runtime_fallback_reason, _runtime_model_size_gb
+    global _runtime_timings_multimodal, _runtime_speed_variant_digest
     _cancel_idle_timer()
-    if _process is not None:
+    with _runtime_status_lock:
+        process = _process
+        _process = None
+        _model_id = ""
+        _device = ""
+        _server_port = 0
+        _vision_available = False
+        _loading_model_id = ""
+        _loaded_model_key = ()
+        _provider = "local"
+        _remote_url = ""
+        _api_key = ""
+        _requested_device = ""
+        _runtime_backend = ""
+        _runtime_build = None
+        _runtime_devices = []
+        _runtime_profile = {}
+        _runtime_timings = {}
+        _runtime_fallback_reason = ""
+        _runtime_model_size_gb = 0.0
+        _runtime_timings_multimodal = False
+        _runtime_speed_variant_digest = ""
+    if process is not None:
         try:
-            _process.terminate()
-            _process.wait(timeout=10)
+            process.terminate()
+            process.wait(timeout=10)
         except Exception:
             try:
-                _process.kill()
+                process.kill()
             except Exception:
                 pass
-    _process = None
-    _model_id = ""
-    _device = ""
-    _server_port = 0
-    _vision_available = False
     gc.collect()
 
 
@@ -1508,6 +3742,151 @@ def _image_to_data_url(image_path: str, max_size: int = 768) -> Optional[str]:
         return f"data:{mime};base64,{data}"
 
 
+@_with_model_lease
+def generate_chat(
+    messages,
+    *,
+    model_id: str,
+    device: str = "cpu",
+    provider: str = "local",
+    remote_url: str = "",
+    api_key: str = "",
+    local_gguf_path: str = "",
+    gguf_file_override: str = "",
+    system_prompt: str = "",
+    image_paths: Optional[Sequence[str]] = None,
+    max_new_tokens: int = 2048,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+) -> str:
+    """Atomically load the selected model and run a role-preserving chat.
+
+    The model singleton is shared by Director and the rest of Maestro. Holding
+    the re-entrant model lease across resolution, load, and inference prevents
+    an idle unload or another request from swapping the process mid-turn.
+    """
+    clean_messages = validate_chat_messages(messages)
+    if (
+        isinstance(max_new_tokens, bool)
+        or not isinstance(max_new_tokens, int)
+        or not 1 <= max_new_tokens <= CHAT_MAX_NEW_TOKENS
+    ):
+        raise ValueError(
+            f"max_new_tokens must be between 1 and {CHAT_MAX_NEW_TOKENS}"
+        )
+    if not isinstance(system_prompt, str):
+        raise ValueError("system_prompt must be text")
+    if image_paths is None:
+        image_paths = []
+    if (
+        isinstance(image_paths, (str, bytes))
+        or not isinstance(image_paths, Sequence)
+        or len(image_paths) > 8
+        or any(not isinstance(path, str) or not path for path in image_paths)
+    ):
+        raise ValueError("image_paths must be a list of at most 8 image files")
+
+    load_model(
+        model_id=model_id,
+        device=device,
+        provider=provider,
+        remote_url=remote_url,
+        api_key=api_key,
+        local_gguf_path=local_gguf_path,
+        gguf_file_override=gguf_file_override,
+    )
+    if not is_loaded():
+        raise RuntimeError("LLM did not finish loading")
+    if image_paths and not _vision_available:
+        _reset_idle_timer()
+        raise ValueError("The selected LLM has no available vision projector")
+
+    _cancel_idle_timer()
+    prepared_system, enable_thinking, thinking_budget = _prepare_thinking(
+        system_prompt, None, 0,
+    )
+    api_messages = []
+    if prepared_system:
+        api_messages.append({"role": "system", "content": prepared_system})
+    api_messages.extend(clean_messages)
+    if image_paths:
+        try:
+            image_content = [
+                {"type": "text", "text": api_messages[-1]["content"]},
+            ]
+            for image_path in image_paths:
+                data_url = _image_to_data_url(image_path)
+                if not data_url:
+                    raise ValueError("An authorized chat image is unavailable")
+                image_content.append({
+                    "type": "image_url", "image_url": {"url": data_url},
+                })
+            api_messages[-1] = {"role": "user", "content": image_content}
+        except Exception:
+            if is_loaded():
+                _reset_idle_timer()
+            raise
+
+    payload = {
+        "messages": api_messages,
+        "max_tokens": max_new_tokens + thinking_budget,
+    }
+    if _provider == "local":
+        payload["cache_prompt"] = not bool(image_paths)
+    temperature, top_p = _apply_model_defaults(temperature, top_p, payload)
+    payload["temperature"] = max(temperature, 0.01)
+    payload["top_p"] = top_p
+    if _provider != "local":
+        payload["model"] = _model_id
+    if enable_thinking is not None:
+        payload["enable_thinking"] = enable_thinking
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": enable_thinking,
+        }
+    if _active_registry_entry().get("disable_thinking", False):
+        payload["stop"] = [
+            "<think>", "<thinking>", "<|think|>", "<channel>",
+            "<|channel|>",
+        ]
+
+    try:
+        if _provider == "anthropic":
+            content = _generate_anthropic(
+                api_messages,
+                max_new_tokens + thinking_budget,
+                max(temperature, 0.01),
+                top_p,
+            )
+        else:
+            try:
+                response = requests.post(
+                    f"{_server_url()}/v1/chat/completions",
+                    json=payload,
+                    headers=_api_headers(),
+                    timeout=(10, 600),
+                )
+                response.raise_for_status()
+            except requests.exceptions.RequestException as error:
+                raise _diagnose_llm_request_failure(error) from error
+            try:
+                response_data = response.json()
+                message = response_data["choices"][0]["message"]
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                raise RuntimeError("LLM returned an invalid chat response") from error
+            content = _strip_thinking_tags(message.get("content") or "").strip()
+        if not content:
+            raise RuntimeError("LLM returned an empty chat response")
+        if _provider != "anthropic":
+            _record_response_metrics(
+                response_data, multimodal=bool(image_paths),
+            )
+        return content
+    finally:
+        if is_loaded():
+            _reset_idle_timer()
+
+
+@_with_model_lease
 def generate(
     prompt: str,
     system_prompt: str = "",
@@ -1584,8 +3963,9 @@ def generate(
     payload = {
         "messages": messages,
         "max_tokens": total_tokens,
-        "cache_prompt": False,  # Disable prompt caching — system prompt changes between calls (LoRA hints, etc.)
     }
+    if _provider == "local":
+        payload["cache_prompt"] = not bool(image_paths)
     # Per-model sampling defaults (e.g. Gemma 4 wants temp=1.0, top_k=64)
     temperature, top_p = _apply_model_defaults(temperature, top_p, payload)
     payload["temperature"] = max(temperature, 0.01)
@@ -1650,7 +4030,6 @@ def generate(
         # into an actionable error naming the real cause (see the helper).
         raise _diagnose_llm_request_failure(e) from e
     data = resp.json()
-
     raw_content = data["choices"][0]["message"]["content"] or ""
     finish_reason = data["choices"][0].get("finish_reason", "unknown")
     usage = data.get("usage", {})
@@ -1669,6 +4048,9 @@ def generate(
     if not content.strip() and raw_content:
         print(f"[LLM] WARNING: Model spent all {completion_tokens} tokens on <think> reasoning with nothing left for the answer. Raw starts with: {raw_content[:200]!r}")
 
+    _record_response_metrics(
+        data, multimodal=bool(image_paths and _vision_available),
+    )
     _reset_idle_timer()
     return content.strip()
 
@@ -1679,6 +4061,7 @@ def get_stream_status() -> dict:
         return {"text": _stream_buffer, "done": _stream_done}
 
 
+@_with_model_lease
 def generate_streaming(
     prompt: str,
     system_prompt: str = "",
@@ -1761,8 +4144,9 @@ def generate_streaming(
         "messages": messages,
         "max_tokens": total_tokens,
         "stream": True,
-        "cache_prompt": False,  # Disable prompt caching — system prompt changes between calls
     }
+    if _provider == "local":
+        payload["cache_prompt"] = not bool(image_paths)
     # Apply caller's penalty values FIRST so they're in the payload
     # before _apply_model_defaults runs. The registry-defaults pass below
     # then overrides them when the active model has tuned values
@@ -1844,6 +4228,8 @@ def generate_streaming(
     raw_content = ""
     reasoning_content = ""
     in_reasoning = False
+    completed_stream_metrics = {}
+    stream_completed = False
     try:
         resp = requests.post(
             f"{_server_url()}/v1/chat/completions",
@@ -1860,9 +4246,17 @@ def generate_streaming(
                 continue
             data_str = line[6:]  # strip "data: "
             if data_str.strip() == "[DONE]":
+                stream_completed = True
                 break
             try:
                 chunk = _json_mod.loads(data_str)
+                if isinstance(chunk, dict):
+                    for section in ("timings", "usage"):
+                        values = chunk.get(section)
+                        if isinstance(values, dict):
+                            completed_stream_metrics.setdefault(section, {}).update(
+                                values
+                            )
                 delta = chunk.get("choices", [{}])[0].get("delta", {})
 
                 # With --jinja, Qwen3.5 may send reasoning via separate field
@@ -1929,6 +4323,11 @@ def generate_streaming(
         _stream_buffer = full_raw  # keep full raw for the UI to show thinking
         _stream_done = True
 
+    if stream_completed and completed_stream_metrics:
+        _record_response_metrics(
+            completed_stream_metrics,
+            multimodal=bool(image_paths and _vision_available),
+        )
     _reset_idle_timer()
     return content.strip()
 
@@ -2054,14 +4453,31 @@ def _generate_streaming_anthropic(messages: list, max_tokens: int, temperature: 
     return content.strip()
 
 
-def _build_enhance_user_prompt(prompt, mode, duration_seconds, window_count, window_size_seconds):
-    """Prefix the user prompt with the app's structural context (duration +
-    sliding-window / paragraph count) so the LLM writes one paragraph per
-    window. Shared by the guide-based path and the raw per-model-enhancer
-    path — the dedicated enhancer gets no system guide, so without this it has
-    no idea how many window-paragraphs to produce."""
+def _build_enhance_user_prompt(
+    prompt, mode, duration_seconds, window_count, window_size_seconds,
+    preserve_global_timeline=False, h3_context_ir=False,
+):
+    """Prefix a prompt with duration and architecture-appropriate structure.
+
+    H3 receives one coherent global-timeline contract. Other video families
+    retain the legacy per-window paragraph contract. Shared by guide-based and
+    raw per-model enhancement paths.
+    """
     if duration_seconds and mode in ("video", "avatar"):
         parts = [f"Duration: {duration_seconds} seconds"]
+        if h3_context_ir:
+            parts.append(
+                "one coherent global timeline spanning the complete Duration; "
+                "keep identities, literal dialogue, speaker IDs, sound, music, "
+                "authored global timestamps, and cuts consistent and in order"
+            )
+            return f"[{', '.join(parts)}]\n\n{prompt}"
+        if preserve_global_timeline:
+            parts.append(
+                "complete global timeline; keep every timestamp token exactly "
+                "unchanged and in the same order; do not split or rebase it"
+            )
+            return f"[{', '.join(parts)}]\n\n{prompt}"
         if window_count and window_count > 1:
             parts.append(f"{window_count} sliding windows of ~{window_size_seconds}s each")
             # State the COUNT explicitly, not just the ratio — a fine-tuned
@@ -2116,18 +4532,16 @@ def enhance_prompt(
     tts_voice_count: int = 2,
     lora_system_hint: str = "",
     raw_enhancer_mode: bool = False,
-    reference_context: Optional[str] = None,
+    preserve_global_timeline: bool = False,
 ) -> str:
-    is_h3_ref2va = (
-        mode in ("video", "avatar")
-        and (model_type or "").lower().startswith("minimax_h3_ref2va")
-    )
     is_h3_context_ir = (
         mode in ("video", "avatar")
         and (model_type or "").lower().startswith("minimax_h3")
-        and not is_h3_ref2va
     )
-    is_h3_structured = is_h3_context_ir or is_h3_ref2va
+    is_h3_ref2va = (
+        is_h3_context_ir
+        and (model_type or "").lower().startswith("minimax_h3_ref2va")
+    )
     # If caller provides a system prompt override, use it directly (e.g., Director third-pass)
     if system_override:
         # Do NOT append the full model-specific enhance guide — the override is self-contained.
@@ -2165,15 +4579,51 @@ def enhance_prompt(
         # a ~free no-op (per-call cost drops from ~1024 tokens of waste to
         # ~1 token), and the user gets the unmodified Pass-2 prompt. Better
         # than the previous behavior of burning 26k+ tokens producing nothing.
-        prompt_with_marker = f"/no_think\n\n{prompt}" if prompt else "/no_think"
+        override_prompt = prompt
+        if is_h3_context_ir:
+            override_prompt = _build_enhance_user_prompt(
+                prompt, mode, duration_seconds, window_count,
+                window_size_seconds, preserve_global_timeline=True,
+                h3_context_ir=True,
+            )
+        prompt_with_marker = (
+            f"/no_think\n\n{override_prompt}" if override_prompt else "/no_think"
+        )
+        override_max_tokens = max(max_new_tokens, 1024)
+        if is_h3_context_ir:
+            override_max_tokens = max(
+                override_max_tokens,
+                min(
+                    4096,
+                    max(
+                        1200 if is_h3_ref2va else 768,
+                        int(float(duration_seconds or 0) * (
+                            48 if is_h3_ref2va else 40
+                        )),
+                    ),
+                ),
+            )
         result = generate(
             prompt=prompt_with_marker,
             system_prompt=system,
-            max_new_tokens=max(max_new_tokens, 1024),
+            max_new_tokens=override_max_tokens,
             temperature=temperature,
             enable_thinking=False,
             stop=["<think>", "<thinking>"],
         )
+        if is_h3_context_ir and result:
+            # Director has already authored the complete Context-IR. Semantic
+            # equivalence cannot be proven safely with token-level checks:
+            # identities, sound/music intent, shot numbering, or hidden
+            # execution prose can drift while timestamps and field labels stay
+            # unchanged. Fail closed unless the refinement is byte-for-byte
+            # equivalent after outer whitespace normalization.
+            if result.strip() != (prompt or "").strip():
+                print(
+                    "[Enhance] H3 Director refinement changed locked Context-IR; "
+                    "preserving the original global timeline"
+                )
+                return prompt
         return result.strip() if result else prompt
 
     # Dedicated per-model enhancer (e.g. Sulphur's uncensored enhancer): the
@@ -2186,12 +4636,30 @@ def enhance_prompt(
         # when the user gave one line per window, enhance each window
         # independently and collapse it to a single paragraph — that makes the
         # output EXACTLY window_count paragraphs regardless of the model.
+        raw_max_tokens = max(max_new_tokens, 256)
+        if is_h3_context_ir:
+            raw_max_tokens = max(
+                raw_max_tokens,
+                min(
+                    4096,
+                    max(
+                        1200 if is_h3_ref2va else 768,
+                        int(float(duration_seconds or 0) * (
+                            48 if is_h3_ref2va else 40
+                        )),
+                    ),
+                ),
+            )
         gen_kw = dict(
-            system_prompt="", max_new_tokens=max(max_new_tokens, 256),
+            system_prompt="", max_new_tokens=raw_max_tokens,
             temperature=temperature, enable_thinking=False,
         )
         lines = [ln.strip() for ln in (prompt or "").split("\n") if ln.strip()]
-        if window_count and window_count > 1 and len(lines) == window_count:
+        if (
+            not is_h3_context_ir
+            and window_count and window_count > 1
+            and len(lines) == window_count
+        ):
             print(f"[Enhance] Raw enhancer: per-window x{window_count} ({model_type})")
             outs = []
             for i, ln in enumerate(lines):
@@ -2204,7 +4672,10 @@ def enhance_prompt(
             return "\n".join(outs)
         # Single call: 1-line "expand into N windows", or a line/window
         # mismatch. Falls back to the explicit-count instruction.
-        raw_prompt = _build_enhance_user_prompt(prompt, mode, duration_seconds, window_count, window_size_seconds)
+        raw_prompt = _build_enhance_user_prompt(
+            prompt, mode, duration_seconds, window_count, window_size_seconds,
+            preserve_global_timeline, h3_context_ir=is_h3_context_ir,
+        )
         print(f"[Enhance] Raw enhancer ({model_type}, images={bool(image_paths)}, windows={window_count})")
         result = generate(prompt=raw_prompt, image_paths=image_paths, **gen_kw)
         return _clean_enhancer_output(result) or prompt
@@ -2217,31 +4688,51 @@ def enhance_prompt(
             has_images = bool(image_paths)
             system = get_enhance_guide(model_type, mode, has_images=has_images)
             print(f"[Enhance] Using model-specific guide for {model_type} ({mode}, images={has_images})")
-        except Exception:
+        except (Exception, SystemExit):
             pass
 
     # Fallback to generic prompts if no guide loaded
     if not system:
-        system_prompts = {
-            "video": (
-                "You are an expert cinematic director. Enhance the user's video prompt "
-                "with detailed descriptions of movements, camera angles, lighting, and "
-                "environment. Keep under 150 words. Output only the enhanced prompt."
-            ),
-            "image": (
-                "You are an expert photographer. Enhance the user's image prompt with "
-                "detailed descriptions of composition, lighting, colors, and mood. "
-                "The output is a STILL PHOTOGRAPH — describe static poses only, no motion verbs "
-                "(no walking, running, reaching, turning, dancing). "
-                "Keep under 150 words. Output only the enhanced prompt."
-            ),
-            "audio": (
-                "You are an expert audio producer. Enhance the user's audio description "
-                "with detailed descriptions of tone, pace, emotion, and sound qualities. "
-                "Keep under 100 words. Output only the enhanced prompt."
-            ),
-        }
-        system = system_prompts.get(mode, system_prompts["video"])
+        if is_h3_ref2va:
+            system = (
+                "Rewrite the request as one complete MiniMax H3 Ref2VA prompt "
+                "with these exact fields in order: subject_definitions:, "
+                "summary:, retention_analysis:, detailed_description:, "
+                "overall_soundscape:, non_diegetic_music:. Use one coherent "
+                "global timeline through the supplied Duration. Preserve "
+                "identities, reference labels, literal <d> dialogue, speaker "
+                "IDs, sound, music, authored global timestamps, and cuts."
+            )
+        elif is_h3_context_ir:
+            system = (
+                "Rewrite the request as one complete MiniMax H3 prompt with "
+                "these exact fields in order: integrated_multimodal_description:, "
+                "overall_soundscape:, non_diegetic_music:. Use one coherent "
+                "global timeline through the supplied Duration. Preserve "
+                "identities, literal <d> dialogue, speaker IDs, sound, music, "
+                "authored global timestamps, and cuts."
+            )
+        else:
+            system_prompts = {
+                "video": (
+                    "You are an expert cinematic director. Enhance the user's video prompt "
+                    "with detailed descriptions of movements, camera angles, lighting, and "
+                    "environment. Keep under 150 words. Output only the enhanced prompt."
+                ),
+                "image": (
+                    "You are an expert photographer. Enhance the user's image prompt with "
+                    "detailed descriptions of composition, lighting, colors, and mood. "
+                    "The output is a STILL PHOTOGRAPH — describe static poses only, no motion verbs "
+                    "(no walking, running, reaching, turning, dancing). "
+                    "Keep under 150 words. Output only the enhanced prompt."
+                ),
+                "audio": (
+                    "You are an expert audio producer. Enhance the user's audio description "
+                    "with detailed descriptions of tone, pace, emotion, and sound qualities. "
+                    "Keep under 100 words. Output only the enhanced prompt."
+                ),
+            }
+            system = system_prompts.get(mode, system_prompts["video"])
 
     # TTS-specific enhance: override system prompt with monologue/dialogue templates.
     #
@@ -2339,7 +4830,7 @@ def enhance_prompt(
     # The generic appendix says to remove all character names and to write one
     # paragraph per sliding window, both of which conflict with H3's
     # knowledge-aware Context-IR format and single native timeline.
-    if mode in ("video", "avatar") and not is_h3_structured:
+    if mode in ("video", "avatar") and not is_h3_context_ir:
         from services.guide_loader import load_guide as _load_vid_guide
         vid_block = _load_vid_guide("enhance", "video_shared")
         if vid_block:
@@ -2347,24 +4838,18 @@ def enhance_prompt(
 
     # Build the user prompt with context (duration + sliding-window count).
     # Shared with the raw per-model-enhancer path via the helper above.
-    user_prompt = _build_enhance_user_prompt(prompt, mode, duration_seconds, window_count, window_size_seconds)
+    user_prompt = _build_enhance_user_prompt(
+        prompt, mode, duration_seconds, window_count, window_size_seconds,
+        preserve_global_timeline, h3_context_ir=is_h3_context_ir,
+    )
 
     # Add image context
     if image_paths:
-        if is_h3_ref2va:
-            user_prompt = (
-                "I have attached the image references from an ordered MiniMax H3 Omni-reference request. "
-                "Use what you can see together with the exact label map below; references are identity/style/motion "
-                "evidence and are not automatically an opening frame.\n\n"
-                f"{reference_context or 'Use the supplied ordered reference labels.'}\n\n{user_prompt}"
-            )
-        elif mode == "image":
+        if mode == "image":
             user_prompt = f"I have attached a reference image. Enhance this prompt based on what you see in the image:\n\n{user_prompt}"
         else:
             user_prompt = f"I have attached a start frame image. Enhance this video prompt to match what you see in the image and describe what should happen:\n\n{user_prompt}"
         print(f"[Enhance] Sending {len(image_paths)} image(s) to vision LLM")
-    elif is_h3_ref2va and reference_context:
-        user_prompt = f"Ordered Omni-reference label map:\n{reference_context}\n\n{user_prompt}"
 
     # Inject LoRA hints into system prompt (NOT user prompt) so LLM treats them as instructions
     if lora_system_hint:
@@ -2384,51 +4869,68 @@ def enhance_prompt(
     # its field labels and <d> blocks are part of the model input, not prose
     # headers to strip. The generic "no labels" rule previously contradicted
     # the H3 guide and encouraged ordinary quote-mark dialogue.
-    if is_h3_ref2va:
+    if is_h3_context_ir:
+        if is_h3_ref2va:
+            system += (
+                "\n\nCRITICAL MINIMAX H3 REF2VA OUTPUT CONTRACT: Output ONLY the "
+                "structured prompt with these exact labels in order: "
+                "subject_definitions:, summary:, retention_analysis:, "
+                "detailed_description:, overall_soundscape:, and "
+                "non_diegetic_music:. Keep every <Subject N>, <Picture N>, "
+                "<Video N>, and <Audio N> label stable across all sections. "
+                "Every spoken line needs a stable (S1), (S2), etc. ID and "
+                "<d>[Language] literal words</d>. No markdown, explanation, or "
+                "LoRA filenames."
+            )
         system += (
-            "\n\nCRITICAL MINIMAX H3 REF2VA OUTPUT CONTRACT: Output ONLY the six required fields, "
-            "in order: subject_definitions:, summary:, retention_analysis:, detailed_description:, "
-            "overall_soundscape:, and non_diegetic_music:. Use only the supplied <Picture n>, <Video n>, "
-            "and <Audio n> labels. These labels and fields are model syntax, not explanatory headings. "
-            "Every VOICE REFERENCE must be bound inside subject_definitions to its matching <Subject n> "
-            "and stable (S1), (S2), etc. speaker ID. Spoken lines require that same ID and <d>[Language] literal "
-            "words</d>. No markdown, "
-            "explanation, filenames, or LoRA names."
+            "\n\nLONG-DURATION H3 CONTRACT: Accept the complete supplied Duration, "
+            "including 30 or 60 seconds, without shortening or rejecting it. "
+            "Write one coherent global timeline from 0.00 seconds through the "
+            "complete Duration. Preserve identities, literal dialogue, speaker "
+            "IDs, sound, music, and every authored global timestamp and cut in "
+            "the same order. Never restart the clock partway through."
         )
-    elif is_h3_context_ir:
-        system += (
-            "\n\nCRITICAL MINIMAX H3 OUTPUT CONTRACT: Output ONLY the structured "
-            "H3 prompt, with the exact field labels "
-            "integrated_multimodal_description:, overall_soundscape:, and "
-            "non_diegetic_music:. These labels are required model syntax, not "
-            "explanatory headers. Every spoken line must have a stable (S1), "
-            "(S2), etc. speaker ID and use <d>[Language] literal words</d>. "
-            "When the user requests a discussion without supplying lines, write "
-            "short meaningful dialogue that fits the supplied Duration. Once the "
-            "last line ends, describe silent visible action and closed mouths; do "
-            "not invent more speech. No markdown, explanation, or LoRA filenames."
-        )
+        if not is_h3_ref2va:
+            system += (
+                "\n\nCRITICAL MINIMAX H3 OUTPUT CONTRACT: Output ONLY the structured "
+                "H3 prompt, with the exact field labels "
+                "integrated_multimodal_description:, overall_soundscape:, and "
+                "non_diegetic_music:. These labels are required model syntax, not "
+                "explanatory headers. Every spoken line must have a stable (S1), "
+                "(S2), etc. speaker ID and use <d>[Language] literal words</d>. "
+                "When the user requests a discussion without supplying lines, write "
+                "short meaningful dialogue that fits the supplied Duration. Once the "
+                "last line ends, describe silent visible action and closed mouths; do "
+                "not invent more speech. No markdown, explanation, or LoRA filenames."
+            )
     else:
         system += "\n\nCRITICAL: Output ONLY the enhanced prompt text. No headers, no labels, no markdown, no explanation, no \"Enhancement Logic\", no \"Edit Prompt:\". No LoRA filenames (.safetensors). Just the raw prompt text."
-
-    if is_h3_structured:
-        dialogue_requirement = _build_h3_dialogue_requirement(prompt, duration_seconds)
-        if dialogue_requirement:
-            # Keep this adjacent to the output contract so a long vision guide
-            # cannot demote literal dialogue into a vague "speaks" action.
-            system += f"\n\n{dialogue_requirement}"
+    if preserve_global_timeline and not is_h3_context_ir:
+        system += (
+            "\n\nGLOBAL TIMELINE LOCK: This is a complete Studio prompt. "
+            "Keep every global timestamp token byte-for-byte unchanged and "
+            "in the same order. Improve descriptions inside the authored "
+            "structure only; do not add, remove, split, rebase, or reorder "
+            "timed beats."
+        )
 
     # Scale max tokens for multi-window video prompts
     effective_max_tokens = max_new_tokens
     if window_count and window_count > 1:
         effective_max_tokens = max(max_new_tokens, window_count * 300 + 256)
-    if is_h3_ref2va:
-        effective_max_tokens = max(effective_max_tokens, 1200)
-    elif is_h3_context_ir:
+    if is_h3_context_ir:
         # Leave enough room for the three required fields plus a compact timed
         # dialogue. Most H3 prompts finish well below this ceiling, but 512 can
         # truncate a vision-assisted 15-second rewrite before its sound fields.
-        effective_max_tokens = max(effective_max_tokens, 768)
+        duration_budget = min(
+            4096,
+            max(768, int(float(duration_seconds or 0) * (48 if is_h3_ref2va else 40))),
+        )
+        effective_max_tokens = max(
+            effective_max_tokens,
+            1200 if is_h3_ref2va else 768,
+            duration_budget,
+        )
 
     # TTS: thinking mode for creative dialogue, disabled for fast mode
     is_tts = bool(tts_enhance_mode)
@@ -2447,632 +4949,43 @@ def enhance_prompt(
         presence_penalty=0.1,   # encourage variety
     )
 
-    # Post-process ordinary prose aggressively, but preserve H3's required field
-    # labels and media tags. The old substring-loop cleaner could truncate a
-    # valid Context-IR response at its first repeated <Picture>/<Audio> mapping.
+    # Post-process: strip any markdown headers, labels, or explanation the model added
     if result:
-        result = _clean_enhance_output(result, preserve_structure=is_h3_structured)
+        if is_h3_context_ir:
+            import re
+            literal_dialogue = []
 
-    structure_is_valid = (
-        _has_complete_h3_ref2va_structure(result)
-        if is_h3_ref2va
-        else _has_complete_h3_context_structure(result)
-    ) if is_h3_structured else True
-    dialogue_is_valid = _h3_dialogue_contract_satisfied(prompt, result) if is_h3_structured else True
-    timed_silence_is_valid = (
-        _h3_timed_silence_contract_satisfied(prompt, result, duration_seconds)
-        if is_h3_structured
-        else True
-    )
-    voice_binding_is_valid = (
-        _h3_voice_binding_contract_satisfied(result, reference_context)
-        if is_h3_ref2va
-        else True
-    )
+            def _protect_dialogue(match):
+                literal_dialogue.append(match.group(0))
+                return f"\x00H3_DIALOGUE_{len(literal_dialogue) - 1}\x00"
 
-    # Small local LLMs can either repeat the first Ref2VA mapping or summarize
-    # quoted dialogue as the word "speaks". Retry malformed H3 output once with
-    # the immutable dialogue contract adjacent to the shape constraint.
-    if is_h3_structured and not (
-        structure_is_valid
-        and dialogue_is_valid
-        and timed_silence_is_valid
-        and voice_binding_is_valid
-    ):
-        failures = []
-        if not structure_is_valid:
-            failures.append("structure")
-        if not dialogue_is_valid:
-            failures.append("dialogue")
-        if not timed_silence_is_valid:
-            failures.append("timed silence")
-        if not voice_binding_is_valid:
-            failures.append("voice binding")
-        print(f"[Enhance] Invalid MiniMax H3 {'/'.join(failures)}; retrying once.")
-        field_requirement = (
-            "Emit each of the six required field labels exactly once, in order."
-            if is_h3_ref2va
-            else "Emit each of the three required field labels exactly once, in order."
-        )
-        retry = generate(
-            prompt=user_prompt,
-            system_prompt=(
-                system
-                + f"\n\nRETRY REQUIREMENT: Be concise. {field_requirement} "
-                "Do not repeat a subject definition or reference mapping. Never replace a requested "
-                "spoken line with the words 'speaks', 'talks', or 'dialogue'; write the actual <d> block."
-            ),
-            max_new_tokens=effective_max_tokens,
-            temperature=min(float(temperature), 0.35),
-            image_paths=image_paths,
-            enable_thinking=False,
-            thinking_budget=4096,
-            frequency_penalty=0.6,
-            presence_penalty=0.15,
-        )
-        retry = _clean_enhance_output(retry, preserve_structure=True) if retry else ""
-        retry_structure_is_valid = (
-            _has_complete_h3_ref2va_structure(retry)
-            if is_h3_ref2va
-            else _has_complete_h3_context_structure(retry)
-        )
-        retry_dialogue_is_valid = _h3_dialogue_contract_satisfied(prompt, retry)
-        retry_timed_silence_is_valid = _h3_timed_silence_contract_satisfied(
-            prompt,
-            retry,
-            duration_seconds,
-        )
-        retry_voice_binding_is_valid = (
-            _h3_voice_binding_contract_satisfied(retry, reference_context)
-            if is_h3_ref2va
-            else True
-        )
-        if (
-            retry_structure_is_valid
-            and retry_dialogue_is_valid
-            and retry_timed_silence_is_valid
-            and retry_voice_binding_is_valid
-        ):
-            result = retry
-        else:
-            print("[Enhance] H3 retry was incomplete; using deterministic structured fallback.")
-            result = (
-                _build_h3_ref2va_tagged_fallback(
-                    prompt,
-                    reference_context,
-                    duration_seconds=duration_seconds,
-                )
-                if is_h3_ref2va
-                else _build_h3_context_fallback(
-                    prompt,
-                    has_start_image=bool(image_paths),
-                    duration_seconds=duration_seconds,
-                )
+            protected = re.sub(
+                r"<d>.*?</d>", _protect_dialogue, result,
+                flags=re.IGNORECASE | re.DOTALL,
             )
-
-    # If two full rewrites still summarize a vague request as "they discuss",
-    # ask the local LLM for only the missing exchange. This rare focused pass is
-    # cheaper and more reliable than accepting a prompt that makes H3 improvise.
-    if (
-        is_h3_structured
-        and _h3_requests_speech(prompt)
-        and not _extract_h3_quoted_dialogue(prompt)
-        and not _h3_dialogue_contract_satisfied(prompt, result)
-    ):
-        word_budget = max(4, int(duration_seconds or 8))
-        print("[Enhance] H3 discussion still has no dialogue; generating a focused exchange.")
-        dialogue_fragment = generate(
-            prompt=(
-                f"Duration: {duration_seconds or 8} seconds. Total dialogue budget: at most "
-                f"{word_budget} spoken words. Request: {prompt}"
-            ),
-            system_prompt=(
-                "Write only the concise dialogue requested by the user. Output one to three lines in "
-                "the exact form 'Speaker description (S1): <d>[English] Literal words.</d>', using "
-                "stable sequential speaker IDs. Communicate the requested topic. No narration, "
-                "markdown, quotation marks, headings, or dialogue beyond the word budget."
-            ),
-            max_new_tokens=min(320, effective_max_tokens),
-            temperature=min(float(temperature), 0.5),
-            image_paths=None,
-            enable_thinking=False,
-            thinking_budget=2048,
-            frequency_penalty=0.4,
-            presence_penalty=0.1,
-        )
-        dialogue_fragment = (
-            _clean_enhance_output(dialogue_fragment, preserve_structure=True)
-            if dialogue_fragment
-            else ""
-        )
-        if _extract_h3_dialogue_blocks(dialogue_fragment):
-            result = _inject_h3_generated_dialogue(
-                result,
-                dialogue_fragment,
-                ref2va=is_h3_ref2va,
-            )
+            result = _clean_enhance_output(protected)
+            for index, dialogue in enumerate(literal_dialogue):
+                result = result.replace(f"\x00H3_DIALOGUE_{index}\x00", dialogue)
         else:
-            print("[Enhance] Focused H3 dialogue pass returned no valid <d> block.")
-
-    # Explicit user dialogue is immutable. Even if both LLM attempts omit it,
-    # compile every quoted line into H3 syntax before returning the prompt.
-    if is_h3_structured and not _h3_dialogue_contract_satisfied(prompt, result):
-        result = _inject_missing_h3_dialogue(result, prompt, ref2va=is_h3_ref2va)
-    if is_h3_structured:
-        result = _strip_h3_untagged_dialogue_duplicates(result, prompt)
-        result = _enforce_h3_soundscape_silence(result, prompt)
-        result = _enforce_h3_music_request(result, prompt, reference_context)
+            result = _clean_enhance_output(result)
+    if preserve_global_timeline and result:
+        import re
+        marker = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,3})?(?!\d)")
+        if marker.findall(result) != marker.findall(prompt):
+            raise ValueError(
+                "Prompt enhancement changed a locked global timestamp; "
+                "the original Studio timeline was preserved"
+            )
     return result
 
 
-_H3_REF2VA_FIELDS = (
-    "subject_definitions",
-    "summary",
-    "retention_analysis",
-    "detailed_description",
-    "overall_soundscape",
-    "non_diegetic_music",
-)
-_H3_CONTEXT_FIELDS = (
-    "integrated_multimodal_description",
-    "overall_soundscape",
-    "non_diegetic_music",
-)
-
-
-def _extract_h3_quoted_dialogue(text: str) -> list[str]:
-    """Extract explicit straight- or curly-quoted speech in source order."""
-    import re
-    matches = []
-    for match in re.finditer(r'"([^"\r\n]{1,500})"|“([^”\r\n]{1,500})”', str(text or "")):
-        value = (match.group(1) or match.group(2) or "").strip()
-        if value:
-            matches.append(value)
-    return matches
-
-
-def _h3_requests_speech(text: str) -> bool:
-    import re
-    return bool(
-        _extract_h3_quoted_dialogue(text)
-        or re.search(
-            r"\b(?:say|says|speak|speaks|talk|talks|discuss|discusses|discussion|"
-            r"argue|argues|announce|announces|ask|asks|reply|replies|tell|tells|"
-            r"conversation|dialogue)\b",
-            str(text or ""),
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def _extract_h3_dialogue_blocks(text: str) -> list[str]:
-    import re
-    return [
-        match.strip()
-        for match in re.findall(
-            r"<d>\s*\[[^\]]+\]\s*(.*?)\s*</d>",
-            str(text or ""),
-            flags=re.DOTALL,
-        )
-        if match.strip()
-    ]
-
-
-def _h3_dialogue_schedule(prompt: str, duration_seconds: Optional[float]) -> tuple[float, float, float]:
-    """Choose an early bounded speech interval and leave useful silent action around it."""
-    duration = max(2.0, float(duration_seconds or 8.0))
-    quotes = _extract_h3_quoted_dialogue(prompt)
-    if quotes:
-        word_count = sum(len(line.split()) for line in quotes)
-    else:
-        # Vague discussion requests still need room for reactions and action.
-        word_count = max(4, int(duration))
-    speech_duration = max(1.0, word_count / 2.0)
-    speech_duration = min(speech_duration, max(1.0, duration * 0.55))
-    start = max(0.5, duration * 0.2)
-    start = min(start, max(0.25, duration - speech_duration - 0.75))
-    end = min(duration - 0.25, start + speech_duration)
-    return duration, start, end
-
-
-def _build_h3_timed_silence_clause(prompt: str, duration_seconds: Optional[float]) -> str:
-    if not _h3_requests_speech(prompt):
-        return ""
-    duration, start, end = _h3_dialogue_schedule(prompt, duration_seconds)
-    return (
-        f"From 0.00 to {start:.2f} seconds, show active scene-appropriate nonverbal action rather "
-        "than idle staring; every mouth stays completely closed and the audio contains no human "
-        "voice. Begin the first tagged line at approximately "
-        f"{start:.2f} seconds and finish all <d> dialogue by approximately {end:.2f} seconds. "
-        f"From {end:.2f} to {duration:.2f} seconds, fill the remaining timeline with concrete "
-        "nonverbal action, reactions, camera development, ambience, and synchronized practical "
-        "effects. Outside the tagged interval there are no voices, whispers, grunts, audible "
-        "breathing, or speech-like vocalizations, and every mouth remains closed."
-    )
-
-
-def _build_h3_dialogue_requirement(
-    prompt: str,
-    duration_seconds: Optional[float] = None,
-) -> str:
-    quotes = _extract_h3_quoted_dialogue(prompt)
-    timed_clause = _build_h3_timed_silence_clause(prompt, duration_seconds)
-    if quotes:
-        required = "\n".join(
-            f"- REQUIRED VERBATIM: <d>[English] {line}</d>" for line in quotes
-        )
-        return (
-            "IMMUTABLE H3 DIALOGUE CONTRACT: The user supplied the spoken lines below. "
-            "Every line must appear verbatim inside a <d> block in the output; do not summarize, "
-            "paraphrase, censor, omit, or add speech. Give each line a stable (S1), (S2), etc. "
-            f"speaker outside its tag. Never repeat these words as ordinary quoted text in summary "
-            f"or any other field.\n{required}\n{timed_clause}"
-        )
-    if _h3_requests_speech(prompt):
-        return (
-            "MANDATORY H3 DIALOGUE CONTRACT: The user explicitly requests speech but supplied no "
-            "script. Write concise, meaningful dialogue that communicates the requested subject, "
-            "using stable speaker IDs and one or more <d>[English] literal words</d> blocks. "
-            "Writing only 'speaks', 'talks', or 'they discuss' makes the output invalid. "
-            f"{timed_clause}"
-        )
-    return ""
-
-
-def _h3_dialogue_contract_satisfied(prompt: str, result: str) -> bool:
-    import re
-    quotes = _extract_h3_quoted_dialogue(prompt)
-    blocks = _extract_h3_dialogue_blocks(result)
-    has_speaker_id = bool(re.search(r"\(S\d+\)", str(result or "")))
-    if quotes:
-        return has_speaker_id and all(line in blocks for line in quotes)
-    if _h3_requests_speech(prompt):
-        return has_speaker_id and bool(blocks)
-    return True
-
-
-def _h3_timed_silence_contract_satisfied(
-    prompt: str,
-    result: str,
-    duration_seconds: Optional[float],
-) -> bool:
-    """Require explicit non-vocal time allocation around requested speech."""
-    if not _h3_requests_speech(prompt):
-        return True
-    import re
-    text = str(result or "")
-    has_opening_interval = bool(re.search(r"(?i)\bfrom\s+0(?:\.0+)?\s+(?:to|until)", text))
-    has_closed_mouths = bool(re.search(r"(?i)\bmouths?\b.{0,50}\bclosed\b", text))
-    has_no_voice = bool(
-        re.search(r"(?i)\b(?:no|without)\s+(?:human\s+)?(?:voices?|speech|vocal)", text)
-    )
-    has_remaining_interval = bool(
-        re.search(r"(?i)\bfrom\s+\d+(?:\.\d+)?\s+(?:to|until)\s+\d+(?:\.\d+)?\s+seconds", text)
-    )
-    return has_opening_interval and has_closed_mouths and has_no_voice and has_remaining_interval
-
-
-def _h3_voice_binding_contract_satisfied(
-    result: str,
-    reference_context: Optional[str],
-) -> bool:
-    """Require every Omni voice reference inside the subject/speaker mapping."""
-    import re
-    voice_labels = re.findall(
-        r"(?mi)^(<Audio\s+\d+>).*?intent=VOICE REFERENCE.*$",
-        str(reference_context or ""),
-    )
-    if not voice_labels:
-        return True
-    match = re.search(
-        r"(?ms)^\s*subject_definitions\s*:(.*?)(?=^\s*summary\s*:)",
-        str(result or ""),
-    )
-    if not match:
-        return False
-    definitions = match.group(1)
-    return all(label in definitions for label in voice_labels) and bool(
-        re.search(r"\(S\d+\)", definitions)
-    )
-
-
-def _has_complete_h3_ref2va_structure(text: str) -> bool:
-    """Return true only for one complete, ordered six-field Ref2VA prompt."""
-    if not text:
-        return False
-    import re
-    positions = []
-    for field in _H3_REF2VA_FIELDS:
-        matches = list(re.finditer(rf"(?mi)^\s*{re.escape(field)}\s*:", text))
-        if len(matches) != 1:
-            return False
-        positions.append(matches[0].start())
-    return positions == sorted(positions)
-
-
-def _has_complete_h3_context_structure(text: str) -> bool:
-    """Return true only for one complete, ordered three-field H3 prompt."""
-    if not text:
-        return False
-    import re
-    positions = []
-    for field in _H3_CONTEXT_FIELDS:
-        matches = list(re.finditer(rf"(?mi)^\s*{re.escape(field)}\s*:", text))
-        if len(matches) != 1:
-            return False
-        positions.append(matches[0].start())
-    return positions == sorted(positions)
-
-
-def _compile_h3_explicit_dialogue(prompt: str) -> str:
-    """Replace user quotation marks with literal H3 dialogue blocks."""
-    import re
-    counter = 0
-
-    def replace(match):
-        nonlocal counter
-        counter += 1
-        value = (match.group(1) or match.group(2) or "").strip()
-        return f"(S{counter}) <d>[English] {value}</d>"
-
-    return re.sub(
-        r'"([^"\r\n]{1,500})"|“([^”\r\n]{1,500})”',
-        replace,
-        str(prompt or ""),
-    )
-
-
-def _inject_missing_h3_dialogue(result: str, prompt: str, *, ref2va: bool) -> str:
-    """Deterministically append omitted literal dialogue to the correct H3 field."""
-    quotes = _extract_h3_quoted_dialogue(prompt)
-    if not quotes:
-        return result
-    existing = set(_extract_h3_dialogue_blocks(result))
-    missing = [line for line in quotes if line not in existing]
-    if not missing:
-        return result
-    additions = " ".join(
-        f"The intended speaker (S{index}) says exactly once: <d>[English] {line}</d>."
-        for index, line in enumerate(missing, start=1)
-    )
-    additions += (
-        " These are the only spoken words in the video; before and after them, everyone remains "
-        "silent with mouths closed, with no other voices or speech-like vocalization."
-    )
-    field = "detailed_description" if ref2va else "integrated_multimodal_description"
-    next_field = "overall_soundscape"
-    import re
-    pattern = re.compile(
-        rf"(?ms)(^\s*{re.escape(field)}\s*:.*?)(?=^\s*{re.escape(next_field)}\s*:)",
-    )
-    if pattern.search(result or ""):
-        return pattern.sub(
-            lambda match: match.group(1).rstrip() + " " + additions + "\n",
-            result,
-            count=1,
-        )
-    return f"{result or ''}\n{field}: {additions}".strip()
-
-
-def _inject_h3_generated_dialogue(result: str, fragment: str, *, ref2va: bool) -> str:
-    """Insert a focused generated exchange while discarding non-dialogue prose."""
-    valid_lines = [
-        line.strip()
-        for line in str(fragment or "").splitlines()
-        if "<d>" in line and "</d>" in line
-    ][:3]
-    if not valid_lines:
-        return result
-    addition = (
-        " The complete requested exchange is: "
-        + " ".join(valid_lines)
-        + " No other words are spoken; afterward everyone remains silent with mouths closed."
-    )
-    field = "detailed_description" if ref2va else "integrated_multimodal_description"
-    import re
-    pattern = re.compile(
-        rf"(?ms)(^\s*{re.escape(field)}\s*:.*?)(?=^\s*overall_soundscape\s*:)",
-    )
-    if pattern.search(result or ""):
-        return pattern.sub(
-            lambda match: match.group(1).rstrip() + addition + "\n",
-            result,
-            count=1,
-        )
-    return f"{result or ''}\n{field}:{addition}".strip()
-
-
-def _strip_h3_untagged_dialogue_duplicates(result: str, prompt: str) -> str:
-    """Remove summary/narration copies of dialogue that already belongs in <d>."""
-    source_lines = _extract_h3_quoted_dialogue(prompt)
-    if not source_lines:
-        return result
-    import re
-
-    def normalized(value: str) -> str:
-        return " ".join(value.strip().rstrip(".,!?;:").casefold().split())
-
-    source_values = {normalized(line) for line in source_lines}
-    protected: list[str] = []
-
-    def stash(match):
-        protected.append(match.group(0))
-        return f"@@MAESTRO_H3_DIALOGUE_{len(protected) - 1}@@"
-
-    text = re.sub(r"<d>.*?</d>", stash, str(result or ""), flags=re.DOTALL)
-
-    def replace_quote(match):
-        value = match.group(1) or match.group(2) or ""
-        return "the scripted line" if normalized(value) in source_values else match.group(0)
-
-    text = re.sub(
-        r'"([^"\r\n]{1,500})"|\u201c([^\u201d\r\n]{1,500})\u201d',
-        replace_quote,
-        text,
-    )
-    for index, block in enumerate(protected):
-        text = text.replace(f"@@MAESTRO_H3_DIALOGUE_{index}@@", block)
-    return text
-
-
-def _enforce_h3_soundscape_silence(result: str, prompt: str) -> str:
-    """Keep the model from filling dialogue gaps with invented human noises."""
-    if not _h3_requests_speech(prompt):
-        return result
-    import re
-    if re.search(
-        r"(?i)\b(?:grunt|gasp|scream|laugh|sob|cry|audible breathing|nonverbal vocal)\w*\b",
-        str(prompt or ""),
-    ):
-        return result
-
-    pattern = re.compile(
-        r"(?ms)(^\s*overall_soundscape\s*:)(.*?)(?=^\s*non_diegetic_music\s*:)",
-    )
-    match = pattern.search(str(result or ""))
-    if not match:
-        return result
-    content = match.group(2).strip()
-    sentences = re.split(r"(?<=[.!?])\s+", content)
-    kept = []
-    for sentence in sentences:
-        has_negation = re.search(r"(?i)\b(?:no|not|without|never)\b", sentence)
-        if has_negation:
-            kept.append(sentence.strip())
-            continue
-        # Remove only comma/semicolon clauses that introduce vocal filler so a
-        # mixed sentence keeps its impacts, ambience, and debris sounds.
-        safe_segments = [
-            segment.strip()
-            for segment in re.split(r"[,;]", sentence)
-            if segment.strip()
-            and not re.search(
-                r"(?i)\b(?:grunt|gasp|whisper|scream|laugh|breath|voice|speech-like)\w*\b",
-                segment,
-            )
-        ]
-        if safe_segments:
-            kept.append(", ".join(safe_segments))
-    kept.append(
-        "Outside the tagged dialogue, no human voices, whispers, grunts, audible breathing, "
-        "or speech-like vocalizations occur"
-    )
-    replacement = match.group(1) + " " + ". ".join(kept).rstrip(".") + ".\n"
-    return result[:match.start()] + replacement + result[match.end():]
-
-
-def _enforce_h3_music_request(
-    result: str,
-    prompt: str,
-    reference_context: Optional[str],
-) -> str:
-    """Do not turn visual words such as 'cinematic' into an invented score."""
-    import re
-    requests_music = bool(
-        re.search(
-            r"(?i)\b(?:music|song|score|soundtrack|orchestra|orchestral|instrumental|melody|theme)\b",
-            str(prompt or ""),
-        )
-    )
-    mapped_music = bool(
-        re.search(
-            r"(?i)(?:AUDIO REUSE / PERFORMANCE DRIVER|Sound / music style|intent=AUDIO REFERENCE)",
-            str(reference_context or ""),
-        )
-    )
-    if requests_music or mapped_music:
-        return result
-    return re.sub(
-        r"(?ms)^\s*non_diegetic_music\s*:.*\Z",
-        "non_diegetic_music: N/A",
-        str(result or ""),
-    )
-
-
-def _build_h3_ref2va_tagged_fallback(
-    prompt: str,
-    reference_context: Optional[str],
-    *,
-    duration_seconds: Optional[float] = None,
-) -> str:
-    """Create a deterministic six-field fallback when the local LLM loops."""
-    raw_mapping = reference_context or "Use the supplied ordered references according to their roles."
-    mapping = " ".join(raw_mapping.split())
-    import re
-    picture_labels = re.findall(r"<Picture\s+\d+>", raw_mapping)
-    voice_labels = re.findall(
-        r"(?mi)^(<Audio\s+\d+>).*?intent=VOICE REFERENCE.*$",
-        raw_mapping,
-    )
-    subject_bindings = []
-    for index, picture_label in enumerate(picture_labels, start=1):
-        subject_bindings.append(
-            f"<Subject {index}> (S{index}) takes visual identity from {picture_label}."
-        )
-    for index, audio_label in enumerate(voice_labels, start=1):
-        subject_index = min(index, max(1, len(picture_labels)))
-        subject_bindings.append(
-            f"{audio_label} is the voice-timbre reference for <Subject {subject_index}> (S{subject_index})."
-        )
-    subject_mapping = " ".join(subject_bindings + [mapping])
-    request = _compile_h3_explicit_dialogue(prompt)
-    timed_clause = _build_h3_timed_silence_clause(prompt, duration_seconds)
-    return (
-        f"subject_definitions: {subject_mapping}\n"
-        "summary: A finished video matching the requested action, identity, setting, and explicitly "
-        "tagged dialogue.\n"
-        f"retention_analysis: Preserve the mapped identity, motion, and audio roles exactly: {mapping}\n"
-        f"detailed_description: The finished target video follows this request: {request} "
-        "Reference pictures provide identity and appearance only, never their original background, "
-        "framing, pose, or an opening still. The scripted dialogue is the only speech; all mouths "
-        f"remain closed before and after it. {timed_clause}\n"
-        "overall_soundscape: Continuous scene-appropriate stereo ambience and synchronized practical "
-        "sound effects begin at the first frame and continue naturally underneath dialogue. Outside "
-        "tagged dialogue there are no human voices, whispers, grunts, audible breathing, or "
-        "speech-like vocalizations.\n"
-        "non_diegetic_music: N/A"
-    )
-
-
-def _build_h3_context_fallback(
-    prompt: str,
-    *,
-    has_start_image: bool,
-    duration_seconds: Optional[float] = None,
-) -> str:
-    """Create a deterministic three-field fallback for ordinary H3 Base."""
-    alignment = (
-        "For the target video, at 0.00 seconds into the target video, <Picture 1> "
-        "(from [Shot 1]) is fully referenced.\n\n"
-        if has_start_image
-        else ""
-    )
-    request = _compile_h3_explicit_dialogue(prompt)
-    timed_clause = _build_h3_timed_silence_clause(prompt, duration_seconds)
-    return (
-        f"{alignment}integrated_multimodal_description: [Shot 1] {request} The scripted dialogue "
-        f"is the only speech; all mouths remain closed before and after it. {timed_clause}\n\n"
-        "overall_soundscape: Continuous scene-appropriate ambience and synchronized practical "
-        "sound effects begin at the first frame and continue naturally underneath dialogue. Outside "
-        "tagged dialogue there are no human voices, whispers, grunts, audible breathing, or "
-        "speech-like vocalizations.\n\n"
-        "non_diegetic_music: N/A"
-    )
-
-
-def _clean_enhance_output(text: str, preserve_structure: bool = False) -> str:
+def _clean_enhance_output(text: str) -> str:
     """Strip markdown formatting, headers, explanation, and repetition loops from enhance output."""
     import re
     # Remove markdown bold/headers
-    if preserve_structure:
-        text = text.replace('**', '')
-    else:
-        text = re.sub(r'\*\*.*?\*\*:?\s*', '', text)
+    text = re.sub(r'\*\*.*?\*\*:?\s*', '', text)
     # Remove markdown headers
-    if preserve_structure:
-        text = re.sub(r'^\s*#{1,4}\s*', '', text, flags=re.MULTILINE)
-    else:
-        text = re.sub(r'^#{1,4}\s+.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^#{1,4}\s+.*$', '', text, flags=re.MULTILINE)
     # Remove horizontal rules
     text = re.sub(r'^---+\s*$', '', text, flags=re.MULTILINE)
     # Remove common label prefixes the model adds
@@ -3084,14 +4997,8 @@ def _clean_enhance_output(text: str, preserve_structure: bool = False) -> str:
     # Collapse excessive blank lines
     text = re.sub(r'\n{3,}', '\n\n', text)
 
-    # H3 Context-IR legitimately repeats subject and reference labels across
-    # sections. Structure validation/retry handles malformed H3 output without
-    # destroying those mappings.
-    cleaned = text.strip()
-    if preserve_structure:
-        return cleaned
-
     # Detect and truncate repetition loops: if any 20+ char substring repeats 3+ times, keep only the first occurrence
+    cleaned = text.strip()
     for chunk_len in range(30, 15, -1):
         if len(cleaned) < chunk_len * 3:
             continue
@@ -4115,6 +6022,34 @@ def _build_fallback_prompt(
         return ", ".join(parts)
 
 
+def _director_reference_bundle(
+    reference_image_path: Optional[str],
+    character_ref_paths: Optional[list],
+    character_ref_labels: Optional[list],
+    location_ref_paths: Optional[list],
+    location_ref_labels: Optional[list],
+) -> tuple[Optional[list], str]:
+    """Return ordered existing Director refs plus stable role instructions."""
+    images: list[str] = []
+    roles: list[str] = []
+
+    def add(path, role: str, label: str = ""):
+        if not isinstance(path, str) or not os.path.isfile(path) or path in images:
+            return
+        images.append(path)
+        suffix = f" — {label.strip()}" if isinstance(label, str) and label.strip() else ""
+        roles.append(f"Picture {len(images)}: {role}{suffix}")
+
+    add(reference_image_path, "main visual/style reference")
+    for index, path in enumerate(character_ref_paths or []):
+        labels = character_ref_labels or []
+        add(path, "character identity reference", labels[index] if index < len(labels) else "")
+    for index, path in enumerate(location_ref_paths or []):
+        labels = location_ref_labels or []
+        add(path, "location/setting reference", labels[index] if index < len(labels) else "")
+    return (images or None), "\n".join(roles)
+
+
 def plan_clip_prompts_and_images(
     clips: list,
     scene_description: str,
@@ -4122,6 +6057,10 @@ def plan_clip_prompts_and_images(
     bpm: float = 120.0,
     max_new_tokens: int = 512,
     reference_image_path: Optional[str] = None,
+    character_ref_paths: Optional[list] = None,
+    character_ref_labels: Optional[list] = None,
+    location_ref_paths: Optional[list] = None,
+    location_ref_labels: Optional[list] = None,
     speaker_mappings: Optional[dict] = None,
     prompt_type: str = "both",
     existing_image_prompts: Optional[list] = None,
@@ -4206,7 +6145,14 @@ def plan_clip_prompts_and_images(
             print(f"[LLM] Single speaker: {only_speaker}")
 
 
-    has_image = reference_image_path and os.path.isfile(reference_image_path)
+    batch_images, reference_roles = _director_reference_bundle(
+        reference_image_path,
+        character_ref_paths,
+        character_ref_labels,
+        location_ref_paths,
+        location_ref_labels,
+    )
+    has_image = bool(batch_images)
 
     # ── Load LLM guides ──────────────────────────────────────────────
     guides_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_guides")
@@ -4404,7 +6350,8 @@ def plan_clip_prompts_and_images(
         )
 
     # Send the reference image with every batch so the LLM can see who's in the scene
-    batch_images = [reference_image_path] if has_image else None
+    if reference_roles:
+        system_prompt += f"\n\nREFERENCE IMAGE ORDER:\n{reference_roles}"
 
     print(f"[LLM] Planning prompts: prompt_type={prompt_type}, {len(clips)} clips")
 
@@ -4614,6 +6561,10 @@ def plan_short_film_prompts(
     lyrics: Optional[list] = None,
     max_new_tokens: int = 512,
     reference_image_path: Optional[str] = None,
+    character_ref_paths: Optional[list] = None,
+    character_ref_labels: Optional[list] = None,
+    location_ref_paths: Optional[list] = None,
+    location_ref_labels: Optional[list] = None,
     speaker_mappings: Optional[dict] = None,
     characters: Optional[list] = None,
     prompt_type: str = "both",
@@ -4641,7 +6592,14 @@ def plan_short_film_prompts(
             if info.get("name"):
                 speaker_names[spk_id] = info["name"]
 
-    has_image = reference_image_path and os.path.isfile(reference_image_path)
+    batch_images, reference_roles = _director_reference_bundle(
+        reference_image_path,
+        character_ref_paths,
+        character_ref_labels,
+        location_ref_paths,
+        location_ref_labels,
+    )
+    has_image = bool(batch_images)
 
     # ── Character context for system prompt ──────────────────────
     char_context = ""
@@ -4816,7 +6774,8 @@ def plan_short_film_prompts(
             "Format: '1V. prompt' then '1I. prompt'. Output ONLY numbered prompts."
         )
 
-    batch_images = [reference_image_path] if has_image else None
+    if reference_roles:
+        system_prompt += f"\n\nREFERENCE IMAGE ORDER:\n{reference_roles}"
 
     print(f"[LLM] Short film prompts: prompt_type={prompt_type}, {len(clips)} clips")
 
@@ -4934,6 +6893,10 @@ def plan_short_film_from_story(
     story_description: str,
     characters: Optional[list] = None,
     reference_image_path: Optional[str] = None,
+    character_ref_paths: Optional[list] = None,
+    character_ref_labels: Optional[list] = None,
+    location_ref_paths: Optional[list] = None,
+    location_ref_labels: Optional[list] = None,
     target_duration: int = 30,
     target_scenes: Optional[int] = None,
     narrative_mode: bool = True,
@@ -4961,7 +6924,14 @@ def plan_short_film_from_story(
         # ~15 seconds per scene, cap at 30 scenes
         target_scenes = max(2, min(30, target_duration // 15))
 
-    has_image = reference_image_path and os.path.isfile(reference_image_path)
+    batch_images, reference_roles = _director_reference_bundle(
+        reference_image_path,
+        character_ref_paths,
+        character_ref_labels,
+        location_ref_paths,
+        location_ref_labels,
+    )
+    has_image = bool(batch_images)
 
     # ── Character context ─────────────────────────────────────────
     char_context = ""
@@ -5168,7 +7138,8 @@ def plan_short_film_from_story(
 
     user_prompt = f"Story Concept: {story_description}"
 
-    batch_images = [reference_image_path] if has_image else None
+    if reference_roles:
+        system_prompt += f"\n\nREFERENCE IMAGE ORDER:\n{reference_roles}"
 
     print(f"[LLM] Planning short film from story: {target_scenes} scenes, {target_duration}s")
     print(f"[LLM] Story: {story_description}")

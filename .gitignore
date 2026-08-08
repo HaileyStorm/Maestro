@@ -16,6 +16,13 @@ cache/
 # in place and we don't want to clobber their changes on update or
 # track per-machine differences in the repo.
 ENVIRONMENT
+ENVIRONMENT.*.tmp
+
+# Cloudflare Worker provisioning/runtime state and local secret files.
+cloudflare/stable-share-worker/.wrangler/
+cloudflare/stable-share-worker/.dev.vars
+cloudflare/stable-share-worker/.dev.vars.*
+cloudflare/stable-share-worker/wrangler.jsonc
 
 # Internal release-readiness checklist — not for public consumption.
 # Kept locally for the maintainer's reference; not shipped via git.
@@ -77,6 +84,13 @@ app/services/sam/checkpoints/
 # still exist on dev machines. Never tracked in git.
 app/services/_supplement_pack/
 
+# Optional local tool runtimes installed by Maestro's Director tooling.
+# Launcher scripts recreate these from pinned upstream releases.
+app/tools/blender/
+app/tools/blender-mcp/
+app/tools/cloudflared/
+app/tools/cuda-12.8.1/
+
 # GPL-3.0 seed-vc voice-conversion component — cloned at install/update
 # time from github.com/Blizaine/maestro-seedvc so the GPL tree is
 # distributed separately under its own license. Never tracked here.
@@ -98,3 +112,8 @@ app/plugins/wan2gp-lora-multipliers-ui/
 # Python bytecode (anywhere)
 __pycache__/
 app/wgp_config.json.bak
+app/.maestro-session-secret
+app/services/blender_mcp/
+app/services/sol_attn_kijai/
+app/services/sageattention_thu_ml/
+app/services/comfy_kitchen_w4a8/

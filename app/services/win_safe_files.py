@@ -35,6 +35,7 @@ since POSIX file semantics already give us this behavior for free.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import threading
@@ -639,5 +640,50 @@ def safe_join_under(base: str, *parts: str):
             if joined != base_real and not joined.startswith(base_real + os.sep):
                 return None
         return joined
+    except (ValueError, OSError):
+        return None
+
+
+def is_safe_direct_basename(name: object) -> bool:
+    """Return whether *name* is one direct filename on every supported OS.
+
+    Checking both separator styles is deliberate: a Linux test/server may
+    receive a Windows-shaped name that would become traversal after moving the
+    same workspace to Windows.
+    """
+    return (
+        isinstance(name, str)
+        and name not in {"", ".", ".."}
+        and "/" not in name
+        and "\\" not in name
+        and os.path.basename(name) == name
+    )
+
+
+_WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def is_safe_workspace_name(name: object) -> bool:
+    """Accept the virtual default workspace or one direct safe folder name."""
+    return isinstance(name, str) and (
+        name == "default" or _WORKSPACE_NAME_RE.fullmatch(name) is not None
+    )
+
+
+def safe_direct_file_under(base: str, name: object):
+    """Resolve one lexical child file without following a symlink alias.
+
+    Destructive operations must act on the filename selected by the user.
+    Resolving the final component through realpath would turn ``alias.mp4``
+    into ``real.mp4`` and delete/move the wrong directory entry.
+    """
+    if not is_safe_direct_basename(name):
+        return None
+    try:
+        base_real = os.path.realpath(base)
+        candidate = os.path.abspath(os.path.join(base_real, name))
+        if os.path.dirname(candidate) != base_real or os.path.islink(candidate):
+            return None
+        return candidate
     except (ValueError, OSError):
         return None

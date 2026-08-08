@@ -3,7 +3,6 @@ import { useStore } from '../../stores/useStore'
 import { useIsMobile } from '../../lib/useIsMobile'
 import { GenerationModeSelector } from './GenerationModeSelector'
 import { InputsPanel } from './InputsPanel'
-import { OmniReferenceSection } from './OmniReferenceSection'
 import { PromptInput } from './PromptInput'
 import { ImageRefSection } from './ImageRefSection'
 import { AudioModeSection } from './AudioModeSection'
@@ -13,6 +12,9 @@ import { SfxControls } from './SfxControls'
 import { MixerControls } from './MixerControls'
 import { ModeToggle } from './ModeToggle'
 import { DurationSlider } from './DurationSlider'
+import { ResolutionPresets } from './ResolutionPresets'
+import { AspectRatioGrid } from './AspectRatioGrid'
+import { H3PerformanceProfiles } from './H3PerformanceProfiles'
 import { AdvancedSettings } from './AdvancedSettings'
 import { GenerateButton } from './GenerateButton'
 import { ModelSelector } from './ModelSelector'
@@ -30,7 +32,8 @@ import { AnchorReturnBanner } from './AnchorReturnBanner'
 import { VoiceRefSection } from './VoiceRefSection'
 import { ToolsPanel } from './ToolsPanel'
 import { HardwareStatusBar } from './HardwareStatusBar'
-import { MiniMaxH3TurboToggle } from './MiniMaxH3TurboToggle'
+import { GenerationPrivacyControls } from './GenerationPrivacyControls'
+import { ProjectReferenceLibrary } from './ProjectReferenceLibrary'
 
 export function Sidebar() {
   const toggleSettings = useStore(s => s.toggleSettings)
@@ -45,6 +48,7 @@ export function Sidebar() {
   const editSubMode = useStore(s => s.editSubMode)
   const modelType = useStore(s => s.params.model_type)
   const openLoraBrowser = useStore(s => s.setLoraBrowserOpen)
+  const machineControls = useStore(s => s.accessContext?.machine_controls === true)
   const isMobile = useIsMobile()
 
   const isVideo = generationMode === 'video'
@@ -59,12 +63,17 @@ export function Sidebar() {
   const isOutpaint = isEdit && editSubMode === 'outpaint'
   const isEditAnything = isEdit && editSubMode === 'edit_anything'
   const isRecast = isEdit && editSubMode === 'recast'
-  const isOmniReference = isVideo && modelOptions?.omni_reference === true
-  const isMultiClip = isVideo && !isOmniReference && imageMode === 2
-  const isContinue = isVideo && !isOmniReference && imageMode === 3
-  const isBlend = isVideo && !isOmniReference && imageMode === 4
+  const isScailEdit = isRecast || isRestyle
+  const isMultiClip = isVideo && imageMode === 2
+  const isContinue = isVideo && imageMode === 3
+  const isBlend = isVideo && imageMode === 4
   const isDirector = sidebarMode === 'director'
   const isI2vOnly = modelOptions?.i2v_class && !modelOptions?.t2v_class
+  const isH3 = isVideo && (
+    modelType.startsWith('minimax_h3')
+    || String(modelOptions?.architecture || '').startsWith('minimax_h3')
+    || String(modelOptions?.model_type || '').startsWith('minimax_h3')
+  )
 
   const modeToggle = (size: 'sm' | 'md') => (
     <div className="flex bg-bg-tertiary rounded-lg p-0.5 border border-border">
@@ -160,16 +169,24 @@ export function Sidebar() {
         {isEdit && editControls}
 
         {/* Video mode */}
-        {isVideo && !isOmniReference && <ModeToggle />}
+        {isVideo && <ModeToggle />}
         {/* Blend mode manages its own duration (overlap_sec) and its own
             start/end anchors — so the generic Duration slider and
             start/end ImageUpload don't apply there. */}
+        {isH3 && <H3PerformanceProfiles />}
         {isVideo && !isBlend && <DurationSlider />}
-        {isVideo && <MiniMaxH3TurboToggle />}
+        {/* Resolution is a primary generation choice. Recast/Repaint and
+            Outpaint own dedicated output-quality canvases; audio has none. */}
+        {!isAudio && !isScailEdit && (
+          <>
+            {!isOutpaint && !modelOptions?.hide_resolution_presets && <ResolutionPresets />}
+            {!isEdit && !isH3 && <AspectRatioGrid />}
+          </>
+        )}
         {/* Frames (image_mode 0) AND Extend (image_mode 3) both use the unified
             InputsPanel. In Extend mode its first tile is the source video to
             continue from; otherwise it's the start frame. */}
-        {isVideo && !isOmniReference && !isMultiClip && !isBlend && (
+        {isVideo && !isMultiClip && !isBlend && (
           <div>
             {isI2vOnly && !isContinue && (
               <div className="text-[10px] text-indicator-warning bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-1.5 mb-2">
@@ -179,7 +196,6 @@ export function Sidebar() {
             <InputsPanel />
           </div>
         )}
-        {isOmniReference && <OmniReferenceSection />}
         {isBlend && <BlendControls />}
 
         {/* Image mode: reference images */}
@@ -203,7 +219,7 @@ export function Sidebar() {
 
         {/* Video: reference images below prompt. In Frames mode the InputsPanel
             renders them as ordered tiles instead. */}
-        {isVideo && !isOmniReference && imageMode !== 0 && imageMode !== 3 && modelOptions?.image_ref_choices && <ImageRefSection />}
+        {isVideo && imageMode !== 0 && imageMode !== 3 && modelOptions?.image_ref_choices && <ImageRefSection />}
 
         {/* Voice Reference (ID-LoRA) — gated by Settings → Services
             toggle (`voice_reference_enabled`). VoiceRefSection internally
@@ -211,7 +227,7 @@ export function Sidebar() {
             mode (basic, multi-clip, continue, blend) — it's the same
             generation path that consumes `directorVoiceRef` server-side.
             Director mode renders its own copy in DirectorChat. */}
-        {isVideo && !isDirector && !isOmniReference && imageMode !== 0 && imageMode !== 3 && <VoiceRefSection />}
+        {isVideo && !isDirector && imageMode !== 0 && imageMode !== 3 && <VoiceRefSection />}
         </>
         )}
       </div>
@@ -223,14 +239,14 @@ export function Sidebar() {
       <div className="px-3 py-2.5 border-t border-border">
         <div className="flex items-center gap-2">
           <AdvancedSettings />
-          <button
+          {machineControls && <button
             onClick={() => useStore.getState().setRecipesOpen(true)}
             className="p-2 rounded-lg bg-bg-tertiary border border-border hover:border-border-light text-text-secondary hover:text-accent-blue transition-colors shrink-0"
             title="Recipes — one-click presets"
           >
             <BookMarked size={14} />
-          </button>
-          {!isOutpaint && (
+          </button>}
+          {machineControls && !isOutpaint && (
             <button
               onClick={() => openLoraBrowser(true, modelType)}
               className="p-2 rounded-lg bg-bg-tertiary border border-border hover:border-border-light text-text-secondary hover:text-accent-blue transition-colors shrink-0"
@@ -283,8 +299,10 @@ export function Sidebar() {
               </button>
             </div>
           </div>
+          <GenerationPrivacyControls />
+          <ProjectReferenceLibrary />
           {isDirector ? <DirectorChat /> : studioControls}
-          <HardwareStatusBar />
+          {machineControls && <HardwareStatusBar />}
         </aside>
       </>
     )
@@ -304,17 +322,19 @@ export function Sidebar() {
         </div>
         <div className="flex items-center gap-2">
           {modeToggle('md')}
-          <button
+          {machineControls && <button
             onClick={toggleSettings}
             className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
             title="Settings"
           >
             <Settings size={16} />
-          </button>
+          </button>}
         </div>
       </div>
+      <GenerationPrivacyControls />
+      <ProjectReferenceLibrary />
       {isDirector ? <DirectorChat /> : studioControls}
-      <HardwareStatusBar />
+      {machineControls && <HardwareStatusBar />}
     </aside>
   )
 }

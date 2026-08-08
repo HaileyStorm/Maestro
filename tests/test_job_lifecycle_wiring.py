@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -45,10 +46,49 @@ def _load_isolated_function(relative_path: str, name: str, namespace: dict):
     return namespace[name]
 
 
+class _PostDecodeStageError(RuntimeError):
+    def __init__(self, message: str, *, stage: str, code: str):
+        super().__init__(message)
+        self.stage = stage
+        self.code = code
+
+
 class TestJobLifecycleWiring(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.launch = _parse("app/launch.py")
+
+    def test_wgp_mmgp_target_matches_requirement_without_version_drift(self):
+        wgp = _parse("app/wgp.py")
+        assignments = {
+            target.id: node.value.value
+            for node in wgp.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance((target := node.targets[0]), ast.Name)
+            and isinstance(node.value, ast.Constant)
+        }
+        with open(
+            os.path.join(_ROOT, "app", "requirements.txt"),
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            requirement = next(
+                line.strip()
+                for line in handle
+                if line.strip().startswith("mmgp @ ")
+            )
+        expected_hash = (
+            "2cfb809c1000a0945101c885c687e68ad44eb37278a373a3d65b8ce747f222cf"
+        )
+        self.assertIn(
+            f"mmgp-{assignments['target_mmgp_version']}-py3-none-any.whl",
+            requirement,
+        )
+        self.assertTrue(requirement.startswith("mmgp @ https://files.pythonhosted.org/"))
+        self.assertTrue(requirement.endswith(f"#sha256={expected_hash}"))
+        self.assertEqual(assignments["WanGP_version"], "10.9875")
+        self.assertEqual(assignments["settings_version"], 2.57)
 
     def test_each_worker_uses_lifecycle_transitions(self):
         expected = {
@@ -186,6 +226,769 @@ class TestJobLifecycleWiring(unittest.TestCase):
         self.assertLess(stamp_at, cancel_at)
         self.assertLess(cancel_at, cancel_return)
 
+    def test_ordinary_repeat_boundary_publishes_before_scheduler_yield(self):
+        generation = _function(self.launch, "_run_generation")
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
+        ) as handle:
+            source = ast.get_source_segment(handle.read(), generation)
+        self.assertIsNotNone(source)
+        callback = source.split(
+            "def _publish_and_yield_after_repeat_output():", 1,
+        )[1].split("if not is_multiclip and not defer_output_publication:", 1)[0]
+        collect_at = callback.index("collect_job_outputs(")
+        sidecar_at = callback.index("_write_output_sidecars(", collect_at)
+        record_at = callback.index("record_job_outputs(", sidecar_at)
+        yield_at = callback.index(
+            "yield_generation_slot_after_output(_gen_lock, job)", record_at,
+        )
+        no_next_at = callback.index(
+            "if completed_repeats >= current_total:", record_at,
+        )
+        restore_path_at = callback.index("wgp.save_path = out_dir", yield_at)
+        restore_coefficient_at = callback.index(
+            "_apply_per_job_coefficient(job)", restore_path_at,
+        )
+        restore_abort_state_at = callback.index(
+            "if not register_abort_state(", restore_coefficient_at,
+        )
+        unregister_at = callback.index("unregister_abort_state(", record_at)
+        self.assertLess(collect_at, sidecar_at)
+        self.assertLess(sidecar_at, record_at)
+        self.assertLess(record_at, unregister_at)
+        self.assertLess(unregister_at, no_next_at)
+        self.assertLess(no_next_at, yield_at)
+        self.assertLess(record_at, yield_at)
+        self.assertLess(yield_at, restore_path_at)
+        self.assertLess(restore_path_at, restore_coefficient_at)
+        self.assertLess(restore_coefficient_at, restore_abort_state_at)
+        self.assertIn(
+            'params["after_repeat_output"] =',
+            source,
+        )
+        self.assertIn(
+            "if not is_multiclip and not defer_output_publication:",
+            source,
+        )
+
+    def test_repeat_boundary_two_outputs_resume_cancel_and_extra_orders(self):
+        import inspect
+
+        namespace = {
+            "inspect": inspect,
+            "get_gen_info": lambda state: state["gen"],
+        }
+        dispatch = _load_isolated_function(
+            "app/wgp.py", "generate_video", namespace,
+        )
+        signature = inspect.signature(dispatch)
+        state = {"gen": {"abort": False, "extra_orders": 0}}
+        calls = []
+        yielded = []
+
+        def one_output(**kwargs):
+            calls.append(kwargs["seed"])
+            return True
+
+        one_output.__signature__ = signature
+        namespace["generate_video"] = one_output
+
+        def publish_and_maybe_yield():
+            gen = state["gen"]
+            if int(gen["repeat_no"]) < int(gen["total_generation"]):
+                yielded.append(gen["repeat_no"])
+            return True
+
+        arguments = {
+            name: None
+            for name, parameter in signature.parameters.items()
+            if parameter.default is inspect.Parameter.empty
+        }
+        arguments.update({
+            "task": {},
+            "send_cmd": lambda *_args: None,
+            "state": state,
+            "seed": 41,
+            "repeat_generation": 2,
+            "after_repeat_output": publish_and_maybe_yield,
+        })
+        self.assertTrue(dispatch(**arguments))
+        self.assertEqual(calls, [41, -1])
+        self.assertEqual(yielded, [1])
+
+        # A live delta retained by the one-output model task is consumed by the
+        # outer dispatcher before it decides whether the request is complete.
+        calls.clear()
+        yielded.clear()
+        state["gen"].update(abort=False, extra_orders=0)
+
+        def add_one_output(**kwargs):
+            calls.append(kwargs["seed"])
+            if len(calls) == 1:
+                state["gen"]["extra_orders"] = 1
+            return True
+
+        add_one_output.__signature__ = signature
+        namespace["generate_video"] = add_one_output
+        self.assertTrue(dispatch(**arguments))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(yielded, [1, 2])
+
+        def cancel_at_boundary():
+            return False
+
+        namespace["generate_video"] = one_output
+        state["gen"].update(abort=False, extra_orders=0)
+        arguments["after_repeat_output"] = cancel_at_boundary
+        self.assertFalse(dispatch(**arguments))
+        self.assertTrue(state["gen"]["abort"])
+
+        # Restart from two durably completed outputs: only repeat three is
+        # dispatched, with the randomized-followup seed contract preserved.
+        calls.clear()
+        yielded.clear()
+        state["gen"].update(abort=False, extra_orders=0)
+        arguments.update({
+            "repeat_generation": 3,
+            "repeat_start_offset": 2,
+            "after_repeat_output": publish_and_maybe_yield,
+        })
+        self.assertTrue(dispatch(**arguments))
+        self.assertEqual(calls, [-1])
+        self.assertEqual(yielded, [])
+        self.assertEqual(state["gen"]["repeat_no"], 3)
+
+    def test_repeat_boundary_one_output_dispatches_once(self):
+        import inspect
+
+        namespace = {
+            "inspect": inspect,
+            "get_gen_info": lambda state: state["gen"],
+        }
+        dispatch = _load_isolated_function(
+            "app/wgp.py", "generate_video", namespace,
+        )
+        signature = inspect.signature(dispatch)
+        state = {"gen": {"abort": False, "extra_orders": 0}}
+        calls = []
+        boundaries = []
+
+        def one_output(**kwargs):
+            calls.append(kwargs["seed"])
+            return True
+
+        one_output.__signature__ = signature
+        namespace["generate_video"] = one_output
+
+        def after_output():
+            boundaries.append((
+                state["gen"]["repeat_no"],
+                state["gen"]["total_generation"],
+            ))
+            return True
+
+        arguments = {
+            name: None
+            for name, parameter in signature.parameters.items()
+            if parameter.default is inspect.Parameter.empty
+        }
+        arguments.update({
+            "task": {},
+            "send_cmd": lambda *_args: None,
+            "state": state,
+            "seed": 41,
+            "repeat_generation": 1,
+            "after_repeat_output": after_output,
+        })
+        self.assertTrue(dispatch(**arguments))
+        self.assertEqual(calls, [41])
+        self.assertEqual(boundaries, [(1, 1)])
+
+    def test_inner_single_repeat_uses_a_stable_loop_target(self):
+        wgp = _parse("app/wgp.py")
+        generate = _function(wgp, "generate_video")
+        with open(
+            os.path.join(_ROOT, "app", "wgp.py"), "r", encoding="utf-8",
+        ) as handle:
+            source = ast.get_source_segment(handle.read(), generate)
+        self.assertIsNotNone(source)
+        offset_at = source.index("single_repeat_offset = (")
+        local_index_at = source.index("repeat_no = 0", offset_at)
+        target_at = source.index("single_repeat_target = 1", local_index_at)
+        loop_at = source.index("while not abort:", target_at)
+        use_at = source.index(
+            "total_generation = single_repeat_target if single_repeat_dispatch",
+            loop_at,
+        )
+        self.assertLess(offset_at, local_index_at)
+        self.assertLess(local_index_at, target_at)
+        self.assertLess(target_at, loop_at)
+        self.assertLess(loop_at, use_at)
+        self.assertNotIn(
+            "total_generation = repeat_no + 1 if single_repeat_dispatch",
+            source,
+        )
+        self.assertIn(
+            "single_repeat_offset + repeat_no",
+            source,
+        )
+        self.assertIn("if repeat_no == 1", source)
+
+    def test_published_repeat_stays_visible_through_real_hold_resume_and_cancel(self):
+        import sys
+        import threading
+        import time
+
+        app_dir = os.path.join(_ROOT, "app")
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        from services import job_lifecycle as lifecycle
+
+        lifecycle._reset_queue_state_for_tests()
+        generation_lock = threading.Lock()
+        generation_lock.acquire()
+        job = {"id": "repeat-resume", "status": "queued", "message": "Queued"}
+        self.assertTrue(lifecycle.try_start(job))
+        lifecycle.record_job_outputs(
+            job,
+            ["repeat-1.mp4"],
+            final_output_files=["repeat-1.mp4"],
+        )
+        self.assertEqual(lifecycle.set_job_hold(job, True), "after_output")
+        resume_result = []
+        resume_thread = threading.Thread(target=lambda: resume_result.append(
+            lifecycle.yield_generation_slot_after_output(
+                generation_lock, job, poll_interval=0.005,
+            )
+        ))
+        resume_thread.start()
+        deadline = time.time() + 1
+        while job.get("status") != "queued" and time.time() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(
+            lifecycle.snapshot_job(job).get("output_files"),
+            ["repeat-1.mp4"],
+        )
+        self.assertEqual(lifecycle.set_job_hold(job, False), "resumed")
+        resume_thread.join(timeout=1)
+        self.assertEqual(resume_result, [True])
+        generation_lock.release()
+
+        lifecycle._reset_queue_state_for_tests()
+        cancel_lock = threading.Lock()
+        cancel_lock.acquire()
+        cancelled = {
+            "id": "repeat-cancel", "status": "queued", "message": "Queued",
+        }
+        self.assertTrue(lifecycle.try_start(cancelled))
+        lifecycle.record_job_outputs(
+            cancelled,
+            ["repeat-before-cancel.mp4"],
+            final_output_files=["repeat-before-cancel.mp4"],
+        )
+        self.assertEqual(
+            lifecycle.set_job_hold(cancelled, True), "after_output",
+        )
+        cancel_result = []
+        cancel_thread = threading.Thread(target=lambda: cancel_result.append(
+            lifecycle.yield_generation_slot_after_output(
+                cancel_lock, cancelled, poll_interval=0.005,
+            )
+        ))
+        cancel_thread.start()
+        deadline = time.time() + 1
+        while cancelled.get("status") != "queued" and time.time() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(
+            lifecycle.snapshot_job(cancelled).get("output_files"),
+            ["repeat-before-cancel.mp4"],
+        )
+        lifecycle.request_cancel(cancelled)
+        cancel_thread.join(timeout=1)
+        self.assertFalse(cancel_thread.is_alive())
+        self.assertEqual(cancel_result, [False])
+        lifecycle._reset_queue_state_for_tests()
+
+    def test_output_callbacks_are_optional_tail_keywords(self):
+        wgp = _parse("app/wgp.py")
+        generate = _function(wgp, "generate_video")
+        self.assertEqual(
+            [argument.arg for argument in generate.args.args[-2:]],
+            ["after_repeat_output", "after_segment_output"],
+        )
+        for default in generate.args.defaults[-2:]:
+            self.assertIsInstance(default, ast.Constant)
+            self.assertIsNone(default.value)
+        with open(
+            os.path.join(_ROOT, "app", "wgp.py"), "r", encoding="utf-8",
+        ) as handle:
+            source = ast.get_source_segment(handle.read(), generate)
+        self.assertIsNotNone(source)
+        recursive_return = source.index(
+            "if not generate_video(**recursive_arguments):",
+        )
+        boundary_at = source.index(
+            "if after_repeat_output() is False:", recursive_return,
+        )
+        self.assertLess(recursive_return, boundary_at)
+
+    def test_wgp_load_configuration_reuses_exact_key_and_reloads_on_budget_change(self):
+        namespace = {"math": math}
+        normalize = _load_isolated_function(
+            "app/wgp.py", "_normalize_output_type", namespace,
+        )
+        namespace["_normalize_output_type"] = normalize
+        configuration = _load_isolated_function(
+            "app/wgp.py", "_model_load_configuration", namespace,
+        )
+        matches = _load_isolated_function(
+            "app/wgp.py", "_model_load_configuration_matches", namespace,
+        )
+        namespace["_model_load_configuration_matches"] = matches
+        reprofile = _load_isolated_function(
+            "app/wgp.py", "_release_for_model_reprofile", namespace,
+        )
+        loaded = configuration(0.85, 4, "video", None, 0)
+        self.assertTrue(matches(
+            loaded, configuration(0.85, 4, "video", None, 0),
+        ))
+        self.assertTrue(matches(
+            loaded, configuration(0.8500001, 4, "video", None, 0),
+        ))
+        self.assertFalse(matches(
+            loaded, configuration(0.90, 4, "video", None, 0),
+        ))
+        self.assertTrue(matches(
+            loaded, configuration(0.85, 4, "image", None, 0),
+        ))
+        self.assertFalse(matches(
+            loaded, configuration(0.85, 3, "image", None, 0),
+        ))
+        self.assertFalse(matches(
+            loaded, configuration(0.85, 4, "video", "vae2", 0),
+        ))
+        release = Mock()
+        self.assertFalse(reprofile(
+            object(), loaded, configuration(0.85, 4, "video", None, 0), release,
+        ))
+        release.assert_not_called()
+        self.assertTrue(reprofile(
+            object(), loaded, configuration(0.90, 4, "video", None, 0), release,
+        ))
+        release.assert_called_once_with()
+
+    def test_submission_coefficient_override_matches_post_apply_residency_key(self):
+        namespace = {
+            "args": SimpleNamespace(vram_safety_coefficient=0.80, gpu=""),
+            "compute_profile": lambda override, _output: override,
+            "_model_load_configuration": lambda coefficient, profile, _output, vae, config, environment=None: (
+                float(coefficient), profile, vae, config, environment,
+            ),
+            "_model_load_environment_signature": lambda model, profile: {
+                "model": model, "profile": profile,
+            },
+            "make_residency_key": lambda *parts: repr(parts),
+            "get_base_model_type": lambda model: f"base:{model}",
+            "transformer_quantization": "fp8",
+            "transformer_dtype_policy": "default",
+            "text_encoder_quantization": "int8",
+            "attention_mode": "sdpa",
+            "compile": "",
+            "vae_config": 0,
+            "server_config": {
+                "vae_precision": "16",
+                "mixed_precision": "0",
+                "enhancer_mode": 1,
+            },
+        }
+        identity = _load_isolated_function(
+            "app/wgp.py", "get_requested_residency_identity", namespace,
+        )
+        for label, effective_coefficient in (
+            ("base", 0.80),
+            ("heavy", 0.67),
+        ):
+            with self.subTest(job=label):
+                namespace["args"].vram_safety_coefficient = 0.80
+                pre_admission = identity(
+                    "minimax_h3",
+                    override_profile=4,
+                    output_type="video",
+                    vram_safety_coefficient=effective_coefficient,
+                )
+                namespace["args"].vram_safety_coefficient = effective_coefficient
+                post_apply = identity(
+                    "minimax_h3",
+                    override_profile=4,
+                    output_type="video",
+                )
+                self.assertEqual(pre_admission, post_apply)
+
+    def test_wgp_load_environment_tracks_compile_decoder_and_attached_enhancer(self):
+        state = {
+            "compile": "",
+            "server_config": {
+                "enhancer_mode": 0,
+                "enhancer_enabled": 1,
+                "prompt_enhancer_quantization": "quanto_int8",
+                "lm_decoder_engine": "legacy",
+            },
+        }
+        namespace = {
+            "get_model_def": lambda _model: {"lm_engines": ["legacy", "vllm"]},
+            "resolve_lm_decoder_engine": lambda requested, _allowed: requested,
+            "lm_decoder_engine": "legacy",
+            **state,
+        }
+        signature = _load_isolated_function(
+            "app/wgp.py", "_model_load_environment_signature", namespace,
+        )
+        baseline = signature("minimax_h3", 4)
+        namespace["compile"] = "transformer"
+        compiled = signature("minimax_h3", 4)
+        self.assertNotEqual(baseline, compiled)
+        namespace["server_config"]["prompt_enhancer_quantization"] = "gguf"
+        requantized = signature("minimax_h3", 4)
+        self.assertNotEqual(compiled, requantized)
+        namespace["lm_decoder_engine"] = "vllm"
+        decoder_changed = signature("minimax_h3", 3)
+        self.assertEqual(decoder_changed["lm_decoder_engine"], "vllm")
+        self.assertNotEqual(requantized, decoder_changed)
+
+    def test_generation_submission_stamps_base_only_residency_before_worker(self):
+        registration = _function(
+            self.launch, "_queue_recovery_register_and_publish",
+        )
+        worker = _function(self.launch, "_run_generation")
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
+        ) as handle:
+            source = handle.read()
+        generate_source = ast.get_source_segment(source, registration)
+        worker_source = ast.get_source_segment(source, worker)
+        self.assertIsNotNone(generate_source)
+        self.assertIsNotNone(worker_source)
+        stamp_at = generate_source.index("_stamp_requested_generation_residency(prepared)")
+        thread_at = generate_source.index("thread = threading.Thread", stamp_at)
+        self.assertLess(stamp_at, thread_at)
+        worker_stamp_at = worker_source.index(
+            "_stamp_requested_generation_residency(job, replace=True)",
+        )
+        self.assertLess(worker_stamp_at, worker_source.index("with generation_slot("))
+
+        stamp_function = _function(
+            self.launch, "_stamp_requested_generation_residency_locked",
+        )
+        stamp_calls = [
+            node for node in ast.walk(stamp_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "stamp_job_residency"
+        ]
+        self.assertEqual(len(stamp_calls), 1)
+        self.assertEqual(len(stamp_calls[0].args), 2)
+        identity_calls = [
+            node for node in ast.walk(stamp_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get_requested_residency_identity"
+        ]
+        self.assertEqual(len(identity_calls), 1)
+        affinity = next(
+            keyword.value for keyword in identity_calls[0].keywords
+            if keyword.arg == "affinity_components"
+        )
+        self.assertIsInstance(affinity, ast.Constant)
+        self.assertIsNone(affinity.value)
+
+    def test_internal_h3_residency_uses_non_mutating_adaptive_first_model(self):
+        params = {
+            "model_type": "minimax_h3",
+            "image_refs": ["synthetic.png"],
+        }
+
+        def route(candidate):
+            candidate["model_type"] = "minimax_h3_ref2va"
+
+        def plan(candidate):
+            candidate["_h3_longform"] = {
+                "segment_models": [{"model_type": candidate["model_type"]}],
+            }
+
+        helper = _load_isolated_function(
+            "app/launch.py",
+            "_residency_request_params",
+            {
+                "_H3_LONG_STUDIO_MODELS": {
+                    "minimax_h3", "minimax_h3_ref2va",
+                },
+                "_apply_h3_adaptive_checkpoint": route,
+                "_prepare_h3_long_studio_request": plan,
+            },
+        )
+        effective = helper(params)
+        self.assertEqual(effective["model_type"], "minimax_h3_ref2va")
+        self.assertNotIn("_h3_longform", params)
+        self.assertEqual(params["model_type"], "minimax_h3")
+
+    def test_load_configuration_mutations_restamp_queued_jobs(self):
+        for function_name in ("update_system_config", "apply_system_detect"):
+            with self.subTest(function=function_name):
+                function = _function(self.launch, function_name)
+                self.assertIn(
+                    "_restamp_queued_generation_residency",
+                    _called_names(function),
+                )
+                self.assertIn(
+                    "residency_configuration_update",
+                    _called_names(function),
+                )
+
+    def test_failed_replacement_clears_stale_residency_key(self):
+        cleared = Mock(return_value=True)
+        stamp = _load_isolated_function(
+            "app/launch.py",
+            "_stamp_requested_generation_residency_locked",
+            {
+                "clear_job_residency": cleared,
+                "_residency_request_params": lambda _params: None,
+            },
+        )
+        job = {
+            "status": "queued",
+            "residency_base_key": "r1:stale",
+            "params": {"model_type": "minimax_h3"},
+        }
+        self.assertFalse(stamp(job, replace=True))
+        cleared.assert_called_once_with(job)
+
+    def test_public_queue_residency_metadata_never_exposes_opaque_keys(self):
+        helper = _load_isolated_function(
+            "app/launch.py", "_public_queue_residency_metadata", {},
+        )
+        public = helper({
+            "queue_reorder_reason": "resident_base",
+            "queue_residency_bypass_count": 999,
+            "queue_residency_bypassed_waiters": 99_999,
+            "residency_base_key": "r1:secret",
+            "residency_affinity_key": "r1:also-secret",
+        })
+        self.assertEqual(public["queue_reorder_reason"], "resident_base")
+        self.assertEqual(public["queue_residency_bypass_count"], 2)
+        self.assertEqual(public["queue_residency_bypassed_waiters"], 10_000)
+        self.assertFalse(any("key" in name for name in public))
+        remote = helper({
+            "queue_reorder_reason": "resident_base",
+            "queue_residency_bypass_count": 2,
+            "queue_residency_bypassed_waiters": 123,
+        }, remote=True)
+        self.assertEqual(remote["queue_residency_bypass_count"], 1)
+        self.assertEqual(remote["queue_residency_bypassed_waiters"], 1)
+
+    def test_queue_endpoint_returns_global_counts_but_only_owner_rows(self):
+        owner_job = {
+            "id": "owner-job", "status": "queued", "session_id": "owner",
+            "queue_priority": 0, "output_files": [],
+        }
+        other_job = {
+            "id": "other-job", "status": "running", "session_id": "other",
+            "queue_priority": 0, "output_files": [],
+        }
+        states = {id(owner_job): dict(owner_job), id(other_job): dict(other_job)}
+        summary = {
+            "running": 1, "waiting": 1, "held": 0, "registering": 0,
+            "active_total": 2,
+        }
+        scheduler = {
+            "paused": False,
+            "pause_after_current": False,
+            "summary": summary,
+            "positions": {id(owner_job): 1},
+            "states": states,
+            "wait_reasons": {
+                id(owner_job): "waiting_for_other_user",
+                id(other_job): "running",
+            },
+        }
+        call_order = []
+        require_remote_project = Mock(
+            side_effect=lambda _request: call_order.append("gate"),
+        )
+        scheduler_snapshot = Mock(side_effect=lambda _jobs: (
+            call_order.append("snapshot") or scheduler
+        ))
+        fake_api = SimpleNamespace(get=lambda *_args, **_kwargs: lambda function: function)
+        endpoint = _load_isolated_function(
+            "app/launch.py", "get_queue_state",
+            {
+                "api": fake_api,
+                "Request": object,
+                "Response": object,
+                "_jobs": {"owner-job": owner_job, "other-job": other_job},
+                "_require_remote_queue_project": require_remote_project,
+                "queue_scheduler_snapshot": scheduler_snapshot,
+                "_job_owned_by_request": lambda job, request: (
+                    job.get("session_id") == request.state.maestro_session_id
+                ),
+                "_job_eta_values": lambda _job: (None, None),
+                "_queue_recovery_is_blocked": lambda _job: False,
+                "_public_queue_residency_metadata": lambda *_args, **_kwargs: {},
+                "_public_queue_recovery_metadata": lambda *_args, **_kwargs: {},
+                "_set_recovery_no_store": lambda response: (
+                    response.headers.update({
+                        "Cache-Control": "private, no-store",
+                    })
+                ),
+            },
+        )
+        response_headers = SimpleNamespace(headers={})
+        response = endpoint(
+            SimpleNamespace(state=SimpleNamespace(
+                maestro_session_id="owner", maestro_remote=True,
+            )),
+            response_headers,
+        )
+
+        self.assertEqual(call_order, ["gate", "snapshot"])
+        require_remote_project.assert_called_once()
+        self.assertEqual(response["summary"], summary)
+        self.assertEqual(response["summary"]["active_total"], sum(
+            response["summary"][name]
+            for name in ("running", "waiting", "held", "registering")
+        ))
+        self.assertEqual([job["job_id"] for job in response["jobs"]], ["owner-job"])
+        self.assertEqual(
+            response_headers.headers["Cache-Control"], "private, no-store",
+        )
+        self.assertEqual(response["jobs"][0]["position"], 1)
+        self.assertGreaterEqual(
+            response["summary"]["waiting"],
+            max(job["position"] for job in response["jobs"] if job["position"]),
+        )
+
+    def test_queue_endpoint_denial_happens_before_global_snapshot(self):
+        fake_api = SimpleNamespace(
+            get=lambda *_args, **_kwargs: lambda function: function,
+        )
+        snapshot = Mock()
+        endpoint = _load_isolated_function(
+            "app/launch.py", "get_queue_state",
+            {
+                "api": fake_api,
+                "Request": object,
+                "Response": object,
+                "_set_recovery_no_store": lambda _response: None,
+                "_require_remote_queue_project": Mock(
+                    side_effect=PermissionError("locked"),
+                ),
+                "_jobs": {},
+                "queue_scheduler_snapshot": snapshot,
+            },
+        )
+        with self.assertRaises(PermissionError):
+            endpoint(
+                SimpleNamespace(state=SimpleNamespace(
+                    maestro_session_id="owner", maestro_remote=True,
+                )),
+                SimpleNamespace(headers={}),
+            )
+        snapshot.assert_not_called()
+
+    def test_queue_ui_explains_residency_reordering_without_keys(self):
+        paths = {
+            "client": "ui/src/api/client.ts",
+            "types": "ui/src/types/index.ts",
+            "main": "ui/src/components/MainContent/MainContent.tsx",
+        }
+        source = {}
+        for name, path in paths.items():
+            with open(os.path.join(_ROOT, path), "r", encoding="utf-8") as handle:
+                source[name] = handle.read()
+        for field in (
+            "queue_reorder_reason",
+            "queue_residency_bypass_count",
+            "queue_residency_bypassed_waiters",
+        ):
+            self.assertIn(field, source["client"])
+        self.assertIn("QueueReorderReason", source["client"])
+        self.assertIn("Reordered to reuse the loaded model", source["main"])
+        self.assertIn("Waiting for another generation on this host", source["main"])
+        for field in ("running", "waiting", "held", "registering", "active_total"):
+            self.assertIn(f"{field}: number", source["client"])
+        self.assertIn("queueSummaryLabel(queueTabState.summary)", source["main"])
+        self.assertIn("Next in line", source["main"])
+        self.assertIn("ahead · ${position} of ${waiting}", source["main"])
+        self.assertIn("queueActiveTotal", source["main"])
+        self.assertIn("queuePollSequence", source["main"])
+        self.assertIn("queuePollAbort.current?.abort()", source["main"])
+        self.assertIn("setQueueTabState(null)", source["main"])
+        self.assertEqual(source["main"].count("api.fetchQueueState("), 1)
+        self.assertIn("fetchQueueState(signal?: AbortSignal)", source["client"])
+        self.assertIn("Your job: overall ETA", source["main"])
+        self.assertNotIn("queueReorderReason", source["types"])
+        self.assertNotIn("residency_base_key", source["client"])
+        self.assertNotIn("residency_affinity_key", source["client"])
+
+    def test_wgp_failure_invalidation_clears_loaded_identity_before_cleanup(self):
+        invalidate_scheduler = Mock()
+        namespace = {
+            "reload_needed": False,
+            "_loaded_model_configuration": (0.85, 4, None, 0),
+            "_loaded_residency_base_key": "base",
+            "_loaded_residency_affinity_key": "affinity",
+            "invalidate_residency_state": invalidate_scheduler,
+        }
+        invalidate = _load_isolated_function(
+            "app/wgp.py", "_invalidate_loaded_model_state", namespace,
+        )
+        invalidate()
+        self.assertTrue(namespace["reload_needed"])
+        self.assertIsNone(namespace["_loaded_model_configuration"])
+        self.assertIsNone(namespace["_loaded_residency_base_key"])
+        self.assertIsNone(namespace["_loaded_residency_affinity_key"])
+        invalidate_scheduler.assert_called_once_with()
+
+    def test_wgp_reuse_gate_tracks_and_invalidates_effective_offload_configuration(self):
+        wgp = _parse("app/wgp.py")
+        generate = _function(wgp, "generate_video")
+        load_models = _function(wgp, "load_models")
+        release_model = _function(wgp, "release_model")
+        invalidate_loaded = _function(wgp, "_invalidate_loaded_model_state")
+        current_identity = _function(wgp, "get_current_residency_identity")
+        self.assertIn("_release_for_model_reprofile", _called_names(generate))
+        self.assertIn("release_model", _called_names(generate))
+        self.assertIn("note_residency_state", _called_names(load_models))
+        self.assertIn("_invalidate_loaded_model_state", _called_names(load_models))
+        self.assertIn("_invalidate_loaded_model_state", _called_names(release_model))
+        self.assertIn(
+            "invalidate_residency_state", _called_names(invalidate_loaded),
+        )
+
+        assigned_in_load = {
+            node.id for node in ast.walk(load_models)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        self.assertIn("_loaded_model_configuration", assigned_in_load)
+        self.assertIn("_loaded_residency_base_key", assigned_in_load)
+
+        assigned_in_invalidation = {
+            node.id for node in ast.walk(invalidate_loaded)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        self.assertTrue({
+            "_loaded_model_configuration",
+            "_loaded_residency_base_key",
+            "_loaded_residency_affinity_key",
+        } <= assigned_in_invalidation)
+        self.assertIn("wan_model", {
+            node.id for node in ast.walk(current_identity)
+            if isinstance(node, ast.Name)
+        })
+        self.assertIn("reload_needed", {
+            node.id for node in ast.walk(current_identity)
+            if isinstance(node, ast.Name)
+        })
+
     def test_director_sidecars_cover_every_supported_media_extension(self):
         generation = _function(self.launch, "_run_generation")
         sidecar_writer = next(
@@ -217,11 +1020,131 @@ class TestJobLifecycleWiring(unittest.TestCase):
         for extension in (".mp4", ".webm", ".mkv", ".mov"):
             self.assertIn(extension, continuation)
 
+    def test_wgp_structures_vae_failure_with_exact_safe_progress(self):
+        structured = _load_isolated_function(
+            "app/wgp.py",
+            "structured_generation_failure",
+            {"get_gen_info": lambda state: state},
+        )
+
+        def build(exception, **values):
+            return {"exception": type(exception).__name__, **values}
+
+        fake_oom = SimpleNamespace(
+            build_failure_details=build,
+            safe_allocator_facts=lambda: {"cuda_allocated_bytes": 64},
+        )
+        with patch.dict("sys.modules", {"services.oom_detect": fake_oom}):
+            details = structured(
+                RuntimeError("private device detail"),
+                {"params": {"multi_clip_info": {
+                    "index": 13,
+                    "total": 14,
+                    "output_index": 0,
+                }}},
+                {
+                    "progress_phase": ("VAE Decoding", 19),
+                    "window_no": 4,
+                    "total_windows": 4,
+                    "num_inference_steps": 19,
+                },
+            )
+        self.assertEqual(details["stage"], "vae_decode")
+        self.assertEqual(details["segment"], {
+            "current": 14, "total": 14, "variant": 1,
+        })
+
+        reference_failure = structured(
+            RuntimeError("private reference detail"),
+            {"params": {}},
+            {"progress_phase": ("Encoding H3 references", 0)},
+        )
+        self.assertEqual(reference_failure["stage"], "denoise")
+        self.assertEqual(
+            reference_failure["code"], "h3_reference_encode_failed",
+        )
+
+        audio_failure = structured(
+            RuntimeError("private audio detail"),
+            {"params": {}},
+            {"progress_phase": ("Decoding H3 audio", 0)},
+        )
+        self.assertEqual(audio_failure["stage"], "vae_decode")
+        self.assertEqual(audio_failure["code"], "h3_audio_decode_failed")
+        self.assertEqual(details["window"], {"current": 4, "total": 4})
+        self.assertEqual(details["step"], {"current": 19, "total": 19})
+        self.assertEqual(details["exception"], "RuntimeError")
+
+        staged_error = _PostDecodeStageError(
+            "private ffmpeg detail", stage="audio_mux", code="audio_mux_timeout",
+        )
+        with patch.dict("sys.modules", {"services.oom_detect": fake_oom}):
+            staged = structured(
+                staged_error,
+                {"params": {}},
+                {"progress_phase": ("VAE Decoding", 19)},
+            )
+        self.assertEqual(staged["stage"], "audio_mux")
+        self.assertEqual(staged["code"], "audio_mux_timeout")
+
+    def test_wgp_marks_segment_encode_and_audio_mux_boundaries(self):
+        with open(
+            os.path.join(_ROOT, "app", "wgp.py"), "r", encoding="utf-8",
+        ) as handle:
+            source = handle.read()
+        generation = ast.get_source_segment(
+            source, _function(ast.parse(source), "generate_video"),
+        )
+        self.assertGreaterEqual(
+            generation.count('stage="segment_checkpoint"'), 2,
+        )
+        self.assertGreaterEqual(
+            generation.count('code="segment_encode_failed"'), 2,
+        )
+        self.assertIn('stage="audio_mux"', generation)
+        self.assertIn('code="audio_mux_failed"', generation)
+
+    def test_launch_prefers_explicit_postdecode_stage_over_stale_vae_phase(self):
+        tree = _parse("app/launch.py")
+        names = {
+            "_job_failure_positions",
+            "_failure_stage_from_job",
+            "_safe_failure_updates",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        namespace = {"wgp": SimpleNamespace(server_config={})}
+        module = ast.Module(body=nodes, type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, "app/launch.py", "exec"), namespace)
+        error = _PostDecodeStageError(
+            "/private/path ffmpeg stderr",
+            stage="concat",
+            code="concat_process_failed",
+        )
+        updates = namespace["_safe_failure_updates"](
+            error,
+            {
+                "phase": "VAE Decoding 19/19",
+                "clip_current": 14,
+                "clip_total": 14,
+            },
+        )
+        details = updates["failure_details"]
+        self.assertEqual(details["stage"], "concat")
+        self.assertEqual(details["code"], "concat_process_failed")
+        self.assertFalse(details["is_oom"])
+        self.assertNotIn("/private/path", str(details))
+        self.assertNotIn("ffmpeg stderr", str(details))
+        self.assertNotIn("VRAM", details["detail"])
+
     def test_failed_multiclip_concat_removes_partial_output(self):
         concatenate = _load_isolated_function(
             "app/wgp.py",
             "concatenate_multi_clip_videos",
-            {"os": os},
+            {"os": os, "PostDecodeStageError": _PostDecodeStageError},
         )
         with tempfile.TemporaryDirectory() as directory:
             clip = os.path.join(directory, "clip.mp4")
@@ -239,14 +1162,78 @@ class TestJobLifecycleWiring(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with patch("subprocess.run", side_effect=fake_run):
-                self.assertFalse(concatenate([clip], output))
+                with self.assertRaises(_PostDecodeStageError) as caught:
+                    concatenate([clip], output)
+            self.assertEqual(caught.exception.stage, "concat")
+            self.assertEqual(caught.exception.code, "concat_process_failed")
+            self.assertNotIn(directory, str(caught.exception))
             self.assertFalse(os.path.exists(output))
+
+    def test_multiclip_concat_rejects_a_partially_missing_component_set(self):
+        concatenate = _load_isolated_function(
+            "app/wgp.py",
+            "concatenate_multi_clip_videos",
+            {"os": os, "PostDecodeStageError": _PostDecodeStageError},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            present = os.path.join(directory, "present.mp4")
+            missing = os.path.join(directory, "missing.mp4")
+            output = os.path.join(directory, "joined.mp4")
+            with open(present, "wb") as handle:
+                handle.write(b"component")
+            with patch("subprocess.run") as run:
+                with self.assertRaises(_PostDecodeStageError) as caught:
+                    concatenate([present, missing], output)
+            self.assertEqual(caught.exception.stage, "concat")
+            self.assertEqual(caught.exception.code, "concat_input_incomplete")
+            run.assert_not_called()
+            self.assertFalse(os.path.exists(output))
+
+    def test_final_segment_callback_runs_before_concat_and_is_stage_safe(self):
+        seal = _load_isolated_function(
+            "app/wgp.py",
+            "seal_multi_clip_segment_before_concat",
+            {"PostDecodeStageError": _PostDecodeStageError},
+        )
+        calls = []
+        callback = lambda path, info: (
+            calls.append((path, info["index"])) or "sealed.mp4"
+        )
+        self.assertEqual(seal(
+            "segment-1.mp4", {"index": 0, "total": 2}, callback,
+        ), "segment-1.mp4")
+        self.assertEqual(calls, [])
+        self.assertEqual(seal(
+            "segment-2.mp4", {"index": 1, "total": 2}, callback,
+        ), "sealed.mp4")
+        self.assertEqual(calls, [("segment-2.mp4", 1)])
+
+        def fail(_path, _info):
+            raise OSError("private checkpoint path")
+
+        with self.assertRaises(_PostDecodeStageError) as caught:
+            seal("segment-2.mp4", {"index": 1, "total": 2}, fail)
+        self.assertEqual(caught.exception.stage, "segment_checkpoint")
+        self.assertEqual(caught.exception.code, "segment_checkpoint_failed")
+        self.assertNotIn("private checkpoint path", str(caught.exception))
+
+        with open(
+            os.path.join(_ROOT, "app", "wgp.py"), "r", encoding="utf-8",
+        ) as handle:
+            source = handle.read()
+        generation = ast.get_source_segment(
+            source, _function(ast.parse(source), "generate_video"),
+        )
+        self.assertLess(
+            generation.index("seal_multi_clip_segment_before_concat("),
+            generation.index("concatenate_multi_clip_videos("),
+        )
 
     def test_multiclip_external_audio_can_start_after_source_time_zero(self):
         concatenate = _load_isolated_function(
             "app/wgp.py",
             "concatenate_multi_clip_videos",
-            {"os": os},
+            {"os": os, "PostDecodeStageError": _PostDecodeStageError},
         )
         with tempfile.TemporaryDirectory() as directory:
             clip = os.path.join(directory, "clip.mp4")
@@ -282,7 +1269,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
         concatenate = _load_isolated_function(
             "app/wgp.py",
             "concatenate_multi_clip_videos",
-            {"os": os},
+            {"os": os, "PostDecodeStageError": _PostDecodeStageError},
         )
         with tempfile.TemporaryDirectory() as directory:
             clip = os.path.join(directory, "clip.mp4")
@@ -327,7 +1314,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
         concatenate = _load_isolated_function(
             "app/wgp.py",
             "concatenate_multi_clip_videos",
-            {"os": os},
+            {"os": os, "PostDecodeStageError": _PostDecodeStageError},
         )
         with tempfile.TemporaryDirectory() as directory:
             clip = os.path.join(directory, "clip.mp4")

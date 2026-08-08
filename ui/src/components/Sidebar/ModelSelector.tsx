@@ -1,6 +1,7 @@
 import { ChevronDown, Check, Plus } from 'lucide-react'
 import { useState, useRef, useEffect } from 'react'
 import { useStore, getFamiliesForMode, getModelsForFamily } from '../../stores/useStore'
+import { fetchH3AccelerationStatus } from '../../api/client'
 import { InfoTooltip } from './InfoTooltip'
 
 export function ModelSelector() {
@@ -11,6 +12,12 @@ export function ModelSelector() {
   const editSubMode = useStore(s => s.editSubMode)
   const currentModelType = useStore(s => s.params.model_type)
   const selectModel = useStore(s => s.selectModel)
+  const h3SelectedProfile = useStore(s => s.h3SelectedProfile)
+  const h3Profiles = useStore(s => s.h3PerformanceProfiles)
+  const pinkCompatibility = useStore(
+    s => s.h3ModelProfileCompatibility.minimax_h3_pinkcherry_fl2va,
+  )
+  const refreshH3Compatibility = useStore(s => s.refreshH3ModelProfileCompatibility)
   const openModelVisibility = useStore(s => s.openModelVisibility)
   // Mature Mode gate: models with nsfw_only flag are hidden from the
   // selector unless servicesConfig.nsfw_mode is enabled. Backend always
@@ -19,6 +26,7 @@ export function ModelSelector() {
   const nsfwMode = useStore(s => s.servicesConfig?.nsfw_mode ?? false)
 
   const [open, setOpen] = useState(false)
+  const [w4a8Capability, setW4a8Capability] = useState<{ available: boolean; reason: string } | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
 
   // Close on click outside
@@ -31,6 +39,45 @@ export function ModelSelector() {
     }
     document.addEventListener('mousedown', handleClick)
     return () => document.removeEventListener('mousedown', handleClick)
+  }, [open])
+
+  const h3CompatibilitySignature = useStore(s => JSON.stringify([
+    s.params.model_type,
+    s.params.num_inference_steps,
+    s.params.resolution,
+    s.params.custom_settings || {},
+    s.params.activated_loras || [],
+    s.params.loras_multipliers || '',
+    s.params.tea_cache,
+    s.spatialUpsampling,
+    s.params.delivery_resolution || '',
+    s.params.delivery_fit || '',
+    s.explicitOutput,
+    s.h3SelectedProfile,
+  ]))
+
+  useEffect(() => {
+    if (!open || !nsfwMode || h3SelectedProfile === 'custom') return
+    void refreshH3Compatibility('minimax_h3_pinkcherry_fl2va')
+  }, [open, nsfwMode, h3SelectedProfile, h3CompatibilitySignature, refreshH3Compatibility])
+
+  useEffect(() => {
+    if (!open) return
+    let current = true
+    fetchH3AccelerationStatus(false)
+      .then(status => {
+        if (current) setW4a8Capability({
+          available: status.w4a8.available,
+          reason: status.w4a8.reason,
+        })
+      })
+      .catch(() => {
+        if (current) setW4a8Capability({
+          available: false,
+          reason: 'Runtime capability check failed',
+        })
+      })
+    return () => { current = false }
   }, [open])
 
   const audioSubMode = useStore(s => s.audioSubMode)
@@ -47,7 +94,12 @@ export function ModelSelector() {
     family,
     models: getModelsForFamily(family.id, models, generationMode, effectiveSubMode)
       .filter(m => enabledModels.has(m.model_type))
-      .filter(m => !m.nsfw_only || nsfwMode),
+      .filter(m => !m.nsfw_only || nsfwMode)
+      .sort((left, right) => (
+        nsfwMode
+          ? Number(!!right.preferred_explicit_fl2va) - Number(!!left.preferred_explicit_fl2va)
+          : 0
+      )),
   })).filter(g => g.models.length > 0)
 
   // How many models are available for this mode but NOT enabled — powers the
@@ -97,33 +149,53 @@ export function ModelSelector() {
                 {/* Models in family */}
                 {famModels.map(model => {
                   const isSelected = model.model_type === currentModelType
-                  const help = model.selector_help
+                  const w4a8Unavailable = (
+                    model.model_type === 'minimax_h3_w4a8_fl2va'
+                    && w4a8Capability?.available !== true
+                  )
+                  const isPinkCherry = model.model_type === 'minimax_h3_pinkcherry_fl2va'
+                  const pinkProfileIncompatible = isPinkCherry
+                    && pinkCompatibility?.requestedProfileId === h3SelectedProfile
+                    && pinkCompatibility.loading === false
+                    && !pinkCompatibility.compatible
+                  const requestedProfileLabel = h3Profiles.find(
+                    profile => profile.id === pinkCompatibility?.requestedProfileId,
+                  )?.label || pinkCompatibility?.requestedProfileId
+                  const pinkReconciliationLabel = pinkProfileIncompatible
+                    ? `${requestedProfileLabel || 'Current profile'} incompatible · selects ${pinkCompatibility?.fallbackProfileLabel || pinkCompatibility?.fallbackProfileId || 'server fallback'}`
+                    : null
                   return (
                     <div
                       key={model.model_type}
                       className={`group w-full flex items-center transition-colors ${
                         isSelected
                           ? 'bg-accent-blue/10 text-text-primary'
-                          : 'hover:bg-bg-hover text-text-secondary hover:text-text-primary'
+                          : 'text-text-secondary hover:bg-bg-hover hover:text-text-primary'
                       }`}
                     >
                       <button
-                        onClick={() => {
-                          selectModel(model.model_type)
-                          setOpen(false)
+                        disabled={w4a8Unavailable}
+                        title={
+                          w4a8Unavailable
+                            ? (w4a8Capability?.reason || 'Checking W4A8 runtime support…')
+                            : pinkReconciliationLabel || model.selector_help || model.description
+                        }
+                        onClick={async () => {
+                          if (await selectModel(model.model_type)) setOpen(false)
                         }}
-                        className="min-w-0 flex-1 px-3 py-1.5 flex items-center gap-2 text-left"
+                        className="min-w-0 flex-1 px-3 py-1.5 flex items-center gap-2 text-left disabled:cursor-not-allowed disabled:opacity-45"
                       >
                         <span className="flex-1 min-w-0 text-xs truncate">{model.name}</span>
                         <ModelBadges model={model} />
+                        {pinkReconciliationLabel && (
+                          <span className="text-[9px] text-amber-300">{pinkReconciliationLabel}</span>
+                        )}
+                        {w4a8Unavailable && <span className="text-[9px] text-amber-300">Unavailable</span>}
                         {isSelected && <Check size={12} className="shrink-0 text-accent-blue" />}
                       </button>
-                      {help && (
-                        <span className="pr-2">
-                          <InfoTooltip
-                            text={help}
-                            label={`About ${model.name}`}
-                          />
+                      {(model.selector_help || model.description) && (
+                        <span className="pr-2 shrink-0">
+                          <InfoTooltip text={model.selector_help || model.description || ''} />
                         </span>
                       )}
                     </div>
@@ -139,42 +211,24 @@ export function ModelSelector() {
 }
 
 function ModelBadges({ model }: {
-  model: {
-    model_type: string
-    is_i2v: boolean
-    is_t2v: boolean
-    supports_end_frame?: boolean
-    supports_audio?: boolean
-    supports_audio_input?: boolean
-    generates_audio?: boolean
-    supports_ref_images?: boolean
-  }
+  model: { model_type: string; is_i2v: boolean; is_t2v: boolean; supports_end_frame?: boolean; supports_audio?: boolean; supports_audio_input?: boolean; generates_audio?: boolean; supports_ref_images?: boolean }
 }) {
-  const badges: Array<{ label: string; title: string }> = []
-  const workflowIsAlreadyInName = model.model_type.startsWith('minimax_h3')
-  if (!workflowIsAlreadyInName && model.is_i2v && model.supports_end_frame) {
-    badges.push({ label: 'First / Last', title: 'Accepts a first frame, a last frame, or both' })
-  } else if (!workflowIsAlreadyInName && model.is_i2v) {
-    badges.push({ label: 'I2V', title: 'Accepts an input image' })
-  }
-  if (model.generates_audio) {
-    badges.push({ label: 'Audio Out', title: 'Generates synchronized audio with the video' })
-  }
-  if (model.supports_audio_input) {
-    badges.push({ label: 'Audio In', title: 'Accepts audio input; H3 Omni uses it as an ordered audio reference' })
-  }
-  if (model.supports_ref_images) {
-    badges.push({ label: 'Refs', title: 'Accepts one or more reference images' })
-  }
+  const badges: Array<{ label: string; title?: string }> = []
+  if (model.model_type === 'minimax_h3_pinkcherry_fl2va') badges.push({ label: 'Explicit FL2VA' })
+  else if (model.model_type === 'minimax_h3_w4a8_fl2va') badges.push({ label: 'Experimental W4A8 FL2VA' })
+  else if (model.model_type === 'minimax_h3_ref2va') badges.push({ label: 'Non-distilled Ref2VA' })
+  else if (model.model_type.startsWith('minimax_h3')) badges.push({ label: 'Non-distilled FL2VA' })
+  if (model.is_i2v && model.supports_end_frame) badges.push({ label: 'S/E Frame', title: 'Supports start and end frame guidance' })
+  else if (model.is_i2v) badges.push({ label: 'I2V', title: 'Supports image-to-video generation' })
+  if (model.generates_audio) badges.push({ label: 'Audio Out', title: 'Generates native audio with video' })
+  if (model.supports_audio_input) badges.push({ label: 'Audio In', title: 'Accepts audio conditioning' })
+  if (model.supports_audio && !model.generates_audio && !model.supports_audio_input) badges.push({ label: 'Audio' })
+  if (model.supports_ref_images) badges.push({ label: 'Refs', title: 'Supports reference images' })
   if (badges.length === 0) return null
   return (
     <span className="flex gap-0.5 shrink-0">
       {badges.map(b => (
-        <span
-          key={b.label}
-          title={b.title}
-          className="text-[9px] px-1 py-0.5 rounded bg-bg-tertiary text-text-muted leading-none"
-        >
+        <span key={b.label} title={b.title} className="text-[9px] px-1 py-0.5 rounded bg-bg-tertiary text-text-muted leading-none">
           {b.label}
         </span>
       ))}

@@ -165,6 +165,9 @@ function NsfwDisclaimerModal({
 
 function NsfwToggleSection() {
   const servicesConfig = useStore(s => s.servicesConfig)
+  const servicesConfigLoading = useStore(s => s.servicesConfigLoading)
+  const servicesConfigError = useStore(s => s.servicesConfigError)
+  const clearServicesConfigError = useStore(s => s.clearServicesConfigError)
   const updateConfig = useStore(s => s.updateServicesConfig)
   const [showDisclaimer, setShowDisclaimer] = useState(false)
 
@@ -176,11 +179,13 @@ function NsfwToggleSection() {
   const hasAccepted = !!servicesConfig.nsfw_accepted_at
 
   const handleToggle = () => {
-    if (isPublicProvider) return // Locked
+    if (isPublicProvider || servicesConfigLoading) return // Locked
+
+    clearServicesConfigError()
 
     if (nsfwEnabled) {
       // Turning OFF — no confirmation needed.
-      updateConfig({ nsfw_mode: false })
+      void updateConfig({ nsfw_mode: false })
       return
     }
 
@@ -190,13 +195,14 @@ function NsfwToggleSection() {
     if (!hasAccepted) {
       setShowDisclaimer(true)
     } else {
-      updateConfig({ nsfw_mode: true })
+      void updateConfig({ nsfw_mode: true })
     }
   }
 
   const handleDisclaimerAccept = () => {
     setShowDisclaimer(false)
-    updateConfig({
+    clearServicesConfigError()
+    void updateConfig({
       nsfw_mode: true,
       nsfw_accepted_at: new Date().toISOString(),
     })
@@ -234,7 +240,7 @@ function NsfwToggleSection() {
           </div>
           <div
             className={`w-9 h-5 rounded-full transition-colors relative shrink-0 ${
-              isPublicProvider ? 'bg-bg-tertiary border border-border opacity-40 cursor-not-allowed'
+              isPublicProvider || servicesConfigLoading ? 'bg-bg-tertiary border border-border opacity-40 cursor-not-allowed'
                 : nsfwEnabled ? 'bg-red-500' : 'bg-bg-tertiary border border-border'
             }`}
           >
@@ -243,6 +249,18 @@ function NsfwToggleSection() {
             }`} />
           </div>
         </div>
+        {servicesConfigError && (
+          <div className="flex items-start justify-between gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[10px] text-red-300">
+            <span>{servicesConfigError}</span>
+            <button
+              type="button"
+              onClick={clearServicesConfigError}
+              className="shrink-0 text-red-200 hover:text-white"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
       </div>
 
       {showDisclaimer && (
@@ -258,6 +276,7 @@ function NsfwToggleSection() {
 export function ServicesSettingsPanel() {
   const servicesConfig = useStore(s => s.servicesConfig)
   const servicesConfigLoading = useStore(s => s.servicesConfigLoading)
+  const servicesConfigError = useStore(s => s.servicesConfigError)
   const updateConfig = useStore(s => s.updateServicesConfig)
   const systemConfig = useStore(s => s.systemConfig)
   const updateSystemConfig = useStore(s => s.updateSystemConfig)
@@ -270,7 +289,11 @@ export function ServicesSettingsPanel() {
     return <div className="text-xs text-text-muted py-4 text-center">Loading...</div>
   }
   if (!servicesConfig) {
-    return <div className="text-xs text-text-muted py-4 text-center">Failed to load services settings</div>
+    return (
+      <div className="py-4 text-center text-xs text-red-300">
+        {servicesConfigError || 'Failed to load services settings'}
+      </div>
+    )
   }
 
   const provider = servicesConfig.llm_provider || 'local'
@@ -492,8 +515,7 @@ export function ServicesSettingsPanel() {
             <option value={2}>LlamaJoy + Florence2</option>
           </select>
           <p className="text-[10px] text-text-muted mt-1">
-            When enabled, overrides the LLM enhancer above. Uses Wan2GP's built-in pipeline
-            (does NOT use our model-specific prompt guides).
+            When enabled, this alternate enhancer takes over and uses its own prompt rules.
           </p>
         </div>
       </div>
@@ -508,7 +530,7 @@ export function ServicesSettingsPanel() {
 
       {/* Director Architecture */}
       <div className="space-y-3">
-        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Director Architecture</h3>
+        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Director Planning</h3>
         {/* Director v2 Engine toggle. v2 became the default 2026-05-03
             after weeks of real-world validation showed it's more
             reliable than v1 (v1 had a polish-pass failure mode where
@@ -519,11 +541,10 @@ export function ServicesSettingsPanel() {
         <label className="flex items-center justify-between cursor-pointer group">
           <div className="flex-1 mr-3">
             <div className="text-sm text-text-primary group-hover:text-accent-blue transition-colors">
-              Director v2 Engine <span className="text-[10px] text-text-muted font-normal">(default)</span>
+              Director Planner <span className="text-[10px] text-text-muted font-normal">(recommended)</span>
             </div>
             <div className="text-[10px] text-text-muted mt-0.5">
-              Layered architecture with structured shot planning, mode-specific renderers, and prompt validation.
-              Supports Podcast and Viral Video skills. Turn off to use the legacy v1 engine.
+              Uses structured shot planning and prompt checks, including Podcast and Viral Video workflows. Turn off to use the previous planner.
             </div>
           </div>
           <div
@@ -549,15 +570,15 @@ export function ServicesSettingsPanel() {
             className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
           >
             <option value="third_pass">Third Pass (Model-aware) — recommended</option>
-            <option value="light_guide">Lightweight Guide Inject (legacy)</option>
-            <option value="full_guide">Full Guide Inject (legacy)</option>
+            <option value="light_guide">Compact model guide</option>
+            <option value="full_guide">Full model guide</option>
             <option value="off">Off</option>
           </select>
           <p className="text-[10px] text-text-muted mt-1">
             {servicesConfig.director_prompt_polish === 'full_guide'
-              ? 'Legacy: injects the complete model-specific prompt guide into the Director planner\'s system prompt.'
+              ? 'Adds the complete model-specific guide before planning.'
               : servicesConfig.director_prompt_polish === 'light_guide'
-              ? 'Legacy: injects a lightweight dialect cheat sheet (~200 tokens) into the Director planner.'
+              ? 'Adds a compact model-specific guide before planning.'
               : servicesConfig.director_prompt_polish === 'off'
               ? 'Director uses its built-in prompting rules only. No model-specific optimization.'
               : 'Default and model-aware. H3 keeps its native video prompts while generated image prompts may still be polished; other models use their dialect-specific enhance pipeline.'}
@@ -632,7 +653,7 @@ export function ServicesSettingsPanel() {
       <div className="space-y-3">
         <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">FlashVSR Upscaling</h3>
         <p className="text-[10px] text-text-muted -mt-1">
-          DiT super-resolution. Pick it per generation in Post Processing → Spatial Upsampling. First use downloads ~4 GB of weights.
+          DiT super-resolution. Pick it per generation in Post Processing → Spatial Upsampling. Maestro downloads ~4 GB of weights to the shared host cache if needed.
         </p>
 
         <div>

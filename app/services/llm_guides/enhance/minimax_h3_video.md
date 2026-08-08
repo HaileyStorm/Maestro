@@ -23,6 +23,27 @@ OUTPUT CONTRACT
 - Keep every described event inside the supplied Duration. Use present tense
   and develop the audiovisual timeline in chronological order.
 
+LONG-DURATION CONTRACT
+- Accept any supplied total Duration, including durations longer than 15
+  seconds such as 30 or 60 seconds. Never shorten, reject, or cap the request
+  at 15 seconds.
+- Write one coherent global timeline from 0.00 seconds through the complete
+  supplied Duration. Timing remains global from the beginning of the video;
+  never restart the clock partway through.
+- Preserve every authored global timestamp and cut exactly as supplied,
+  including its order and shot number. Add precise increasing global times
+  only when the user requests timing or cuts without fully specifying them.
+- For times the user has not authored, treat timestamps as chronological
+  narrative anchors, not a metronome. Vary shot and event lengths according
+  to action, dialogue, reactions, and visual rhythm. Approximate, irregular
+  boundaries are valid; do not routinely place every change at exact 5, 10,
+  15, or 30-second intervals. Keep event order and the requested total
+  Duration coherent. This flexibility never permits changing a timestamp the
+  user supplied.
+- Maintain the same identities, visual descriptors, spatial state, speaker
+  IDs, literal dialogue, soundscape, and music intent throughout the complete
+  timeline.
+
 SOURCE AND CANON FIDELITY - HIGHEST PRIORITY
 - This is a faithful expansion, not a redesign. Preserve the user's exact
   premise, named identities, actor/character portrayal, franchise or series,
@@ -40,16 +61,6 @@ SOURCE AND CANON FIDELITY - HIGHEST PRIORITY
 - "Classic attire" is not a usable continuity description. When wardrobe is
   unspecified, choose one restrained canonical everyday outfit appropriate to
   the exact portrayal and describe its garments and colors concretely.
-
-SLIDING-WINDOW SAFETY
-- Sliding-window boundaries are continuation boundaries, not automatic camera
-  edits. Never invent "Cut at [window time]", [Shot 2], [Shot 3], a dissolve,
-  or a new establishing shot merely because structural context names multiple
-  windows. Every continuation pass uses a local clock beginning at 0.00.
-- Maestro normally routes multi-window First/Last enhancement to its dedicated
-  window planner, which repeats identity, wardrobe, setting, lighting, camera,
-  ambience, and music continuity in every complete window prompt. Never emit
-  one globally timed screenplay followed by one shared sound or music footer.
 
 VISUAL TIMELINE
 - Establish the visible subjects, setting, composition, lighting, action, and
@@ -91,7 +102,9 @@ SPEAKERS AND DIALOGUE
 - Budget all spoken words across all speakers at no more than about two words
   per second. A roughly 5-second clip normally fits one short line; a roughly
   10-second clip fits one brief exchange; a roughly 15-second clip fits a few
-  short turns with reactions between them.
+  short turns with reactions between them. For 30- or 60-second requests,
+  budget dialogue across the complete Duration and leave enough time for the
+  authored action, reactions, silence, sound, and music.
 - Do not use speech merely to occupy unused time. After the final line, assign
   the remaining seconds to concrete reactions or movement and explicitly state
   that the people remain silent with their mouths closed. This prevents H3

@@ -4009,7 +4009,7 @@ class TestMultiPersonRecast(unittest.TestCase):
             advanced,
         )
         self.assertIn(
-            "!isScailEdit && (modelOptions as Record<string, unknown> | null)?.perturbation",
+            "!isScailEdit && modelOptions?.perturbation",
             advanced,
         )
         self.assertIn(

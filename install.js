@@ -1,3 +1,5 @@
+const { runtimeSecretEnv } = require("./launcher_secret_env")
+
 module.exports = {
   requires: {
     bundle: "ai"
@@ -10,6 +12,13 @@ module.exports = {
         html: "This app requires an NVIDIA GPU on Windows or Linux."
       },
       next: null
+    },
+    {
+      method: "shell.run",
+      params: {
+        env: runtimeSecretEnv,
+        message: "python app/scripts/ensure_environment_defaults.py --file ENVIRONMENT"
+      }
     },
     // Optional HuggingFace login. Maestro's default models are all on
     // PUBLIC repos, so this is NOT required — but a token lifts HuggingFace's
@@ -24,6 +33,7 @@ module.exports = {
     {
       method: "shell.run",
       params: {
+        env: runtimeSecretEnv,
         venv: "env",
         path: "app",
         message: [
@@ -54,6 +64,7 @@ module.exports = {
     {
       method: "shell.run",
       params: {
+        env: runtimeSecretEnv,
         venv: "env",
         path: "app",
         message: "python scripts/install_gguf_kernels.py"
@@ -69,13 +80,31 @@ module.exports = {
       when: "{{!exists('app/postprocessing/seedvc/__init__.py')}}",
       method: "shell.run",
       params: {
+        env: runtimeSecretEnv,
         message: "git clone --depth 1 --branch v1.0.0 https://github.com/Blizaine/maestro-seedvc app/postprocessing/seedvc"
       }
+    },
+    {
+      method: "script.start",
+      params: { uri: "blender_mcp_install.js" }
+    },
+    {
+      method: "script.start",
+      params: { uri: "blender_runtime_install.js" }
+    },
+    {
+      method: "script.start",
+      params: { uri: "h3_acceleration_install.js" }
+    },
+    {
+      method: "script.start",
+      params: { uri: "h3_w4a8_runtime_install.js" }
     },
     {
       when: "{{exists('ui/package.json')}}",
       method: "shell.run",
       params: {
+        env: runtimeSecretEnv,
         path: "ui",
         message: [
           "npm install",

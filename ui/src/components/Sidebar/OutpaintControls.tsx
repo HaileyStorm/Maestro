@@ -64,6 +64,7 @@ export function OutpaintControls() {
   const windowSize = useStore(s => s.slidingWindowSeconds)
   const setWindowSize = useStore(s => s.setSlidingWindowSeconds)
   const windowLocked = useStore(s => s.slidingWindowLocked)
+  const modelOptions = useStore(s => s.modelOptions)
 
   const [error, setError] = useState<string | null>(null)
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -124,19 +125,25 @@ export function OutpaintControls() {
     ? trimEnd - trimStart
     : editVideoDuration
 
-  // Match Studio Frames mode: an unlocked window follows a short clip with
-  // a one-second quantization buffer, up to the model's ~20-second limit.
+  // Match Studio Frames mode: an unlocked window follows the source trim,
+  // while the selected model owns the actual frame grid and min/max limits.
   // Outpaint has a trim timeline instead of DurationSlider, so it needs the
   // same tracking behavior here.
   useEffect(() => {
-    if (windowLocked || !isVideoFile || selectedDuration <= 0) return
-    if (selectedDuration <= 20) {
-      const nextWindow = Math.min(21, Math.ceil(selectedDuration) + 1)
-      if (windowSize !== nextWindow) setWindowSize(nextWindow)
-    } else if (windowSize < 10) {
-      setWindowSize(20)
-    }
-  }, [isVideoFile, selectedDuration, windowLocked]) // eslint-disable-line react-hooks/exhaustive-deps
+    if (windowLocked || !isVideoFile || selectedDuration <= 0 || !modelOptions?.sliding_window) return
+    const fps = modelOptions.fps || 16
+    const defaults = modelOptions.sliding_window_defaults || {}
+    const minimum = Math.max(1 / fps, (defaults.window_min ?? 1) / fps)
+    const maximum = Math.max(minimum, (defaults.window_max ?? Math.round(20 * fps)) / fps)
+    const fallback = Math.min(maximum, Math.max(
+      minimum,
+      (defaults.window_default ?? modelOptions.default_sliding_window_size ?? Math.round(20 * fps)) / fps,
+    ))
+    const nextWindow = selectedDuration <= maximum
+      ? Math.min(maximum, Math.max(minimum, Math.ceil(selectedDuration) + 1))
+      : fallback
+    if (Math.abs(windowSize - nextWindow) > 1 / fps) setWindowSize(nextWindow)
+  }, [isVideoFile, selectedDuration, windowLocked, modelOptions, setWindowSize, windowSize])
 
   return (
     <div className="space-y-3">
@@ -245,7 +252,7 @@ export function OutpaintControls() {
         <div className="space-y-3 pl-2 border-l border-border/50">
           <label
             className="flex items-start gap-2 cursor-pointer"
-            title="Uses LTX-2.3's binary-mask conditioning and a soft multiscale boundary blend. Disable only to compare with Maestro's legacy Outpaint path."
+            title="Preserves the source subject with a soft boundary blend. Disable only for comparison."
           >
             <input
               type="checkbox"

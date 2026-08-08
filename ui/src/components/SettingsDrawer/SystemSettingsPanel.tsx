@@ -865,6 +865,160 @@ function AutoPerformanceCard() {
   )
 }
 
+function formatResearchTime(value: string | null | undefined): string {
+  if (!value) return 'Not yet'
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? 'Unavailable' : parsed.toLocaleString()
+}
+
+function ResearchCard() {
+  const [status, setStatus] = useState<api.ResearchStatus | null>(null)
+  const [pollError, setPollError] = useState<string | null>(null)
+  const [action, setAction] = useState<'research' | 'implementation' | null>(null)
+  const requestSequence = useRef(0)
+
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    const sequence = ++requestSequence.current
+    try {
+      const next = await api.fetchResearchStatus(signal)
+      if (sequence !== requestSequence.current) return
+      setStatus(next)
+      setPollError(null)
+    } catch (error) {
+      if (signal?.aborted || sequence !== requestSequence.current) return
+      setPollError(error instanceof Error ? error.message : 'Research status is unavailable')
+    }
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let timeout: number | undefined
+    const poll = async () => {
+      await refresh(controller.signal)
+      if (!controller.signal.aborted) {
+        timeout = window.setTimeout(() => { void poll() }, 5000)
+      }
+    }
+    void poll()
+    return () => {
+      controller.abort()
+      if (timeout !== undefined) window.clearTimeout(timeout)
+    }
+  }, [refresh])
+
+  const runNow = useCallback(async () => {
+    setAction('research')
+    setPollError(null)
+    try {
+      await api.runResearchNow()
+      await refresh()
+    } catch (error) {
+      setPollError(error instanceof Error ? error.message : 'Research could not start')
+    } finally {
+      setAction(null)
+    }
+  }, [refresh])
+
+  const startImplementation = useCallback(async () => {
+    if (!status || status.implementation_chunk_count < 1) return
+    setAction('implementation')
+    setPollError(null)
+    try {
+      // One or two eligible findings may be implemented explicitly; force
+      // bypasses only the normal count threshold on the server.
+      await api.startResearchImplementation(!status.implementation_ready)
+      await refresh()
+    } catch (error) {
+      setPollError(error instanceof Error ? error.message : 'Implementation could not start')
+    } finally {
+      setAction(null)
+    }
+  }, [refresh, status])
+
+  const busy = !!status?.research_active || !!status?.implementation_active
+  const eligible = status?.implementation_chunk_count ?? 0
+  const threshold = status?.readiness_threshold ?? 3
+  const recent = (status?.recent_pending ?? []).slice(0, 3)
+
+  return (
+    <div className="space-y-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Research</h3>
+        <span className={`text-[10px] ${status?.implementation_ready ? 'text-indicator-success' : 'text-text-muted'}`}>
+          {eligible}/{threshold} eligible · {status?.implementation_ready ? 'ready' : 'building'}
+        </span>
+      </div>
+
+      <div className="rounded-lg bg-bg-tertiary border border-border p-3 space-y-2.5">
+        <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
+          <span className="text-text-muted">Queued</span>
+          <span className="text-text-secondary text-right">{status?.queued_candidate_count ?? 0}</span>
+          <span className="text-text-muted">Next cycle</span>
+          <span className="text-text-secondary text-right">{formatResearchTime(status?.next_due_at)}</span>
+          <span className="text-text-muted">Last cycle</span>
+          <span className="text-text-secondary text-right">{formatResearchTime(status?.last_cycle_at)}</span>
+          <span className="text-text-muted">Last implementation</span>
+          <span className="text-text-secondary text-right">
+            {status?.last_implementation_run.status === 'never_run'
+              ? 'Not yet'
+              : status?.last_implementation_run
+                ? `${status.last_implementation_run.status} · ${formatResearchTime(
+                    status.last_implementation_run.active
+                      ? status.last_implementation_run.started_at
+                      : status.last_implementation_run.completed_at,
+                  )}`
+                : 'Unavailable'}
+          </span>
+        </div>
+
+        {busy && (
+          <div className="text-[10px] text-indicator-warning">
+            Active: {status?.implementation_active ? 'implementation' : status?.research_phase || 'research'}
+          </div>
+        )}
+
+        {recent.length > 0 && (
+          <div className="space-y-1 border-t border-border/40 pt-2">
+            {recent.map(suggestion => (
+              <div key={suggestion.finding_id} className="text-[10px] leading-snug">
+                <span className="text-text-secondary">{suggestion.title}</span>
+                <span className="text-text-muted"> — {suggestion.summary}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <p className="text-[9px] leading-snug text-text-muted border-t border-border/40 pt-2">
+          {status?.disclosure || "Only public catalog metadata is sent to DeepSeek through Nous. If DeepSeek's mechanical gate fails or its circuit opens, isolated GPT-5.6 Luna is the only fallback. Project names, prompts, jobs, media, and logs are never sent."}
+        </p>
+
+        {(pollError || status?.runtime_error) && (
+          <div className="text-[10px] text-indicator-warning">
+            {pollError || status?.runtime_error}
+          </div>
+        )}
+
+        <div className="flex gap-2">
+          <button
+            onClick={runNow}
+            disabled={busy || action !== null}
+            className="flex-1 px-2 py-1.5 text-[10px] rounded border border-border text-text-secondary hover:text-text-primary hover:border-border-light disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {action === 'research' ? 'Starting…' : 'Run research now'}
+          </button>
+          <button
+            onClick={startImplementation}
+            disabled={busy || eligible < 1 || action !== null}
+            className="flex-1 px-2 py-1.5 text-[10px] rounded border border-border text-text-secondary hover:text-text-primary hover:border-border-light disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {action === 'implementation' ? 'Starting…' : 'Start implementation'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function SystemSettingsPanel() {
   const systemConfig = useStore(s => s.systemConfig)
   const systemConfigLoading = useStore(s => s.systemConfigLoading)
@@ -1046,6 +1200,10 @@ export function SystemSettingsPanel() {
         <span className="flex-1 text-left">Storage Manager</span>
         <span className="text-[10px] text-text-muted">usage, duplicates, cleanup</span>
       </button>
+
+      <hr className="border-border" />
+
+      <ResearchCard />
 
       <hr className="border-border" />
 

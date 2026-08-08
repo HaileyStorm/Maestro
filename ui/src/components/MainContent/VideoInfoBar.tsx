@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { Pencil, RefreshCw, Copy, Trash2, Check, Combine, Loader2, Sparkles, Mic } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { getUploadUrl } from '../../api/client'
@@ -8,10 +8,12 @@ export function VideoInfoBar() {
   const outputs = useStore(s => s.filteredOutputs())
   const selectedOutput = useStore(s => s.selectedOutput)
   const meta = useStore(s => s.selectedOutputMeta)
+  const metaName = useStore(s => s.selectedOutputMetaName)
   const metadataLoading = useStore(s => s.metadataLoading)
   const loadSettingsFromOutput = useStore(s => s.loadSettingsFromOutput)
   const rerollGeneration = useStore(s => s.rerollGeneration)
   const deleteSelectedOutput = useStore(s => s.deleteSelectedOutput)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
   const rejoinClipGroup = useStore(s => s.rejoinClipGroup)
   const quickUpscaleClip = useStore(s => s.quickUpscaleClip)
   const sendClipToTools = useStore(s => s.sendClipToTools)
@@ -19,17 +21,22 @@ export function VideoInfoBar() {
   // (see modelDisplayName helper).
   const models = useStore(s => s.models)
   const [confirmDelete, setConfirmDelete] = useState(false)
-  const confirmRef = useRef(false)
+  const confirmRef = useRef<{ name: string; workspace: string } | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const [copied, setCopied] = useState(false)
   const [rejoining, setRejoining] = useState(false)
   const [upscaling, setUpscaling] = useState(false)
 
   const selected = outputs[selectedOutput]
+  useEffect(() => {
+    confirmRef.current = null
+    setConfirmDelete(false)
+    clearTimeout(timeoutRef.current)
+  }, [selected?.name, activeWorkspace])
   if (!selected) return null
 
   // While loading, show a subtle bar
-  if (metadataLoading) {
+  if (metadataLoading || metaName !== selected.name) {
     return (
       <div className="shrink-0 px-4 py-2 border-b border-border min-h-[44px] flex items-center">
         <div className="text-[11px] text-text-muted animate-pulse">Loading info...</div>
@@ -68,20 +75,26 @@ export function VideoInfoBar() {
   }
 
   const handleDelete = async () => {
-    if (!confirmRef.current) {
-      confirmRef.current = true
+    const confirmed = confirmRef.current
+    if (
+      !confirmed
+      || confirmed.name !== selected.name
+      || confirmed.workspace !== activeWorkspace
+    ) {
+      confirmRef.current = { name: selected.name, workspace: activeWorkspace }
       setConfirmDelete(true)
       clearTimeout(timeoutRef.current)
       timeoutRef.current = setTimeout(() => {
-        confirmRef.current = false
+        confirmRef.current = null
         setConfirmDelete(false)
       }, 3000)
       return
     }
     clearTimeout(timeoutRef.current)
-    confirmRef.current = false
+    const target = confirmRef.current
+    confirmRef.current = null
     setConfirmDelete(false)
-    await deleteSelectedOutput()
+    if (target) await deleteSelectedOutput(target.name, target.workspace)
   }
 
   const handleRejoin = async () => {

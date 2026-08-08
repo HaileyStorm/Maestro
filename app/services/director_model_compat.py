@@ -17,7 +17,6 @@ from typing import Any
 
 from services.director_video_strategy import (
     BOUNDED_START_END,
-    OMNI_REFERENCE,
     ROLLING_WINDOW,
     SHOT_IMAGES_REQUIRED,
     shot_image_support,
@@ -160,7 +159,7 @@ def _base_video_capability(model_def: Mapping[str, Any]) -> dict[str, Any]:
     if (
         model_def.get("one_image_ref_needed")
         or model_def.get("at_least_one_image_ref_needed")
-    ) and strategy != OMNI_REFERENCE:
+    ):
         return _result(
             False,
             "This model requires additional references that Director does not guarantee.",
@@ -183,8 +182,6 @@ def _audio_video_capability(
 ) -> dict[str, Any]:
     if not base.get("compatible"):
         return dict(base)
-    if model_def.get("director_audio_input_mode") == "reference_manifest":
-        return _result(True)
     if not model_def.get("any_audio_prompt"):
         return _result(
             False,
@@ -264,6 +261,9 @@ def assess_director_model(
             "max_image_refs": None,
         }
 
+    model_def = dict(model_def)
+    if architecture:
+        model_def["architecture"] = architecture
     image = _image_capability(model_def)
     base_video = _base_video_capability(model_def)
     audio_video = _audio_video_capability(model_def, base_video)
@@ -277,11 +277,14 @@ def assess_director_model(
         or model_type
     ).lower()
     strategy = video_strategy(model_def)
-    audio_input_mode = str(
-        model_def.get("director_audio_input_mode") or
-        ("generic_audio_guide" if model_def.get("any_audio_prompt") else "none")
+    audio_input_mode = (
+        "generic_audio_guide" if model_def.get("any_audio_prompt") else "none"
     )
-    native_voice_reference = strategy == OMNI_REFERENCE
+    reference_mode = str(
+        model_def.get("director_reference_mode") or "start_frame"
+    )
+    if reference_mode not in {"none", "start_frame", "start_end"}:
+        reference_mode = "start_frame"
     return {
         "image": image,
         "video": {
@@ -293,22 +296,16 @@ def assess_director_model(
         # Keep input and output audio separate.  The old supports_audio field
         # merged these concepts and is the root cause of incompatible Music
         # Video choices appearing in Director.
-        "supports_audio_input": bool(
-            model_def.get("any_audio_prompt")
-            or audio_input_mode == "reference_manifest"
-        ),
+        "supports_audio_input": bool(model_def.get("any_audio_prompt")),
         "generates_audio": bool(model_def.get("returns_audio")),
-        "supports_voice_reference": bool(
-            architecture_key.startswith("ltx2") or native_voice_reference
-        ),
+        "supports_voice_reference": architecture_key.startswith("ltx2"),
         "voice_reference_mode": (
-            "native_reference" if native_voice_reference
-            else "id_lora" if architecture_key.startswith("ltx2")
+            "id_lora" if architecture_key.startswith("ltx2")
             else "none"
         ),
         "video_strategy": strategy,
         "audio_input_mode": audio_input_mode,
-        "reference_mode": str(model_def.get("director_reference_mode") or "start_frame"),
+        "reference_mode": reference_mode,
         "shot_image_support": shot_image_support(model_def),
         "supports_endpoint_continuity": bool(
             model_def.get("director_endpoint_continuity")

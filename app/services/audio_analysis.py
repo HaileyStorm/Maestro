@@ -25,13 +25,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # The analyze() call is synchronous from the API client's POV but
 # internally goes through several phases (load → beat detect → vocals
-# → transcribe → diarize) that each take seconds-to-minutes. The first
-# run also downloads ~500MB of model weights (vocal-extraction,
-# Whisper, pyannote diarization) silently inside those phases.
+# → transcribe → diarize) that each take seconds-to-minutes. When
+# absent from this host, ~500MB of model weights (vocal-extraction,
+# Whisper, pyannote diarization) are downloaded inside those phases.
 #
 # Without progress signaling, the UI just shows "Analyzing audio..."
-# for the entire 1-5 minute wait — looks broken on first runs that
-# include a download. This module exposes a thread-safe progress dict
+# for the entire 1-5 minute wait — looks broken when host preparation
+# includes a download. This module exposes a thread-safe progress dict
 # updated at each phase boundary, polled by the frontend via
 # /api/v1/audio/analyze/status.
 #
@@ -383,7 +383,7 @@ def get_diarizer_pipeline(profile: str = "speech"):
       2. HF_HOME CACHE — if path #1's files are missing but
          <project_root>/cache/HF_HOME/hub/speaker-diarization-3.1/
          exists (Music Video mode's expected layout, populated by
-         the audio_analysis module on first use), use the HF_HOME
+         the audio_analysis module when needed), use the HF_HOME
          env var trick + canonical name.
 
       3. HF DOWNLOAD — if HF_TOKEN is set and the user has accepted
@@ -438,7 +438,7 @@ def get_diarizer_pipeline(profile: str = "speech"):
         # reaches audio analysis first (e.g. Director on an uploaded
         # song) has no local files, no HF cache, and — without an
         # HF_TOKEN for the gated upstream repo — diarization silently
-        # skipped. Fetch the two files directly so first use just works.
+        # skipped. Fetch the two files directly when this host needs them.
         embedding_path = os.path.join(_app_root, "ckpts", "pyannote",
                                        "pyannote_model_wespeaker-voxceleb-resnet34-LM.bin")
         segmentation_path = os.path.join(_app_root, "ckpts", "pyannote",
@@ -455,7 +455,7 @@ def get_diarizer_pipeline(profile: str = "speech"):
                     dest = os.path.join(target_dir, fname)
                     if os.path.isfile(dest):
                         continue
-                    print(f"[Diarization] Downloading {fname} (ungated mirror, first use)...")
+                    print(f"[Diarization] Downloading {fname} from the ungated mirror to this host...")
                     tmp_dir = tempfile.mkdtemp(prefix="pyannote_dl_")
                     try:
                         got = hf_hub_download(repo_id="DeepBeepMeep/Wan2.1", filename=fname,
@@ -573,8 +573,8 @@ def _diarize(audio_path: str, lyrics: List[LyricSegment]) -> List[LyricSegment]:
     used to carry its own legacy loader that only knew the HF-clone and
     gated-token paths, so fresh installs (no local clone, no HF_TOKEN)
     silently skipped diarization even though the shared loader can
-    assemble the pipeline from ungated .bin files (auto-downloaded on
-    first use).
+    assemble the pipeline from ungated .bin files (downloaded to the host
+    cache when needed).
     """
     try:
         import torch
@@ -687,14 +687,11 @@ def analyze(
 
     Updates the module-level _PROGRESS dict at each phase boundary
     so the frontend can poll /api/v1/audio/analyze/status during the
-    long-running call and show meaningful status (e.g. "Downloading
-    transcription model..." vs "Transcribing audio..."). The first
-    run downloads ~500MB total of models silently inside the load
-    helpers; the "loading X model" status is the user's signal that
-    a download MAY be happening (we can't easily detect cache state
-    across HF cache layouts so we don't try to differentiate
-    "downloading" vs "loading from cache" — the parenthetical hint
-    "first use downloads it" tells the user what to expect).
+    long-running call and show meaningful status (e.g. "Preparing
+    transcription model..." vs "Transcribing audio..."). When files are
+    absent from the host cache, the load helpers download ~500MB total.
+    We cannot reliably detect cache state across HF layouts, so preparation
+    status says a download may be needed and names loading as the next step.
     """
     if not os.path.isfile(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -739,14 +736,16 @@ def analyze(
                     vocals_path = os.path.join(vocals_dir, vocals_filename)
 
                     if not os.path.isfile(vocals_path):
-                        # The first call to get_vocals() downloads the
-                        # vocal-extraction model (~50MB) before running.
-                        # Status string says "loading" with the "first use
-                        # downloads" hint so users understand a long pause
-                        # here means download, not a hang.
-                        _set_progress("loading_vocal_model", "Loading vocal-extraction model (first use downloads ~50MB)")
+                        # get_vocals() owns both model preparation and
+                        # separation and exposes no boundary callback. Keep
+                        # this one combined state instead of immediately
+                        # claiming extraction has started while it may still
+                        # be downloading/loading the model.
+                        _set_progress(
+                            "preparing_vocal_extraction",
+                            "Preparing the vocal model, then extracting vocals (a host download may be needed)",
+                        )
                         print("[AudioAnalysis] Extracting vocals for transcription...")
-                        _set_progress("extracting_vocals", "Extracting vocals")
                         vocals_path = get_vocals(audio_path, vocals_path)
 
                     transcription_path = vocals_path
@@ -754,19 +753,27 @@ def analyze(
                 except Exception as e:
                     print(f"[AudioAnalysis] Vocal extraction failed, transcribing full mix: {e}")
 
-            # _transcribe loads Whisper on first call (~300MB download
-            # the very first time, cached after).
-            _set_progress("loading_transcription_model", "Loading transcription model (first use downloads ~300MB)")
+            # Resolve model preparation first so "Transcribing" is not shown
+            # during a download/load. _transcribe reuses this cached instance.
+            _set_progress(
+                "loading_transcription_model",
+                "Preparing transcription model on this host (a download may be needed)",
+            )
+            _get_whisper_model()
             print("[AudioAnalysis] Running transcription...")
             _set_progress("transcribing", "Transcribing audio")
             result.lyrics = _transcribe(transcription_path, lyrics_hint=lyrics_hint)
 
             # Run speaker diarization on the original mix (needs both voices)
             if result.lyrics:
-                # _diarize loads pyannote on first call (~100MB cached).
-                _set_progress("loading_diarization_model", "Loading speaker-diarization model (first use downloads ~30MB)")
-                _set_progress("identifying_speakers", "Identifying speakers")
-                result.lyrics = _diarize(audio_path, result.lyrics)
+                _set_progress(
+                    "loading_diarization_model",
+                    "Preparing speaker-diarization model on this host (a download may be needed)",
+                )
+                diarizer = get_diarizer_pipeline(profile="music")
+                if diarizer is not None:
+                    _set_progress("identifying_speakers", "Identifying speakers")
+                    result.lyrics = _diarize(audio_path, result.lyrics)
                 unload_diarizer()  # Free VRAM immediately
             unload_whisper()  # Free Whisper VRAM before LLM loads
         except ImportError as e:

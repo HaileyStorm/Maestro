@@ -1,0 +1,42 @@
+{
+    "model": {
+        "name": "MiniMax H3 Kijai W4A8 FL2VA (Experimental)",
+        "architecture": "minimax_h3",
+        "description": "Opt-in base H3 FL2VA transformer in Kijai's grouped W4A8 format. Compatible with text, first-frame, and first/last-frame H3 segments; not compatible with Ref2VA semantic references and does not contain PinkCherry's tune. Uses Maestro's validated official FP16 H3 VAE.",
+        "URLs": [
+            "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/8b48334e6263a39b34eef85f9f5e271ba4506945/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
+        ],
+        "h3_w4a8": true,
+        "experimental": true,
+        "model_update": {
+            "enabled": true,
+            "provider": "huggingface",
+            "repo_id": "Kijai/MiniMax-H3-experimental",
+            "path": "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors",
+            "check_interval_hours": 24,
+            "auto_replace": true,
+            "compatibility": {
+                "quantization_family": "h3_w4a8",
+                "required_tensors": {
+                    "blocks.0.attn.out_proj.weight": {"dtype": "I8", "shape": [5376, 3584]},
+                    "blocks.0.attn.out_proj.weight_s_rel": {"dtypes": ["F8_E4M3", "F8_E5M2"], "shape": [5376, 448]},
+                    "blocks.0.attn.out_proj.weight_s_channel": {"dtype": "F32", "shape": [5376]},
+                    "blocks.0.adaln_proj.linear.weight": {"dtypes": ["F16", "BF16"], "shape": [96768, 8]}
+                }
+            }
+        }
+    },
+    "prompt": "A cinematic scene with natural movement, synchronized dialogue, and detailed environmental sound.",
+    "num_inference_steps": 20,
+    "video_length": 124,
+    "resolution": "1344x768",
+    "guidance_scale": 1.0,
+    "custom_settings": {"h3_attention_engine": "sol_attn"},
+    "tea_cache": 0,
+    "activated_loras": [],
+    "loras_multipliers": "",
+    "spatial_upsampling": "",
+    "delivery_resolution": "",
+    "delivery_fit": "",
+    "image_prompt_type": ""
+}

@@ -1,15 +1,33 @@
-# MiniMax H3 Fast Runtime Research and Integration Plan
+# MiniMax H3 Fast Runtime Research (Historical Snapshot)
 
-Status: research complete; implementation deferred
+Status: research complete; original implementation plan deferred and superseded
 
 Research date: 2026-08-07
 
 Maestro checkpoint before this note: `6707da2` (`feat: add MiniMax H3 LoRA browser routing`)
 Checkpoint verification: `58` MiniMax H3 regression tests passed
 
+## Current shipped contract (supersedes the product recommendations below)
+
+This note is preserved as point-in-time research provenance. Its comparisons,
+"current" statements, proposed controls, and staged plan describe checkpoint
+`6707da2`, not the shipped v1.6.5 product contract.
+
+The shipped contract uses server-authored profiles: Draft and Fast are managed
+Turbo bundles at four and eight steps with pinned asset/runtime/model authority;
+Quality and High are native profiles, and Delivery profiles state their native
+render and post-generation upscale/crop path explicitly. Turbo is not a public
+LoRA or a Full-checkpoint tuning surface, and FirstBlockCache is not exposed as
+a public control. Studio and Director keep one coherent global prompt and map it
+deterministically to legal, potentially unequal native shots; they do not ask an
+LLM to storyboard each continuation window.
+
+The remaining sections intentionally retain the supplied workflow facts,
+research reasoning, and rejected/deferred design for historical traceability.
+
 ## Purpose
 
-Preserve the research comparing Maestro's current MiniMax H3 Turbo implementation with three attention/cache-accelerated ComfyUI workflows, and record a safe implementation plan for later.
+Preserve the research comparing Maestro's then-current MiniMax H3 Turbo implementation with three attention/cache-accelerated ComfyUI workflows, and record the implementation plan that was considered at the time.
 
 The workflows were supplied locally as:
 
@@ -21,7 +39,7 @@ The associated social post claims that Sol-Attn, SageAttention, and EasyCache re
 
 ## Executive conclusion
 
-The workflows use a fundamentally different acceleration strategy from Maestro Turbo:
+At the research checkpoint, the workflows used a fundamentally different acceleration strategy from Maestro Turbo:
 
 - Maestro Turbo uses the Full 33B H3 model, a low-step distillation LoRA at `0.70`, and six model evaluations.
 - The ComfyUI workflows use the Pruned 20B H3 models at 20 steps, then accelerate attention and reuse intermediate model output.
@@ -111,9 +129,9 @@ Therefore:
 - EasyCache can bypass both by avoiding an entire model evaluation.
 - Their individual speedup factors cannot be multiplied together because their savings overlap.
 
-## Comparison with Maestro's current H3 runtime
+## Historical comparison with Maestro's checkpoint H3 runtime
 
-| Area | Maestro Turbo | Supplied ComfyUI fast workflows |
+| Area | Maestro Turbo at checkpoint `6707da2` | Supplied ComfyUI fast workflows |
 |---|---|---|
 | Transformer | Full 33B | Pruned 20B |
 | Sampling | 6 model evaluations | 20 model evaluations |
@@ -134,7 +152,7 @@ Relevant Maestro code:
 
 T2V, I2V, and Ref2VA share the same H3 transformer core in Maestro. A correctly designed acceleration layer can therefore serve all three modes, with stricter conditioning rules for Ref2VA.
 
-## Current local compatibility snapshot
+## Historical local compatibility snapshot
 
 Test machine:
 
@@ -215,7 +233,7 @@ At six evaluations:
 
 Do not enable caching by default with Turbo LoRA. Treat any Turbo-plus-Sol combination as a separate experiment.
 
-## Recommended product design
+## Historical product recommendation (superseded)
 
 Keep these controls conceptually separate:
 
@@ -257,7 +275,7 @@ Possible expert controls can remain hidden behind Advanced settings:
 - Morton mode
 - Diagnostic logging
 
-## Staged implementation plan
+## Historical staged implementation plan (superseded)
 
 ### Phase 0: Establish a reproducible benchmark harness
 
@@ -347,7 +365,7 @@ Do not infer combined performance by multiplying standalone speedup numbers.
 6. Store accelerator settings in generation metadata and Load Settings.
 7. Add regression tests for T2V, I2V, Ref2VA, aspect ratio, audio conditioning, Turbo compatibility, cancellation, and model switching.
 
-## Acceptance criteria
+## Historical acceptance criteria
 
 A runtime preset should not ship as the default unless it meets all of the following:
 
@@ -360,7 +378,7 @@ A runtime preset should not ship as the default unless it meets all of the follo
 - Settings persist and reload correctly.
 - Turbo LoRA behavior remains unchanged when Fast Runtime is off.
 
-## Likely outcome
+## Historical projected outcome (superseded)
 
 The most promising order is:
 
@@ -370,7 +388,7 @@ The most promising order is:
 
 A 3x warm-run improvement may be achievable for some 20-step Pruned-model workloads on a 4090, but it should be treated as a benchmark target rather than a product promise.
 
-## Resume checklist
+## Deferred research checklist (not the shipped plan)
 
 When this work resumes:
 

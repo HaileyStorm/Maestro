@@ -28,7 +28,13 @@ module.exports = {
       if (running.start) {
         let local = info.local("start.js")
         if (local && local.url) {
-          return [{
+          let remote = local.share_url
+          let remoteKind = local.share_kind
+          if (!remote && local.$share && local.$share.cloudflare) {
+            remote = local.$share.cloudflare[local.url] || Object.values(local.$share.cloudflare)[0]
+            remoteKind = "quick"
+          }
+          let menu = [{
             default: true,
             icon: "fa-solid fa-rocket",
             text: "Open Web UI",
@@ -39,9 +45,23 @@ module.exports = {
             href: local.url + "/classic",
           }, {
             icon: 'fa-solid fa-terminal',
-            text: "Terminal",
+            text: `Terminal · ${local.sharing || "Localhost only"}`,
             href: "start.js",
           }]
+          if (remote) {
+            menu.splice(1, 0, {
+              icon: "fa-brands fa-cloudflare",
+              text: `<div><strong>Open / copy Cloudflare ${remoteKind === "stable" ? "stable" : "Quick Tunnel"} URL</strong><div>${remote}</div></div>`,
+              href: remote,
+            })
+          } else if (local.sharing && local.sharing.includes("Cloudflare")) {
+            menu.splice(1, 0, {
+              icon: "fa-brands fa-cloudflare",
+              text: "Cloudflare tunnel is starting…",
+              href: "start.js",
+            })
+          }
+          return menu
         } else {
           return [{
             icon: 'fa-solid fa-terminal',
@@ -59,7 +79,7 @@ module.exports = {
             href: local.url,
           }, {
             icon: 'fa-solid fa-terminal',
-            text: "Terminal",
+            text: `Terminal · ${local.sharing || "Localhost only"}`,
             href: "start_classic.js",
           }]
         } else {
@@ -86,11 +106,11 @@ module.exports = {
       } else {
         return [{
           icon: "fa-solid fa-power-off",
-          text: "Start",
+          text: "<div><strong>Start</strong><div>Cloudflare app sharing is enabled by default; LAN binding stays off. Remote visitors unlock password-protected projects and cannot access machine controls. The live share URL appears after launch.</div></div>",
           href: "start.js",
         }, {
           icon: "fa-solid fa-display",
-          text: "Start (Classic UI)",
+          text: "<div><strong>Start (Classic UI)</strong><div>Classic UI is local-only even while Cloudflare app sharing is enabled.</div></div>",
           href: "start_classic.js",
         }, {
           icon: "fa-solid fa-power-off",
@@ -141,6 +161,18 @@ module.exports = {
             ? "Update Inpaint Support (SAM 3.1)"
             : "Install Inpaint Support (SAM 3.1)",
           href: "sam_install.js",
+        }, {
+          icon: "fa-solid fa-cube",
+          text: info.exists("app/services/blender_mcp/mcp/blmcp/__init__.py")
+            ? "Verify / Repair Blender MCP Support"
+            : "Install Blender MCP Support",
+          href: "blender_mcp_install.js",
+        }, {
+          icon: "fa-solid fa-clapperboard",
+          text: info.exists("app/tools/blender/runtime.json")
+            ? "Verify / Repair Blender Runtime"
+            : "Install Blender Runtime",
+          href: "blender_runtime_install.js",
         }, {
           icon: "fa-regular fa-circle-xmark",
           text: "<div><strong>Reset</strong><div>Revert to pre-install state</div></div>",

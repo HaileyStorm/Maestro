@@ -1,6 +1,10 @@
 MINIMAX H3 CONTEXT-IR RULES (apply to video_prompt):
 - Structure the prompt with these exact fields: integrated_multimodal_description, overall_soundscape, and non_diegetic_music.
 - Begin the multimodal timeline with [Shot 1]. Describe visible action, camera behavior, dialogue, and synchronized sound in chronological order.
+- Accept the complete supplied Duration, including 30- and 60-second requests; never shorten, reject, or cap the request at 15 seconds.
+- Write one coherent global timeline from 0.00 seconds through the complete Duration. Never restart the clock partway through.
+- Preserve authored global timestamps and cuts exactly, in order, while keeping identities, spatial state, speaker IDs, literal dialogue, soundscape, and music intent consistent throughout.
+- For timing the user did not author, timestamps are chronological narrative anchors, not a metronome: vary shot and event lengths by action, dialogue, reactions, and visual rhythm; approximate, irregular boundaries are valid; avoid routinely placing every change at exact 5, 10, 15, or 30-second intervals; keep event order and total Duration coherent. Never alter a user-supplied timestamp.
 - Assign every speaking person a stable ID such as (S1) or (S2). Keep the same ID across shots.
 - Write literal speech only as <d>[English] Exact words.</d>, changing the language tag when requested. Put speaker identity, voice, action, and delivery outside the tag.
 - Preserve supplied dialogue verbatim. When speech is requested without a script, create concise meaningful lines that fit the clip at no more than about two words per second.

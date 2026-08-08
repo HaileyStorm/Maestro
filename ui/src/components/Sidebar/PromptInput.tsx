@@ -1,6 +1,8 @@
-import { useState, useRef, useEffect, useLayoutEffect } from 'react'
-import { Sparkles, Loader2, ChevronDown, ChevronUp, Brain, PenLine, RefreshCw } from 'lucide-react'
+import { useState, useRef, useEffect } from 'react'
+import { Sparkles, Loader2, ChevronUp, Brain, PenLine } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import * as api from '../../api/client'
+import { controlFpsTotalFrames, effectiveSlidingWindowGeometry, globalTimelineEndSeconds, hasGlobalTimeline, usesStudioSegments } from '../../lib/timelinePrompt'
 
 const placeholders: Record<string, string> = {
   image: 'Describe your image...',
@@ -9,75 +11,85 @@ const placeholders: Record<string, string> = {
   avatar: 'Describe your avatar animation...',
 }
 
-function H3WindowPromptTextarea({
-  value,
-  onChange,
-  readOnly,
-  title,
-  active,
-}: {
-  value: string
-  onChange: (value: string) => void
-  readOnly: boolean
-  title: string
-  active: boolean
-}) {
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+const H3_STYLE_PREF_KEY = 'maestro:h3-prepared-style'
+const H3_STYLE_PREFIX_RE = /^H3 prepared style \[[^\]]+\]:[^\n]*(?:\n\n)?/
+type H3PreparedStyle = { id: string; label: string; brief: string; description?: string }
+const H3_PREPARED_STYLES: H3PreparedStyle[] = [
+  { id: '', label: 'Unstyled · preserve my prompt', brief: '' },
+  { id: 'papercraft-stop-motion-explainer', label: 'Papercraft stop-motion explainer', description: 'Tactile handmade paper explainers with layered sets, props, visual metaphors, motion, transitions, and sound.', brief: 'Tactile cut paper, layered diorama sets, handmade props, readable visual metaphors, staged stop-motion, and paper-like sound.' },
+  { id: 'paper-collage-explainer-generator', label: 'Paper-collage explainer', description: 'Tactile halftone collage explainers built from approved stills and stop-motion clips.', brief: 'Halftone paper collage, tactile cutouts, abstract visual metaphors, stop-motion movement, and collage sound effects.' },
+  { id: '3d-animation-short-generator', label: 'Stylized 3D animation short', description: 'Narrative 3D shorts with character, environment, shot, continuity, performance, camera, and audio planning.', brief: 'Stylized 3D narrative animation with consistent character cards, environments, performances, camera language, continuity, and sound.' },
+  { id: 'minimalist-product-ad-generator', label: 'Minimalist product ad', description: 'Clean premium product shorts with concise copy, beat-synced typography, and polished camera language.', brief: 'Premium clean product film, concise on-screen copy, controlled typography, polished camera motion, and clear selling-point beats.' },
+  { id: 'brand-promo-video-generator', label: 'Brand / product promo', description: 'Fact-grounded promotional shorts for products, sites, apps, shops, and personal projects.', brief: 'Fact-grounded promotional short with a clear narrative direction, capability and use-case beats, authorized assets, and a call to action.' },
+  { id: 'music-video-subtitle-generator', label: 'Music video + lyric typography', description: 'Beat-aware connected music-video shots with lyric typography and long-work stitching guidance.', brief: 'Beat-reactive connected shots, spatial lyric typography, stable character and scene references, and audio-timed transitions.' },
+  { id: 'co-op-game-intro-generator', label: 'Co-op game menu intro', description: 'Two-player character-led menu or opening animations with coordinated UI and interaction motion.', brief: 'Two-character game-menu opening with stable identity cues, coordinated player cards, UI copy, icons, and timed menu interaction.' },
+  { id: 'handdrawn-live-video-generator', label: 'Hand-drawn + live-action fusion', description: 'Surreal shorts combining rough glowing hand-drawn animation with live-action spaces.', brief: 'Rough glowing hand-drawn animation interacting physically with live-action space, continuous morphing, and delayed handheld camera response.' },
+]
 
-  const fitToContent = () => {
-    const textarea = textareaRef.current
-    if (!textarea) return
-    textarea.style.height = 'auto'
-    // scrollHeight includes padding but not the two one-pixel borders used
-    // by this border-box textarea. Include them so the final line never clips.
-    textarea.style.height = `${textarea.scrollHeight + 2}px`
-  }
-
-  useLayoutEffect(fitToContent, [value])
-  useEffect(() => {
-    window.addEventListener('resize', fitToContent)
-    return () => window.removeEventListener('resize', fitToContent)
-  }, [])
-
-  return (
-    <textarea
-      ref={textareaRef}
-      rows={1}
-      value={value}
-      onChange={event => onChange(event.target.value)}
-      readOnly={readOnly}
-      title={title}
-      className={`w-full min-h-[92px] resize-none overflow-hidden bg-bg-secondary border rounded px-2 py-1.5 text-[10px] leading-relaxed text-text-secondary focus:outline-none focus:border-accent-blue ${
-        active ? 'border-accent-blue/70 bg-accent-blue/5' : 'border-border'
-      }`}
-    />
-  )
+function compactBytes(value: number): string {
+  if (value < 1024) return `${value} B`
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MiB`
+  return `${(value / 1024 ** 3).toFixed(1)} GiB`
 }
 
-function useEnhanceStatus(isEnhancing: boolean) {
-  const [status, setStatus] = useState<{ phase: 'loading' | 'thinking' | 'writing' | 'idle'; chars: number }>({ phase: 'idle', chars: 0 })
+function useEnhanceStatus(
+  isEnhancing: boolean,
+  expectedModelId: string,
+  expectedModelLabel: string,
+  tracksLlm: boolean,
+) {
+  const [status, setStatus] = useState<{
+    phase: 'loading' | 'thinking' | 'writing' | 'idle'
+    chars: number
+    detail?: string
+  }>({ phase: 'idle', chars: 0 })
 
   useEffect(() => {
-    if (!isEnhancing) {
-      setStatus({ phase: 'idle', chars: 0 })
-      return
-    }
-    setStatus({ phase: 'loading', chars: 0 })
+    if (!isEnhancing) return
     let active = true
+    const initialStatusTimer = window.setTimeout(() => {
+      if (active) setStatus({ phase: 'loading', chars: 0, detail: `Preparing ${expectedModelLabel}...` })
+    }, 0)
     const poll = async () => {
       let streamStarted = false
       while (active) {
         try {
-          // Check if LLM is still loading
-          if (!streamStarted) {
-            const llmRes = await fetch('/api/v1/llm/status')
-            if (llmRes.ok && active) {
-              const llmData = await llmRes.json()
-              if (!llmData.loaded) {
-                setStatus({ phase: 'loading', chars: 0 })
-                await new Promise(r => setTimeout(r, 800))
-                continue
+          if (tracksLlm && !streamStarted) {
+            const llmData = await api.fetchLlmStatus()
+            const loadingId = String(llmData.loading_model_id || llmData.download?.model_id || '')
+            const matchesExpected = !expectedModelId || loadingId === expectedModelId
+            const expectedLoaded = Boolean(llmData.loaded && (!expectedModelId || llmData.model_id === expectedModelId))
+            if (!expectedLoaded || (llmData.loading && matchesExpected)) {
+              const download = matchesExpected ? llmData.download : null
+              const total = Number(download?.total_bytes || 0)
+              const downloaded = Number(download?.downloaded_bytes || 0)
+              const percent = total > 0 ? Math.min(100, Math.round(downloaded * 100 / total)) : null
+              const byteProgress = downloaded > 0
+                ? ` · ${compactBytes(downloaded)}${total > 0 ? ` / ${compactBytes(total)}` : ''}`
+                : ''
+              const percentProgress = percent != null ? ` · ${percent}%` : ''
+              const filename = String(download?.filename || '').toLowerCase()
+              const loadingPhase = String(llmData.loading_phase || download?.phase || '')
+              let activity = `Preparing ${expectedModelLabel}`
+              if (matchesExpected && (filename.includes('mmproj') || filename.includes('projector'))) {
+                activity = 'Downloading vision projector'
+              } else if (matchesExpected && loadingPhase === 'downloading_runtime') {
+                activity = 'Downloading accelerated LLM runtime'
+              } else if (matchesExpected && loadingPhase === 'building_runtime') {
+                activity = 'Building accelerated LLM runtime'
+              } else if (matchesExpected && loadingPhase === 'downloading') {
+                activity = `Downloading ${expectedModelLabel}`
+              } else if (matchesExpected && loadingPhase) {
+                activity = `${loadingPhase.replaceAll('_', ' ')} · ${expectedModelLabel}`
               }
+              setStatus({
+                phase: 'loading',
+                chars: 0,
+                detail: `${activity}${byteProgress}${percentProgress}`,
+              })
+              await new Promise(r => setTimeout(r, 800))
+              continue
             }
           }
           const res = await fetch('/api/v1/llm/stream-status')
@@ -88,11 +100,11 @@ function useEnhanceStatus(isEnhancing: boolean) {
             const hasThinking = text.includes('<think>') || text.includes('<thinking>')
             const thinkingClosed = text.includes('</think>') || text.includes('</thinking>')
             if (hasThinking && !thinkingClosed) {
-              setStatus({ phase: 'thinking', chars: text.length })
+              setStatus({ phase: 'thinking', chars: text.length, detail: expectedModelLabel })
             } else if (text.length > 0) {
-              setStatus({ phase: 'writing', chars: text.length })
+              setStatus({ phase: 'writing', chars: text.length, detail: expectedModelLabel })
             } else if (!streamStarted) {
-              setStatus({ phase: 'loading', chars: 0 })
+              setStatus({ phase: 'loading', chars: 0, detail: `Preparing ${expectedModelLabel}...` })
             }
             if (data.done) break
           }
@@ -101,10 +113,13 @@ function useEnhanceStatus(isEnhancing: boolean) {
       }
     }
     poll()
-    return () => { active = false }
-  }, [isEnhancing])
+    return () => {
+      active = false
+      window.clearTimeout(initialStatusTimer)
+    }
+  }, [expectedModelId, expectedModelLabel, isEnhancing, tracksLlm])
 
-  return status
+  return isEnhancing ? status : { phase: 'idle' as const, chars: 0 }
 }
 
 export function PromptInput() {
@@ -118,23 +133,21 @@ export function PromptInput() {
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
   const slidingWindowOverlap = useStore(s => s.slidingWindowOverlap)
   const modelOptions = useStore(s => s.modelOptions)
+  const guideVideoFps = useStore(s => s.guideVideoFps)
+  const guideVideoFrameCount = useStore(s => s.guideVideoFrameCount)
+  const forceFps = useStore(s => s.params.force_fps)
+  const videoGuide = useStore(s => s.params.video_guide)
+  const studioPromptEnhance = useStore(s => s.studioPromptEnhance)
+  const setStudioPromptEnhance = useStore(s => s.setStudioPromptEnhance)
+  const servicesConfig = useStore(s => s.servicesConfig)
+  const systemConfig = useStore(s => s.systemConfig)
+  const llmModels = useStore(s => s.llmModels)
   const imageMode = useStore(s => s.params.image_mode)
-  const h3WindowPlanningEnabled = useStore(s => s.params.minimax_h3_window_storyboard !== false)
-  const h3WindowPlan = useStore(s => s.h3WindowPlan)
-  const updateH3WindowPrompt = useStore(s => s.updateH3WindowPrompt)
-  const activeH3JobPhase = useStore(s => {
-    const job = s.jobs.find(item => (
-      (item.status === 'queued' || item.status === 'running')
-      && !!item.h3WindowPlan
-    ))
-    return job ? (job.phase || job.message || '') : ''
-  })
-  const activeH3JobPlanSignature = useStore(s => s.jobs.find(item => (
-    (item.status === 'queued' || item.status === 'running')
-    && !!item.h3WindowPlan
-  ))?.h3WindowPlan?.signature || '')
   const [ttsMenuOpen, setTtsMenuOpen] = useState(false)
-  const [windowPlanOpen, setWindowPlanOpen] = useState(false)
+  const [h3PreparedStyle, setH3PreparedStyle] = useState(() => {
+    try { return localStorage.getItem(H3_STYLE_PREF_KEY) || '' } catch { return '' }
+  })
+  const [availableH3Styles, setAvailableH3Styles] = useState<H3PreparedStyle[]>(H3_PREPARED_STYLES)
   const menuRef = useRef<HTMLDivElement>(null)
 
   const isAudioOnly = modelOptions?.audio_only
@@ -152,36 +165,81 @@ export function PromptInput() {
   // 2+ voice slots, monologue otherwise. The dropdown lets the user override
   // either way regardless of voice slot count.
   const defaultMode: 'dialogue' | 'monologue' = isMultiVoice ? 'dialogue' : 'monologue'
-  const enhanceStatus = useEnhanceStatus(isEnhancing)
-  const fps = modelOptions?.fps ?? 16
-  const swDefaults = (modelOptions as Record<string, unknown> | null)?.sliding_window_defaults as Record<string, number> | undefined
-  const discardFrames = swDefaults?.discard_last_frames ?? 0
-  const overlapSec = slidingWindowOverlap / fps
-  const discardSec = discardFrames / fps
-  const stride = slidingWindowSeconds - discardSec - overlapSec
-  const supportsSlidingWindows = modelOptions?.sliding_window === true
-  const windowCount = supportsSlidingWindows && stride > 0 && durationSeconds > slidingWindowSeconds
-    ? 1 + Math.ceil((durationSeconds - slidingWindowSeconds + discardSec) / stride)
+  const usesSegmentedStudio = usesStudioSegments(modelOptions)
+  const supportsSlidingWindows = modelOptions?.sliding_window === true || usesSegmentedStudio
+  const windowCount = modelOptions
+    ? effectiveSlidingWindowGeometry(
+        durationSeconds, slidingWindowSeconds, slidingWindowOverlap, modelOptions,
+        { totalFrames: controlFpsTotalFrames(durationSeconds, forceFps, videoGuide, guideVideoFps, guideVideoFrameCount) },
+      ).windowCount
     : 1
   const usesWindows = generationMode === 'video' && supportsSlidingWindows && windowCount > 1 && imageMode !== 2
-  const usesH3WindowPlanner = (
-    usesWindows
-    && modelOptions?.sliding_window_auto_prompt_pacing === true
-    && h3WindowPlanningEnabled
+  const globalTimelineDetected = hasGlobalTimeline(prompt)
+  const authoredTimelineEnd = globalTimelineEndSeconds(prompt)
+  const setDurationSeconds = useStore(s => s.setDurationSeconds)
+  const usesGlobalTimeline = usesWindows && globalTimelineDetected
+
+  // A complete Studio timeline owns its total duration. Pasting a prompt that
+  // reaches 01:00 should not silently leave a 15-second generation selected.
+  // Only expand here; the user can still deliberately add extra tail time.
+  useEffect(() => {
+    if (
+      generationMode === 'video'
+      && imageMode !== 2
+      && authoredTimelineEnd != null
+      && authoredTimelineEnd > durationSeconds + 0.01
+    ) {
+      setDurationSeconds(authoredTimelineEnd)
+    }
+  }, [authoredTimelineEnd, durationSeconds, generationMode, imageMode, setDurationSeconds])
+  const enhancerModeLabels: Record<number, string> = {
+    1: 'Llama 3.2 + Florence2',
+    2: 'LlamaJoy + Florence2',
+    3: 'Qwen3.5 4B Abliterated',
+    4: 'Qwen3.5 9B Abliterated',
+  }
+  const needsH3Guide = (generationMode === 'video' || generationMode === 'avatar')
+    && String(modelOptions?.model_type || '').toLowerCase().startsWith('minimax_h3')
+  useEffect(() => {
+    if (!needsH3Guide) return
+    let active = true
+    api.fetchH3StyleWorkflows().then(catalog => {
+      if (!active || !Array.isArray(catalog.styles) || catalog.styles.length === 0) return
+      setAvailableH3Styles([
+        H3_PREPARED_STYLES[0],
+        ...catalog.styles.map(style => ({
+          id: style.id,
+          label: style.label,
+          brief: style.prompt_brief,
+          description: style.description,
+        })),
+      ])
+    }).catch(() => { /* bundled catalog remains available offline */ })
+    return () => { active = false }
+  }, [needsH3Guide])
+  const wangpEnhancerMode = Number(systemConfig?.enhancer_enabled || 0)
+  const dedicatedEnhancerId = modelOptions?.prompt_enhancer_model || servicesConfig?.enhance_llm_model_id || ''
+  const configuredEnhancerId = dedicatedEnhancerId || servicesConfig?.llm_model_id || ''
+  const configuredEnhancerLabel = llmModels.find(model => model.id === configuredEnhancerId)?.label || configuredEnhancerId
+  const enhancerModelLabel = wangpEnhancerMode > 0 && !needsH3Guide
+    ? enhancerModeLabels[wangpEnhancerMode] || `Wan2GP enhancer mode ${wangpEnhancerMode}`
+    : configuredEnhancerLabel || 'Configured Director LLM'
+  const tracksEnhancerLlm = !(wangpEnhancerMode > 0 && !needsH3Guide)
+  const enhanceStatus = useEnhanceStatus(
+    isEnhancing,
+    tracksEnhancerLlm ? configuredEnhancerId : '',
+    enhancerModelLabel,
+    tracksEnhancerLlm,
   )
-  const h3PlanIsStale = !!h3WindowPlan && (
-    h3WindowPlan.source_prompt.trim() !== prompt.trim()
-    || h3WindowPlan.window_count !== windowCount
-    || h3WindowPlan.total_frames !== Math.max(1, Math.round(durationSeconds * fps))
-    || h3WindowPlan.window_frames !== Math.max(1, Math.round(slidingWindowSeconds * fps))
-  )
-  const matchingActiveH3Phase = (
-    h3WindowPlan?.signature === activeH3JobPlanSignature
-      ? activeH3JobPhase
-      : ''
-  )
-  const activeWindowMatch = matchingActiveH3Phase.match(/Sliding Window\s+(\d+)\/(\d+)/i)
-  const activeH3Window = activeWindowMatch ? Number(activeWindowMatch[1]) : null
+  const enhancerFooter = !isAudioOnly
+  const preparedStyle = availableH3Styles.find(style => style.id === h3PreparedStyle) || availableH3Styles[0]
+  const applyPreparedStyle = () => {
+    const authored = prompt.replace(H3_STYLE_PREFIX_RE, '').trimStart()
+    const next = preparedStyle.id
+      ? `H3 prepared style [${preparedStyle.label}]: ${preparedStyle.brief}\n\n${authored}`
+      : authored
+    setParam('prompt', next)
+  }
   const modePlaceholder = generationMode === 'avatar' && editSubMode === 'recast'
     ? 'Describe the finished video and replacement characters...'
     : generationMode === 'avatar' && editSubMode === 'restyle'
@@ -198,114 +256,96 @@ export function PromptInput() {
     return () => document.removeEventListener('mousedown', handler)
   }, [ttsMenuOpen])
 
-  // A server-created plan used to arrive collapsed, making the exact prompts
-  // effectively invisible once an expensive generation had started. Open a
-  // newly planned storyboard once; the user can still collapse it afterward.
-  useEffect(() => {
-    if (usesH3WindowPlanner && h3WindowPlan?.signature) {
-      setWindowPlanOpen(true)
-    }
-  }, [usesH3WindowPlanner, h3WindowPlan?.signature])
-
   // grow shrink-0: fill spare vertical space when the sidebar is roomy, but
   // never shrink below the textarea's min-height. Dropping the old
   // `flex-1 min-h-0` stops the wrapper from collapsing under the textarea
   // (which made it overflow and overlap the section below).
   return (
     <div className="relative grow shrink-0 flex flex-col">
+      {needsH3Guide && generationMode === 'video' && (
+        <div className="mb-1.5 rounded-lg border border-border bg-bg-tertiary/60 p-2">
+          <div className="flex items-center gap-1.5">
+            <select
+              value={preparedStyle.id}
+              onChange={event => {
+                const value = event.target.value
+                setH3PreparedStyle(value)
+                try { localStorage.setItem(H3_STYLE_PREF_KEY, value) } catch { /* local preference only */ }
+              }}
+              className="min-w-0 flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-[10px] text-text-primary"
+              aria-label="H3 prepared style workflow"
+            >
+              {availableH3Styles.map(style => <option key={style.id || 'none'} value={style.id}>{style.label}</option>)}
+            </select>
+            <button type="button" onClick={applyPreparedStyle} className="rounded border border-accent-blue/40 px-2 py-1 text-[10px] text-accent-blue hover:bg-accent-blue/10">
+              {preparedStyle.id ? 'Apply' : 'Remove'}
+            </button>
+          </div>
+          <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+            {preparedStyle.id
+              ? preparedStyle.description || 'Official prepared visual workflow.'
+              : 'No prepared workflow is added; your complete Studio prompt stays unchanged.'}{' '}
+            <a href="https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills" target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Official H3 workflows</a>
+          </p>
+        </div>
+      )}
       {/* Enhance status indicator */}
       {isEnhancing && enhanceStatus.phase !== 'idle' && (
         <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-text-muted bg-bg-tertiary/80 rounded-t-lg border border-b-0 border-border">
           {enhanceStatus.phase === 'loading' ? (
             <>
               <Loader2 size={10} className="text-text-muted animate-spin" />
-              <span>Loading LLM...</span>
+              <span>{enhanceStatus.detail || `Preparing ${enhancerModelLabel}...`}</span>
             </>
           ) : enhanceStatus.phase === 'thinking' ? (
             <>
               <Brain size={10} className="text-chip-purple animate-pulse" />
-              <span>Thinking...</span>
+              <span>{`Thinking with ${enhanceStatus.detail || enhancerModelLabel}...`}</span>
             </>
           ) : (
             <>
               <PenLine size={10} className="text-accent-blue animate-pulse" />
-              <span>Writing...</span>
+              <span>{`Writing with ${enhanceStatus.detail || enhancerModelLabel}...`}</span>
             </>
-          )}
-        </div>
-      )}
-      {usesH3WindowPlanner && h3WindowPlan && (
-        <div className="mb-1.5">
-          <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-border bg-bg-tertiary/70">
-            <button
-              type="button"
-              onClick={() => setWindowPlanOpen(open => !open)}
-              className="flex-1 min-w-0 flex items-center gap-1.5 text-left"
-              title="Review the complete Context-IR prompt assigned to each H3 continuation window."
-            >
-              {windowPlanOpen ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-              <span className="text-[10px] font-medium text-text-secondary truncate">
-                Exact H3 prompts · {h3WindowPlan.window_count} windows
-              </span>
-              {h3PlanIsStale && (
-                <span className="text-[9px] text-amber-400">Needs update</span>
-              )}
-              {h3WindowPlan.planned_by === 'deterministic_fallback' && (
-                <span className="text-[9px] text-amber-400">Fallback</span>
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={() => enhancePrompt()}
-              disabled={isEnhancing}
-              title="Rebuild the H3 window plan from the current idea and timing."
-              className="p-1 text-text-muted hover:text-accent-blue disabled:opacity-50"
-            >
-              <RefreshCw size={11} className={isEnhancing ? 'animate-spin' : ''} />
-            </button>
-          </div>
-          {windowPlanOpen && (
-            <div className="mt-2 space-y-3">
-              {h3WindowPlan.windows.map((window, index) => (
-                <div
-                  key={`${window.index}-${window.start_frame}`}
-                  className="space-y-1"
-                >
-                  <div className={`flex items-center justify-between text-[9px] ${
-                    activeH3Window === window.index ? 'text-accent-blue' : 'text-text-muted'
-                  }`}>
-                    <span>
-                      Window {window.index}: {window.title || `Beat ${window.index}`}
-                      {activeH3Window === window.index ? ' · Generating now' : ''}
-                    </span>
-                    <span>{window.start_seconds.toFixed(1)}–{window.end_seconds.toFixed(1)}s</span>
-                  </div>
-                  <H3WindowPromptTextarea
-                    value={window.prompt}
-                    onChange={value => updateH3WindowPrompt(index, value)}
-                    readOnly={!!matchingActiveH3Phase}
-                    title={matchingActiveH3Phase
-                      ? 'This is the exact prompt already submitted for the active generation.'
-                      : 'Edit this exact window prompt before the next generation.'}
-                    active={activeH3Window === window.index}
-                  />
-                </div>
-              ))}
-            </div>
           )}
         </div>
       )}
       <textarea
         value={prompt}
         onChange={e => setParam('prompt', e.target.value)}
-        placeholder={usesH3WindowPlanner
-          ? `Describe the complete video idea—Maestro will plan ${windowCount} H3 windows.`
-          : usesWindows
-            ? `Line 1 = window 1, line 2 = window 2... (${windowCount} windows)`
+        placeholder={usesWindows
+          ? `Describe the whole video; add [00:00-00:10] timed beats for ${windowCount} automatic windows`
           : modePlaceholder}
         className="w-full flex-1 bg-bg-tertiary border border-border rounded-lg px-3 py-2 pr-10 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue transition-colors"
         style={{ resize: 'none', minHeight: 112 }}
       />
+      {usesWindows && (
+        <div className="px-1 pt-1 text-[10px] text-text-muted">
+          {usesGlobalTimeline
+            ? `Global timeline detected — timestamps will be clipped and rebased automatically per ${usesSegmentedStudio ? 'segment' : 'window'}.`
+            : `Use [00:00-00:10] descriptions for one global timeline; plain lines remain one prompt per ${usesSegmentedStudio ? 'segment' : 'window'}.`}
+        </div>
+      )}
+      {enhancerFooter && (
+        <label
+          className="mt-1 flex cursor-pointer items-start gap-2 rounded-md px-1 py-1 text-[10px] text-text-muted"
+          title={`Enhance once before generation with ${enhancerModelLabel}`}
+        >
+          <input
+            type="checkbox"
+            checked={studioPromptEnhance}
+            disabled={isEnhancing}
+            onChange={event => setStudioPromptEnhance(event.target.checked)}
+            className="mt-0.5 h-3.5 w-3.5 accent-accent-blue"
+          />
+          <span className="min-w-0 leading-tight">
+            <span className="block text-text-secondary">Enhance before Generate</span>
+            <span className="block truncate">
+              {usesGlobalTimeline ? `Model: ${enhancerModelLabel} · global timeline is preserved as authored (timestamps locked)` : `Model: ${enhancerModelLabel}`}
+            </span>
+          </span>
+        </label>
+      )}
       {prompt.trim() && (
         isAudioOnly ? (
           /* TTS: mode-aware split button. Main button uses default mode based
@@ -316,7 +356,7 @@ export function PromptInput() {
              slots — bad UX trap especially with audio_mode_from_voice_count
              models like Scenema where the user may want a generated-voice
              dialogue script as a starting point. */
-          <div ref={menuRef} className="absolute right-2 bottom-2">
+          <div ref={menuRef} className={`absolute right-2 ${usesWindows ? 'bottom-7' : 'bottom-2'}`}>
             <div className="flex items-center">
               <button
                 onClick={() => enhancePrompt(defaultMode)}
@@ -378,7 +418,7 @@ export function PromptInput() {
             onClick={() => enhancePrompt()}
             disabled={isEnhancing}
             title="Enhance prompt with AI"
-            className="absolute right-2 bottom-2 p-1.5 rounded-md text-text-muted hover:text-accent-blue hover:bg-bg-hover transition-colors disabled:opacity-50"
+            className={`absolute right-2 ${usesWindows ? 'bottom-12' : 'bottom-7'} p-1.5 rounded-md text-text-muted hover:text-accent-blue hover:bg-bg-hover transition-colors disabled:opacity-50`}
           >
             {isEnhancing ? (
               <Loader2 size={14} className="animate-spin" />

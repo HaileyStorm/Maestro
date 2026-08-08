@@ -5,6 +5,8 @@ import { useStore } from '../../stores/useStore'
 import { generateLoraGuide, fetchLoraGuide, fetchLoraDetails, checkLoraUpdates } from '../../api/client'
 import { formatAge } from '../../lib/format'
 import type { LoraRecommendedWeights, LoraUpdateStatus } from '../../types'
+import { sortLoraNames } from './loraSort'
+import type { LoraDates, LoraPickerSort } from './loraSort'
 
 export function LoraGuideTooltip({ guide }: { guide: string }) {
   const [show, setShow] = useState(false)
@@ -48,7 +50,7 @@ export function LoraGuideTooltip({ guide }: { guide: string }) {
 
 /** Per-file dates lifted from the /details response — shared shape between
  *  the Studio and Director LoRA pickers. */
-export type LoraDates = { released?: string | null; downloaded?: string | null }
+export type { LoraDates } from './loraSort'
 
 /** Compact age chip for LoRA picker rows. Prefers the CivitAI release date
  *  (answers "how new is this LoRA?"), falls back to the download/mtime date
@@ -70,20 +72,7 @@ export function LoraAgeChip({ released, downloaded }: LoraDates) {
 // Persistence and cross-picker sync live in the store (loraPickerSort /
 // setLoraPickerSort) — per-component state would desync simultaneously
 // mounted pickers, e.g. Director's Image + Video accordions.
-export type LoraPickerSort = 'name' | 'newest'
-
-/** Order picker rows. 'name' keeps the backend's alphabetical order;
- *  'newest' sorts by the same date the age chip shows (release date,
- *  download/mtime fallback), newest first, dateless files last by name. */
-export function sortLoraNames(names: string[], sort: LoraPickerSort, dates: Record<string, LoraDates>): string[] {
-  if (sort !== 'newest') return names
-  const dateOf = (n: string) => {
-    const iso = dates[n]?.released || dates[n]?.downloaded
-    const t = iso ? Date.parse(iso) : NaN
-    return Number.isNaN(t) ? 0 : t
-  }
-  return [...names].sort((a, b) => dateOf(b) - dateOf(a) || a.localeCompare(b))
-}
+export type { LoraPickerSort } from './loraSort'
 
 /** Two-state sort toggle shared by both pickers: A-Z <-> newest first. */
 export function LoraSortToggle({ sort, onChange }: { sort: LoraPickerSort; onChange: (s: LoraPickerSort) => void }) {
@@ -117,6 +106,7 @@ export function LoraSelector() {
   const generationMode = useStore(s => s.generationMode)
   const editSubMode = useStore(s => s.editSubMode)
   const toggleLora = useStore(s => s.toggleLora)
+  const registerMatureLoraFlags = useStore(s => s.registerMatureLoraFlags)
   const setLoraWeight = useStore(s => s.setLoraWeight)
   const loadLoras = useStore(s => s.loadLoras)
   const openBrowser = useStore(s => s.setLoraBrowserOpen)
@@ -144,6 +134,9 @@ export function LoraSelector() {
   // Set of filenames flagged NSFW (sidecar `nsfw:true` OR keyword match).
   // Populated from the /details response alongside weight recs + guides.
   const [nsfwFlags, setNsfwFlags] = useState<Record<string, boolean>>({})
+  const [loraDetailsModel, setLoraDetailsModel] = useState('')
+  const [loraDetailsError, setLoraDetailsError] = useState<{ modelType: string; message: string } | null>(null)
+  const loraDetailsRequest = useRef(0)
   // Per-filename update_status from the cached LoRA-update manifest. The
   // backend embeds this on every /details response so we don't need to
   // fetch it separately; we just lift it into a lookup map.
@@ -268,7 +261,9 @@ export function LoraSelector() {
       }).catch(() => {})
     }
     // Load weight recommendations, guides, and apply defaults to newly activated LoRAs
+    const detailsRequest = ++loraDetailsRequest.current
     fetchLoraDetails(modelType).then(r => {
+      if (detailsRequest !== loraDetailsRequest.current) return
       const recs: Record<string, LoraRecommendedWeights> = {}
       const guides: Record<string, string> = {}
       const statuses: Record<string, 'exists' | 'none'> = {}
@@ -279,7 +274,7 @@ export function LoraSelector() {
         if (info.recommended_weights) recs[info.filename] = info.recommended_weights
         if (info.guide) { guides[info.filename] = info.guide; statuses[info.filename] = 'exists' }
         else if (info.has_guide) statuses[info.filename] = 'exists'
-        if (info.nsfw) nsfw[info.filename] = true
+        nsfw[info.filename] = !!info.nsfw
         if (info.update_status) updates[info.filename] = info.update_status
         if (info.released_at || info.downloaded_at) {
           dates[info.filename] = { released: info.released_at, downloaded: info.downloaded_at }
@@ -289,6 +284,9 @@ export function LoraSelector() {
       setGuideTexts(prev => ({ ...prev, ...guides }))
       setGuideStatus(prev => ({ ...prev, ...statuses }))
       setNsfwFlags(nsfw)
+      registerMatureLoraFlags(modelType, r.loras)
+      setLoraDetailsModel(modelType)
+      setLoraDetailsError(null)
       setUpdateStatuses(updates)
       setLoraDates(dates)
       setLastCheckedAt(r.manifest_last_check_at ?? null)
@@ -316,7 +314,13 @@ export function LoraSelector() {
           setLoraWeight(lora, i, newWeights[i])
         }
       }
-    }).catch(() => {})
+    }).catch(error => {
+      if (detailsRequest !== loraDetailsRequest.current) return
+      setLoraDetailsError({
+        modelType,
+        message: error instanceof Error ? error.message : 'Could not classify LoRAs',
+      })
+    })
   }, [modelType, activatedLoras]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleGenerateGuide = async (filename: string) => {
@@ -355,9 +359,14 @@ export function LoraSelector() {
   // LoRAs are always hidden (except already-activated ones — they
   // stay visible so the user can deactivate them).
   const effectiveShowNsfw = nsfwEnabled && showNsfw
+  const loraDetailsReady = loraDetailsModel === modelType
+  const currentLoraDetailsError = loraDetailsError?.modelType === modelType
+    ? loraDetailsError.message
+    : null
   const filtered = sortLoraNames(availableLoras.filter(name => {
     if (!displayName(name).toLowerCase().includes(search.toLowerCase())) return false
     const isActivated = activatedLoras.includes(name)
+    if (!loraDetailsReady && !isActivated) return false
     if (!effectiveShowNsfw && !isActivated && nsfwFlags[name]) return false
     if (updatableOnly && !isActivated && updateStatuses[name] !== 'available') return false
     return true
@@ -398,6 +407,18 @@ export function LoraSelector() {
     <div>
       {loraHeader}
       {compatibilityNotice}
+
+      {!loraDetailsReady && (
+        <div className={`mb-2 rounded-lg border px-3 py-2 text-[10px] ${
+          currentLoraDetailsError
+            ? 'border-red-500/30 bg-red-500/10 text-red-300'
+            : 'border-border bg-bg-tertiary text-text-muted'
+        }`}>
+          {currentLoraDetailsError
+            ? `LoRA safety metadata unavailable: ${currentLoraDetailsError}. New selections are disabled.`
+            : 'Checking LoRA safety metadata before enabling selections…'}
+        </div>
+      )}
 
       {/* Search + NSFW + Updatable toggles */}
       <div className="flex items-center gap-2 mb-2">

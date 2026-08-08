@@ -1,0 +1,25 @@
+{
+    "model": {
+        "name": "Qwen Image Edit 2511 + Uncensored LoRA (Mature)",
+        "architecture": "qwen_image_edit_plus2_20B",
+        "description": "Mature-mode Qwen Image Edit 2511 with a curated OpenRAIL++ uncensored edit LoRA. Use one or more source images and describe the desired edit. Hidden unless Explicit mode is enabled; outputs default private.",
+        "URLs": [
+            "https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_8steps_v1.0.safetensors"
+        ],
+        "preload_URLs": "qwen_image_edit_20B",
+        "profiles_dir": [""],
+        "attention": {
+            "<89": "sdpa"
+        },
+        "loras": [
+            "https://huggingface.co/ScottzillaSystems/qwen-image-edit-plus-nsfw-lora/resolve/66e89e998dd4ea1a359c4bf0dd5e17d2f0b06ef0/qwen-image-edit-plus-nsfw-lora.safetensors"
+        ],
+        "loras_multipliers": [1.0],
+        "nsfw_only": true
+    },
+    "prompt": "Apply the requested adult edit while preserving identity, anatomy, lighting, and the untouched scene.",
+    "resolution": "1024x1024",
+    "num_inference_steps": 8,
+    "guidance_scale": 1,
+    "batch_size": 1
+}

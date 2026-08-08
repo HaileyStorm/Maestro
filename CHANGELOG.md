@@ -7,40 +7,39 @@ pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 
 ## [1.6.5] - 2026-08-08
 
-MiniMax H3 performance and memory: rebalanced transformer residency and
-activation workspace, added bounded QKV/MLP processing, and made Studio and
-Director choose native H3 window lengths from the selected resolution, model,
-and detected GPU memory. The main resolution menu now uses an aligned
-1280x704 consumer 720p tier, exposes 1080p as an experimental option with
-shorter hardware-aware windows, and keeps the former 768p tier available for
-saved settings and API compatibility without presenting it as the default.
-Users can lock a manual window override, and an optional experimental First
-Block Cache offers selectable speed/quality thresholds.
+MiniMax H3 profiles and authority: replaced the exposed checkpoint/Turbo tuning
+surface with server-authored performance bundles. **Draft** uses managed
+four-step Turbo at 608x352 and **Fast** uses managed eight-step Turbo at
+864x480; both require the exact pinned adapter, runtime, model, and validation
+matrix before the server will authorize them. **Quality** and **High** provide
+20-step native generation at 960x544 and 1344x768, while 1080p, Ultra, and 4K
+Delivery profiles state their native render and post-generation delivery path
+separately. The server response remains authoritative if a client submits stale
+or invented accelerator settings. There is no public First Block Cache control.
 
-H3 Turbo and LoRAs: Turbo now runs on both Pruned 20B and Full 33B checkpoints
-through automatic AdaLN adapter conversion. The managed preset uses six steps
-and a default strength of 0.50 while remaining editable in Advanced and
-Director settings. Full-model jobs that are unnecessarily expensive receive a
-Pruned recommendation instead of a hard failure. The CivitAI browser now has
-an H3 filter, and both CivitAI downloads and pasted Hugging Face H3 LoRA URLs
-route to the shared MiniMax H3 LoRA folder. Required conversion support assets
-are revision-pinned, verified, and atomically published before generation.
+H3 models and acceleration: Turbo is a managed accelerator profile rather than
+a separately selectable model or public LoRA, and its curated Draft/Fast step
+counts are not user-adjustable. The current surface uses the Base FL2VA,
+experimental W4A8 Base FL2VA, explicit PinkCherry FL2VA, and Ref2VA model IDs;
+compatibility is checked before any managed asset is acquired or generation is
+queued. MiniMax H3 LoRAs discovered through CivitAI or pasted Hugging Face URLs
+continue to route to the shared H3 LoRA folder without weakening Turbo's pinned
+server authority.
 
-H3 long-form prompting: Studio can turn one long-video idea into a structured,
-window-local storyboard. Each continuation receives its own complete
-Context-IR prompt with stable subject and setting continuity but distinct
-actions, dialogue, camera coverage, ambience, effects, and music. This keeps a
-multi-window story from finishing and repeating in its first pass. Exact
-generated prompts are saved with the job, remain editable before submission,
-show the currently generating window, and expand to their full content without
-nested scrollbars.
+H3 long-form prompting: Studio and Director retain one coherent global prompt.
+Authored timestamps remain exact; untimed prompts are mapped deterministically
+onto legal native shots, with unequal shot lengths when action/dialogue density
+warrants them. This native-shot plan is an execution artifact, not a set of
+per-window prompts written by an LLM, and it is persisted for reproducibility.
 
-Director H3 execution: Director now uses the same model-specific resolution,
-frame-grid, VRAM, and Turbo rules as Studio. It divides long scenes into valid
-native shots before queueing, rejects unsafe runtime shrinkage, preserves one
-native pass for Turbo shots, and supports per-LoRA strength controls. Prompt-
-only independent shots receive self-contained world, cast, wardrobe, blocking,
-dialogue, sound, and continuity anchors rather than rolling-window commands.
+Director H3 execution: Director uses the same server-authored profiles and
+deterministic native-shot planner as Studio. It rejects unsafe runtime shrinkage
+and keeps prompt-only independent shots self-contained with world, cast,
+wardrobe, blocking, dialogue, sound, and continuity anchors.
+
+The v1.6.1 and v1.6.0 entries below are retained as release-history provenance.
+Their Full-checkpoint, adjustable Turbo-LoRA, and older continuation-control
+descriptions were superseded by the managed v1.6.5 profile contract above.
 
 ## [1.6.1] - 2026-08-06
 

@@ -1,26 +1,32 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { Film, Music, PanelRightClose, PanelRightOpen, X } from 'lucide-react'
+import { EyeOff, Film, Music, PanelRightClose, PanelRightOpen, X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { requestThumbnail } from '../../lib/thumbnailCache'
 import { useIsMobile } from '../../lib/useIsMobile'
+import {
+  privatePreviewIdentity,
+  privatePreviewWasRevealed,
+  revealPrivatePreview,
+  subscribePrivatePreviewChanges,
+} from '../../lib/privatePreview'
 
 // Thumbnail dimensions: 80px wide, 16:9 aspect = 45px tall, 6px gap
 const THUMB_HEIGHT = 45
 const THUMB_GAP = 6
 const THUMB_OVERSCAN = 10
 
-function VideoThumbnail({ src, name }: { src: string; name: string }) {
+function VideoThumbnail({ src, name, cacheKey }: { src: string; name: string; cacheKey: string }) {
   const [thumbUrl, setThumbUrl] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
 
-    requestThumbnail(src, name).then((dataUrl) => {
+    requestThumbnail(src, cacheKey).then((dataUrl) => {
       if (!cancelled && dataUrl) setThumbUrl(dataUrl)
     })
 
     return () => { cancelled = true }
-  }, [src, name])
+  }, [src, cacheKey])
 
   if (thumbUrl) {
     return <img src={thumbUrl} alt={name} className="w-full h-full object-cover" />
@@ -43,7 +49,14 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
   const containerRef = useRef<HTMLDivElement>(null)
   const [scrollTop, setScrollTop] = useState(0)
   const [viewHeight, setViewHeight] = useState(400)
+  const [, refreshPrivateReveal] = useState(0)
   const isAutoScrolling = useRef(false)
+
+  // Main cards and thumbnails share session reveal state. Subscribe once so a
+  // card's "Blur again" action immediately re-blurs its thumbnail too.
+  useEffect(() => subscribePrivatePreviewChanges(() => {
+    refreshPrivateReveal(value => value + 1)
+  }), [])
 
   // Measure container height
   useEffect(() => {
@@ -108,11 +121,24 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
       <div className="relative" style={{ height: totalHeight }}>
         {outputs.slice(startIdx, endIdx).map((file, i) => {
           const idx = startIdx + i
+          const privateIdentity = privatePreviewIdentity(file.workspace, file.name, file.revision)
+          const privateRevealed = file.private && privatePreviewWasRevealed(privateIdentity)
           return (
             <button
-              key={file.name}
+              type="button"
+              key={`${file.workspace}:${file.name}:${file.revision}`}
               data-thumb-index={idx}
+              aria-label={file.private && !privateRevealed
+                ? `Reveal private preview and select ${file.name}`
+                : `Select ${file.name}`}
+              title={file.private && !privateRevealed
+                ? 'Click, tap, or press Enter to reveal this private preview'
+                : file.name}
               onClick={() => {
+                if (file.private) {
+                  revealPrivatePreview(privateIdentity)
+                  refreshPrivateReveal(value => value + 1)
+                }
                 onThumbnailClick(idx)
                 onMobileClick?.()
               }}
@@ -130,14 +156,27 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
                 height: THUMB_HEIGHT,
               }}
             >
+              <div className={`h-full w-full transition-[filter] ${
+                file.private && !privateRevealed ? 'blur-md' : ''
+              }`}>
               {file.type === 'video' ? (
-                <VideoThumbnail src={file.url} name={file.name} />
+                <VideoThumbnail
+                  src={file.url}
+                  name={file.name}
+                  cacheKey={`${file.workspace}:${file.name}:${file.revision}`}
+                />
               ) : file.type === 'audio' ? (
                 <div className="w-full h-full bg-bg-active flex items-center justify-center">
                   <Music size={14} className="text-text-muted" />
                 </div>
               ) : (
                 <img src={file.url} alt={file.name} className="w-full h-full object-cover" />
+              )}
+              </div>
+              {file.private && !privateRevealed && (
+                <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25 text-white">
+                  <EyeOff size={13} aria-label="Private preview" />
+                </span>
               )}
             </button>
           )
