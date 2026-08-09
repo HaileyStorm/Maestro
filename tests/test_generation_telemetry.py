@@ -233,7 +233,8 @@ class GenerationTelemetryTests(unittest.TestCase):
         self.assertIn("hasExactCurrentSteps\n        ? (currentStep / currentTotalSteps)", main)
         self.assertIn("Overall ETA ${compactEta(job.etaSeconds)}", main)
         self.assertIn("Current segment ETA ${compactEta(job.subtaskEtaSeconds)}", main)
-        self.assertIn("Estimated runtime ${compactEta(queuedH3Runtime)} after start", main)
+        self.assertIn("Estimated time ${compactEta(queuedH3Runtime)} after start", main)
+        self.assertIn("Planned time ${compactEta(queuedH3Runtime)} after start", main)
         self.assertIn("stripTimeSuffix", main)
         pipeline_start = main.index("function PipelinePlaceholder()")
         pipeline = main[pipeline_start:]
@@ -255,7 +256,7 @@ class GenerationTelemetryTests(unittest.TestCase):
             reconnect_start:store.index("// LoRA state", reconnect_start)
         ]
         self.assertNotIn("isGenerating: remaining.length > 0", reconnect)
-        self.assertIn("j.status === 'running' || j.status === 'queued'", reconnect)
+        self.assertIn("job.status === 'queued' || job.status === 'running'", reconnect)
 
     def test_requeued_h3_card_prefers_preserved_remaining_eta(self):
         main = _source("ui/src/components/MainContent/MainContent.tsx")
@@ -301,7 +302,11 @@ class GenerationTelemetryTests(unittest.TestCase):
             placeholder,
         )
         self.assertIn(
-            "Estimated runtime ${compactEta(queuedH3Runtime)} after start",
+            "Estimated time ${compactEta(queuedH3Runtime)} after start",
+            eta_render,
+        )
+        self.assertIn(
+            "Planned time ${compactEta(queuedH3Runtime)} after start",
             eta_render,
         )
         self.assertIn("Overall ETA ${compactEta(job.etaSeconds)}", eta_render)

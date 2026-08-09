@@ -228,3 +228,128 @@ remains dense SDPA. W4A8, PinkCherry, and Ref2VA
 remain structurally reachable but unvalidated, and the curated profiles never
 select Sage for them. Successful timing records carry both requested and
 effective engine IDs.
+
+## Experimental clean-room Spectrum H3 accelerator
+
+Maestro's optional `spectrum_h3_v1` profile is an independent clean-room
+implementation based only on the publicly described behavior of Spectrum H3.
+No GPL-licensed Spectrum source, ComfyUI node code, or dependency is imported,
+translated, vendored, or executed by Maestro. The behavioral provenance is the
+upstream v0.2.1 release at commit
+`1427dfe96029985be9cbc0033abb44bf2e7adc4f`; its published release ZIP has
+SHA256 `30682b5edf828f156dc3162914080290c3e3a027e35cfacaea419281475e1b80`.
+
+The public v0.2.1 audio-fix behavior requires an offline smoothing replay,
+zero video/audio blend during the causal capture, configured video blend only
+during the transformer-free replay, and audio blend fixed at zero. Maestro
+captures only packed target audio/video hidden rows after the final transformer
+block and before H3's FinalLayer; text and condition/reference rows are never
+cached. Every forecast coordinate reruns that coordinate's fresh FinalLayer,
+audio/video projections, reconstruction, sigma, and paired schedulers. A
+20-evaluation run retains alternating actual hidden anchors plus the final
+evaluation (11 block-stack calls and nine forecast slots), seals them, resets
+cloned initial latents and both schedulers, and performs a block-stack-free
+replay. Forecast hidden features are never promoted to actual anchors or fed
+into a later actual transformer call.
+
+Maestro's versioned clean-room numerical choices use a degree-one Chebyshev
+ridge fit over all actual anchors (ridge 0.10) at normalized coordinate
+`2k/19 - 1`, followed by the minimal affine constant-preserving weight
+correction. Missing replay coordinates also receive nearest-bracket local
+linear interpolation. Leave-one-actual-anchor-out RMS validation conservatively
+selects the worst applicable bracket score; the video spectral share is
+`0.5 / max(1, score)`, while audio stays on local interpolation. A non-finite or
+missing validation score disables the spectral branch. Capture is causal: one
+prior anchor is held, two or more prior anchors permit linear extrapolation,
+and future anchors are used only after capture has ended.
+
+Only Base FL2VA at exactly 20 native evaluations with dense SDPA or Sol-Attn is
+initially admitted. Turbo, SageAttention, Ref2VA, ConvRot/W4A8/PinkCherry,
+user LoRAs, other step caches, and native boundary conditioning fail before
+inference. State is generation-local and is invalidated by any timestep,
+layout, conditioning, segment, cancellation, or model-boundary change. Only
+the profile/version setting is persisted; prediction tensors and media/content
+signatures are neither persisted nor logged.
+
+The newer v0.2.3 release supersedes packaging and documentation only; no newer
+runtime behavior is incorporated here. Public performance evidence for this
+method is limited and includes small average gains with additional VRAM, so the
+profile remains visibly experimental, off by default, and does not claim a
+speedup until Maestro records a successful same-machine quality/timing matrix.
+
+## Experimental LightX2V four-evaluation adapter
+
+Maestro's manual `h3_lightx2v_fl2v_4_v1` profile uses the official Apache-2.0
+`lightx2v/Minimax-h3-Turbo` adapter. The model artifact is pinned to immutable
+Hugging Face revision `b65e359c0d128b3c5e08e0f5bf2791b794378588`, filename
+`minimax_h3_fl2v_turbo_4step_v0.1.safetensors`, size 1,383,677,888 bytes, and
+SHA256 `5ff4a12c8b4599fec716e1b15a45e504e0d1129111896bdcde5ac4a15e395b29`.
+The corresponding upstream source revision is
+`82423dcbcf4d99fd5a31086a7633521438443c8f`.
+
+The immutable safetensors header contains exactly 624 BF16 PEFT tensors: rank
+128 A/B pairs for q, k, v, attention output, and the two feed-forward linear
+projections in 50 transformer blocks and two token-refiner blocks. There are no
+AdaLN adapters. Maestro validates the complete tensor-key, dtype, shape, byte
+extent, metadata, file-size, and digest contract before atomically publishing
+the managed asset. Upstream rank 128 and alpha 8 are represented by a fixed
+effective MMGP multiplier of `8 / 128 = 0.0625`; the managed filename and scale
+are never exposed as a user LoRA.
+
+The initial runtime matrix is intentionally narrow: MiniMax H3 Base FL2VA,
+one native segment, exactly four model evaluations on a five-point scheduler
+grid, dense SDPA, and no semantic references, native-boundary history, step
+cache, Spectrum, LarryVRH Turbo, SageAttention, W4A8, ConvRot/PinkCherry, or
+other LoRA. The profile, immutable asset revision/digest, effective scale, and
+scheduler identity are persisted for recovery and must match before a restored
+job can run. Generic MMGP LoRA lifecycle owns load, finalize, unload, and audio
+and video generation; no LightX-specific tensors survive job cleanup.
+
+LightX2V remains a separately named Experimental profile, off by default. It
+does not replace Draft or Fast until exact same-machine timing plus visual and
+audio acceptance validates a broader matrix.
+
+## Experimental clean-room T8 source-audio contracts
+
+Maestro's Base-FL2VA source-audio modes are an independent clean-room design
+informed only by public behavior and terminology from
+`T8Mars/comfyui-minimax-h3-audio-T8` at audited commit
+`5ff46c253192e9d8cae185280fd34f4b4add063b` (metadata version 1.3.3,
+GPL-3.0-or-later; no tags or releases existed at the audit). No GPL source,
+ComfyUI node implementation, expression, or algorithm is copied, imported,
+translated, vendored, or executed. Public behavioral owners reviewed for the
+clean-room requirements were the named audio-conditioning, audio-latent,
+duration, window, mix, trim, preflight, and dual-clock sampler nodes plus their
+conditioning/sampling/preflight behavior.
+
+The versioned `maestro_h3_source_audio_v1` contract resolves audio structurally
+into independent drive/reference and final-delivery roles. `native` preserves
+the released H3 path. `lock_source` fits one authorized source to H3's exact
+32 kHz stereo target clock, initializes the target audio latents from it, and
+keeps those target rows fixed while still advancing the paired scheduler;
+delivery defaults to the exact source track. `remix_source` initializes the
+same target from a source/noise blend and uses an audio sigma grid beginning at
+the explicitly selected strength while the paired video clock remains native;
+delivery defaults to newly decoded H3 audio. `reference_only` adds up to three
+content-only audio condition blocks while starting target audio from fresh
+noise. An explicit final soundtrack remains an independent delivery override
+for every mode.
+
+Only MiniMax H3 Base FL2VA, one segment, exactly 20 native steps, and dense
+SDPA or Sol-Attn are initially admitted. Ref2VA/semantic references, native
+boundary history, LightX2V, Spectrum, managed Turbo, SageAttention, W4A8,
+PinkCherry/ConvRot, user LoRAs, and step caches fail closed before inference.
+Media validation is content-neutral: it checks only separate contiguous
+`<Picture N>`, `<Video N>`, and `<Audio N>` namespaces. A selected primary
+audio is moved to `<Audio 1>` with one collision-safe ordinal remap; prompt
+subject matter and waveform/media content are never classified or inspected
+to choose a role.
+
+The public four-video/eight-audio dual-clock idea is represented only by the
+disabled `t8_4v8a_evidence_v1` synthetic benchmark identity. Ordinary runtime
+continues to require paired equal-length schedules; the evidence case can be
+printed only with the local benchmark runner's `--dry-run` and cannot submit a
+job. It remains disabled until a future implementation records exact schedule
+endpoints/call identity and passes synchronized visual/audio quality review.
+Non-native source-audio timing observations are likewise excluded until the
+job capture layer can persist the exact content-free mode/version identity.

@@ -7427,16 +7427,18 @@ def resolve_mux_audio_contract(
     source_audio_metadata=None,
     audio_paths=None,
     native_h3_audio_selected=False,
+    experimental_h3_audio_selected=False,
 ):
     """Return the final sample-rate/channel contract without changing legacy models."""
-    if native_h3_audio_selected:
+    if native_h3_audio_selected or experimental_h3_audio_selected:
         if base_model_type not in {"minimax_h3", "minimax_h3_ref2va"}:
             raise ValueError("Native H3 audio selection requires a MiniMax H3 model")
-        if generated_audio is None:
+        if native_h3_audio_selected and generated_audio is None:
             raise ValueError("Selected MiniMax H3 audio is missing")
-        audio = np.asarray(generated_audio)
-        if audio.ndim != 2 or audio.shape[1] != 2:
-            raise ValueError("MiniMax H3 generated audio must be stereo")
+        if generated_audio is not None:
+            audio = np.asarray(generated_audio)
+            if audio.ndim != 2 or audio.shape[1] != 2:
+                raise ValueError("MiniMax H3 generated audio must be stereo")
         return 32000, 2
     return (
         resolve_mux_audio_sampling_rate(
@@ -7446,6 +7448,79 @@ def resolve_mux_audio_contract(
         ),
         1,
     )
+
+
+def resume_h3_source_audio_premux(
+    *,
+    premux_video_path,
+    final_audio_path,
+    output_path,
+    recovery_staging_dir,
+    premux_audio_path=None,
+    audio_codec_key="aac_128",
+    combine_fn=None,
+):
+    """Finish a hash-verified H3 source-audio mux without model inference."""
+
+    staging = os.path.realpath(os.path.abspath(recovery_staging_dir))
+
+    def staged_file(path, label):
+        candidate = os.path.realpath(os.path.abspath(str(path or "")))
+        if (
+            os.path.dirname(candidate) != staging
+            or os.path.islink(candidate)
+            or not os.path.isfile(candidate)
+            or os.path.getsize(candidate) < 1
+            or not os.path.basename(candidate).startswith("unit-")
+        ):
+            raise ValueError(f"Recovered H3 {label} identity is invalid")
+        return candidate
+
+    premux_video = staged_file(premux_video_path, "pre-mux video")
+    recovered_audio = (
+        staged_file(premux_audio_path, "pre-mux audio")
+        if premux_audio_path else None
+    )
+    selected_audio = recovered_audio or os.path.realpath(
+        os.path.abspath(str(final_audio_path or ""))
+    )
+    if not selected_audio or not os.path.isfile(selected_audio):
+        raise ValueError("Recovered H3 final audio is unavailable")
+    output = os.path.realpath(os.path.abspath(output_path))
+    if (
+        os.path.dirname(output) != staging
+        or os.path.islink(output)
+        or not os.path.basename(output).startswith("unit-")
+    ):
+        raise ValueError("Recovered H3 final output identity is invalid")
+    try:
+        os.remove(output)
+    except FileNotFoundError:
+        pass
+    combine = combine_fn or combine_and_concatenate_video_with_audio_tracks
+    combine(
+        output,
+        premux_video,
+        [],
+        [selected_audio],
+        0,
+        32000,
+        new_audio_from_start=True,
+        audio_codec_key=audio_codec_key,
+        output_audio_channels=2,
+    )
+    if not os.path.isfile(output) or os.path.getsize(output) < 1:
+        raise PostDecodeStageError(
+            "Recovered H3 audio mux produced no final output",
+            stage="audio_mux", code="audio_mux_output_invalid",
+        )
+    for temporary in (premux_video, recovered_audio):
+        if temporary:
+            try:
+                os.remove(temporary)
+            except FileNotFoundError:
+                pass
+    return output
 
 
 def resolve_model_preprocess_all(model_def, **kwargs):
@@ -7837,6 +7912,7 @@ def generate_video(
     # dispatch; interrupted denoising still reruns because the offset advances
     # only after media+sidecar evidence has been durably checkpointed.
     repeat_start_offset=0,
+    _h3_source_audio_premux_recovery=None,
     after_repeat_output=None,
     after_segment_output=None,
 ):
@@ -7899,6 +7975,10 @@ def generate_video(
             })
             if not generate_video(**recursive_arguments):
                 return False
+            # A private pre-mux descriptor belongs to exactly one recovered
+            # repeat. Consume it only after that dispatch succeeds: a failed
+            # dispatch remains restartable, while later repeats generate fresh.
+            recursive_arguments.pop("_h3_source_audio_premux_recovery", None)
 
             completed_repeats += 1
             next_seed = -1
@@ -8032,6 +8112,106 @@ def generate_video(
     base_model_type = get_base_model_type(model_type)
     model_handler = get_model_handler(base_model_type)
     block_size = model_handler.get_vae_block_size(base_model_type) if hasattr(model_handler, "get_vae_block_size") else 16
+    h3_audio_roles = None
+    if base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
+        from services.h3_audio import resolve_h3_audio_roles, source_audio_requested
+
+        h3_custom_settings = (
+            custom_settings if isinstance(custom_settings, dict) else {}
+        )
+        h3_experimental_source_audio = source_audio_requested(h3_custom_settings)
+        h3_audio_roles = resolve_h3_audio_roles(
+            selected_model_type=str(model_type or ""),
+            model_def=model_def,
+            custom_settings=h3_custom_settings,
+            sampling_steps=num_inference_steps,
+            attention_engine=str(
+                h3_custom_settings.get("h3_attention_engine") or "sol_attn"
+            ),
+            audio_prompt_type=audio_prompt_type,
+            audio_guides=(audio_guide, audio_guide2, audio_guide3),
+            final_audio=audio_source,
+            semantic_references=(
+                bool(image_refs)
+                or "V" in (video_prompt_type or "")
+                or (
+                    not h3_experimental_source_audio
+                    and any(letter in (audio_prompt_type or "") for letter in "ABCK")
+                )
+            ),
+            multisegment=(
+                isinstance(multi_clip_info, dict)
+                and int(multi_clip_info.get("total", 1) or 1) > 1
+            ),
+            activated_loras=activated_loras,
+            loras_multipliers=loras_multipliers,
+            skip_steps_cache_type=skip_steps_cache_type,
+            native_boundary=(
+                h3_native_boundary_conditioning is True
+                or h3_custom_settings.get("h3_native_boundary_conditioning") is True
+            ),
+        )
+        if h3_audio_roles.experimental:
+            # Delivery audio is independent from the drive/reference slot.
+            # lock_source defaults to the exact source track; remix/reference
+            # default to H3's generated 32 kHz stereo unless an explicit final
+            # soundtrack was supplied.
+            audio_source = h3_audio_roles.final_audio
+
+    if _h3_source_audio_premux_recovery is not None:
+        if (
+            durable_output_dir is None
+            or h3_audio_roles is None
+            or not h3_audio_roles.experimental
+            or not isinstance(_h3_source_audio_premux_recovery, dict)
+        ):
+            raise RuntimeError("H3 pre-mux recovery identity is invalid")
+        repeat_index = max(
+            0,
+            int(_h3_source_audio_premux_recovery.get("repeat_index", 0) or 0),
+        )
+        expected_repeat = max(
+            0, int(getattr(after_repeat_output, "repeat_offset", 0) or 0),
+        )
+        if repeat_index != expected_repeat:
+            raise RuntimeError("H3 pre-mux recovery repeat identity changed")
+        recovered_output = os.path.join(
+            durable_output_dir,
+            f"{durable_output_prefix}-r{repeat_index}-w1.{container}",
+        )
+        try:
+            recovered_output = resume_h3_source_audio_premux(
+                premux_video_path=_h3_source_audio_premux_recovery.get(
+                    "video_path"
+                ),
+                premux_audio_path=_h3_source_audio_premux_recovery.get(
+                    "audio_path"
+                ),
+                final_audio_path=audio_source,
+                output_path=recovered_output,
+                recovery_staging_dir=durable_output_dir,
+                audio_codec_key=server_config.get(
+                    "audio_output_codec", "aac_128"
+                ),
+            )
+        except PostDecodeStageError:
+            raise
+        except Exception as error:
+            raise PostDecodeStageError(
+                "The recovered H3 output could not be combined with audio",
+                stage="audio_mux", code="audio_mux_failed",
+            ) from error
+        with lock:
+            if recovered_output not in gen.setdefault("artifact_list", []):
+                gen["artifact_list"].append(recovered_output)
+            gen.setdefault("artifact_roles", {})[recovered_output] = "final"
+            file_list.append(recovered_output)
+            file_settings_list.append({
+                "custom_settings": dict(custom_settings or {}),
+            })
+            gen["last_was_audio"] = False
+        send_cmd("output")
+        return True
 
     if "P" in preload_model_policy and not "U" in preload_model_policy:
         while wan_model == None:
@@ -8406,52 +8586,106 @@ def generate_video(
     else:
         clear_h3_turbo_runtime(trans_lora)
 
-    if len(loras_selected) > 0:
-        pinnedLora = loaded_profile !=5  # and transformer_loras_filenames == None False # # # 
-        preprocess_target = trans_lora if trans_lora is not None else trans
-        split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
-        try:
-            offload.load_loras_into_model(
-                trans_lora,
-                loras_selected,
-                loras_list_mult_choices_nums,
-                activate_all_loras=True,
-                preprocess_sd=get_loras_preprocessor(preprocess_target, base_model_type),
-                pinnedLora=pinnedLora,
-                maxReservedLoras=server_config.get("max_reserved_loras", -1),
-                split_linear_modules_map=split_linear_modules_map,
+    from services.h3_lightx2v import (
+        H3_LIGHTX2V_EFFECTIVE_SCALE,
+        acquire_lightx2v_asset,
+        call_with_lightx2v_cleanup,
+        guard_lightx2v_lora_load,
+        lightx2v_assets_status,
+        lightx2v_requested,
+        validate_lightx2v_request,
+    )
+    lightx2v_runtime_requested = lightx2v_requested(custom_settings)
+    lightx2v_assets = None
+    if lightx2v_runtime_requested:
+        validate_lightx2v_request(
+            selected_model_type=str(model_type or ""), model_def=model_def,
+            custom_settings=custom_settings, authored_steps=num_inference_steps,
+            semantic_references=bool(model_def.get("minimax_h3_reference_mode")),
+            multisegment=(
+                isinstance(multi_clip_info, dict)
+                and int(multi_clip_info.get("total", 1) or 1) > 1
+            ), activated_loras=activated_loras,
+            loras_multipliers=loras_multipliers,
+            skip_steps_cache_type=skip_steps_cache_type,
+            native_boundary=h3_native_boundary_conditioning is True,
+        )
+        if not lightx2v_assets_status().get("available"):
+            send_cmd(
+                "status",
+                "Downloading the pinned LightX2V H3 adapter...",
             )
-        except Exception:
-            clear_h3_turbo_runtime(trans_lora)
-            raise
-        errors = trans_lora._loras_errors
-        if len(errors) > 0:
-            clear_h3_turbo_runtime(trans_lora)
-            error_files = [msg for _ ,  msg  in errors]
-            raise gr.Error("Error while loading Loras: " + ", ".join(error_files))
-        if trans2_lora is not None: 
-            offload.sync_models_loras(trans_lora, trans2_lora)
-        if hasattr(wan_model, "finalize_loras"):
-            try:
-                wan_model.finalize_loras()
-            except Exception:
-                offload.unload_loras_from_model(trans_lora)
-                clear_h3_turbo_runtime(trans_lora)
+        lightx2v_assets = acquire_lightx2v_asset()
+        send_cmd("status", "LightX2V H3 adapter verified")
+        loras_list_mult_choices_nums, loras_slists, errors = parse_loras_multipliers(
+            str(H3_LIGHTX2V_EFFECTIVE_SCALE), 1, num_inference_steps,
+            nb_phases=model_def_nb_phases, merge_slist=loras_slists,
+            model_switch_phase=model_switch_phase,
+        )
+        if errors:
+            raise Exception(f"Error preparing LightX2V H3 multiplier: {errors}")
+        loras_selected.append(str(lightx2v_assets.lora_path))
+
+    _generation_loras_loaded = False
+
+    def _unload_generation_loras():
+        nonlocal _generation_loras_loaded
+        offload.unload_loras_from_model(trans_lora)
+        clear_h3_turbo_runtime(trans_lora)
+        if trans2_lora is not None:
+            offload.unload_loras_from_model(trans2_lora)
+            clear_h3_turbo_runtime(trans2_lora)
+        _generation_loras_loaded = False
+
+    def _load_generation_loras():
+        nonlocal _generation_loras_loaded
+        if _generation_loras_loaded:
+            return
+
+        def prepare():
+            if len(loras_selected) > 0:
+                pinnedLora = loaded_profile !=5  # and transformer_loras_filenames == None False # # #
+                preprocess_target = trans_lora if trans_lora is not None else trans
+                split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
+                offload.load_loras_into_model(
+                    trans_lora,
+                    loras_selected,
+                    loras_list_mult_choices_nums,
+                    activate_all_loras=True,
+                    preprocess_sd=get_loras_preprocessor(preprocess_target, base_model_type),
+                    pinnedLora=pinnedLora,
+                    maxReservedLoras=server_config.get("max_reserved_loras", -1),
+                    split_linear_modules_map=split_linear_modules_map,
+                )
+                errors = trans_lora._loras_errors
+                if len(errors) > 0:
+                    error_files = [msg for _, msg in errors]
+                    raise gr.Error(
+                        "Error while loading Loras: " + ", ".join(error_files)
+                    )
                 if trans2_lora is not None:
-                    offload.unload_loras_from_model(trans2_lora)
-                    clear_h3_turbo_runtime(trans2_lora)
+                    offload.sync_models_loras(trans_lora, trans2_lora)
+                if hasattr(wan_model, "finalize_loras"):
+                    wan_model.finalize_loras()
+            if turbo_assets is not None:
+                activate_h3_turbo_runtime(trans_lora)
+
+        if lightx2v_runtime_requested:
+            guard_lightx2v_lora_load(prepare, _unload_generation_loras)
+        else:
+            try:
+                prepare()
+            except BaseException:
+                _unload_generation_loras()
                 raise
-    if turbo_assets is not None:
-        try:
-            activate_h3_turbo_runtime(trans_lora)
-        except Exception:
-            offload.unload_loras_from_model(trans_lora)
-            clear_h3_turbo_runtime(trans_lora)
-            if trans2_lora is not None:
-                offload.unload_loras_from_model(trans2_lora)
-                clear_h3_turbo_runtime(trans2_lora)
-            raise
-        
+        _generation_loras_loaded = True
+
+    # Preserve every existing model/user/Turbo LoRA load point. Only the new
+    # managed LightX2V adapter waits until fallible window preprocessing has
+    # completed, so it cannot survive an exception before inference begins.
+    if not lightx2v_runtime_requested:
+        _load_generation_loras()
+
     seed = None if seed == -1 else seed
     # negative_prompt = "" # not applicable in the inference
     model_filename = get_model_filename(base_model_type)  
@@ -8773,6 +9007,11 @@ def generate_video(
         # Requires: model declares the capability, user opted in via "L"
         # in audio_prompt_type, and we're not in "full audio" mode ("F").
         video_length_not_limited_by_audio = model_def.get("video_length_not_limited_by_audio", False) and "L" in audio_prompt_type and "F" not in audio_prompt_type
+        if h3_audio_roles is not None and h3_audio_roles.experimental:
+            # The T8 contract fits the drive waveform to H3's exact target
+            # audio clock in the model runtime.  Do not silently shorten the
+            # requested video to the source file's container duration.
+            video_length_not_limited_by_audio = True
         # The historic behavior: cap video length to whatever the audio
         # source allowed. Now optional: when the user opts into "L",
         # the text prompt drives length and the model continues the
@@ -8817,11 +9056,7 @@ def generate_video(
         """Release preparation/runtime state on success, failure, or abort."""
         clear_status(state)
         trans.cache = None
-        offload.unload_loras_from_model(trans_lora)
-        clear_h3_turbo_runtime(trans_lora)
-        if trans2_lora is not None:
-            offload.unload_loras_from_model(trans2_lora)
-            clear_h3_turbo_runtime(trans2_lora)
+        _unload_generation_loras()
         if trans2 is not None:
             trans2.cache = None
         if control_audio_tracks or source_audio_tracks:
@@ -9518,6 +9753,11 @@ def generate_video(
                 send_cmd("output")
 
             try:
+                # Delay managed/user adapter activation until every window's
+                # fallible preprocessing is complete. The enclosing handler
+                # now owns every later error/cancellation, while the guarded
+                # loader cleans even partially installed LightX2V tensors.
+                _load_generation_loras()
                 # SCAIL-2's first-window fake start image is only an
                 # identity-reference carrier.  The custom preprocessor has
                 # already sized the control/reference tensors to the
@@ -9583,7 +9823,10 @@ def generate_video(
                     prepared_reference_videos += [None] * (3 - len(prepared_reference_videos))
                     src_video, src_video2, src_video3 = prepared_reference_videos[:3]
                 overridden_inputs = None
-                samples = call_with_sticky_interrupt(
+                samples = call_with_lightx2v_cleanup(
+                    lightx2v_runtime_requested,
+                    _unload_generation_loras,
+                    call_with_sticky_interrupt,
                     gen,
                     wan_model,
                     wan_model.generate,
@@ -9732,6 +9975,15 @@ def generate_video(
                     progressive_stage3_sigma=progressive_stage3_sigma,
                     progressive_stage1_image_weight=progressive_stage1_image_weight,
                     progressive_stage3_image_weight=progressive_stage3_image_weight,
+                    **({} if base_model_type not in {
+                        "minimax_h3", "minimax_h3_ref2va",
+                    } else {
+                        "audio_source": audio_source,
+                        "activated_loras": activated_loras,
+                        "loras_multipliers": loras_multipliers,
+                        "skip_steps_cache_type": skip_steps_cache_type,
+                        "multi_clip_info": multi_clip_info,
+                    }),
                     # Motion suffix: only passed when the loaded suffix video
                     # is available. Other model handlers (Wan / Flux / Qwen /
                     # Hunyuan) don't accept these kwargs, so we omit them
@@ -9754,11 +10006,7 @@ def generate_video(
                 trans.cache = None 
                 if trans2 is not None: 
                     trans2.cache = None 
-                offload.unload_loras_from_model(trans_lora)
-                clear_h3_turbo_runtime(trans_lora)
-                if trans2_lora is not None: 
-                    offload.unload_loras_from_model(trans2_lora)
-                    clear_h3_turbo_runtime(trans2_lora)
+                _unload_generation_loras()
                 skip_steps_cache = None
                 # if compile:
                 #     cache_size = torch._dynamo.config.cache_size_limit                                      
@@ -9970,6 +10218,7 @@ def generate_video(
                 inputs.pop("_h3_native_boundary", None)
                 inputs.pop("_recovery_output_directory", None)
                 inputs.pop("_recovery_output_prefix", None)
+                inputs.pop("_h3_source_audio_premux_recovery", None)
                 inputs.pop("after_repeat_output", None)
                 inputs.pop("after_segment_output", None)
                 if recast_warmup_frames > 0:
@@ -10046,6 +10295,13 @@ def generate_video(
                 elif len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0 or output_new_audio_filepath is not None or any_mmaudio or output_new_audio_data is not None or audio_source is not None:
                     video_path = os.path.join(output_dir, file_name)
                     save_path_tmp = video_path.rsplit('.', 1)[0] + f"_tmp.{container}"
+                    h3_keep_premux = bool(
+                        durable_output_dir is not None
+                        and h3_audio_roles is not None
+                        and h3_audio_roles.experimental
+                    )
+                    h3_premux_paths = []
+                    h3_mux_succeeded = False
                     try:
                         save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
                     except Exception as error:
@@ -10054,6 +10310,14 @@ def generate_video(
                             stage="segment_checkpoint",
                             code="segment_encode_failed",
                         ) from error
+                    if h3_keep_premux:
+                        premux_video_path = os.path.join(
+                            durable_output_dir,
+                            f"{durable_file_stem}-premux-video.{container}",
+                        )
+                        os.replace(save_path_tmp, premux_video_path)
+                        save_path_tmp = premux_video_path
+                        h3_premux_paths.append(premux_video_path)
                     output_new_audio_temp_filepath = None
                     try:
                         native_h3_audio_selected = False
@@ -10077,7 +10341,12 @@ def generate_video(
                                 "minimax_h3", "minimax_h3_ref2va",
                             }
                             output_new_audio_filepath = output_new_audio_temp_filepath = (
-                                os.path.join(output_dir, f"{durable_file_stem}-audio-tmp.wav")
+                                os.path.join(
+                                    output_dir,
+                                    f"{durable_file_stem}-premux-audio.wav",
+                                )
+                                if h3_keep_premux
+                                else os.path.join(output_dir, f"{durable_file_stem}-audio-tmp.wav")
                                 if durable_file_stem is not None
                                 else get_available_filename(output_dir, f"tmp{time_flag}.wav")
                             )
@@ -10094,7 +10363,39 @@ def generate_video(
                             source_audio_metadata,
                             new_audio_tracks,
                             native_h3_audio_selected=native_h3_audio_selected,
+                            experimental_h3_audio_selected=bool(
+                                h3_audio_roles is not None
+                                and h3_audio_roles.experimental
+                            ),
                         )
+
+                        if h3_keep_premux:
+                            if (
+                                h3_audio_roles.final_audio_kind == "generated"
+                                and output_new_audio_filepath is not None
+                            ):
+                                h3_premux_paths.append(output_new_audio_filepath)
+                            if any(
+                                not os.path.isfile(path)
+                                or os.path.getsize(path) < 1
+                                for path in h3_premux_paths
+                            ):
+                                raise PostDecodeStageError(
+                                    "The rendered H3 pre-mux checkpoint is invalid",
+                                    stage="segment_checkpoint",
+                                    code="segment_checkpoint_invalid",
+                                )
+                            with lock:
+                                artifact_list = gen.setdefault(
+                                    "artifact_list", []
+                                )
+                                artifact_roles = gen.setdefault(
+                                    "artifact_roles", {}
+                                )
+                                for premux_path in h3_premux_paths:
+                                    if premux_path not in artifact_list:
+                                        artifact_list.append(premux_path)
+                                    artifact_roles[premux_path] = "temporary"
 
                         combine_and_concatenate_video_with_audio_tracks(
                             video_path,
@@ -10109,6 +10410,7 @@ def generate_video(
                             output_audio_channels=mux_audio_channels,
                             verbose=verbose_level >= 2,
                         )
+                        h3_mux_succeeded = True
                     except PostDecodeStageError:
                         raise
                     except Exception as error:
@@ -10118,23 +10420,41 @@ def generate_video(
                             code="audio_mux_failed",
                         ) from error
                     finally:
-                        try:
-                            os.remove(save_path_tmp)
-                        except FileNotFoundError:
-                            pass
-                        except PermissionError:
-                            gc.collect()
+                        if not h3_keep_premux or h3_mux_succeeded:
                             try:
                                 os.remove(save_path_tmp)
+                            except FileNotFoundError:
+                                pass
                             except PermissionError:
-                                print(f"  [WARN] Could not delete temp file (locked): {save_path_tmp}")
-                        if output_new_audio_temp_filepath is not None:
+                                gc.collect()
+                                try:
+                                    os.remove(save_path_tmp)
+                                except PermissionError:
+                                    print(f"  [WARN] Could not delete temp file (locked): {save_path_tmp}")
+                        if (
+                            output_new_audio_temp_filepath is not None
+                            and (not h3_keep_premux or h3_mux_succeeded)
+                        ):
                             try:
                                 os.remove(output_new_audio_temp_filepath)
                             except FileNotFoundError:
                                 pass
                             except PermissionError:
                                 print(f"  [WARN] Could not delete temp audio file (locked): {output_new_audio_temp_filepath}")
+                        if h3_mux_succeeded and h3_premux_paths:
+                            with lock:
+                                artifact_list = gen.setdefault(
+                                    "artifact_list", []
+                                )
+                                gen["artifact_list"] = [
+                                    path for path in artifact_list
+                                    if path not in h3_premux_paths
+                                ]
+                                artifact_roles = gen.setdefault(
+                                    "artifact_roles", {}
+                                )
+                                for premux_path in h3_premux_paths:
+                                    artifact_roles.pop(premux_path, None)
 
                 else:
                     try:

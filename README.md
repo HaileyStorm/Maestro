@@ -104,6 +104,7 @@ Multiple isolated output directories with a quick switcher in the sidebar. Usefu
 
 - Cloudflare access is enabled by default. Remote visitors see project names, then unlock only the project they know the password for; counts, prompts, assets, jobs, and media stay hidden until unlock.
 - Remote visitors cannot change machine settings, start/stop services, browse storage/model folders, or import arbitrary Hugging Face/CivitAI URLs. Curated model weights may still download when their generation needs them.
+- After unlocking a project, remote visitors can browse and apply Maestro's bundled Recipes in Studio. Host-global user recipes are never listed remotely; saving, importing, deleting, and installing recipe LoRAs remain local host-owner actions.
 - Project passwords protect access through Maestro and its remote-sharing flow.
 - The Project References creation tool makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Studio semantic-reference workflows.
 - Gallery selection supports bulk move, privacy, and deletion. Finals are shown by default; All, Components, Windows, and Temporary views expose intermediate artifacts when needed. Deleting a final can atomically include its linked parts.
@@ -122,8 +123,8 @@ held and resumed.
 
 The Tools area and Project References dialog include a structured Blender scene tool. It creates primitives/materials, animates the full requested frame range, inspects the scene, and samples multiple frames into protected project references. Pinokio installs a pinned portable Blender runtime plus the official Blender Lab MCP extension, then starts its localhost-only bridge with Maestro. Remote project users can invoke the same hosted tool through Maestro's project-scoped API; they never receive filesystem or machine-control access. Maestro never exposes the upstream arbitrary-Python surface.
 
-### 🔒 Mature mode + experimental gate
-- **NSFW mode** is opt-in with a disclaimer step. Disabled by default. Gates uncensored model variants, NSFW LoRAs in the CivitAI browser, and the Settings → Services NSFW toggle.
+### 🔒 Explicit guidance + experimental gate
+- **Explicit prompt guidance** is an opt-in authoring aid with a disclaimer step. It never hides models, LoRAs, recipes, prompts, or locally processed outputs, and it does not moderate local content.
 - **Experimental features gate** hides power-user toggles (external API keys, Voice Reference, Inpaint, Restyle, Wan2GP Enhancer) by default for a focused first-launch experience.
 
 ### 📊 Director Pipeline Dashboard
@@ -357,8 +358,6 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 - Improved cleanup of failed and interrupted downloads.
 
 **Safety, compatibility, and stability**
-- Improved Director's minor-content safety checks.
-- Improved detection across deeply nested planning data while reducing common false positives.
 - Fixed sidebar crashes when changing models or generation modes.
 - Improved NVIDIA GPU compatibility checks during Pinokio installation.
 - Expanded automated regression testing for both dev and main.
@@ -510,7 +509,7 @@ The version you are running is shown next to the Maestro title in the UI. To upd
 
 **Improved**
 - Downloaded models always show bright in the Enabled Models list; mode groups start collapsed.
-- NSFW filter toggles in the CivitAI browser and LoRA selector are remembered across sessions.
+- Model, LoRA, and recipe catalogs remain content-neutral and follow ordinary user-selected search and visibility controls.
 - Deleting models can never touch files inside linked installs.
 
 ### v1.0.0 (2026-07-08)
@@ -567,17 +566,22 @@ Click **Reset** to wipe the install and start over. Removes `app/env/`, `ui/node
 After clicking **Start**, the launcher shows an **Open Web UI** button once the server is up.
 
 - **Sidebar** — mode toggle (Studio / Director), model picker, prompt, LoRAs, advanced settings
+- **Recipes** — open the bundled preset library from the empty Gallery or Studio sidebar; applying a recipe deliberately returns to Studio with editable settings and prompt
 - **Main feed** — generated outputs, dashboard, Director pipeline status
-- **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, NSFW, theme)
+- **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, mature prompt guidance, theme)
 - **Pinokio menu** — Update, Reset, Install Inpaint Support, LoRA folder shortcuts
 
 ## Remote and local-network sharing
 
 Cloudflare sharing is enabled by default through `PINOKIO_SHARE_CLOUDFLARE=true`. After Maestro starts, the live URL appears both in Pinokio and as **Cloudflare · Copy link** in Maestro's top bar. Give another person that URL; their first visit immediately opens the project chooser, where they can unlock an existing project or create a new password-protected project (minimum 8 characters).
 
-For a reusable address without buying a domain, Maestro includes a minimal Cloudflare Workers Free redirect in [`cloudflare/stable-share-worker`](cloudflare/stable-share-worker/README.md). It keeps Pinokio's existing Quick Tunnel and updates only a KV-stored target after each launch. Maestro displays the `*.workers.dev` address only after an authenticated update plus health/target verification at the updating edge; if that check fails, the current `*.trycloudflare.com` URL remains available. The Worker briefly checks Maestro's minimal public `/health` endpoint before redirecting; while the studio/tunnel is down, browser visits receive a self-contained no-tracking offline page and API requests receive `503` JSON. No media, uploads, prompts, or app responses are proxied or stored. Because Workers KV is eventually consistent across edge locations, another region can briefly retain the prior (normally expired) Quick Tunnel until KV converges. Keep the Worker update secret only in the ignored local `ENVIRONMENT`; the one-time Cloudflare provisioning credential is removed after setup. Do not enable a paid Workers plan for this setup.
+When a verified stable Worker URL is active, Pinokio shows it as the primary Cloudflare address and also keeps the current direct `*.trycloudflare.com` Quick Tunnel visible as a separate copyable fallback. The direct URL bypasses the Worker proxy hop and remains available for Worker-quota or stable-route emergencies. If both sources report the same URL, Pinokio shows only one entry.
+
+For a reusable address without buying a domain, Maestro includes a minimal Cloudflare Workers Free stable-share Worker in [`cloudflare/stable-share-worker`](cloudflare/stable-share-worker/README.md). It keeps Pinokio's existing Quick Tunnel and updates only a KV-stored target after each launch. Maestro displays the `*.workers.dev` address only after an authenticated update plus health/target verification at the updating edge; if that check fails, the current `*.trycloudflare.com` URL remains available. The default `SHARE_MODE=proxy` streams polling, uploads, downloads, and other HTTP traffic so the stable hostname survives page refreshes across Maestro restarts; `SHARE_MODE=redirect` is the configuration-only rollback. Proxying adds a Cloudflare Worker transit hop: bodies and session headers are not logged or stored, observability is disabled, and responses are `no-store`, but the traffic does pass through Cloudflare's Worker runtime. Cloudflare Free inbound requests are capped at 100 MB; that ceiling applies to the Worker and is also expected at the Quick Tunnel edge, so larger uploads require local/LAN access or a future chunked-upload path. The Workers Free allowance is 100,000 requests/day and 10 ms CPU/invocation. The landed remote idle cadence is 2,880 requests/day per visible tab and zero while hidden, below the 25,000/day enablement gate. Periodic upper bounds are 56,160/day for one continuously active remote job and 59,040/day for one running plus ten queued, before bounded event-driven refreshes. Multiple active tabs can still exhaust the allowance, so the independently surfaced Quick Tunnel remains the quota/extra-hop fallback. The Worker's `/direct` convenience route only works while the Worker is healthy; it is not usable after quota exhaustion. In proxy mode upstream redirects are never auto-followed, only same-target redirects are rewritten to the stable host, and cross-target redirects are rejected. Because Workers KV is eventually consistent across edge locations, another region can briefly retain the prior (normally expired) Quick Tunnel until KV converges. Keep the Worker update secret only in the ignored local `ENVIRONMENT`; the one-time Cloudflare provisioning credential is removed after setup. Do not enable a paid Workers plan for this setup.
 
 Remote access is deliberately not an administration surface. It exposes the app but denies Classic UI, system/storage/model-source settings, arbitrary model links/paths, and service load/unload. New remote projects require a password. LAN binding remains disabled by default.
+
+Lawful-use and separately licensed Ref2VA notices are versioned once per Maestro host, not per browser, project, or device. Any current local project user or password-unlocked remote project user may record the exact displayed version; doing so grants no project or machine-control capability. A notice version change requires a fresh acceptance. Mature prompt guidance is a separate host setting and is applied only when the current Studio or Director job is explicitly marked **Explicit**. Maestro does not inspect local prompts or outputs to make that choice. External LLM providers remain separately disclosed and subject to their own terms and privacy policies.
 
 Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to `false` (in the per-app or global ENVIRONMENT file) to bind the server to loopback only; set to `true` for LAN access. Pinokio's own daemon proxy is a separate concern that may also need to honor the variable depending on your setup.
 
@@ -586,8 +590,8 @@ Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to
 The React UI uses the same project-scoped API. A browser must first unlock a protected project; the signed `maestro_session` cookie then carries that unlock for later requests.
 
 ```bash
-# Resolve the stable redirect once. Mutating API calls use the final Quick
-# Tunnel origin so Maestro's same-origin CSRF policy can verify them.
+# Resolve whichever surface is active. Default proxy mode remains on the stable
+# Worker; explicit redirect rollback resolves to the current Quick Tunnel.
 STABLE='https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev'
 EFFECTIVE=$(curl -fsS -L -c cookies.txt -o /dev/null -w '%{url_effective}' \
   "$STABLE/api/v1/access-context")

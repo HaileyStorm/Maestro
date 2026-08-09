@@ -366,14 +366,10 @@ def output_policy_from_request(
     """Pop request-local flags and return the durable sidecar/job policy.
 
     ``explicit_enabled`` remains accepted for source compatibility but no
-    longer supplies a default.  Host settings may affect catalog visibility;
-    they must never silently label an ordinary omitted request explicit.
+    longer supplies a default and never labels an omitted request explicit.
 
-    A known mature request is always recorded explicit.  If the caller did
-    not affirmatively submit ``explicit_output=True``, it is also forced
-    private so a false or omitted flag cannot publish mature output.  The
-    deliberate ``explicit_output=True, private_output=False`` override stays
-    available.
+    ``mature_output`` remains accepted for source compatibility but is ignored:
+    publication metadata comes only from the caller's explicit choices.
     """
     requested_private = params.pop("private_output", None)
     requested_explicit = params.pop("explicit_output", None)
@@ -381,42 +377,8 @@ def output_policy_from_request(
         raise ValueError("private_output must be a boolean")
     if requested_explicit is not None and not isinstance(requested_explicit, bool):
         raise ValueError("explicit_output must be a boolean")
-    explicitly_acknowledged = requested_explicit is True
     explicit = bool(requested_explicit) if requested_explicit is not None else False
-    if mature_output:
-        explicit = True
-        private = (
-            requested_private
-            if explicitly_acknowledged and requested_private is not None
-            else True
-        )
-    else:
-        private = explicit if requested_private is None else requested_private
-    return {
-        "private": private,
-        "explicit": explicit,
-    }
-
-
-def harden_output_access_for_maturity(
-    policy: Mapping[str, Any] | None,
-    *,
-    mature_output: bool,
-    owner_session_id: str,
-) -> dict[str, Any]:
-    """Normalize trusted inherited metadata and prevent mature downgrades."""
-    source = policy if isinstance(policy, Mapping) else {}
-    private = source.get("private", False)
-    explicit = source.get("explicit", False)
-    if not isinstance(private, bool) or not isinstance(explicit, bool):
-        raise ValueError("Inherited output policy flags must be booleans")
-    if mature_output and not explicit:
-        # An inherited non-explicit policy cannot prove that the originating
-        # caller acknowledged an explicit public result.
-        private = True
-        explicit = True
-    elif mature_output:
-        explicit = True
+    private = explicit if requested_private is None else requested_private
     return {
         "private": private,
         "explicit": explicit,

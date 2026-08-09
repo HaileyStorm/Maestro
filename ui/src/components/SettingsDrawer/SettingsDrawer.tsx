@@ -46,11 +46,11 @@ export function SettingsDrawer() {
       )}
 
       {/* Drawer */}
-      <div className={`fixed top-0 left-0 h-full w-full md:w-[420px] bg-bg-secondary border-r border-border z-50 transform transition-transform duration-300 ease-in-out ${
+      <div className={`fixed top-0 left-0 flex h-[100dvh] w-full flex-col border-r border-border bg-bg-secondary pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)] z-50 transform transition-transform duration-300 ease-in-out md:w-[420px] ${
         settingsOpen ? 'translate-x-0' : '-translate-x-full'
       }`}>
         {/* Header */}
-        <div className="px-5 py-3 border-b border-border flex items-center justify-between">
+        <div className="shrink-0 px-5 py-3 border-b border-border flex items-center justify-between">
           <h2 className="font-semibold text-sm">Settings</h2>
           <button
             onClick={() => setSettingsOpen(false)}
@@ -61,7 +61,7 @@ export function SettingsDrawer() {
         </div>
 
         {/* Tab Bar */}
-        <div className="px-5 pt-3">
+        <div className="shrink-0 px-5 pt-3">
           <div className="flex bg-bg-tertiary rounded-lg p-0.5 border border-border">
             {tabs.map(tab => (
               <button
@@ -80,7 +80,7 @@ export function SettingsDrawer() {
         </div>
 
         {/* Content */}
-        <div className="overflow-y-auto h-[calc(100%-96px)] px-5 py-4 space-y-5">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-4 space-y-5 [-webkit-overflow-scrolling:touch]">
           {settingsTab === 'performance' && (
             <SystemSettingsPanel />
           )}

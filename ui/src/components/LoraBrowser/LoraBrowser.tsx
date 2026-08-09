@@ -58,26 +58,6 @@ export function LoraBrowser() {
   // LoRA (adapter) vs Checkpoint (full model) browse mode. Checkpoint mode
   // searches CivitAI Checkpoints and imports them as finetune model variants.
   const [browseKind, setBrowseKind] = useState<'lora' | 'checkpoint'>('lora')
-  // Sticky across sessions (localStorage) — the master nsfw_mode gate below
-  // still applies, so a persisted "on" is inert until Mature Mode is enabled.
-  const [nsfw, setNsfw] = useState(() => {
-    try { return localStorage.getItem('maestro_civitai_nsfw') === '1' } catch { return false }
-  })
-  const setNsfwSticky = (v: boolean) => {
-    setNsfw(v)
-    try { localStorage.setItem('maestro_civitai_nsfw', v ? '1' : '0') } catch { /* private mode */ }
-  }
-  // Master gate from Settings → Services. NSFW filter UI + data flow
-  // is only honored when the user has enabled NSFW mode (which itself
-  // requires the disclaimer acknowledgement). Without this gate, the
-  // checkbox would tease users who haven't opted in, and the CivitAI
-  // API would return NSFW results to a user who shouldn't see them.
-  const nsfwEnabled = !!useStore(s => s.servicesConfig?.nsfw_mode)
-  // Effective NSFW value: only true when both the master gate AND the
-  // local checkbox are on. Used everywhere instead of raw `nsfw` so
-  // disabling NSFW mode in services immediately suppresses NSFW
-  // content even if the local checkbox happens to still be checked.
-  const effectiveNsfw = nsfwEnabled && nsfw
   const [modelFilters, setModelFilters] = useState<CivitAIModelFilter[]>([])
   const [scanning, setScanning] = useState(false)
   const [scanProgress, setScanProgress] = useState('')
@@ -181,9 +161,7 @@ export function LoraBrowser() {
   const doSearch = useCallback((append = false) => {
     const params: Record<string, unknown> = {
       sort, period,
-      // Send the effective NSFW value (false when master gate is off,
-      // even if local checkbox is checked from a prior session).
-      nsfw: effectiveNsfw,
+      nsfw: true,
       types: browseKind === 'checkpoint' ? 'Checkpoint' : 'LORA',
       limit: 20,
     }
@@ -196,18 +174,15 @@ export function LoraBrowser() {
     if (activeFilter?.civitai_base && !activeFilter?.search_query) params.baseModels = activeFilter.civitai_base
     if (append && cursor) params.cursor = cursor
     search(params, append)
-  }, [query, sort, period, activeFilter, effectiveNsfw, cursor, search, browseKind])
+  }, [query, sort, period, activeFilter, cursor, search, browseKind])
 
-  // Debounced search on filter changes — also re-runs when the master
-  // NSFW gate toggles (nsfwEnabled), so disabling NSFW in services
-  // refreshes the result set immediately instead of leaving stale
-  // NSFW thumbnails on screen.
+  // Debounced search on ordinary query and catalog-filter changes.
   useEffect(() => {
     if (!open) return
     clearTimeout(searchTimeoutRef.current)
     searchTimeoutRef.current = setTimeout(() => doSearch(), 300)
     return () => clearTimeout(searchTimeoutRef.current)
-  }, [query, sort, period, selectedFilter, effectiveNsfw, nsfwEnabled, browseKind]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [query, sort, period, selectedFilter, browseKind]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Infinite scroll sentinel
   useEffect(() => {
@@ -498,22 +473,6 @@ export function LoraBrowser() {
             {modelFilters.map(f => <option key={f.label} value={f.label}>{f.label}</option>)}
           </select>
 
-          {/* NSFW filter checkbox is only rendered when the user has
-              enabled NSFW mode in Settings → Services. Without that
-              opt-in, the entire affordance is hidden — both for the
-              CivitAI search and the installed-LoRA view. */}
-          {nsfwEnabled && (
-          <label className="flex items-center gap-1.5 text-xs text-text-secondary cursor-pointer shrink-0">
-            <input
-              type="checkbox"
-              checked={nsfw}
-              onChange={e => setNsfwSticky(e.target.checked)}
-              className="w-3.5 h-3.5 rounded accent-red-500"
-            />
-            NSFW
-          </label>
-          )}
-
           {/* Updatable-only filter — only meaningful in the My LoRAs
               view, so we render it conditionally to avoid clutter while
               the user is browsing CivitAI. Same UX shape as the
@@ -654,11 +613,6 @@ export function LoraBrowser() {
             ) : (() => {
               // Filter installed LoRAs by active model filter and search query
               const filtered = installedLoras.filter(lora => {
-                // Filter by NSFW — when the master gate is off OR the
-                // local checkbox is unchecked, hide NSFW LoRAs.
-                // Uses effectiveNsfw so disabling NSFW in services
-                // immediately suppresses NSFW items in this view too.
-                if (!effectiveNsfw && lora.nsfw) return false
                 // Filter by update availability — when "Updates" is on,
                 // only LoRAs with update_status === 'available' pass
                 if (updatableOnly && lora.update_status !== 'available') return false

@@ -1057,7 +1057,6 @@ class DirectorRecoveryTests(unittest.TestCase):
                     or {"status": "completed"}
                 )
             ),
-            "_classify_director_maturity": lambda _body: False,
             "_http_output_policy_from_request": (
                 lambda *_args, **_kwargs: {
                     "private": True,

@@ -6,14 +6,12 @@ import { BookMarked, Loader2 } from 'lucide-react'
  * recipe. The output's sidecar supplies model + LoRAs + settings and the
  * media supplies the thumbnail; the user just names it.
  */
-export function SaveRecipeDialog({ defaultNsfw, onSave, onCancel }: {
-  defaultNsfw: boolean
+export function SaveRecipeDialog({ onSave, onCancel }: {
   onSave: (name: string, description: string, nsfw: boolean) => Promise<void>
   onCancel: () => void
 }) {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
-  const [nsfw, setNsfw] = useState(defaultNsfw)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -21,7 +19,7 @@ export function SaveRecipeDialog({ defaultNsfw, onSave, onCancel }: {
     if (!name.trim() || saving) return
     setSaving(true); setError(null)
     try {
-      await onSave(name.trim(), description.trim(), nsfw)
+      await onSave(name.trim(), description.trim(), false)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Save failed')
       setSaving(false)
@@ -60,11 +58,6 @@ export function SaveRecipeDialog({ defaultNsfw, onSave, onCancel }: {
           rows={2}
           className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue resize-none mb-3"
         />
-
-        <label className="flex items-center gap-2 cursor-pointer mb-4">
-          <input type="checkbox" checked={nsfw} onChange={e => setNsfw(e.target.checked)} className="accent-accent-blue" />
-          <span className="text-[11px] text-text-secondary">Mature recipe (hidden unless mature mode is on)</span>
-        </label>
 
         {error && <div className="text-[11px] text-red-400 mb-3">{error}</div>}
 

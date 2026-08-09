@@ -8,6 +8,7 @@ import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecov
 import { useStore } from '../../stores/useStore'
 import type { GenerationJob } from '../../types'
 import * as api from '../../api/client'
+import { boundedBackoffDelay, POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
 
 const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
@@ -23,7 +24,9 @@ function h3EstimatedRuntime(job: GenerationJob): number | null {
   const estimate = job.h3Estimate
   if (!estimate) return null
   const run = Number(estimate.seconds || 0)
-  const load = Number(estimate.model_load_seconds || 0)
+  const load = estimate.model_load_state === 'resident'
+    ? 0
+    : Number(estimate.model_load_seconds || 0)
   const total = run + load
   return Number.isFinite(total) && total > 0 ? total : null
 }
@@ -705,7 +708,9 @@ function JobPlaceholder({
             {!isFailed && !recoveryBlocked && (
               <p className="mt-1 text-[10px] text-text-secondary">
                 {queuedH3Runtime != null
-                  ? `Estimated runtime ${compactEta(queuedH3Runtime)} after start`
+                  ? job.h3SegmentPlan?.segments.length
+                    ? `Planned time ${compactEta(queuedH3Runtime)} after start`
+                    : `Estimated time ${compactEta(queuedH3Runtime)} after start`
                   : `Overall ETA ${compactEta(job.etaSeconds)}`}
                 {job.status === 'running' && hasWindows && job.modelType?.startsWith('minimax_h3')
                     ? ` · Current segment ETA ${compactEta(job.subtaskEtaSeconds)}`
@@ -775,7 +780,7 @@ function JobPlaceholder({
                 Step {job.step}/{job.totalSteps}
               </p>
             )}
-            {(job.activeWindowPrompt || job.promptPreview) && (
+            {!job.modelType?.startsWith('minimax_h3') && (job.activeWindowPrompt || job.promptPreview) && (
               <div className="mt-2 rounded-md border border-border bg-bg-secondary/80 px-2.5 py-2 text-left">
                 <p className="text-[9px] uppercase tracking-wide text-text-muted mb-1">
                   {job.activeWindowPrompt && hasWindows ? `Active ${progressUnit.toLowerCase()} prompt` : 'Prompt'}
@@ -793,7 +798,7 @@ function JobPlaceholder({
             {!!job.h3SegmentPlan?.segments.length && !isFailed && (
               <div className="mt-2 rounded-md border border-border bg-bg-secondary/80 px-2.5 py-2 text-left">
                 <div className="mb-1.5 flex items-center justify-between text-[9px] uppercase tracking-wide text-text-muted">
-                  <span>Adaptive H3 plan</span>
+                  <span>Planned segments {job.h3SegmentPlan.clip_count}</span>
                   <span>{job.h3SegmentPlan.checkpoint_switches} model switch{job.h3SegmentPlan.checkpoint_switches === 1 ? '' : 'es'}</span>
                 </div>
                 <div className="flex gap-1 overflow-x-auto pb-0.5">
@@ -801,10 +806,14 @@ function JobPlaceholder({
                     const active = (job.windowCurrent || 0) === segment.index
                     const ref2va = segment.model_type === 'minimax_h3_ref2va'
                     const boundary = segment.boundary_from_previous?.type
+                    const generatedFrames = segment.generated_frames ?? segment.frames
+                    const publishedFrames = segment.published_frames ?? generatedFrames
+                    const generatedSeconds = segment.generated_duration_seconds ?? segment.duration_seconds
+                    const publishedSeconds = segment.published_duration_seconds ?? generatedSeconds
                     return (
                       <div
                         key={segment.index}
-                        title={`Segment ${segment.index}: ${ref2va ? 'Ref2VA' : 'FL2VA'} · ${segment.model_reason}${boundary ? ` · ${boundary}` : ''}`}
+                        title={`Segment ${segment.index}: ${ref2va ? 'Ref2VA' : 'FL2VA'} · ${publishedSeconds.toFixed(2)}s published (${publishedFrames}f)${generatedFrames !== publishedFrames ? ` · ${generatedSeconds.toFixed(2)}s generated (${generatedFrames}f)` : ''} · ${segment.model_reason}${boundary ? ` · ${boundary}` : ''}`}
                         className={`min-w-[44px] rounded border px-1.5 py-1 text-center transition-colors ${
                           active ? 'border-white/70 ring-1 ring-white/30' : 'border-transparent'
                         } ${ref2va ? 'bg-violet-500/25 text-violet-200' : 'bg-sky-500/25 text-sky-200'}`}
@@ -1353,10 +1362,12 @@ export function MainContent() {
   const openQueueAfterSubmit = useStore(s => s.openQueueAfterSubmit)
   const accessContext = useStore(s => s.accessContext)
   const loadAccessContext = useStore(s => s.loadAccessContext)
+  const reconcileQueueState = useStore(s => s.reconcileQueueState)
   const [shareCopied, setShareCopied] = useState(false)
   const [mainView, setMainView] = useState<'gallery' | 'queue' | 'chat'>('gallery')
   const [queueTabState, setQueueTabState] = useState<api.QueueState | null>(null)
   const [queueTabError, setQueueTabError] = useState<string | null>(null)
+  const [accessPollAttempt, setAccessPollAttempt] = useState(0)
   const queuePollSequence = useRef(0)
   const queuePollAbort = useRef<AbortController | null>(null)
   const seenJobIds = useRef(new Set(jobs.map(job => job.id).filter(Boolean)))
@@ -1377,14 +1388,17 @@ export function MainContent() {
     if (newActiveJob && openQueueAfterSubmit) setMainView('queue')
   }, [jobs, openQueueAfterSubmit])
 
-  const refreshQueue = useCallback(async () => {
+  const refreshQueue = useCallback(async (pollSignal?: AbortSignal) => {
     const sequence = ++queuePollSequence.current
     queuePollAbort.current?.abort()
     const controller = new AbortController()
     queuePollAbort.current = controller
+    const relayAbort = () => controller.abort()
+    pollSignal?.addEventListener('abort', relayAbort, { once: true })
     try {
       const next = await api.fetchQueueState(controller.signal)
       if (sequence !== queuePollSequence.current || controller.signal.aborted) return
+      reconcileQueueState(next)
       setQueueTabState(next)
       setQueueTabError(null)
     } catch (reason) {
@@ -1395,39 +1409,58 @@ export function MainContent() {
       )
       throw reason
     } finally {
+      pollSignal?.removeEventListener('abort', relayAbort)
       if (queuePollAbort.current === controller) queuePollAbort.current = null
     }
-  }, [])
+  }, [reconcileQueueState])
 
   useEffect(() => {
-    const refresh = () => void refreshQueue().catch(() => {})
+    const refresh = () => {
+      if (!document.hidden) void refreshQueue().catch(() => {})
+    }
     window.addEventListener(QUEUE_REFRESH_EVENT, refresh)
     return () => window.removeEventListener(QUEUE_REFRESH_EVENT, refresh)
   }, [refreshQueue])
 
-  useEffect(() => {
-    void refreshQueue().catch(() => {})
-    const timer = window.setInterval(
-      () => void refreshQueue().catch(() => {}),
-      2000,
-    )
-    return () => {
+  const activeQueueJobs = jobs.filter(job => job.status === 'queued' || job.status === 'running')
+  const queueActiveTotal = queueTabState?.summary.active_total ?? 0
+  const queueActivity = activeQueueJobs.length > 0 || queueActiveTotal > 0
+
+  useVisibilityPolling(
+    refreshQueue,
+    queueActivity
+      ? POLL_INTERVAL_MS.queueActiveVisible
+      : POLL_INTERVAL_MS.queueIdleVisible,
+  )
+
+  useEffect(() => () => {
       queuePollSequence.current += 1
       queuePollAbort.current?.abort()
       queuePollAbort.current = null
-      window.clearInterval(timer)
+  }, [])
+
+  const accessContextPending = !accessContext?.remote
+    && accessContext?.cloudflare_enabled === true
+    && !accessContext.share_url
+  const refreshAccessContext = useCallback(async () => {
+    try {
+      await loadAccessContext()
+    } finally {
+      setAccessPollAttempt(attempt => Math.min(attempt + 1, 16))
     }
-  }, [refreshQueue])
+  }, [loadAccessContext])
 
   useEffect(() => {
-    if (accessContext?.remote || !accessContext?.cloudflare_enabled || accessContext.share_url) return
-    const timer = window.setInterval(() => void loadAccessContext(), 2500)
-    return () => window.clearInterval(timer)
-  }, [accessContext?.remote, accessContext?.cloudflare_enabled, accessContext?.share_url, loadAccessContext])
+    if (!accessContextPending) setAccessPollAttempt(0)
+  }, [accessContextPending])
 
-  const activeQueueJobs = jobs.filter(job => job.status === 'queued' || job.status === 'running')
+  useVisibilityPolling(
+    refreshAccessContext,
+    boundedBackoffDelay(accessPollAttempt),
+    { enabled: accessContextPending, immediate: false },
+  )
+
   const currentJob = activeQueueJobs.find(job => job.status === 'running')
-  const queueActiveTotal = queueTabState?.summary.active_total ?? 0
   const queueStateLabel = (queueTabState?.summary.running ?? (currentJob ? 1 : 0)) > 0
     ? (queueTabState?.pause_after_current ? 'running · pause next' : 'running')
     : queueTabState?.paused
@@ -1797,8 +1830,10 @@ export function MainContent() {
                     Follow preparation status on the generation card.
                   </p>
                   <button
+                    type="button"
                     onClick={() => useStore.getState().setRecipesOpen(true)}
                     className="mt-1 flex items-center gap-1.5 px-3 py-1.5 text-xs bg-accent-blue/10 border border-accent-blue/30 rounded-lg text-accent-blue hover:bg-accent-blue/20 transition-colors"
+                    aria-label="Browse recipes"
                   >
                     <BookMarked size={13} /> Browse recipes
                   </button>

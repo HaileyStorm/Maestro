@@ -2702,8 +2702,8 @@ class TestModelVisibilityPersistence(unittest.TestCase):
         self.assertIn("updateModelVisibility", client)
         self.assertIn("api.fetchModelVisibility()", store)
         self.assertIn("api.updateModelVisibility(payload)", store)
-        self.assertIn("initialized_mature_models", store)
-        self.assertIn("_enableUninitializedMatureModels", store)
+        self.assertNotIn("initialized_mature_models", store)
+        self.assertNotIn("_enableUninitializedMatureModels", store)
         self.assertNotIn("for (const mt of nsfwModels)", store)
 
 
@@ -2763,11 +2763,10 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
         self.assertIn("loraWeights: { ...settings.lora_weights }", profile_block)
         self.assertIn("tea_cache: settings.tea_cache", profile_block)
         self.assertIn("'h3_turbo_profile'", store)
-        # Profiles remain editable bundles, but choosing one that contains a
-        # mature model/LoRA must apply the same safe per-job defaults as the
-        # direct selectors.
-        self.assertIn("_modelTypeIsMature(state, target)", profile_block)
-        self.assertIn("explicitOutput: true, privateOutput: true", profile_block)
+        # Profiles remain editable bundles and do not infer publication
+        # policy from model or LoRA metadata.
+        self.assertNotIn("_modelTypeIsMature", profile_block)
+        self.assertNotIn("explicitOutput: true, privateOutput: true", profile_block)
         self.assertNotIn("nsfw_mode:", profile_block)
 
     def test_plan_checkpoint_reconciliation_refreshes_pending_submission(self):

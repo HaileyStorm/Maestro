@@ -519,6 +519,76 @@ def plan_h3_clip_frames(
     return density_weighted(preferred_plan), policy
 
 
+def estimate_h3_segment_count(
+    total_frames: int,
+    *,
+    prompt: str,
+    fps: float,
+    minimum_frames: int,
+    maximum_frames: int,
+    align_frame_count,
+    profile_id: str = "high",
+    manual_segment_ceiling: bool = False,
+    published_total_frames: int | None = None,
+) -> dict[str, Any]:
+    """Summarize deterministic H3 geometry without inventing a second plan.
+
+    A present prompt is enough to run the exact shared planner, including its
+    authored-timestamp and prompt-beat behavior.  With no prompt there is no
+    honest way to know how many later authored beats will justify shorter
+    shots, so report the ordinary plan as ``likely`` and the full legal range
+    permitted by the model minimum.  The range is derived from model geometry,
+    never from a multiplier applied to the likely count.
+    """
+
+    planned, policy = plan_h3_clip_frames(
+        total_frames,
+        prompt=prompt,
+        fps=fps,
+        minimum_frames=minimum_frames,
+        maximum_frames=maximum_frames,
+        align_frame_count=align_frame_count,
+        profile_id=profile_id,
+        manual_segment_ceiling=manual_segment_ceiling,
+        published_total_frames=published_total_frames,
+    )
+    likely = len(planned)
+    if str(prompt or "").strip():
+        source = (
+            "deterministic_authored_timeline"
+            if policy.get("reason") == "authored timestamps are authoritative"
+            else "deterministic_prompt_beats"
+        )
+        return {
+            "minimum": likely,
+            "maximum": likely,
+            "likely": likely,
+            "source": source,
+            "confidence": "high",
+            "reason": str(policy.get("reason") or "shared deterministic H3 plan"),
+        }
+
+    visible_frames = max(
+        1,
+        int(
+            published_total_frames
+            if published_total_frames is not None else total_frames
+        ),
+    )
+    legal_maximum = max(likely, visible_frames // max(1, int(minimum_frames)))
+    return {
+        "minimum": likely,
+        "maximum": legal_maximum,
+        "likely": likely,
+        "source": "duration_profile_model_grid",
+        "confidence": "low",
+        "reason": (
+            "No prompt beats or timestamps are available yet; the range spans "
+            "legal model-grid plans under the selected profile and segment ceiling."
+        ),
+    }
+
+
 def _partition_untimed_prompt(prompt: str, frame_counts: Sequence[int]) -> list[str]:
     count = len(frame_counts)
     units, context, final_blocking = _untimed_units(prompt, count)

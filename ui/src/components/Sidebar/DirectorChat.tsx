@@ -1,11 +1,11 @@
 import { useState, useCallback, useRef, useMemo, useEffect } from 'react'
 import { Upload, Loader2, Music, RotateCcw, Check, X, ChevronRight, ChevronDown, ImageIcon, Play, Film, Mic, Sparkles, Send, Users, FileText, Clock } from 'lucide-react'
 import { useStore, getFamiliesForMode, getModelsForFamily, isDirectorPipelineActive, resolveResolution } from '../../stores/useStore'
-import { fetchModelOptions, getFileUrl } from '../../api/client'
+import { estimateH3Performance, fetchDefaults, fetchModelOptions, getFileUrl } from '../../api/client'
 import { DirectorLoraSelector } from '../SettingsDrawer/DirectorLoraSelector'
 import { DirectorSongSetup } from './DirectorSongSetup'
 import { InfoTooltip } from './InfoTooltip'
-import type { DirectorPipelineType, DirectorShotImageGuidance, DirectorSkill, ModelOptions, ShortFilmCharacter, ShortFilmPath } from '../../types'
+import type { DirectorPipelineType, DirectorShotImageGuidance, DirectorSkill, H3SegmentCountEstimate, ModelOptions, ShortFilmCharacter, ShortFilmPath } from '../../types'
 
 // AUDIO_ACCEPT lists both audio formats AND video formats. When a video
 // file is uploaded, the backend's /api/v1/upload-audio endpoint extracts
@@ -174,123 +174,71 @@ function UserBubble({ children }: { children: React.ReactNode }) {
 }
 
 function LlmThinkingStream({ stage }: { stage: string }) {
-  const [streamText, setStreamText] = useState('')
-  const [streamDone, setStreamDone] = useState(false)
+  const pipelineStatus = useStore(s => s.pipelineStatus)
+  const progress = pipelineStatus?.llm_progress ?? null
+  const pipelineActive = isDirectorPipelineActive(pipelineStatus)
   const [expanded, setExpanded] = useState(true)
-  const appendLlmLog = useStore(s => s.directorAppendLlmLog)
-  // Latest stream text, readable from inside the poll loop's closure
-  // (streamText state would be stale there). Used to persist the finished
-  // stream into the chat history on the streaming→done transition.
-  const latestTextRef = useRef('')
-  // Inner scroll container — kept fixed-height so a long thinking
-  // dump doesn't blow up the entire chat panel. Auto-scrolls to the
-  // bottom as new tokens arrive so the user always sees the latest
-  // generation, just like a terminal tail.
   const streamScrollRef = useRef<HTMLDivElement>(null)
+  const partialText = pipelineActive && progress && !progress.done
+    ? progress.partial_text
+    : ''
 
-  // Poll the stream-status endpoint continuously for the lifetime of
-  // the component. Two failure modes have to be handled:
-  //
-  //   1. We mount BEFORE the LLM starts streaming (rare but possible
-  //      when the user clicks a button that kicks off planning). Need
-  //      to wait for `done: false` before treating subsequent
-  //      `done: true` as completion — otherwise we'd flash "done"
-  //      immediately and never show any text.
-  //
-  //   2. Multiple LLM calls happen during the same component mount —
-  //      e.g. short-film story mode where Pass 1 (screenplay) and
-  //      Pass 2 (shot breakdown) both run while the chat sits at
-  //      step='plan'. The previous implementation BROKE the polling
-  //      loop after the first stream finished, so Pass 2 never showed.
-  //      Now we keep polling: when we detect a fresh transition from
-  //      done→streaming, we reset streamText and streamDone so the
-  //      new stream renders cleanly from the top.
-  //
-  // The poll interval (400ms) is unchanged — fine for a streaming
-  // text-display use case, server endpoint is cheap.
-  useEffect(() => {
-    let active = true
-    const poll = async () => {
-      // wasStreaming tracks the last poll's state so we can detect
-      // transitions: streaming→done means current run finished;
-      // done→streaming means a NEW LLM call has started.
-      let wasStreaming = false
-      while (active) {
-        try {
-          const res = await fetch('/api/v1/llm/stream-status')
-          if (res.ok) {
-            const data = await res.json()
-            if (!active) break
-            const isStreaming = !data.done
-            // Transition: fresh stream started (done→streaming).
-            // Mark not-done so the "thinking" indicator returns.
-            // We don't wipe streamText here — the streamText update
-            // below replaces it with the new stream's first tokens
-            // in the same render, avoiding a flash of empty content.
-            if (!wasStreaming && isStreaming) {
-              setStreamDone(false)
-            }
-            // Transition: stream just finished (streaming→done).
-            // Keep the final text visible, just stop the indicator —
-            // and persist the completed stream into the chat history so
-            // it survives this component unmounting at the next step.
-            if (wasStreaming && !isStreaming) {
-              setStreamDone(true)
-              appendLlmLog(stage, data.text || latestTextRef.current)
-            }
-            // While actively streaming, push every chunk into state so
-            // the user sees text grow live. Skip when idle so we don't
-            // overwrite the previous stream's final text with stale or
-            // empty backend buffer between runs.
-            if (isStreaming) {
-              setStreamText(data.text || '')
-              latestTextRef.current = data.text || ''
-            }
-            wasStreaming = isStreaming
-          }
-        } catch { /* ignore — endpoint unreachable, retry next tick */ }
-        await new Promise(r => setTimeout(r, 400))
-      }
-    }
-    poll()
-    return () => { active = false }
-  }, [stage, appendLlmLog])
-
-  // Auto-scroll the inner preview box to its bottom whenever new
-  // tokens arrive. Uses scrollTop (NOT scrollIntoView) so we don't
-  // also drag the outer chat panel — this is a self-contained tail.
+  // Auto-tail only the bounded preview; never move the outer chat viewport.
   useEffect(() => {
     const el = streamScrollRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [streamText])
+  }, [partialText])
+
+  if (!progress || (!pipelineActive && !progress.done)) return null
 
   // Separate thinking from output
-  const thinkMatch = streamText.match(/<think>([\s\S]*?)(<\/think>|$)/)
+  const thinkMatch = partialText.match(/<think>([\s\S]*?)(<\/think>|$)/)
   const thinking = thinkMatch ? thinkMatch[1].trim() : ''
   const isStillThinking = thinkMatch ? !thinkMatch[2].includes('</think>') : false
-  const output = streamText.replace(/<think>[\s\S]*?(<\/think>|$)/, '').trim()
-
-  const displayText = thinking || output || ''
-  if (!displayText) return null
+  const output = partialText.replace(/<think>[\s\S]*?(<\/think>|$)/, '').trim()
+  const hasPartial = Boolean(thinking || output)
+  const humanize = (value: string) => value.replace(/_/g, ' ')
+  const passLabel = humanize(progress.pass || 'LLM pass')
+  const phaseLabel = humanize(progress.phase || stage)
+  const activityLabel = humanize(progress.activity || (progress.done ? 'complete' : 'starting'))
+  const attemptLabel = `attempt ${progress.attempt} of ${progress.attempt_limit}`
+  const statusLabel = `${phaseLabel} · ${passLabel} · ${activityLabel} · ${attemptLabel}`
+  const metrics: string[] = []
+  if (progress.generated_tokens_approx > 0) metrics.push(`~${progress.generated_tokens_approx} tokens`)
+  if (progress.elapsed_seconds > 0) metrics.push(`${progress.elapsed_seconds.toFixed(1)}s`)
+  if (!progress.done && progress.live_tps != null) metrics.push(`${progress.live_tps.toFixed(1)} live tok/s`)
+  if (progress.average_tps != null) metrics.push(`${progress.average_tps.toFixed(1)} ${progress.done ? 'final' : 'average'} tok/s`)
 
   return (
     <div className="mt-2">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1 text-[10px] text-text-muted hover:text-text-secondary transition-colors"
-      >
-        {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-        {isStillThinking ? 'Thinking...' : thinking && !output ? 'Thinking complete' : output ? 'Writing scenes...' : 'LLM Output'}
-      </button>
-      {expanded && (
-        // Fixed-height preview box. It's a "what's happening right now"
-        // tail, not a full transcript — capping the height keeps the
-        // chat scroll position stable while the LLM streams long
-        // thinking dumps. Inner scroll auto-tails to the bottom (see
-        // streamScrollRef effect above).
+      <span role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {`Director ${statusLabel}`}
+      </span>
+      <div className="flex items-start justify-between gap-2">
+        {hasPartial ? (
+          <button
+            onClick={() => setExpanded(!expanded)}
+            className="flex min-w-0 items-center gap-1 text-left text-[10px] text-text-muted hover:text-text-secondary transition-colors"
+            aria-expanded={expanded}
+          >
+            {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+            <span>{statusLabel}</span>
+          </button>
+        ) : (
+          <span className="text-[10px] text-text-muted">{statusLabel}</span>
+        )}
+        {metrics.length > 0 && (
+          <span className="shrink-0 text-right text-[9px] text-text-muted">
+            {metrics.join(' · ')}
+          </span>
+        )}
+      </div>
+      {expanded && hasPartial && (
         <div
           ref={streamScrollRef}
           className="mt-1 rounded bg-bg-primary/50 border border-border/30 p-2 max-h-32 overflow-y-auto"
+          aria-label="Live Director model output preview"
+          aria-live="off"
         >
           {thinking && (
             <pre className="text-[10px] text-text-muted whitespace-pre-wrap font-mono leading-relaxed">
@@ -301,53 +249,11 @@ function LlmThinkingStream({ stage }: { stage: string }) {
           {output && (
             <pre className="text-[10px] text-accent-blue/70 whitespace-pre-wrap font-mono leading-relaxed mt-1 pt-1 border-t border-border/30">
               {output}
-              {!streamDone && !isStillThinking && <span className="animate-pulse">|</span>}
+              {!progress.done && !isStillThinking && <span className="animate-pulse">|</span>}
             </pre>
           )}
         </div>
       )}
-    </div>
-  )
-}
-
-/** Collapsed, persistent record of completed LLM streams for one stage.
- *  Replaces the old behavior where the thinking/output box vanished the
- *  moment a stage finished. Default-collapsed so history stays compact. */
-function LlmLogStage({ stage, label }: { stage: string; label: string }) {
-  const log = useStore(s => s.directorLlmLog)
-  const [openIdx, setOpenIdx] = useState<number | null>(null)
-  const entries = log.filter(e => e.stage === stage)
-  if (entries.length === 0) return null
-  return (
-    <div className="space-y-1">
-      {entries.map((entry, i) => {
-        const open = openIdx === i
-        // Same thinking/output split as the live stream box
-        const thinkMatch = entry.text.match(/<think>([\s\S]*?)(<\/think>|$)/)
-        const thinking = thinkMatch ? thinkMatch[1].trim() : ''
-        const output = entry.text.replace(/<think>[\s\S]*?(<\/think>|$)/, '').trim()
-        return (
-          <div key={i}>
-            <button
-              onClick={() => setOpenIdx(open ? null : i)}
-              className="flex items-center gap-1 text-[10px] text-text-muted hover:text-text-secondary transition-colors"
-            >
-              {open ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-              {label}{entries.length > 1 ? ` · pass ${i + 1}` : ''} (done)
-            </button>
-            {open && (
-              <div className="mt-1 rounded bg-bg-primary/50 border border-border/30 p-2 max-h-48 overflow-y-auto">
-                {thinking && (
-                  <pre className="text-[10px] text-text-muted whitespace-pre-wrap font-mono leading-relaxed">{thinking}</pre>
-                )}
-                {output && (
-                  <pre className={`text-[10px] text-accent-blue/70 whitespace-pre-wrap font-mono leading-relaxed ${thinking ? 'mt-1 pt-1 border-t border-border/30' : ''}`}>{output}</pre>
-                )}
-              </div>
-            )}
-          </div>
-        )
-      })}
     </div>
   )
 }
@@ -430,8 +336,9 @@ export function DirectorChat() {
   const shortFilmNarrative = useStore(s => s.shortFilmNarrative)
   const shortFilmSetNarrative = useStore(s => s.shortFilmSetNarrative)
   const startDirectorPipeline = useStore(s => s.startDirectorPipeline)
-  const pipelinePhase = useStore(s => s.pipelineStatus?.phase)
-  const pipelineActive = useStore(s => isDirectorPipelineActive(s.pipelineStatus))
+  const pipelineStatus = useStore(s => s.pipelineStatus)
+  const pipelinePhase = pipelineStatus?.phase
+  const pipelineActive = isDirectorPipelineActive(pipelineStatus)
 
   const isShortFilm = skill === 'short_film'
   const isStoryPath = isShortFilm && shortFilmPath === 'story'
@@ -840,6 +747,19 @@ export function DirectorChat() {
           </div>
         )}
 
+        {/* Exact-pipeline, process-memory-only LLM telemetry. This is the one
+            live view for every Director pass and remains aggregate-only once
+            the backend clears its bounded partial at pass completion. */}
+        {pipelineStatus?.llm_progress
+          && (pipelineActive || pipelineStatus.llm_progress.done) && (
+          <SystemBubble>
+            <LlmThinkingStream
+              key={`${pipelineStatus.id}:${pipelineStatus.llm_progress.pass}:${pipelineStatus.llm_progress.attempt}`}
+              stage={step === 'plan_video' ? 'plan video' : 'planning'}
+            />
+          </SystemBubble>
+        )}
+
         {/* Structure step — hidden for story path */}
         {!isStoryPath && (atStep('structure') || pastStep('structure')) && (
           <>
@@ -974,13 +894,7 @@ export function DirectorChat() {
                       : `Writing ${usesShotImages ? 'image' : 'video'} prompts...`}
               </span>
             </div>
-            {pipelinePhase !== 'polishing_prompts' && <LlmThinkingStream stage="plan" />}
           </SystemBubble>
-        )}
-
-        {/* Completed planning streams stay in the chat history */}
-        {(pastStep('plan') || (atStep('plan') && !loading)) && (
-          <LlmLogStage stage="plan" label={usesShotImages ? (isShortFilm ? 'Scene planning' : 'Image prompts') : 'Video-first planning'} />
         )}
 
         {/* Review step (image prompts) */}
@@ -1018,13 +932,7 @@ export function DirectorChat() {
               <Loader2 size={14} className="animate-spin text-accent-blue" />
               <span className="text-xs text-text-muted">Writing video prompts...</span>
             </div>
-            <LlmThinkingStream stage="plan_video" />
           </SystemBubble>
-        )}
-
-        {/* Completed video-prompt streams stay in the chat history */}
-        {(pastStep('plan_video') || (atStep('plan_video') && !loading) || atStep('review_video')) && (
-          <LlmLogStage stage="plan_video" label="Video prompts" />
         )}
 
         {/* Video review step */}
@@ -2019,6 +1927,23 @@ function DirectorAdvancedAccordion() {
   const maxShotFramesByModel = useStore(s => s.directorVideoMaxShotFramesByModel)
   const setMaxShotFrames = useStore(s => s.setDirectorVideoMaxShotFrames)
   const [videoOptions, setVideoOptions] = useState<ModelOptions | null>(null)
+  const [videoDefaults, setVideoDefaults] = useState<Record<string, unknown>>({})
+  const [h3SegmentEstimate, setH3SegmentEstimate] = useState<H3SegmentCountEstimate | null>(null)
+  const [h3EstimateUnavailable, setH3EstimateUnavailable] = useState(false)
+  const h3EstimateSequence = useRef(0)
+  const directorSceneDescription = useStore(s => s.directorSceneDescription)
+  const directorPlannedClips = useStore(s => s.directorPlannedClips)
+  const directorClipPlans = useStore(s => s.directorClipPlans)
+  const directorAnalysis = useStore(s => s.directorAnalysis)
+  const shortFilmTargetDuration = useStore(s => s.shortFilmTargetDuration)
+  const savedVideoParams = useStore(s => s.savedParamsPerMode.video)
+  const savedVideoLoras = useStore(s => s.savedLoraPerMode.video)
+  const explicitOutput = useStore(s => s.explicitOutput)
+  const directorReferenceCount = useStore(s => (
+    Number(Boolean(s.directorReferenceImage || s.directorReferenceImagePath))
+    + Math.max(s.directorCharacterRefs.length, s.directorCharacterRefPaths.length)
+    + Math.max(s.directorLocationRefs.length, s.directorLocationRefPaths.length)
+  ))
 
   // Image post-processing
   const imgUpsampling = useStore(s => s.directorImageSpatialUpsampling)
@@ -2040,17 +1965,22 @@ function DirectorAdvancedAccordion() {
 
   useEffect(() => {
     let current = true
-    fetchModelOptions(videoModel)
-      .then(options => {
+    Promise.all([fetchModelOptions(videoModel), fetchDefaults(videoModel)])
+      .then(([options, defaults]) => {
         if (!current) return
         setVideoOptions(options)
+        setVideoDefaults(defaults)
         const defaultValue = options.default_num_inference_steps
         if (defaultValue != null && Number.isFinite(defaultValue)) {
           const configured = useStore.getState().directorVideoInferenceStepsByModel[videoModel]
           if (configured == null) setVideoSteps(videoModel, defaultValue)
         }
       })
-      .catch(() => { if (current) setVideoOptions(null) })
+      .catch(() => {
+        if (!current) return
+        setVideoOptions(null)
+        setVideoDefaults({})
+      })
     return () => { current = false }
   }, [setVideoSteps, videoModel])
 
@@ -2085,6 +2015,92 @@ function DirectorAdvancedAccordion() {
     .filter(frames => (frames - frameMinimum) % frameStep === 0 || frames === frameMaximum)
     .sort((left, right) => left - right)
   const selectedMaxShotFrames = maxShotFramesByModel[videoModel]
+  const h3DirectorModel = videoModel.startsWith('minimax_h3')
+  const directorEstimateScenes = useMemo(() => directorPlannedClips.map((clip, index) => ({
+    duration_seconds: Math.max(0, Number(clip.end) - Number(clip.start)),
+    prompt: directorClipPlans[index]?.video_prompt
+      || clip.suggested_prompt_hint
+      || directorSceneDescription,
+  })).filter(scene => scene.duration_seconds > 0), [
+    directorClipPlans, directorPlannedClips, directorSceneDescription,
+  ])
+  const plannedDirectorDuration = directorEstimateScenes.reduce(
+    (total, scene) => total + scene.duration_seconds,
+    0,
+  )
+  const directorDuration = plannedDirectorDuration
+    || Number(directorAnalysis?.duration || 0)
+    || Number(shortFilmTargetDuration || 0)
+  const matchingVideoParams = useMemo(
+    () => savedVideoParams?.model_type === videoModel ? savedVideoParams : {},
+    [savedVideoParams, videoModel],
+  )
+
+  useEffect(() => {
+    const sequence = ++h3EstimateSequence.current
+    if (!h3DirectorModel || !activeVideoOptions || directorDuration <= 0) {
+      return
+    }
+    const timer = window.setTimeout(() => {
+      setH3SegmentEstimate(null)
+      setH3EstimateUnavailable(false)
+      const customSettings = (
+        matchingVideoParams.custom_settings
+        || videoDefaults.custom_settings
+        || {}
+      ) as Record<string, unknown>
+      void estimateH3Performance({
+        model_type: videoModel,
+        duration_seconds: directorDuration,
+        window_seconds: (selectedMaxShotFrames || frameMaximum) / (activeVideoOptions.fps || 24),
+        window_overlap: 0,
+        prompt: directorPlannedClips.length ? '' : directorSceneDescription,
+        segment_scenes: directorEstimateScenes.length ? directorEstimateScenes : undefined,
+        h3_adaptive_conditioning: true,
+        manual_segment_ceiling: selectedMaxShotFrames != null,
+        num_inference_steps: videoSteps,
+        resolution: String(matchingVideoParams.resolution || videoDefaults.resolution || '1344x768'),
+        custom_settings: customSettings,
+        activated_loras: [...(savedVideoLoras?.activated_loras || [])],
+        loras_multipliers: savedVideoLoras?.loras_multipliers || '',
+        tea_cache: Number(matchingVideoParams.tea_cache ?? videoDefaults.tea_cache ?? 0),
+        spatial_upsampling: vidUpsampling,
+        delivery_resolution: String(matchingVideoParams.delivery_resolution || ''),
+        delivery_fit: String(matchingVideoParams.delivery_fit || ''),
+        reference_shape: {
+          has_start: false,
+          has_end: false,
+          image_count: directorReferenceCount,
+          video_count: 0,
+          audio_count: directorAnalysis ? 1 : 0,
+        },
+        explicit_output: explicitOutput,
+      }).then(response => {
+        if (sequence === h3EstimateSequence.current) {
+          setH3SegmentEstimate(response.segment_count_estimate)
+          setH3EstimateUnavailable(false)
+        }
+      }).catch(() => {
+        if (sequence === h3EstimateSequence.current) {
+          setH3SegmentEstimate(null)
+          setH3EstimateUnavailable(true)
+        }
+      })
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [
+    activeVideoOptions, directorAnalysis, directorDuration, directorEstimateScenes,
+    directorPlannedClips, directorReferenceCount, directorSceneDescription,
+    explicitOutput, frameMaximum, h3DirectorModel,
+    matchingVideoParams, savedVideoLoras, selectedMaxShotFrames, vidUpsampling,
+    videoDefaults, videoModel, videoSteps,
+  ])
+
+  const directorSegmentEstimateLabel = h3SegmentEstimate
+    ? h3SegmentEstimate.minimum === h3SegmentEstimate.maximum
+      ? String(h3SegmentEstimate.likely)
+      : `${h3SegmentEstimate.minimum}–${h3SegmentEstimate.maximum} (likely ${h3SegmentEstimate.likely})`
+    : h3EstimateUnavailable ? 'unavailable' : 'calculating…'
 
   const upsamplingOptions = [
     { value: '', label: 'Off' },
@@ -2206,7 +2222,9 @@ function DirectorAdvancedAccordion() {
             </div>
 
             {frameMaximum > frameMinimum && <div>
-              <label className="text-[11px] text-text-secondary block mb-1">Maximum planned shot</label>
+              <label className="text-[11px] text-text-secondary block mb-1">
+                {h3DirectorModel ? 'Maximum segment length' : 'Maximum planned shot'}
+              </label>
               <select
                 value={selectedMaxShotFrames || ''}
                 onChange={e => setMaxShotFrames(videoModel, e.target.value ? Number(e.target.value) : null)}
@@ -2218,8 +2236,17 @@ function DirectorAdvancedAccordion() {
                 ))}
               </select>
               <p className="text-[10px] text-text-muted mt-0.5">
-                Auto uses the selected model/backend safe limit; manual is an expert one-pass cap.
+                {h3DirectorModel
+                  ? selectedMaxShotFrames
+                    ? 'This is an exact ceiling, not a target or average. Director may plan shorter, unequal prompt-driven segments.'
+                    : 'Auto respects authored timing and may plan shorter, unequal segments up to the model-safe ceiling.'
+                  : 'Auto uses the selected model/backend safe limit; manual is an expert one-pass cap.'}
               </p>
+              {h3DirectorModel && directorDuration > 0 && (
+                <p className="mt-1 text-[10px] text-text-muted" title={h3SegmentEstimate?.reason}>
+                  Estimated segments {directorSegmentEstimateLabel}
+                </p>
+              )}
             </div>}
 
             <div>
@@ -2294,7 +2321,7 @@ function DirectorAdvancedAccordion() {
 }
 
 /** Compact model picker for Director — same visibility rules as the Studio
- *  ModelSelector (enabledModels + Mature Mode gate), grouped by family.
+ *  ModelSelector (enabledModels), grouped by family.
  *  Changing it updates selectedModelPerMode, which the pipeline submission
  *  reads AND the LoRA accordions below re-fetch from (their modelType prop). */
 function DirectorModelPicker({ mode, value, onChange }: {
@@ -2305,7 +2332,6 @@ function DirectorModelPicker({ mode, value, onChange }: {
   const models = useStore(s => s.models)
   const families = useStore(s => s.families)
   const enabledModels = useStore(s => s.enabledModels)
-  const nsfwMode = useStore(s => s.servicesConfig?.nsfw_mode ?? false)
   const directorSkill = useStore(s => s.directorSkill)
   const shortFilmPath = useStore(s => s.shortFilmPath)
   const seamless = useStore(s => s.directorSeamless)
@@ -2326,19 +2352,18 @@ function DirectorModelPicker({ mode, value, onChange }: {
   }, [mode, pipelineType, seamless])
 
   useEffect(() => {
-    if (mode !== 'video' || !nsfwMode || h3SelectedProfile === 'custom') return
+    if (mode !== 'video' || h3SelectedProfile === 'custom') return
     void refreshH3Compatibility('minimax_h3_pinkcherry_fl2va')
-  }, [mode, value, nsfwMode, h3SelectedProfile, refreshH3Compatibility])
+  }, [mode, value, h3SelectedProfile, refreshH3Compatibility])
 
   const groups = useMemo(() =>
     getFamiliesForMode(mode, families).map(family => ({
       family,
       models: getModelsForFamily(family.id, models, mode)
         .filter(m => enabledModels.has(m.model_type))
-        .filter(m => !m.nsfw_only || nsfwMode)
         .filter(isCompatible),
     })).filter(g => g.models.length > 0),
-  [mode, families, models, enabledModels, nsfwMode, isCompatible])
+  [mode, families, models, enabledModels, isCompatible])
 
   const compatibleModels = useMemo(() => groups.flatMap(group => group.models), [groups])
   const known = compatibleModels.some(model => model.model_type === value)

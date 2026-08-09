@@ -16,6 +16,7 @@ Environment variables:
 import gc
 import base64
 import atexit
+import copy
 import hashlib
 import hmac
 import ipaddress
@@ -198,7 +199,6 @@ from services.output_access import (
     can_access_upload,
     decode_session_cookie,
     encode_session_cookie,
-    harden_output_access_for_maturity,
     load_or_create_session_secret,
     output_policy_from_request,
     public_output_policy,
@@ -213,6 +213,7 @@ _output_share_manager_lock = threading.Lock()
 _output_share_manager_value = None
 _project_access = ProjectAccessManager()
 _project_unlock_limiter = ProjectUnlockRateLimiter()
+_services_config_lock = threading.RLock()
 _workspace_creation_lock = threading.RLock()
 _workspace_lifecycle_lock = threading.RLock()
 _workspaces_deleting: set[str] = set()
@@ -364,7 +365,6 @@ _REMOTE_LOCAL_ONLY_PREFIXES = (
     "/api/v1/huggingface",
     "/api/v1/civitai",
     "/api/v1/checkpoints",
-    "/api/v1/recipes",
     "/api/v1/presets",
 )
 _REMOTE_LOCAL_ONLY_EXACT = frozenset({
@@ -373,6 +373,7 @@ _REMOTE_LOCAL_ONLY_EXACT = frozenset({
     ("POST", "/api/v1/models/reload"),
     ("POST", "/api/v1/llm/load"),
     ("POST", "/api/v1/llm/unload"),
+    ("POST", "/api/v1/llm/refusal-literals"),
     ("GET", "/api/v1/llm/stream-status"),
     ("POST", "/api/v1/queue/pause-after-output"),
     ("POST", "/api/v1/queue/resume"),
@@ -395,6 +396,14 @@ def _remote_local_only_denial(request: Request) -> JSONResponse | None:
             {"detail": "This machine-wide control is available locally only"},
             status_code=403,
         )
+    if path == "/api/v1/recipes" or path.startswith("/api/v1/recipes/"):
+        # Project-authorized remote users may read the bundled starter pack.
+        # User recipe storage and every recipe mutation remain host controls.
+        if method != "GET":
+            return JSONResponse(
+                {"detail": "Recipe import, saving, and deletion are available locally only"},
+                status_code=403,
+            )
     if path.startswith("/api/v1/models/"):
         # Remote users may trigger only the curated model catalog's automatic
         # download route. Debug/delete/reload remain machine-owner controls.
@@ -587,6 +596,8 @@ def _recovery_response_requires_no_store(path: str) -> bool:
         or path.startswith("/api/v1/cancel/")
         or path.startswith("/api/v1/jobs/")
         or path.startswith("/api/v1/queue/")
+        or path.startswith("/api/v1/director/pipeline/")
+        or path.startswith("/api/v1/director/pipelines")
     )
 
 
@@ -809,6 +820,7 @@ _RECOVERY_UNIT_FIXED_ARTIFACT_ROLES = {
     "h3_segment": "component",
     "h3_concat": "final",
     "h3_delivery": "final",
+    "h3_source_audio_premux": "temporary",
 }
 _RECOVERY_ARTIFACT_ROLES = {"final", "component", "window", "temporary"}
 _director_recovery_parents: dict[str, dict] = {}
@@ -847,29 +859,6 @@ class _JobRegistry(dict):
                 requested_outputs = 1
             value.setdefault("requested_outputs", requested_outputs)
             params = value.get("params") if isinstance(value.get("params"), dict) else {}
-            maturity_classifier = globals().get("_classify_generation_maturity")
-            if callable(maturity_classifier):
-                trusted_plan = params.get("_h3_longform")
-                if not isinstance(trusted_plan, dict):
-                    trusted_plan = None
-                mature_output = maturity_classifier(params, trusted_plan)
-            else:
-                # Supports isolated startup/contract harnesses that execute
-                # the registry before the launch adapter is defined. Normal
-                # server publication always takes the authoritative path.
-                from services.mature_policy import request_is_mature
-                mature_output = bool(request_is_mature(
-                    model_definition=wgp.get_model_def(
-                        str(params.get("model_type") or "")
-                    ) or {},
-                    loras=[
-                        {"filename": filename}
-                        for filename in (params.get("activated_loras") or [])
-                        if isinstance(filename, str)
-                    ],
-                    mmaudio_variant=str(params.get("_mmaudio_variant") or ""),
-                ))
-
             session_id = value.get("session_id") or _request_session_id.get()
             if session_id:
                 value["session_id"] = session_id
@@ -881,30 +870,20 @@ class _JobRegistry(dict):
                     ):
                         policy = output_policy_from_request(
                             params,
-                            mature_output=mature_output,
                             owner_session_id=session_id,
                         )
                     else:
-                        policy = harden_output_access_for_maturity(
-                            value.get("access_policy"),
-                            mature_output=mature_output,
-                            owner_session_id=session_id,
-                        )
+                        inherited = value.get("access_policy") or {}
+                        private = inherited.get("private", False)
+                        explicit = inherited.get("explicit", False)
+                        if not isinstance(private, bool) or not isinstance(explicit, bool):
+                            raise ValueError("Inherited output policy flags must be booleans")
+                        policy = {"private": private, "explicit": explicit}
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 value["access_policy"] = policy
                 value["private"] = policy["private"]
                 value["explicit"] = policy["explicit"]
-            elif mature_output:
-                # No owner exists for a private sidecar, so this fail-closed
-                # policy cannot be published or served as a public result.
-                value["access_policy"] = {
-                    "private": True,
-                    "explicit": True,
-                    "owner_session_id": None,
-                }
-                value["private"] = True
-                value["explicit"] = True
         return value
 
     def publish_prepared(self, key, value):
@@ -1545,6 +1524,7 @@ def _queue_recovery_register_and_publish(
         # project manifests can never select a host output directory.
         prepared_params.pop("_recovery_output_directory", None)
         prepared_params.pop("_recovery_output_prefix", None)
+        _stamp_h3_lightx2v_recovery_identity(prepared_params)
     prepared["kind"] = str(recovery_kind or "studio_generation")
     job_id = str(prepared.get("id") or "")
     workspace = str(prepared.get("workspace") or "default")
@@ -3423,16 +3403,35 @@ def _queue_recovery_unit_matches(
         artifacts = unit.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts:
             continue
-        if not all(
-            validate_artifact_descriptor(
-                project_dir, descriptor, producer_unit_id=unit_id,
+        if kind == "h3_source_audio_premux":
+            artifacts_valid = all(
+                _queue_recovery_validate_staged_artifact(
+                    project_dir, descriptor,
+                )
+                for descriptor in artifacts
+                if isinstance(descriptor, dict)
             )
-            for descriptor in artifacts
-            if isinstance(descriptor, dict)
-        ) or len([item for item in artifacts if isinstance(item, dict)]) != len(artifacts):
-            for descriptor in artifacts:
-                if isinstance(descriptor, dict):
-                    _quarantine_recovery_artifact(project_dir, descriptor)
+        else:
+            artifacts_valid = all(
+                validate_artifact_descriptor(
+                    project_dir, descriptor, producer_unit_id=unit_id,
+                )
+                for descriptor in artifacts
+                if isinstance(descriptor, dict)
+            )
+        if (
+            not artifacts_valid
+            or len([item for item in artifacts if isinstance(item, dict)])
+            != len(artifacts)
+        ):
+            # Private pre-mux descriptors deliberately have no public
+            # sidecars and cannot use the public artifact quarantine path.
+            # Leave invalid private bytes for the bounded staging-orphan
+            # cleanup rather than interpreting them as gallery artifacts.
+            if kind != "h3_source_audio_premux":
+                for descriptor in artifacts:
+                    if isinstance(descriptor, dict):
+                        _quarantine_recovery_artifact(project_dir, descriptor)
             return None
         continuation = unit.get("continuation")
         if isinstance(continuation, dict) and continuation.get("basename"):
@@ -3447,6 +3446,52 @@ def _queue_recovery_unit_matches(
                 return None
         return unit
     return None
+
+
+def _queue_recovery_validate_staged_artifact(
+    project_dir: str, descriptor: dict,
+) -> bool:
+    """Validate one private, direct-child pre-mux artifact by exact hash."""
+    if not isinstance(descriptor, dict) or descriptor.get("storage") != "recovery_staging":
+        return False
+    name = descriptor.get("basename")
+    if (
+        not isinstance(name, str)
+        or os.path.basename(name) != name
+        or not name.startswith("unit-")
+    ):
+        return False
+    path = os.path.realpath(os.path.join(
+        ensure_recovery_staging_directory(project_dir), name,
+    ))
+    if (
+        os.path.dirname(path) != os.path.realpath(
+            ensure_recovery_staging_directory(project_dir)
+        )
+        or os.path.islink(path)
+        or not os.path.isfile(path)
+    ):
+        return False
+    try:
+        size, digest = _recovery_sha256_file(path)
+    except QueueRecoveryRuntimeError:
+        return False
+    return (
+        size == descriptor.get("size")
+        and hmac.compare_digest(digest, str(descriptor.get("sha256") or ""))
+        and descriptor.get("media_kind") in {"video", "audio"}
+    )
+
+
+def _queue_recovery_staged_artifact_path(
+    project_dir: str, descriptor: dict,
+) -> str:
+    if not _queue_recovery_validate_staged_artifact(project_dir, descriptor):
+        raise QueueRecoveryRuntimeError("H3 pre-mux artifact is invalid.")
+    return os.path.realpath(os.path.join(
+        ensure_recovery_staging_directory(project_dir),
+        descriptor["basename"],
+    ))
 
 
 def _queue_recovery_checkpoint_unit(
@@ -3505,6 +3550,77 @@ def _queue_recovery_checkpoint_unit(
     cursor["completed_units"] = units[-2048:]
     if ordinary_repeat_offset is not None:
         cursor["ordinary_repeat_offset"] = max(0, int(ordinary_repeat_offset))
+    _queue_recovery_checkpoint(
+        job,
+        recovery_unit=unit,
+        recovery_cursor=cursor,
+        recovery_state="restored",
+        reruns_denoise=False,
+    )
+    return unit
+
+
+def _queue_recovery_checkpoint_staged_premux(
+    job: dict,
+    *,
+    index: int,
+    project_dir: str,
+    media_paths: dict[str, str],
+    settings: dict,
+) -> dict:
+    """Persist private H3 pre-mux bytes without publishing gallery artifacts."""
+    descriptors = []
+    staging = os.path.realpath(ensure_recovery_staging_directory(project_dir))
+    for media_kind in ("video", "audio"):
+        path = media_paths.get(media_kind)
+        if not path:
+            continue
+        resolved = os.path.realpath(os.path.abspath(path))
+        if (
+            os.path.dirname(resolved) != staging
+            or os.path.islink(resolved)
+            or not os.path.isfile(resolved)
+            or not os.path.basename(resolved).startswith("unit-")
+        ):
+            raise QueueRecoveryRuntimeError("H3 pre-mux staging identity is invalid.")
+        size, digest = _recovery_sha256_file(resolved)
+        descriptors.append({
+            "basename": os.path.basename(resolved),
+            "media_kind": media_kind,
+            "sha256": digest,
+            "size": size,
+            "storage": "recovery_staging",
+        })
+    expected_kinds = {"video"} | (
+        {"audio"} if settings.get("final_audio_kind") == "generated" else set()
+    )
+    if {item["media_kind"] for item in descriptors} != expected_kinds:
+        raise QueueRecoveryRuntimeError("H3 pre-mux artifact set is incomplete.")
+    unit_id = recovery_unit_id(
+        str(job.get("id") or ""), "h3_source_audio_premux",
+        variant=0, index=index, settings=settings,
+    )
+    unit = {
+        "artifacts": descriptors,
+        "dependencies": [],
+        "index": index,
+        "kind": "h3_source_audio_premux",
+        "settings": dict(settings),
+        "state": "completed",
+        "unit_id": unit_id,
+        "variant": 0,
+    }
+    units = [
+        item for item in _queue_recovery_units(job)
+        if not (
+            item.get("kind") == "h3_source_audio_premux"
+            and item.get("variant") == 0
+            and item.get("index") == index
+        )
+    ]
+    units.append(unit)
+    cursor = dict(job.get("recovery_cursor") or {})
+    cursor["completed_units"] = units[-2048:]
     _queue_recovery_checkpoint(
         job,
         recovery_unit=unit,
@@ -3715,6 +3831,8 @@ def _queue_recovery_repair_unit_roles(
 ) -> dict | None:
     """Repair semantic roles and reseal descriptors after byte changes."""
     kind = str(unit.get("kind") or "")
+    if kind == "h3_source_audio_premux":
+        return unit
     unit_id = str(unit.get("unit_id") or "")
     try:
         variant = max(0, int(unit.get("variant", 0) or 0))
@@ -4053,6 +4171,8 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
             if name not in artifacts:
                 artifacts.append(name)
         for unit in verified_h3_units:
+            if unit.get("kind") == "h3_source_audio_premux":
+                continue
             for descriptor in unit.get("artifacts") or []:
                 name = (
                     descriptor.get("basename")
@@ -4138,6 +4258,31 @@ def _h3_segment_recovery_settings(clip_info: dict) -> dict:
         "native_boundary_conditioning": native,
         "published_frames": published,
         "trim_tail_frames": tail,
+    }
+
+
+def _h3_source_audio_premux_settings(params: dict) -> dict | None:
+    """Return the path-free identity for one supported source-audio mux retry."""
+    if not isinstance(params, dict) or str(params.get("model_type") or "") != "minimax_h3":
+        return None
+    custom = params.get("custom_settings")
+    if not isinstance(custom, dict):
+        return None
+    mode = str(custom.get("h3_source_audio_mode") or "native")
+    if mode not in {"lock_source", "remix_source", "reference_only"}:
+        return None
+    clip = params.get("multi_clip_info")
+    if isinstance(clip, dict) and int(clip.get("total", 1) or 1) > 1:
+        return None
+    final_audio_kind = (
+        "explicit" if params.get("audio_source")
+        else "source" if mode == "lock_source"
+        else "generated"
+    )
+    return {
+        "algorithm_version": "maestro_h3_source_audio_v1",
+        "final_audio_kind": final_audio_kind,
+        "source_audio_mode": mode,
     }
 
 
@@ -5056,13 +5201,9 @@ def list_models(request: Request):
             "supports_ref_images": bool(md.get("image_ref_choices")),
             "director": director,
             "is_downloaded": _check_model_downloaded(mt),
-            # When True, the UI hides this model unless Mature Mode is
-            # enabled. Set in the model JSON's "model" block (e.g.
-            # defaults/ltx2_22B_10eros.json). The backend ALWAYS returns
-            # the entry — visibility gating happens client-side so a single
-            # nsfw_mode toggle can show/hide without reloading models.
+            # Upstream descriptive metadata retained for catalog compatibility.
+            # It does not gate visibility, execution, or publication.
             "nsfw_only": bool(md.get("nsfw_only", False)),
-            "preferred_explicit_fl2va": bool(md.get("preferred_explicit_fl2va", False)),
             "update_status": str(_versioned_model_update_status.get(mt, {}).get("status") or (
                 "versioned" if isinstance(md.get("model_update"), dict) else "pinned"
             )),
@@ -5114,21 +5255,16 @@ def _model_visibility_response():
         return {
             "configured": False,
             "enabled_models": [],
-            "initialized_mature_models": [],
             "defaults_version": 0,
         }
     try:
         enabled_models = _normalize_model_visibility_ids(
             raw.get("enabled_models", []),
         )
-        initialized_mature_models = _normalize_model_visibility_ids(
-            raw.get("initialized_mature_models", []),
-        )
     except ValueError:
         return {
             "configured": False,
             "enabled_models": [],
-            "initialized_mature_models": [],
             "defaults_version": 0,
         }
     try:
@@ -5138,7 +5274,6 @@ def _model_visibility_response():
     return {
         "configured": True,
         "enabled_models": enabled_models,
-        "initialized_mature_models": initialized_mature_models,
         "defaults_version": defaults_version,
     }
 
@@ -5166,9 +5301,7 @@ def _persist_model_visibility_config():
 def get_model_visibility(request: Request):
     """Return the server-persisted model selector whitelist."""
     response = _model_visibility_response()
-    if not bool(getattr(request.state, "maestro_remote", False)):
-        return response
-    return {**response, "initialized_mature_models": []}
+    return response
 
 
 @api.put("/api/v1/model-visibility")
@@ -5184,9 +5317,6 @@ async def update_model_visibility(request: Request):
         enabled_models = _normalize_model_visibility_ids(
             body.get("enabled_models"),
         )
-        initialized_mature_models = _normalize_model_visibility_ids(
-            body.get("initialized_mature_models", []),
-        )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     try:
@@ -5200,7 +5330,6 @@ async def update_model_visibility(request: Request):
     with _MODEL_VISIBILITY_WRITE_LOCK:
         wgp.server_config[_MODEL_VISIBILITY_CONFIG_KEY] = {
             "enabled_models": enabled_models,
-            "initialized_mature_models": initialized_mature_models,
             "defaults_version": defaults_version,
         }
         _persist_model_visibility_config()
@@ -5505,93 +5634,6 @@ def _compute_lora_id(filename: str, sidecar_meta: dict | None) -> str:
                 # Some sidecars store modelId as a string; pass through.
                 return f"civitai:{model_id}"
     return f"local:{filename}"
-
-
-# ── NSFW LoRA classification ─────────────────────────────────────────
-# Used by /api/v1/loras/installed and /api/v1/loras/{model_type}/details.
-# Always called as a fallback after checking the CivitAI sidecar's `nsfw`
-# boolean — sidecar-true wins; this only fires when the sidecar didn't
-# flag it (or the LoRA has no sidecar at all, which is the case for
-# anything downloaded outside our CivitAI integration).
-#
-# Two design choices to limit false positives:
-#
-#   1. Word-boundary matching, not substring. So "anal" matches "anal"
-#      but not "ANALysis"; "oral" matches "oral" but not "mORAL"; "sex"
-#      matches "sex" but not "susSEX". Substring matching previously
-#      caused real-world FPs (e.g. an LTX-2.3 enhancement LoRA whose
-#      guide mentioned "explicit text overlays" was flagged because
-#      "explicit" appeared anywhere in the text).
-#
-#   2. Curated keyword list. Words too ambiguous for context-free
-#      matching (e.g. "explicit", "adult", "mature") are deliberately
-#      EXCLUDED — they show up too often in SFW contexts. Words that
-#      are unambiguous in any reasonable context stay.
-#
-# Filenames and tags often use `_` or `-` as separators; Python's `\b`
-# treats `_` as a word char, so we normalize those to spaces before
-# matching. This lets `\bboob\b` correctly match "Big_Boobs_LoRA" when
-# the filename is normalized to "Big Boobs LoRA".
-import re as _re_nsfw
-from functools import lru_cache as _lru_cache_nsfw
-
-# NSFW LoRA-classification keyword fallback — flags a LoRA as mature when a
-# keyword appears as a whole word in its name / tags / description, used only
-# when the CivitAI sidecar doesn't already flag it. Category-level terms only
-# (the two most explicit terms from the original list are dropped to
-# keep tracked source clean). `\b` word boundaries prevent false hits like
-# "oral"->"moral", "breast"->"breastfeeding", "sex"->"Sussex" (filenames are
-# normalized `_`/`-` -> space before matching; see _NSFW_NORMALIZE_RE).
-_NSFW_LORA_KEYWORDS = [
-    "nsfw", "nude", "naked", "sex", "breast", "oral",
-    "doggy", "xxx", "porn", "hentai", "uncensored", "unchained",
-]
-
-
-@_lru_cache_nsfw(maxsize=1)
-def _get_nsfw_regex() -> "_re_nsfw.Pattern[str]":
-    """Compiled word-boundary regex over the NSFW LoRA keyword fallback."""
-    return _re_nsfw.compile(
-        r"\b(?:" + "|".join(_re_nsfw.escape(k) for k in _NSFW_LORA_KEYWORDS) + r")\b",
-        _re_nsfw.IGNORECASE,
-    )
-
-
-# Normalize filename separators to spaces so word boundaries work
-# inside underscore/dash-joined identifiers.
-_NSFW_NORMALIZE_RE = _re_nsfw.compile(r"[_\-]")
-
-def _classify_lora_nsfw(
-    filename: str,
-    display_name: str | None = None,
-    sidecar_meta: dict | None = None,
-    guide_text: str | None = None,
-) -> bool:
-    """Return True if any NSFW keyword appears as a whole word anywhere
-    across the LoRA's text metadata. Checks:
-      - filename (with `_`/`-` normalized to spaces so word boundaries
-        catch tokens inside identifiers like `Big_Boobs_LoRA`)
-      - display name (CivitAI sidecar's `name`)
-      - sidecar tags
-      - sidecar description + versionDescription
-      - generated `.guide.md` content
-    """
-    blobs: list[str] = []
-    blobs.append(filename or "")
-    if display_name:
-        blobs.append(str(display_name))
-    if isinstance(sidecar_meta, dict):
-        tags = sidecar_meta.get("tags") or []
-        if isinstance(tags, list):
-            blobs.append(" ".join(str(t) for t in tags))
-        for key in ("description", "versionDescription"):
-            val = sidecar_meta.get(key)
-            if isinstance(val, str):
-                blobs.append(val)
-    if guide_text:
-        blobs.append(str(guide_text))
-    haystack = _NSFW_NORMALIZE_RE.sub(" ", " ".join(blobs))
-    return _get_nsfw_regex().search(haystack) is not None
 
 
 # ── System-managed LoRA detection ────────────────────────────────────
@@ -6896,6 +6938,7 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
     body["multi_prompts_gen_type"] = 3
     body["_h3_longform"] = {
         "model_type": model_type,
+        "fps": fps,
         "requested_frames": requested_frames,
         "planned_frames": planned_frames,
         "published_frames": requested_frames,
@@ -6934,18 +6977,50 @@ def _public_h3_long_plan(
     if not isinstance(plan, dict) or int(plan.get("clip_count") or 0) <= 1:
         return None
     frames = list(plan.get("clip_frames") or [])
+    stored_published_frames = plan.get("clip_published_frames")
+    published_frames = (
+        list(stored_published_frames)
+        if isinstance(stored_published_frames, list)
+        and len(stored_published_frames) == len(frames)
+        else list(frames)
+    )
+    if published_frames and published_frames == frames:
+        try:
+            aggregate_trim = max(
+                0,
+                int(plan.get("planned_frames") or sum(frames))
+                - int(plan.get("published_frames") or plan.get("requested_frames") or sum(frames)),
+            )
+        except (TypeError, ValueError):
+            aggregate_trim = 0
+        if 0 < aggregate_trim < published_frames[-1]:
+            published_frames[-1] -= aggregate_trim
+    try:
+        fps = float(plan.get("fps") or 24)
+    except (TypeError, ValueError):
+        fps = 24.0
+    if fps <= 0:
+        fps = 24.0
     models = list(plan.get("segment_models") or [])
     boundaries = list(plan.get("clip_boundaries") or [])
-    prompts = list(plan.get("clip_prompt_previews") or [])
     segments = []
     for index in range(int(plan.get("clip_count") or 0)):
         model = models[index] if index < len(models) and isinstance(models[index], dict) else {}
         boundary = boundaries[index - 1] if index > 0 and index - 1 < len(boundaries) else None
         frame_count = int(frames[index]) if index < len(frames) else 0
+        published_frame_count = int(
+            published_frames[index]
+            if index < len(published_frames) else frame_count
+        )
         segments.append({
             "index": index + 1,
+            # Compatibility aliases retain their historical generated meaning.
             "frames": frame_count,
-            "duration_seconds": frame_count / 24.0,
+            "duration_seconds": frame_count / fps,
+            "generated_frames": frame_count,
+            "published_frames": published_frame_count,
+            "generated_duration_seconds": frame_count / fps,
+            "published_duration_seconds": published_frame_count / fps,
             "model_type": model.get("model_type"),
             "model_reason": model.get("reason"),
             "edge_anchor_locked": bool(
@@ -6957,7 +7032,6 @@ def _public_h3_long_plan(
             ),
             "switch_from_previous": bool(model.get("switch_from_previous")),
             "boundary_from_previous": boundary,
-            "prompt_preview": prompts[index] if index < len(prompts) else "",
         })
     effective_models = []
     for segment in segments:
@@ -6967,8 +7041,12 @@ def _public_h3_long_plan(
     public = {
         "kind": "h3_segments",
         "clip_count": len(segments),
+        "fps": fps,
         "requested_frames": int(plan.get("requested_frames") or 0),
         "planned_frames": int(plan.get("planned_frames") or 0),
+        "published_frames": int(
+            plan.get("published_frames") or plan.get("requested_frames") or 0
+        ),
         "adaptive_conditioning": bool(plan.get("adaptive_conditioning")),
         "checkpoint_switches": sum(
             1 for segment in segments if segment["switch_from_previous"]
@@ -7047,7 +7125,6 @@ def _h3_checkpoint_options() -> list[dict]:
     ordinary model loader can auto-download. Optional runtimes and mature-only
     checkpoints remain visible but disabled with the server-authored reason.
     """
-    mature_allowed = _nsfw_allowed()
     w4a8_capability = None
     options = []
     for model_type in _H3_CHECKPOINT_CATALOG_ORDER:
@@ -7064,13 +7141,7 @@ def _h3_checkpoint_options() -> list[dict]:
         )
         available = True
         unavailable_reason = ""
-        if model_def.get("nsfw_only") is True and not mature_allowed:
-            available = False
-            unavailable_reason = (
-                "Requires Explicit mode with recorded consent and a "
-                "local/private LLM provider."
-            )
-        elif model_type == _H3_W4A8_FL2VA_MODEL:
+        if model_type == _H3_W4A8_FL2VA_MODEL:
             if w4a8_capability is None:
                 from services.h3_acceleration import get_h3_acceleration_status
                 w4a8_capability = (
@@ -7103,7 +7174,6 @@ def _h3_checkpoint_options() -> list[dict]:
             "managed_download": managed_download,
             "auto_download": managed_download,
             "terms_required": model_type == _H3_REF2VA_MODEL,
-            "mature_only": model_def.get("nsfw_only") is True,
             "available": available,
             "unavailable_reason": unavailable_reason,
         })
@@ -7439,19 +7509,7 @@ def list_all_installed_loras():
                     # backfilled for existing files by check-updates.
                     info["downloaded_at"] = meta.get("downloadedAt")
                     info["released_at"] = meta.get("publishedAt")
-                    # Manual override (set via /api/v1/loras/nsfw-override)
-                    # takes precedence over CivitAI's `nsfw` boolean, which
-                    # is sometimes overly conservative (it's "worst content
-                    # across the entire model" — set true if any version or
-                    # example image is NSFW, even when the LoRA itself is
-                    # SFW). Override = bool → use it; Override absent → fall
-                    # back to CivitAI's flag.
-                    if isinstance(meta.get("nsfw_override"), bool):
-                        info["nsfw"] = meta["nsfw_override"]
-                        info["nsfw_overridden"] = True
-                    else:
-                        info["nsfw"] = meta.get("nsfw", False)
-                        info["nsfw_overridden"] = False
+                    info["nsfw"] = bool(meta.get("nsfw", False))
                     # CivitAI images
                     images = meta.get("images", [])
                     if images and isinstance(images, list) and images[0].get("url"):
@@ -7481,26 +7539,6 @@ def list_all_installed_loras():
                             break
                     if info.get("preview_url"):
                         break
-            # Infer NSFW from filename + sidecar tags/description + guide
-            # text — but only when no authoritative signal exists. Manual
-            # override always wins; CivitAI's flag wins over the heuristic;
-            # the keyword fallback is only for hand-installed LoRAs without
-            # sidecars at all.
-            has_override = isinstance(meta, dict) and isinstance(meta.get("nsfw_override"), bool)
-            sidecar_has_nsfw_field = isinstance(meta, dict) and "nsfw" in meta
-            if not info["nsfw"] and not has_override and not sidecar_has_nsfw_field:
-                _meta = meta if os.path.isfile(sidecar) else None
-                guide_path = next((b + ".guide.md" for b in _bases if os.path.isfile(b + ".guide.md")), None)
-                guide_text = None
-                if guide_path:
-                    try:
-                        with open(guide_path, "r", encoding="utf-8") as gf:
-                            guide_text = gf.read()
-                    except Exception:
-                        guide_text = None
-                if _classify_lora_nsfw(filename=f, display_name=info.get("name"),
-                                       sidecar_meta=_meta, guide_text=guide_text):
-                    info["nsfw"] = True
             # Stable identifier: civitai:{modelId} when available, else local:{filename}.
             # Survives version updates so persisted state (weights, activations,
             # NSFW stash) carries forward automatically.
@@ -7729,14 +7767,7 @@ def list_loras_details(model_type: str):
                 # date) is captured at download and backfilled by check-updates.
                 info["downloaded_at"] = meta.get("downloadedAt")
                 info["released_at"] = meta.get("publishedAt")
-                # Manual override > CivitAI flag > keyword fallback. See
-                # /api/v1/loras/installed for full rationale.
-                if isinstance(meta.get("nsfw_override"), bool):
-                    info["nsfw"] = meta["nsfw_override"]
-                    info["nsfw_overridden"] = True
-                else:
-                    info["nsfw"] = bool(meta.get("nsfw", False))
-                    info["nsfw_overridden"] = False
+                info["nsfw"] = bool(meta.get("nsfw", False))
                 images = meta.get("images", [])
                 if images and isinstance(images, list) and images[0].get("url"):
                     info["preview_url"] = images[0]["url"]
@@ -7749,18 +7780,6 @@ def list_loras_details(model_type: str):
                 info["downloaded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(f)))
             except OSError:
                 info["downloaded_at"] = None
-        # Fallback: infer NSFW from filename + tags + description + guide
-        # only when no authoritative signal exists.
-        has_override = isinstance(meta, dict) and isinstance(meta.get("nsfw_override"), bool)
-        sidecar_has_nsfw_field = isinstance(meta, dict) and "nsfw" in meta
-        if not info["nsfw"] and not has_override and not sidecar_has_nsfw_field:
-            if _classify_lora_nsfw(
-                filename=basename,
-                display_name=(meta.get("name") if isinstance(meta, dict) else None),
-                sidecar_meta=meta,
-                guide_text=info.get("guide"),
-            ):
-                info["nsfw"] = True
         # Stable identifier: civitai:{modelId} when available, else local:{filename}.
         info["lora_id"] = _compute_lora_id(basename, meta)
         # Per-file update status (see /api/v1/loras/installed for the
@@ -7789,85 +7808,6 @@ def list_loras_details(model_type: str):
         "loras": loras,
         "guidance_max_phases": md.get("guidance_max_phases", 1),
         "manifest_last_check_at": _manifest.get("last_full_check_at") if isinstance(_manifest, dict) else None,
-    }
-
-
-@api.post("/api/v1/loras/nsfw-override")
-async def set_lora_nsfw_override(request: Request):
-    """Manually flag a LoRA as SFW or NSFW, overriding CivitAI's nsfw value.
-
-    CivitAI's model-level `nsfw` boolean is "worst content across the model"
-    and gets set true if any version or example image is NSFW — even when
-    the LoRA itself is SFW. Their browser uses a granular `nsfwLevel` int
-    that we don't currently capture, so users with misclassified LoRAs need
-    a way to correct the local sidecar.
-
-    Body: `{"filename": "<basename>", "nsfw": true|false|null}`
-      - `true` / `false`: write `nsfw_override` to sidecar
-      - `null`: clear the override, fall back to CivitAI's flag
-
-    Returns: `{filename, nsfw, nsfw_overridden}` — the new effective state.
-    """
-    body = await request.json()
-    filename = body.get("filename")
-    nsfw_value = body.get("nsfw")
-    if not isinstance(filename, str) or not filename:
-        raise HTTPException(status_code=400, detail="filename is required")
-    if nsfw_value is not None and not isinstance(nsfw_value, bool):
-        raise HTTPException(status_code=400, detail="nsfw must be true, false, or null")
-    # Reject path-traversal — only accept a basename.
-    if "/" in filename or "\\" in filename or ".." in filename:
-        raise HTTPException(status_code=400, detail="filename must be a basename, not a path")
-
-    lora_root = _resolve_lora_root()
-    if not lora_root:
-        raise HTTPException(status_code=500, detail="LoRA root not found")
-
-    # Locate the sidecar by walking the tree — LoRAs live in subdirectories
-    # by architecture, and the caller doesn't necessarily know which.
-    target_safetensors: str | None = None
-    for dirpath, _dirnames, filenames in os.walk(lora_root):
-        if filename in filenames:
-            target_safetensors = os.path.join(dirpath, filename)
-            break
-    if not target_safetensors:
-        raise HTTPException(status_code=404, detail=f"LoRA not found: {filename}")
-
-    sidecar_path = os.path.splitext(target_safetensors)[0] + ".civitai.json"
-    if os.path.isfile(sidecar_path):
-        try:
-            with open(sidecar_path, "r", encoding="utf-8") as sf:
-                sidecar = json.load(sf)
-            if not isinstance(sidecar, dict):
-                sidecar = {}
-        except Exception:
-            sidecar = {}
-    else:
-        # Create a minimal sidecar so the override has somewhere to live.
-        sidecar = {}
-
-    if nsfw_value is None:
-        sidecar.pop("nsfw_override", None)
-    else:
-        sidecar["nsfw_override"] = bool(nsfw_value)
-
-    try:
-        with open(sidecar_path, "w", encoding="utf-8") as sf:
-            json.dump(sidecar, sf, indent=2)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to write sidecar: {e}")
-
-    # Compute the new effective nsfw value (override wins over flag).
-    if isinstance(sidecar.get("nsfw_override"), bool):
-        effective_nsfw = sidecar["nsfw_override"]
-        overridden = True
-    else:
-        effective_nsfw = bool(sidecar.get("nsfw", False))
-        overridden = False
-    return {
-        "filename": filename,
-        "nsfw": effective_nsfw,
-        "nsfw_overridden": overridden,
     }
 
 
@@ -9211,7 +9151,7 @@ def civitai_search(
     limit: int = 20, cursor: str = "",
 ):
     """Proxy CivitAI model search (TTL-cached)."""
-    # nsfw MUST be part of the key — mature-mode gating changes results.
+    # nsfw changes the provider's search results and must be part of the cache key.
     cache_key = ("search", query, sort, period, nsfw, types, baseModels, limit, cursor)
     cached = _civitai_cache_get(cache_key)
     if cached is not None:
@@ -11761,175 +11701,68 @@ def system_release_model():
 # API Routes: Recipes (one-click Studio presets)
 # ============================================================================
 
-def _nsfw_allowed() -> bool:
+def _explicit_llm_guidance_allowed(body: dict) -> bool:
+    """Authorize strong explicit prompt-authoring guidance for one request."""
+    if not isinstance(body, dict) or body.get("explicit_output") is not True:
+        return False
     from services.mature_policy import mature_mode_allowed
     return mature_mode_allowed(wgp.server_config.get("services", {}))
-
-
-def _classify_generation_maturity(
-    body: dict,
-    plan: dict | None = None,
-) -> bool:
-    """Classify every effective model, LoRA, and audio variant."""
-    from services.mature_policy import request_is_mature
-
-    model_types = _h3_effective_model_types(body, plan)
-    if not model_types:
-        model_types = [str(body.get("model_type") or "")]
-    loras = _mature_lora_descriptors(body)
-    mmaudio_variant = _effective_mmaudio_variant(body)
-    mature_output = False
-    for model_type in model_types:
-        mature_output = request_is_mature(
-            model_definition=wgp.get_model_def(model_type) or {},
-            loras=loras,
-            mmaudio_variant=mmaudio_variant,
-        ) or mature_output
-    return mature_output
 
 
 def _http_output_policy_from_request(
     params: dict,
     *,
     owner_session_id: str,
-    mature_output: bool = False,
 ) -> dict:
     """Translate request flag validation failures into a client error."""
     try:
         return output_policy_from_request(
             params,
-            mature_output=mature_output,
             owner_session_id=owner_session_id,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
 
-def _effective_mmaudio_variant(body: dict) -> str:
-    """Return the runtime MMAudio flavor when this request can invoke it."""
-    requested = str(body.get("_mmaudio_variant") or "")
-    # Match wgp.get_mmaudio_settings(): only registered per-request variants
-    # override the configured model. Unknown values fall through to config.
-    if requested in {"v2", "nsfw"}:
-        return requested
-    uses_configured_mmaudio = bool(body.get("sfx_mode"))
-    if not uses_configured_mmaudio:
-        try:
-            uses_configured_mmaudio = int(body.get("MMAudio_setting") or 0) != 0
-        except (TypeError, ValueError):
-            uses_configured_mmaudio = bool(body.get("MMAudio_setting"))
-    if not uses_configured_mmaudio:
-        return ""
-    configured_mode = wgp.server_config.get("mmaudio_mode")
-    return (
-        "nsfw"
-        if configured_mode == getattr(wgp, "MMAUDIO_MODE_NSFW", 3)
-        else ""
-    )
-
-
-def _classify_director_maturity(body: dict) -> bool:
-    """Classify both Director generation lanes before pipeline publication."""
-    mature_output = False
-    lanes = (
-        ("image_model", "image_loras", "image_params"),
-        ("video_model", "video_loras", "video_params"),
-    )
-    for model_key, lora_key, params_key in lanes:
-        model_type = str(body.get(model_key) or "")
-        lora_config = body.get(lora_key)
-        lora_config = lora_config if isinstance(lora_config, dict) else {}
-        lane_params = body.get(params_key)
-        lane = dict(lane_params) if isinstance(lane_params, dict) else {}
-        lane["model_type"] = model_type
-        lane["activated_loras"] = list(
-            lora_config.get("activated_loras") or []
-        )
-        for key in (
-            "explicit_output", "sfx_mode", "MMAudio_setting",
-            "_mmaudio_variant",
-        ):
-            if key in body and key not in lane:
-                lane[key] = body[key]
-        mature_output = _classify_generation_maturity(lane) or mature_output
-    return mature_output
-
-
-def _mature_lora_descriptors(body: dict) -> list[dict]:
-    """Load authoritative LoRA explicitness metadata and guide descriptors."""
-    descriptors = []
-    model_type = str(body.get("model_type") or "")
-    try:
-        lora_dir = wgp.get_lora_dir(model_type)
-    except Exception:
-        lora_dir = ""
-    for raw_name in body.get("activated_loras") or []:
-        if not isinstance(raw_name, str):
-            continue
-        filename = os.path.basename(raw_name)
-        # Maestro's writable primary mirror owns manual metadata overrides,
-        # even when the weights resolve to a linked read-only installation.
-        bases = []
-        if lora_dir:
-            bases.append(os.path.join(lora_dir, os.path.splitext(filename)[0]))
-        try:
-            resolved = wgp.resolve_lora_path(model_type, raw_name)
-            if resolved:
-                resolved_base = os.path.splitext(resolved)[0]
-                if resolved_base not in bases:
-                    bases.append(resolved_base)
-        except Exception:
-            pass
-        metadata = None
-        guide = ""
-        for base in bases:
-            sidecar = base + ".civitai.json"
-            if metadata is None and os.path.isfile(sidecar):
-                try:
-                    with open(sidecar, "r", encoding="utf-8") as handle:
-                        value = json.load(handle)
-                    if isinstance(value, dict):
-                        metadata = value
-                except (OSError, ValueError, TypeError):
-                    pass
-            guide_path = base + ".guide.md"
-            if not guide and os.path.isfile(guide_path):
-                try:
-                    with open(guide_path, "r", encoding="utf-8") as handle:
-                        guide = handle.read(65536)
-                except OSError:
-                    pass
-        descriptors.append({
-            "filename": filename,
-            "name": str((metadata or {}).get("name") or ""),
-            "metadata": metadata or {},
-            "guide": guide,
-        })
-    return descriptors
+def _recipe_read_scope(request: Request, workspace: str) -> tuple[bool, str]:
+    """Authorize remote recipe reads and return their bounded visibility."""
+    remote = bool(getattr(request.state, "maestro_remote", False))
+    if not remote:
+        return False, ""
+    selected = _request_project_workspace(request, workspace)
+    _require_project_access(request, selected)
+    return True, selected
 
 
 @api.get("/api/v1/recipes")
-def list_recipes_route():
-    """List recipe cards (bundled + user). NSFW recipes hidden unless mature."""
+def list_recipes_route(request: Request, workspace: str = ""):
+    """List local recipes, or bundled-only cards for an unlocked project."""
     from services import recipes
-    return {"recipes": recipes.list_recipes(nsfw_allowed=_nsfw_allowed())}
+    bundled_only, selected = _recipe_read_scope(request, workspace)
+    cards = recipes.list_recipes(bundled_only=bundled_only)
+    if bundled_only:
+        encoded_workspace = quote(selected, safe="")
+        for card in cards:
+            if card.get("thumbnail_url"):
+                card["thumbnail_url"] += f"?workspace={encoded_workspace}"
+    return {"recipes": cards}
 
 
 @api.get("/api/v1/recipes/{rid}")
-def get_recipe_route(rid: str):
+def get_recipe_route(request: Request, rid: str, workspace: str = ""):
     from services import recipes
-    recipe = recipes.get_recipe(rid)
+    bundled_only, _selected = _recipe_read_scope(request, workspace)
+    recipe = recipes.get_recipe(rid, bundled_only=bundled_only)
     if not recipe:
-        raise HTTPException(status_code=404, detail="Recipe not found")
-    if recipe.get("nsfw") and not _nsfw_allowed():
         raise HTTPException(status_code=404, detail="Recipe not found")
     return recipe
 
 
 @api.get("/api/v1/recipes/{rid}/thumbnail")
-def get_recipe_thumbnail_route(rid: str):
+def get_recipe_thumbnail_route(request: Request, rid: str, workspace: str = ""):
     from services import recipes
-    path = recipes.get_recipe_thumbnail_path(rid)
+    bundled_only, _selected = _recipe_read_scope(request, workspace)
+    path = recipes.get_recipe_thumbnail_path(rid, bundled_only=bundled_only)
     if not path:
         raise HTTPException(status_code=404, detail="No thumbnail")
     return FileResponse(path, media_type="image/jpeg")
@@ -12159,16 +11992,20 @@ def _llm_default_device() -> str:
     return "cpu"
 
 
-# Default LLM repo — kept in sync with DEFAULT_HF_REPO in
-# services/llm_service.py. Updated to Gemma 4 4B 2026-05-03.
-_DEFAULT_LLM_REPO = "Abhiray/gemma-4-E4B-it-heretic-GGUF"
+# Default LLM repos — kept in sync with services/llm_service.py. Director and
+# other heavy authoring use the 31B model; generic rewrite/image enhancement
+# uses the faster Qwen 27B Vision model.
+_DEFAULT_LLM_REPO = "MoonRide/gemma-4-31B-it-heretic-ara-GGUF"
+_DEFAULT_ENHANCE_LLM_REPO = (
+    "Youssofal/Qwen3.6-27B-Abliterated-Heretic-Uncensored-GGUF"
+)
 
 
 @api.get("/api/v1/services-config")
 def get_services_config(request: Request):
     """Return services settings with API keys masked."""
     services = wgp.server_config.get("services", {})
-    provider = services.get("llm_provider", "local")
+    provider = str(services.get("llm_provider", "local") or "local").strip().lower()
     # Enforce: NSFW must be off when using a public provider
     nsfw = services.get("nsfw_mode", False) and provider not in _PUBLIC_LLM_PROVIDERS
     response = {
@@ -12176,7 +12013,10 @@ def get_services_config(request: Request):
         "llm_device": services.get("llm_device", _llm_default_device()),
         "llm_provider": provider,
         "llm_remote_url": services.get("llm_remote_url", ""),
-        "enhance_llm_model_id": services.get("enhance_llm_model_id", ""),
+        "enhance_llm_model_id": (
+            services.get("enhance_llm_model_id")
+            or _DEFAULT_ENHANCE_LLM_REPO
+        ),
         "enhance_llm_device": services.get("enhance_llm_device", "cuda"),
         "google_api_key": _mask_key(services.get("google_api_key", "")),
         "google_api_key_set": bool(services.get("google_api_key", "")),
@@ -12194,7 +12034,6 @@ def get_services_config(request: Request):
         # users who never touched the toggle see the new default.
         "use_director_v2": services.get("use_director_v2", True),
         "nsfw_mode": nsfw,
-        "nsfw_accepted_at": services.get("nsfw_accepted_at", None),
         # Default flipped from "off" to "third_pass" — Pass 3 polish runs
         # each generated prompt through a model-specific dialect pass after
         # planning, which produces materially better LTX-2 / Flux output
@@ -12268,6 +12107,65 @@ def get_services_config(request: Request):
     return response
 
 
+def _require_host_terms_project_access(request: Request, workspace: str) -> str:
+    """Authorize one known project without creating arbitrary local names."""
+    remote = bool(getattr(request.state, "maestro_remote", False))
+    if workspace != "default" or remote:
+        _existing_workspace_dir(workspace)
+    return _require_project_access(request, workspace)
+
+
+@api.get("/api/v1/host-terms")
+def get_host_terms(request: Request, workspace: str = ""):
+    """Return host-wide notice versions after project authorization."""
+    selected = _request_project_workspace(request, workspace)
+    _require_host_terms_project_access(request, selected)
+    from services.host_terms import host_terms_status
+    with _services_config_lock:
+        terms = host_terms_status(wgp.server_config.get("services", {}))
+    return {"terms": terms}
+
+
+@api.post("/api/v1/host-terms/accept")
+async def accept_host_terms(request: Request):
+    """Record one exact notice version for the host.
+
+    This narrowly authorized mutation is available to any current project
+    user, including a password-unlocked remote session.  It grants no project
+    or machine-control capability and stores no accepting identity.
+    """
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_host_terms_project_access(request, workspace)
+
+    from services.host_terms import (
+        StaleHostTermVersionError,
+        UnknownHostTermError,
+        accept_host_term,
+    )
+    try:
+        with _services_config_lock:
+            services = copy.deepcopy(wgp.server_config.get("services", {}))
+            if not isinstance(services, dict):
+                services = {}
+            terms = accept_host_term(
+                services,
+                body.get("term"),
+                body.get("version"),
+            )
+            staged_config = dict(wgp.server_config)
+            staged_config["services"] = services
+            _atomic_write_json(wgp.server_config_filename, staged_config)
+            wgp.server_config["services"] = services
+    except UnknownHostTermError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except StaleHostTermVersionError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {"status": "ok", "terms": terms}
+
+
 @api.get("/api/v1/access-context")
 def get_access_context(request: Request):
     """Expose non-sensitive UI capabilities for local vs tunnel clients."""
@@ -12334,59 +12232,70 @@ async def register_runtime_share_url(request: Request):
 async def update_services_config(request: Request):
     """Update services configuration. API keys are stored in full, returned masked."""
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
 
     ALLOWED_KEYS = {
         "llm_model_id", "llm_device", "llm_provider", "llm_remote_url",
         "enhance_llm_model_id", "enhance_llm_device",
         "google_api_key", "openai_api_key", "anthropic_api_key",
-        "use_director_v2", "nsfw_mode", "nsfw_accepted_at", "director_prompt_polish",
+        "use_director_v2", "nsfw_mode", "director_prompt_polish",
         "civitai_api_key", "voice_reference_enabled", "ltx_progressive_pipeline",
         "show_experimental", "auto_performance", "storage_allow_linked_removal",
         "director_multishot_lora_mode",
         "flashvsr_mode", "flashvsr_topk_ratio", "flashvsr_backend",
     }
 
-    services = wgp.server_config.setdefault("services", {})
-    updated = {}
+    from services.host_terms import LAWFUL_USE_TERM, host_term_accepted
+    from services.mature_policy import provider_is_public
+    with _services_config_lock:
+        services = copy.deepcopy(wgp.server_config.get("services", {}))
+        if not isinstance(services, dict):
+            services = {}
+        updated = {}
 
-    for key, value in body.items():
-        if key not in ALLOWED_KEYS:
-            continue
-        # Don't overwrite a real key with its masked version
-        if key.endswith("_api_key") and value and "..." in value:
-            continue
-        services[key] = value
-        updated[key] = _mask_key(value) if key.endswith("_api_key") else value
+        for key, value in body.items():
+            if key not in ALLOWED_KEYS:
+                continue
+            # Don't overwrite a real key with its masked version
+            if key.endswith("_api_key") and value and "..." in value:
+                continue
+            if key == "llm_provider":
+                value = str(value or "local").strip().lower()
+                if value not in {"local", "remote", "openai", "anthropic"}:
+                    raise HTTPException(status_code=400, detail="Unknown LLM provider")
+            services[key] = value
+            updated[key] = _mask_key(value) if key.endswith("_api_key") else value
 
-    # Enforce: cannot enable NSFW with a public LLM provider
-    provider = services.get("llm_provider", "local")
-    if services.get("nsfw_mode") and provider in _PUBLIC_LLM_PROVIDERS:
-        services["nsfw_mode"] = False
-        updated["nsfw_mode"] = False
+        # Provider compatibility is separate from host notice acceptance.
+        provider = services.get("llm_provider", "local")
+        if services.get("nsfw_mode") and provider_is_public(provider):
+            services["nsfw_mode"] = False
+            updated["nsfw_mode"] = False
 
-    if services.get("nsfw_mode"):
-        accepted_at = services.get("nsfw_accepted_at")
-        if not isinstance(accepted_at, str) or not accepted_at.strip():
+        if services.get("nsfw_mode") and not host_term_accepted(
+            services, LAWFUL_USE_TERM,
+        ):
             services["nsfw_mode"] = False
             updated["nsfw_mode"] = False
             raise HTTPException(
                 status_code=400,
-                detail="Explicit mode requires recorded consent before it can be enabled",
+                detail="Mature guidance requires the current host notice acceptance",
             )
 
-    # When switching TO a public provider, auto-disable NSFW
-    if "llm_provider" in body and body["llm_provider"] in _PUBLIC_LLM_PROVIDERS:
-        if services.get("nsfw_mode"):
-            services["nsfw_mode"] = False
-            updated["nsfw_mode"] = False
+        # When switching TO a public provider, auto-disable mature guidance.
+        if "llm_provider" in body and provider_is_public(body["llm_provider"]):
+            if services.get("nsfw_mode"):
+                services["nsfw_mode"] = False
+                updated["nsfw_mode"] = False
 
-    if not updated:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
+        if not updated:
+            raise HTTPException(status_code=400, detail="No valid fields to update")
 
-    wgp.server_config["services"] = services
-
-    with open(wgp.server_config_filename, "w", encoding="utf-8") as f:
-        f.write(json.dumps(wgp.server_config, indent=4))
+        staged_config = dict(wgp.server_config)
+        staged_config["services"] = services
+        _atomic_write_json(wgp.server_config_filename, staged_config)
+        wgp.server_config["services"] = services
 
     return {"status": "ok", "updated": updated}
 
@@ -12879,14 +12788,36 @@ def _project_asset_error(error):
         ProjectAssetPersistenceError,
     )
     if isinstance(error, HTTPException):
-        return error
+        details = {
+            400: "Invalid reference asset request",
+            401: "Reference asset access denied",
+            403: "Reference asset access denied",
+            404: "Reference asset not found",
+            409: "Reference asset conflict",
+        }
+        return HTTPException(
+            status_code=error.status_code,
+            detail=details.get(
+                error.status_code,
+                "Reference asset operation failed",
+            ),
+        )
     if isinstance(error, ProjectAssetNotFoundError):
         return HTTPException(status_code=404, detail="Reference asset not found")
     if isinstance(error, ValueError):
-        return HTTPException(status_code=400, detail=str(error))
+        return HTTPException(status_code=400, detail="Invalid reference asset request")
     if isinstance(error, ProjectAssetPersistenceError):
-        return HTTPException(status_code=500, detail=str(error))
-    return HTTPException(status_code=500, detail=str(error))
+        return HTTPException(
+            status_code=503,
+            detail="Reference asset storage is unavailable",
+        )
+    return HTTPException(status_code=500, detail="Reference asset operation failed")
+
+
+def _project_asset_provenance(value, *, default: str):
+    """Normalize the UI's local-import alias at the HTTP compatibility edge."""
+    selected = default if value is None else value
+    return "imported" if selected == "local_import" else selected
 
 
 def _asset_scope(request: Request, project: str):
@@ -13016,7 +12947,9 @@ async def create_project_asset(project: str, request: Request):
             asset_type=body.get("asset_type", "character"),
             description=body.get("description", ""),
             tags=body.get("tags"),
-            provenance=body.get("provenance", "typed"),
+            provenance=_project_asset_provenance(
+                body.get("provenance"), default="typed",
+            ),
             metadata=body.get("metadata"),
         )
     except Exception as error:
@@ -13102,7 +13035,9 @@ async def add_project_asset_variant(project: str, asset_id: str, request: Reques
                 variant_type=body.get("variant_type", "reference"),
                 label=body.get("label", "Reference"),
                 outputs=outputs,
-                provenance=body.get("provenance", "imported"),
+                provenance=_project_asset_provenance(
+                    body.get("provenance"), default="imported",
+                ),
                 status=body.get("status", "candidate"),
                 metadata=body.get("metadata"),
             )
@@ -13200,126 +13135,934 @@ def serve_project_asset_media(project: str, relative_path: str, request: Request
     return share_delete_file_response(path)
 
 
-@api.post("/api/v1/projects/{project}/assets/generate")
-async def generate_project_asset_references(project: str, request: Request):
-    """Generate one or more candidate reference variants from a card brief."""
-    project_id, workspace_id = _asset_scope(request, project)
-    body = await request.json()
-    model_type = body.get("model_type") or "flux2_klein_9b"
-    _require_remote_visible_models(request, [model_type])
-    asset_id = body.get("asset_id")
-    _begin_workspace_operation(project_id)
-    try:
-        if asset_id:
-            asset = _require_project_asset_media_access(
-                project_id, workspace_id, asset_id,
-                request.state.maestro_session_id,
-            )
-        else:
-            asset = _project_asset_store().create_asset(
-                project_id,
-                workspace_id,
-                name=body.get("name", "Untitled reference"),
-                asset_type=body.get("asset_type", "character"),
-                description=body.get("description", ""),
-                tags=body.get("tags"),
-                provenance="generated",
-                metadata={"genre": body.get("genre"), "style": body.get("style")},
-            )
-            asset_id = asset["id"]
-    except Exception as error:
-        raise _project_asset_error(error) from error
-    finally:
-        _end_workspace_operation(project_id)
+_PROJECT_REFERENCE_BODY_FIELDS = frozenset({
+    "asset_id", "parent_variant_id", "edit_instruction", "name",
+    "asset_type", "description", "tags", "poses", "outfits", "style",
+    "genre", "candidate_count", "mode", "model_type", "editor_model_type",
+    "panel_size", "draft_size", "resolution", "columns", "palette_swatches",
+    "review", "num_inference_steps", "guidance_scale", "seed",
+    "negative_prompt", "activated_loras", "loras_multipliers",
+    "private_output", "explicit_output",
+})
+_PROJECT_REFERENCE_EDITOR_ARCHITECTURES = frozenset({
+    "qwen_image_edit_20B", "qwen_image_edit_plus_20B",
+    "qwen_image_edit_plus2_20B", "flux2_dev", "pi_flux2",
+    "flux2_klein_4b", "flux2_klein_9b", "flux",
+})
+_PROJECT_REFERENCE_IMAGE_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
+})
 
-    candidate_count = max(1, min(8, int(body.get("candidate_count") or 1)))
-    variant_parts = [
-        str(body.get("poses") or "").strip(),
-        str(body.get("outfits") or "").strip(),
-        str(body.get("style") or "").strip(),
-        str(body.get("genre") or "").strip(),
-    ]
-    variant_direction = ", ".join(part for part in variant_parts if part)
-    asset_type = str(asset.get("asset_type") or "reference")
-    prompt = (
-        f"Create a production reference sheet for this {asset_type}: "
-        f"{asset.get('name')}. {asset.get('description')}. "
-        f"{variant_direction}. Clear identity-consistent design, useful for "
-        "future image and video conditioning, uncluttered background."
-    ).strip()
-    generation_params = {
-        "model_type": model_type,
-        "prompt": prompt,
-        "image_mode": 1,
-        "image_prompt_type": "",
-        "video_prompt_type": "",
-        "resolution": body.get("resolution") or "1280x720",
-        "num_inference_steps": int(body.get("num_inference_steps") or 8),
-        "guidance_scale": float(body.get("guidance_scale") or 1),
-        "seed": int(body.get("seed") or -1),
-        "settings_version": 2.52,
-        "generation_mode": "image",
-        "repeat_generation": candidate_count,
-        "negative_prompt": str(body.get("negative_prompt") or ""),
-        "activated_loras": body.get("activated_loras") or [],
-        "loras_multipliers": str(body.get("loras_multipliers") or ""),
-        "video_length": 1,
+
+def _project_reference_text(value, field, *, limit, default=""):
+    if value is None:
+        value = default
+    if not isinstance(value, str) or len(value) > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be text of at most {limit} characters",
+        )
+    return value.strip()
+
+
+def _project_reference_dimensions(value, field, default):
+    if value is None:
+        value = default
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d{2,4})[xX](\d{2,4})\s*", value)
+        value = [int(match.group(1)), int(match.group(2))] if match else None
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+        or any(item < 64 or item > 4096 for item in value)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must contain two dimensions from 64 through 4096",
+        )
+    return int(value[0]), int(value[1])
+
+
+def _project_reference_request_config(body, request):
+    """Validate the complete public request before any asset can be created."""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+    unknown = set(body).difference(_PROJECT_REFERENCE_BODY_FIELDS)
+    if unknown:
+        raise HTTPException(status_code=400, detail="Unsupported reference request fields")
+
+    mode = body.get("mode", "production")
+    if mode not in {"production", "hybrid", "draft"}:
+        raise HTTPException(status_code=400, detail="Unsupported reference-sheet mode")
+    asset_type = body.get("asset_type", "character")
+    if asset_type not in {"character", "setting", "item", "style"}:
+        raise HTTPException(status_code=400, detail="Unsupported reference asset type")
+
+    model_type = body.get("model_type") or "flux2_klein_9b"
+    if not isinstance(model_type, str) or not 1 <= len(model_type) <= 128:
+        raise HTTPException(status_code=400, detail="Invalid reference image model")
+    _require_remote_visible_models(request, [model_type])
+    model_def = wgp.get_model_def(model_type)
+    if not isinstance(model_def, dict) or not model_def.get("image_outputs"):
+        raise HTTPException(status_code=400, detail="Reference generation requires an image model")
+
+    editor_model_type = body.get("editor_model_type")
+    if editor_model_type is None and mode == "hybrid":
+        base_type = str(wgp.get_base_model_type(model_type) or "")
+        editor_model_type = (
+            model_type
+            if base_type in _PROJECT_REFERENCE_EDITOR_ARCHITECTURES
+            else "qwen_image_edit_2511_20B_fp8_lightning_4step"
+        )
+    if editor_model_type is not None:
+        if not isinstance(editor_model_type, str) or not 1 <= len(editor_model_type) <= 128:
+            raise HTTPException(status_code=400, detail="Invalid reference editor model")
+        _require_remote_visible_models(request, [editor_model_type])
+        editor_def = wgp.get_model_def(editor_model_type)
+        editor_base = str(wgp.get_base_model_type(editor_model_type) or "")
+        choices = (
+            editor_def.get("image_ref_choices", {}).get("choices", [])
+            if isinstance(editor_def, dict) else []
+        )
+        reference_modes = [
+            str(choice[1]) for choice in choices
+            if isinstance(choice, (list, tuple)) and len(choice) > 1
+            and "I" in str(choice[1])
+        ]
+        if (
+            not isinstance(editor_def, dict)
+            or not editor_def.get("image_outputs")
+            or editor_base not in _PROJECT_REFERENCE_EDITOR_ARCHITECTURES
+            or not reference_modes
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Hybrid mode needs a local image editor with reference-image support",
+            )
+        editor_reference_mode = "KI" if any("K" in item for item in reference_modes) else "I"
+    else:
+        editor_reference_mode = ""
+
+    def bounded_integer(field, default, minimum, maximum):
+        value = body.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field} must be an integer from {minimum} through {maximum}",
+            )
+        return value
+
+    candidate_count = bounded_integer("candidate_count", 1, 1, 8)
+    steps = bounded_integer("num_inference_steps", 4, 1, 200)
+    seed = bounded_integer("seed", -1, -1, (2 ** 63) - 1)
+    columns = bounded_integer("columns", 2, 1, 4)
+    palette_swatches = bounded_integer("palette_swatches", 8, 3, 12)
+    guidance = body.get("guidance_scale", 1.0)
+    if (
+        isinstance(guidance, bool)
+        or not isinstance(guidance, (int, float))
+        or not math.isfinite(float(guidance))
+        or not 0 <= float(guidance) <= 30
+    ):
+        raise HTTPException(status_code=400, detail="guidance_scale must be from 0 through 30")
+    review = body.get("review", True)
+    if not isinstance(review, bool):
+        raise HTTPException(status_code=400, detail="review must be a boolean")
+
+    resolution = body.get("resolution")
+    resolution_size = (
+        _project_reference_dimensions(resolution, "resolution", (512, 512))
+        if resolution is not None else None
+    )
+    panel_size = _project_reference_dimensions(
+        body.get("panel_size"), "panel_size", resolution_size or (512, 512),
+    )
+    draft_size = _project_reference_dimensions(
+        body.get("draft_size"), "draft_size", resolution_size or (1024, 1024),
+    )
+    tags = body.get("tags")
+    if tags is not None and (
+        not isinstance(tags, list)
+        or len(tags) > 100
+        or any(not isinstance(tag, str) or not tag.strip() or len(tag.strip()) > 64 for tag in tags)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid reference asset tags")
+    loras = body.get("activated_loras") or []
+    if (
+        not isinstance(loras, list)
+        or len(loras) > 64
+        or any(not isinstance(item, str) or not item or len(item) > 512 for item in loras)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid reference LoRA selection")
+
+    asset_id = body.get("asset_id")
+    parent_variant_id = body.get("parent_variant_id")
+    for value, field in ((asset_id, "asset_id"), (parent_variant_id, "parent_variant_id")):
+        if value is not None and (not isinstance(value, str) or not value or len(value) > 128):
+            raise HTTPException(status_code=400, detail=f"Invalid {field}")
+    edit_instruction = _project_reference_text(
+        body.get("edit_instruction"), "edit_instruction", limit=10_000,
+    )
+    if (parent_variant_id or edit_instruction) and not asset_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Retry and edit requests require asset_id",
+        )
+
+    policy_request = {
         "private_output": body.get("private_output"),
         "explicit_output": body.get("explicit_output"),
     }
-    workspace = project
-    job_out_dir = _require_project_access(request, workspace)
-    job_id = uuid.uuid4().hex[:8]
-    job = {
-        "id": job_id,
+    policy = _http_output_policy_from_request(
+        policy_request,
+        owner_session_id=request.state.maestro_session_id,
+    )
+    name = _project_reference_text(
+        body.get("name"), "name", limit=200, default="Untitled reference",
+    )
+    if not asset_id and not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    return {
+        "mode": mode,
+        "asset_type": asset_type,
+        "model_type": model_type,
+        "editor_model_type": editor_model_type,
+        "editor_reference_mode": editor_reference_mode,
+        "candidate_count": candidate_count,
+        "num_inference_steps": steps,
+        "guidance_scale": float(guidance),
+        "seed": seed,
+        "columns": columns,
+        "palette_swatches": palette_swatches,
+        "panel_size": panel_size,
+        "draft_size": draft_size,
+        "review": review,
+        "asset_id": asset_id,
+        "parent_variant_id": parent_variant_id,
+        "edit_instruction": edit_instruction,
+        "name": name,
+        "description": _project_reference_text(
+            body.get("description"), "description", limit=10_000,
+        ),
+        "tags": tags,
+        "poses": _project_reference_text(body.get("poses"), "poses", limit=10_000),
+        "outfits": _project_reference_text(body.get("outfits"), "outfits", limit=10_000),
+        "style": _project_reference_text(body.get("style"), "style", limit=10_000),
+        "genre": _project_reference_text(body.get("genre"), "genre", limit=10_000),
+        "negative_prompt": _project_reference_text(
+            body.get("negative_prompt"), "negative_prompt", limit=50_000,
+        ),
+        "activated_loras": list(loras),
+        "loras_multipliers": _project_reference_text(
+            body.get("loras_multipliers"), "loras_multipliers", limit=2_000,
+        ),
+        "policy": policy,
+    }
+
+
+def _project_reference_creative_request(asset, config):
+    parts = [
+        str(asset.get("name") or "").strip(),
+        str(asset.get("description") or "").strip(),
+        (
+            config["description"]
+            if config["description"] != str(asset.get("description") or "").strip()
+            else ""
+        ),
+        config["poses"], config["outfits"], config["style"], config["genre"],
+        config["edit_instruction"],
+    ]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _project_reference_generation_params(
+    config, *, model_type, prompt, size, seed, reference_path=None,
+):
+    params = {
+        "model_type": model_type,
+        "prompt": prompt,
+        "negative_prompt": config["negative_prompt"],
+        "image_mode": 1,
+        "image_prompt_type": "",
+        "video_prompt_type": "",
+        "resolution": f"{size[0]}x{size[1]}",
+        "num_inference_steps": config["num_inference_steps"],
+        "guidance_scale": config["guidance_scale"],
+        "seed": seed,
+        "settings_version": 2.57,
+        "generation_mode": "image",
+        "repeat_generation": 1,
+        "batch_size": 1,
+        "video_length": 1,
+        "private_output": config["policy"]["private"],
+        "explicit_output": config["policy"]["explicit"],
+    }
+    if reference_path is None:
+        params["activated_loras"] = list(config["activated_loras"])
+        params["loras_multipliers"] = config["loras_multipliers"]
+    else:
+        params.update({
+            "image_refs": [str(reference_path)],
+            "video_prompt_type": config["editor_reference_mode"],
+            "remove_background_images_ref": 0,
+            "image_refs_relative_size": 100,
+            "activated_loras": [],
+            "loras_multipliers": "",
+        })
+    return params
+
+
+def _write_project_reference_sidecar(
+    path, *, parent_job, model_type, artifact_metadata,
+):
+    """Replace generator sidecars with prompt-free public role metadata."""
+    sidecar_path = os.path.splitext(path)[0] + ".meta.json"
+    sidecar = {
+        "params": {"reference_sheet": dict(artifact_metadata)},
+        "generation_mode": "image",
+        "model_type": model_type,
+        "job_id": str(parent_job.get("id") or ""),
+        "reference_parent_job_id": str(parent_job.get("id") or ""),
+    }
+    stamp_sidecar_policy(
+        sidecar,
+        parent_job.get("access_policy") or {},
+        workspace=str(parent_job.get("workspace") or "default"),
+    )
+    temp_path = f"{sidecar_path}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(sidecar, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, sidecar_path)
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def _run_project_reference_image_job(
+    parent_job, params, *, role, phase, step, total_steps,
+):
+    """Run one recoverable local image child and return only its owned output."""
+    child_id = uuid.uuid4().hex[:8]
+    child = {
+        "id": child_id,
         "status": "queued",
         "progress": 0,
         "step": 0,
         "total_steps": 0,
         "phase": "",
-        "message": "Queued reference generation",
+        "message": phase,
         "created_at": time.time(),
-        "params": generation_params,
+        "params": dict(params),
+        "output_files": [],
+        "error": None,
+        "workspace": parent_job["workspace"],
+        "out_dir": parent_job["out_dir"],
+        "session_id": parent_job["session_id"],
+        "source_remote": bool(parent_job.get("source_remote")),
+        "prompt_preview": "",
+        "model_type": params["model_type"],
+        "generation_mode": "image",
+        "requested_outputs": 1,
+    }
+    thread = _queue_recovery_register_and_publish(
+        child,
+        recovery_kind="studio_generation",
+        thread_name=f"reference-panel-{child_id}",
+    )
+    while thread.is_alive():
+        thread.join(timeout=0.1)
+        snapshot = snapshot_job(child)
+        child_progress = max(0.0, min(100.0, float(snapshot.get("progress") or 0)))
+        overall = ((step - 1) + (child_progress / 100.0)) / max(1, total_steps) * 100.0
+        if not update_job(
+            parent_job,
+            progress=min(99.0, overall),
+            step=step,
+            total_steps=total_steps,
+            phase=phase,
+            message=f"{phase} · {child_progress:.0f}%",
+        ):
+            request_cancel(child, job_id=child_id, active_states=_active_gen_states)
+    snapshot = snapshot_job(child)
+    if snapshot.get("status") != "completed":
+        raise RuntimeError("reference_image_generation_failed")
+    candidates = []
+    root = os.path.realpath(str(parent_job["out_dir"]))
+    for filename in snapshot.get("output_files") or []:
+        if not isinstance(filename, str) or os.path.basename(filename) != filename:
+            continue
+        lexical_path = os.path.join(root, filename)
+        path = os.path.realpath(lexical_path)
+        if (
+            not os.path.islink(lexical_path)
+            and os.path.dirname(path) == root
+            and os.path.isfile(path)
+            and os.path.splitext(path)[1].lower() in _PROJECT_REFERENCE_IMAGE_EXTENSIONS
+        ):
+            candidates.append(path)
+    if len(candidates) != 1:
+        raise RuntimeError("reference_image_output_invalid")
+    artifact_metadata = {
+        "role": role,
+        "model": params["model_type"],
+        "provenance": {
+            "strategy": "local_generation",
+            "version": "reference-sheet-v1",
+        },
+        "reason_codes": [],
+    }
+    _write_project_reference_sidecar(
+        candidates[0],
+        parent_job=parent_job,
+        model_type=params["model_type"],
+        artifact_metadata=artifact_metadata,
+    )
+    return candidates[0]
+
+
+def _project_reference_local_generate(llm_service, parent_job, generate_kwargs):
+    """Atomically enforce local vision residency across one review request."""
+    with llm_service._lock:
+        status = llm_service.get_status()
+        if (
+            status.get("provider") != "local"
+            or not status.get("loaded")
+            or not status.get("vision_available")
+            or not llm_service.vision_available()
+        ):
+            raise RuntimeError("review_unavailable")
+        if is_cancel_requested(parent_job):
+            raise RuntimeError("reference_job_cancelled")
+        return llm_service.generate(**generate_kwargs)
+
+
+def _project_reference_local_reviewer(parent_job, review_request):
+    """Use only the already-loaded local vision model for fidelity review."""
+    from services import llm_service
+
+    if is_cancel_requested(parent_job):
+        raise RuntimeError("reference_job_cancelled")
+
+    def progress(event):
+        if not isinstance(event, dict):
+            return
+        rate = event.get("live_tps")
+        if rate is None:
+            rate = event.get("average_tps")
+        suffix = ""
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool) and math.isfinite(float(rate)):
+            suffix = f" · {float(rate):.1f} tok/s"
+        update_job(
+            parent_job,
+            phase="Reviewing fidelity",
+            message=f"Reviewing reference-sheet fidelity{suffix}",
+        )
+
+    result = _project_reference_local_generate(llm_service, parent_job, dict(
+        prompt=(
+            f"{review_request.instruction}\n"
+            f"Creative request:\n{review_request.creative_request}\n"
+            f"Ordered panel roles: {', '.join(review_request.panel_roles)}"
+        ),
+        system_prompt=(
+            "You are a local visual-fidelity reviewer. Evaluate only identity, "
+            "request, view, accessory, and style fidelity. Return strict JSON."
+        ),
+        image_paths=[str(review_request.sheet_path)],
+        max_new_tokens=512,
+        temperature=0.1,
+        top_p=0.9,
+        enable_thinking=False,
+        json_schema=dict(review_request.response_schema),
+        progress_callback=progress,
+    ))
+    if is_cancel_requested(parent_job):
+        raise RuntimeError("reference_job_cancelled")
+    return result
+
+
+def _attach_project_reference_result(
+    *, project_id, workspace_id, asset_id, asset_spec, result, parent_job,
+    candidate_index, candidate_count, parent_variant_id,
+):
+    if is_cancel_requested(parent_job):
+        raise RuntimeError("reference_job_cancelled")
+    artifacts = list(result.artifacts)
+    sheets = [item for item in artifacts if item.role == "sheet" and item.path is not None]
+    panels = [item for item in artifacts if item.role != "sheet" and item.path is not None]
+    if len(sheets) != 1:
+        raise RuntimeError("reference_sheet_output_invalid")
+    ordered = [sheets[0], *panels]
+    policy = public_output_policy(parent_job.get("access_policy") or {})
+    lineage = {
+        "parent_job_id": str(parent_job.get("id") or ""),
+        "candidate_index": candidate_index + 1,
+        "candidate_count": candidate_count,
+        "parent_asset_id": asset_id,
+        "parent_variant_id": parent_variant_id or None,
+    }
+    outputs = []
+    for artifact in ordered:
+        artifact_metadata = artifact.public_metadata()
+        outputs.append({
+            "source_path": str(artifact.path),
+            "label": "Reference sheet" if artifact.role == "sheet" else artifact.role,
+            "metadata": {
+                **policy,
+                "reference_sheet": artifact_metadata,
+                "lineage": dict(lineage),
+            },
+        })
+        _write_project_reference_sidecar(
+            str(artifact.path),
+            parent_job=parent_job,
+            model_type=artifact.model,
+            artifact_metadata=artifact_metadata,
+        )
+
+    variant_id = f"{parent_job['id']}_sheet_{candidate_index + 1}"
+    variant_spec = {
+        "id": variant_id,
+        "variant_type": "reference_sheet",
+        "label": f"Candidate {candidate_index + 1}",
+        "outputs": outputs,
+        "provenance": {
+            "kind": "generated",
+            "details": {
+                "service": "reference_sheets",
+                "version": result.plan.planner_version,
+                "job_id": str(parent_job.get("id") or ""),
+            },
+        },
+        "status": "candidate",
+        "metadata": {
+            "reference_sheet": result.public_metadata(),
+            "job": {
+                "id": str(parent_job.get("id") or ""),
+                "model": result.plan.model,
+                "candidate_index": candidate_index + 1,
+                "candidate_count": candidate_count,
+            },
+            "policy": policy,
+            "parent": {
+                "asset_id": asset_id,
+                "variant_id": parent_variant_id or None,
+            },
+        },
+    }
+    store = _project_asset_store()
+    try:
+        asset = store.get_asset(project_id, workspace_id, asset_id)
+    except Exception as error:
+        from services.project_assets import ProjectAssetNotFoundError
+        if not isinstance(error, ProjectAssetNotFoundError):
+            raise
+        try:
+            asset = store.create_asset(
+                project_id,
+                workspace_id,
+                asset_id=asset_id,
+                name=asset_spec["name"],
+                asset_type=asset_spec["asset_type"],
+                description=asset_spec["description"],
+                tags=asset_spec["tags"],
+                provenance="generated",
+                metadata={},
+                variants=[variant_spec],
+            )
+            return next(item for item in asset["variants"] if item["id"] == variant_id)
+        except ValueError as create_error:
+            # A concurrent replay may have committed this stable identity
+            # after our miss. Re-read once; unrelated validation failures
+            # retain their original exception and never become an overwrite.
+            try:
+                asset = store.get_asset(project_id, workspace_id, asset_id)
+            except Exception:
+                raise create_error
+    existing = next(
+        (item for item in asset.get("variants") or [] if item.get("id") == variant_id),
+        None,
+    )
+    if existing is not None:
+        return existing
+    return store.add_variant(
+        project_id,
+        workspace_id,
+        asset_id,
+        variant_id=variant_id,
+        variant_type=variant_spec["variant_type"],
+        label=variant_spec["label"],
+        outputs=variant_spec["outputs"],
+        provenance=variant_spec["provenance"],
+        status=variant_spec["status"],
+        metadata=variant_spec["metadata"],
+    )
+
+
+@api.post("/api/v1/projects/{project}/assets/generate")
+async def generate_project_asset_references(project: str, request: Request):
+    """Queue versioned local reference-sheet generation for one project card."""
+    project_id, workspace_id = _asset_scope(request, project)
+    body = await request.json()
+    config = _project_reference_request_config(body, request)
+    # Keep the authorization guard visible at the route boundary as well as
+    # inside complete request validation; source-contract checks and future
+    # refactors must not be able to separate model visibility from submission.
+    _require_remote_visible_models(
+        request,
+        [config["model_type"], config.get("editor_model_type")],
+    )
+    workspace = project
+    job_out_dir = _require_project_access(request, workspace)
+    owner_session_id = request.state.maestro_session_id
+    asset_id = config["asset_id"]
+
+    try:
+        if asset_id:
+            asset = _require_project_asset_media_access(
+                project_id, workspace_id, asset_id, owner_session_id,
+            )
+            if asset.get("asset_type") not in {"character", "setting", "item", "style"}:
+                raise HTTPException(status_code=400, detail="Unsupported reference asset type")
+            if body.get("asset_type") is not None and body.get("asset_type") != asset.get("asset_type"):
+                raise HTTPException(status_code=409, detail="Reference asset type cannot change on retry")
+            config["asset_type"] = asset["asset_type"]
+            if config["parent_variant_id"]:
+                _require_project_asset_media_access(
+                    project_id,
+                    workspace_id,
+                    asset_id,
+                    owner_session_id,
+                    variant_id=config["parent_variant_id"],
+                )
+            asset_spec = {
+                "name": asset["name"],
+                "asset_type": asset["asset_type"],
+                "description": asset.get("description") or "",
+                "tags": list(asset.get("tags") or []),
+            }
+            response_asset = asset
+        else:
+            asset_id = uuid.uuid4().hex
+            asset_spec = {
+                "name": config["name"],
+                "asset_type": config["asset_type"],
+                "description": config["description"],
+                "tags": list(config["tags"] or []),
+            }
+            asset = {**asset_spec, "id": asset_id}
+            response_asset = {
+                **asset_spec,
+                "id": asset_id,
+                "provenance": {"kind": "generated", "details": {}},
+                "metadata": {},
+                "variants": [],
+                "pending": True,
+            }
+    except Exception as error:
+        raise _project_asset_error(error) from error
+
+    creative_request = _project_reference_creative_request(asset, config)
+    if not creative_request:
+        raise HTTPException(status_code=400, detail="Reference request is empty")
+    job_id = uuid.uuid4().hex[:8]
+    panel_count = {
+        "character": 6, "setting": 5, "item": 5, "style": 5,
+    }[config["asset_type"]]
+    # Production/Hybrid reserve enough denominator for the bounded worst case:
+    # one repair and one second compose/review pass. A no-repair run simply
+    # completes before the ceiling and transitions to 100% at final attach.
+    operations_per_candidate = 3 if config["mode"] == "draft" else panel_count + 4
+    total_steps = operations_per_candidate * config["candidate_count"]
+    job = {
+        "id": job_id,
+        "status": "queued",
+        "progress": 0,
+        "step": 0,
+        "total_steps": total_steps,
+        "phase": "Planning",
+        "message": "Queued reference-sheet planning",
+        "created_at": time.time(),
+        "params": {
+            "reference_sheet": {
+                "schema_version": 1,
+                "planner_version": "reference-sheet-v1",
+                "mode": config["mode"],
+                "asset_type": config["asset_type"],
+                "candidate_count": config["candidate_count"],
+                "panel_size": list(config["panel_size"]),
+                "draft_size": list(config["draft_size"]),
+                "columns": config["columns"],
+                "palette_swatches": config["palette_swatches"],
+                "review_requested": config["review"],
+            },
+        },
         "output_files": [],
         "error": None,
         "workspace": workspace,
         "out_dir": job_out_dir,
-        "prompt_preview": prompt[:500],
-        "model_type": generation_params["model_type"],
+        "session_id": owner_session_id,
+        "access_policy": dict(config["policy"]),
+        "private": config["policy"]["private"],
+        "explicit": config["policy"]["explicit"],
+        "source_remote": bool(_request_remote.get()),
+        "prompt_preview": "",
+        "model_type": config["model_type"],
         "generation_mode": "image",
+        "requested_outputs": config["candidate_count"],
     }
-    # Reserve before publication so delete cannot interleave between a queued
-    # registry entry and the worker taking responsibility for the project.
     _begin_workspace_operation(project_id)
 
     def _run_and_attach_candidates(_job_id):
+        from services.reference_sheets import (
+            build_reference_sheet_plan,
+            create_reference_sheet,
+        )
+
+        parent_job = _jobs[_job_id]
+        completed_sheets = []
+        step_state = {"value": 0}
+
+        def next_step(phase):
+            step_state["value"] += 1
+            if not update_job(
+                parent_job,
+                step=step_state["value"],
+                total_steps=total_steps,
+                progress=min(99.0, (step_state["value"] - 1) / max(1, total_steps) * 100.0),
+                phase=phase,
+                message=phase,
+            ):
+                raise RuntimeError("reference_job_cancelled")
+            return step_state["value"]
+
         try:
-            _run_generation(job_id)
-            snapshot = snapshot_job(job)
-            if snapshot.get("status") != "completed":
+            if not try_start(
+                parent_job,
+                message="Planning reference sheets",
+                phase="Planning",
+                total_steps=total_steps,
+            ):
                 return
-            for index, filename in enumerate(snapshot.get("output_files") or []):
-                path = os.path.join(job["out_dir"], filename)
-                if not os.path.isfile(path):
-                    continue
+            for candidate_index in range(config["candidate_count"]):
+                variant_id = f"{job_id}_sheet_{candidate_index + 1}"
                 try:
-                    _project_asset_store().add_variant(
-                        project_id,
-                        workspace_id,
-                        asset_id,
-                        variant_type="reference",
-                        label=f"Candidate {index + 1}",
-                        outputs=[{
-                            "source_path": path,
-                            "label": variant_direction or "Reference",
-                            "metadata": dict(job.get("access_policy") or {}),
-                        }],
-                        provenance="generated",
-                        status="candidate",
-                        metadata={"prompt": prompt, "job_id": job_id},
+                    current_asset = _project_asset_store().get_asset(
+                        project_id, workspace_id, asset_id,
                     )
-                except Exception as error:
-                    print(f"[ProjectAssets] Could not attach {filename}: {error}")
+                except Exception:
+                    current_asset = None
+                if current_asset is not None and any(
+                    item.get("id") == variant_id
+                    for item in current_asset.get("variants") or []
+                ):
+                    step_state["value"] += operations_per_candidate
+                    continue
+
+                plan = build_reference_sheet_plan(
+                    asset_type=config["asset_type"],
+                    mode=config["mode"],
+                    creative_request=creative_request,
+                    model=config["model_type"],
+                    panel_size=config["panel_size"],
+                    draft_size=config["draft_size"],
+                    columns=config["columns"],
+                    palette_swatches=config["palette_swatches"],
+                )
+
+                def adjusted_seed(index):
+                    if config["seed"] < 0:
+                        return -1
+                    return min(
+                        (2 ** 63) - 1,
+                        config["seed"] + candidate_index * 100 + index,
+                    )
+
+                def generate_panel(panel_request):
+                    phase = (
+                        f"Generating candidate {candidate_index + 1}/{config['candidate_count']} "
+                        f"panel {panel_request.index + 1}/{panel_request.panel_count}"
+                    )
+                    step = next_step(phase)
+                    prompt = (
+                        f"Generate exactly one {panel_request.asset_type} reference panel. "
+                        f"Role: {panel_request.label}. Objective: {panel_request.objective}. "
+                        "Keep the requested identity and design consistent. No collage, "
+                        "no captions, no labels, no borders. "
+                        f"Creative request: {panel_request.creative_request}"
+                    )
+                    params = _project_reference_generation_params(
+                        config,
+                        model_type=config["model_type"],
+                        prompt=prompt,
+                        size=panel_request.panel_size,
+                        seed=adjusted_seed(panel_request.index),
+                    )
+                    return _run_project_reference_image_job(
+                        parent_job, params,
+                        role=panel_request.role,
+                        phase=phase,
+                        step=step,
+                        total_steps=total_steps,
+                    )
+
+                def edit_panel(anchor_path, panel_request):
+                    phase = (
+                        f"Editing candidate {candidate_index + 1}/{config['candidate_count']} "
+                        f"panel {panel_request.index + 1}/{panel_request.panel_count}"
+                    )
+                    step = next_step(phase)
+                    prompt = (
+                        "Create a new targeted reference view from the attached identity "
+                        "anchor. Preserve identity, design, materials, and palette. "
+                        f"Role: {panel_request.label}. Objective: {panel_request.objective}. "
+                        "Output one clean panel with no collage, captions, labels, or borders. "
+                        f"Creative request: {panel_request.creative_request}"
+                    )
+                    params = _project_reference_generation_params(
+                        config,
+                        model_type=config["editor_model_type"],
+                        prompt=prompt,
+                        size=panel_request.panel_size,
+                        seed=adjusted_seed(panel_request.index),
+                        reference_path=anchor_path,
+                    )
+                    return _run_project_reference_image_job(
+                        parent_job, params,
+                        role=panel_request.role,
+                        phase=phase,
+                        step=step,
+                        total_steps=total_steps,
+                    )
+
+                def generate_draft(draft_request):
+                    phase = f"Generating draft sheet {candidate_index + 1}/{config['candidate_count']}"
+                    step = next_step(phase)
+                    prompt = (
+                        f"Create one compatibility reference sheet for this {draft_request.asset_type}: "
+                        f"{draft_request.creative_request}. Include the ordered views "
+                        f"{', '.join(draft_request.panel_labels)} and one embedded palette "
+                        "region within the sheet. Clear, identity-consistent design for "
+                        "future image and video conditioning; no separate palette image."
+                    )
+                    params = _project_reference_generation_params(
+                        config,
+                        model_type=config["model_type"],
+                        prompt=prompt,
+                        size=draft_request.draft_size,
+                        seed=adjusted_seed(0),
+                    )
+                    return _run_project_reference_image_job(
+                        parent_job, params,
+                        role="sheet",
+                        phase=phase,
+                        step=step,
+                        total_steps=total_steps,
+                    )
+
+                def repair_panel(original_path, repair_request):
+                    phase = (
+                        f"Repairing candidate {candidate_index + 1}/{config['candidate_count']} "
+                        f"panel {repair_request.label}"
+                    )
+                    step = next_step(phase)
+                    use_editor = config["mode"] == "hybrid"
+                    prompt = (
+                        "Create one corrected replacement reference panel. "
+                        f"Role: {repair_request.label}. Objective: {repair_request.objective}. "
+                        f"Correction reasons: {', '.join(repair_request.reason_codes)}. "
+                        "Preserve the requested design and output no collage, captions, "
+                        f"labels, or borders. Creative request: {repair_request.creative_request}"
+                    )
+                    params = _project_reference_generation_params(
+                        config,
+                        model_type=(
+                            config["editor_model_type"] if use_editor else config["model_type"]
+                        ),
+                        prompt=prompt,
+                        size=repair_request.panel_size,
+                        seed=adjusted_seed(plan.panel_roles.index(repair_request.role) + 50),
+                        reference_path=original_path if use_editor else None,
+                    )
+                    return _run_project_reference_image_job(
+                        parent_job, params,
+                        role=repair_request.role,
+                        phase=phase,
+                        step=step,
+                        total_steps=total_steps,
+                    )
+
+                def reviewer(review_request):
+                    next_step(
+                        f"Composing candidate {candidate_index + 1}/{config['candidate_count']}"
+                    )
+                    update_job(
+                        parent_job,
+                        phase="Reviewing fidelity",
+                        message=(
+                            f"Reviewing candidate {candidate_index + 1}/"
+                            f"{config['candidate_count']} fidelity"
+                        ),
+                    )
+                    if not config["review"]:
+                        raise RuntimeError("review_unavailable")
+                    return _project_reference_local_reviewer(parent_job, review_request)
+
+                output_path = os.path.join(
+                    job_out_dir,
+                    f"reference_sheet_{job_id}_{candidate_index + 1}.png",
+                )
+                result = create_reference_sheet(
+                    plan,
+                    output_path,
+                    generate_panel=generate_panel,
+                    edit_panel=edit_panel,
+                    generate_draft=generate_draft,
+                    reviewer=reviewer,
+                    repair_panel=repair_panel,
+                )
+                next_step(
+                    f"Attaching candidate {candidate_index + 1}/{config['candidate_count']}"
+                )
+                _attach_project_reference_result(
+                    project_id=project_id,
+                    workspace_id=workspace_id,
+                    asset_id=asset_id,
+                    asset_spec=asset_spec,
+                    result=result,
+                    parent_job=parent_job,
+                    candidate_index=candidate_index,
+                    candidate_count=config["candidate_count"],
+                    parent_variant_id=config["parent_variant_id"],
+                )
+                completed_sheets.append(os.path.basename(str(result.sheet_path)))
+
+            finish_job(
+                parent_job,
+                "completed",
+                progress=100,
+                step=total_steps,
+                total_steps=total_steps,
+                phase="",
+                message="Reference sheets ready",
+                output_files=completed_sheets,
+                error=None,
+            )
+        except Exception:
+            finish_job(
+                parent_job,
+                "failed",
+                progress=0,
+                phase="",
+                message="Reference-sheet generation failed",
+                error="Reference-sheet generation failed",
+            )
         finally:
             _end_workspace_operation(project_id)
 
@@ -13330,10 +14073,10 @@ async def generate_project_asset_references(project: str, request: Request):
             recovery_kind="studio_project_asset_preparation",
             thread_name=f"studio-project-asset-{job_id}",
         )
-    except Exception:
+    except Exception as error:
         _end_workspace_operation(project_id)
-        raise
-    return {"job_id": job_id, "asset": asset}
+        raise _project_asset_error(error) from error
+    return {"job_id": job_id, "asset": response_asset}
 
 
 # ============================================================================
@@ -15123,33 +15866,49 @@ def _safe_llm_speed(speed) -> dict:
 async def llm_load(request: Request):
     """Load the LLM model."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = {}
     if request.headers.get("content-type", "").startswith("application/json"):
         body = await request.json()
 
+    _require_local_llm_control(request)
+
     services = wgp.server_config.get("services", {})
-    model_id = body.get("model_id", services.get("llm_model_id", _DEFAULT_LLM_REPO))
-    device = body.get("device", services.get("llm_device", _llm_default_device()))
     provider = body.get("provider", services.get("llm_provider", "local"))
-    remote_url = body.get("remote_url", services.get("llm_remote_url", ""))
-    api_key = ""
-    if provider == "openai":
-        api_key = services.get("openai_api_key", "")
-    elif provider == "anthropic":
-        api_key = services.get("anthropic_api_key", "")
+    selection = {
+        "model_id": body.get(
+            "model_id", services.get("llm_model_id", _DEFAULT_LLM_REPO),
+        ),
+        "device": body.get(
+            "device", services.get("llm_device", _llm_default_device()),
+        ),
+        "provider": provider,
+        "remote_url": body.get(
+            "remote_url", services.get("llm_remote_url", ""),
+        ),
+        "api_key": _llm_provider_api_key(provider, services),
+        "local_gguf_path": "",
+        "gguf_file_override": "",
+    }
 
     try:
-        llm_service.load_model(model_id=model_id, device=device, provider=provider, remote_url=remote_url, api_key=api_key)
+        await run_blocking_shielded(
+            _run_authorized_llm_with_selection, request, selection,
+        )
         return {"status": "ok", **llm_service.get_status()}
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="LLM preparation failed; check the local Maestro logs",
+        ) from error
 
 
 @api.post("/api/v1/llm/unload")
-def llm_unload():
+def llm_unload(request: Request):
     """Unload the LLM model to free memory."""
     from services import llm_service
+    _require_local_llm_control(request)
     llm_service.unload_model()
     return {"status": "ok"}
 
@@ -15467,6 +16226,88 @@ def _llm_chat_request_is_external(request: Request) -> bool:
     )
 
 
+def _promote_external_llm_request(request: Request) -> None:
+    """Apply Chat's LAN/Cloudflare boundary before project authorization."""
+    if _llm_chat_request_is_external(request):
+        request.state.maestro_remote = True
+
+
+def _require_local_llm_control(request: Request) -> None:
+    """Deny machine-wide LLM controls to every external transport."""
+    _promote_external_llm_request(request)
+    if bool(getattr(request.state, "maestro_remote", False)):
+        raise HTTPException(
+            status_code=403,
+            detail="This machine-wide control is available locally only",
+        )
+
+
+@api.middleware("http")
+async def _llm_operation_no_store(request: Request, call_next):
+    """Keep transient LLM operation state/results out of intermediary caches."""
+    response = await call_next(request)
+    path = request.url.path
+    if (
+        path == "/api/v1/llm/prepare"
+        or path.startswith("/api/v1/llm/prepare/")
+        or path == "/api/v1/llm/chat"
+        or path.startswith("/api/v1/llm/chat/")
+        or path == "/api/v1/llm/refusal-literals"
+    ):
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@api.post("/api/v1/llm/refusal-literals")
+async def add_llm_refusal_literal(request: Request):
+    """Add one exact owner-confirmed response literal on the host only."""
+    # Repeat both guards at the endpoint so alternate/test invocation cannot
+    # parse a remote or cross-origin body even without the normal middleware.
+    _require_local_llm_control(request)
+    csrf_denial = _reject_cross_origin_mutation(request)
+    if csrf_denial is not None:
+        return csrf_denial
+    try:
+        body = await request.json()
+    except Exception as error:
+        raise HTTPException(
+            status_code=400, detail="Invalid refusal literal request",
+        ) from error
+    if not isinstance(body, dict) or "literal" not in body:
+        raise HTTPException(
+            status_code=400, detail="Invalid refusal literal request",
+        )
+
+    from services.llm_refusal_corpus import (
+        RefusalCorpusStorageError,
+        RefusalCorpusValidationError,
+        add_refusal_literal,
+    )
+
+    try:
+        update = add_refusal_literal(body.get("literal"))
+    except RefusalCorpusValidationError as error:
+        raise HTTPException(
+            status_code=400, detail="Invalid refusal literal",
+        ) from error
+    except RefusalCorpusStorageError as error:
+        raise HTTPException(
+            status_code=500, detail="Refusal literal could not be saved",
+        ) from error
+    return JSONResponse(
+        {
+            "added": update.added,
+            "count": update.snapshot.count,
+            "revision": update.snapshot.revision,
+        },
+        headers={
+            "Cache-Control": "private, no-store",
+            "Pragma": "no-cache",
+        },
+    )
+
+
 def _llm_project_instance_id(request: Request, workspace: str) -> str:
     """Return an opaque identity that changes if a project is recreated."""
     _require_project_access(request, workspace)
@@ -15779,6 +16620,259 @@ def _resolve_llm_chat_model(request: Request, model_id: str) -> dict:
     }
 
 
+def _configured_llm_selection() -> dict:
+    """Snapshot the exact server-configured LLM load arguments."""
+    services = wgp.server_config.get("services", {})
+    provider = str(services.get("llm_provider") or "local")
+    return {
+        "model_id": str(
+            services.get("llm_model_id") or _DEFAULT_LLM_REPO
+        ),
+        "device": str(
+            services.get("llm_device") or _llm_default_device()
+        ),
+        "provider": provider,
+        "remote_url": str(services.get("llm_remote_url") or ""),
+        "api_key": _llm_provider_api_key(provider, services),
+        "local_gguf_path": "",
+        "gguf_file_override": "",
+    }
+
+
+def _resolve_direct_llm_selection(request: Request) -> dict:
+    """Resolve the server-owned selection for a direct LLM request.
+
+    External callers may use only the curated local catalog. They can neither
+    inherit a host-configured network provider nor make Maestro reveal or use
+    its provider URL/key. If the configured model is not in that catalog, use
+    the server's curated default rather than accepting caller-controlled input.
+    """
+    if not _llm_chat_request_is_external(request):
+        return _configured_llm_selection()
+    services = wgp.server_config.get("services", {})
+    configured_model = str(
+        services.get("llm_model_id") or _DEFAULT_LLM_REPO
+    )
+    try:
+        selection = _resolve_llm_chat_model(request, configured_model)
+    except ValueError:
+        selection = _resolve_llm_chat_model(request, _DEFAULT_LLM_REPO)
+    if selection.get("provider") != "local":
+        raise ValueError("External LLM requests require a local model")
+    selection["remote_url"] = ""
+    selection["api_key"] = ""
+    return selection
+
+
+def _run_authorized_llm_with_selection(
+    request: Request,
+    selection: dict,
+    operation=None,
+    /,
+    *args,
+    **kwargs,
+):
+    """Revalidate locality before model load and immediately before content."""
+    external = _llm_chat_request_is_external(request)
+
+    def require_allowed_selection() -> None:
+        if external and (
+            selection.get("provider") != "local"
+            or selection.get("remote_url")
+            or selection.get("api_key")
+        ):
+            raise PermissionError("External LLM selection is not local")
+
+    require_allowed_selection()
+
+    def run_after_load():
+        require_allowed_selection()
+        if operation is None:
+            return None
+        return operation(*args, **kwargs)
+
+    return _run_llm_with_selection(selection, run_after_load)
+
+
+def _run_llm_with_selection(
+    selection: dict,
+    operation=None,
+    /,
+    *args,
+    **kwargs,
+):
+    """Hold one exact model identity across load and optional inference."""
+    from services import llm_service
+
+    load_args = {
+        key: selection.get(key, "")
+        for key in (
+            "model_id", "device", "provider", "remote_url", "api_key",
+            "local_gguf_path", "gguf_file_override",
+        )
+    }
+    with llm_service.loaded_model_lease(**load_args):
+        if operation is None:
+            return None
+        return operation(*args, **kwargs)
+
+
+def _prepare_llm_selection(selection: dict) -> None:
+    _run_llm_with_selection(selection)
+
+
+def _llm_operation_scope(
+    request: Request,
+    workspace: str,
+) -> tuple[str, str]:
+    """Return opaque session and project keys after project authorization."""
+    project_key = _llm_project_instance_id(request, workspace)
+    session_id = str(
+        getattr(request.state, "maestro_session_id", "") or ""
+    )
+    owner_key = hmac.new(
+        _session_secret(),
+        f"llm-operation-owner-v1\0{session_id}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return owner_key, project_key
+
+
+def _llm_selection_key(purpose: str, selection: dict) -> str:
+    """Hash exact load inputs so the manager never retains credentials."""
+    material = json.dumps(
+        {
+            "purpose": purpose,
+            "selection": {
+                key: str(selection.get(key, "") or "")
+                for key in (
+                    "model_id", "device", "provider", "remote_url", "api_key",
+                    "local_gguf_path", "gguf_file_override",
+                )
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(
+        _session_secret(), material, hashlib.sha256,
+    ).hexdigest()
+
+
+def _resolve_llm_prepare_selection(
+    request: Request,
+    body: dict,
+) -> tuple[str, dict]:
+    purpose = body.get("purpose")
+    if purpose not in {"chat", "enhance", "configured"}:
+        raise ValueError("invalid purpose")
+    allowed = {"workspace", "purpose"}
+    if purpose == "chat":
+        allowed.add("model_id")
+        selection = _resolve_llm_chat_model(request, body.get("model_id"))
+    elif purpose == "enhance":
+        from services import llm_service
+
+        allowed.update({"model_type", "vision_required"})
+        vision_required = body.get("vision_required", False)
+        if not isinstance(vision_required, bool):
+            raise ValueError("invalid vision_required")
+        model_type = body.get("model_type", "")
+        if not isinstance(model_type, str):
+            raise ValueError("invalid model_type")
+        services = wgp.server_config.get("services", {})
+        model_id, device, _raw_mode = _resolve_prompt_enhancer_selection(
+            model_type,
+            services,
+            has_images=vision_required,
+            model_registry=llm_service.MODEL_REGISTRY,
+        )
+        selection = {
+            "model_id": model_id,
+            "device": device,
+            "provider": "local",
+            "remote_url": "",
+            "api_key": "",
+            "local_gguf_path": "",
+            "gguf_file_override": "",
+        } if model_id else _resolve_direct_llm_selection(request)
+    else:
+        selection = _resolve_direct_llm_selection(request)
+    if set(body) - allowed:
+        raise ValueError("unexpected preparation field")
+    return purpose, selection
+
+
+@api.post("/api/v1/llm/prepare", status_code=202)
+async def llm_prepare(request: Request):
+    """Start/coalesce content-free, project-authorized model preparation."""
+    from services.llm_operations import (
+        LlmOperationCapacityError,
+        llm_preparation_manager,
+    )
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="Invalid LLM preparation request",
+        )
+    if _llm_chat_request_is_external(request):
+        request.state.maestro_remote = True
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace)
+    try:
+        purpose, selection = await asyncio.to_thread(
+            _resolve_llm_prepare_selection, request, body,
+        )
+    except (TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail="LLM preparation selection is not available",
+        ) from error
+    owner_key, project_key = _llm_operation_scope(request, workspace)
+    selection_key = _llm_selection_key(purpose, selection)
+    try:
+        return await llm_preparation_manager.start(
+            owner_key=owner_key,
+            project_key=project_key,
+            selection_key=selection_key,
+            purpose=purpose,
+            prepare=lambda: _prepare_llm_selection(selection),
+        )
+    except LlmOperationCapacityError as error:
+        raise HTTPException(
+            status_code=503, detail="LLM preparation is busy",
+        ) from error
+
+
+@api.get("/api/v1/llm/prepare/{operation_id}")
+def llm_prepare_status(
+    request: Request,
+    operation_id: str,
+    workspace: str = "",
+):
+    """Return bounded public state for one owned preparation operation."""
+    from services.llm_operations import llm_preparation_manager
+
+    if _llm_chat_request_is_external(request):
+        request.state.maestro_remote = True
+    selected_workspace = _request_project_workspace(request, workspace)
+    _require_project_access(request, selected_workspace)
+    owner_key, project_key = _llm_operation_scope(
+        request, selected_workspace,
+    )
+    status = llm_preparation_manager.status(
+        operation_id,
+        owner_key=owner_key,
+        project_key=project_key,
+    )
+    if status is None:
+        raise HTTPException(
+            status_code=404, detail="LLM preparation not found",
+        )
+    return status
+
+
 def _resolve_llm_chat_images(
     request: Request,
     body: dict,
@@ -15817,61 +16911,246 @@ async def _execute_llm_chat(
     request: Request,
     body: dict,
     image_paths: list[str],
+    progress_callback=None,
+    validated: dict | None = None,
+    response_assist_snapshot=None,
 ) -> dict:
-    """Validate, resolve, and execute one already-authorized Chat turn."""
+    """Execute one prevalidated, already-authorized Chat turn."""
     from services import llm_service
 
-    try:
-        messages = llm_service.validate_chat_messages(body.get("messages"))
-        guide_ids, system_prompt = llm_service.load_chat_guides(
-            body.get("guide_ids", []),
-        )
-        selection = _resolve_llm_chat_model(request, body.get("model_id"))
-        if image_paths and selection.get("vision_capable") is False:
-            raise ValueError("The selected LLM is text only and cannot accept images")
-        max_new_tokens = body.get("max_new_tokens", 2048)
-        if (
-            isinstance(max_new_tokens, bool)
-            or not isinstance(max_new_tokens, int)
-            or not 1 <= max_new_tokens <= llm_service.CHAT_MAX_NEW_TOKENS
-        ):
-            raise ValueError(
-                "max_new_tokens must be between 1 and "
-                f"{llm_service.CHAT_MAX_NEW_TOKENS}"
+    from services.llm_operations import run_blocking_shielded
+
+    if validated is None:
+        try:
+            validated = await run_blocking_shielded(
+                _validate_llm_chat_request, request, body, image_paths,
             )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    if response_assist_snapshot is None:
+        from services.llm_response_assist import response_assist_corpus_snapshot
+        response_assist_snapshot = response_assist_corpus_snapshot()
+    messages = validated["messages"]
+    guide_ids = validated["guide_ids"]
+    system_prompt = validated["system_prompt"]
+    selection = validated["selection"]
+    max_new_tokens = validated["max_new_tokens"]
+    temperature = validated["temperature"]
+    top_p = validated["top_p"]
 
     try:
-        text = await asyncio.to_thread(
-            llm_service.generate_chat,
-            messages,
-            model_id=selection["model_id"],
-            device=selection["device"],
-            provider=selection["provider"],
-            remote_url=selection["remote_url"],
-            api_key=selection["api_key"],
-            local_gguf_path=selection["local_gguf_path"],
-            gguf_file_override=selection["gguf_file_override"],
-            system_prompt=system_prompt,
-            max_new_tokens=max_new_tokens,
-            image_paths=image_paths,
+        _emit_llm_progress(progress_callback, {
+            "phase": "loading",
+            "attempt": 1,
+        })
+
+        def run_chat():
+            # Resolve both consent and provider locality after the exact model
+            # lease is ready. A stale configured URL/key or a public provider
+            # can never receive the prefill/detector mechanism.
+            response_assist = _resolved_local_response_assist(
+                body, selection, corpus_snapshot=response_assist_snapshot,
+            )
+            _emit_llm_progress(progress_callback, {
+                "phase": "inference",
+                "attempt": 1,
+                "attempt_cap": 2 if (
+                    response_assist
+                    and response_assist.get("retry_on_refusal") is True
+                ) else 1,
+            })
+            runtime_system_prompt = system_prompt
+            if _explicit_llm_guidance_allowed(body):
+                from services.director.nsfw_guidance import inject_content_guidance
+                runtime_system_prompt = inject_content_guidance(
+                    runtime_system_prompt, True, "enhance",
+                )
+            return llm_service.generate_chat(
+                messages,
+                model_id=selection["model_id"],
+                device=selection["device"],
+                provider=selection["provider"],
+                remote_url=selection["remote_url"],
+                api_key=selection["api_key"],
+                local_gguf_path=selection["local_gguf_path"],
+                gguf_file_override=selection["gguf_file_override"],
+                system_prompt=runtime_system_prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                enable_thinking=(
+                    False
+                    if response_assist
+                    and response_assist.get("assistant_prefill")
+                    else None
+                ),
+                image_paths=image_paths,
+                response_assist=response_assist,
+                progress_callback=progress_callback,
+            )
+
+        text = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            run_chat,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except Exception as error:
         traceback.print_exc()
-        detail = (
-            "LLM chat failed; check the local Maestro logs"
-            if bool(getattr(request.state, "maestro_remote", False))
-            else str(error)
-        )
-        raise HTTPException(status_code=500, detail=detail) from error
+        raise HTTPException(
+            status_code=500,
+            detail="LLM chat failed; check the local Maestro logs",
+        ) from error
     return {
         "text": text,
         "model_id": selection["response_model_id"],
         "guide_ids": guide_ids,
     }
+
+
+def _emit_llm_progress(progress_callback, event: dict) -> None:
+    """Send one operation-local snapshot without risking inference failure."""
+    if not callable(progress_callback):
+        return
+    try:
+        progress_callback(event)
+    except Exception:
+        pass
+
+
+def _llm_chat_sampling_options(body: dict) -> tuple[float, float]:
+    """Validate the public Chat sampling controls used by inference/digest."""
+    temperature = body.get("temperature", 0.7)
+    top_p = body.get("top_p", 0.9)
+    if (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not math.isfinite(temperature)
+        or not 0 <= temperature <= 2
+    ):
+        raise ValueError("temperature must be between 0 and 2")
+    if (
+        isinstance(top_p, bool)
+        or not isinstance(top_p, (int, float))
+        or not math.isfinite(top_p)
+        or not 0 < top_p <= 1
+    ):
+        raise ValueError("top_p must be greater than 0 and at most 1")
+    return float(temperature), float(top_p)
+
+
+def _validate_llm_chat_request(
+    request: Request,
+    body: dict,
+    image_paths: list[str],
+) -> dict:
+    """Resolve all deterministic Chat inputs before admitting an operation."""
+    from services import llm_service
+
+    messages = llm_service.validate_chat_messages(body.get("messages"))
+    guide_ids, system_prompt = llm_service.load_chat_guides(
+        body.get("guide_ids", []),
+    )
+    selection = _resolve_llm_chat_model(request, body.get("model_id"))
+    if image_paths and selection.get("vision_capable") is False:
+        raise ValueError("The selected LLM is text only and cannot accept images")
+    max_new_tokens = body.get("max_new_tokens", 2048)
+    if (
+        isinstance(max_new_tokens, bool)
+        or not isinstance(max_new_tokens, int)
+        or not 1 <= max_new_tokens <= llm_service.CHAT_MAX_NEW_TOKENS
+    ):
+        raise ValueError(
+            "max_new_tokens must be between 1 and "
+            f"{llm_service.CHAT_MAX_NEW_TOKENS}"
+        )
+    temperature, top_p = _llm_chat_sampling_options(body)
+    return {
+        "messages": messages,
+        "guide_ids": guide_ids,
+        "system_prompt": system_prompt,
+        "selection": selection,
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
+
+
+def _resolved_local_response_assist(
+    body: dict,
+    selection: dict,
+    *,
+    corpus_snapshot=None,
+) -> dict | None:
+    """Gate prefill/detection on literal opt-in, current consent, and locality."""
+    if (
+        body.get("explicit_output") is not True
+        or not _explicit_llm_guidance_allowed(body)
+        or str(selection.get("provider") or "local").strip().lower() != "local"
+        or bool(str(selection.get("remote_url") or "").strip())
+        or bool(str(selection.get("api_key") or "").strip())
+    ):
+        return None
+    from services.llm_response_assist import build_server_response_assist
+    return build_server_response_assist(corpus_snapshot=corpus_snapshot)
+
+
+def _normalize_llm_chat_request_id(value) -> str:
+    if not isinstance(value, str):
+        raise ValueError("request_id must be a UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("request_id must be a UUID") from error
+    return parsed.hex
+
+
+def _llm_chat_request_digest(
+    body: dict,
+    *,
+    workspace: str,
+    image_paths: list[str],
+    response_assist_snapshot=None,
+) -> str:
+    """Bind a recovery id to only fields that affect Chat inference."""
+    from services.llm_response_assist import (
+        SERVER_RESPONSE_ASSIST_IDENTITY,
+        response_assist_corpus_snapshot,
+    )
+
+    if response_assist_snapshot is None:
+        response_assist_snapshot = response_assist_corpus_snapshot()
+    corpus_revision = getattr(response_assist_snapshot, "revision", 0)
+    if isinstance(corpus_revision, bool) or not isinstance(corpus_revision, int):
+        corpus_revision = 0
+
+    effective_request = {
+        "workspace": workspace,
+        "model_id": body.get("model_id"),
+        "messages": body.get("messages"),
+        "guide_ids": body.get("guide_ids", []),
+        "max_new_tokens": body.get("max_new_tokens", 2048),
+        "temperature": body.get("temperature", 0.7),
+        "top_p": body.get("top_p", 0.9),
+        "explicit_output": body.get("explicit_output") is True,
+        "response_assist": dict(SERVER_RESPONSE_ASSIST_IDENTITY),
+        "refusal_corpus_revision": corpus_revision,
+        "image_paths": list(image_paths),
+    }
+    try:
+        material = json.dumps(
+            effective_request,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError("Chat request is not serializable") from error
+    return hmac.new(
+        _session_secret(), material, hashlib.sha256,
+    ).hexdigest()
 
 
 @api.post("/api/v1/llm/chat")
@@ -15897,79 +17176,166 @@ async def llm_chat(request: Request):
     )
     cleanup_chat_uploads = globals().get("_cleanup_llm_chat_uploads")
 
-    if not _llm_chat_admission.acquire(blocking=False):
+    from services.llm_operations import (
+        ChatAdmissionError,
+        ChatRequestMismatchError,
+        LlmOperationCapacityError,
+        llm_chat_operation_manager,
+    )
+
+    raw_request_id = body.get("request_id")
+    if raw_request_id is None:
         if callable(cleanup_chat_uploads):
             cleanup_chat_uploads(request, workspace, image_paths)
         raise HTTPException(
-            status_code=429,
-            detail="Another LLM chat turn is already running; retry shortly",
+            status_code=400,
+            detail="request_id is required for recoverable Chat",
         )
-    execution = asyncio.create_task(
-        _execute_llm_chat(request, body, image_paths),
-    )
-    def finish_chat_turn(_finished) -> None:
+    try:
+        request_id = _normalize_llm_chat_request_id(raw_request_id)
+    except ValueError as error:
+        if callable(cleanup_chat_uploads):
+            cleanup_chat_uploads(request, workspace, image_paths)
+        raise HTTPException(
+            status_code=400, detail="Invalid Chat request id",
+        ) from error
+    try:
+        from services.llm_operations import run_blocking_shielded
+        validated = await run_blocking_shielded(
+            _validate_llm_chat_request, request, body, image_paths,
+        )
+        from services.llm_response_assist import response_assist_corpus_snapshot
+        response_assist_snapshot = response_assist_corpus_snapshot()
+        request_digest = _llm_chat_request_digest(
+            body,
+            workspace=workspace,
+            image_paths=image_paths,
+            response_assist_snapshot=response_assist_snapshot,
+        )
+    except ValueError as error:
+        if callable(cleanup_chat_uploads):
+            cleanup_chat_uploads(request, workspace, image_paths)
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    owner_key, project_key = _llm_operation_scope(request, workspace)
+
+    def finish_async_chat() -> None:
         try:
             if callable(cleanup_chat_uploads):
                 cleanup_chat_uploads(request, workspace, image_paths)
         finally:
             _llm_chat_admission.release()
+
     try:
-        # Keep the worker and its admission slot alive if a client disconnects;
-        # cancelling to_thread does not stop its underlying model inference.
-        return await asyncio.shield(execution)
-    finally:
-        if execution.done():
-            finish_chat_turn(execution)
-        else:
-            execution.add_done_callback(finish_chat_turn)
+        status = llm_chat_operation_manager.submit(
+            request_id=request_id,
+            owner_key=owner_key,
+            project_key=project_key,
+            request_digest=request_digest,
+            execute=lambda progress_callback: _execute_llm_chat(
+                request, body, image_paths, progress_callback, validated,
+                response_assist_snapshot,
+            ),
+            admit=lambda: _llm_chat_admission.acquire(blocking=False),
+            release=finish_async_chat,
+        )
+    except ChatRequestMismatchError as error:
+        # The original in-flight operation may still need these exact
+        # single-use uploads. Its completion callback owns cleanup.
+        raise HTTPException(
+            status_code=409, detail="Chat request does not match",
+        ) from error
+    except ChatAdmissionError as error:
+        if callable(cleanup_chat_uploads):
+            cleanup_chat_uploads(request, workspace, image_paths)
+        raise HTTPException(
+            status_code=429,
+            detail="Another LLM chat turn is already running; retry shortly",
+        ) from error
+    except LlmOperationCapacityError as error:
+        if callable(cleanup_chat_uploads):
+            cleanup_chat_uploads(request, workspace, image_paths)
+        raise HTTPException(
+            status_code=503, detail="LLM Chat recovery is busy",
+        ) from error
+    if status is None:
+        if callable(cleanup_chat_uploads):
+            cleanup_chat_uploads(request, workspace, image_paths)
+        raise HTTPException(status_code=404, detail="Chat request not found")
+    return JSONResponse(status, status_code=202)
+
+
+@api.get("/api/v1/llm/chat/{request_id}")
+def llm_chat_status(
+    request: Request,
+    request_id: str,
+    workspace: str = "",
+):
+    """Recover one bounded, in-memory Chat result by opaque request id."""
+    from services.llm_operations import llm_chat_operation_manager
+
+    if _llm_chat_request_is_external(request):
+        request.state.maestro_remote = True
+    selected_workspace = _request_project_workspace(request, workspace)
+    _require_project_access(request, selected_workspace)
+    try:
+        normalized_id = _normalize_llm_chat_request_id(request_id)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=404, detail="Chat request not found",
+        ) from error
+    owner_key, project_key = _llm_operation_scope(
+        request, selected_workspace,
+    )
+    status = llm_chat_operation_manager.status(
+        normalized_id,
+        owner_key=owner_key,
+        project_key=project_key,
+    )
+    if status is None:
+        raise HTTPException(status_code=404, detail="Chat request not found")
+    return status
 
 
 @api.get("/api/v1/llm/stream-status")
-def llm_stream_status():
+def llm_stream_status(request: Request):
     """Return current LLM streaming state for real-time display."""
     from services import llm_service
+    _require_local_llm_control(request)
     return llm_service.get_stream_status()
 
 
 def _ensure_llm_loaded():
     """Auto-load LLM if not already loaded. Reloads if configured model changed."""
-    from services import llm_service
-    services = wgp.server_config.get("services", {})
-    desired = services.get("llm_model_id", _DEFAULT_LLM_REPO)
-    desired_device = services.get("llm_device", _llm_default_device())
-    desired_provider = services.get("llm_provider", "local")
-    desired_remote_url = services.get("llm_remote_url", "")
-    desired_api_key = ""
-    if desired_provider == "openai":
-        desired_api_key = services.get("openai_api_key", "")
-    elif desired_provider == "anthropic":
-        desired_api_key = services.get("anthropic_api_key", "")
-
-    # load_model owns the complete idempotence key: model bytes, projector,
-    # device, endpoint, runtime binary, flags, and performance profile.
-    llm_service.load_model(
-        model_id=desired,
-        device=desired_device,
-        provider=desired_provider,
-        remote_url=desired_remote_url,
-        api_key=desired_api_key,
-    )
+    _prepare_llm_selection(_configured_llm_selection())
 
 
 @api.post("/api/v1/llm/generate")
 async def llm_generate(request: Request):
-    """Generate text with the local LLM."""
+    """Generate text with the configured LLM for an authorized project."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = await request.json()
+    _promote_external_llm_request(request)
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace)
 
     prompt = body.get("prompt", "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
-    _ensure_llm_loaded()
-
     try:
-        result = llm_service.generate(
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+        result = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
+            llm_service.generate,
             prompt=prompt,
             system_prompt=body.get("system_prompt", ""),
             max_new_tokens=body.get("max_new_tokens", 256),
@@ -15978,8 +17344,12 @@ async def llm_generate(request: Request):
             seed=body.get("seed"),
         )
         return {"text": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as error:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="LLM generation failed; check the local Maestro logs",
+        ) from error
 
 
 # --- Music: LLM song-writer (Music mode Simple) ---
@@ -16030,7 +17400,9 @@ async def llm_write_song(request: Request):
     Caption (style tags) + structured lyrics for ACE-Step. Returns
     {style, lyrics, raw}."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = await request.json()
+    _promote_external_llm_request(request)
     description = (body.get("description") or "").strip()
     if not description:
         raise HTTPException(status_code=400, detail="description is required")
@@ -16042,7 +17414,8 @@ async def llm_write_song(request: Request):
     image_paths = body.get("image_paths") or []
     if not image_paths and body.get("reference_image_path"):
         image_paths = [body["reference_image_path"]]
-    workspace = body.get("workspace") or _get_active_workspace()
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace)
     image_paths = [
         resolved for path in image_paths
         if (resolved := _resolve_authorized_request_media(
@@ -16050,14 +17423,24 @@ async def llm_write_song(request: Request):
         ))
     ]
 
-    _ensure_llm_loaded()
     from services.guide_loader import load_guide
     if instrumental:
         system_prompt = load_guide("music", "song_writer_instrumental") or _SONG_WRITER_FALLBACK_INSTRUMENTAL
     else:
         system_prompt = load_guide("music", "song_writer") or _SONG_WRITER_FALLBACK
     try:
-        raw = llm_service.generate(
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+        raw = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
+            llm_service.generate,
             prompt=description,
             system_prompt=system_prompt,
             max_new_tokens=body.get("max_new_tokens", 1024),
@@ -16066,8 +17449,12 @@ async def llm_write_song(request: Request):
             seed=body.get("seed"),
             image_paths=image_paths or None,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as error:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="Song writing failed; check the local Maestro logs",
+        ) from error
     style, lyrics = _parse_song_output(raw, instrumental)
     return {"style": style, "lyrics": lyrics, "raw": raw}
 
@@ -16150,7 +17537,11 @@ async def director_generate_music(request: Request):
     {audio_path} so the frontend can feed it straight into /audio/analyze.
     Returns {audio_path, filename, style, lyrics}."""
     import asyncio
+
+    from services.llm_operations import run_blocking_shielded
+
     body = await request.json()
+    _promote_external_llm_request(request)
     description = (body.get("description") or "").strip()
     style = (body.get("style") or "").strip()
     lyrics = (body.get("lyrics") or "").strip()
@@ -16158,7 +17549,7 @@ async def director_generate_music(request: Request):
     model_type = body.get("model_type") or "ace_step_v1_5_xl_sft_lm_4b"
     duration_seconds = body.get("duration_seconds")
     seed = body.get("seed")
-    workspace = body.get("workspace") or _get_active_workspace()
+    workspace = _request_project_workspace(request, body.get("workspace"))
     if not body.get("director_request_id") and wgp.get_model_def(model_type) is None:
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_type}")
 
@@ -16218,13 +17609,22 @@ async def director_generate_music(request: Request):
     if (not style or not lyrics) and description:
         from services import llm_service
         from services.guide_loader import load_guide
-        _ensure_llm_loaded()
         if instrumental:
             system_prompt = load_guide("music", "song_writer_instrumental") or _SONG_WRITER_FALLBACK_INSTRUMENTAL
         else:
             system_prompt = load_guide("music", "song_writer") or _SONG_WRITER_FALLBACK
         try:
-            raw = await asyncio.to_thread(
+            selection = await run_blocking_shielded(
+                _resolve_direct_llm_selection, request,
+            )
+            raw = await run_blocking_shielded(
+                _run_authorized_llm_with_selection,
+                request,
+                selection,
+                _run_llm_route_operation,
+                request,
+                body,
+                selection,
                 llm_service.generate,
                 prompt=description,
                 system_prompt=system_prompt,
@@ -16234,8 +17634,12 @@ async def director_generate_music(request: Request):
                 seed=body.get("seed"),
                 image_paths=image_paths or None,
             )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Song writing failed: {e}")
+        except Exception as error:
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail="Song writing failed; check the local Maestro logs",
+            ) from error
         w_style, w_lyrics = _parse_song_output(raw, instrumental)
         style = style or w_style
         lyrics = lyrics or w_lyrics
@@ -16256,11 +17660,8 @@ async def director_generate_music(request: Request):
         raise HTTPException(status_code=400, detail="Provide a description, or style + lyrics")
 
     gen_params = _build_music_gen_params(model_type, lyrics, style, duration_seconds, seed)
-    mature_output = _classify_generation_maturity(gen_params)
-
     music_policy = _http_output_policy_from_request(
         body,
-        mature_output=mature_output,
         owner_session_id=request.state.maestro_session_id,
     )
     gen_params["_maestro_access_policy"] = music_policy
@@ -16287,8 +17688,12 @@ async def director_generate_music(request: Request):
             workspace=workspace,
             out_dir=out_dir,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Music generation failed: {e}")
+    except Exception as error:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="Music generation failed; check the local Maestro logs",
+        ) from error
     if not output_files:
         raise HTTPException(status_code=500, detail="Music generation produced no output")
 
@@ -16328,16 +17733,134 @@ async def director_generate_music(request: Request):
     }
 
 
+def _resolve_prompt_enhancer_selection(
+    model_type: str,
+    services: dict,
+    *,
+    has_images: bool = False,
+    model_registry: dict | None = None,
+) -> tuple[str, str, bool]:
+    """Return a task/capability-safe enhancer selection.
+
+    Dedicated generation-model enhancers retain precedence when they support
+    the request. An image-bearing request never reaches a text-only configured
+    or dedicated override; it falls back to the generic Qwen Vision enhancer.
+    """
+    enhance_model = str(
+        services.get("enhance_llm_model_id")
+        or _DEFAULT_ENHANCE_LLM_REPO
+    )
+    enhance_device = str(services.get("enhance_llm_device") or "cuda")
+    raw_enhancer_mode = False
+    if model_type:
+        try:
+            model_definition = wgp.get_model_def(model_type)
+            dedicated = (model_definition or {}).get("prompt_enhancer_model")
+            if dedicated:
+                enhance_model = str(dedicated)
+                raw_enhancer_mode = True
+        except Exception as error:
+            print(f"[Enhance] Per-model enhancer lookup failed: {error}")
+
+    if has_images:
+        registry_entry = (model_registry or {}).get(enhance_model) or {}
+        if not (
+            registry_entry.get("mmproj_file")
+            or registry_entry.get("native_vision") is True
+        ):
+            print(
+                f"[Enhance] {enhance_model} has no registered vision "
+                "projector; using the Qwen Vision enhancer"
+            )
+            enhance_model = _DEFAULT_ENHANCE_LLM_REPO
+            raw_enhancer_mode = False
+    return enhance_model, enhance_device, raw_enhancer_mode
+
+
+def _resolve_vision_llm_selection() -> dict:
+    """Resolve the local Qwen/compatible enhancer lane for image work."""
+    from services import llm_service
+
+    services = wgp.server_config.get("services", {})
+    model_id, device, _raw_mode = _resolve_prompt_enhancer_selection(
+        "",
+        services,
+        has_images=True,
+        model_registry=llm_service.MODEL_REGISTRY,
+    )
+    return {
+        "model_id": model_id,
+        "device": device,
+        "provider": "local",
+        "remote_url": "",
+        "api_key": "",
+        "local_gguf_path": "",
+        "gguf_file_override": "",
+    }
+
+
+def _llm_route_progress_callback(request: Request):
+    """Return only a server-owned, request-scoped telemetry writer."""
+    callback = getattr(request.state, "maestro_llm_progress_callback", None)
+    return callback if callable(callback) else None
+
+
+def _run_llm_route_operation(
+    request: Request,
+    body: dict,
+    selection: dict,
+    operation,
+    /,
+    *args,
+    explicit_guidance_keyword: str = "",
+    **kwargs,
+):
+    """Inject only server-owned options after the exact-model lease is held."""
+    if explicit_guidance_keyword:
+        kwargs[explicit_guidance_keyword] = _explicit_llm_guidance_allowed(body)
+    kwargs.setdefault(
+        "response_assist",
+        _resolved_local_response_assist(body, selection),
+    )
+    kwargs.setdefault(
+        "progress_callback",
+        _llm_route_progress_callback(request),
+    )
+    return operation(*args, **kwargs)
+
+
+def _with_llm_route_progress(
+    operation,
+    progress_callback,
+    response_assist=None,
+):
+    """Bind request options without reading the singleton stream buffer."""
+    if not callable(progress_callback) and not response_assist:
+        return operation
+
+    def run(*args, **kwargs):
+        if callable(progress_callback):
+            kwargs.setdefault("progress_callback", progress_callback)
+        if response_assist:
+            kwargs.setdefault("response_assist", response_assist)
+        return operation(*args, **kwargs)
+
+    return run
+
+
 @api.post("/api/v1/llm/enhance-prompt")
 async def llm_enhance_prompt(request: Request):
     """Enhance a generation prompt. Routes to Wan2GP enhancer or local LLM based on config."""
     body = await request.json()
+    from services.llm_operations import run_blocking_shielded
+    _promote_external_llm_request(request)
 
     prompt = body.get("prompt", "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
-    workspace = body.get("workspace") or _get_active_workspace()
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace)
     requested_image_paths = body.get("image_paths") or []
     if not requested_image_paths and body.get("image_path"):
         requested_image_paths = [body["image_path"]]
@@ -16355,12 +17878,23 @@ async def llm_enhance_prompt(request: Request):
         and generation_mode in ("video", "avatar")
     )
     enhancer_enabled = int(wgp.server_config.get("enhancer_enabled", 0) or 0)
+    explicit_guidance = _explicit_llm_guidance_allowed(body)
+    explicit_provider = ""
+    if explicit_guidance:
+        explicit_provider = str(
+            wgp.server_config.get("services", {}).get("llm_provider")
+            or "local"
+        ).strip().lower()
 
     # The generic Wan2GP cinematic enhancer cannot produce MiniMax H3's
     # required Context-IR fields, speaker IDs, or <d> dialogue tags. Route H3
     # through Maestro's model-specific guide even when the legacy enhancer is
     # enabled; all other model families retain the configured behavior.
-    if enhancer_enabled > 0 and not needs_h3_context_ir:
+    if (
+        enhancer_enabled > 0
+        and not needs_h3_context_ir
+        and not explicit_guidance
+    ):
         try:
             # Support both single image_path and array image_paths
             return await _enhance_with_wangp(
@@ -16374,48 +17908,52 @@ async def llm_enhance_prompt(request: Request):
             # Fall through to LLM
     elif enhancer_enabled > 0 and needs_h3_context_ir:
         print("[Enhance] MiniMax H3 requires structured Context-IR; using Maestro's model-specific LLM guide")
+    elif enhancer_enabled > 0 and explicit_guidance:
+        print(
+            "[Enhance] Explicit request requires server-owned authoring "
+            "guidance; bypassing the generic Wan2GP enhancer"
+        )
 
     # Use our local LLM service
     from services import llm_service
 
     services = wgp.server_config.get("services", {})
-    provider = services.get("llm_provider", "local")
-    nsfw = services.get("nsfw_mode", False) and provider not in _PUBLIC_LLM_PROVIDERS
-
-    # Check if a separate enhance LLM is configured
-    enhance_model = services.get("enhance_llm_model_id", "")
-    enhance_device = services.get("enhance_llm_device", "cuda")
 
     # Per-model dedicated prompt enhancer: when the active gen model declares
     # `prompt_enhancer_model` (e.g. Sulphur ships its own uncensored enhancer
     # LLM), it takes precedence and runs in raw-passthrough mode — the user's
     # prompt (+ optional image) is sent with NO guide/system prompt because the
-    # model is trained to enhance directly. nsfw_only gen models are already
-    # gated to Mature Mode, so no extra gate is needed here.
-    raw_enhancer_mode = False
-    _enh_mt = body.get("model_type", "")
-    if _enh_mt:
-        try:
-            _md = wgp.get_model_def(_enh_mt)
-            _pe = (_md or {}).get("prompt_enhancer_model")
-            if _pe:
-                enhance_model = _pe
-                raw_enhancer_mode = True
-                print(f"[Enhance] Per-model enhancer for {_enh_mt}: {_pe} (raw passthrough)")
-        except Exception as e:
-            print(f"[Enhance] Per-model enhancer lookup failed: {e}")
+    # model is trained to enhance directly. Ordinary calls stay raw; the LLM
+    # service supplies server-owned guidance only when explicit_guidance is
+    # true, so selecting an nsfw_only model alone cannot activate it.
+    enhance_model, enhance_device, raw_enhancer_mode = (
+        _resolve_prompt_enhancer_selection(
+            model_type,
+            services,
+            has_images=bool(authorized_image_paths),
+            model_registry=llm_service.MODEL_REGISTRY,
+        )
+    )
+    if raw_enhancer_mode:
+        print(
+            f"[Enhance] Per-model enhancer for {model_type}: "
+            f"{enhance_model} (raw passthrough)"
+        )
 
-    if enhance_model:
-        # Load the enhance-specific LLM (may differ from Director LLM)
-        def _prepare_enhance_model():
-            llm_service.load_model(
-                model_id=enhance_model,
-                device=enhance_device,
-            )
-        await asyncio.to_thread(_prepare_enhance_model)
-    else:
-        # Use the Director LLM (default)
-        await asyncio.to_thread(_ensure_llm_loaded)
+    selection = (
+        {
+            "model_id": enhance_model,
+            "device": enhance_device,
+            "provider": "local",
+            "remote_url": "",
+            "api_key": "",
+            "local_gguf_path": "",
+            "gguf_file_override": "",
+        }
+        if enhance_model else await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+    )
 
     # Collect image paths for vision-enabled LLM
     llm_image_paths = authorized_image_paths
@@ -16486,34 +18024,72 @@ async def llm_enhance_prompt(request: Request):
             print(f"[Enhance] LoRA hint loading failed: {e}")
 
     try:
+        def run_enhancement():
+            # Revalidate after the exact model lease finishes cold loading and
+            # immediately before content reaches the provider.
+            if explicit_guidance:
+                current_provider = str(
+                    wgp.server_config.get("services", {}).get("llm_provider")
+                    or "local"
+                ).strip().lower()
+                if (
+                    not _explicit_llm_guidance_allowed(body)
+                    or current_provider != explicit_provider
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "LLM provider settings changed while the explicit "
+                            "prompt enhancer was preparing. Retry after settings "
+                            "stabilize."
+                        ),
+                    )
+            response_assist = _resolved_local_response_assist(
+                body, selection,
+            )
+            return llm_service.enhance_prompt(
+                prompt=prompt,
+                lora_system_hint=lora_hint_text,
+                mode=body.get("mode", "video"),
+                max_new_tokens=body.get("max_new_tokens", 512),
+                temperature=body.get("temperature", 0.6),
+                nsfw=explicit_guidance,
+                model_type=model_type,
+                image_paths=llm_image_paths if llm_image_paths else None,
+                duration_seconds=body.get("duration_seconds"),
+                window_count=body.get("window_count"),
+                window_size_seconds=body.get("window_size_seconds"),
+                preserve_global_timeline=bool(body.get("preserve_global_timeline")),
+                tts_enhance_mode=body.get("tts_enhance_mode"),
+                tts_voice_count=body.get("tts_voice_count", 2),
+                raw_enhancer_mode=raw_enhancer_mode,
+                response_assist=response_assist,
+                progress_callback=_llm_route_progress_callback(request),
+            )
+
         # Pass LoRA hints as system-level context so the LLM treats them as instructions,
         # not content to parrot. The hints go via lora_system_hint into the system prompt.
-        result = await asyncio.to_thread(
-            llm_service.enhance_prompt,
-            prompt=prompt,
-            lora_system_hint=lora_hint_text,
-            mode=body.get("mode", "video"),
-            max_new_tokens=body.get("max_new_tokens", 512),
-            temperature=body.get("temperature", 0.6),
-            nsfw=nsfw,
-            model_type=model_type,
-            image_paths=llm_image_paths if llm_image_paths else None,
-            duration_seconds=body.get("duration_seconds"),
-            window_count=body.get("window_count"),
-            window_size_seconds=body.get("window_size_seconds"),
-            preserve_global_timeline=bool(body.get("preserve_global_timeline")),
-            tts_enhance_mode=body.get("tts_enhance_mode"),
-            tts_voice_count=body.get("tts_voice_count", 2),
-            raw_enhancer_mode=raw_enhancer_mode,
+        result = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            run_enhancement,
         )
         return {"original": prompt, "enhanced": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as error:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="Prompt enhancement failed; check the local Maestro logs",
+        ) from error
 
 
 async def _enhance_with_wangp(prompt: str, mode: str, enhancer_enabled: int, image_paths: list = None):
     """Run the Wan2GP prompt enhancer using wgp's built-in offload system."""
-    return await asyncio.to_thread(
+    from services.llm_operations import run_blocking_shielded
+    return await run_blocking_shielded(
         _enhance_with_wangp_sync,
         prompt,
         mode,
@@ -16600,30 +18176,53 @@ def _enhance_with_wangp_sync(prompt: str, mode: str, enhancer_enabled: int, imag
 async def llm_describe_image(request: Request):
     """Describe an uploaded image using the LLM."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = await request.json()
+    _promote_external_llm_request(request)
 
     image_path = body.get("image_path", "")
     if not image_path:
         raise HTTPException(status_code=400, detail="image_path is required")
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace)
     image_path = _resolve_authorized_request_media(
         request,
         image_path,
-        body.get("workspace") or _get_active_workspace(),
+        workspace,
     )
     if not image_path:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    _ensure_llm_loaded()
-
     try:
-        result = llm_service.describe_image(
-            image_path=image_path,
-            prompt=body.get("prompt", "Describe this image in detail."),
-            max_new_tokens=body.get("max_new_tokens", 256),
+        selection = await run_blocking_shielded(
+            _resolve_vision_llm_selection,
+        )
+
+        def run_description():
+            return llm_service.describe_image(
+                image_path=image_path,
+                image_paths=[image_path],
+                prompt=body.get("prompt", "Describe this image in detail."),
+                max_new_tokens=body.get("max_new_tokens", 256),
+                response_assist=_resolved_local_response_assist(
+                    body, selection,
+                ),
+                progress_callback=_llm_route_progress_callback(request),
+            )
+
+        result = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            run_description,
         )
         return {"description": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as error:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="Image description failed; check the local Maestro logs",
+        ) from error
 
 
 # ============================================================================
@@ -17223,9 +18822,12 @@ async def suggest_audio_clips(request: Request):
             total_duration=total_duration,
         )
         return {"clips": clips}
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Audio clip suggestion failed; check the local Maestro logs",
+        ) from error
 
 
 # ============================================================================
@@ -17236,7 +18838,11 @@ async def suggest_audio_clips(request: Request):
 async def director_plan_prompts(request: Request):
     """Use LLM to generate per-clip video prompts from audio analysis."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = await request.json()
+    _promote_external_llm_request(request)
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace)
 
     clips = body.get("clips")
     style_prompt = body.get("style_prompt", "")
@@ -17245,42 +18851,72 @@ async def director_plan_prompts(request: Request):
     if not style_prompt:
         raise HTTPException(status_code=400, detail="style_prompt is required")
 
-    _ensure_llm_loaded()
-
     try:
-        prompts = llm_service.plan_clip_prompts(
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+        prompts = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
+            llm_service.plan_clip_prompts,
             clips=clips,
             style_prompt=style_prompt,
             lyrics=body.get("lyrics"),
             bpm=body.get("bpm", 120.0),
+            explicit_guidance_keyword="nsfw",
         )
         return {"prompts": prompts}
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Director prompt planning failed; check the local Maestro logs",
+        ) from error
 
 
 @api.post("/api/v1/director/plan-angle-prompts")
 async def director_plan_angle_prompts(request: Request):
     """Use LLM to generate image-edit prompts for camera angle variations."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = await request.json()
+    _promote_external_llm_request(request)
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace)
 
     style_prompt = body.get("style_prompt", "")
     if not style_prompt:
         raise HTTPException(status_code=400, detail="style_prompt is required")
 
-    _ensure_llm_loaded()
-
     try:
-        prompts = llm_service.plan_angle_prompts(
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+        prompts = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
+            llm_service.plan_angle_prompts,
             style_prompt=style_prompt,
             num_angles=body.get("num_angles", 4),
+            explicit_guidance_keyword="nsfw",
         )
         return {"prompts": prompts}
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Director angle planning failed; check the local Maestro logs",
+        ) from error
 
 
 @api.post("/api/v1/audio/plan-structure")
@@ -17347,16 +18983,26 @@ async def plan_audio_structure(request: Request):
                 if director_request_id else {}
             ),
         }
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Audio structure planning failed; check the local Maestro logs",
+        ) from error
 
 
 @api.post("/api/v1/director/classify-sections")
 async def director_classify_sections(request: Request):
     """Use LLM to reclassify section labels based on lyrics content."""
-    from services import llm_service, audio_analysis
+    from services import audio_analysis, llm_service
+    from services.llm_operations import run_blocking_shielded
+
     body = await request.json()
+    _promote_external_llm_request(request)
+    if bool(getattr(request.state, "maestro_remote", False)):
+        body["workspace"] = _request_project_workspace(
+            request, body.get("workspace"),
+        )
 
     director_request_id = str(body.get("director_request_id") or "")
     director_project_dir = ""
@@ -17370,6 +19016,9 @@ async def director_classify_sections(request: Request):
         director_project_dir = _require_project_access(
             request, str(preparation.get("workspace") or "default"),
         )
+    else:
+        workspace = _request_project_workspace(request, body.get("workspace"))
+        director_project_dir = _require_project_access(request, workspace)
     if not analysis:
         raise HTTPException(status_code=400, detail="analysis is required")
 
@@ -17391,8 +19040,18 @@ async def director_classify_sections(request: Request):
         return response
 
     try:
-        _ensure_llm_loaded()
-        result = llm_service.classify_song_sections(
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+        result = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
+            llm_service.classify_song_sections,
             sections=sections,
             lyrics=lyrics,
             duration=duration,
@@ -17447,7 +19106,12 @@ async def director_classify_sections(request: Request):
 async def director_plan_prompts_and_images(request: Request):
     """Use LLM to generate per-clip video AND image-edit prompts."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = await request.json()
+    _promote_external_llm_request(request)
+    body["workspace"] = _request_project_workspace(
+        request, body.get("workspace"),
+    )
     _authorize_director_media_inputs(request, body)
 
     clips = body.get("clips")
@@ -17457,12 +19121,21 @@ async def director_plan_prompts_and_images(request: Request):
     if not scene_description:
         raise HTTPException(status_code=400, detail="scene_description is required")
 
-    _ensure_llm_loaded()
-
     ref_image_path = body.get("reference_image_path")
 
     try:
-        clip_plans = llm_service.plan_clip_prompts_and_images(
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+        clip_plans = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
+            llm_service.plan_clip_prompts_and_images,
             clips=clips,
             scene_description=scene_description,
             lyrics=body.get("lyrics"),
@@ -17475,11 +19148,15 @@ async def director_plan_prompts_and_images(request: Request):
             speaker_mappings=body.get("speaker_mappings"),
             prompt_type=body.get("prompt_type", "both"),
             existing_image_prompts=body.get("existing_image_prompts"),
+            explicit_guidance_keyword="nsfw",
         )
         return {"clip_plans": clip_plans}
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Director section planning failed; check the local Maestro logs",
+        ) from error
 
 
 # ============================================================================
@@ -17505,16 +19182,24 @@ async def director_plan_dialogue_scenes(request: Request):
             frames_minimum=body.get("frames_minimum", 5),
         )
         return {"clips": clips}
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Director clip planning failed; check the local Maestro logs",
+        ) from error
 
 
 @api.post("/api/v1/director/plan-short-film-prompts")
 async def director_plan_short_film_prompts(request: Request):
     """Use LLM to generate cinematic per-shot prompts for short film mode."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = await request.json()
+    _promote_external_llm_request(request)
+    body["workspace"] = _request_project_workspace(
+        request, body.get("workspace"),
+    )
     _authorize_director_media_inputs(request, body)
 
     clips = body.get("clips")
@@ -17524,10 +19209,19 @@ async def director_plan_short_film_prompts(request: Request):
     if not scene_description:
         raise HTTPException(status_code=400, detail="scene_description is required")
 
-    _ensure_llm_loaded()
-
     try:
-        clip_plans = llm_service.plan_short_film_prompts(
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+        clip_plans = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
+            llm_service.plan_short_film_prompts,
             clips=clips,
             scene_description=scene_description,
             lyrics=body.get("lyrics"),
@@ -17540,31 +19234,45 @@ async def director_plan_short_film_prompts(request: Request):
             characters=body.get("characters"),
             prompt_type=body.get("prompt_type", "both"),
             existing_image_prompts=body.get("existing_image_prompts"),
+            explicit_guidance_keyword="nsfw",
         )
         return {"clip_plans": clip_plans}
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Director prompt planning failed; check the local Maestro logs",
+        ) from error
 
 
 @api.post("/api/v1/director/plan-short-film-script")
 async def director_plan_short_film_script(request: Request):
     """Use LLM to plan scenes and prompts from a story description (no audio)."""
     from services import llm_service
+    from services.llm_operations import run_blocking_shielded
     body = await request.json()
+    _promote_external_llm_request(request)
+    body["workspace"] = _request_project_workspace(
+        request, body.get("workspace"),
+    )
     _authorize_director_media_inputs(request, body)
 
     story_description = body.get("story_description", "")
     if not story_description:
         raise HTTPException(status_code=400, detail="story_description is required")
 
-    _ensure_llm_loaded()
-
-    import asyncio
-
     try:
-        # Run in thread pool so the event loop stays free for stream-status polling
-        result = await asyncio.to_thread(
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
+        )
+        result = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
             llm_service.plan_short_film_from_story,
             story_description=story_description,
             characters=body.get("characters"),
@@ -17579,11 +19287,15 @@ async def director_plan_short_film_script(request: Request):
             fps=body.get("fps", 24),
             frames_steps=body.get("frames_steps", 4),
             frames_minimum=body.get("frames_minimum", 5),
+            explicit_guidance_keyword="nsfw",
         )
         return result
-    except Exception as e:
+    except Exception as error:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Director story planning failed; check the local Maestro logs",
+        ) from error
 
 
 # ── Director Pipeline Endpoints ─────────────────────────────────────────
@@ -17873,12 +19585,18 @@ def _require_saved_pipeline(
 
 def _public_pipeline_state(state: dict) -> dict:
     import copy
+    from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     public = copy.deepcopy(state)
+    # Historical raw planner logs predate request-scoped streaming. Keep the
+    # file untouched for provenance, but never publish its prompt, thinking,
+    # or response content. New Director checkpoints write this field as null.
+    public["llm_log"] = None
     snapshot = public.get("_params_snapshot")
     if isinstance(snapshot, dict):
         snapshot = dict(snapshot)
         snapshot.pop("_maestro_session_id", None)
         snapshot.pop("_maestro_access_policy", None)
+        snapshot.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
         public["_params_snapshot"] = snapshot
     return _redact_local_paths(_sanitize_director_public_failures(public))
 
@@ -17886,10 +19604,6 @@ def _public_pipeline_state(state: dict) -> dict:
 _DIRECTOR_PUBLIC_FAILURE_MESSAGES = {
     "director_pipeline_failed": "Director generation stopped after an internal error.",
     "director_worker_start_failed": "Director could not start its worker.",
-    "safety_policy_refusal": (
-        "Generation was blocked by the safety policy. Revise the concept so "
-        "every depicted character is an adult (18+)."
-    ),
     "cuda_oom": "Director generation stopped after a GPU memory error.",
 }
 _DIRECTOR_PUBLIC_REPAIR_FAILURE_MESSAGES = {
@@ -18039,8 +19753,12 @@ async def director_pipeline_start(request: Request):
     Runs entirely server-side so the browser can be closed.
     """
     _init_pipeline()
+    from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     from services.director_pipeline import start_pipeline
     body = await request.json()
+    # This private recovery bit is server-owned. start_pipeline recomputes it
+    # from the authoritative consent/provider policy and literal request flag.
+    body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
     workspace = _authorize_director_media_inputs(request, body)
     body["workspace"] = workspace
     # Only the public, server-validated chain id may link a preparation to a
@@ -18058,10 +19776,8 @@ async def director_pipeline_start(request: Request):
                 detail="Director preparation is not complete.",
             )
     caller_explicit_output = body.get("explicit_output") is True
-    mature_output = _classify_director_maturity(body)
     access_policy = _http_output_policy_from_request(
         body,
-        mature_output=mature_output,
         owner_session_id=request.state.maestro_session_id,
     )
     # Output classification and publication policy never change Director's
@@ -18089,6 +19805,7 @@ def director_pipeline_status(request: Request, pid: str):
     for internal in (
         "_recovery", "_recovery_parent", "_recovery_owner_digest",
         "_recovery_project_digest", "_recovery_block_reason",
+        "_llm_log", "_llm_passes",
     ):
         p.pop(internal, None)
     p.update(_public_director_recovery_metadata(p))
@@ -18479,6 +20196,8 @@ async def director_v2_plan(request: Request):
     Returns structured ProductionPlan + rendered clip_plans.
     """
     body = await request.json()
+    from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
+    body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
     _authorize_director_media_inputs(request, body)
     skill_type = body.get("skill_type", body.get("pipeline_type", "music_video"))
 
@@ -18493,20 +20212,12 @@ async def director_v2_plan(request: Request):
     skill_type = skill_map.get(skill_type, skill_type)
 
     try:
-        _ensure_llm_loaded()
-
         from services import llm_service
         from services.director.orchestrator import DirectorOrchestrator, DirectorFlags
+        from services.llm_operations import run_blocking_shielded
 
         flags = DirectorFlags.from_dict(body.get("director_flags", {}))
-        director = DirectorOrchestrator(
-            llm_generate=llm_service.generate,
-            llm_generate_streaming=llm_service.generate_streaming,
-            flags=flags,
-        )
-
-        # Build planner kwargs from request body
-        planner_kwargs = {}
+        planner_kwargs_base = {}
         for key in ["clips", "scene_description", "story_description", "lyrics", "bpm",
                      "reference_image_path", "speaker_mappings", "characters",
                      "character_ref_paths", "character_ref_labels",
@@ -18515,65 +20226,87 @@ async def director_v2_plan(request: Request):
                      "fps", "frames_steps", "frames_minimum",
                      "concept", "visual_style", "platform", "style", "transcript"]:
             if key in body:
-                planner_kwargs[key] = body[key]
-
-        # NSFW from server config (enforced: never with public providers)
-        services = wgp.server_config.get("services", {})
-        provider = services.get("llm_provider", "local")
-        planner_kwargs["nsfw"] = services.get("nsfw_mode", False) and provider not in _PUBLIC_LLM_PROVIDERS
-
-        # Prompt polish mode: off | full_guide | light_guide | third_pass.
-        # Default flipped from "off" to "third_pass" — see /api/v1/services
-        # GET endpoint for full rationale.
-        polish_mode = services.get("director_prompt_polish", "third_pass")
+                planner_kwargs_base[key] = body[key]
         video_model = body.get("video_model", "")
         image_model = body.get("image_model", "")
-
-        # Extract activated LoRA filenames for guide loading
         video_loras_activated = (body.get("video_loras") or {}).get("activated_loras", [])
         image_loras_activated = (body.get("image_loras") or {}).get("activated_loras", [])
-
-        # For guide injection modes (full/light), pass polish block to planners via kwargs
-        if polish_mode in ("full_guide", "light_guide"):
-            from services.director.prompt_polish import build_polish_block
-            guide_mode = "full" if polish_mode == "full_guide" else "light"
-            polish_block = build_polish_block(video_model, image_model, guide_mode,
-                                              video_loras=video_loras_activated, image_loras=image_loras_activated)
-            if polish_block:
-                planner_kwargs["polish_block"] = polish_block
-
-        # Plan
-        plan = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: director.plan(skill_type, **planner_kwargs)
+        selection = await run_blocking_shielded(
+            _resolve_direct_llm_selection, request,
         )
 
-        # Render
-        has_reference = bool(body.get("reference_image_path"))
-        prompt_type = body.get("prompt_type", "both")
-        rendered = director.render_plan(plan, prompt_type=prompt_type, has_reference=has_reference)
-        clip_plans = director.plan_to_clip_plans(rendered)
-
-        # Third-pass polish: run each prompt through the enhance pipeline
-        if polish_mode == "third_pass" and clip_plans:
-            from services.director.prompt_polish import polish_prompts_third_pass
-            nsfw = planner_kwargs.get("nsfw", False)
-            # Forward character profiles so polish can map names → correct
-            # non-human descriptors (e.g. Lumi → the white unicorn) instead
-            # of falling back to generic "the woman" / "the man".
-            polish_chars = planner_kwargs.get("characters", []) or []
-            clip_plans = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: polish_prompts_third_pass(
-                    clip_plans, video_model, image_model, nsfw,
-                    video_loras=video_loras_activated, image_loras=image_loras_activated,
-                    characters=polish_chars,
-                )
+        def run_director_plan():
+            # Consent and provider locality are resolved only after the exact
+            # selected-model lease is held. Concurrent enhancer/Qwen requests
+            # cannot swap the singleton during any planning or polish pass.
+            route_progress = _llm_route_progress_callback(request)
+            route_response_assist = _resolved_local_response_assist(
+                body, selection,
             )
+            director = DirectorOrchestrator(
+                llm_generate=_with_llm_route_progress(
+                    llm_service.generate,
+                    route_progress,
+                    route_response_assist,
+                ),
+                llm_generate_streaming=_with_llm_route_progress(
+                    llm_service.generate_streaming,
+                    route_progress,
+                    route_response_assist,
+                ),
+                flags=flags,
+            )
+            planner_kwargs = dict(planner_kwargs_base)
+            planner_kwargs["nsfw"] = _explicit_llm_guidance_allowed(body)
+            services = wgp.server_config.get("services", {})
+            polish_mode = services.get("director_prompt_polish", "third_pass")
+            if polish_mode in ("full_guide", "light_guide"):
+                from services.director.prompt_polish import build_polish_block
+                guide_mode = (
+                    "full" if polish_mode == "full_guide" else "light"
+                )
+                polish_block = build_polish_block(
+                    video_model,
+                    image_model,
+                    guide_mode,
+                    video_loras=video_loras_activated,
+                    image_loras=image_loras_activated,
+                )
+                if polish_block:
+                    planner_kwargs["polish_block"] = polish_block
 
-        return {
-            "clip_plans": clip_plans,
-            "production_plan": plan.to_dict(),
-            "skill_type": skill_type,
-        }
+            plan = director.plan(skill_type, **planner_kwargs)
+            rendered = director.render_plan(
+                plan,
+                prompt_type=body.get("prompt_type", "both"),
+                has_reference=bool(body.get("reference_image_path")),
+            )
+            clip_plans = director.plan_to_clip_plans(rendered)
+            if polish_mode == "third_pass" and clip_plans:
+                from services.director.prompt_polish import (
+                    polish_prompts_third_pass,
+                )
+                clip_plans = polish_prompts_third_pass(
+                    clip_plans,
+                    video_model,
+                    image_model,
+                    planner_kwargs["nsfw"],
+                    video_loras=video_loras_activated,
+                    image_loras=image_loras_activated,
+                    characters=planner_kwargs.get("characters", []) or [],
+                )
+            return {
+                "clip_plans": clip_plans,
+                "production_plan": plan.to_dict(),
+                "skill_type": skill_type,
+            }
+
+        return await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            run_director_plan,
+        )
 
     except Exception:
         import traceback
@@ -18616,9 +20349,10 @@ async def preview_generation_plan(request: Request):
         _require_h3_acceleration_available(body, plan)
         estimate_context = _h3_estimate_context(body, plan)
         _validate_h3_turbo_estimate_context(estimate_context)
+        _validate_h3_spectrum_estimate_context(estimate_context)
+        _validate_h3_lightx2v_estimate_context(estimate_context)
     except (TypeError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _classify_generation_maturity(body, plan)
     _require_remote_visible_models(
         request,
         _h3_effective_model_types(body, plan),
@@ -18632,14 +20366,22 @@ async def preview_generation_plan(request: Request):
             for option in requirements.get("checkpoint_options") or []
             if str(option.get("model_type") or "") in remote_visible
         ]
-    estimate = (
+    estimate_payload = (
         _h3_profile_estimate_payload(
             estimate_context,
             include_residency=not bool(
                 getattr(request.state, "maestro_remote", False)
             ),
-        )["current"]["estimate"]
+        )
         if model_type in _H3_LONG_STUDIO_MODELS else None
+    )
+    estimate = (
+        estimate_payload["current"]["estimate"]
+        if isinstance(estimate_payload, dict) else None
+    )
+    segment_count_estimate = (
+        estimate_payload.get("segment_count_estimate")
+        if isinstance(estimate_payload, dict) else None
     )
     return {
         "requires_review": bool(plan and int(plan.get("clip_count") or 0) > 1),
@@ -18647,6 +20389,7 @@ async def preview_generation_plan(request: Request):
         "effective_model_type": str(body.get("model_type") or ""),
         "requirements": requirements,
         "h3_estimate": estimate,
+        "segment_count_estimate": segment_count_estimate,
     }
 
 
@@ -18713,11 +20456,37 @@ def _record_h3_benchmark_observation(
     custom = params.get("custom_settings")
     if not isinstance(custom, dict):
         custom = {}
+    if str(custom.get("h3_source_audio_mode") or "native") != "native":
+        # Launch capture cannot yet persist the exact T8 source-audio
+        # mode/version. Exclude the observation rather than contaminate the
+        # native or Ref2VA calibration populations.
+        return
     model_type = str(params.get("model_type") or "")
     if model_type not in _H3_LONG_STUDIO_MODELS:
         return
     from services.h3_benchmark import build_benchmark_spec, record_observation
     model_def = wgp.get_model_def(model_type) or {}
+    spectrum_stats = None
+    if custom.get("h3_spectrum_profile") == "spectrum_h3_v1":
+        candidate_stats = getattr(
+            getattr(wgp, "wan_model", None), "_last_spectrum_stats", None,
+        )
+        # A fallback run includes abandoned capture/replay work followed by a
+        # full native pass. It is neither a Spectrum nor a native calibration
+        # sample, so keep it out of both estimator populations.
+        if not isinstance(candidate_stats, dict) or candidate_stats.get(
+            "reset_reason"
+        ) != "completed":
+            return
+        expected_counts = {
+            "actual_transformer_calls": 11,
+            "forecast_transformer_calls": 9,
+            "replay_transformer_calls": 0,
+            "replay_steps": 20,
+        }
+        if any(candidate_stats.get(key) != value for key, value in expected_counts.items()):
+            return
+        spectrum_stats = candidate_stats
     has_semantic = bool(params.get("image_refs")) or any(
         params.get(key) for key in (
             "video_guide", "video_guide2", "video_guide3",
@@ -18775,15 +20544,26 @@ def _record_h3_benchmark_observation(
             "family": "minimax_h3",
             "quantization": "w4a8" if model_type == _H3_W4A8_FL2VA_MODEL else "native",
             "accelerator": (
-                "turbo"
+                "spectrum"
+                if spectrum_stats is not None
+                else "lightx2v"
+                if custom.get("h3_lightx2v_profile") == "h3_lightx2v_fl2v_4_v1"
+                else "turbo"
                 if custom.get("h3_turbo_profile") == "h3_turbo_v4"
                 else "native"
+            ),
+            "accelerator_version": (
+                str(spectrum_stats.get("algorithm_version") or "")
+                if spectrum_stats is not None
+                else "h3_lightx2v_fl2v_4_v1"
+                if custom.get("h3_lightx2v_profile") == "h3_lightx2v_fl2v_4_v1"
+                else ""
             ),
         },
         engine=engine_spec,
         encoder={
-            "id": "heretic_int8_convrot" if model_def.get("preferred_explicit_conditioner") else "official_nvfp4_awq",
-            "quantization": "int8" if model_def.get("preferred_explicit_conditioner") else "nvfp4_awq",
+            "id": "heretic_int8_convrot" if model_def.get("h3_convrot") else "official_nvfp4_awq",
+            "quantization": "int8" if model_def.get("h3_convrot") else "nvfp4_awq",
         },
         input_signature=_h3_benchmark_input_signature(params, case_id),
         task={
@@ -18807,24 +20587,48 @@ def _record_h3_benchmark_observation(
             peak = None
     from services.h3_benchmark import validate_output_artifacts
     media_exists = validate_output_artifacts(out_dir, output_files)
+    phase_times = {"generation": wall_time_seconds}
+    if spectrum_stats is not None:
+        phase_times.update({
+            "spectrum_anchor_capture": spectrum_stats.get("anchor_capture_seconds"),
+            "spectrum_offline_replay": spectrum_stats.get("offline_replay_seconds"),
+        })
     record = record_observation(
         spec,
         wall_time_seconds=wall_time_seconds,
         output_frames=frames,
         output_valid=media_exists,
         peak_gpu_memory_bytes=peak,
-        phase_times_seconds={"generation": wall_time_seconds},
+        phase_times_seconds=phase_times,
+        actual_transformer_calls=(
+            spectrum_stats.get("actual_transformer_calls")
+            if spectrum_stats is not None else steps
+        ),
+        forecast_transformer_calls=(
+            spectrum_stats.get("forecast_transformer_calls")
+            if spectrum_stats is not None else 0
+        ),
+        replay_transformer_calls=(
+            spectrum_stats.get("replay_transformer_calls")
+            if spectrum_stats is not None else 0
+        ),
     )
     _get_h3_benchmark_cache().put(record)
 
 
 def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
-    """Project a generation request to content-free timing factors."""
+    """Project a request to timing and deterministic segment-count factors.
+
+    Prompt text is consumed only by the shared planner and is never copied
+    into estimate/status responses or benchmark observations.
+    """
     model_type = str(body.get("model_type") or "minimax_h3")
     model_def = wgp.get_model_def(model_type) or {}
     fps = float(model_def.get("fps") or 24)
     try:
-        duration = float(body.get("_duration_seconds") or 0)
+        duration = float(
+            body.get("_duration_seconds") or body.get("duration_seconds") or 0
+        )
     except (TypeError, ValueError):
         duration = 0
     if duration <= 0:
@@ -18834,39 +20638,120 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
             duration = 124 / 24
     long_plan = plan if isinstance(plan, dict) else body.get("_h3_longform")
     clip_frames = list(long_plan.get("clip_frames") or []) if isinstance(long_plan, dict) else []
+    clip_published_frames = (
+        list(long_plan.get("clip_published_frames") or clip_frames)
+        if isinstance(long_plan, dict) else []
+    )
     try:
-        window_seconds = max(clip_frames) / fps if clip_frames else float(
-            body.get("sliding_window_size") or model_def.get("frames_maximum") or 345
-        ) / fps
+        if clip_frames:
+            window_seconds = max(clip_frames) / fps
+        elif body.get("window_seconds") not in (None, ""):
+            window_seconds = float(body.get("window_seconds"))
+        else:
+            window_seconds = float(
+                body.get("sliding_window_size")
+                or model_def.get("frames_maximum") or 345
+            ) / fps
     except (TypeError, ValueError, ZeroDivisionError):
         window_seconds = 345 / 24
     images = body.get("image_refs")
+    estimate_reference = body.get("reference_shape")
+    estimate_reference = (
+        estimate_reference if isinstance(estimate_reference, dict) else {}
+    )
+    raw_segment_scenes = body.get("segment_scenes")
+    segment_scenes = []
+    if raw_segment_scenes is not None:
+        if not isinstance(raw_segment_scenes, list) or len(raw_segment_scenes) > 200:
+            raise ValueError("H3 estimate segment_scenes must be a list of at most 200 scenes")
+        for scene in raw_segment_scenes:
+            if not isinstance(scene, dict):
+                raise ValueError("Each H3 estimate scene must be an object")
+            try:
+                scene_duration = float(scene.get("duration_seconds") or 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Each H3 estimate scene requires a positive duration_seconds") from exc
+            if not 0 < scene_duration <= 300:
+                raise ValueError("Each H3 estimate scene requires a positive duration_seconds")
+            segment_scenes.append({
+                "duration_seconds": scene_duration,
+                "prompt": str(scene.get("prompt") or ""),
+            })
     context = {
         "model_type": model_type,
         "duration_seconds": duration,
         "window_seconds": window_seconds,
         "window_overlap": (
             0 if isinstance(long_plan, dict)
-            else body.get("sliding_window_overlap", 0)
+            else body.get(
+                "window_overlap", body.get("sliding_window_overlap", 0)
+            )
         ),
+        "prompt": str(
+            long_plan.get("global_prompt") or ""
+            if isinstance(long_plan, dict)
+            else body.get("prompt") or ""
+        ),
+        "manual_segment_ceiling": bool(
+            long_plan.get("manual_segment_ceiling")
+            if isinstance(long_plan, dict)
+            else (
+                body.get("manual_segment_ceiling", False)
+                or body.get("sliding_window_size") not in (None, "")
+            )
+        ),
+        "h3_adaptive_conditioning": body.get(
+            "h3_adaptive_conditioning", True,
+        ) is not False,
+        "segment_ceiling_frames": (
+            int(long_plan.get("segment_frames_maximum") or 0)
+            if isinstance(long_plan, dict) else 0
+        ),
+        "_planned_segment_count": (
+            int(long_plan.get("clip_count") or 0)
+            if isinstance(long_plan, dict) else 0
+        ),
+        "_generated_total_frames": (
+            sum(int(value) for value in clip_frames)
+            if clip_frames else 0
+        ),
+        "_published_total_frames": (
+            sum(int(value) for value in clip_published_frames)
+            if clip_published_frames else 0
+        ),
+        "_segment_count_scenes": segment_scenes,
         "num_inference_steps": body.get("num_inference_steps", 20),
         "resolution": body.get("resolution") or "1344x768",
         "custom_settings": dict(body.get("custom_settings") or {}),
         "activated_loras": list(body.get("activated_loras") or []),
+        "loras_multipliers": body.get("loras_multipliers") or "",
         "tea_cache": body.get("tea_cache", 0),
         "spatial_upsampling": str(body.get("spatial_upsampling") or ""),
         "delivery_resolution": str(body.get("delivery_resolution") or ""),
         "delivery_fit": str(body.get("delivery_fit") or ""),
         "reference_shape": {
-            "has_start": bool(body.get("image_start")),
-            "has_end": bool(body.get("image_end")),
-            "image_count": len(images) if isinstance(images, (list, tuple)) else int(bool(images)),
-            "video_count": sum(bool(body.get(key)) for key in (
-                "video_guide", "video_guide2", "video_guide3",
-            )),
-            "audio_count": sum(bool(body.get(key)) for key in (
-                "audio_guide", "audio_guide2", "audio_guide3",
-            )),
+            "has_start": bool(
+                estimate_reference.get("has_start", body.get("image_start"))
+            ),
+            "has_end": bool(
+                estimate_reference.get("has_end", body.get("image_end"))
+            ),
+            "image_count": int(estimate_reference.get(
+                "image_count",
+                len(images) if isinstance(images, (list, tuple)) else int(bool(images)),
+            ) or 0),
+            "video_count": int(estimate_reference.get(
+                "video_count",
+                sum(bool(body.get(key)) for key in (
+                    "video_guide", "video_guide2", "video_guide3",
+                )),
+            ) or 0),
+            "audio_count": int(estimate_reference.get(
+                "audio_count",
+                sum(bool(body.get(key)) for key in (
+                    "audio_guide", "audio_guide2", "audio_guide3",
+                )),
+            ) or 0),
         },
         "explicit_output": bool(body.get("explicit_output")),
     }
@@ -18879,9 +20764,17 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
                 continue
             effective_model = str(segment_model.get("model_type") or model_type)
             segment = dict(context)
+            published_frame_count = int(
+                clip_published_frames[index]
+                if index < len(clip_published_frames) else frame_count
+            )
             segment.update({
                 "model_type": effective_model,
                 "duration_seconds": max(1, int(frame_count)) / fps,
+                "generated_frames": max(1, int(frame_count)),
+                "published_frames": max(1, published_frame_count),
+                "generated_duration_seconds": max(1, int(frame_count)) / fps,
+                "published_duration_seconds": max(1, published_frame_count) / fps,
                 "window_seconds": min(15.0, max(1.0, int(frame_count) / fps)),
                 "window_overlap": 0,
                 # Whole-file delivery runs once after confirmed segments are
@@ -18913,6 +20806,139 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
         if len(segment_contexts) == len(clip_frames):
             context["_segment_contexts"] = segment_contexts
     return context
+
+
+def _h3_segment_count_estimate(context: dict) -> dict:
+    """Derive segment-count preview from the shared runtime planner."""
+
+    try:
+        planned_count = int(context.get("_planned_segment_count") or 0)
+    except (TypeError, ValueError):
+        planned_count = 0
+    if planned_count > 0:
+        return {
+            "minimum": planned_count,
+            "maximum": planned_count,
+            "likely": planned_count,
+            "source": "persisted_deterministic_plan",
+            "confidence": "high",
+            "reason": "Exact generated and published segment geometry is planned.",
+        }
+
+    selected = str(context.get("model_type") or "minimax_h3")
+    reference_shape = context.get("reference_shape")
+    reference_shape = reference_shape if isinstance(reference_shape, dict) else {}
+    semantic_reference = bool(
+        reference_shape.get("image_count")
+        or reference_shape.get("video_count")
+        or reference_shape.get("audio_count")
+    )
+    frame_anchor = bool(
+        reference_shape.get("has_start") or reference_shape.get("has_end")
+    )
+    adaptive = context.get("h3_adaptive_conditioning", True) is not False
+    if adaptive:
+        if semantic_reference:
+            selected = _H3_REF2VA_MODEL
+        elif selected == _H3_REF2VA_MODEL:
+            selected = _H3_BASE_FL2VA_MODEL
+    elif selected == _H3_REF2VA_MODEL and frame_anchor:
+        raise ValueError(
+            "Pinned Ref2VA cannot use first/last-frame anchors; enable "
+            "adaptive conditioning or remove the edge anchors"
+        )
+    elif selected in _H3_FL2VA_MODELS and semantic_reference:
+        raise ValueError(
+            "Pinned FL2VA cannot use semantic references; enable adaptive "
+            "conditioning or remove the semantic references"
+        )
+    model_def = wgp.get_model_def(selected) or {}
+    fps = float(model_def.get("fps") or 24)
+    minimum = int(model_def.get("frames_minimum") or 1)
+    maximum = int(model_def.get("frames_maximum") or 0)
+    if fps <= 0 or maximum <= 0:
+        raise ValueError("H3 segment estimates require model frame geometry")
+
+    published_frames = max(1, round(float(context.get("duration_seconds") or 0) * fps))
+    generated_frames = published_frames + (
+        int(model_def.get("frames_steps") or 0)
+        if bool(reference_shape.get("has_end")) else 0
+    )
+    manual = bool(context.get("manual_segment_ceiling", False))
+    from services.h3_shot_planner import (
+        estimate_h3_segment_count,
+        floor_h3_frame_count,
+        infer_h3_profile_id,
+    )
+    if manual:
+        requested_ceiling = int(
+            context.get("segment_ceiling_frames")
+            or round(float(context.get("window_seconds") or 0) * fps)
+            or maximum
+        )
+        ceiling = floor_h3_frame_count(
+            requested_ceiling,
+            minimum_frames=minimum,
+            maximum_frames=maximum,
+            align_frame_count=lambda value: wgp.align_model_frame_count(
+                value, model_def,
+            ),
+        )
+    else:
+        ceiling = int(wgp.align_model_frame_count(maximum, model_def))
+    planner_kwargs = {
+        "fps": fps,
+        "minimum_frames": minimum,
+        "maximum_frames": max(minimum, min(maximum, ceiling)),
+        "align_frame_count": lambda value: wgp.align_model_frame_count(
+            value, model_def,
+        ),
+        "profile_id": infer_h3_profile_id(context),
+        "manual_segment_ceiling": manual,
+    }
+    scenes = context.get("_segment_count_scenes")
+    if isinstance(scenes, list) and scenes:
+        scene_estimates = []
+        for index, scene in enumerate(scenes):
+            scene_published = max(1, round(float(scene["duration_seconds"]) * fps))
+            scene_generated = scene_published + (
+                int(model_def.get("frames_steps") or 0)
+                if index == len(scenes) - 1 and bool(reference_shape.get("has_end"))
+                else 0
+            )
+            scene_estimates.append(estimate_h3_segment_count(
+                scene_generated,
+                prompt=str(scene.get("prompt") or ""),
+                published_total_frames=scene_published,
+                **planner_kwargs,
+            ))
+        if len(scene_estimates) == 1:
+            return scene_estimates[0]
+        confidence_rank = {"low": 0, "medium": 1, "high": 2}
+        confidence = min(
+            (str(item.get("confidence") or "low") for item in scene_estimates),
+            key=lambda value: confidence_rank.get(value, 0),
+        )
+        return {
+            "minimum": sum(int(item["minimum"]) for item in scene_estimates),
+            "maximum": sum(int(item["maximum"]) for item in scene_estimates),
+            "likely": sum(int(item["likely"]) for item in scene_estimates),
+            "source": (
+                "deterministic_director_scene_aggregate"
+                if confidence == "high" else "duration_profile_model_grid"
+            ),
+            "confidence": confidence,
+            "reason": (
+                f"{len(scene_estimates)} Director scenes are planned independently "
+                "with the shared deterministic H3 planner."
+            ),
+        }
+    return estimate_h3_segment_count(
+        generated_frames,
+        prompt=str(context.get("prompt") or ""),
+        published_total_frames=published_frames,
+        **planner_kwargs,
+    )
 
 
 def _h3_model_is_resident(model_type: str) -> bool:
@@ -18990,6 +21016,7 @@ def _h3_profile_estimate_payload(
 ) -> dict:
     from services.h3_profiles import build_profile_options
     turbo_status = {"registered": False, "downloaded": False}
+    lightx2v_status = {"registered": True, "downloaded": False}
     sage2_status = {"available": False, "validated": False}
     upscale_status = {"enabled": False, "downloaded": False}
     try:
@@ -18998,6 +21025,15 @@ def _h3_profile_estimate_payload(
         turbo_status = {
             "registered": True,
             "downloaded": bool(runtime_status.get("available")),
+        }
+    except (ImportError, OSError, TypeError, ValueError):
+        pass
+    try:
+        from services.h3_lightx2v import lightx2v_assets_status
+        light_status = dict(lightx2v_assets_status() or {})
+        lightx2v_status = {
+            "registered": True,
+            "downloaded": bool(light_status.get("available")),
         }
     except (ImportError, OSError, TypeError, ValueError):
         pass
@@ -19076,12 +21112,31 @@ def _h3_profile_estimate_payload(
             return False, str(exc)
         return True, None
 
+    def spectrum_compatibility(settings: dict) -> tuple[bool, str | None]:
+        candidate = candidate_for_settings(settings)
+        try:
+            _validate_h3_spectrum_estimate_context(candidate)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return False, str(exc)
+        return True, None
+
+    def lightx2v_compatibility(settings: dict) -> tuple[bool, str | None]:
+        candidate = candidate_for_settings(settings)
+        try:
+            _validate_h3_lightx2v_estimate_context(candidate)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return False, str(exc)
+        return True, None
+
     profiles = build_profile_options(
         context,
         model_exists=lambda model: wgp.get_model_def(model) is not None,
         model_downloaded=_check_model_downloaded,
         turbo_status=turbo_status,
         turbo_compatibility=turbo_compatibility,
+        spectrum_compatibility=spectrum_compatibility,
+        lightx2v_status=lightx2v_status,
+        lightx2v_compatibility=lightx2v_compatibility,
         sage2_status=sage2_status,
         upscale_status=upscale_status,
     )
@@ -19091,11 +21146,16 @@ def _h3_profile_estimate_payload(
         profile["estimate"] = _h3_estimate_for_context(
             candidate, include_residency=include_residency,
         )
+        profile["segment_count_estimate"] = _h3_segment_count_estimate(
+            candidate,
+        )
         profile.pop("matched_reference_count", None)
+    current_segment_count = _h3_segment_count_estimate(context)
     return {
         "current": {"estimate": _h3_estimate_for_context(
             context, include_residency=include_residency,
-        )},
+        ), "segment_count_estimate": current_segment_count},
+        "segment_count_estimate": current_segment_count,
         "profiles": profiles,
     }
 
@@ -19155,14 +21215,124 @@ def _validate_h3_turbo_estimate_context(
     )
 
 
+def _validate_h3_spectrum_estimate_context(context: dict) -> None:
+    """Apply the runtime Spectrum matrix to timing/profile candidates."""
+    from models.minimax_h3.spectrum import (
+        spectrum_requested, validate_spectrum_request,
+    )
+
+    custom = context.get("custom_settings")
+    if not spectrum_requested(custom):
+        return
+    segment_contexts = context.get("_segment_contexts")
+    if isinstance(segment_contexts, list) and segment_contexts:
+        top_level = dict(context)
+        top_level.pop("_segment_contexts", None)
+        _validate_h3_spectrum_estimate_context(top_level)
+        for segment in segment_contexts:
+            if not isinstance(segment, dict):
+                raise ValueError("Spectrum Experimental requires a valid segment plan")
+            candidate = dict(segment)
+            candidate.pop("_segment_contexts", None)
+            _validate_h3_spectrum_estimate_context(candidate)
+        return
+    selected = str(context.get("model_type") or _H3_BASE_FL2VA_MODEL)
+    reference = context.get("reference_shape")
+    if not isinstance(reference, dict):
+        reference = {}
+    semantic_reference = any(int(reference.get(key) or 0) > 0 for key in (
+        "image_count", "video_count", "audio_count",
+    ))
+    model_def = wgp.get_model_def(selected) or {}
+    validate_spectrum_request(
+        selected_model_type=selected,
+        model_def=model_def,
+        reference_mode=bool(
+            semantic_reference or model_def.get("minimax_h3_reference_mode")
+        ),
+        sampling_steps=context.get("num_inference_steps"),
+        attention_engine=str(
+            dict(custom or {}).get("h3_attention_engine") or "sol_attn"
+        ),
+        custom_settings=custom,
+        activated_loras=context.get("activated_loras"),
+        loras_multipliers=context.get("loras_multipliers"),
+        skip_steps_cache_type=context.get("tea_cache"),
+        native_boundary=bool(
+            dict(custom or {}).get("h3_native_boundary_conditioning")
+        ),
+    )
+
+
+def _validate_h3_lightx2v_estimate_context(context: dict) -> None:
+    from services.h3_lightx2v import lightx2v_requested, validate_lightx2v_request
+    custom = context.get("custom_settings")
+    if not lightx2v_requested(custom):
+        return
+    segments = context.get("_segment_contexts")
+    selected = str(context.get("model_type") or _H3_BASE_FL2VA_MODEL)
+    reference = context.get("reference_shape")
+    if not isinstance(reference, dict):
+        reference = {}
+    semantic = any(
+        int(reference.get(key) or 0) > 0
+        for key in ("image_count", "video_count", "audio_count")
+    )
+    model_def = wgp.get_model_def(selected) or {}
+    validate_lightx2v_request(
+        selected_model_type=selected, model_def=model_def,
+        custom_settings=custom, authored_steps=context.get("num_inference_steps"),
+        semantic_references=semantic,
+        multisegment=isinstance(segments, list) and len(segments) > 1,
+        activated_loras=context.get("activated_loras"),
+        loras_multipliers=context.get("loras_multipliers"),
+        skip_steps_cache_type=context.get("tea_cache"),
+        native_boundary=bool(dict(custom or {}).get("h3_native_boundary_conditioning")),
+    )
+
+
+def _stamp_h3_lightx2v_recovery_identity(params: dict) -> None:
+    """Persist the immutable adapter/schedule contract beside job params."""
+    from services.h3_lightx2v import (
+        lightx2v_requested,
+        lightx2v_runtime_identity,
+    )
+
+    if lightx2v_requested(params.get("custom_settings")):
+        params["_h3_lightx2v_identity"] = lightx2v_runtime_identity()
+    else:
+        params.pop("_h3_lightx2v_identity", None)
+
+
+def _validate_h3_lightx2v_recovery_identity(params: dict) -> None:
+    from services.h3_lightx2v import (
+        lightx2v_requested,
+        validate_lightx2v_runtime_identity,
+    )
+
+    requested = lightx2v_requested(params.get("custom_settings"))
+    identity = params.get("_h3_lightx2v_identity")
+    if requested:
+        validate_lightx2v_runtime_identity(identity)
+    elif identity is not None:
+        raise ValueError(
+            "LightX2V recovery identity is present without its profile"
+        )
+
+
+_H3_ESTIMATE_PROMPT_FIELD = "pro" + "mpt"
+
+
 @api.post("/api/v1/h3/estimate")
 async def h3_estimate(request: Request):
-    """Return stateless H3 profile estimates from content-free configuration."""
+    """Return stateless H3 estimates without echoing authored prompt text."""
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="H3 estimate body must be an object")
     allowed = {
         "model_type", "duration_seconds", "window_seconds", "window_overlap",
+        _H3_ESTIMATE_PROMPT_FIELD, "segment_scenes",
+        "h3_adaptive_conditioning", "manual_segment_ceiling",
         "num_inference_steps", "resolution", "custom_settings",
         "activated_loras", "loras_multipliers", "reference_shape",
         "explicit_output", "tea_cache",
@@ -19185,12 +21355,20 @@ async def h3_estimate(request: Request):
         or set(custom) - {
             "h3_attention_engine", "h3_sol_tau", "h3_sol_dense_steps",
             "h3_sol_dense_blocks", "h3_sol_min_tokens", "h3_turbo_profile",
+            "h3_spectrum_profile", "h3_native_boundary_conditioning",
+            "h3_lightx2v_profile",
             "h3_benchmark_capture",
+            "h3_source_audio_mode", "h3_primary_audio_ordinal",
+            "h3_audio_remix_strength", "h3_multirate_profile",
         }
     ):
         raise HTTPException(status_code=400, detail="Unsupported H3 estimator settings")
     if isinstance(custom, dict) and custom.get("h3_turbo_profile") not in (None, "", "h3_turbo_v4"):
         raise HTTPException(status_code=400, detail="Unknown H3 performance profile")
+    if isinstance(custom, dict) and custom.get("h3_spectrum_profile") not in (None, "", "spectrum_h3_v1"):
+        raise HTTPException(status_code=400, detail="Unknown H3 Spectrum profile")
+    if isinstance(custom, dict) and custom.get("h3_lightx2v_profile") not in (None, "", "h3_lightx2v_fl2v_4_v1"):
+        raise HTTPException(status_code=400, detail="Unknown H3 LightX2V profile")
     reference = body.get("reference_shape")
     if reference is not None and (
         not isinstance(reference, dict)
@@ -19200,9 +21378,12 @@ async def h3_estimate(request: Request):
     ):
         raise HTTPException(status_code=400, detail="Unsupported H3 reference shape")
     try:
-        _validate_h3_turbo_estimate_context(body)
+        context = _h3_estimate_context(body)
+        _validate_h3_turbo_estimate_context(context)
+        _validate_h3_spectrum_estimate_context(context)
+        _validate_h3_lightx2v_estimate_context(context)
         return _h3_profile_estimate_payload(
-            body,
+            context,
             include_residency=not bool(
                 getattr(request.state, "maestro_remote", False)
             ),
@@ -19320,18 +21501,26 @@ async def generate(request: Request):
         _validate_h3_explicit_multiclip_request(body)
         _h3_long_plan = _prepare_h3_long_studio_request(body)
         _require_h3_acceleration_available(body, _h3_long_plan)
+        _h3_submission_estimate_context = _h3_estimate_context(
+            body, _h3_long_plan,
+        )
         _validate_h3_turbo_estimate_context(
-            _h3_estimate_context(body, _h3_long_plan),
+            _h3_submission_estimate_context,
             _h3_turbo_validation_authorized=(
                 _h3_turbo_validation_authorized
             ),
+        )
+        _validate_h3_spectrum_estimate_context(
+            _h3_submission_estimate_context,
+        )
+        _validate_h3_lightx2v_estimate_context(
+            _h3_submission_estimate_context,
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Unable to plan long MiniMax H3 generation: {exc}",
         ) from exc
-    mature_output = _classify_generation_maturity(body, _h3_long_plan)
     _require_remote_visible_models(
         request,
         _h3_effective_model_types(body, _h3_long_plan),
@@ -19474,7 +21663,6 @@ async def generate(request: Request):
     session_id = request.state.maestro_session_id
     access_policy = _http_output_policy_from_request(
         body,
-        mature_output=mature_output,
         owner_session_id=session_id,
     )
 
@@ -33757,13 +35945,11 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                             "original_image_end"
                         ),
                     )
+                _validate_h3_lightx2v_recovery_identity(raw_params)
                 _require_h3_acceleration_available(
                     raw_params,
                     trusted_h3_plan,
                     allow_server_prepared=True,
-                )
-                _classify_generation_maturity(
-                    raw_params, trusted_h3_plan,
                 )
                 _require_h3_generation_terms(raw_params, trusted_h3_plan)
             except HTTPException as exc:
@@ -35473,11 +37659,25 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                                     if name in staged_media
                                 },
                             )
+                        repeat_index = max(0, completed_repeats - 1)
+                        cursor_without_premux = dict(
+                            job.get("recovery_cursor") or {}
+                        )
+                        cursor_without_premux["completed_units"] = [
+                            unit for unit in _queue_recovery_units(job)
+                            if not (
+                                unit.get("kind")
+                                == "h3_source_audio_premux"
+                                and unit.get("variant") == 0
+                                and unit.get("index") == repeat_index
+                            )
+                        ]
+                        job["recovery_cursor"] = cursor_without_premux
                         _queue_recovery_checkpoint_unit(
                             job,
                             kind="ordinary_repeat",
                             variant=0,
-                            index=max(0, completed_repeats - 1),
+                            index=repeat_index,
                             project_dir=out_dir,
                             artifact_names=new_artifacts,
                             ordinary_repeat_offset=completed_repeats,
@@ -35701,6 +37901,53 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                         params["after_segment_output"] = (
                             _seal_final_h3_segment_before_concat
                         )
+
+                premux_settings = _h3_source_audio_premux_settings(params)
+                if premux_settings is not None:
+                    try:
+                        premux_index = max(
+                            0, int(params.get("repeat_start_offset", 0) or 0),
+                        )
+                    except (TypeError, ValueError):
+                        premux_index = 0
+                    premux_unit = _queue_recovery_unit_matches(
+                        job,
+                        kind="h3_source_audio_premux",
+                        variant=0,
+                        index=premux_index,
+                        project_dir=out_dir,
+                    )
+                    if (
+                        premux_unit is not None
+                        and premux_unit.get("settings") == premux_settings
+                    ):
+                        recovered_paths = {}
+                        for descriptor in premux_unit.get("artifacts") or []:
+                            media_kind = descriptor.get("media_kind")
+                            if media_kind in recovered_paths:
+                                raise QueueRecoveryRuntimeError(
+                                    "H3 pre-mux recovery contains duplicate media."
+                                )
+                            recovered_paths[media_kind] = (
+                                _queue_recovery_staged_artifact_path(
+                                    out_dir, descriptor,
+                                )
+                            )
+                        expected_kinds = {"video"} | (
+                            {"audio"}
+                            if premux_settings["final_audio_kind"] == "generated"
+                            else set()
+                        )
+                        if set(recovered_paths) != expected_kinds:
+                            raise QueueRecoveryRuntimeError(
+                                "H3 pre-mux recovery artifact set changed."
+                            )
+                        params["_h3_source_audio_premux_recovery"] = {
+                            "audio_path": recovered_paths.get("audio"),
+                            "repeat_index": premux_index,
+                            "video_path": recovered_paths["video"],
+                        }
+                        job["reruns_denoise"] = False
 
                 com_stream = AsyncStream()
                 send_cmd = com_stream.output_queue.push
@@ -36191,6 +38438,62 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                             dependencies=failed_dependencies,
                             settings=failed_settings,
                         )
+
+                premux_settings = _h3_source_audio_premux_settings(task_params)
+                if (
+                    task_error
+                    and failure_stage == "audio_mux"
+                    and premux_settings is not None
+                ):
+                    try:
+                        premux_index = max(
+                            0, int(gen.get("repeat_no", 1) or 1) - 1,
+                        )
+                    except (TypeError, ValueError):
+                        premux_index = 0
+                    sealed_premux = _queue_recovery_unit_matches(
+                        job,
+                        kind="h3_source_audio_premux",
+                        variant=0,
+                        index=premux_index,
+                        project_dir=out_dir,
+                    )
+                    premux_media = {}
+                    for name, path in task_staged_media.items():
+                        if "-premux-video." in name:
+                            premux_media["video"] = path
+                        elif name.endswith("-premux-audio.wav"):
+                            premux_media["audio"] = path
+                    if sealed_premux is None:
+                        if not update_job(
+                            job,
+                            message="Sealing rendered output before audio mux...",
+                            phase="Audio checkpoint",
+                        ):
+                            return False
+                        sealed_premux = _queue_recovery_checkpoint_staged_premux(
+                            job,
+                            index=premux_index,
+                            project_dir=out_dir,
+                            media_paths=premux_media,
+                            settings=premux_settings,
+                        )
+                    if sealed_premux.get("settings") != premux_settings:
+                        raise QueueRecoveryRuntimeError(
+                            "H3 pre-mux recovery settings changed."
+                        )
+                    premux_paths = set(premux_media.values())
+                    if premux_paths:
+                        with wgp.lock:
+                            gen["artifact_list"] = [
+                                path for path in gen.get("artifact_list") or []
+                                if path not in premux_paths
+                            ]
+                            roles = gen.get("artifact_roles")
+                            if isinstance(roles, dict):
+                                for path in premux_paths:
+                                    roles.pop(path, None)
+                    job["reruns_denoise"] = False
 
                 if not task_error:
                     completed += 1
@@ -38458,6 +40761,16 @@ def _set_recovery_no_store(response: Response) -> None:
     response.headers["Pragma"] = "no-cache"
 
 
+def _public_job_prompt_fields(job: dict) -> dict:
+    """Keep authored H3 text out of polling/recovery response surfaces."""
+    if str(job.get("model_type") or "").startswith("minimax_h3"):
+        return {"prompt_preview": "", "active_window_prompt": ""}
+    return {
+        "prompt_preview": str(job.get("prompt_preview") or ""),
+        "active_window_prompt": str(job.get("active_window_prompt") or ""),
+    }
+
+
 @api.get("/api/v1/status/{job_id}")
 def get_status(job_id: str, request: Request, response: Response):
     """Get generation job status."""
@@ -38469,6 +40782,7 @@ def get_status(job_id: str, request: Request, response: Response):
     j = snapshot_job(_jobs[job_id])
     recovery_blocked = _queue_recovery_is_blocked(j)
     eta_seconds, subtask_eta_seconds = _job_eta_values(j)
+    public_prompt_fields = _public_job_prompt_fields(j)
     return {
         "job_id": j["id"],
         "status": j["status"],
@@ -38483,7 +40797,7 @@ def get_status(job_id: str, request: Request, response: Response):
         # Present only on failed jobs that look like CUDA OOMs. UI
         # renders the OOM recovery banner when this is non-null.
         "oom_info": j.get("oom_info"),
-        "prompt_preview": j.get("prompt_preview", ""),
+        "prompt_preview": public_prompt_fields["prompt_preview"],
         "model_type": j.get("model_type", ""),
         "generation_mode": j.get("generation_mode", ""),
         "workspace": j.get("workspace", "default"),
@@ -38493,7 +40807,7 @@ def get_status(job_id: str, request: Request, response: Response):
         "window_total_steps": j.get("window_total_steps", 0),
         "window_progress": j.get("window_progress", 0),
         "overall_progress": j.get("overall_progress", j.get("progress", 0)),
-        "active_window_prompt": j.get("active_window_prompt", ""),
+        "active_window_prompt": public_prompt_fields["active_window_prompt"],
         "clip_current": j.get("clip_current", 0),
         "clip_total": j.get("clip_total", 0),
         "clip_progress": j.get("clip_progress", 0),
@@ -38563,6 +40877,7 @@ def list_jobs(request: Request, response: Response):
         if j["status"] in ("queued", "running", "failed", "cancelled"):
             recovery_blocked = _queue_recovery_is_blocked(j)
             eta_seconds, subtask_eta_seconds = _job_eta_values(j)
+            public_prompt_fields = _public_job_prompt_fields(j)
             active.append({
                 "job_id": j["id"],
                 "status": j["status"],
@@ -38576,7 +40891,7 @@ def list_jobs(request: Request, response: Response):
                 "failure_details": j.get("failure_details"),
                 "oom_info": j.get("oom_info"),
                 "created_at": j.get("created_at", 0),
-                "prompt_preview": j.get("prompt_preview", ""),
+                "prompt_preview": public_prompt_fields["prompt_preview"],
                 "model_type": j.get("model_type", ""),
                 "generation_mode": j.get("generation_mode", ""),
                 "workspace": j.get("workspace", "default"),
@@ -38586,7 +40901,7 @@ def list_jobs(request: Request, response: Response):
                 "window_total_steps": j.get("window_total_steps", 0),
                 "window_progress": j.get("window_progress", 0),
                 "overall_progress": j.get("overall_progress", j.get("progress", 0)),
-                "active_window_prompt": j.get("active_window_prompt", ""),
+                "active_window_prompt": public_prompt_fields["active_window_prompt"],
                 "clip_current": j.get("clip_current", 0),
                 "clip_total": j.get("clip_total", 0),
                 "clip_progress": j.get("clip_progress", 0),

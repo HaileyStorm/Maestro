@@ -25,6 +25,7 @@ _LAUNCH_PATH = _APP / "launch.py"
 _LLM_SERVICE_PATH = _APP / "services" / "llm_service.py"
 _DEFAULT_PATH = _APP / "defaults" / "minimax_h3.json"
 _STORE_PATH = _ROOT / "ui" / "src" / "stores" / "useStore.ts"
+_TYPES_PATH = _ROOT / "ui" / "src" / "types" / "index.ts"
 _PROMPT_INPUT_PATH = _ROOT / "ui" / "src" / "components" / "Sidebar" / "PromptInput.tsx"
 _MODEL_SELECTOR_PATH = _ROOT / "ui" / "src" / "components" / "Sidebar" / "ModelSelector.tsx"
 _ADVANCED_SETTINGS_PATH = _ROOT / "ui" / "src" / "components" / "Sidebar" / "AdvancedSettings.tsx"
@@ -249,7 +250,17 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("TIMED SILENCE AROUND DIALOGUE", enhance_guide)
         self.assertIn("idle staring", enhance_guide)
         self.assertIn("<d>[English] Exact words.</d>", dialect_guide)
-        self.assertIn("Never invent extra speech", dialect_guide)
+        self.assertIn(
+            "Preserve supplied dialogue verbatim. When speech is requested "
+            "without a script",
+            dialect_guide,
+        )
+        self.assertIn(
+            "After the final line, keep mouths closed and extend or hold only "
+            "the requested state and atmosphere.",
+            dialect_guide,
+        )
+        self.assertIn("never invent them as filler", dialect_guide)
 
     def test_ref2va_prompt_guide_preserves_reference_and_audio_safety(self):
         self.assertIn(
@@ -281,7 +292,8 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         launch = _read(_LAUNCH_PATH)
         llm_service = _read(_LLM_SERVICE_PATH)
         self.assertIn("needs_h3_context_ir", launch)
-        self.assertIn("enhancer_enabled > 0 and not needs_h3_context_ir", launch)
+        self.assertIn("and not needs_h3_context_ir", launch)
+        self.assertIn("and not explicit_guidance", launch)
         self.assertIn("is_h3_context_ir", llm_service)
         self.assertIn('mode in ("video", "avatar") and not is_h3_context_ir', llm_service)
         self.assertIn("CRITICAL MINIMAX H3 OUTPUT CONTRACT", llm_service)
@@ -314,6 +326,20 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn('tensor_layout="NHD"', transformer)
         self.assertIn('is_causal=False', transformer)
         self.assertIn('{"sdpa", "sol_attn", "sage2"}', main)
+
+    def test_spectrum_profile_type_and_custom_restore_key_stay_in_ui_parity(self):
+        store = _read(_STORE_PATH)
+        types_source = _read(_TYPES_PATH)
+        restorable = store[
+            store.index("const H3_RESTORABLE_CUSTOM_KEYS"):
+            store.index("type H3AttentionEngine")
+        ]
+        self.assertIn("'h3_spectrum_profile'", restorable)
+        profile_ids = types_source[
+            types_source.index("export type H3PerformanceProfileId"):
+            types_source.index("export type H3EstimateConfidence")
+        ]
+        self.assertIn("'spectrum_experimental'", profile_ids)
 
     def test_w4a8_is_capability_gated_in_selector_and_backend(self):
         launch = _read(_LAUNCH_PATH)

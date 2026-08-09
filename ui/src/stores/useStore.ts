@@ -1,14 +1,16 @@
 import { create } from 'zustand'
 import type { StoreApi } from 'zustand'
-import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping } from '../types'
+import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
+import { HOST_TERM_NOTICES } from '../lib/hostTerms'
 import { applyH3SegmentCeilingPolicy, hasManualH3SegmentCeiling } from '../lib/h3Submission'
 import { alignStudioTotalFrames, alignTotalFrames, controlFpsTotalFrames, effectiveSlidingWindowGeometry, hasGlobalTimeline, usesStudioSegments } from '../lib/timelinePrompt'
 
 const CIVIT_DOWNLOAD_POLL_MS = 2000
 const CIVIT_DOWNLOAD_COMPLETED_VISIBLE_MS = 30_000
 const H3_REF2VA_TERMS_ACK_KEY = 'maestro:minimax-h3-ref2va-terms-v1'
+const H3_REF2VA_LEGACY_TERM_VERSION = HOST_TERM_NOTICES.minimax_h3_ref2va.version
 const H3_ATTENTION_ENGINE_KEY = 'maestro:h3-attention-engine'
 const H3_STUDIO_MODELS = new Set([
   'minimax_h3',
@@ -17,6 +19,8 @@ const H3_STUDIO_MODELS = new Set([
   'minimax_h3_ref2va',
 ])
 const H3_RESTORABLE_CUSTOM_KEYS = new Set([
+  'h3_spectrum_profile',
+  'h3_lightx2v_profile',
   'h3_attention_engine',
   'h3_sol_tau',
   'h3_sol_dense_steps',
@@ -39,29 +43,41 @@ function _restorableH3CustomSettings(value: unknown): Record<string, unknown> {
   )
 }
 
-let _h3Ref2VATermsSessionAccepted = false
+let _h3Ref2VATermsHostAccepted = false
 
 export function h3Ref2VATermsAccepted(): boolean {
-  if (_h3Ref2VATermsSessionAccepted) return true
+  return _h3Ref2VATermsHostAccepted
+}
+
+function _legacyH3Ref2VATermsAccepted(): boolean {
   try {
-    _h3Ref2VATermsSessionAccepted = localStorage.getItem(H3_REF2VA_TERMS_ACK_KEY) === 'accepted'
-    return _h3Ref2VATermsSessionAccepted
+    return localStorage.getItem(H3_REF2VA_TERMS_ACK_KEY) === 'accepted'
   } catch {
     return false
   }
 }
 
-export function setH3Ref2VATermsAccepted(accepted: boolean): void {
-  _h3Ref2VATermsSessionAccepted = accepted
+function _clearLegacyH3Ref2VATermsAcceptance(): void {
   try {
-    if (accepted) localStorage.setItem(H3_REF2VA_TERMS_ACK_KEY, 'accepted')
-    else localStorage.removeItem(H3_REF2VA_TERMS_ACK_KEY)
+    localStorage.removeItem(H3_REF2VA_TERMS_ACK_KEY)
   } catch {
-    // Session state remains authoritative when browser storage is unavailable.
+    // Server persistence remains authoritative when browser storage is unavailable.
   }
+}
+
+function _setH3Ref2VATermsAccepted(accepted: boolean): void {
+  _h3Ref2VATermsHostAccepted = accepted
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('maestro:h3-ref2va-terms-change', { detail: accepted }))
   }
+}
+
+let _hostTermsOperationTail: Promise<void> = Promise.resolve()
+
+function _queueHostTermsOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const result = _hostTermsOperationTail.then(operation, operation)
+  _hostTermsOperationTail = result.then(() => undefined, () => undefined)
+  return result
 }
 let _civitDownloadPollTask: Promise<void> | null = null
 let _civitDownloadPollController: AbortController | null = null
@@ -82,12 +98,115 @@ type DirectorRepairPoll = {
   operationId: string
   timer: number | null
 }
+type ActiveJobPoll = {
+  timer: number | null
+  wake: () => void
+  stop: () => void
+}
+type TerminalJobWaiter = {
+  resolve: (status: api.ApiJobStatus) => void
+  reject: (error: Error) => void
+  timer: number
+}
 const _directorRepairPolls = new Map<string, DirectorRepairPoll>()
 const _directorRepairDiscoveries = new Map<string, object>()
-const _recoveryJobPolls = new Map<string, ReturnType<typeof setInterval>>()
+const _recoveryJobPolls = new Map<string, ActiveJobPoll>()
+const _terminalJobWaiters = new Map<string, TerminalJobWaiter>()
 let _directorPreparationPoll: ReturnType<typeof setInterval> | null = null
 let _dashboardPipelineLoadToken = 0
 let _dashboardPipelineListLoadToken = 0
+let _enhanceLlmRequestToken: symbol | null = null
+let _directorLlmRequestToken: symbol | null = null
+let _directorPipelineLifecycleToken: symbol | null = null
+
+function _beginWorkspaceLlmRequest(
+  workspace: string,
+  onLostOwnership?: () => void,
+) {
+  const controller = new AbortController()
+  let ownershipLost = false
+  const loseOwnership = () => {
+    if (ownershipLost) return
+    ownershipLost = true
+    controller.abort()
+    onLostOwnership?.()
+  }
+  const unsubscribe = useStore.subscribe(state => {
+    if (state.activeWorkspace !== workspace) loseOwnership()
+  })
+  if (useStore.getState().activeWorkspace !== workspace) loseOwnership()
+  return {
+    signal: controller.signal,
+    ownsWorkspace: () => useStore.getState().activeWorkspace === workspace,
+    dispose: unsubscribe,
+  }
+}
+
+function _beginEnhanceLlmRequest(workspace: string) {
+  const token = Symbol('enhance-llm-request')
+  _enhanceLlmRequestToken = token
+  const lifecycle = _beginWorkspaceLlmRequest(workspace, () => {
+    if (_enhanceLlmRequestToken !== token) return
+    _enhanceLlmRequestToken = null
+    useStore.setState({ isEnhancing: false })
+  })
+  return {
+    signal: lifecycle.signal,
+    ownsWorkspace: () => (
+      lifecycle.ownsWorkspace() && _enhanceLlmRequestToken === token
+    ),
+    dispose: () => {
+      if (_enhanceLlmRequestToken === token) _enhanceLlmRequestToken = null
+      lifecycle.dispose()
+    },
+  }
+}
+
+function _beginDirectorLlmRequest(workspace: string) {
+  const token = Symbol('director-llm-request')
+  _directorLlmRequestToken = token
+  const previousStep = useStore.getState().directorStep
+  const lifecycle = _beginWorkspaceLlmRequest(workspace, () => {
+    if (_directorLlmRequestToken !== token) return
+    _directorLlmRequestToken = null
+    useStore.setState({
+      directorLoading: false,
+      directorLoadingMessage: null,
+      directorStep: previousStep,
+    })
+  })
+  return {
+    signal: lifecycle.signal,
+    ownsWorkspace: () => (
+      lifecycle.ownsWorkspace() && _directorLlmRequestToken === token
+    ),
+    dispose: () => {
+      if (_directorLlmRequestToken === token) _directorLlmRequestToken = null
+      lifecycle.dispose()
+    },
+  }
+}
+
+function _beginDirectorPipelineLifecycle(workspace: string) {
+  const token = Symbol('director-pipeline-lifecycle')
+  _directorPipelineLifecycleToken = token
+  const lifecycle = _beginWorkspaceLlmRequest(workspace)
+  return {
+    ownsWorkspace: () => (
+      lifecycle.ownsWorkspace() && _directorPipelineLifecycleToken === token
+    ),
+    dispose: () => {
+      if (_directorPipelineLifecycleToken === token) {
+        _directorPipelineLifecycleToken = null
+      }
+      lifecycle.dispose()
+    },
+  }
+}
+
+function _isBrowserAbort(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+}
 let _h3PlanDecisionResolver: ((decision: H3PlanDecision | null) => void) | null = null
 
 type StoredDirectorPreparation = { requestId: string; workspace: string }
@@ -194,6 +313,7 @@ type H3EstimateState = {
   durationSeconds: number
   slidingWindowSeconds: number
   slidingWindowOverlap: number
+  slidingWindowLocked: boolean
   spatialUpsampling: string
   startImage: unknown
   endImage: unknown
@@ -214,6 +334,9 @@ function _buildH3EstimateRequest(
     duration_seconds: state.durationSeconds,
     window_seconds: state.slidingWindowSeconds,
     window_overlap: state.slidingWindowOverlap,
+    prompt: String(state.params.prompt || ''),
+    h3_adaptive_conditioning: state.params.h3_adaptive_conditioning !== false,
+    manual_segment_ceiling: state.slidingWindowLocked,
     num_inference_steps: state.params.num_inference_steps,
     resolution: state.params.resolution,
     custom_settings: { ...(state.params.custom_settings || {}) },
@@ -368,6 +491,140 @@ function _mergeJobStatus(job: GenerationJob, status: api.ApiJobStatus): Generati
   }
 }
 
+const ACTIVE_JOB_STATUS_POLL_MS = 2_000
+const QUEUED_JOB_STATUS_SAFETY_MS = 300_000
+const ACTIVE_OUTPUT_REFRESH_MIN_MS = 15_000
+const ACTIVE_OUTPUT_REFRESH_SAFETY_MS = 30_000
+
+function _waitForTerminalJobStatus(jobId: string, timeoutMs: number): Promise<api.ApiJobStatus> {
+  return new Promise((resolve, reject) => {
+    const previous = _terminalJobWaiters.get(jobId)
+    if (previous) {
+      window.clearTimeout(previous.timer)
+      previous.reject(new Error(`Job ${jobId} acquired a replacement completion waiter`))
+    }
+    const timer = window.setTimeout(() => {
+      _terminalJobWaiters.delete(jobId)
+      reject(new Error(`Job ${jobId} timed out`))
+    }, timeoutMs)
+    _terminalJobWaiters.set(jobId, { resolve, reject, timer })
+  })
+}
+
+function _publishTerminalJobStatus(status: api.ApiJobStatus): void {
+  if (
+    status.status !== 'completed'
+    && status.status !== 'failed'
+    && status.status !== 'cancelled'
+  ) return
+  const waiter = _terminalJobWaiters.get(status.job_id)
+  if (!waiter) return
+  _terminalJobWaiters.delete(status.job_id)
+  window.clearTimeout(waiter.timer)
+  waiter.resolve(status)
+}
+
+function _rejectTerminalJobWaiter(jobId: string, message: string): void {
+  const waiter = _terminalJobWaiters.get(jobId)
+  if (!waiter) return
+  _terminalJobWaiters.delete(jobId)
+  window.clearTimeout(waiter.timer)
+  waiter.reject(new Error(message))
+}
+
+function _jobNeedsFastStatusPoll(job: GenerationJob): boolean {
+  return job.status === 'running' || job.recoveryState === 'retrying'
+}
+
+function _queueJobDetails(status: api.QueueJobState): Partial<GenerationJob> {
+  return {
+    status: status.status,
+    queueWaitReason: status.wait_reason,
+    etaSeconds: status.eta_seconds ?? null,
+    subtaskEtaSeconds: status.status === 'running'
+      ? (status.subtask_eta_seconds ?? null)
+      : null,
+    recoveryState: status.recovery_state ?? null,
+    recoveryInterrupted: status.recovery_interrupted === true,
+    recoveryBlocked: status.recovery_blocked === true,
+    recoveryAttempt: status.recovery_attempt ?? 0,
+    recoveryAttemptLimit: status.recovery_attempt_limit ?? 0,
+    recoveryRerunsDenoise: status.recovery_reruns_denoise === true,
+    recoveryReason: status.recovery_reason ?? null,
+    recoveryReasonText: status.recovery_reason_text ?? null,
+    recoveryActionable: status.recovery_actionable === true,
+    recoveryActions: status.recovery_actions || [],
+    estimateAfterResume: status.estimate_after_resume ?? null,
+  }
+}
+
+type ActiveOutputRefreshTracker = {
+  outputSignature: string
+  phase: string
+  lastRefreshAt: number
+  pendingDelta: boolean
+  hasRefreshed: boolean
+}
+
+type GalleryRefreshClock = Pick<
+  ActiveOutputRefreshTracker,
+  'lastRefreshAt' | 'pendingDelta' | 'hasRefreshed'
+>
+
+function _coalescedGalleryRefreshDue(
+  tracker: GalleryRefreshClock,
+  changed: boolean,
+  visible: boolean,
+  now = Date.now(),
+): boolean {
+  tracker.pendingDelta = tracker.pendingDelta || changed
+  const elapsed = now - tracker.lastRefreshAt
+  const coalescedDeltaDue = tracker.pendingDelta
+    && (!tracker.hasRefreshed || elapsed >= ACTIVE_OUTPUT_REFRESH_MIN_MS)
+  const safetyRefreshDue = elapsed >= ACTIVE_OUTPUT_REFRESH_SAFETY_MS
+  if (!visible || (!coalescedDeltaDue && !safetyRefreshDue)) return false
+  tracker.lastRefreshAt = now
+  tracker.pendingDelta = false
+  tracker.hasRefreshed = true
+  return true
+}
+
+function _activeOutputSignature(status: api.ApiJobStatus): string {
+  return `${status.produced_outputs}:${JSON.stringify(status.output_files)}`
+}
+
+function _createActiveOutputRefreshTracker(
+  job: Pick<GenerationJob, 'outputFiles' | 'phase'>,
+  now = Date.now(),
+): ActiveOutputRefreshTracker {
+  return {
+    outputSignature: `0:${JSON.stringify(job.outputFiles)}`,
+    phase: job.phase,
+    lastRefreshAt: now,
+    pendingDelta: false,
+    hasRefreshed: false,
+  }
+}
+
+function _activeOutputRefreshDue(
+  tracker: ActiveOutputRefreshTracker,
+  status: api.ApiJobStatus,
+  visible: boolean,
+  now = Date.now(),
+): boolean {
+  const outputSignature = _activeOutputSignature(status)
+  const outputChanged = outputSignature !== tracker.outputSignature
+  const phasePublished = !!status.phase && status.phase !== tracker.phase
+  tracker.outputSignature = outputSignature
+  tracker.phase = status.phase
+  return status.status === 'running' && _coalescedGalleryRefreshDue(
+    tracker,
+    outputChanged || phasePublished,
+    visible,
+    now,
+  )
+}
+
 function _waitForDownloadPoll(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise(resolve => {
     if (signal.aborted) {
@@ -397,6 +654,12 @@ if (import.meta.hot) {
       _stopDirectorRepairPoll(pid)
     }
     _directorRepairDiscoveries.clear()
+    for (const poll of [..._recoveryJobPolls.values()]) {
+      poll.stop()
+    }
+    for (const jobId of [..._terminalJobWaiters.keys()]) {
+      _rejectTerminalJobWaiter(jobId, 'UI reloaded while waiting for generation')
+    }
   })
 }
 
@@ -748,6 +1011,8 @@ const _PRIMARY_MODEL_DEFAULT_FIELDS: ReadonlyArray<string> = [
 // most recently requested model's options may touch the store.
 let _modelOptionsSeq = 0
 let _modelDefaultsSeq = 0
+let _loraLoadSeq = 0
+let _recipesLoadSeq = 0
 let _h3EstimateSeq = 0
 let _h3ProfileApplySeq = 0
 let _h3CompatibilitySeq = 0
@@ -1019,7 +1284,6 @@ const OLD_MUSIC_DEFAULT = 'ace_step_v1_5_xl_turbo_lm_4b'
 const NEW_MUSIC_DEFAULT = 'ace_step_v1_5_xl_sft_lm_4b'
 
 const ENABLED_MODELS_KEY = 'maestro_enabled_models'
-let _initializedMatureModels = new Set<string>()
 let _modelVisibilityHydrated = false
 let _modelVisibilityDefaultsVersion = 1
 let _modelVisibilitySaveTask: Promise<void> = Promise.resolve()
@@ -1030,7 +1294,6 @@ function _saveEnabledModels(models: Set<string>) {
   } catch { /* quota exceeded */ }
   const payload = {
     enabled_models: [...models],
-    initialized_mature_models: [..._initializedMatureModels],
     defaults_version: _modelVisibilityDefaultsVersion,
   }
   _modelVisibilitySaveTask = _modelVisibilitySaveTask
@@ -1050,40 +1313,6 @@ function _loadEnabledModels(): Set<string> | null {
     if (raw) return new Set(JSON.parse(raw))
   } catch { /* ignore */ }
   return null
-}
-
-function _markMatureModelsInitialized(
-  models: ModelDef[],
-  modelTypes?: Iterable<string>,
-) {
-  const requested = modelTypes ? new Set(modelTypes) : null
-  for (const model of models) {
-    if (
-      model.nsfw_only
-      && (requested == null || requested.has(model.model_type))
-    ) {
-      _initializedMatureModels.add(model.model_type)
-    }
-  }
-}
-
-function _enableUninitializedMatureModels(
-  models: ModelDef[],
-  enabledModels: Set<string>,
-): Set<string> | null {
-  const next = new Set(enabledModels)
-  let changed = false
-  for (const model of models) {
-    if (
-      model.nsfw_only
-      && !_initializedMatureModels.has(model.model_type)
-    ) {
-      _initializedMatureModels.add(model.model_type)
-      next.add(model.model_type)
-      changed = true
-    }
-  }
-  return changed ? next : null
 }
 
 // Default model_type per generation mode
@@ -1505,6 +1734,7 @@ interface AppState {
   setRecipesOpen: (open: boolean) => void
   recipes: import('../api/client').RecipeCard[]
   recipesLoading: boolean
+  recipesError: string | null
   loadRecipes: () => Promise<void>
   applyRecipe: (id: string) => Promise<{ missing: import('../api/client').RecipeLora[] }>
   saveRecipeFromOutput: (outputName: string, name: string, description: string, nsfw: boolean) => Promise<void>
@@ -1688,11 +1918,13 @@ interface AppState {
   jobs: GenerationJob[]
   isGenerating: boolean
   pendingH3Plan: H3SegmentPlan | null
+  pendingH3PlanEstimate: H3PerformanceEstimate | null
   approveH3Plan: (decision: H3PlanDecision) => void
   cancelH3Plan: () => void
   startGeneration: () => Promise<void>
   stopGeneration: (jobId?: string) => void
   dismissJob: (jobId: string) => void
+  reconcileQueueState: (queue: api.QueueState) => void
   reconnectJobs: () => Promise<void>
   resumeJobRecovery: (jobId: string) => Promise<void>
   retryJobRecovery: (jobId: string) => Promise<void>
@@ -1702,9 +1934,6 @@ interface AppState {
   availableLoras: string[]
   lorasLoading: boolean
   loraWeights: Record<string, number[]>
-  matureLoraNames: Set<string>
-  classifiedLoraNames: Set<string>
-  registerMatureLoraFlags: (modelType: string, loras: Array<{ filename: string; nsfw?: boolean }>) => void
   /** Map of LoRA filename → stable lora_id (e.g. `civitai:12345` for a
    *  CivitAI-sourced LoRA, `local:foo.safetensors` for hand-installed).
    *  Populated from /api/v1/loras/installed at boot and refreshed when
@@ -1745,11 +1974,13 @@ interface AppState {
   loadModelOptions: (modelType: string) => Promise<void>
   h3PerformanceProfiles: H3PerformanceProfile[]
   h3CurrentEstimate: H3PerformanceEstimate | null
+  h3SegmentCountEstimate: H3SegmentCountEstimate | null
   h3EstimateLoading: boolean
   h3EstimateError: string | null
   h3SelectedProfile: H3PerformanceProfileId | 'custom'
   h3ProfileApplying: H3PerformanceProfileId | null
   h3ModelProfileCompatibility: Record<string, H3ModelProfileCompatibility | undefined>
+  invalidateH3PerformanceEstimates: () => void
   refreshH3PerformanceEstimates: () => Promise<void>
   refreshH3ModelProfileCompatibility: (modelType: string) => Promise<void>
   normalizeH3EditableProfile: () => Promise<boolean>
@@ -1846,11 +2077,15 @@ interface AppState {
   clearServicesConfigError: () => void
   loadServicesConfig: () => Promise<void>
   updateServicesConfig: (partial: Partial<ServicesConfig>) => Promise<void>
+  hostTerms: HostTermsStatus | null
+  hostTermsLoading: boolean
+  hostTermsError: string | null
+  loadHostTerms: () => Promise<void>
+  acceptHostTerm: (term: HostTermId) => Promise<boolean>
   /** Per-browser, per-job intent. This is deliberately not hydrated from the
    *  host's durable mature-capability setting or persisted to localStorage. */
   explicitOutput: boolean
   setExplicitOutput: (enabled: boolean) => void
-  matureSelectionActive: () => boolean
   privateOutput: boolean
   setPrivateOutput: (enabled: boolean) => void
 
@@ -1898,16 +2133,6 @@ interface AppState {
   directorVoiceRef: File | null
   directorVoiceRefPath: string | null
   directorIdentityGuidanceScale: number
-  /** Experimental: bypass the safety check that disables ID-LoRA reference
-   *  audio concatenation on the distilled LTX-2.3 pipeline. The base
-   *  distilled model produces noise when ref tokens are prepended, but
-   *  newer ID-LoRA variants (e.g. AviadDahan CelebVHQ-3K) claim distilled
-   *  compatibility — this flag lets users test those LoRAs.
-   *
-   *  REMOVED 2026-05-26: Per WanGP v11.77 testing, the CelebVHQ ID-LoRA
-   *  works on both dev and distilled. The block-on-distilled gate and
-   *  this experimental override are both gone. The comment is preserved
-   *  for historical context only. */
   setDirectorVoiceRef: (file: File | null) => void
   setDirectorIdentityGuidanceScale: (v: number) => void
   directorClipImages: DirectorClipImage[]
@@ -1919,10 +2144,6 @@ interface AppState {
   directorShotImageGuidance: DirectorShotImageGuidance
   directorVideoInferenceStepsByModel: Record<string, number>
   directorVideoMaxShotFramesByModel: Record<string, number>
-  /** Completed LLM stream outputs, kept so the thinking/output boxes stay
-   *  in the chat history after each stage finishes instead of vanishing. */
-  directorLlmLog: { stage: string; text: string }[]
-  directorAppendLlmLog: (stage: string, text: string) => void
   directorSkill: DirectorSkill | null
   directorResolution: ResolutionPreset
   directorAspectRatio: AspectRatio
@@ -1981,7 +2202,7 @@ interface AppState {
   directorGenerate: () => void
   directorReset: () => void
   directorEditClipPlan: (index: number, field: 'video_prompt' | 'image_prompt', value: string) => void
-  _uploadDirectorRefs: () => Promise<{ refImagePath: string | null; charPaths: string[]; locPaths: string[] }>
+  _uploadDirectorRefs: (lifecycle?: { ownsWorkspace: () => boolean }) => Promise<{ refImagePath: string | null; charPaths: string[]; locPaths: string[] }>
 
   // Short Film Director
   shortFilmCharacters: ShortFilmCharacter[]
@@ -1997,10 +2218,6 @@ interface AppState {
   shortFilmPlanPrompts: () => Promise<void>
   shortFilmPlanVideoPrompts: () => Promise<void>
   shortFilmPlanFromStory: () => Promise<void>
-
-  // LLM streaming
-  llmStreamText: string
-  llmStreamDone: boolean
 
   // Director Pipeline (server-side)
   pipelineId: string | null
@@ -2106,10 +2323,6 @@ async function _applyH3ServerProfile(
       [mode]: target,
     }
     set({
-      ...(_modelTypeIsMature(state, target)
-        || settings.activated_loras.some(name => _loraNeedsExplicit(state, target, name))
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
       params: nextParams,
       selectedModelPerMode,
       modelOptions: options,
@@ -2127,6 +2340,9 @@ async function _applyH3ServerProfile(
       h3SelectedProfile: id,
       h3ProfileApplying: null,
       h3CurrentEstimate: profile.estimate,
+      ...(profile.segment_count_estimate
+        ? { h3SegmentCountEstimate: profile.segment_count_estimate }
+        : {}),
     })
     const applied = get()
     _saveSettings({
@@ -2332,37 +2548,6 @@ function computeFilteredOutputs(outputs: OutputFile[], mediaFilter: MediaFilter)
     _foCachedResult = outputs
   }
   return _foCachedResult
-}
-
-const KNOWN_MATURE_MODEL_TYPES = new Set(['mmaudio_nsfw'])
-
-function _modelTypeIsMature(state: AppState, modelType: string | undefined): boolean {
-  if (!modelType) return false
-  return KNOWN_MATURE_MODEL_TYPES.has(modelType)
-    || state.models.some(model => model.model_type === modelType && model.nsfw_only)
-}
-
-function _matureLoraKey(modelType: string, filename: string): string {
-  return `${modelType}\u0000${filename}`
-}
-
-function _loraNeedsExplicit(state: AppState, modelType: string, filename: string): boolean {
-  const key = _matureLoraKey(modelType, filename)
-  return !state.classifiedLoraNames.has(key) || state.matureLoraNames.has(key)
-}
-
-function _activeSelectionHasMatureComponent(state: AppState): boolean {
-  if (state.sidebarMode === 'director') {
-    const imageLoras = state.savedLoraPerMode.image?.activated_loras || []
-    const videoLoras = state.savedLoraPerMode.video?.activated_loras || []
-    return _modelTypeIsMature(state, state.selectedModelPerMode.image)
-      || _modelTypeIsMature(state, state.selectedModelPerMode.video)
-      || imageLoras.some(name => _loraNeedsExplicit(state, state.selectedModelPerMode.image || '', name))
-      || videoLoras.some(name => _loraNeedsExplicit(state, state.selectedModelPerMode.video || '', name))
-  }
-  return _modelTypeIsMature(state, state.params.model_type)
-    || (state.params.activated_loras || []).some(name => _loraNeedsExplicit(state, state.params.model_type, name))
-    || (state.params as unknown as Record<string, unknown>)._mmaudio_variant === 'nsfw'
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -2920,9 +3105,6 @@ export const useStore = create<AppState>((set, get) => ({
       loraWeights: sameModel ? restoredLora.loraWeights : {},
       availableLoras: sameModel ? restoredLora.availableLoras : [],
     }))
-    if (_activeSelectionHasMatureComponent(get())) {
-      set({ explicitOutput: true, privateOutput: true })
-    }
     if (newModelType && !sfxModelTypes.has(newModelType)) {
       if (!sameModel) {
         get().loadLoras(newModelType)
@@ -3420,16 +3602,32 @@ export const useStore = create<AppState>((set, get) => ({
       ? selected.workspace
       : state.dashboardPipelineList.find(item => item.id === pid)?.workspace
     if (!workspace) throw new Error('Director recovery project is unavailable')
-    const result = await api.resumePipeline(pid, workspace)
-    if (
-      result.status === 'paused'
-      && result.next_action === 'continue'
-      && result.actions?.includes('continue')
-    ) {
-      await api.continuePipeline(pid)
+    if (workspace !== state.activeWorkspace) {
+      throw new Error('Switch to the Director pipeline project before resuming it')
     }
-    set({ dashboardOpen: false, pipelineId: pid, pipelinePolling: true })
-    get().pollPipelineStatus()
+    const lifecycle = _beginDirectorPipelineLifecycle(workspace)
+    try {
+      if (!lifecycle.ownsWorkspace()) return
+      const result = await api.resumePipeline(pid, workspace)
+      if (!lifecycle.ownsWorkspace()) return
+      if (
+        result.status === 'paused'
+        && result.next_action === 'continue'
+        && result.actions?.includes('continue')
+      ) {
+        await api.continuePipeline(pid)
+        if (!lifecycle.ownsWorkspace()) return
+      }
+      set({
+        dashboardOpen: false,
+        pipelineId: pid,
+        pipelineStatus: null,
+        pipelinePolling: true,
+      })
+      get().pollPipelineStatus()
+    } finally {
+      lifecycle.dispose()
+    }
   },
 
   // ── Recipes (one-click Studio presets) ────────────────────────────
@@ -3440,14 +3638,23 @@ export const useStore = create<AppState>((set, get) => ({
   },
   recipes: [],
   recipesLoading: false,
+  recipesError: null,
   loadRecipes: async () => {
-    set({ recipesLoading: true })
+    const seq = ++_recipesLoadSeq
+    const workspace = get().activeWorkspace
+    set({ recipesLoading: true, recipesError: null })
     try {
-      const { recipes } = await api.fetchRecipes()
-      set({ recipes, recipesLoading: false })
+      const { recipes } = await api.fetchRecipes(workspace)
+      if (seq !== _recipesLoadSeq || get().activeWorkspace !== workspace) return
+      set({ recipes, recipesLoading: false, recipesError: null })
     } catch (e) {
+      if (seq !== _recipesLoadSeq || get().activeWorkspace !== workspace) return
       console.error('Failed to load recipes:', e)
-      set({ recipes: [], recipesLoading: false })
+      set({
+        recipes: [],
+        recipesLoading: false,
+        recipesError: e instanceof Error ? e.message : 'Failed to load recipes',
+      })
     }
   },
   applyRecipe: async (id) => {
@@ -3456,10 +3663,77 @@ export const useStore = create<AppState>((set, get) => ({
     // working set, and PREPOPULATE the prompt (a real, editable value — not
     // placeholder text) so the user just tweaks the subject. Seed and repeat
     // reset so a recipe reproduces a look, not a specific frame.
-    const recipe = await api.fetchRecipe(id)
+    const recipeWorkspace = get().activeWorkspace
+    const recipe = await api.fetchRecipe(id, recipeWorkspace)
+    if (get().activeWorkspace !== recipeWorkspace) {
+      throw new Error('The active project changed before the recipe could be applied. Open Recipes and try again.')
+    }
     const { models } = get()
     const model = models.find(m => m.model_type === recipe.model_type)
     const mode = model ? getModelMode(recipe.model_type, model.family) : ((recipe.mode as GenerationMode) || 'video')
+
+    // Inventory must be authoritative before we claim any LoRA is missing.
+    // loadLoras intentionally degrades failures to an empty UI list, which is
+    // not strong enough for an apply decision and could prompt a duplicate
+    // host install after a transient request failure.
+    let availableLoras: string[] = []
+    if (recipe.model_type) {
+      try {
+        availableLoras = (await api.fetchLoras(recipe.model_type)).loras
+      } catch {
+        throw new Error('Could not verify the LoRAs installed on this Maestro host. The recipe was not applied; try again.')
+      }
+      if (get().activeWorkspace !== recipeWorkspace) {
+        throw new Error('The active project changed before the recipe could be applied. Open Recipes and try again.')
+      }
+    }
+
+    const applySnapshot = get()
+    const restoreInterruptedApply = () => {
+      // First use the shared transition to leave the recipe mode cleanly,
+      // then reinstate the exact pre-apply working/persisted state. Invalidate
+      // transition requests so a late response cannot reintroduce partial
+      // recipe state after this rollback.
+      if (get().generationMode !== applySnapshot.generationMode) {
+        get().setGenerationMode(applySnapshot.generationMode)
+      }
+      ++_modelOptionsSeq
+      ++_modelDefaultsSeq
+      ++_loraLoadSeq
+      ++_h3ProfileApplySeq
+      set({
+        generationMode: applySnapshot.generationMode,
+        selectedModelPerMode: applySnapshot.selectedModelPerMode,
+        savedLoraPerMode: applySnapshot.savedLoraPerMode,
+        savedParamsPerMode: applySnapshot.savedParamsPerMode,
+        savedPromptPerMode: applySnapshot.savedPromptPerMode,
+        params: applySnapshot.params,
+        loraWeights: applySnapshot.loraWeights,
+        availableLoras: applySnapshot.availableLoras,
+        lorasLoading: false,
+        modelOptions: applySnapshot.modelOptions,
+        modelOptionsLoading: false,
+        durationSeconds: applySnapshot.durationSeconds,
+        slidingWindowSeconds: applySnapshot.slidingWindowSeconds,
+        slidingWindowOverlap: applySnapshot.slidingWindowOverlap,
+        slidingWindowLocked: applySnapshot.slidingWindowLocked,
+        filmGrainIntensity: applySnapshot.filmGrainIntensity,
+        filmGrainSaturation: applySnapshot.filmGrainSaturation,
+        resolutionPreset: applySnapshot.resolutionPreset,
+        aspectRatio: applySnapshot.aspectRatio,
+        ttsVoiceCount: applySnapshot.ttsVoiceCount,
+        ttsVoices: applySnapshot.ttsVoices,
+        h3SelectedProfile: applySnapshot.h3SelectedProfile,
+        h3ProfileApplying: applySnapshot.h3ProfileApplying,
+      })
+      _saveSettings({
+        generationMode: applySnapshot.generationMode,
+        selectedModelPerMode: applySnapshot.selectedModelPerMode,
+        savedParamsPerMode: applySnapshot.savedParamsPerMode,
+        savedLoraPerMode: applySnapshot.savedLoraPerMode,
+        savedPromptPerMode: applySnapshot.savedPromptPerMode,
+      }, applySnapshot.loraIdByFilename)
+    }
 
     const activated = (recipe.loras || []).map(l => l.filename)
     const multipliers = (recipe.loras || []).map(l => String(l.multiplier ?? '1.0')).join(' ')
@@ -3468,13 +3742,58 @@ export const useStore = create<AppState>((set, get) => ({
       loraWeights[l.filename] = String(l.multiplier ?? '1.0').split(';').map(Number)
     }
 
+    // Preserve and cleanly leave the current generation mode before layering
+    // in the recipe. Directly changing generationMode would leak Audio/Edit
+    // fields into Studio and skip the normal per-mode restoration contract.
+    const previousMode = get().generationMode
+    ++_loraLoadSeq
+    if (previousMode !== mode) {
+      // Seed the target mode with the recipe model and the already-verified
+      // inventory. This makes the shared transition restore the intended
+      // model and prevents it from launching an untracked loadLoras request
+      // for an older/default target model that could resolve after apply.
+      set(s => ({
+        selectedModelPerMode: { ...s.selectedModelPerMode, [mode]: recipe.model_type },
+        savedLoraPerMode: {
+          ...s.savedLoraPerMode,
+          [mode]: { activated_loras: activated, loras_multipliers: multipliers, loraWeights, availableLoras },
+        },
+      }))
+      get().setGenerationMode(mode)
+    }
+    // setGenerationMode may start H3 profile normalization as a detached
+    // task. Recipe tuning is authoritative, so supersede that task after the
+    // shared transition has issued it (and also cancel any same-mode task).
+    ++_h3ProfileApplySeq
+
+    if (recipe.model_type) {
+      // Supersede the mode transition's model/default requests, then await the
+      // final capability/geometry response before applying the recipe tuning.
+      // Applying params last prevents late defaults from silently reverting
+      // the recipe's steps, guidance, duration, or other tuned values.
+      ++_modelDefaultsSeq
+      await get().loadModelOptions(recipe.model_type)
+      ++_modelDefaultsSeq
+      if (get().activeWorkspace !== recipeWorkspace) {
+        restoreInterruptedApply()
+        throw new Error('The active project changed before the recipe could be applied. Open Recipes and try again.')
+      }
+      if (get().modelOptions?.model_type !== recipe.model_type) {
+        restoreInterruptedApply()
+        throw new Error('Could not load this recipe model\'s Studio options. The recipe was not applied; try again.')
+      }
+    }
+
+    // No H3 profile response issued during model-options loading may commit
+    // after the recipe's final tuned state.
+    ++_h3ProfileApplySeq
+
+    // Applying a Studio preset is also an explicit navigation action. Use the
+    // shared transition so desktop and mobile cannot diverge on Director state.
+    get().setSidebarMode('studio')
+
     set(s => ({
       generationMode: mode,
-      ...(recipe.nsfw
-        || _modelTypeIsMature(s, recipe.model_type)
-        || activated.some(name => _loraNeedsExplicit(s, recipe.model_type, name))
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
       // NOTE: do NOT close the overlay here. The RecipesOverlay closes
       // itself on success, but keeps itself open when the recipe needs
       // LoRAs you don't have — so it can show the download prompt. Closing
@@ -3494,23 +3813,33 @@ export const useStore = create<AppState>((set, get) => ({
         image_mode: mode === 'image' ? 1 : 0,
       },
       loraWeights,
-      availableLoras: [],
+      availableLoras,
+      lorasLoading: false,
       selectedModelPerMode: { ...s.selectedModelPerMode, [mode]: recipe.model_type },
     }))
 
+    // Recipe selection is a real Studio model selection, not a transient
+    // preview. Persist it through the same per-mode settings channel so a
+    // reload does not silently return to the pre-recipe model.
+    const applied = get()
+    _saveSettings({
+      generationMode: applied.generationMode,
+      selectedModelPerMode: applied.selectedModelPerMode,
+      savedParamsPerMode: applied.savedParamsPerMode,
+      savedLoraPerMode: applied.savedLoraPerMode,
+      savedPromptPerMode: applied.savedPromptPerMode,
+    }, applied.loraIdByFilename)
+
     if (recipe.model_type) {
-      get().loadModelOptions(recipe.model_type)
       // Derive duration from video_length if the recipe carried one.
       const vlen = (recipe.params as Record<string, unknown>)?.video_length
       const fps = model?.fps || 16
       if (typeof vlen === 'number' && vlen > 0) {
         set({ durationSeconds: Math.round((vlen / fps) * 10) / 10 })
       }
-      // Await the LoRA list so we can report which recipe LoRAs are missing.
-      await get().loadLoras(recipe.model_type)
     }
 
-    const present = new Set(get().availableLoras.map(x => (x || '').replace(/\\/g, '/').split('/').pop() || ''))
+    const present = new Set(availableLoras.map(x => (x || '').replace(/\\/g, '/').split('/').pop() || ''))
     const missing = (recipe.loras || []).filter(l => !present.has(l.filename))
     return { missing }
   },
@@ -3564,9 +3893,6 @@ export const useStore = create<AppState>((set, get) => ({
         dashboardOpen: true,
         dashboardSelectedPipeline: pipeline,
       })
-      if (_activeSelectionHasMatureComponent(get())) {
-        set({ explicitOutput: true, privateOutput: true })
-      }
     } catch (e) {
       console.error('Failed to load Director pipeline:', e)
     }
@@ -3727,7 +4053,6 @@ export const useStore = create<AppState>((set, get) => ({
   modelsLoaded: false,
   enabledModels: _loadEnabledModels() ?? new Set(DEFAULT_ENABLED_MODELS),
   toggleModelEnabled: (modelType) => {
-    _markMatureModelsInitialized(get().models, [modelType])
     set(s => {
       const next = new Set(s.enabledModels)
       if (next.has(modelType)) next.delete(modelType)
@@ -3737,13 +4062,11 @@ export const useStore = create<AppState>((set, get) => ({
     })
   },
   resetEnabledModels: () => {
-    _markMatureModelsInitialized(get().models)
     const next = new Set(DEFAULT_ENABLED_MODELS)
     _saveEnabledModels(next)
     set({ enabledModels: next })
   },
   setAllModelsEnabled: (enabled) => {
-    _markMatureModelsInitialized(get().models)
     if (enabled) {
       const all = new Set(get().models.map(m => m.model_type))
       _saveEnabledModels(all)
@@ -3755,7 +4078,6 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   setModelsEnabled: (modelTypes, enabled) => {
-    _markMatureModelsInitialized(get().models, modelTypes)
     set(s => {
       const next = new Set(s.enabledModels)
       for (const mt of modelTypes) {
@@ -3808,7 +4130,6 @@ export const useStore = create<AppState>((set, get) => ({
         director: m.director,
         is_downloaded: m.is_downloaded ?? false,
         nsfw_only: m.nsfw_only ?? false,
-        preferred_explicit_fl2va: m.preferred_explicit_fl2va ?? false,
         update_status: m.update_status,
       }))
       // Inject virtual SFX (MMAudio) models alongside backend models
@@ -3822,9 +4143,6 @@ export const useStore = create<AppState>((set, get) => ({
         let restoredModels: Set<string>
         if (visibility.configured) {
           restoredModels = new Set(visibility.enabled_models)
-          _initializedMatureModels = new Set(
-            visibility.initialized_mature_models,
-          )
           _modelVisibilityDefaultsVersion = (
             visibility.defaults_version || 1
           )
@@ -3838,16 +4156,6 @@ export const useStore = create<AppState>((set, get) => ({
           _modelVisibilityDefaultsVersion = legacyModels
             ? (legacyDefaultsVersion || 1)
             : DEFAULTS_VERSION
-          // An existing browser whitelist is an explicit snapshot. Mark the
-          // current Mature entries initialized so migration cannot re-enable
-          // one the user deliberately disabled.
-          _initializedMatureModels = legacyModels
-            ? new Set(
-                models
-                  .filter(model => model.nsfw_only)
-                  .map(model => model.model_type),
-              )
-            : new Set()
         }
         _modelVisibilityHydrated = true
         set({ enabledModels: restoredModels })
@@ -3972,9 +4280,6 @@ export const useStore = create<AppState>((set, get) => ({
       // without it the sliders would show INITIAL_PARAMS' generic values
       // instead of the model's.
       const mt = initialModelType || get().params.model_type
-      if (_modelTypeIsMature(get(), mt)) {
-        set({ explicitOutput: true, privateOutput: true })
-      }
       if (mt && !sfxModelTypes.has(mt)) {
         get().loadLoras(mt)
         _applyModelDefaults(get, set, mt)
@@ -3986,21 +4291,6 @@ export const useStore = create<AppState>((set, get) => ({
       // filename without user intervention).
       get().refreshLoraIdMap()
 
-      // Auto-enable each Mature model once, then preserve an explicit
-      // disable. The initialized IDs live in the same server-side visibility
-      // record, so a changing Pinokio port cannot reset this decision.
-      const cfg = get().servicesConfig
-      if (cfg?.nsfw_mode && _modelVisibilityHydrated) {
-        set(s => {
-          const next = _enableUninitializedMatureModels(
-            models,
-            s.enabledModels,
-          )
-          if (!next) return s
-          _saveEnabledModels(next)
-          return { enabledModels: next }
-        })
-      }
     } catch (e) {
       console.error('Failed to load models:', e)
     }
@@ -4237,36 +4527,10 @@ export const useStore = create<AppState>((set, get) => ({
         : await api.submitToolRevoice({ video_path: source, voice_ref_paths: refPaths, mode: s.toolsRevoiceMode, workspace: s.activeWorkspace })
 
       set(st => ({
-        jobs: st.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'running', message: tool === 'upscale' ? 'Upscaling...' : 'Replacing voice...' } : j),
+        jobs: st.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
       }))
-
-      const pollInterval = setInterval(async () => {
-        if (!get().jobs.find(j => j.id === result.job_id)) { clearInterval(pollInterval); return }
-        try {
-          const status = await api.fetchJobStatus(result.job_id)
-          set(st => ({
-            jobs: st.jobs.map(j => j.id !== result.job_id ? j : {
-              ...j, status: status.status, progress: status.progress / 100,
-              step: status.step, totalSteps: status.total_steps,
-              phase: status.phase, message: status.message,
-              outputFiles: status.output_files, error: status.error, oomInfo: status.oom_info ?? null,
-              ..._jobStatusDetails(status),
-            }),
-          }))
-          if (status.status === 'running') get().refreshOutputs()
-          if (status.status === 'completed') {
-            clearInterval(pollInterval)
-            set(st => {
-              const remaining = st.jobs.filter(j => j.id !== result.job_id)
-              return { jobs: remaining, isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued') }
-            })
-            get().loadOutputs()
-          } else if (status.status === 'failed' || status.status === 'cancelled') {
-            clearInterval(pollInterval)
-            set(st => ({ isGenerating: st.jobs.some(j => j.id !== result.job_id && (j.status === 'running' || j.status === 'queued')) }))
-          }
-        } catch { /* ignore poll errors */ }
-      }, 2000)
+      get()._pollRecoveredJob(result.job_id)
+      window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
     } catch (e) {
       const msg = e instanceof Error ? e.message : (tool === 'upscale' ? 'Upscale failed' : 'Revoice failed')
       set(st => ({
@@ -4543,16 +4807,17 @@ export const useStore = create<AppState>((set, get) => ({
   jobs: [],
   isGenerating: false,
   pendingH3Plan: null,
+  pendingH3PlanEstimate: null,
   approveH3Plan: (decision) => {
     const resolve = _h3PlanDecisionResolver
     _h3PlanDecisionResolver = null
-    set({ pendingH3Plan: null })
+    set({ pendingH3Plan: null, pendingH3PlanEstimate: null })
     resolve?.(decision)
   },
   cancelH3Plan: () => {
     const resolve = _h3PlanDecisionResolver
     _h3PlanDecisionResolver = null
-    set({ pendingH3Plan: null })
+    set({ pendingH3Plan: null, pendingH3PlanEstimate: null })
     resolve?.(null)
   },
 
@@ -4709,43 +4974,10 @@ export const useStore = create<AppState>((set, get) => ({
         })
 
         set(s => ({
-          jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'running', message: 'Blending...' } : j),
+          jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
         }))
-
-        const pollInterval = setInterval(async () => {
-          if (!get().jobs.find(j => j.id === result.job_id)) { clearInterval(pollInterval); return }
-          try {
-            const status = await api.fetchJobStatus(result.job_id)
-            set(s => ({
-              jobs: s.jobs.map(j => j.id !== result.job_id ? j : {
-                ...j, status: status.status, progress: status.progress / 100,
-                step: status.step, totalSteps: status.total_steps,
-                phase: status.phase, message: status.message,
-                outputFiles: status.output_files, error: status.error, oomInfo: status.oom_info ?? null,
-                ..._jobStatusDetails(status),
-              }),
-            }))
-            if (status.status === 'running') get().refreshOutputs()
-            if (status.status === 'completed') {
-              clearInterval(pollInterval)
-              set(s => {
-                const remaining = s.jobs.filter(j => j.id !== result.job_id)
-                return {
-                  jobs: remaining,
-                  isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued'),
-                }
-              })
-              get().loadOutputs()
-            } else if (status.status === 'failed' || status.status === 'cancelled') {
-              clearInterval(pollInterval)
-              // Keep the failed/cancelled job in the queue so its placeholder
-              // stays visible with the error message — user dismisses via X.
-              set(s => ({
-                isGenerating: s.jobs.some(j => j.id !== result.job_id && (j.status === 'running' || j.status === 'queued')),
-              }))
-            }
-          } catch { /* ignore poll errors */ }
-        }, 2000)
+        get()._pollRecoveredJob(result.job_id)
+        window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Blend failed'
         // Submit itself failed (pre-queue). Convert the placeholder to a
@@ -4871,43 +5103,10 @@ export const useStore = create<AppState>((set, get) => ({
         })
 
         set(s => ({
-          jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'running', message: 'Outpainting...' } : j),
+          jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
         }))
-
-        const pollInterval = setInterval(async () => {
-          if (!get().jobs.find(j => j.id === result.job_id)) { clearInterval(pollInterval); return }
-          try {
-            const status = await api.fetchJobStatus(result.job_id)
-            set(s => ({
-              jobs: s.jobs.map(j => j.id !== result.job_id ? j : {
-                ...j, status: status.status, progress: status.progress / 100,
-                step: status.step, totalSteps: status.total_steps,
-                phase: status.phase, message: status.message,
-                outputFiles: status.output_files, error: status.error, oomInfo: status.oom_info ?? null,
-                ..._jobStatusDetails(status),
-              }),
-            }))
-            if (status.status === 'running') get().refreshOutputs()
-            if (status.status === 'completed') {
-              clearInterval(pollInterval)
-              set(s => {
-                const remaining = s.jobs.filter(j => j.id !== result.job_id)
-                return {
-                  jobs: remaining,
-                  isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued'),
-                }
-              })
-              get().loadOutputs()
-            } else if (status.status === 'failed' || status.status === 'cancelled') {
-              clearInterval(pollInterval)
-              // Keep the failed/cancelled job in the queue so its placeholder
-              // stays visible with the error message — user dismisses via X.
-              set(s => ({
-                isGenerating: s.jobs.some(j => j.id !== result.job_id && (j.status === 'running' || j.status === 'queued')),
-              }))
-            }
-          } catch { /* ignore poll errors */ }
-        }, 2000)
+        get()._pollRecoveredJob(result.job_id)
+        window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Outpaint failed'
         // Submit itself failed (pre-queue). Convert the placeholder to a
@@ -4973,51 +5172,11 @@ export const useStore = create<AppState>((set, get) => ({
 
         set(s => ({
           jobs: s.jobs.map(j => j === newJob
-            ? { ...j, id: result.job_id, status: 'running', message: 'Queued...' }
+            ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' }
             : j),
         }))
-
-        const pollInterval = setInterval(async () => {
-          if (!get().jobs.find(j => j.id === result.job_id)) {
-            clearInterval(pollInterval)
-            return
-          }
-          try {
-            const status = await api.fetchJobStatus(result.job_id)
-            set(s => ({
-              jobs: s.jobs.map(j => j.id !== result.job_id ? j : {
-                ...j,
-                status: status.status,
-                progress: status.progress / 100,
-                step: status.step,
-                totalSteps: status.total_steps,
-                phase: status.phase,
-                message: status.message,
-                outputFiles: status.output_files,
-                error: status.error,
-                oomInfo: status.oom_info ?? null,
-                ..._jobStatusDetails(status),
-              }),
-            }))
-            if (status.status === 'running') get().refreshOutputs()
-            if (status.status === 'completed') {
-              clearInterval(pollInterval)
-              set(s => {
-                const remaining = s.jobs.filter(j => j.id !== result.job_id)
-                return {
-                  jobs: remaining,
-                  isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued'),
-                }
-              })
-              get().loadOutputs()
-            } else if (status.status === 'failed' || status.status === 'cancelled') {
-              clearInterval(pollInterval)
-              set(s => ({
-                isGenerating: s.jobs.some(j => j.id !== result.job_id && (j.status === 'running' || j.status === 'queued')),
-              }))
-            }
-          } catch { /* ignore poll errors */ }
-        }, 2000)
+        get()._pollRecoveredJob(result.job_id)
+        window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Repaint failed'
         set(s => ({
@@ -5101,41 +5260,10 @@ export const useStore = create<AppState>((set, get) => ({
         })
 
         set(s => ({
-          jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'running', message: 'Queued...' } : j),
+          jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
         }))
-
-        const pollInterval = setInterval(async () => {
-          if (!get().jobs.find(j => j.id === result.job_id)) { clearInterval(pollInterval); return }
-          try {
-            const status = await api.fetchJobStatus(result.job_id)
-            set(s => ({
-              jobs: s.jobs.map(j => j.id !== result.job_id ? j : {
-                ...j, status: status.status, progress: status.progress / 100,
-                step: status.step, totalSteps: status.total_steps,
-                phase: status.phase, message: status.message,
-                outputFiles: status.output_files, error: status.error, oomInfo: status.oom_info ?? null,
-                ..._jobStatusDetails(status),
-              }),
-            }))
-            if (status.status === 'running') get().refreshOutputs()
-            if (status.status === 'completed') {
-              clearInterval(pollInterval)
-              set(s => {
-                const remaining = s.jobs.filter(j => j.id !== result.job_id)
-                return {
-                  jobs: remaining,
-                  isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued'),
-                }
-              })
-              get().loadOutputs()
-            } else if (status.status === 'failed' || status.status === 'cancelled') {
-              clearInterval(pollInterval)
-              set(s => ({
-                isGenerating: s.jobs.some(j => j.id !== result.job_id && (j.status === 'running' || j.status === 'queued')),
-              }))
-            }
-          } catch { /* ignore poll errors */ }
-        }, 2000)
+        get()._pollRecoveredJob(result.job_id)
+        window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Recast failed'
         set(s => ({
@@ -5243,44 +5371,10 @@ export const useStore = create<AppState>((set, get) => ({
         }
 
         set(s => ({
-          jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'running', message: 'Queued...' } : j),
+          jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
         }))
-
-        // Standard job polling (same as regular generation)
-        const pollInterval = setInterval(async () => {
-          if (!get().jobs.find(j => j.id === result.job_id)) { clearInterval(pollInterval); return }
-          try {
-            const status = await api.fetchJobStatus(result.job_id)
-            set(s => ({
-              jobs: s.jobs.map(j => j.id !== result.job_id ? j : {
-                ...j, status: status.status, progress: status.progress / 100,
-                step: status.step, totalSteps: status.total_steps,
-                phase: status.phase, message: status.message,
-                outputFiles: status.output_files, error: status.error, oomInfo: status.oom_info ?? null,
-                ..._jobStatusDetails(status),
-              }),
-            }))
-            if (status.status === 'running') get().refreshOutputs()
-            if (status.status === 'completed') {
-              clearInterval(pollInterval)
-              set(s => {
-                const remaining = s.jobs.filter(j => j.id !== result.job_id)
-                return {
-                  jobs: remaining,
-                  isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued'),
-                }
-              })
-              get().loadOutputs()
-            } else if (status.status === 'failed' || status.status === 'cancelled') {
-              clearInterval(pollInterval)
-              // Keep the failed/cancelled job in the queue so its placeholder
-              // stays visible with the error message — user dismisses via X.
-              set(s => ({
-                isGenerating: s.jobs.some(j => j.id !== result.job_id && (j.status === 'running' || j.status === 'queued')),
-              }))
-            }
-          } catch { /* ignore poll errors */ }
-        }, 2000)
+        get()._pollRecoveredJob(result.job_id)
+        window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Generation failed'
         // Submit itself failed (pre-queue). Convert the placeholder to a
@@ -5811,6 +5905,8 @@ export const useStore = create<AppState>((set, get) => ({
     // cuts. Build the exact server plan before queuing, show it for a short
     // countdown, and let the user override every segment/boundary. The same
     // payload is planned again at submission, so UI and runtime cannot drift.
+    let plannedH3Estimate: H3PerformanceEstimate | null = null
+    let plannedH3SegmentPlan: H3SegmentPlan | null = null
     if (
       state.generationMode === 'video'
       && ['minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_w4a8_fl2va', 'minimax_h3_ref2va'].includes(String(params.model_type || ''))
@@ -5821,12 +5917,17 @@ export const useStore = create<AppState>((set, get) => ({
         // choose segment geometry; locked values remain byte-for-byte exact.
         applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
         const preview = await api.previewGenerationPlan(params)
+        plannedH3Estimate = preview.h3_estimate
+        plannedH3SegmentPlan = preview.plan
         let effectiveNeedsRef2VA = preview.requirements.ref2va_terms_required
         if (preview.requires_review && preview.plan) {
           if (_h3PlanDecisionResolver) return
           const decision = await new Promise<H3PlanDecision | null>(resolve => {
             _h3PlanDecisionResolver = resolve
-            set({ pendingH3Plan: preview.plan })
+            set({
+              pendingH3Plan: preview.plan,
+              pendingH3PlanEstimate: preview.h3_estimate,
+            })
           })
           if (!decision) return
           // The plan dialog can reconcile a manually selected checkpoint to
@@ -5859,7 +5960,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     const initialH3Estimate = String(params.model_type || '').startsWith('minimax_h3')
-      ? state.h3CurrentEstimate
+      ? (plannedH3Estimate || state.h3CurrentEstimate)
       : null
     const newJob: GenerationJob = {
       id: '',
@@ -5873,11 +5974,14 @@ export const useStore = create<AppState>((set, get) => ({
       outputFiles: [],
       error: null,
       oomInfo: null,
-      promptPreview: String(params.prompt || ''),
+      promptPreview: String(params.model_type || '').startsWith('minimax_h3')
+        ? ''
+        : String(params.prompt || ''),
       modelType: String(params.model_type || ''),
       generationMode: state.generationMode,
       workspace: state.activeWorkspace,
       h3Estimate: initialH3Estimate,
+      h3SegmentPlan: plannedH3SegmentPlan,
     }
 
     set(s => ({
@@ -5902,62 +6006,12 @@ export const useStore = create<AppState>((set, get) => ({
         } : j),
       }))
 
-      // Poll for status on this specific job
-      const pollInterval = setInterval(async () => {
-        // Check if this job was removed (stopped)
-        if (!get().jobs.find(j => j.id === job_id)) {
-          clearInterval(pollInterval)
-          return
-        }
-
-        try {
-          const status = await api.fetchJobStatus(job_id)
-
-          set(s => ({
-            jobs: s.jobs.map(j => j.id !== job_id ? j : {
-              ...j,
-              status: status.status,
-              progress: status.progress / 100,
-              step: status.step,
-              totalSteps: status.total_steps,
-              phase: status.phase,
-              message: status.message,
-              outputFiles: status.output_files,
-              error: status.error,
-              oomInfo: status.oom_info ?? null,
-              ..._jobStatusDetails(status, j),
-            }),
-          }))
-
-          // Refresh gallery during generation to show sliding window progress
-          if (status.status === 'running') {
-            get().refreshOutputs()
-          }
-
-          if (status.status === 'completed') {
-            clearInterval(pollInterval)
-            // Completed job — remove the placeholder, real output now in gallery
-            set(s => {
-              const remaining = s.jobs.filter(j => j.id !== job_id)
-              return {
-                jobs: remaining,
-                isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued'),
-              }
-            })
-            get().loadOutputs()
-          } else if (status.status === 'failed' || status.status === 'cancelled') {
-            clearInterval(pollInterval)
-            // Keep the failed/cancelled job in the queue so its placeholder
-            // card stays visible with the error message. User dismisses via
-            // the X button on the tile.
-            set(s => ({
-              isGenerating: s.jobs.some(j => j.id !== job_id && (j.status === 'running' || j.status === 'queued')),
-            }))
-          }
-        } catch (e) {
-          console.error('Status poll error:', e)
-        }
-      }, 2000)
+      // Queued cards use the shared queue snapshot for start transitions. A
+      // slow per-card fallback check remains for missed events; the same poller
+      // is woken and switches to 2s only once this job is truly executing.
+      get()._pollRecoveredJob(job_id)
+      window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+      window.dispatchEvent(new CustomEvent('maestro:downloads-refresh'))
 
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Generation failed'
@@ -5974,6 +6028,8 @@ export const useStore = create<AppState>((set, get) => ({
   stopGeneration: (jobId) => {
     if (jobId) {
       // Cancel specific job on backend, then remove from UI
+      _recoveryJobPolls.get(jobId)?.stop()
+      _rejectTerminalJobWaiter(jobId, 'Generation cancelled')
       api.cancelJob(jobId).catch(e => console.error('Cancel failed:', e))
       set(s => {
         const remaining = s.jobs.filter(j => j.id !== jobId)
@@ -5983,7 +6039,11 @@ export const useStore = create<AppState>((set, get) => ({
       // Cancel all jobs
       const jobs = get().jobs
       jobs.forEach(j => {
-        if (j.id) api.cancelJob(j.id).catch(() => {})
+        if (j.id) {
+          _recoveryJobPolls.get(j.id)?.stop()
+          _rejectTerminalJobWaiter(j.id, 'Generation cancelled')
+          api.cancelJob(j.id).catch(() => {})
+        }
       })
       set({ jobs: [], isGenerating: false })
     }
@@ -5999,6 +6059,29 @@ export const useStore = create<AppState>((set, get) => ({
         isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued'),
       }
     })
+  },
+
+  reconcileQueueState: (queue) => {
+    const queueJobs = new Map(queue.jobs.map(job => [job.job_id, job]))
+    const previous = new Map(get().jobs.map(job => [job.id, job]))
+    set(s => ({
+      jobs: s.jobs.map(job => {
+        const queueJob = queueJobs.get(job.id)
+        return queueJob ? { ...job, ..._queueJobDetails(queueJob) } : job
+      }),
+    }))
+
+    for (const job of get().jobs) {
+      const queueJob = queueJobs.get(job.id)
+      if (!queueJob) continue
+      const before = previous.get(job.id)
+      const becameFast = _jobNeedsFastStatusPoll(job)
+        && (!before || !_jobNeedsFastStatusPoll(before))
+      const recoveryChanged = before?.recoveryState !== job.recoveryState
+      if (becameFast || recoveryChanged || !_recoveryJobPolls.has(job.id)) {
+        get()._pollRecoveredJob(job.id)
+      }
+    }
   },
 
   resumeJobRecovery: async (jobId) => {
@@ -6052,18 +6135,82 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   _pollRecoveredJob: (jobId) => {
-    if (_recoveryJobPolls.has(jobId)) return
+    const existing = _recoveryJobPolls.get(jobId)
+    if (existing) {
+      existing.wake()
+      return
+    }
+    const initialJob = get().jobs.find(job => job.id === jobId)
+    if (!initialJob) return
+
     let consecutivePollFailures = 0
-    const pollInterval = setInterval(async () => {
+    let running = false
+    let pendingWake = false
+    let stopped = false
+    const outputRefresh = _createActiveOutputRefreshTracker(initialJob)
+    const poll: ActiveJobPoll = {
+      timer: null,
+      wake: () => {},
+      stop: () => {},
+    }
+
+    const stop = () => {
+      if (stopped) return
+      stopped = true
+      if (poll.timer !== null) window.clearTimeout(poll.timer)
+      poll.timer = null
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      if (_recoveryJobPolls.get(jobId) === poll) {
+        _recoveryJobPolls.delete(jobId)
+      }
+    }
+
+    const scheduleNext = () => {
+      if (stopped) return
+      if (poll.timer !== null) window.clearTimeout(poll.timer)
+      const current = get().jobs.find(job => job.id === jobId)
+      if (!current) {
+        stop()
+        return
+      }
+      const delay = _jobNeedsFastStatusPoll(current)
+        ? ACTIVE_JOB_STATUS_POLL_MS
+        : QUEUED_JOB_STATUS_SAFETY_MS
+      poll.timer = window.setTimeout(() => {
+        poll.timer = null
+        void tick(true)
+      }, delay)
+    }
+
+    const tick = async (queuedSafety = false) => {
+      if (stopped) return
+      if (running) {
+        pendingWake = true
+        return
+      }
+      const current = get().jobs.find(job => job.id === jobId)
+      if (!current) {
+        stop()
+        return
+      }
+      if (!_jobNeedsFastStatusPoll(current) && !queuedSafety) {
+        scheduleNext()
+        return
+      }
+
+      running = true
       try {
         const status = await api.fetchJobStatus(jobId)
         consecutivePollFailures = 0
         set(s => ({
           jobs: s.jobs.map(job => job.id !== jobId ? job : _mergeJobStatus(job, status)),
         }))
+        _publishTerminalJobStatus(status)
+        if (_activeOutputRefreshDue(outputRefresh, status, !document.hidden)) {
+          void get().refreshOutputs()
+        }
         if (status.status === 'completed') {
-          clearInterval(pollInterval)
-          _recoveryJobPolls.delete(jobId)
+          stop()
           set(s => {
             const remaining = s.jobs.filter(job => job.id !== jobId)
             return {
@@ -6073,21 +6220,22 @@ export const useStore = create<AppState>((set, get) => ({
           })
           get().loadOutputs()
         } else if (status.status === 'failed' || status.status === 'cancelled') {
-          clearInterval(pollInterval)
-          _recoveryJobPolls.delete(jobId)
+          // Terminal failures stay visible so their error/recovery controls
+          // remain actionable; only the poller and global generating state stop.
+          stop()
           set(s => ({
             isGenerating: s.jobs.some(job => (
               job.id !== jobId && (job.status === 'queued' || job.status === 'running')
             )),
           }))
+          get().loadOutputs()
         }
       } catch {
         // A transient disconnect must not strand the only poller for an
         // existing recovered card. Keep retrying; periodically reconcile the
         // owner list as an independent authoritative path.
         if (!get().jobs.some(job => job.id === jobId)) {
-          clearInterval(pollInterval)
-          _recoveryJobPolls.delete(jobId)
+          stop()
           return
         }
         consecutivePollFailures += 1
@@ -6095,9 +6243,47 @@ export const useStore = create<AppState>((set, get) => ({
           consecutivePollFailures = 0
           void get().reconnectJobs()
         }
+      } finally {
+        running = false
+        if (!stopped) {
+          if (pendingWake) {
+            pendingWake = false
+            poll.wake()
+          } else {
+            scheduleNext()
+          }
+        }
       }
-    }, 2000)
-    _recoveryJobPolls.set(jobId, pollInterval)
+    }
+
+    const wake = () => {
+      if (stopped) return
+      if (poll.timer !== null) window.clearTimeout(poll.timer)
+      poll.timer = null
+      if (running) {
+        pendingWake = true
+        return
+      }
+      void tick(false)
+    }
+
+    function onVisibilityChange() {
+      if (document.hidden) return
+      const current = get().jobs.find(job => job.id === jobId)
+      if (!current || !_jobNeedsFastStatusPoll(current)) return
+      outputRefresh.lastRefreshAt = Date.now()
+      outputRefresh.pendingDelta = false
+      outputRefresh.hasRefreshed = true
+      void get().refreshOutputs()
+      wake()
+    }
+
+    poll.wake = wake
+    poll.stop = stop
+    _recoveryJobPolls.set(jobId, poll)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    if (_jobNeedsFastStatusPoll(initialJob)) wake()
+    else void tick(true)
   },
 
   reconnectJobs: async () => {
@@ -6159,65 +6345,21 @@ export const useStore = create<AppState>((set, get) => ({
               job.status === 'queued' || job.status === 'running'
             ),
           }))
-          // Start polling only active reconnected jobs. Terminal failures stay
-          // visible until the user dismisses them, including after refresh.
-          newJobs
-            .filter(job => job.status === 'queued' || job.status === 'running')
-            .forEach(job => {
-              const pollInterval = setInterval(async () => {
-              try {
-                const status = await api.fetchJobStatus(job.id)
-                set(s => ({
-                  jobs: s.jobs.map(j => j.id !== job.id ? j : {
-                    ...j,
-                    status: status.status,
-                    progress: status.progress / 100,
-                    step: status.step,
-                    totalSteps: status.total_steps,
-                    phase: status.phase,
-                    message: status.message,
-                    outputFiles: status.output_files,
-                    error: status.error,
-                    oomInfo: status.oom_info ?? null,
-                    ..._jobStatusDetails(status, j),
-                  }),
-                }))
-                if (status.status === 'completed') {
-                  clearInterval(pollInterval)
-                  set(s => {
-                    const remaining = s.jobs.filter(j => j.id !== job.id)
-                    return {
-                      jobs: remaining,
-                      isGenerating: remaining.some(j =>
-                        j.status === 'running' || j.status === 'queued'
-                      ),
-                    }
-                  })
-                  get().loadOutputs()
-                } else if (status.status === 'failed' || status.status === 'cancelled') {
-                  clearInterval(pollInterval)
-                  set(s => ({
-                    isGenerating: s.jobs.some(j =>
-                      j.id !== job.id && (j.status === 'running' || j.status === 'queued'),
-                    ),
-                  }))
-                }
-              } catch {
-                // Job may have been cleaned up
-                clearInterval(pollInterval)
-                set(s => {
-                  const remaining = s.jobs.filter(j => j.id !== job.id)
-                  return {
-                    jobs: remaining,
-                    isGenerating: remaining.some(j =>
-                      j.status === 'running' || j.status === 'queued'
-                    ),
-                  }
-                })
-              }
-              }, 2000)
-            })
           console.log(`[Queue] Reconnected to ${newJobs.length} active job(s)`)
+        }
+        // Queue snapshots keep queued cards current; only running/retrying
+        // jobs switch the shared per-card poller to its 2s execution cadence.
+        for (const status of data.jobs) {
+          if (status.status === 'queued' || status.status === 'running') {
+            get()._pollRecoveredJob(status.job_id)
+          }
+        }
+        if (data.jobs.some(status => (
+          status.status === 'completed'
+          || status.status === 'failed'
+          || status.status === 'cancelled'
+        ))) {
+          void get().loadOutputs()
         }
       }
       await get().reconnectDirectorPreparation()
@@ -6230,26 +6372,6 @@ export const useStore = create<AppState>((set, get) => ({
   availableLoras: [],
   lorasLoading: false,
   loraWeights: {},
-  matureLoraNames: new Set<string>(),
-  classifiedLoraNames: new Set<string>(),
-  registerMatureLoraFlags: (modelType, loras) => set(s => {
-    const matureLoraNames = new Set(s.matureLoraNames)
-    const classifiedLoraNames = new Set(s.classifiedLoraNames)
-    for (const lora of loras) {
-      const key = _matureLoraKey(modelType, lora.filename)
-      classifiedLoraNames.add(key)
-      if (lora.nsfw) matureLoraNames.add(key)
-      else matureLoraNames.delete(key)
-    }
-    const next = { ...s, matureLoraNames, classifiedLoraNames }
-    return {
-      matureLoraNames,
-      classifiedLoraNames,
-      ...(_activeSelectionHasMatureComponent(next)
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
-    }
-  }),
   loraIdByFilename: {},
   filenameByLoraId: {},
 
@@ -6373,11 +6495,22 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   loadLoras: async (modelType) => {
+    const seq = ++_loraLoadSeq
     set({ lorasLoading: true })
     try {
       const data = await api.fetchLoras(modelType)
+      if (seq !== _loraLoadSeq) return
+      if (get().params.model_type !== modelType) {
+        set({ lorasLoading: false })
+        return
+      }
       set({ availableLoras: data.loras, lorasLoading: false })
     } catch {
+      if (seq !== _loraLoadSeq) return
+      if (get().params.model_type !== modelType) {
+        set({ lorasLoading: false })
+        return
+      }
       set({ availableLoras: [], lorasLoading: false })
     }
   },
@@ -6415,9 +6548,6 @@ export const useStore = create<AppState>((set, get) => ({
       loraWeights: newWeights,
       h3SelectedProfile: 'custom',
       h3ProfileApplying: null,
-      ...(idx < 0 && _loraNeedsExplicit(get(), params.model_type, filename)
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
       params: {
         ...s.params,
         activated_loras: current,
@@ -6645,10 +6775,6 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
     set(s => ({
-      ...(_modelTypeIsMature(s, preset.model_type)
-        || preset.activated_loras.some(name => _loraNeedsExplicit(s, preset.model_type, name))
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
       params: { ...s.params, ...newParams },
       selectedModelPerMode: {
         ...s.selectedModelPerMode,
@@ -6677,11 +6803,21 @@ export const useStore = create<AppState>((set, get) => ({
   modelOptionsLoading: false,
   h3PerformanceProfiles: [],
   h3CurrentEstimate: null,
+  h3SegmentCountEstimate: null,
   h3EstimateLoading: false,
   h3EstimateError: null,
   h3SelectedProfile: 'high',
   h3ProfileApplying: null,
   h3ModelProfileCompatibility: {},
+
+  invalidateH3PerformanceEstimates: () => {
+    ++_h3EstimateSeq
+    set({
+      h3SegmentCountEstimate: null,
+      h3EstimateLoading: true,
+      h3EstimateError: null,
+    })
+  },
 
   refreshH3PerformanceEstimates: async () => {
     const seq = ++_h3EstimateSeq
@@ -6698,6 +6834,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         h3PerformanceProfiles: response.profiles,
         h3CurrentEstimate: response.current.estimate,
+        h3SegmentCountEstimate: response.segment_count_estimate,
         h3EstimateLoading: false,
         h3EstimateError: null,
       })
@@ -6706,6 +6843,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         h3PerformanceProfiles: [],
         h3CurrentEstimate: null,
+        h3SegmentCountEstimate: null,
         h3EstimateLoading: false,
         h3EstimateError: error instanceof Error ? error.message : 'Could not estimate H3 performance',
         h3SelectedProfile: 'custom',
@@ -6990,9 +7128,9 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  // Live hardware telemetry (HardwareStatusBar). Polled ~2s from the
+  // Live hardware telemetry (HardwareStatusBar). Polled ~5s from the
   // component while mounted. Swallows a single failed tick (e.g. backend
-  // restarting) instead of spamming the console at 2s cadence.
+  // restarting) instead of spamming the console at the polling cadence.
   systemStats: null,
   loadSystemStats: async () => {
     try {
@@ -7012,9 +7150,11 @@ export const useStore = create<AppState>((set, get) => ({
   servicesConfigLoading: false,
   servicesConfigError: null,
   clearServicesConfigError: () => set({ servicesConfigError: null }),
+  hostTerms: null,
+  hostTermsLoading: false,
+  hostTermsError: null,
   explicitOutput: false,
   setExplicitOutput: (enabled) => {
-    if (!enabled && _activeSelectionHasMatureComponent(get())) return
     ++_h3CompatibilitySeq
     set({
       explicitOutput: enabled,
@@ -7023,7 +7163,6 @@ export const useStore = create<AppState>((set, get) => ({
       ...(enabled ? { privateOutput: true } : {}),
     })
   },
-  matureSelectionActive: () => _activeSelectionHasMatureComponent(get()),
   privateOutput: false,
   setPrivateOutput: (enabled) => set({ privateOutput: enabled }),
   loadServicesConfig: async () => {
@@ -7035,21 +7174,7 @@ export const useStore = create<AppState>((set, get) => ({
         servicesConfigLoading: false,
         servicesConfigError: null,
       })
-      if (
-        config.nsfw_mode
-        && _modelVisibilityHydrated
-        && get().models.length > 0
-      ) {
-        set(s => {
-          const next = _enableUninitializedMatureModels(
-            s.models,
-            s.enabledModels,
-          )
-          if (!next) return s
-          _saveEnabledModels(next)
-          return { enabledModels: next }
-        })
-      }
+      void get().loadHostTerms()
     } catch (e) {
       console.error('Failed to load services config:', e)
       set({
@@ -7063,19 +7188,6 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       await api.updateServicesConfig(partial)
       await get().loadServicesConfig()
-      // Newly-discovered Mature models appear once when Mature Mode is
-      // enabled. Previously initialized models retain the user's whitelist.
-      if (partial.nsfw_mode === true && _modelVisibilityHydrated) {
-        set(s => {
-          const next = _enableUninitializedMatureModels(
-            s.models,
-            s.enabledModels,
-          )
-          if (!next) return s
-          _saveEnabledModels(next)
-          return { enabledModels: next }
-        })
-      }
     } catch (e) {
       console.error('Failed to update services config:', e)
       const message = e instanceof Error ? e.message : 'Failed to update services settings'
@@ -7085,6 +7197,81 @@ export const useStore = create<AppState>((set, get) => ({
       await get().loadServicesConfig()
       set({ servicesConfigError: message })
     }
+  },
+  loadHostTerms: async () => {
+    await _queueHostTermsOperation(async () => {
+      const workspace = get().activeWorkspace
+      if (!workspace) {
+        _setH3Ref2VATermsAccepted(false)
+        set({ hostTerms: null, hostTermsLoading: false, hostTermsError: null })
+        return
+      }
+      set({ hostTermsLoading: true, hostTermsError: null })
+      try {
+        let result = await api.fetchHostTerms(workspace)
+        const ref2va = result.terms.minimax_h3_ref2va
+        if (
+          !ref2va.accepted
+          && ref2va.current_version === H3_REF2VA_LEGACY_TERM_VERSION
+          && _legacyH3Ref2VATermsAccepted()
+        ) {
+          result = await api.acceptHostTerm(
+            'minimax_h3_ref2va',
+            H3_REF2VA_LEGACY_TERM_VERSION,
+            workspace,
+          )
+        }
+        if (result.terms.minimax_h3_ref2va.accepted) {
+          _clearLegacyH3Ref2VATermsAcceptance()
+        }
+        _setH3Ref2VATermsAccepted(result.terms.minimax_h3_ref2va.accepted)
+        set({
+          hostTerms: result.terms,
+          hostTermsLoading: false,
+          hostTermsError: null,
+        })
+      } catch (error) {
+        _setH3Ref2VATermsAccepted(false)
+        set({
+          hostTermsLoading: false,
+          hostTermsError: error instanceof Error ? error.message : 'Failed to load host notice status',
+        })
+      }
+    })
+  },
+  acceptHostTerm: async (term) => {
+    return _queueHostTermsOperation(async () => {
+      const state = get()
+      const document = state.hostTerms?.[term]
+      if (!state.activeWorkspace || !document) {
+        set({ hostTermsError: 'Select and unlock a project before accepting this notice' })
+        return false
+      }
+      if (document.current_version !== HOST_TERM_NOTICES[term].version) {
+        set({ hostTermsError: 'The notice changed. Refresh Maestro to review the current version.' })
+        return false
+      }
+      set({ hostTermsLoading: true, hostTermsError: null })
+      try {
+        const result = await api.acceptHostTerm(
+          term,
+          HOST_TERM_NOTICES[term].version,
+          state.activeWorkspace,
+        )
+        if (term === 'minimax_h3_ref2va') {
+          _clearLegacyH3Ref2VATermsAcceptance()
+        }
+        _setH3Ref2VATermsAccepted(result.terms.minimax_h3_ref2va.accepted)
+        set({ hostTerms: result.terms, hostTermsLoading: false, hostTermsError: null })
+        return true
+      } catch (error) {
+        set({
+          hostTermsLoading: false,
+          hostTermsError: error instanceof Error ? error.message : 'Host notice acceptance failed',
+        })
+        return false
+      }
+    })
   },
 
   // LLM state
@@ -7131,8 +7318,9 @@ export const useStore = create<AppState>((set, get) => ({
   studioPromptEnhance: false,
   setStudioPromptEnhance: (enabled) => set({ studioPromptEnhance: enabled }),
   enhancePrompt: async (ttsMode?: string) => {
-    const { params, generationMode, startImage, imageRefs } = get()
+    const { params, generationMode, startImage, imageRefs, activeWorkspace } = get()
     if (!params.prompt.trim()) return false
+    const lifecycle = _beginEnhanceLlmRequest(activeWorkspace)
     set({ isEnhancing: true })
     try {
       // Collect images relevant to the CURRENT mode only
@@ -7182,6 +7370,7 @@ export const useStore = create<AppState>((set, get) => ({
       const maxTokens = (generationMode === 'audio' && ttsMode) ? 2048 : undefined
 
       const result = await api.llmEnhancePrompt({
+        workspace: activeWorkspace,
         prompt: params.prompt,
         mode: generationMode,
         model_type: params.model_type,
@@ -7194,10 +7383,11 @@ export const useStore = create<AppState>((set, get) => ({
         activated_loras: params.activated_loras.length > 0 ? params.activated_loras : undefined,
         tts_enhance_mode: ttsMode || undefined,
         tts_voice_count: state.ttsVoiceCount || undefined,
-      })
+        explicit_output: state.explicitOutput,
+      }, { signal: lifecycle.signal })
+      if (!lifecycle.ownsWorkspace()) return false
       set(s => ({
         params: { ...s.params, prompt: result.enhanced },
-        isEnhancing: false,
       }))
       // Auto-parse speaker names from the enhanced text whenever there are
       // voice slots to fill. Previously gated to dialogue mode only; the user
@@ -7210,10 +7400,13 @@ export const useStore = create<AppState>((set, get) => ({
       }
       return true
     } catch (e) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return false
       console.error('Failed to enhance prompt:', e)
       window.alert(e instanceof Error ? e.message : 'Prompt enhancement failed')
-      set({ isEnhancing: false })
       return false
+    } finally {
+      if (lifecycle.ownsWorkspace()) set({ isEnhancing: false })
+      lifecycle.dispose()
     }
   },
 
@@ -7259,7 +7452,6 @@ export const useStore = create<AppState>((set, get) => ({
   directorAutoMode: true,
   directorSeamless: false,
   directorShotImageGuidance: 'auto' as DirectorShotImageGuidance,
-  directorLlmLog: [],
   directorSkill: null,
   directorMusicSource: null,
   directorSongDescription: '',
@@ -7309,23 +7501,12 @@ export const useStore = create<AppState>((set, get) => ({
   shortFilmPath: null,
   shortFilmTargetDuration: 30,
   shortFilmNarrative: false,
-  llmStreamText: '',
-  llmStreamDone: true,
   pipelineId: null,
   pipelineStatus: null,
   pipelinePolling: false,
   setDirectorAutoMode: (v) => set({ directorAutoMode: v }),
   setDirectorSeamless: (v) => set({ directorSeamless: v }),
   setDirectorShotImageGuidance: (v) => set({ directorShotImageGuidance: v }),
-  directorAppendLlmLog: (stage, text) => set(s => {
-    const t = (text || '').trim()
-    if (!t) return {}
-    const last = s.directorLlmLog[s.directorLlmLog.length - 1]
-    // Skip exact repeats (the poll can fire the done-transition more than
-    // once for the same stream when stages restart back-to-back).
-    if (last && last.stage === stage && last.text === t) return {}
-    return { directorLlmLog: [...s.directorLlmLog, { stage, text: t }] }
-  }),
   setDirectorSkill: (skill) => {
     set({ directorSkill: skill })
     // Music director default for image-to-video reference strength is
@@ -7364,9 +7545,6 @@ export const useStore = create<AppState>((set, get) => ({
   selectDirectorImageModel: (modelType) => {
     set(s => ({
       selectedModelPerMode: { ...s.selectedModelPerMode, image: modelType },
-      ...(_modelTypeIsMature(s, modelType)
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
     }))
     const s = get()
     _saveSettings({
@@ -7385,9 +7563,6 @@ export const useStore = create<AppState>((set, get) => ({
     }
     set(s => ({
       selectedModelPerMode: { ...s.selectedModelPerMode, video: modelType },
-      ...(_modelTypeIsMature(s, modelType)
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
     }))
     get().loadModelOptions(modelType)
     const s = get()
@@ -7407,9 +7582,6 @@ export const useStore = create<AppState>((set, get) => ({
     }
     set({
       savedLoraPerMode: updatedLoraPerMode,
-      ...(activated_loras.some(name => _loraNeedsExplicit(s, s.selectedModelPerMode[mode] || '', name))
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
     })
     _saveSettings({
       generationMode: s.generationMode,
@@ -7448,9 +7620,6 @@ export const useStore = create<AppState>((set, get) => ({
     } else {
       set({ sidebarMode: 'studio' })
     }
-    if (_activeSelectionHasMatureComponent(get())) {
-      set({ explicitOutput: true, privateOutput: true })
-    }
   },
 
   directorUploadAndAnalyze: async (file) => {
@@ -7483,6 +7652,7 @@ export const useStore = create<AppState>((set, get) => ({
   directorAnalyzeAndPlan: async (audioPath, opts) => {
     const transcribe = opts?.transcribe !== false
     const workspace = get().activeWorkspace
+    const lifecycle = _beginDirectorLlmRequest(workspace)
     const directorRequestId = get().directorRequestWorkspace === workspace
       ? get().directorRequestId
       : null
@@ -7502,8 +7672,9 @@ export const useStore = create<AppState>((set, get) => ({
     const startAnalyzePolling = () => {
       analyzePoll = setInterval(async () => {
         try {
+          if (!lifecycle.ownsWorkspace()) return
           const status = await api.fetchAudioAnalyzeStatus()
-          if (!status.step) return  // No analyze in flight or just cleared
+          if (!status.step || !lifecycle.ownsWorkspace()) return  // No analyze in flight or just cleared
           set({ directorLoadingMessage: `${status.detail}...` })
         } catch { /* polling errors are non-fatal */ }
       }, 1000)
@@ -7525,6 +7696,7 @@ export const useStore = create<AppState>((set, get) => ({
         lyrics_hint: opts?.lyricsHint || undefined,
       })
       stopAnalyzePolling()
+      if (!lifecycle.ownsWorkspace()) return
 
       // Try LLM-based section classification (falls back to heuristic)
       if (analysis.lyrics && analysis.lyrics.length > 0) {
@@ -7534,17 +7706,19 @@ export const useStore = create<AppState>((set, get) => ({
             analysis,
             workspace,
             director_request_id: directorRequestId || undefined,
-          })
+          }, { signal: lifecycle.signal })
           analysis = {
             ...analysis,
             sections: classified.sections,
             song_structure: classified.song_structure || null,
           }
-        } catch {
+        } catch (error) {
+          if (_isBrowserAbort(error) || !lifecycle.ownsWorkspace()) return
           // LLM not available — keep heuristic labels
         }
       }
 
+      if (!lifecycle.ownsWorkspace()) return
       set({ directorAnalysis: analysis })
 
       // Extract unique speakers from diarized lyrics
@@ -7579,7 +7753,8 @@ export const useStore = create<AppState>((set, get) => ({
         // belong to a music model — e.g. ACE-Step after generating a track —
         // whose fps fallback of 16 used to shrink clips by 16/25).
         video_model: get().selectedModelPerMode.video || undefined,
-      })
+      }, { signal: lifecycle.signal })
+      if (!lifecycle.ownsWorkspace()) return
       // Music Video skips the manual clip-structure review step entirely —
       // the beat-aligned clips are used as-is. Short Film keeps it.
       const skipStructure = get().directorSkill === 'music_video'
@@ -7590,12 +7765,14 @@ export const useStore = create<AppState>((set, get) => ({
         directorLoadingMessage: null,
       })
     } catch (e: unknown) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Analysis failed'
       console.error('Director analysis failed:', e)
       set({ directorLoading: false, directorLoadingMessage: null, directorError: msg, directorStep: 'upload' })
       throw e
     } finally {
       stopAnalyzePolling()
+      lifecycle.dispose()
     }
   },
 
@@ -7606,23 +7783,34 @@ export const useStore = create<AppState>((set, get) => ({
     const s = get()
     const description = s.directorSongDescription.trim()
     if (!description) return
+    const lifecycle = _beginDirectorLlmRequest(s.activeWorkspace)
     let refPath = s.directorReferenceImagePath
-    if (!refPath && s.directorReferenceImage) {
-      try {
-        refPath = (await api.uploadImage(s.directorReferenceImage)).path
-        set({ directorReferenceImagePath: refPath })
-      } catch { /* image upload is best-effort */ }
+    try {
+      if (!refPath && s.directorReferenceImage) {
+        try {
+          refPath = (await api.uploadImage(s.directorReferenceImage)).path
+          if (lifecycle.ownsWorkspace()) set({ directorReferenceImagePath: refPath })
+        } catch { /* image upload is best-effort */ }
+      }
+      if (!lifecycle.ownsWorkspace()) return
+      set({ directorError: null })
+      const r = await api.writeSong({
+        workspace: s.activeWorkspace,
+        description,
+        instrumental: s.directorSongInstrumental,
+        reference_image_path: refPath || undefined,
+      }, { signal: lifecycle.signal })
+      if (!lifecycle.ownsWorkspace()) return
+      set({
+        directorSongStyle: r.style || '',
+        directorSongLyrics: s.directorSongInstrumental ? '[Instrumental]' : (r.lyrics || ''),
+      })
+    } catch (error) {
+      if (_isBrowserAbort(error) || !lifecycle.ownsWorkspace()) return
+      throw error
+    } finally {
+      lifecycle.dispose()
     }
-    set({ directorError: null })
-    const r = await api.writeSong({
-      description,
-      instrumental: s.directorSongInstrumental,
-      reference_image_path: refPath || undefined,
-    })
-    set({
-      directorSongStyle: r.style || '',
-      directorSongLyrics: s.directorSongInstrumental ? '[Instrumental]' : (r.lyrics || ''),
-    })
   },
 
   // Music Video: generate the track (writing the song first if the user only
@@ -7748,14 +7936,15 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   directorSetEnergyBias: async (bias) => {
-    const { directorAnalysis } = get()
+    const { directorAnalysis, activeWorkspace } = get()
     if (!directorAnalysis) return
+    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
     set({ directorLoading: true, directorEnergyBias: bias })
     try {
       const structure = await api.planClipStructure({
         analysis: directorAnalysis,
-        workspace: get().activeWorkspace,
-        director_request_id: get().directorRequestWorkspace === get().activeWorkspace
+        workspace: activeWorkspace,
+        director_request_id: get().directorRequestWorkspace === activeWorkspace
           ? get().directorRequestId || undefined
           : undefined,
         energy_bias: bias,
@@ -7763,11 +7952,15 @@ export const useStore = create<AppState>((set, get) => ({
         frames_steps: get().modelOptions?.frames_steps ?? 4,
         frames_minimum: get().modelOptions?.frames_minimum ?? 5,
         video_model: get().selectedModelPerMode.video || undefined,
-      })
+      }, { signal: lifecycle.signal })
+      if (!lifecycle.ownsWorkspace()) return
       set({ directorPlannedClips: structure.clips, directorLoading: false })
     } catch (e: unknown) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Failed to update structure'
       set({ directorLoading: false, directorError: msg })
+    } finally {
+      lifecycle.dispose()
     }
   },
 
@@ -7826,19 +8019,28 @@ export const useStore = create<AppState>((set, get) => ({
   directorSetSceneDescription: (prompt) => set({ directorSceneDescription: prompt }),
 
   // Helper: upload all Director reference images (main + characters + locations)
-  _uploadDirectorRefs: async () => {
+  _uploadDirectorRefs: async (lifecycle) => {
     const s = get()
+    const requireOwnership = () => {
+      if (lifecycle && !lifecycle.ownsWorkspace()) {
+        throw new DOMException('The browser stopped waiting', 'AbortError')
+      }
+    }
+    requireOwnership()
     // Upload main reference
     let refImagePath = s.directorReferenceImagePath
     if (s.directorReferenceImage && !refImagePath) {
       const uploaded = await api.uploadImage(s.directorReferenceImage)
+      requireOwnership()
       refImagePath = uploaded.path
       set({ directorReferenceImagePath: refImagePath })
     }
     // Upload character refs
     const charPaths = [...s.directorCharacterRefPaths]
     for (let i = charPaths.length; i < s.directorCharacterRefs.length; i++) {
+      requireOwnership()
       const uploaded = await api.uploadImage(s.directorCharacterRefs[i])
+      requireOwnership()
       charPaths.push(uploaded.path)
     }
     if (charPaths.length > s.directorCharacterRefPaths.length) {
@@ -7847,7 +8049,9 @@ export const useStore = create<AppState>((set, get) => ({
     // Upload location refs
     const locPaths = [...s.directorLocationRefPaths]
     for (let i = locPaths.length; i < s.directorLocationRefs.length; i++) {
+      requireOwnership()
       const uploaded = await api.uploadImage(s.directorLocationRefs[i])
+      requireOwnership()
       locPaths.push(uploaded.path)
     }
     if (locPaths.length > s.directorLocationRefPaths.length) {
@@ -7857,12 +8061,14 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   directorPlanPrompts: async () => {
-    const { directorPlannedClips, directorSceneDescription, directorAnalysis } = get()
+    const { directorPlannedClips, directorSceneDescription, directorAnalysis, activeWorkspace } = get()
     if (!directorPlannedClips.length || !directorSceneDescription.trim()) return
+    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    const requestExplicitOutput = get().explicitOutput
     set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
       // Upload all reference images
-      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs()
+      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
       const extraRefs = {
         ...(charPaths.length > 0 ? { character_ref_paths: charPaths, character_ref_labels: charLabels } : {}),
@@ -7887,7 +8093,9 @@ export const useStore = create<AppState>((set, get) => ({
       if (useV2) {
         // Director v2: structured planning → rendering → validation
         const result = await api.directorV2Plan({
+          workspace: activeWorkspace,
           skill_type: 'music_video',
+          explicit_output: requestExplicitOutput,
           clips: directorPlannedClips,
           scene_description: directorSceneDescription,
           lyrics: directorAnalysis?.lyrics ?? undefined,
@@ -7896,7 +8104,7 @@ export const useStore = create<AppState>((set, get) => ({
           ...extraRefs,
           speaker_mappings: Object.keys(speakerMappings).length > 0 ? speakerMappings : undefined,
           prompt_type: 'both',
-        })
+        }, { signal: lifecycle.signal })
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
@@ -7904,20 +8112,23 @@ export const useStore = create<AppState>((set, get) => ({
       } else {
         // Legacy: direct LLM prompt generation
         const result = await api.planClipPromptsAndImages({
+          workspace: activeWorkspace,
           clips: directorPlannedClips,
           scene_description: directorSceneDescription,
+          explicit_output: requestExplicitOutput,
           lyrics: directorAnalysis?.lyrics ?? undefined,
           bpm: directorAnalysis?.bpm ?? 120,
           reference_image_path: refImagePath,
           ...extraRefs,
           speaker_mappings: Object.keys(speakerMappings).length > 0 ? speakerMappings : undefined,
           prompt_type: 'both',
-        })
+        }, { signal: lifecycle.signal })
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
         }))
       }
+      if (!lifecycle.ownsWorkspace()) return
       set({
         directorClipPlans: plans,
         directorStep: 'review',
@@ -7932,15 +8143,20 @@ export const useStore = create<AppState>((set, get) => ({
         get().directorGenerateStartImages()
       }
     } catch (e: unknown) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Planning failed'
       console.error('Director planning failed:', e)
       set({ directorLoading: false, directorError: msg, directorStep: 'style' })
+    } finally {
+      lifecycle.dispose()
     }
   },
 
   directorPlanVideoPrompts: async () => {
-    const { directorPlannedClips, directorSceneDescription, directorAnalysis, directorClipPlans, directorReferenceImagePath } = get()
+    const { directorPlannedClips, directorSceneDescription, directorAnalysis, directorClipPlans, directorReferenceImagePath, activeWorkspace } = get()
     if (!directorPlannedClips.length || !directorClipPlans.length) return
+    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    const requestExplicitOutput = get().explicitOutput
     set({ directorLoading: true, directorError: null, directorStep: 'plan_video' })
     try {
       // Build speaker_mappings
@@ -7955,8 +8171,10 @@ export const useStore = create<AppState>((set, get) => ({
       const existingImagePrompts = directorClipPlans.map(p => p.image_prompt || '')
       const { directorCharacterRefPaths: crp, directorLocationRefPaths: lrp } = get()
       const result = await api.planClipPromptsAndImages({
+        workspace: activeWorkspace,
         clips: directorPlannedClips,
         scene_description: directorSceneDescription,
+        explicit_output: requestExplicitOutput,
         lyrics: directorAnalysis?.lyrics ?? undefined,
         bpm: directorAnalysis?.bpm ?? 120,
         reference_image_path: directorReferenceImagePath,
@@ -7965,12 +8183,13 @@ export const useStore = create<AppState>((set, get) => ({
         speaker_mappings: Object.keys(speakerMappings).length > 0 ? speakerMappings : undefined,
         prompt_type: 'video',
         existing_image_prompts: existingImagePrompts,
-      })
+      }, { signal: lifecycle.signal })
       // Merge video prompts into existing clip plans
       const updatedPlans = directorClipPlans.map((plan, i) => ({
         ...plan,
         video_prompt: result.clip_plans[i]?.video_prompt || '',
       }))
+      if (!lifecycle.ownsWorkspace()) return
       set({
         directorClipPlans: updatedPlans,
         directorStep: 'review_video',
@@ -7982,9 +8201,12 @@ export const useStore = create<AppState>((set, get) => ({
         get().directorGenerate()
       }
     } catch (e: unknown) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Video prompt planning failed'
       console.error('Director video planning failed:', e)
       set({ directorLoading: false, directorError: msg, directorStep: 'generate_images' })
+    } finally {
+      lifecycle.dispose()
     }
   },
 
@@ -8040,7 +8262,8 @@ export const useStore = create<AppState>((set, get) => ({
       return pp
     }
 
-    // Submit one image generation, poll to completion, download the result as a File.
+    // Submit one image generation through the shared queue-aware job tracker,
+    // then download the terminal result as a File.
     const genImage = async (prompt: string, refs: string[], label: string): Promise<{ file: File; filename: string }> => {
       const genParams = {
         model_type: imageModel,
@@ -8066,17 +8289,44 @@ export const useStore = create<AppState>((set, get) => ({
         ...buildImgPostProc(),
       }
       const { job_id } = await api.submitGeneration(genParams)
-      let outputFiles: string[] = []
-      let attempts = 0
-      const maxAttempts = 300  // 300 × 2s = 10 minutes
-      while (attempts < maxAttempts) {
-        await new Promise(r => setTimeout(r, 2000))
-        const status = await api.fetchJobStatus(job_id)
-        if (status.status === 'completed') { outputFiles = status.output_files; break }
-        if (status.status === 'failed') throw new Error(status.error || `${label} generation failed`)
-        attempts++
+      const directorJob: GenerationJob = {
+        id: job_id,
+        status: 'queued',
+        progress: 0,
+        step: 0,
+        totalSteps: 0,
+        phase: '',
+        message: `Queued ${label}...`,
+        outputFiles: [],
+        error: null,
+        oomInfo: null,
+        promptPreview: prompt,
+        modelType: imageModel,
+        generationMode: 'image',
+        workspace: get().activeWorkspace,
       }
-      if (attempts >= maxAttempts) throw new Error(`${label} generation timed out`)
+      set(s => ({
+        jobs: s.jobs.some(job => job.id === job_id)
+          ? s.jobs
+          : [directorJob, ...s.jobs],
+        isGenerating: true,
+      }))
+      const terminalStatus = _waitForTerminalJobStatus(job_id, 600_000)
+      get()._pollRecoveredJob(job_id)
+      window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+      let status: api.ApiJobStatus
+      try {
+        status = await terminalStatus
+      } catch (error) {
+        if (error instanceof Error && error.message.endsWith('timed out')) {
+          throw new Error(`${label} generation timed out`)
+        }
+        throw error
+      }
+      if (status.status !== 'completed') {
+        throw new Error(status.error || `${label} generation ${status.status}`)
+      }
+      const outputFiles = status.output_files
       if (outputFiles.length === 0) throw new Error(`No output file for ${label}`)
       const filename = outputFiles[0]
       const imgRes = await fetch(api.getFileUrl(filename))
@@ -8338,6 +8588,7 @@ export const useStore = create<AppState>((set, get) => ({
   directorReset: () => {
     _stopDirectorPreparationPoll()
     _storeDirectorPreparation(null, null)
+    _directorPipelineLifecycleToken = null
     set({
       sidebarMode: 'studio' as const,
       directorStep: 'upload',
@@ -8367,7 +8618,6 @@ export const useStore = create<AppState>((set, get) => ({
       directorAutoMode: true,
       directorSeamless: false,
       directorShotImageGuidance: 'auto' as DirectorShotImageGuidance,
-      directorLlmLog: [],
       directorSkill: null,
       directorMusicSource: null,
       directorSongDescription: '',
@@ -8383,6 +8633,9 @@ export const useStore = create<AppState>((set, get) => ({
       shortFilmPath: null,
       shortFilmTargetDuration: 30,
       shortFilmNarrative: false,
+      pipelineId: null,
+      pipelineStatus: null,
+      pipelinePolling: false,
     })
   },
 
@@ -8394,6 +8647,8 @@ export const useStore = create<AppState>((set, get) => ({
   shortFilmSetNarrative: (v) => set({ shortFilmNarrative: v }),
 
   shortFilmUploadAndAnalyze: async (file) => {
+    const requestWorkspace = get().activeWorkspace
+    const lifecycle = _beginDirectorLlmRequest(requestWorkspace)
     set({
       directorLoading: true,
       directorLoadingMessage: 'Uploading audio...',
@@ -8407,8 +8662,9 @@ export const useStore = create<AppState>((set, get) => ({
     const startAnalyzePolling = () => {
       analyzePoll = setInterval(async () => {
         try {
+          if (!lifecycle.ownsWorkspace()) return
           const status = await api.fetchAudioAnalyzeStatus()
-          if (!status.step) return
+          if (!status.step || !lifecycle.ownsWorkspace()) return
           set({ directorLoadingMessage: `${status.detail}...` })
         } catch { /* polling errors are non-fatal */ }
       }, 1000)
@@ -8421,15 +8677,18 @@ export const useStore = create<AppState>((set, get) => ({
     }
     try {
       const uploaded = await api.uploadAudio(file)
+      if (!lifecycle.ownsWorkspace()) return
       set({ directorAudioPath: uploaded.path, directorLoadingMessage: 'Analyzing audio...' })
 
       startAnalyzePolling()
       const analysis = await api.analyzeAudio({
         audio_path: uploaded.path,
+        workspace: requestWorkspace,
         transcribe: true,
         extract_vocals: true,
       })
       stopAnalyzePolling()
+      if (!lifecycle.ownsWorkspace()) return
 
       set({ directorAnalysis: analysis })
 
@@ -8454,12 +8713,14 @@ export const useStore = create<AppState>((set, get) => ({
       // Plan dialogue-paced clip structure (not beat-aligned)
       set({ directorLoadingMessage: 'Planning scenes...' })
       const structure = await api.planDialogueScenes({
+        workspace: requestWorkspace,
         analysis,
         pacing_bias: get().directorEnergyBias,
         fps: get().modelOptions?.fps ?? 16,
         frames_steps: get().modelOptions?.frames_steps ?? 4,
         frames_minimum: get().modelOptions?.frames_minimum ?? 5,
-      })
+      }, { signal: lifecycle.signal })
+      if (!lifecycle.ownsWorkspace()) return
       set({
         directorPlannedClips: structure.clips,
         directorStep: 'structure',
@@ -8467,41 +8728,51 @@ export const useStore = create<AppState>((set, get) => ({
         directorLoadingMessage: null,
       })
     } catch (e: unknown) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Analysis failed'
       console.error('Short film analysis failed:', e)
       set({ directorLoading: false, directorLoadingMessage: null, directorError: msg, directorStep: 'upload' })
     } finally {
       stopAnalyzePolling()
+      lifecycle.dispose()
     }
   },
 
   shortFilmSetPacingBias: async (bias) => {
-    const { directorAnalysis } = get()
+    const { directorAnalysis, activeWorkspace } = get()
     if (!directorAnalysis) return
+    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
     set({ directorLoading: true, directorEnergyBias: bias })
     try {
       const structure = await api.planDialogueScenes({
+        workspace: activeWorkspace,
         analysis: directorAnalysis,
         pacing_bias: bias,
         fps: get().modelOptions?.fps ?? 16,
         frames_steps: get().modelOptions?.frames_steps ?? 4,
         frames_minimum: get().modelOptions?.frames_minimum ?? 5,
-      })
+      }, { signal: lifecycle.signal })
+      if (!lifecycle.ownsWorkspace()) return
       set({ directorPlannedClips: structure.clips, directorLoading: false })
     } catch (e: unknown) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Failed to update structure'
       set({ directorLoading: false, directorError: msg })
+    } finally {
+      lifecycle.dispose()
     }
   },
 
   shortFilmPlanPrompts: async () => {
     const { directorPlannedClips, directorSceneDescription, directorAnalysis,
-            shortFilmCharacters } = get()
+            shortFilmCharacters, activeWorkspace } = get()
     if (!directorPlannedClips.length || !directorSceneDescription.trim()) return
+    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    const requestExplicitOutput = get().explicitOutput
     set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
       // Upload all reference images
-      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs()
+      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
       const extraRefs = {
         ...(charPaths.length > 0 ? { character_ref_paths: charPaths, character_ref_labels: charLabels } : {}),
@@ -8525,7 +8796,9 @@ export const useStore = create<AppState>((set, get) => ({
 
       if (useV2) {
         const result = await api.directorV2Plan({
+          workspace: activeWorkspace,
           skill_type: 'short_film',
+          explicit_output: requestExplicitOutput,
           clips: directorPlannedClips,
           scene_description: directorSceneDescription,
           lyrics: directorAnalysis?.lyrics ?? undefined,
@@ -8534,27 +8807,30 @@ export const useStore = create<AppState>((set, get) => ({
           speaker_mappings: Object.keys(speakerMappings).length > 0 ? speakerMappings : undefined,
           characters: shortFilmCharacters.length > 0 ? shortFilmCharacters : undefined,
           prompt_type: 'both',
-        })
+        }, { signal: lifecycle.signal })
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
         }))
       } else {
         const result = await api.planShortFilmPrompts({
+          workspace: activeWorkspace,
           clips: directorPlannedClips,
           scene_description: directorSceneDescription,
+          explicit_output: requestExplicitOutput,
           lyrics: directorAnalysis?.lyrics ?? undefined,
           reference_image_path: refImagePath,
           ...extraRefs,
           speaker_mappings: Object.keys(speakerMappings).length > 0 ? speakerMappings : undefined,
           characters: shortFilmCharacters.length > 0 ? shortFilmCharacters : undefined,
           prompt_type: 'both',
-        })
+        }, { signal: lifecycle.signal })
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
         }))
       }
+      if (!lifecycle.ownsWorkspace()) return
       set({
         directorClipPlans: plans,
         directorStep: 'review',
@@ -8571,16 +8847,21 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
     } catch (e: unknown) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Planning failed'
       console.error('Short film planning failed:', e)
       set({ directorLoading: false, directorError: msg, directorStep: 'style' })
+    } finally {
+      lifecycle.dispose()
     }
   },
 
   shortFilmPlanVideoPrompts: async () => {
     const { directorPlannedClips, directorSceneDescription, directorAnalysis,
-            directorClipPlans, directorReferenceImagePath, shortFilmCharacters } = get()
+            directorClipPlans, directorReferenceImagePath, shortFilmCharacters, activeWorkspace } = get()
     if (!directorPlannedClips.length || !directorClipPlans.length) return
+    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    const requestExplicitOutput = get().explicitOutput
     set({ directorLoading: true, directorError: null, directorStep: 'plan_video' })
     try {
       const speakerMappings: Record<string, { name: string; role: string }> = {}
@@ -8593,8 +8874,10 @@ export const useStore = create<AppState>((set, get) => ({
       const existingImagePrompts = directorClipPlans.map(p => p.image_prompt || '')
       const { directorCharacterRefPaths: crp2, directorLocationRefPaths: lrp2 } = get()
       const result = await api.planShortFilmPrompts({
+        workspace: activeWorkspace,
         clips: directorPlannedClips,
         scene_description: directorSceneDescription,
+        explicit_output: requestExplicitOutput,
         lyrics: directorAnalysis?.lyrics ?? undefined,
         reference_image_path: directorReferenceImagePath,
         ...(crp2.length > 0 ? { character_ref_paths: crp2 } : {}),
@@ -8603,11 +8886,12 @@ export const useStore = create<AppState>((set, get) => ({
         characters: shortFilmCharacters.length > 0 ? shortFilmCharacters : undefined,
         prompt_type: 'video',
         existing_image_prompts: existingImagePrompts,
-      })
+      }, { signal: lifecycle.signal })
       const updatedPlans = directorClipPlans.map((plan, i) => ({
         ...plan,
         video_prompt: result.clip_plans[i]?.video_prompt || '',
       }))
+      if (!lifecycle.ownsWorkspace()) return
       set({
         directorClipPlans: updatedPlans,
         directorStep: 'review_video',
@@ -8618,20 +8902,25 @@ export const useStore = create<AppState>((set, get) => ({
         get().directorGenerate()
       }
     } catch (e: unknown) {
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Video prompt planning failed'
       console.error('Short film video planning failed:', e)
       set({ directorLoading: false, directorError: msg, directorStep: 'generate_images' })
+    } finally {
+      lifecycle.dispose()
     }
   },
 
   shortFilmPlanFromStory: async () => {
     const { directorSceneDescription,
-            shortFilmCharacters, shortFilmTargetDuration, shortFilmNarrative } = get()
+            shortFilmCharacters, shortFilmTargetDuration, shortFilmNarrative, activeWorkspace } = get()
     if (!directorSceneDescription.trim()) return
-    set({ directorLoading: true, directorError: null, directorStep: 'plan', llmStreamText: '', llmStreamDone: false })
+    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    const requestExplicitOutput = get().explicitOutput
+    set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
       // Upload all reference images
-      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs()
+      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
       const extraRefs = {
         ...(charPaths.length > 0 ? { character_ref_paths: charPaths, character_ref_labels: charLabels } : {}),
@@ -8647,7 +8936,9 @@ export const useStore = create<AppState>((set, get) => ({
 
       if (useV2) {
         const result = await api.directorV2Plan({
+          workspace: activeWorkspace,
           skill_type: 'short_film',
+          explicit_output: requestExplicitOutput,
           scene_description: directorSceneDescription,
           story_description: directorSceneDescription,
           characters: shortFilmCharacters.length > 0 ? shortFilmCharacters : undefined,
@@ -8659,7 +8950,7 @@ export const useStore = create<AppState>((set, get) => ({
           frames_steps: get().modelOptions?.frames_steps ?? 4,
           frames_minimum: get().modelOptions?.frames_minimum ?? 5,
           prompt_type: 'both',
-        })
+        }, { signal: lifecycle.signal })
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
@@ -8689,7 +8980,9 @@ export const useStore = create<AppState>((set, get) => ({
         }
       } else {
         const result = await api.planShortFilmScript({
+          workspace: activeWorkspace,
           story_description: directorSceneDescription,
+          explicit_output: requestExplicitOutput,
           characters: shortFilmCharacters.length > 0 ? shortFilmCharacters : undefined,
           reference_image_path: refImagePath ?? undefined,
           ...extraRefs,
@@ -8698,7 +8991,7 @@ export const useStore = create<AppState>((set, get) => ({
           fps: get().modelOptions?.fps ?? 24,
           frames_steps: get().modelOptions?.frames_steps ?? 4,
           frames_minimum: get().modelOptions?.frames_minimum ?? 5,
-        })
+        }, { signal: lifecycle.signal })
         storyClips = result.clips
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
@@ -8706,8 +8999,7 @@ export const useStore = create<AppState>((set, get) => ({
         }))
       }
 
-      set({ llmStreamDone: true })
-
+      if (!lifecycle.ownsWorkspace()) return
       set({
         directorPlannedClips: storyClips || get().directorPlannedClips,
         directorClipPlans: plans,
@@ -8725,10 +9017,12 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
     } catch (e: unknown) {
-      set({ llmStreamDone: true })
+      if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Story planning failed'
       console.error('Short film story planning failed:', e)
       set({ directorLoading: false, directorError: msg, directorStep: 'style' })
+    } finally {
+      lifecycle.dispose()
     }
   },
 
@@ -8790,9 +9084,6 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
     set(s => ({
-      ...(_modelTypeIsMature(s, modelType)
-        ? { explicitOutput: true, privateOutput: true }
-        : {}),
       params: {
         ...s.params,
         model_type: modelType,
@@ -8829,11 +9120,27 @@ export const useStore = create<AppState>((set, get) => ({
   loadWorkspaces: async () => {
     try {
       const data = await api.fetchWorkspaces()
+      const projectChanged = data.active !== get().activeWorkspace
+      if (projectChanged) {
+        _directorPipelineLifecycleToken = null
+        _dashboardPipelineLoadToken += 1
+        _dashboardPipelineListLoadToken += 1
+      }
       set({
         workspaces: data.workspaces,
         activeWorkspace: data.active,
         selectedOutputKeys: [],
         gallerySelectionMode: false,
+        ...(projectChanged ? {
+          pipelineId: null,
+          pipelineStatus: null,
+          pipelinePolling: false,
+          directorLoading: false,
+          dashboardOpen: false,
+          dashboardPipelineList: [],
+          dashboardSelectedPipeline: null,
+          dashboardLoading: false,
+        } : {}),
       })
       if (get().accessContext?.remote && data.active) {
         void get().loadOutputs()
@@ -8850,9 +9157,28 @@ export const useStore = create<AppState>((set, get) => ({
       set({ browsingUploads: true, outputs: [], outputsTotal: 0, selectedOutput: 0, selectedOutputMeta: null, selectedOutputKeys: [] })
       return get().loadOutputs()
     }
+    _directorPipelineLifecycleToken = null
+    _dashboardPipelineLoadToken += 1
+    _dashboardPipelineListLoadToken += 1
     try {
       await api.setActiveWorkspace(name)
-      set({ browsingUploads: false, activeWorkspace: name, outputs: [], outputsTotal: 0, selectedOutput: 0, selectedOutputMeta: null, selectedOutputKeys: [] })
+      set({
+        browsingUploads: false,
+        activeWorkspace: name,
+        outputs: [],
+        outputsTotal: 0,
+        selectedOutput: 0,
+        selectedOutputMeta: null,
+        selectedOutputKeys: [],
+        pipelineId: null,
+        pipelineStatus: null,
+        pipelinePolling: false,
+        directorLoading: false,
+        dashboardOpen: false,
+        dashboardPipelineList: [],
+        dashboardSelectedPipeline: null,
+        dashboardLoading: false,
+      })
       const loaded = await get().loadOutputs()
       void get().loadWorkspaces()
       return loaded && get().activeWorkspace === name && !get().browsingUploads
@@ -8862,10 +9188,29 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   createWorkspace: async (name, password) => {
+    _directorPipelineLifecycleToken = null
+    _dashboardPipelineLoadToken += 1
+    _dashboardPipelineListLoadToken += 1
     try {
       await api.createWorkspace(name, password)
       await api.setActiveWorkspace(name)
-      set({ browsingUploads: false, activeWorkspace: name, outputs: [], outputsTotal: 0, selectedOutput: 0, selectedOutputMeta: null, selectedOutputKeys: [] })
+      set({
+        browsingUploads: false,
+        activeWorkspace: name,
+        outputs: [],
+        outputsTotal: 0,
+        selectedOutput: 0,
+        selectedOutputMeta: null,
+        selectedOutputKeys: [],
+        pipelineId: null,
+        pipelineStatus: null,
+        pipelinePolling: false,
+        directorLoading: false,
+        dashboardOpen: false,
+        dashboardPipelineList: [],
+        dashboardSelectedPipeline: null,
+        dashboardLoading: false,
+      })
       get().loadOutputs()
       get().loadWorkspaces()
     } catch (e) {
@@ -8883,9 +9228,30 @@ export const useStore = create<AppState>((set, get) => ({
     // its switched_to_default answer is authoritative (a client-side
     // activeWorkspace comparison could disagree after a desync and would
     // widen it by force-resetting state the server never changed).
+    if (name === get().activeWorkspace) {
+      _directorPipelineLifecycleToken = null
+      _dashboardPipelineLoadToken += 1
+      _dashboardPipelineListLoadToken += 1
+    }
     const result = await api.deleteWorkspace(name)
     if (result.switched_to_default) {
-      set({ browsingUploads: false, activeWorkspace: 'default', outputs: [], outputsTotal: 0, selectedOutput: 0, selectedOutputMeta: null, selectedOutputKeys: [] })
+      set({
+        browsingUploads: false,
+        activeWorkspace: 'default',
+        outputs: [],
+        outputsTotal: 0,
+        selectedOutput: 0,
+        selectedOutputMeta: null,
+        selectedOutputKeys: [],
+        pipelineId: null,
+        pipelineStatus: null,
+        pipelinePolling: false,
+        directorLoading: false,
+        dashboardOpen: false,
+        dashboardPipelineList: [],
+        dashboardSelectedPipeline: null,
+        dashboardLoading: false,
+      })
       get().loadOutputs()
     }
     get().loadWorkspaces()
@@ -9683,10 +10049,6 @@ export const useStore = create<AppState>((set, get) => ({
     }
     const restoredExplicitOutput = pendingOutput.explicit
       || selectedOutputMeta.explicit === true
-      || !!model?.nsfw_only
-      || KNOWN_MATURE_MODEL_TYPES.has(modelType)
-      || loras.some(name => _loraNeedsExplicit(get(), modelType, name))
-      || p._mmaudio_variant === 'nsfw'
 
     // Restore duration from metadata
     const restoredDuration = (p.duration_seconds as number) || 0
@@ -10230,6 +10592,7 @@ export const useStore = create<AppState>((set, get) => ({
   // ── Director Pipeline (server-side) ──────────────────────────────
   startDirectorPipeline: async () => {
     const state = get()
+    const requestWorkspace = state.activeWorkspace
     const { directorPlannedClips, directorSceneDescription,
             directorAudioPath, directorAnalysis, directorReferenceImagePath,
             directorAutoMode, directorSeamless, directorResolution, directorAspectRatio,
@@ -10243,6 +10606,8 @@ export const useStore = create<AppState>((set, get) => ({
             shortFilmPath, shortFilmCharacters, shortFilmTargetDuration,
             shortFilmNarrative } = state
 
+    const lifecycle = _beginDirectorPipelineLifecycle(requestWorkspace)
+    try {
     const selectedImageModel = selectedModelPerMode.image || 'flux2_klein_9b'
     const selectedVideoModel = selectedModelPerMode.video || 'ltx2_22B_distilled_1_1'
     const [imageModelDefaults, videoModelDefaults, imageModelOptions, videoModelOptions] = await Promise.all([
@@ -10251,6 +10616,7 @@ export const useStore = create<AppState>((set, get) => ({
       api.fetchModelOptions(selectedImageModel).catch(() => null),
       api.fetchModelOptions(selectedVideoModel).catch(() => null),
     ])
+    if (!lifecycle.ownsWorkspace()) return
     const directorImageResolution = resolveResolution(imageModelOptions, directorResolution, directorAspectRatio)
     const directorVideoResolution = resolveResolution(videoModelOptions, directorResolution, directorAspectRatio)
     const fps = videoModelOptions?.fps ?? 16
@@ -10277,10 +10643,13 @@ export const useStore = create<AppState>((set, get) => ({
     let refImagePath = directorReferenceImagePath
     if (!refImagePath && state.directorReferenceImage) {
       try {
+        if (!lifecycle.ownsWorkspace()) return
         const uploaded = await api.uploadImage(state.directorReferenceImage)
+        if (!lifecycle.ownsWorkspace()) return
         refImagePath = uploaded.path
         set({ directorReferenceImagePath: refImagePath })
       } catch (e) {
+        if (!lifecycle.ownsWorkspace()) return
         console.error('Failed to upload reference image for pipeline:', e)
       }
     }
@@ -10288,22 +10657,38 @@ export const useStore = create<AppState>((set, get) => ({
     const charPaths = [...state.directorCharacterRefPaths]
     for (let i = charPaths.length; i < state.directorCharacterRefs.length; i++) {
       try {
+        if (!lifecycle.ownsWorkspace()) return
         const uploaded = await api.uploadImage(state.directorCharacterRefs[i])
+        if (!lifecycle.ownsWorkspace()) return
         charPaths.push(uploaded.path)
-      } catch { /* skip failed uploads */ }
+      } catch {
+        if (!lifecycle.ownsWorkspace()) return
+        /* skip failed uploads */
+      }
     }
-    if (charPaths.length > state.directorCharacterRefPaths.length) {
+    if (
+      lifecycle.ownsWorkspace()
+      && charPaths.length > state.directorCharacterRefPaths.length
+    ) {
       set({ directorCharacterRefPaths: charPaths })
     }
     // Upload location refs that haven't been uploaded yet
     const locPaths = [...state.directorLocationRefPaths]
     for (let i = locPaths.length; i < state.directorLocationRefs.length; i++) {
       try {
+        if (!lifecycle.ownsWorkspace()) return
         const uploaded = await api.uploadImage(state.directorLocationRefs[i])
+        if (!lifecycle.ownsWorkspace()) return
         locPaths.push(uploaded.path)
-      } catch { /* skip failed uploads */ }
+      } catch {
+        if (!lifecycle.ownsWorkspace()) return
+        /* skip failed uploads */
+      }
     }
-    if (locPaths.length > state.directorLocationRefPaths.length) {
+    if (
+      lifecycle.ownsWorkspace()
+      && locPaths.length > state.directorLocationRefPaths.length
+    ) {
       set({ directorLocationRefPaths: locPaths })
     }
     const selectedVideoDefinition = state.models.find(
@@ -10316,10 +10701,15 @@ export const useStore = create<AppState>((set, get) => ({
     let voiceRefPath = state.directorVoiceRefPath
     if (supportsVoiceReference && !voiceRefPath && state.directorVoiceRef) {
       try {
+        if (!lifecycle.ownsWorkspace()) return
         const uploaded = await api.uploadAudio(state.directorVoiceRef)
+        if (!lifecycle.ownsWorkspace()) return
         voiceRefPath = uploaded.path
         set({ directorVoiceRefPath: voiceRefPath })
-      } catch { /* skip */ }
+      } catch {
+        if (!lifecycle.ownsWorkspace()) return
+        /* skip */
+      }
     }
 
     // Determine pipeline type
@@ -10327,13 +10717,27 @@ export const useStore = create<AppState>((set, get) => ({
     if (shortFilmPath === 'story') pipelineType = 'short_film_story'
     else if (shortFilmPath === 'audio') pipelineType = 'short_film_audio'
 
+    const directorVideoParams: Record<string, unknown> = {
+      ...videoModelDefaults,
+      ...matchingVideoParams,
+      num_inference_steps: directorVideoSteps,
+      resolution: directorVideoResolution,
+    }
+    if (H3_STUDIO_MODELS.has(selectedVideoModel)) {
+      // Director owns `director_max_shot_frames` as its explicit ceiling.
+      // Never leak a model/default rolling-window field into automatic H3
+      // planning; the backend materializes execution geometry only after it
+      // commits the deterministic segment plan.
+      delete directorVideoParams.sliding_window_size
+    }
+
     const pipelineParams: Record<string, unknown> = {
       pipeline_type: pipelineType,
       ...(state.directorRequestWorkspace === state.activeWorkspace && state.directorRequestId
         ? { director_request_id: state.directorRequestId }
         : {}),
       auto_mode: directorAutoMode,
-      workspace: get().activeWorkspace,
+      workspace: requestWorkspace,
       private_output: state.privateOutput,
       explicit_output: state.explicitOutput,
       scene_description: directorSceneDescription,
@@ -10387,12 +10791,7 @@ export const useStore = create<AppState>((set, get) => ({
 
       // Video gen settings
       video_model: selectedVideoModel,
-      video_params: {
-        ...videoModelDefaults,
-        ...matchingVideoParams,
-        num_inference_steps: directorVideoSteps,
-        resolution: directorVideoResolution,
-      },
+      video_params: directorVideoParams,
       video_loras: savedLoraPerMode.video || {},
       video_spatial_upsampling: directorVideoSpatialUpsampling,
       video_film_grain_intensity: directorVideoFilmGrainIntensity,
@@ -10411,8 +10810,9 @@ export const useStore = create<AppState>((set, get) => ({
       } : {}),
     }
 
-    try {
+      if (!lifecycle.ownsWorkspace()) return
       const { pipeline_id } = await api.startPipeline(pipelineParams)
+      if (!lifecycle.ownsWorkspace()) return
       _stopDirectorPreparationPoll()
       _storeDirectorPreparation(null, null)
       set({
@@ -10428,17 +10828,22 @@ export const useStore = create<AppState>((set, get) => ({
       })
       get().pollPipelineStatus()
     } catch (e) {
+      if (!lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Pipeline failed to start'
       set({ directorError: msg })
+    } finally {
+      lifecycle.dispose()
     }
   },
 
   continuePipeline: async (updates) => {
     const pid = get().pipelineId
     if (!pid) return
+    const workspace = get().activeWorkspace
     try {
       await api.continuePipeline(pid, updates)
-      set({ directorLoading: true })
+      if (get().pipelineId !== pid || get().activeWorkspace !== workspace) return
+      set({ directorLoading: true, pipelineStatus: null })
     } catch (e) {
       console.error('Failed to continue pipeline:', e)
     }
@@ -10447,8 +10852,11 @@ export const useStore = create<AppState>((set, get) => ({
   stopPipeline: async () => {
     const pid = get().pipelineId
     if (!pid) return
+    const workspace = get().activeWorkspace
+    _directorPipelineLifecycleToken = null
     try {
       await api.stopPipeline(pid)
+      if (get().pipelineId !== pid || get().activeWorkspace !== workspace) return
       set({ pipelineId: null, pipelineStatus: null, pipelinePolling: false, directorLoading: false })
     } catch (e) {
       console.error('Failed to stop pipeline:', e)
@@ -10458,12 +10866,32 @@ export const useStore = create<AppState>((set, get) => ({
   pollPipelineStatus: () => {
     const pid = get().pipelineId
     if (!pid) return
+    const workspace = get().activeWorkspace
+    const outputRefresh: GalleryRefreshClock = {
+      lastRefreshAt: Date.now(),
+      pendingDelta: false,
+      hasRefreshed: false,
+    }
+    let outputSignature = ''
+    let nextPollMs = 2000
 
     const poll = async () => {
-      if (!get().pipelinePolling || get().pipelineId !== pid) return
+      if (
+        !get().pipelinePolling
+        || get().pipelineId !== pid
+        || get().activeWorkspace !== workspace
+      ) return
 
       try {
         const status = await api.fetchPipelineStatus(pid)
+        if (
+          !get().pipelinePolling
+          || get().pipelineId !== pid
+          || get().activeWorkspace !== workspace
+        ) return
+        if (status.id !== pid || status.workspace !== workspace) {
+          throw new Error('Pipeline status identity mismatch')
+        }
         const pipelineActive = isDirectorPipelineActive(status)
         const pipelineTerminal = status.status === 'completed'
           || status.status === 'failed'
@@ -10477,7 +10905,6 @@ export const useStore = create<AppState>((set, get) => ({
           } : {
             directorLoading: false,
             directorLoadingMessage: null,
-            llmStreamDone: true,
           }),
           ...((pipelineTerminal || pipelineBlocked) ? { pipelinePolling: false } : {}),
           ...(pipelineFailed ? {
@@ -10538,18 +10965,39 @@ export const useStore = create<AppState>((set, get) => ({
               status: 'generating',
             },
           })
-          // Refresh media feed to show new images as they're generated
-          get().refreshOutputs()
         } else if (pipelineActive && status.phase === 'generating_video') {
           set({ directorStep: 'review_video' })
-          // Refresh media feed to show new video clips as they complete
-          get().refreshOutputs()
         }
 
-        // Handle LLM streaming
-        if (pipelineActive && status.llm_streaming) {
-          set({ llmStreamDone: false })
+        if (
+          pipelineActive
+          && (status.phase === 'generating_images' || status.phase === 'generating_video')
+        ) {
+          const nextOutputSignature = JSON.stringify([
+            status.phase,
+            status.progress.current,
+            status.progress.total,
+            status.clip_images,
+          ])
+          const changed = nextOutputSignature !== outputSignature
+          outputSignature = nextOutputSignature
+          if (_coalescedGalleryRefreshDue(
+            outputRefresh,
+            changed,
+            !document.hidden,
+          )) {
+            void get().refreshOutputs()
+          }
         }
+
+        // The exact pipeline status is the sole Director LLM telemetry
+        // source. Poll faster only while planning or a transient pass is
+        // active; other phases retain the lower background cadence.
+        nextPollMs = pipelineActive && (
+          status.phase === 'planning'
+          || status.phase === 'polishing_prompts'
+          || (status.llm_progress != null && !status.llm_progress.done)
+        ) ? 400 : 2000
 
         // Handle pause
         if (status.status === 'paused') {
@@ -10580,8 +11028,12 @@ export const useStore = create<AppState>((set, get) => ({
       }
 
       // Continue polling
-      if (get().pipelinePolling) {
-        setTimeout(poll, 2000)
+      if (
+        get().pipelinePolling
+        && get().pipelineId === pid
+        && get().activeWorkspace === workspace
+      ) {
+        setTimeout(poll, nextPollMs)
       }
     }
 

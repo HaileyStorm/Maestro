@@ -210,6 +210,32 @@ class _CatalogRegistry(_Registry):
 
 
 class TestDirectorPreviewFailureContract(unittest.TestCase):
+    def test_local_director_has_no_maestro_content_refusal_layer(self):
+        self.assertFalse(
+            (APP_DIR / "services" / "director" / "safety_scan.py").exists(),
+        )
+        self.assertFalse(
+            (
+                APP_DIR
+                / "services/llm_guides/director/nsfw_off_safety_rules.md"
+            ).exists(),
+        )
+        forbidden_symbols = (
+            "SafetyViolationError",
+            "assert_no_minor_content",
+            "assert_safe_final_director_prompts",
+            "safety_policy_refusal",
+            "strip_sex_act_leet_tokens",
+            "_SEX_ACT_LEET_TOKENS",
+        )
+        for path in APP_DIR.rglob("*"):
+            if not path.is_file() or path.suffix not in {".py", ".md"}:
+                continue
+            relative = path.relative_to(APP_DIR)
+            source = path.read_text(encoding="utf-8", errors="replace")
+            for symbol in forbidden_symbols:
+                self.assertNotIn(symbol, source, msg=f"{relative}: {symbol}")
+
     def test_unexpected_preview_failure_is_stable_and_keeps_local_traceback(self):
         private_detail = (
             "provider=openrouter api_key=private at "

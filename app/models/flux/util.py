@@ -258,27 +258,21 @@ def save_image(
     x = rearrange(x[0], "c h w -> h w c")
     img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
     
-    if nsfw_classifier is not None:
-        nsfw_score = [x["score"] for x in nsfw_classifier(img) if x["label"] == "nsfw"][0]
+    # Keep the legacy parameters for upstream call compatibility. Maestro does
+    # not classify or suppress locally generated images based on subject matter.
+    exif_data = Image.Exif()
+    if name in ["flux-dev", "flux-schnell"]:
+        exif_data[ExifTags.Base.Software] = "AI generated;txt2img;flux"
     else:
-        nsfw_score = nsfw_threshold - 1.0
-
-    if nsfw_score < nsfw_threshold:
-        exif_data = Image.Exif()
-        if name in ["flux-dev", "flux-schnell"]:
-            exif_data[ExifTags.Base.Software] = "AI generated;txt2img;flux"
-        else:
-            exif_data[ExifTags.Base.Software] = "AI generated;img2img;flux"
-        exif_data[ExifTags.Base.Make] = "Black Forest Labs"
-        exif_data[ExifTags.Base.Model] = name
-        if add_sampling_metadata:
-            exif_data[ExifTags.Base.ImageDescription] = prompt
-        img.save(fn, exif=exif_data, quality=95, subsampling=0)
-        if track_usage:
-            track_usage_via_api(name, 1)
-        idx += 1
-    else:
-        print("Your generated image may contain NSFW content.")
+        exif_data[ExifTags.Base.Software] = "AI generated;img2img;flux"
+    exif_data[ExifTags.Base.Make] = "Black Forest Labs"
+    exif_data[ExifTags.Base.Model] = name
+    if add_sampling_metadata:
+        exif_data[ExifTags.Base.ImageDescription] = prompt
+    img.save(fn, exif=exif_data, quality=95, subsampling=0)
+    if track_usage:
+        track_usage_via_api(name, 1)
+    idx += 1
 
     return idx
 
@@ -1127,5 +1121,4 @@ class Flux2TransformerShared:
         )
         defaults.update(kwargs)
         return Flux2Transformer2DModel(**defaults)
-
 

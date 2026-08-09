@@ -89,9 +89,16 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             h3_segment_plan={
                 "kind": "h3_segments",
                 "clip_count": 2,
+                "fps": 24,
+                "published_frames": 240,
                 "segments": [{
                     "index": 1,
-                    "frames": 81,
+                    "frames": 124,
+                    "duration_seconds": 124 / 24,
+                    "generated_frames": 124,
+                    "published_frames": 116,
+                    "generated_duration_seconds": 124 / 24,
+                    "published_duration_seconds": 116 / 24,
                     "model_type": "hunyuan3d",
                     "prompt_preview": "implicit prompt must be dropped",
                 }],
@@ -110,11 +117,51 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
         self.assertTrue(snapshot["explicit"])
         self.assertEqual(snapshot["recovery_unit"]["index"], 2)
         self.assertEqual(snapshot["window_total_steps"], 20)
+        recovered_plan = snapshot["h3_segment_plan"]
+        self.assertEqual(recovered_plan["fps"], 24)
+        self.assertEqual(recovered_plan["published_frames"], 240)
+        self.assertEqual(recovered_plan["segments"][0]["generated_frames"], 124)
+        self.assertEqual(recovered_plan["segments"][0]["published_frames"], 116)
+        self.assertEqual(
+            recovered_plan["segments"][0]["published_duration_seconds"],
+            116 / 24,
+        )
         self.assertEqual(snapshot["request_manifest"]["prompt"], "explicit synthetic manifest")
         self.assertNotIn("must not leak implicitly", rendered)
         self.assertNotIn("session_id", rendered)
         self.assertNotIn("out_dir", rendered)
         self.assertNotIn("prompt_preview", rendered)
+
+    def test_h3_recovery_geometry_rejects_nonfinite_or_boolean_numbers(self):
+        base_plan = {
+            "kind": "h3_segments",
+            "clip_count": 1,
+            "fps": 24,
+            "published_frames": 124,
+            "segments": [{
+                "index": 1,
+                "generated_frames": 124,
+                "published_frames": 124,
+                "generated_duration_seconds": 124 / 24,
+                "published_duration_seconds": 124 / 24,
+            }],
+        }
+        invalid_plans = []
+        for field, value in (("fps", float("inf")), ("published_frames", True)):
+            invalid_plans.append({**base_plan, field: value})
+        invalid_plans.append({
+            **base_plan,
+            "segments": [{**base_plan["segments"][0], "published_frames": 0}],
+        })
+        for plan in invalid_plans:
+            with self.subTest(plan=plan):
+                with self.assertRaises(QueueRecoveryAdapterError):
+                    serialize_job(
+                        self._job(h3_segment_plan=plan),
+                        owner_digest=self.owner,
+                        project_digest=self.project,
+                        request_manifest={"prompt": "synthetic"},
+                    )
 
     def test_manifest_and_global_reject_absolute_paths_and_unknown_fields(self):
         with self.assertRaises(QueueRecoveryAdapterError):

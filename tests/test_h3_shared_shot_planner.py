@@ -14,6 +14,7 @@ if _APP not in sys.path:
 from services.h3_shot_planner import (  # noqa: E402
     H3ShotPlanError,
     build_h3_visual_context,
+    estimate_h3_segment_count,
     plan_h3_clip_frames,
     plan_h3_native_shots,
 )
@@ -60,6 +61,59 @@ class H3SharedShotPlannerTests(unittest.TestCase):
                         for item in planned
                     ))
                     self.assertEqual(policy["profile_id"], profile)
+
+    def test_blank_prompt_estimate_uses_model_grid_range_not_multiplier(self):
+        estimate = estimate_h3_segment_count(
+            720,
+            prompt="",
+            fps=24,
+            minimum_frames=124,
+            maximum_frames=345,
+            align_frame_count=self._align,
+            profile_id="draft",
+            published_total_frames=720,
+        )
+
+        self.assertEqual(estimate["likely"], 3)
+        self.assertEqual(estimate["minimum"], 3)
+        self.assertEqual(estimate["maximum"], 720 // 124)
+        self.assertEqual(estimate["confidence"], "low")
+        self.assertEqual(estimate["source"], "duration_profile_model_grid")
+        self.assertNotEqual(estimate["maximum"], int(estimate["likely"] * 1.5))
+
+    def test_prompt_estimate_is_the_exact_shared_planner_count(self):
+        prompt = (
+            "[Shot 1] At 0 seconds, begin. "
+            "[Shot 2] At 6 seconds, cut. "
+            "[Shot 3] At 17 seconds, reveal the final view."
+        )
+        estimate = estimate_h3_segment_count(
+            720,
+            prompt=prompt,
+            fps=24,
+            minimum_frames=124,
+            maximum_frames=345,
+            align_frame_count=self._align,
+            profile_id="draft",
+            published_total_frames=720,
+        )
+        frames, _ = plan_h3_clip_frames(
+            720,
+            prompt=prompt,
+            fps=24,
+            minimum_frames=124,
+            maximum_frames=345,
+            align_frame_count=self._align,
+            profile_id="draft",
+            published_total_frames=720,
+        )
+
+        self.assertEqual(
+            (estimate["minimum"], estimate["likely"], estimate["maximum"]),
+            (len(frames), len(frames), len(frames)),
+        )
+        self.assertEqual(estimate["confidence"], "high")
+        self.assertEqual(estimate["source"], "deterministic_authored_timeline")
 
     def test_explicit_timeline_and_manual_ceiling_override_profile_pressure(self):
         timed = "[0-10s] First action.\n[10-20s] Second action."

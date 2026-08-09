@@ -32,9 +32,8 @@ from .base import BasePlanner
 
 
 # Video-model architecture → Pass 2 shot-breakdown guide file.
-# Currently only LTX-2/LTX-V have a dedicated Pass-2 guide. Other
-# video families share the LTX-2 rules as a best-effort fallback
-# until per-model Pass-2 guides land in Phase 3.
+# MiniMax H3 and LTX-2/LTX-V have dedicated Pass-2 guides. Other video
+# families still share the LTX-2 rules as a best-effort fallback.
 _VIDEO_PASS2_GUIDE_MAP = {
     "minimax_h3_ref2va": "minimax_h3_shot_breakdown.md",
     "minimax_h3": "minimax_h3_shot_breakdown.md",
@@ -1058,6 +1057,80 @@ def _h3_native_structure_issues(
         if missing:
             issues.append(f"shot {index} is missing {', '.join(missing)}")
     return issues
+
+
+def _h3_audio_repair_lock_errors(before: str, after: str) -> list[str]:
+    """Apply Enhance's exact format-repair lock plus lexical time parity."""
+
+    from services import llm_service
+    from ..h3_dialogue import _H3_CANONICAL_RECORD_RE, _extract_h3_fields
+
+    def canonical_record_tokens(value: str) -> list[tuple[str, str, str]]:
+        fields = _extract_h3_fields(str(value or ""))
+        visual = (
+            fields.get("detailed_description")
+            or fields.get("integrated_multimodal_description")
+            or ""
+        )
+        tokens: list[tuple[str, str, str]] = []
+        for raw_line in visual.splitlines():
+            line = raw_line.strip()
+            canonical = _H3_CANONICAL_RECORD_RE.fullmatch(line)
+            if canonical:
+                tokens.append((
+                    canonical.group("number"),
+                    canonical.group("start"),
+                    canonical.group("end"),
+                ))
+                continue
+            loose = llm_service._H3_LOOSE_RANGE_RE.fullmatch(line)
+            if loose:
+                tokens.append(("", loose.group("start"), loose.group("end")))
+        return tokens
+
+    errors = list(llm_service._h3_format_repair_lock_errors(before, after))
+    source_records = canonical_record_tokens(before)
+    repaired_records = canonical_record_tokens(after)
+    source_times = [(start, end) for _, start, end in source_records]
+    repaired_times = [(start, end) for _, start, end in repaired_records]
+    if source_times and repaired_times != source_times:
+        errors.append("format repair changed timestamp precision or values")
+    if source_records and all(number for number, _, _ in source_records):
+        if [number for number, _, _ in repaired_records] != [
+            number for number, _, _ in source_records
+        ]:
+            errors.append("format repair changed canonical shot numbers")
+    return list(dict.fromkeys(errors))
+
+
+def _call_h3_audio_format_repair_once(
+    planner,
+    *,
+    user_prompt: str,
+    system_prompt: str,
+    max_tokens: int,
+    image_paths: list[str],
+    json_schema: dict,
+) -> list[dict]:
+    """Make exactly one physical, grammar-constrained local repair call."""
+
+    gen_fn = planner._generate_streaming or planner._generate
+    if gen_fn is None:
+        raise RuntimeError("No local LLM generate function provided for H3 repair")
+    response = gen_fn(
+        prompt=user_prompt,
+        system_prompt=system_prompt,
+        max_new_tokens=max_tokens,
+        thinking_budget=0,
+        temperature=0.2,
+        image_paths=image_paths or [],
+        frequency_penalty=0.3,
+        presence_penalty=0.1,
+        enable_thinking=False,
+        json_schema=json_schema,
+    )
+    parsed = planner._parse_json_response(response)
+    return parsed if isinstance(parsed, list) else []
 
 
 def _h3_planner_token_budget(target_duration: float) -> int:
@@ -2752,6 +2825,7 @@ FULL SCREENPLAY FOR ACTION AND RELATIONSHIP CONTEXT:
         # Audio-driven mode also uses dialect-aware Pass 2 guides — see
         # _route_video_pass2_guide / get_image_prompt_rules for routing.
         video_model = getattr(self, '_video_model', '') or ''
+        is_h3_video = video_model.lower().startswith("minimax_h3")
         image_model = getattr(self, '_image_model', '') or ''
         video_guide = _route_video_pass2_guide(video_model)
         video_name_rules = _video_character_name_rules(
@@ -2811,6 +2885,71 @@ FULL SCREENPLAY FOR ACTION AND RELATIONSHIP CONTEXT:
             if uses_generated_images else ""
         )
 
+        video_prompt_detail_rule = (
+            "- video_prompt MUST be a complete MiniMax H3 Context-IR prompt "
+            "that follows the routed guide exactly."
+            if is_h3_video else
+            "- video_prompt MUST be a full detailed paragraph (80-150 words) "
+            "— NOT a brief label."
+        )
+        video_prompt_rules = (
+            """VIDEO PROMPT (video_prompt) — follow the MiniMax H3 Context-IR guide below exactly:
+- Put integrated_multimodal_description on its own line.
+- Write each internal shot as one canonical [Shot N] [STARTs-ENDs] record.
+- Put literal speech only in <d>[Language] exact words</d> blocks and preserve every supplied vocalization.
+- Keep overall_soundscape and non_diegetic_music as the final two fields.
+- Do not replace the record structure with prose timing or quote-mark dialogue.
+""" + video_name_rules
+            if is_h3_video else
+            f"""VIDEO PROMPT (video_prompt) — follow the LTX-2 style guide below closely:
+- One single flowing paragraph, present tense, 4-8 sentences.
+- Start with shot type and visual style early.
+- Characters: {"preserve supplied proper names and add useful visible traits (clothing, hair, posture, expression)" if preserve_names else "describe by visible traits (clothing, hair, posture, expression)"}.
+- Emotion through PHYSICAL CUES only (jaw tightens, fists clench, shoulders drop) — never abstract labels like "serious expression" or "looks determined".
+- Action: chronological order — setup, movement, reaction, final beat.
+- Camera: explicit movement tied to the subject (slow dolly in, tracking left, orbit around, handheld follow) — never vague ("digital drift", "cinematic camera").
+- Audio: include ambient sound when relevant, and any other sounds or sound effects that are relevant to the scene.
+- Dialogue: in quotes with delivery cue if present.
+- NEVER say montage, quick cuts, cut to.
+{video_name_rules}"""
+        )
+        video_guide_reference = (
+            "REFERENCE — MiniMax H3 Context-IR guide:\n"
+            if is_h3_video else
+            "REFERENCE — LTX-2 video style guide:\n"
+        ) + (video_guide if video_guide else "(no guide loaded)")
+        video_prompt_example = (
+            "MiniMax H3 Context-IR with integrated_multimodal_description on "
+            "its own line, canonical [Shot N] [STARTs-ENDs] records, then "
+            "overall_soundscape and non_diegetic_music"
+            if is_h3_video else
+            "Full flowing paragraph for video generation — describes the action..."
+        )
+        window_prompts_example = (
+            "[]"
+            if is_h3_video else
+            '["(OPTIONAL) Window 1 — first ~20s of action...", "Window 2 — next ~20s, continues from where window 1 ends..."]'
+        )
+        prompt_duration_policy = (
+            """MINIMAX H3 VIDEO PROMPT:
+- Always populate video_prompt with the complete Context-IR for that audio clip.
+- Always emit window_prompts as []. Do not move any H3 prompt content there.
+- The first shot record starts at 0.00 and the final record ends at the exact audio-clip duration.
+- Follow the routed MiniMax H3 guide for canonical records, dialogue tags, sound fields, and natural inferred timing."""
+            if is_h3_video else
+            '''WINDOW PROMPTS vs VIDEO PROMPT — use ONE or the OTHER, never both:
+- Scenes 20s or under: write video_prompt, leave window_prompts as [].
+- Scenes over 20s: write window_prompts, leave video_prompt as "".
+  Each window covers ~20s. Windows play SEQUENTIALLY — window 2 continues exactly
+  where window 1 left off, picking up the action mid-flow.
+  CRITICAL: The video model only sees the last few frames — it has NO memory of
+  earlier action or sound. Each window must briefly re-establish ongoing state
+  (e.g. "the audience continues cheering" or "rain still falling") before
+  describing new action. Without this, ongoing activity abruptly stops.
+  Example: Window 1 delivers the joke → Window 2: "The audience continues laughing
+  and clapping. She takes a bow, wipes her brow, and walks to stage left..."'''
+        )
+
         system_prompt = f"""You are a cinematic scene planner for a short film with dialogue audio. Output ONLY the JSON array.
 
 {f"You are given a REFERENCE PHOTO of the characters. Use their visible appearance in all prompts." if has_reference else ""}
@@ -2840,25 +2979,14 @@ SHORT FILM PLANNING RULES:
 - Match camera complexity to emotional tone: steady for intimate, dynamic for action.
 - Each shot should advance the story or reveal character.
 - Describe the ENVIRONMENT in detail for each shot (room, furniture, lighting, time of day).
-- video_prompt MUST be a full detailed paragraph (80-150 words) — NOT a brief label.
+{video_prompt_detail_rule}
 {image_planning_rules}
 
-VIDEO PROMPT (video_prompt) — follow the LTX-2 style guide below closely:
-- One single flowing paragraph, present tense, 4-8 sentences.
-- Start with shot type and visual style early.
-- Characters: {"preserve supplied proper names and add useful visible traits (clothing, hair, posture, expression)" if preserve_names else "describe by visible traits (clothing, hair, posture, expression)"}.
-- Emotion through PHYSICAL CUES only (jaw tightens, fists clench, shoulders drop) — never abstract labels like "serious expression" or "looks determined".
-- Action: chronological order — setup, movement, reaction, final beat.
-- Camera: explicit movement tied to the subject (slow dolly in, tracking left, orbit around, handheld follow) — never vague ("digital drift", "cinematic camera").
-- Audio: include ambient sound when relevant, and any other sounds or sound effects that are relevant to the scene.
-- Dialogue: in quotes with delivery cue if present.
-- NEVER say montage, quick cuts, cut to.
-{video_name_rules}
+{video_prompt_rules}
 
 {image_prompt_rules}
 
-REFERENCE — LTX-2 video style guide:
-{video_guide if video_guide else "(no guide loaded)"}
+{video_guide_reference}
 
 OUTPUT FORMAT — respond with ONLY a JSON array:
 [
@@ -2887,37 +3015,22 @@ OUTPUT FORMAT — respond with ONLY a JSON array:
       "lip_sync_critical": true
     }},
     "ending_beat": "Final visual moment",
-{image_output_fields}    "video_prompt": "Full flowing paragraph for video generation — describes the action...",
-    "window_prompts": ["(OPTIONAL) Window 1 — first ~20s of action...", "Window 2 — next ~20s, continues from where window 1 ends..."]
+{image_output_fields}    "video_prompt": "{video_prompt_example}",
+    "window_prompts": {window_prompts_example}
   }}
 ]
 
 {image_output_notes}
 
-WINDOW PROMPTS vs VIDEO PROMPT — use ONE or the OTHER, never both:
-- Scenes 20s or under: write video_prompt, leave window_prompts as [].
-- Scenes over 20s: write window_prompts, leave video_prompt as "".
-  Each window covers ~20s. Windows play SEQUENTIALLY — window 2 continues exactly
-  where window 1 left off, picking up the action mid-flow.
-  CRITICAL: The video model only sees the last few frames — it has NO memory of
-  earlier action or sound. Each window must briefly re-establish ongoing state
-  (e.g. "the audience continues cheering" or "rain still falling") before
-  describing new action. Without this, ongoing activity abruptly stops.
-  Example: Window 1 delivers the joke → Window 2: "The audience continues laughing
-  and clapping. She takes a bow, wipes her brow, and walks to stage left..."
+{prompt_duration_policy}
 Output exactly {len(clips)} shot plans. Go:"""
 
         # Inject model-specific prompt polish guide if provided
         if polish_block:
             system_prompt = f"{system_prompt}\n\n{polish_block}"
 
-        # Mature-mode guidance is now SELF-GATING: the version-controlled
-        # clinical guides apply only when the scene is actually sexual and tell
-        # the model to write normally otherwise, so the block can be injected
-        # whenever mature mode is on without harming clean scenes. This replaced
-        # the old keyword pre-scan, which depended on an explicit wordlist that
-        # cannot live in the version-controlled repo and missed scenes phrased
-        # without its keywords.
+        # Request-scoped explicit guidance is added only after the server-owned
+        # consent/provider gate authorizes it.
         effective_nsfw = nsfw
         system_prompt = inject_nsfw_if_enabled(
             system_prompt,
@@ -2961,18 +3074,27 @@ Shots to plan:
         # grammar-enforced, not just prompted: the model cannot close the
         # array early or run past the clip count. keyframe_prompts /
         # window_prompts stay optional (spec tags them OPTIONAL).
+        audio_required = [
+            "scene_goal", "scene_type", "subjects_on_screen",
+            "spatial_setup", "environment", "visual_style", "lighting",
+            "mood", "action_beats", "dialogue_beats", "camera_plan",
+            "audio_plan", "ending_beat", "image_source", "image_prompt",
+            "visual_changes", "video_prompt",
+        ]
+        if is_h3_video:
+            audio_required.append("window_prompts")
         audio_schema = _shot_list_schema(
             min_items=len(clips),
             max_items=len(clips),
-            required=[
-                "scene_goal", "scene_type", "subjects_on_screen",
-                "spatial_setup", "environment", "visual_style", "lighting",
-                "mood", "action_beats", "dialogue_beats", "camera_plan",
-                "audio_plan", "ending_beat", "image_source", "image_prompt",
-                "visual_changes", "video_prompt",
-            ],
+            required=audio_required,
             include_image_fields=uses_generated_images,
         )
+        if is_h3_video:
+            audio_schema["items"]["properties"]["window_prompts"] = {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 0,
+            }
 
         shot_dicts = self._call_llm_json(
             user_prompt=user_prompt,
@@ -2982,6 +3104,188 @@ Shots to plan:
             image_paths=image_paths,
             json_schema=audio_schema,
         )
+
+        if is_h3_video:
+            from ..h3_dialogue import (
+                validate_h3_context_ir_records,
+                validate_h3_prompt_contract,
+            )
+            from shared.utils.prompt_parser import parse_global_timeline_prompt
+
+            canonical_time = r"(?:(?:\d{1,2}:){1,2})?\d+(?:\.\d+)?"
+            canonical_record = re.compile(
+                rf"^\[Shot (?P<number>[1-9]\d*)\] "
+                rf"\[(?P<start>{canonical_time})s-(?P<end>{canonical_time})s\] "
+                r"shot_name: [^|\r\n]+ \| "
+                r"audiovisual_description: [^|\r\n]+ \| "
+                r"dialogue_and_vocalizations: [^\r\n]+$"
+            )
+
+            def _h3_audio_format_issues(items: list[dict]) -> list[str]:
+                issues: list[str] = []
+                if len(items) != len(clips):
+                    issues.append(
+                        f"expected {len(clips)} audio shot objects, found {len(items)}"
+                    )
+                for index, clip in enumerate(clips):
+                    if index >= len(items):
+                        continue
+                    if not isinstance(items[index], dict):
+                        issues.append(f"shot {index + 1}: expected a JSON object")
+                        continue
+                    raw = items[index]
+                    prompt_text = str(raw.get("video_prompt") or "")
+                    dialogue = raw.get("dialogue_beats") or []
+                    duration = (
+                        float(clip.get("end", 0))
+                        - float(clip.get("start", 0))
+                    )
+                    for error in validate_h3_prompt_contract(
+                        prompt_text,
+                        dialogue,
+                        mode="t2va",
+                        duration_seconds=duration,
+                    ):
+                        issues.append(f"shot {index + 1}: {error}")
+                    for error in validate_h3_context_ir_records(
+                        prompt_text,
+                        mode="t2va",
+                        duration_seconds=duration,
+                    ):
+                        issues.append(f"shot {index + 1}: {error}")
+                    section = re.search(
+                        r"(?ms)^integrated_multimodal_description:[ \t]*\n"
+                        r"(?P<body>.*?)^overall_soundscape:",
+                        prompt_text,
+                    )
+                    record_lines = [
+                        line.strip()
+                        for line in (section.group("body").splitlines() if section else [])
+                        if line.strip()
+                    ]
+                    matches = [canonical_record.fullmatch(line) for line in record_lines]
+                    if not section or not record_lines or not all(matches):
+                        issues.append(
+                            f"shot {index + 1}: video_prompt must contain only canonical "
+                            "physical-line shot records"
+                        )
+                        continue
+                    numbers = [int(match.group("number")) for match in matches if match]
+                    if numbers != list(range(1, len(numbers) + 1)):
+                        issues.append(
+                            f"shot {index + 1}: shot record numbers are not sequential"
+                        )
+                    _, events = parse_global_timeline_prompt(prompt_text)
+                    if len(events) != len(record_lines) or any(
+                        event.get("kind") != "range" for event in events
+                    ):
+                        issues.append(
+                            f"shot {index + 1}: production timeline parser did not "
+                            "recognize every canonical record"
+                        )
+                        continue
+                    if not math.isclose(events[0]["start"], 0.0, abs_tol=1e-6):
+                        issues.append(f"shot {index + 1}: first record does not start at 0.00")
+                    for previous, current in zip(events, events[1:]):
+                        if not math.isclose(
+                            previous["end"], current["start"], abs_tol=1e-6,
+                        ):
+                            issues.append(
+                                f"shot {index + 1}: record ranges are not contiguous"
+                            )
+                            break
+                    if not math.isclose(
+                        events[-1]["end"], duration, abs_tol=0.01,
+                    ):
+                        issues.append(
+                            f"shot {index + 1}: final record does not end at "
+                            f"the {duration:.2f}-second audio duration"
+                        )
+                    if raw.get("window_prompts"):
+                        issues.append(f"shot {index + 1}: window_prompts must be []")
+                return list(dict.fromkeys(issues))
+
+            format_issues = _h3_audio_format_issues(shot_dicts)
+            if format_issues:
+                from services import llm_service
+
+                authoritative_shot_dicts = copy.deepcopy(shot_dicts)
+                repair_prompt = f"""{user_prompt}
+
+FORMAT-ONLY H3 REPAIR — the previous JSON was structurally valid, but its
+video_prompt strings violated the routed MiniMax H3 Context-IR record grammar:
+{chr(10).join(f'- {issue}' for issue in format_issues)}
+
+Rewrite only each video_prompt into the canonical format required by the
+system guide. Copy every other JSON field and every name, dialogue word,
+vocalization, action, reference, and timing association unchanged. Keep
+window_prompts as []. Return the complete JSON array once.
+
+PREVIOUS JSON:
+{json.dumps(shot_dicts, ensure_ascii=False)}"""
+                # Provider selection is process-global. Hold the same
+                # re-entrant lease used by Enhance across locality validation
+                # and the single repair call so a remote provider cannot be
+                # swapped in between them.
+                with llm_service._lock:
+                    if llm_service._provider != "local":
+                        raise RuntimeError(
+                            "MiniMax H3 audio plan violated its Context-IR "
+                            "contract and local format repair is unavailable"
+                        )
+                    repaired_shot_dicts = _call_h3_audio_format_repair_once(
+                        self,
+                        user_prompt=repair_prompt,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                        image_paths=image_paths,
+                        json_schema=audio_schema,
+                    )
+                shot_dicts = copy.deepcopy(authoritative_shot_dicts)
+                repair_lock_issues: list[str] = []
+                if not isinstance(repaired_shot_dicts, list):
+                    repair_lock_issues.append(
+                        "format repair wrapped the audio shot array"
+                    )
+                    repaired_shot_dicts = []
+                if len(repaired_shot_dicts) != len(authoritative_shot_dicts):
+                    repair_lock_issues.append(
+                        "format repair changed the audio shot-object count"
+                    )
+                for index, raw in enumerate(shot_dicts):
+                    if not isinstance(raw, dict):
+                        repair_lock_issues.append(
+                            f"shot {index + 1}: authoritative shot is not an object"
+                        )
+                        continue
+                    repaired = (
+                        repaired_shot_dicts[index]
+                        if index < len(repaired_shot_dicts)
+                        and isinstance(repaired_shot_dicts[index], dict)
+                        else {}
+                    )
+                    repaired_prompt = str(repaired.get("video_prompt") or "")
+                    repair_lock_issues.extend(
+                        f"shot {index + 1}: {error}"
+                        for error in _h3_audio_repair_lock_errors(
+                            str(authoritative_shot_dicts[index].get("video_prompt") or ""),
+                            repaired_prompt,
+                        )
+                    )
+                    # The first parsed JSON remains authoritative. Only the
+                    # repaired prompt string may cross this boundary.
+                    raw["video_prompt"] = repaired_prompt
+                format_issues = _h3_audio_format_issues(shot_dicts)
+                final_issues = list(dict.fromkeys([
+                    *repair_lock_issues,
+                    *format_issues,
+                ]))
+                if final_issues:
+                    raise RuntimeError(
+                        "MiniMax H3 audio-driven plan still violated the "
+                        "canonical shot-record contract after one format-only "
+                        "repair: " + "; ".join(final_issues)
+                    )
 
         if not uses_generated_images:
             _discard_unused_image_fields(shot_dicts)
@@ -3093,10 +3397,6 @@ Shots to plan:
                 video_prompt format.
         """
         from ..nsfw_guidance import inject_nsfw_if_enabled
-        from ..safety_scan import (
-            assert_no_minor_content,
-            collect_pass2_text,
-        )
 
         if target_scenes is None:
             target_scenes = max(2, min(20, target_duration // 20))
@@ -3112,13 +3412,6 @@ Shots to plan:
         )
 
         image_paths = self._build_all_image_paths(reference_image_path, has_reference)
-
-        # ── PRE-PASS-1 SAFETY SCAN: user concept ────────────────────────
-        # Scan the user's input concept BEFORE running Pass 1. Catches
-        # obviously-prohibited concepts ~30s earlier and avoids burning
-        # an LLM call on something we'll abort anyway. Same scanner /
-        # same hybrid co-occurrence policy as the post-Pass-1 check.
-        assert_no_minor_content(story_description, source="user concept")
 
         # ── PASS 1: Screenplay ───────────────────────────────────────────
         story_guide = ""
@@ -3323,13 +3616,6 @@ H3 CHARACTER-AUTHENTICITY RULES:
                 f"(budget {max_total_words})"
             )
 
-        # ── POST-PASS-1 SAFETY SCAN ─────────────────────────────────────
-        # Catches anything the prompt-level prohibition rule failed to
-        # prevent. Raises SafetyViolationError; pipeline error handler
-        # in director_pipeline.py converts to a clean user-visible
-        # message in chat.
-        assert_no_minor_content(screenplay, source="screenplay (Pass 1)")
-
         # H3 renders independent bounded shots rather than 20-second rolling
         # windows. Plan directly on its native duration lattice so legacy
         # Window 1/2 prose never reaches the later compatibility adapter.
@@ -3357,13 +3643,6 @@ H3 CHARACTER-AUTHENTICITY RULES:
                             )),
                         ),
                     )
-                )
-                assert_no_minor_content(
-                    "\n".join(
-                        str(entry.get("spoken_text") or "")
-                        for entry in screenplay_dialogue_manifest
-                    ),
-                    source="H3 character table read",
                 )
             return self._plan_story_h3_native(
                 story_description=story_description,
@@ -3421,10 +3700,9 @@ H3 CHARACTER-AUTHENTICITY RULES:
                 image_model=image_model,
             )
 
-        # Load all guide content from .md files. Video shot-breakdown
-        # currently routes only to LTX-2 vs. a generic fallback —
-        # other model families share the LTX-2 rules until per-model
-        # Pass-2 video guides land in Phase 3.
+        # Load all guide content from .md files. MiniMax H3 and LTX-2 use
+        # dedicated shot-breakdown guides; other families use the generic
+        # fallback chosen by _route_video_pass2_guide.
         shot_structure = load_guide("shot_structure_rules.md")
         video_rules = _route_video_pass2_guide(video_model)
         video_name_rules = _video_character_name_rules(
@@ -3460,11 +3738,8 @@ H3 CHARACTER-AUTHENTICITY RULES:
             "(background extra, unnamed character), set to null or omit the field."
         )
 
-        # Mature-mode guidance is self-gating (see audio-mode pass 2): the
-        # version-controlled clinical guides apply only to scenes that are
-        # actually sexual, so the block is injected whenever mature mode is on.
-        # (Replaces the old explicit-keyword pre-scan, which can't be version-
-        # controlled and missed scenes phrased without its keywords.)
+        # Request-scoped explicit guidance is added only after the server-owned
+        # consent/provider gate authorizes it.
         effective_nsfw = nsfw
 
         # Keyframe guidance is useful only when Director will actually render
@@ -3956,16 +4231,6 @@ SCREENPLAY:
         )
         if not uses_generated_images:
             _discard_unused_image_fields(shot_dicts)
-
-        # ── POST-PASS-2 SAFETY SCAN ─────────────────────────────────────
-        # Defense in depth — Pass 2's structured output (image/video
-        # prompts, action beats, dialogue, subjects) gets concatenated
-        # and scanned the same way the screenplay was. Catches the case
-        # where Pass 1 produced clean text but Pass 2's expansion
-        # introduced minor + sexual co-occurrence.
-        assert_no_minor_content(
-            collect_pass2_text(shot_dicts), source="shot list (Pass 2)"
-        )
 
         # ── CHARACTER DESCRIPTOR CANONICALIZATION ────────────────────
         # User-reported bug: uploaded selfie tagged "man in black",
@@ -4766,63 +5031,6 @@ SCREENPLAY:
         except Exception as e:
             print(f"[ShortFilmPlanner] Image-prompt sanitization skipped: {e}")
 
-        # ── Sex-act leet trigger strip (always-on safety net) ────────
-        # User-reported leak: a SFW music video had "bl0wj0b" in a
-        # keyframe_prompt. Same risk applies to short films when a
-        # user has NSFW LoRAs in their video_loras selection from
-        # prior testing and runs a SFW concept. Strip from image and
-        # keyframe fields ALWAYS (still images don't use video LoRA
-        # triggers). Strip from video/window fields when nsfw=False.
-        try:
-            from ..prompt_polish import strip_sex_act_leet_tokens as _strip_leet
-            leet_count = 0
-            for sd in shot_dicts:
-                if not isinstance(sd, dict):
-                    continue
-                ip = sd.get("image_prompt") or ""
-                if ip:
-                    new_ip, n = _strip_leet(ip)
-                    if n:
-                        sd["image_prompt"] = new_ip
-                        leet_count += n
-                kfs = sd.get("keyframe_prompts") or []
-                if isinstance(kfs, list):
-                    new_kfs = []
-                    for kf in kfs:
-                        if isinstance(kf, str):
-                            new_kf, n = _strip_leet(kf)
-                            new_kfs.append(new_kf)
-                            leet_count += n
-                        else:
-                            new_kfs.append(kf)
-                    sd["keyframe_prompts"] = new_kfs
-                if not nsfw:
-                    vp = sd.get("video_prompt") or ""
-                    if vp:
-                        new_vp, n = _strip_leet(vp)
-                        if n:
-                            sd["video_prompt"] = new_vp
-                            leet_count += n
-                    wps_local = sd.get("window_prompts") or []
-                    if isinstance(wps_local, list):
-                        new_wps = []
-                        for w in wps_local:
-                            if isinstance(w, str):
-                                new_w, n = _strip_leet(w)
-                                new_wps.append(new_w)
-                                leet_count += n
-                            else:
-                                new_wps.append(w)
-                        sd["window_prompts"] = new_wps
-            if leet_count:
-                print(
-                    f"[ShortFilmPlanner] Stripped {leet_count} sex-act leet "
-                    f"trigger token(s) — LLM placed them in fields where they "
-                    f"don't belong (still images or SFW video context)."
-                )
-        except Exception as e:
-            print(f"[ShortFilmPlanner] Leet trigger strip skipped: {e}")
-
         # ── Storyboard camera-name leak strip (Multi-Shot LoRA mode) ─
         # When Pass 2 produced Format B storyboard prompts, the LLM
         # sometimes embeds character names inside the camera-type
@@ -4902,8 +5110,6 @@ SCREENPLAY:
         """Break a screenplay directly into self-contained native H3 shots."""
 
         from ..nsfw_guidance import inject_nsfw_if_enabled
-        from ..safety_scan import assert_no_minor_content, collect_pass2_text
-
         uses_generated_images = bool(
             getattr(self, "_uses_generated_shot_images", True)
         )
@@ -5698,10 +5904,6 @@ repeating that prose across every metadata field."""
         )
         shot_dicts = _prepare_h3_prompt_only_continuity(shot_dicts)
 
-        assert_no_minor_content(
-            collect_pass2_text(shot_dicts), source="shot list (H3 native Pass 2)"
-        )
-
         shots = self._convert_story_shots(
             shot_dicts,
             char_profiles,
@@ -5939,17 +6141,6 @@ Go:"""
             "both" if uses_generated_images else "video",
         )
 
-        # Single-pass fallback also gets the safety scan — it bypasses
-        # Pass 1 entirely, so the post-Pass-1 scan above doesn't run for
-        # this code path. Mirror the same hybrid co-occurrence check on
-        # the user's concept (pre-call) and on the structured shot list
-        # (post-call).
-        from ..safety_scan import (
-            assert_no_minor_content,
-            collect_pass2_text,
-        )
-        assert_no_minor_content(story_description, source="user concept")
-
         image_paths = self._build_all_image_paths(reference_image_path, has_reference)
         # Grammar constraint — this path runs with thinking_budget=4096, so
         # the schema only fires on the parse-failure retry (see
@@ -5972,10 +6163,6 @@ Go:"""
         )
         if not uses_generated_images:
             _discard_unused_image_fields(shot_dicts)
-
-        assert_no_minor_content(
-            collect_pass2_text(shot_dicts), source="shot list (single-pass fallback)"
-        )
 
         seen_goals = set()
         unique_dicts = []

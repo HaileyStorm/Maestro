@@ -106,36 +106,14 @@ export function LoraSelector() {
   const generationMode = useStore(s => s.generationMode)
   const editSubMode = useStore(s => s.editSubMode)
   const toggleLora = useStore(s => s.toggleLora)
-  const registerMatureLoraFlags = useStore(s => s.registerMatureLoraFlags)
   const setLoraWeight = useStore(s => s.setLoraWeight)
   const loadLoras = useStore(s => s.loadLoras)
   const openBrowser = useStore(s => s.setLoraBrowserOpen)
 
   const [search, setSearch] = useState('')
-  // Sticky across sessions (localStorage) — gated by nsfw_mode below, so a
-  // persisted "on" is inert until Mature Mode is enabled.
-  const [showNsfw, setShowNsfw] = useState(() => {
-    try { return localStorage.getItem('maestro_loras_show_nsfw') === '1' } catch { return false }
-  })
-  const setShowNsfwSticky = (v: boolean) => {
-    setShowNsfw(v)
-    try { localStorage.setItem('maestro_loras_show_nsfw', v ? '1' : '0') } catch { /* private mode */ }
-  }
-  // Master gate: only honor "show NSFW LoRAs" when the user has
-  // enabled NSFW mode in Settings → Services (which requires the
-  // disclaimer acknowledgement). Without this gate, the NSFW filter
-  // checkbox would tease users who haven't opted in. nsfwEnabled is
-  // also used to suppress the "X NSFW LoRAs hidden" hint when the
-  // user shouldn't even know NSFW LoRAs exist in their library yet.
-  const nsfwEnabled = !!useStore(s => s.servicesConfig?.nsfw_mode)
   const [guideStatus, setGuideStatus] = useState<Record<string, 'none' | 'exists' | 'generating' | 'done'>>({})
   const [guideTexts, setGuideTexts] = useState<Record<string, string>>({})
   const [loraWeightRecs, setLoraWeightRecs] = useState<Record<string, LoraRecommendedWeights>>({})
-  // Set of filenames flagged NSFW (sidecar `nsfw:true` OR keyword match).
-  // Populated from the /details response alongside weight recs + guides.
-  const [nsfwFlags, setNsfwFlags] = useState<Record<string, boolean>>({})
-  const [loraDetailsModel, setLoraDetailsModel] = useState('')
-  const [loraDetailsError, setLoraDetailsError] = useState<{ modelType: string; message: string } | null>(null)
   const loraDetailsRequest = useRef(0)
   // Per-filename update_status from the cached LoRA-update manifest. The
   // backend embeds this on every /details response so we don't need to
@@ -267,14 +245,12 @@ export function LoraSelector() {
       const recs: Record<string, LoraRecommendedWeights> = {}
       const guides: Record<string, string> = {}
       const statuses: Record<string, 'exists' | 'none'> = {}
-      const nsfw: Record<string, boolean> = {}
       const updates: Record<string, LoraUpdateStatus> = {}
       const dates: Record<string, LoraDates> = {}
       for (const info of r.loras) {
         if (info.recommended_weights) recs[info.filename] = info.recommended_weights
         if (info.guide) { guides[info.filename] = info.guide; statuses[info.filename] = 'exists' }
         else if (info.has_guide) statuses[info.filename] = 'exists'
-        nsfw[info.filename] = !!info.nsfw
         if (info.update_status) updates[info.filename] = info.update_status
         if (info.released_at || info.downloaded_at) {
           dates[info.filename] = { released: info.released_at, downloaded: info.downloaded_at }
@@ -283,10 +259,6 @@ export function LoraSelector() {
       setLoraWeightRecs(recs)
       setGuideTexts(prev => ({ ...prev, ...guides }))
       setGuideStatus(prev => ({ ...prev, ...statuses }))
-      setNsfwFlags(nsfw)
-      registerMatureLoraFlags(modelType, r.loras)
-      setLoraDetailsModel(modelType)
-      setLoraDetailsError(null)
       setUpdateStatuses(updates)
       setLoraDates(dates)
       setLastCheckedAt(r.manifest_last_check_at ?? null)
@@ -316,10 +288,7 @@ export function LoraSelector() {
       }
     }).catch(error => {
       if (detailsRequest !== loraDetailsRequest.current) return
-      setLoraDetailsError({
-        modelType,
-        message: error instanceof Error ? error.message : 'Could not classify LoRAs',
-      })
+      console.error('Could not load LoRA details:', error)
     })
   }, [modelType, activatedLoras]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -349,34 +318,16 @@ export function LoraSelector() {
     return filename.replace(/\.(safetensors|sft)$/i, '')
   }
 
-  // Filter by search term AND (unless overridden by toggles) exclude
-  // NSFW-flagged LoRAs / non-updatable ones. Activated LoRAs are always
+  // Filter by search term and the optional update-status filter. Activated LoRAs are always
   // shown so the user can deactivate them without first turning off the
   // current filter — otherwise the checkbox becomes confusing when a
   // selected item suddenly vanishes from the list.
-  // Effective NSFW visibility: only true when the master gate is on
-  // AND the local checkbox is checked. When the gate is off, NSFW
-  // LoRAs are always hidden (except already-activated ones — they
-  // stay visible so the user can deactivate them).
-  const effectiveShowNsfw = nsfwEnabled && showNsfw
-  const loraDetailsReady = loraDetailsModel === modelType
-  const currentLoraDetailsError = loraDetailsError?.modelType === modelType
-    ? loraDetailsError.message
-    : null
   const filtered = sortLoraNames(availableLoras.filter(name => {
     if (!displayName(name).toLowerCase().includes(search.toLowerCase())) return false
     const isActivated = activatedLoras.includes(name)
-    if (!loraDetailsReady && !isActivated) return false
-    if (!effectiveShowNsfw && !isActivated && nsfwFlags[name]) return false
     if (updatableOnly && !isActivated && updateStatuses[name] !== 'available') return false
     return true
   }), sortMode, loraDates)
-  // "X NSFW hidden" hint only meaningful when the user CAN reveal
-  // them (NSFW mode enabled). Otherwise we don't hint at the existence
-  // of hidden NSFW LoRAs at all.
-  const hiddenByNsfw = nsfwEnabled && !showNsfw
-    ? availableLoras.filter(name => nsfwFlags[name] && !activatedLoras.includes(name)).length
-    : 0
 
   if (lorasLoading) {
     return (
@@ -408,19 +359,7 @@ export function LoraSelector() {
       {loraHeader}
       {compatibilityNotice}
 
-      {!loraDetailsReady && (
-        <div className={`mb-2 rounded-lg border px-3 py-2 text-[10px] ${
-          currentLoraDetailsError
-            ? 'border-red-500/30 bg-red-500/10 text-red-300'
-            : 'border-border bg-bg-tertiary text-text-muted'
-        }`}>
-          {currentLoraDetailsError
-            ? `LoRA safety metadata unavailable: ${currentLoraDetailsError}. New selections are disabled.`
-            : 'Checking LoRA safety metadata before enabling selections…'}
-        </div>
-      )}
-
-      {/* Search + NSFW + Updatable toggles */}
+      {/* Search + Updatable toggle */}
       <div className="flex items-center gap-2 mb-2">
         <div className="relative flex-1">
           <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-muted" />
@@ -456,31 +395,6 @@ export function LoraSelector() {
             Updates
           </span>
         </label>
-        {/* NSFW filter checkbox is only rendered when the user has
-            enabled NSFW mode in Settings → Services (which gates them
-            on the disclaimer acknowledgement). Without that enable,
-            NSFW LoRAs stay hidden and there's no UI affordance to
-            reveal them. */}
-        {nsfwEnabled && (
-        <label
-          className="flex items-center gap-1 cursor-pointer shrink-0 select-none"
-          title={showNsfw
-            ? 'Showing all LoRAs (including NSFW). Uncheck to hide NSFW.'
-            : hiddenByNsfw > 0
-              ? `${hiddenByNsfw} NSFW LoRA${hiddenByNsfw === 1 ? '' : 's'} hidden — check to show.`
-              : 'Check to include NSFW LoRAs'}
-        >
-          <input
-            type="checkbox"
-            checked={showNsfw}
-            onChange={e => setShowNsfwSticky(e.target.checked)}
-            className="w-3 h-3 rounded border-border accent-red-500"
-          />
-          <span className={`text-[10px] uppercase tracking-wider ${showNsfw ? 'text-red-400' : 'text-text-muted'}`}>
-            NSFW
-          </span>
-        </label>
-        )}
       </div>
 
       {/* Available LoRAs list */}
@@ -544,9 +458,7 @@ export function LoraSelector() {
         })}
         {filtered.length === 0 && (
           <div className="px-3 py-2 text-xs text-text-muted text-center">
-            {hiddenByNsfw > 0 && !search
-              ? `${hiddenByNsfw} NSFW LoRA${hiddenByNsfw === 1 ? '' : 's'} hidden — check NSFW to show`
-              : 'No matches'}
+            No matches
           </div>
         )}
       </div>

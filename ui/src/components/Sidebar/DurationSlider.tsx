@@ -19,6 +19,22 @@ export function DurationSlider() {
   const videoGuide = useStore(s => s.params.video_guide)
   const h3AdaptiveConditioning = useStore(s => s.params.h3_adaptive_conditioning !== false)
   const setParam = useStore(s => s.setParam)
+  const h3SegmentEstimate = useStore(s => s.h3SegmentCountEstimate)
+  const h3EstimateLoading = useStore(s => s.h3EstimateLoading)
+  const invalidateH3Estimates = useStore(s => s.invalidateH3PerformanceEstimates)
+  const refreshH3Estimates = useStore(s => s.refreshH3PerformanceEstimates)
+  const pendingH3Plan = useStore(s => s.pendingH3Plan)
+  const h3ReferenceShapeKey = useStore(s => [
+    Number(Boolean(s.startImage || s.params.image_start)),
+    Number(Boolean(s.endImage || s.params.image_end)),
+    Math.max(s.imageRefs.length, Array.isArray(s.params.image_refs) ? s.params.image_refs.length : 0),
+    Number(Boolean(s.params.video_guide)),
+    Number(Boolean(s.params.video_guide2)),
+    Number(Boolean(s.params.video_guide3)),
+    Number(Boolean(s.params.audio_guide)),
+    Number(Boolean(s.params.audio_guide2)),
+    Number(Boolean(s.params.audio_guide3)),
+  ].join(':'))
   const fps = modelOptions?.fps ?? 16
   const supportsSliding = modelOptions?.sliding_window === true
   const usesSegments = usesStudioSegments(modelOptions)
@@ -53,6 +69,20 @@ export function DurationSlider() {
   const windowCount = geometry?.windowCount ?? 1
   const showSlidingWindow = windowCount > 1
 
+  const prompt = useStore(s => s.params.prompt)
+  useEffect(() => {
+    if (!usesSegments) return
+    invalidateH3Estimates()
+    const timer = window.setTimeout(() => {
+      void refreshH3Estimates()
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [
+    duration, h3AdaptiveConditioning, h3ReferenceShapeKey,
+    invalidateH3Estimates, locked, overlap, prompt, refreshH3Estimates,
+    usesSegments, windowSize,
+  ])
+
   // Auto-track within the selected model's declared window range. Manual
   // movement locks the value; model switching rehydrates/clamps in the store.
   //
@@ -76,8 +106,14 @@ export function DurationSlider() {
 
   const imageMode = useStore(s => s.params.image_mode)
   const isMultiClip = imageMode === 2
-  const promptLineCount = useStore(s => s.params.prompt.split('\n').filter((l: string) => l.trim()).length)
+  const promptLineCount = prompt.split('\n').filter((l: string) => l.trim()).length
   const globalTimeline = useStore(s => hasGlobalTimeline(s.params.prompt))
+  const plannedSegmentCount = pendingH3Plan?.clip_count ?? null
+  const estimatedSegmentLabel = h3SegmentEstimate
+    ? h3SegmentEstimate.minimum === h3SegmentEstimate.maximum
+      ? String(h3SegmentEstimate.likely)
+      : `${h3SegmentEstimate.minimum}–${h3SegmentEstimate.maximum} (likely ${h3SegmentEstimate.likely})`
+    : h3EstimateLoading ? 'calculating…' : 'unavailable'
 
   return (
     <div>
@@ -85,8 +121,14 @@ export function DurationSlider() {
         <label className="text-[11px] text-text-muted uppercase tracking-wider">Duration</label>
         <span className="text-xs text-text-secondary">
           {duration >= 60 ? `${Math.floor(duration / 60)}m${duration % 60 ? ` ${duration % 60}s` : ''}` : `${duration}s`}
-          {showSlidingWindow && (
-            <span className="text-text-muted ml-1">({windowCount} {usesSegments ? 'segments' : 'win'})</span>
+          {(usesSegments || showSlidingWindow) && (
+            <span className="text-text-muted ml-1">
+              ({usesSegments
+                ? plannedSegmentCount != null
+                  ? `Planned segments ${plannedSegmentCount}`
+                  : `Estimated segments ${estimatedSegmentLabel}`
+                : `${windowCount} win`})
+            </span>
           )}
         </span>
       </div>
@@ -98,25 +140,39 @@ export function DurationSlider() {
         value={duration}
         onChange={e => setDuration(Number(e.target.value))}
       />
-      {showSlidingWindow && !isMultiClip && (
+      {(usesSegments || showSlidingWindow) && !isMultiClip && (
         <div className="text-[10px] text-text-muted mt-1">
-          {windowCount} {usesSegments ? 'segments' : 'windows'} of up to {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s &middot; {globalTimeline ? (
-            'global timeline mapped automatically'
-          ) : (
-            <>{promptLineCount}/{windowCount} prompts{promptLineCount < windowCount && ' (last reused)'}</>
-          )}
+          {usesSegments ? (
+            <span title={h3SegmentEstimate?.reason}>
+              {plannedSegmentCount != null
+                ? `Planned segments ${plannedSegmentCount}`
+                : `Estimated segments ${estimatedSegmentLabel}`}
+              {' '}· maximum {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s each
+              {globalTimeline ? ' · authored timestamps mapped exactly' : ' · prompt beats can produce shorter unequal shots'}
+            </span>
+          ) : <>
+            {windowCount} windows of up to {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s &middot; {globalTimeline ? (
+              'global timeline mapped automatically'
+            ) : (
+              <>{promptLineCount}/{windowCount} prompts{promptLineCount < windowCount && ' (last reused)'}</>
+            )}
+          </>}
         </div>
       )}
       {supportsWindowPlanning && !isMultiClip && (
         <div className="mt-3 rounded-lg border border-border bg-bg-tertiary/60 p-2.5">
           <div className="flex items-center justify-between mb-1.5">
             <div className="flex items-center gap-1.5">
-              <label className="text-[11px] text-text-muted uppercase tracking-wider">{usesSegments ? 'Segment size' : 'Window size'}</label>
+              <label className="text-[11px] text-text-muted uppercase tracking-wider">{usesSegments ? 'Maximum segment length' : 'Window size'}</label>
               <button
                 type="button"
                 onClick={() => setLocked(!locked)}
                 className={`flex items-center gap-1 rounded px-1 py-0.5 text-[9px] ${locked ? 'text-accent-blue' : 'text-text-muted hover:text-text-secondary'}`}
-                title={locked ? 'Manual window size — click for Automatic' : 'Automatic window size — click to edit manually'}
+                title={usesSegments
+                  ? locked
+                    ? 'Manual H3 segment ceiling — click for Automatic planning'
+                    : 'Automatic H3 segment planning — click to set a manual ceiling'
+                  : locked ? 'Manual window size — click for Automatic' : 'Automatic window size — click to edit manually'}
               >
                 {locked ? <Lock size={10} /> : <Unlock size={10} />}
                 {locked ? 'Manual' : 'Automatic'}
@@ -139,7 +195,9 @@ export function DurationSlider() {
           />
           <p className="mt-1 text-[9px] text-text-muted">
             {usesSegments
-              ? `Each segment stays within H3's ${windowMax.toFixed(2)}s legal aligned maximum (~15s nominal) and is joined automatically. The published result is trimmed to the requested length on H3's 17-frame grid.`
+              ? locked
+                ? `This is an exact ceiling, not a target or average. Every H3 segment stays at or below ${windowSize.toFixed(2)}s; prompt-driven shots may be shorter and unequal. Generated grid-aligned tails are trimmed to the exact published duration.`
+                : `Automatic planning may choose shorter, unequal prompt-driven shots up to H3's ${windowMax.toFixed(2)}s legal aligned maximum. Authored timestamps remain exact; generated grid-aligned tails are trimmed to the exact published duration.`
               : 'Effective aligned value for this model. Larger windows use more VRAM; smaller windows create more joins.'}
           </p>
           {usesSegments && (

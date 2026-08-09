@@ -155,13 +155,15 @@ class BasePlanner(ABC):
                 kwargs["json_schema"] = json_schema
         try:
             response = gen_fn(**kwargs)
-        except Exception as e:
+        except Exception:
             if "json_schema" not in kwargs:
                 raise
             # Never let the grammar make planning WORSE than before it
             # existed — a rejecting server (old llama-server binary, odd
             # provider) drops the constraint and runs the call as-is.
-            print(f"[Planner] Grammar-constrained call failed ({e}); retrying unconstrained")
+            # Provider exception messages are intentionally not echoed:
+            # some backends include request or generated content in them.
+            print("[Planner] JSON generation fallback: reason=initial_grammar_rejected")
             kwargs.pop("json_schema", None)
             response = gen_fn(**kwargs)
 
@@ -197,10 +199,10 @@ class BasePlanner(ABC):
         )
         try:
             response2 = gen_fn(**retry_kwargs)
-        except Exception as e:
+        except Exception:
             # Same degradation contract as attempt 1: fall back to the
             # historical unconstrained retry (thinking budget restored).
-            print(f"[Planner] Grammar-constrained retry failed ({e}); retrying unconstrained")
+            print("[Planner] JSON generation fallback: reason=retry_grammar_rejected")
             retry_kwargs.pop("json_schema", None)
             retry_kwargs.pop("enable_thinking", None)
             retry_kwargs["thinking_budget"] = 2048
@@ -239,8 +241,13 @@ class BasePlanner(ABC):
                 return result["shots"]
             return [result]
         except json.JSONDecodeError as e:
-            print(f"[Planner] Direct JSON parse failed: {e}")
-            print(f"[Planner] Text starts with: {text[:200]!r}")
+            # Never log parser input or exception text. JSON/parser/provider
+            # exceptions can embed generated content; numeric diagnostics are
+            # enough to distinguish malformed and truncated responses.
+            print(
+                "[Planner] JSON parse failed: reason=direct_decode_error "
+                f"chars={len(text)} position={e.pos}"
+            )
 
         # Try to find JSON array in text
         match = re.search(r'\[[\s\S]*\]', text)
@@ -251,8 +258,10 @@ class BasePlanner(ABC):
                     print(f"[Planner] JSON parse OK: {len(result)} items (regex array)")
                     return result
             except json.JSONDecodeError as e:
-                print(f"[Planner] Regex array parse failed: {e}")
-                print(f"[Planner] Matched array starts with: {match.group()[:200]!r}")
+                print(
+                    "[Planner] JSON parse failed: reason=extracted_array_decode_error "
+                    f"chars={len(match.group())} position={e.pos}"
+                )
         else:
             print(f"[Planner] No JSON array found in {len(text)} chars")
 
@@ -286,12 +295,18 @@ class BasePlanner(ABC):
                 if isinstance(result, dict):
                     print("[Planner] JSON parse OK via json_repair: 1 item (single object)")
                     return [result]
-            except Exception as e:
-                print(f"[Planner] json_repair fallback failed: {e}")
+            except Exception:
+                print(
+                    "[Planner] JSON parse failed: reason=json_repair_error "
+                    f"chars={len(text)}"
+                )
         else:
             print("[Planner] json_repair not installed — install with `pip install json_repair` to recover from LLM JSON typos")
 
-        print(f"[Planner] All JSON parse attempts failed. Text ends with: {text[-200:]!r}")
+        print(
+            "[Planner] JSON parse failed: reason=all_strategies_exhausted "
+            f"chars={len(text)}"
+        )
         return None
 
     # ── Guide Loading ────────────────────────────────────────────────

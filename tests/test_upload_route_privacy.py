@@ -440,10 +440,11 @@ class UploadRouteSourceContractTests(unittest.TestCase):
 
     def test_project_asset_variants_use_store_source_path_contract(self):
         imported = _function_source("add_project_asset_variant")
-        generated = _function_source("generate_project_asset_references")
+        generated = _function_source("_attach_project_reference_result")
         self.assertIn('"source_path": path', imported)
         self.assertIn('"metadata": inherited', imported)
-        self.assertIn('"source_path": path', generated)
+        self.assertIn('"source_path": str(artifact.path)', generated)
+        self.assertIn('ordered = [sheets[0], *panels]', generated)
 
 
 if __name__ == "__main__":

@@ -395,6 +395,8 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             "_h3_preferred_fl2va_model",
             "_prepare_h3_long_studio_request",
             "_public_h3_long_plan",
+            "_h3_estimate_context",
+            "_h3_segment_count_estimate",
             "_plan_h3_adaptive_models",
             "_validate_h3_segment_plan",
             "_expand_h3_longform_outputs",
@@ -463,7 +465,6 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             "_MULTI_CLIP_SEPARATOR": "\n---CLIP_BOUNDARY---\n",
             "_check_model_downloaded": lambda model_type: model_type != "minimax_h3_ref2va",
             "_variant_group_downloaded": lambda urls: True,
-            "_nsfw_allowed": lambda: True,
         }
         exec(compile(ast.Module(body=helpers, type_ignores=[]), source_path, "exec"), namespace)
         return namespace
@@ -492,6 +493,21 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         )
         public = helpers["_public_h3_long_plan"](plan)
         self.assertEqual(public["clip_count"], len(plan["segment_models"]))
+        self.assertEqual(public["fps"], 24)
+        self.assertEqual(public["published_frames"], plan["requested_frames"])
+        for segment, generated, published in zip(
+            public["segments"],
+            plan["clip_frames"],
+            plan["clip_published_frames"],
+        ):
+            self.assertEqual(segment["generated_frames"], generated)
+            self.assertEqual(segment["published_frames"], published)
+            self.assertEqual(
+                segment["generated_duration_seconds"], generated / 24,
+            )
+            self.assertEqual(
+                segment["published_duration_seconds"], published / 24,
+            )
         self.assertEqual(
             public["effective_model_count"], len(public["effective_models"]),
         )
@@ -499,6 +515,104 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             set(public["effective_models"]),
             {"minimax_h3_w4a8_fl2va", "minimax_h3_ref2va"},
         )
+
+    def test_public_legacy_h3_plan_recovers_published_tail_geometry(self):
+        helpers = self._load_launch_helpers()
+        public = helpers["_public_h3_long_plan"]({
+            "clip_count": 2,
+            "clip_frames": [124, 124],
+            "segment_models": [
+                {"model_type": "minimax_h3", "reason": "base"},
+                {"model_type": "minimax_h3_ref2va", "reason": "semantic"},
+            ],
+            "clip_boundaries": [{"type": "cut"}],
+            "clip_prompt_previews": ["one", "two"],
+            "requested_frames": 240,
+            "planned_frames": 248,
+        })
+        self.assertEqual(
+            [segment["generated_frames"] for segment in public["segments"]],
+            [124, 124],
+        )
+        self.assertEqual(
+            [segment["published_frames"] for segment in public["segments"]],
+            [124, 116],
+        )
+        self.assertEqual(
+            [segment["published_duration_seconds"] for segment in public["segments"]],
+            [124 / 24, 116 / 24],
+        )
+
+    def test_director_scene_count_estimate_matches_independent_runtime_plans(self):
+        helpers = self._load_launch_helpers()
+        context = helpers["_h3_estimate_context"]({
+            "model_type": "minimax_h3",
+            "duration_seconds": 6,
+            "window_seconds": 345 / 24,
+            "window_overlap": 0,
+            "prompt": "",
+            "segment_scenes": [
+                {"duration_seconds": 3, "prompt": "First short scene."},
+                {"duration_seconds": 3, "prompt": "Second short scene."},
+            ],
+            "num_inference_steps": 20,
+            "resolution": "1344x768",
+        })
+        estimate = helpers["_h3_segment_count_estimate"](context)
+        self.assertEqual(
+            (estimate["minimum"], estimate["likely"], estimate["maximum"]),
+            (2, 2, 2),
+        )
+        self.assertEqual(estimate["confidence"], "high")
+        self.assertEqual(
+            estimate["source"], "deterministic_director_scene_aggregate",
+        )
+
+    def test_public_estimate_normalizes_manual_window_seconds_as_ceiling(self):
+        helpers = self._load_launch_helpers()
+        context = helpers["_h3_estimate_context"]({
+            "model_type": "minimax_h3",
+            "duration_seconds": 30,
+            "window_seconds": 124 / 24,
+            "window_overlap": 0,
+            "prompt": "Six prompt-driven scenes.",
+            "manual_segment_ceiling": True,
+            "num_inference_steps": 20,
+            "resolution": "1344x768",
+        })
+        self.assertEqual(context["window_seconds"], 124 / 24)
+        self.assertEqual(context["window_overlap"], 0)
+        estimate = helpers["_h3_segment_count_estimate"](context)
+        self.assertEqual(
+            (estimate["minimum"], estimate["likely"], estimate["maximum"]),
+            (6, 6, 6),
+        )
+
+    def test_estimate_adaptive_ref2va_uses_effective_fl2va_geometry(self):
+        helpers = self._load_launch_helpers()
+        request = {
+            "model_type": "minimax_h3_ref2va",
+            "duration_seconds": 30,
+            "window_seconds": 107 / 24,
+            "window_overlap": 0,
+            "prompt": "A continuous text-only sequence.",
+            "manual_segment_ceiling": True,
+            "num_inference_steps": 20,
+            "resolution": "1344x768",
+        }
+        adaptive = helpers["_h3_estimate_context"]({
+            **request,
+            "h3_adaptive_conditioning": True,
+        })
+        with self.assertRaisesRegex(ValueError, "below the model minimum"):
+            helpers["_h3_segment_count_estimate"](adaptive)
+
+        pinned = helpers["_h3_estimate_context"]({
+            **request,
+            "h3_adaptive_conditioning": False,
+        })
+        estimate = helpers["_h3_segment_count_estimate"](pinned)
+        self.assertEqual(estimate["likely"], 7)
 
     def test_explicit_metadata_preserves_base_and_manual_pinkcherry_selection(self):
         helpers = self._load_launch_helpers()
@@ -565,13 +679,12 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         )
         self.assertTrue(all(not option["is_downloaded"] for option in options))
         self.assertTrue(all(option["auto_download"] for option in options))
-        helpers["_nsfw_allowed"] = lambda: False
-        mature_disabled = {
+        content_labeled = {
             option["model_type"]: option
             for option in helpers["_h3_checkpoint_options"]()
         }["minimax_h3_pinkcherry_fl2va"]
-        self.assertFalse(mature_disabled["available"])
-        self.assertIn("Requires Explicit mode", mature_disabled["unavailable_reason"])
+        self.assertTrue(content_labeled["available"])
+        self.assertEqual(content_labeled["unavailable_reason"], "")
         public = helpers["_public_h3_long_plan"]({
             "clip_count": 2,
             "clip_frames": [124, 124],
@@ -1260,7 +1373,7 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("{progressUnit} {job.windowCurrent || 1}/{job.windowTotal}", card)
         self.assertIn("Current {progressUnit.toLowerCase()}", card)
         self.assertIn("job.activeWindowPrompt || job.promptPreview", card)
-        self.assertIn(".filter(job => job.status === 'queued' || job.status === 'running')", store)
+        self.assertIn("if (status.status === 'queued' || status.status === 'running')", store)
         self.assertIn("Terminal failures stay", store)
 
     def test_main_studio_window_controls_use_model_effective_values(self):
@@ -1280,8 +1393,10 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("export function alignTotalFrames", timeline)
         self.assertIn("export function alignStudioTotalFrames", timeline)
         self.assertIn("export function usesStudioSegments", timeline)
-        self.assertIn("Segment size", duration)
-        self.assertIn("17-frame grid", duration)
+        self.assertIn("Maximum segment length", duration)
+        self.assertIn("Estimated segments", duration)
+        self.assertIn("not a target or average", duration)
+        self.assertIn("shorter, unequal prompt-driven shots", duration)
 
     def test_automatic_h3_output_restore_returns_to_studio_semantics(self):
         store = Path(ROOT, "ui", "src", "stores", "useStore.ts").read_text(encoding="utf-8")

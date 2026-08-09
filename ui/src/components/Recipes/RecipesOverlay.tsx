@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { X, BookMarked, Trash2, Upload, Play, Loader2, AlertTriangle, Download, ExternalLink, Layers } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import type { RecipeCard, RecipeLora } from '../../api/client'
@@ -7,29 +7,84 @@ import * as api from '../../api/client'
 /**
  * RecipesOverlay — the one-click preset library. Bundled starters + the
  * user's own saved recipes as a thumbnail grid. Clicking a card applies
- * it (switches model + settings, prepopulates the prompt) and closes the
- * overlay so the user lands on a ready-to-generate Studio.
+ * it (switches model + settings and prepopulates the prompt). Fully ready
+ * recipes close into Studio; missing-LoRA recipes remain open with truthful
+ * host-install guidance.
  */
 export function RecipesOverlay() {
   const open = useStore(s => s.recipesOpen)
   const setOpen = useStore(s => s.setRecipesOpen)
   const recipes = useStore(s => s.recipes)
   const loading = useStore(s => s.recipesLoading)
+  const loadError = useStore(s => s.recipesError)
   const applyRecipe = useStore(s => s.applyRecipe)
   const deleteRecipe = useStore(s => s.deleteRecipe)
   const loadRecipes = useStore(s => s.loadRecipes)
   const civitaiKeySet = useStore(s => s.servicesConfig?.civitai_api_key_set ?? false)
   const setSettingsOpen = useStore(s => s.setSettingsOpen)
   const setSettingsTab = useStore(s => s.setSettingsTab)
+  const machineControls = useStore(s => s.accessContext?.machine_controls === true)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const applyingRef = useRef(false)
+  const titleId = useId()
 
   const [applying, setApplying] = useState<string | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [missing, setMissing] = useState<{ modelType: string; loras: RecipeLora[] } | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  const closeOverlay = useCallback(() => {
+    if (!applyingRef.current) setOpen(false)
+  }, [setOpen])
+
+  useEffect(() => {
+    if (!open) return
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    setMissing(null)
+    setError(null)
+    closeButtonRef.current?.focus()
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeOverlay()
+        return
+      }
+      if (event.key !== 'Tab' || !dialogRef.current) return
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ))
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (!dialogRef.current.contains(document.activeElement)) {
+        event.preventDefault()
+        ;(event.shiftKey ? last : first).focus()
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      previousFocus?.focus()
+    }
+  }, [closeOverlay, open])
 
   if (!open) return null
 
   const handleApply = async (card: RecipeCard) => {
+    if (applyingRef.current) return
+    applyingRef.current = true
+    closeButtonRef.current?.focus()
     setApplying(card.id); setError(null); setMissing(null)
+    let closeAfterApply = false
     try {
       const { missing: missingLoras } = await applyRecipe(card.id)
       if (missingLoras.length > 0) {
@@ -38,12 +93,14 @@ export function RecipesOverlay() {
         // (rather than hitting a cryptic "Loras missing" failure at gen time).
         setMissing({ modelType: card.model_type, loras: missingLoras })
       } else {
-        setOpen(false)
+        closeAfterApply = true
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to apply recipe')
     } finally {
+      applyingRef.current = false
       setApplying(null)
+      if (closeAfterApply) setOpen(false)
     }
   }
 
@@ -69,29 +126,67 @@ export function RecipesOverlay() {
     input.click()
   }
 
+  const handleDelete = async (card: RecipeCard) => {
+    if (applyingRef.current) return
+    if (confirmDelete !== card.id) {
+      setConfirmDelete(card.id)
+      window.setTimeout(() => setConfirmDelete(current => current === card.id ? null : current), 4000)
+      return
+    }
+    setConfirmDelete(null)
+    applyingRef.current = true
+    closeButtonRef.current?.focus()
+    setApplying(`delete:${card.id}`)
+    setError(null)
+    try {
+      await deleteRecipe(card.id)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to delete recipe')
+    } finally {
+      applyingRef.current = false
+      setApplying(null)
+    }
+  }
+
   return (
-    <div className="fixed inset-0 z-[80] flex flex-col bg-bg-primary">
+    <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+      className="fixed inset-0 z-[100] flex h-[100dvh] flex-col overflow-hidden bg-bg-primary pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]"
+    >
       {/* Header */}
-      <div className="px-4 py-3 border-b border-border flex items-center gap-2 shrink-0">
+      <div className="px-3 py-3 sm:px-4 border-b border-border flex items-center gap-2 shrink-0">
         <BookMarked size={16} className="text-accent-blue shrink-0" />
-        <h1 className="text-sm font-semibold text-text-primary">Recipes</h1>
-        <span className="text-[11px] text-text-muted">one-click presets — pick a look, tweak the prompt, generate</span>
+        <h1 id={titleId} className="text-sm font-semibold text-text-primary">Recipes</h1>
+        <span className="hidden text-[11px] text-text-muted sm:inline">one-click presets — pick a look, tweak the prompt, generate</span>
         <div className="flex-1" />
-        <button
+        {machineControls && <button
+          type="button"
           onClick={handleImport}
+          disabled={applying !== null}
           className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] bg-bg-tertiary border border-border rounded-lg text-text-secondary hover:text-text-primary hover:border-border-light transition-colors"
+          aria-label="Import a recipe file"
         >
           <Upload size={12} /> Import
-        </button>
-        <button onClick={() => setOpen(false)}
-          className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors border border-border">
+        </button>}
+        <button
+          ref={closeButtonRef}
+          type="button"
+          onClick={closeOverlay}
+          className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors border border-border"
+          aria-label={applying ? 'Recipe action in progress; close is temporarily unavailable' : 'Close recipes'}
+          aria-disabled={applying !== null}
+        >
           <X size={16} />
         </button>
       </div>
 
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain [-webkit-overflow-scrolling:touch]">
       {/* Missing-LoRA notice */}
       {missing && (
-        <div className="px-4 py-2.5 bg-amber-500/10 border-b border-amber-500/30">
+        <div role="status" aria-live="polite" className="px-4 py-2.5 bg-amber-500/10 border-b border-amber-500/30">
           <div className="flex items-start gap-2">
             <AlertTriangle size={14} className="text-indicator-warning shrink-0 mt-0.5" />
             <div className="flex-1 text-[11px] text-text-primary">
@@ -101,68 +196,100 @@ export function RecipesOverlay() {
               </div>
               <div className="space-y-1">
                 {missing.loras.map(l => (
-                  <MissingLoraRow key={l.filename} lora={l} modelType={missing.modelType} civitaiKeySet={civitaiKeySet} />
+                  <MissingLoraRow
+                    key={l.filename}
+                    lora={l}
+                    modelType={missing.modelType}
+                    civitaiKeySet={civitaiKeySet}
+                    canInstall={machineControls}
+                  />
                 ))}
               </div>
-              {!civitaiKeySet && missing.loras.some(l => l.source_url) && (
+              {machineControls && !civitaiKeySet && missing.loras.some(l => l.source_url) && (
                 <div className="mt-1.5 text-[10px] text-text-secondary leading-snug">
                   Auto-download needs a free CivitAI API key.{' '}
-                  <button onClick={openCivitaiKeySettings} className="underline hover:text-text-primary">Add one in Settings</button>
+                  <button type="button" onClick={openCivitaiKeySettings} className="underline hover:text-text-primary">Add one in Settings</button>
                   {' '}— then click Download. Or use each “Open source” link to grab it manually.
                 </div>
               )}
               <div className="mt-1.5 text-[10px] text-text-secondary">
-                The recipe is applied and ready — you just need the LoRA before you Generate.
+                {machineControls
+                  ? 'The recipe is applied in Studio. Install the LoRA before you Generate.'
+                  : 'The recipe is applied in Studio, but this LoRA can only be installed by the Maestro host owner. Ask them to install it before you Generate.'}
               </div>
             </div>
-            <button onClick={() => { setMissing(null); setOpen(false) }}
+            <button type="button" onClick={() => { setMissing(null); closeOverlay() }}
               className="text-[10px] text-text-secondary hover:text-text-primary shrink-0">Dismiss</button>
           </div>
         </div>
       )}
       {error && (
-        <div className="px-4 py-2 bg-red-500/10 border-b border-red-500/30 text-[11px] text-chip-red">{error}</div>
+        <div role="alert" className="px-4 py-2 bg-red-500/10 border-b border-red-500/30 text-[11px] text-chip-red">{error}</div>
       )}
 
       {/* Grid */}
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="p-3 sm:p-4">
         {loading ? (
           <div className="flex items-center justify-center min-h-[300px] text-text-muted">
             <Loader2 size={22} className="animate-spin" />
           </div>
+        ) : loadError ? (
+          <div className="flex flex-col items-center justify-center min-h-[300px] gap-3 text-text-muted text-center">
+            <AlertTriangle size={28} />
+            <p role="alert" className="text-sm max-w-xs">{loadError}</p>
+            <button
+              type="button"
+              onClick={() => void loadRecipes()}
+              className="rounded-lg border border-border bg-bg-secondary px-3 py-1.5 text-xs text-text-primary hover:bg-bg-hover"
+            >
+              Try again
+            </button>
+          </div>
         ) : recipes.length === 0 ? (
           <div className="flex flex-col items-center justify-center min-h-[300px] gap-3 text-text-muted text-center">
             <BookMarked size={28} />
-            <p className="text-sm max-w-xs">No recipes yet. Generate something you like, then use
-              “Save as Recipe” on it — or Import a recipe file.</p>
+            <p className="text-sm max-w-xs">
+              {machineControls
+                ? 'No recipes yet. Generate something you like, then use “Save as Recipe” on it — or import a recipe file.'
+                : 'No bundled recipes are available on this Maestro host.'}
+            </p>
           </div>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(min(200px,100%),1fr))] gap-3">
             {recipes.map(card => (
               <RecipeGridCard
                 key={card.id}
                 card={card}
                 applying={applying === card.id}
+                disabled={applying !== null}
                 onApply={() => handleApply(card)}
-                onDelete={card.source === 'user' ? () => deleteRecipe(card.id) : undefined}
+                onDelete={card.source === 'user' ? () => void handleDelete(card) : undefined}
+                deleteConfirming={confirmDelete === card.id}
               />
             ))}
           </div>
         )}
       </div>
+      </div>
     </div>
   )
 }
 
-function RecipeGridCard({ card, applying, onApply, onDelete }: {
-  card: RecipeCard; applying: boolean; onApply: () => void; onDelete?: () => void
+function RecipeGridCard({ card, applying, disabled, onApply, onDelete, deleteConfirming }: {
+  card: RecipeCard; applying: boolean; disabled: boolean; onApply: () => void; onDelete?: () => void; deleteConfirming: boolean
 }) {
   return (
     <div className="group relative rounded-xl border border-border bg-bg-secondary overflow-hidden hover:border-accent-blue/60 transition-colors flex flex-col">
       {/* Thumbnail */}
-      <button onClick={onApply} disabled={applying} className="block aspect-video bg-bg-tertiary relative">
+      <button
+        type="button"
+        onClick={onApply}
+        disabled={disabled}
+        className="block aspect-video bg-bg-tertiary relative"
+        aria-label={`Apply recipe ${card.name} in Studio`}
+      >
         {card.thumbnail_url ? (
-          <img src={card.thumbnail_url} alt={card.name} className="absolute inset-0 w-full h-full object-cover" />
+          <img src={card.thumbnail_url} alt="" className="absolute inset-0 w-full h-full object-cover" />
         ) : (
           <div className="absolute inset-0 flex items-center justify-center text-text-muted">
             <BookMarked size={28} />
@@ -173,9 +300,6 @@ function RecipeGridCard({ card, applying, onApply, onDelete }: {
             ? <Loader2 size={22} className="text-white animate-spin" />
             : <Play size={22} className="text-white opacity-0 group-hover:opacity-100 transition-opacity" />}
         </div>
-        {card.nsfw && (
-          <span className="absolute top-1.5 left-1.5 text-[8px] uppercase tracking-wide bg-red-500/80 text-white rounded px-1 py-0.5">Mature</span>
-        )}
       </button>
 
       {/* Body */}
@@ -183,9 +307,12 @@ function RecipeGridCard({ card, applying, onApply, onDelete }: {
         <div className="flex items-start justify-between gap-1.5">
           <div className="text-xs font-medium text-text-primary leading-tight">{card.name}</div>
           {onDelete && (
-            <button onClick={onDelete} title="Delete recipe"
-              className="shrink-0 p-0.5 rounded text-text-muted hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100">
-              <Trash2 size={12} />
+            <button type="button" onClick={onDelete} disabled={disabled}
+              title={deleteConfirming ? 'Click again to confirm delete' : 'Delete recipe'}
+              aria-label={deleteConfirming ? `Confirm delete recipe ${card.name}` : `Delete recipe ${card.name}`}
+              className={`shrink-0 min-h-11 min-w-11 -m-2 px-2 flex items-center justify-center gap-1 rounded transition-colors sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 focus-visible:opacity-100 ${deleteConfirming ? 'text-red-400 bg-red-500/10 sm:opacity-100' : 'text-text-muted hover:text-red-400'}`}>
+              <Trash2 size={14} />
+              {deleteConfirming && <span className="text-[10px] font-medium">Confirm?</span>}
             </button>
           )}
         </div>
@@ -203,7 +330,12 @@ function RecipeGridCard({ card, applying, onApply, onDelete }: {
   )
 }
 
-function MissingLoraRow({ lora, modelType, civitaiKeySet }: { lora: RecipeLora; modelType: string; civitaiKeySet: boolean }) {
+function MissingLoraRow({ lora, modelType, civitaiKeySet, canInstall }: {
+  lora: RecipeLora
+  modelType: string
+  civitaiKeySet: boolean
+  canInstall: boolean
+}) {
   const downloadRecipeLora = useStore(s => s.downloadRecipeLora)
   const [state, setState] = useState<'idle' | 'downloading' | 'done' | 'error'>('idle')
 
@@ -229,23 +361,24 @@ function MissingLoraRow({ lora, modelType, civitaiKeySet }: { lora: RecipeLora; 
   )
 
   return (
-    <div className="flex items-center gap-2">
-      <span className="font-mono text-text-secondary truncate">{lora.filename}</span>
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+      <span className="min-w-0 max-w-full break-all font-mono text-text-secondary">{lora.filename}</span>
       {lora.size_mb ? <span className="text-text-secondary shrink-0">~{Math.round(lora.size_mb)} MB</span> : null}
       {/* In-app auto-download needs a CivitAI key. With a key → offer Download;
           without → skip the button (it would just fail) and show the source
           link so the user can grab it manually. */}
-      {lora.source_url && civitaiKeySet && state === 'idle' && (
-        <button onClick={handleDownload}
+      {!canInstall && <span className="text-text-secondary shrink-0">host installation required</span>}
+      {canInstall && lora.source_url && civitaiKeySet && state === 'idle' && (
+        <button type="button" onClick={handleDownload}
           className="flex items-center gap-0.5 text-accent-blue hover:text-accent-blue-hover shrink-0">
           <Download size={10} /> Download
         </button>
       )}
-      {lora.source_url && !civitaiKeySet && state === 'idle' && sourceLink}
-      {state === 'downloading' && <Loader2 size={10} className="animate-spin text-indicator-warning shrink-0" />}
-      {state === 'done' && <span className="text-indicator-success shrink-0">started ↓ (see download bar)</span>}
-      {state === 'error' && sourceLink}
-      {!lora.source_url && state === 'idle' && sourceLink}
+      {canInstall && lora.source_url && !civitaiKeySet && state === 'idle' && sourceLink}
+      {canInstall && state === 'downloading' && <Loader2 size={10} className="animate-spin text-indicator-warning shrink-0" />}
+      {canInstall && state === 'done' && <span className="text-indicator-success shrink-0">started ↓ (see download bar)</span>}
+      {canInstall && state === 'error' && sourceLink}
+      {canInstall && !lora.source_url && state === 'idle' && sourceLink}
     </div>
   )
 }

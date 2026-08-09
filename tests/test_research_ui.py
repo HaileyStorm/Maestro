@@ -60,7 +60,7 @@ class ResearchUiContracts(unittest.TestCase):
 
     def test_polling_is_resilient_and_below_threshold_action_is_enabled(self):
         card = PANEL[PANEL.index("function ResearchCard()"):]
-        self.assertIn("window.setTimeout", card)
+        self.assertIn("useVisibilityPolling(refresh, POLL_INTERVAL_MS.researchVisible)", card)
         self.assertNotIn("window.setInterval", card)
         self.assertIn("sequence !== requestSequence.current", card)
         self.assertIn("catch (error)", card)

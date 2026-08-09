@@ -24,6 +24,7 @@ const SEEN_KEY = 'maestro_welcome_seen_v1'
 export function WelcomeModal() {
   const accessContext = useStore(state => state.accessContext)
   const activeWorkspace = useStore(state => state.activeWorkspace)
+  const setSidebarMode = useStore(state => state.setSidebarMode)
   const titleId = useId()
   const descriptionId = useId()
   const dialogRef = useRef<HTMLDivElement>(null)
@@ -40,6 +41,11 @@ export function WelcomeModal() {
     try { localStorage.setItem(SEEN_KEY, '1') } catch { /* storage may be blocked */ }
     setOpen(false)
   }, [])
+
+  const enterStudio = useCallback(() => {
+    setSidebarMode('studio')
+    dismiss()
+  }, [dismiss, setSidebarMode])
 
   useEffect(() => {
     if (!open) return
@@ -87,16 +93,24 @@ export function WelcomeModal() {
       : 'Open Maestro from Pinokio for the most direct, dependable local connection.'
 
   return (
-    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-3 sm:p-6" onClick={dismiss}>
+    <div
+      className="fixed inset-0 z-[120] flex items-center justify-center overflow-hidden bg-black/70 p-3 sm:p-6"
+      style={{
+        paddingTop: 'max(0.75rem, env(safe-area-inset-top))',
+        paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))',
+      }}
+      onClick={dismiss}
+    >
       <div
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
-        className="w-full max-w-3xl max-h-[92vh] overflow-y-auto rounded-2xl border border-border bg-bg-secondary shadow-2xl"
+        className="flex w-full max-w-3xl max-h-[calc(100dvh-1.5rem)] min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-bg-secondary shadow-2xl sm:max-h-[92vh]"
         onClick={e => e.stopPropagation()}
       >
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain [-webkit-overflow-scrolling:touch]">
         <div className="relative overflow-hidden border-b border-border px-5 pb-5 pt-6 sm:px-7 sm:pb-6 sm:pt-7">
           <div className="pointer-events-none absolute -right-16 -top-24 h-64 w-64 rounded-full bg-accent-blue/15 blur-3xl" />
           <div className="relative flex items-start gap-3 sm:gap-4">
@@ -114,7 +128,7 @@ export function WelcomeModal() {
                 Move from a single idea to finished images, video, audio, and connected stories—without losing sight of the work between.
               </p>
             </div>
-            <button onClick={dismiss} className="shrink-0 rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label="Close welcome to Maestro">
+            <button type="button" onClick={dismiss} className="shrink-0 rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label="Close welcome to Maestro">
               <X size={17} />
             </button>
           </div>
@@ -155,8 +169,9 @@ export function WelcomeModal() {
             </FeaturePoint>
           </div>
         </div>
+        </div>
 
-        <div className="border-t border-border px-5 py-4 sm:flex sm:items-center sm:justify-between sm:gap-5 sm:px-7">
+        <div className="sticky bottom-0 shrink-0 border-t border-border bg-bg-secondary px-5 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:flex sm:items-center sm:justify-between sm:gap-5 sm:px-7">
           <div className="space-y-1.5 text-[10px] leading-relaxed text-text-muted sm:max-w-lg sm:text-[11px]">
             <div className="flex items-start gap-2">
               <ShieldCheck size={14} className="mt-0.5 shrink-0 text-accent-green" />
@@ -169,7 +184,8 @@ export function WelcomeModal() {
           </div>
           <button
             ref={startButtonRef}
-            onClick={dismiss}
+            type="button"
+            onClick={enterStudio}
             className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-gradient-cta-from to-gradient-cta-to px-5 py-2.5 text-xs font-semibold text-white transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue sm:mt-0 sm:w-auto"
           >
             Enter the studio <ArrowRight size={14} />

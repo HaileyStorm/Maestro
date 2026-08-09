@@ -29,6 +29,7 @@ from services.output_access import (  # noqa: E402
     can_access_upload,
     write_upload_access_sidecar,
 )
+from services import llm_operations  # noqa: E402
 
 
 class _HTTPException(Exception):
@@ -39,6 +40,23 @@ class _HTTPException(Exception):
 
 
 def _launch_namespace(names: set[str], **overrides):
+    if "_execute_llm_chat" in names:
+        names = {
+            *names,
+            "_emit_llm_progress",
+            "_explicit_llm_guidance_allowed",
+            "_llm_chat_sampling_options",
+            "_validate_llm_chat_request",
+            "_resolved_local_response_assist",
+        }
+    if "llm_chat" in names:
+        names = {
+            *names,
+            "_normalize_llm_chat_request_id",
+            "_llm_chat_request_digest",
+            "_llm_chat_sampling_options",
+            "_validate_llm_chat_request",
+        }
     source = LAUNCH_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(LAUNCH_PATH))
     body = []
@@ -74,10 +92,23 @@ def _launch_namespace(names: set[str], **overrides):
         },
         "_LLM_CHAT_UPLOAD_MARKER_SUFFIX": ".llm-chat-upload.json",
         "_LLM_CHAT_UPLOAD_TTL_SECONDS": 24 * 60 * 60,
-        "_DEFAULT_LLM_REPO": "Abhiray/gemma-4-E4B-it-heretic-GGUF",
+        "_DEFAULT_LLM_REPO": "MoonRide/gemma-4-31B-it-heretic-ara-GGUF",
         "_llm_chat_upload_lock": threading.RLock(),
         "_llm_project_instance_lock": threading.Lock(),
         "_llm_chat_admission": threading.BoundedSemaphore(1),
+        "_run_llm_with_selection": (
+            lambda _selection, operation, *args, **kwargs:
+            operation(*args, **kwargs)
+        ),
+        "_run_authorized_llm_with_selection": (
+            lambda _request, _selection, operation, *args, **kwargs:
+            operation(*args, **kwargs)
+        ),
+        "_llm_operation_scope": lambda *_args: ("owner", "project"),
+        "_session_secret": lambda: b"test-session-secret",
+        "JSONResponse": __import__(
+            "fastapi.responses", fromlist=["JSONResponse"],
+        ).JSONResponse,
         **overrides,
     }
     exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
@@ -310,6 +341,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
                     "messages": [{"role": "user", "content": "What is shown?"}],
                     "guide_ids": [],
                     "image_paths": ["upload.png"],
+                    "request_id": "44444444-4444-4444-8444-444444444444",
                 }
 
         def resolve_media(request, raw, workspace):
@@ -333,7 +365,6 @@ class MultimodalChatRouteTests(unittest.TestCase):
             load_chat_guides=lambda _value: ([], ""),
             generate_chat=generate_chat,
         )
-        package = types.SimpleNamespace(llm_service=service)
         namespace = _launch_namespace(
             {
                 "_resolve_llm_chat_images", "_execute_llm_chat", "llm_chat",
@@ -356,8 +387,29 @@ class MultimodalChatRouteTests(unittest.TestCase):
                 "vision_capable": True,
             },
         )
-        with mock.patch.dict(sys.modules, {"services": package}):
-            result = asyncio.run(namespace["llm_chat"](Request()))
+        manager = llm_operations.LlmChatOperationManager(ttl_seconds=60)
+
+        async def exercise():
+            response = await namespace["llm_chat"](Request())
+            for _ in range(100):
+                status = manager.status(
+                    "44444444444444448444444444444444",
+                    owner_key="owner", project_key="project",
+                )
+                if status and status["status"] == "completed":
+                    return response, status
+                await asyncio.sleep(0.001)
+            self.fail("Chat operation did not complete")
+
+        with mock.patch.object(
+            sys.modules["services"], "llm_service", service,
+            create=True,
+        ), mock.patch.dict(sys.modules, {
+            "services.llm_operations": llm_operations,
+        }), mock.patch.object(
+            llm_operations, "llm_chat_operation_manager", manager,
+        ):
+            response, result = asyncio.run(exercise())
 
         self.assertEqual(events, [
             "authorize",
@@ -368,7 +420,8 @@ class MultimodalChatRouteTests(unittest.TestCase):
         self.assertEqual(
             captured["image_paths"], ["/authorized/uploads/upload.png"],
         )
-        self.assertEqual(result["text"], "answer")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(result["result"]["text"], "answer")
 
     def test_foreign_upload_reference_is_denied_before_generation(self):
         generated = []
@@ -399,7 +452,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 404)
         self.assertEqual(generated, [])
 
-    def test_client_cancel_keeps_chat_cleanup_attached_to_server_work(self):
+    def test_submit_returns_while_chat_cleanup_stays_attached_to_server_work(self):
         entered = asyncio.Event()
         finish = asyncio.Event()
         cleaned = []
@@ -416,6 +469,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
                     "model_id": "vision/model",
                     "messages": [{"role": "user", "content": "Inspect"}],
                     "image_paths": ["upload.png"],
+                    "request_id": "33333333-3333-4333-8333-333333333333",
                 }
 
         async def execute(*_args):
@@ -433,19 +487,38 @@ class MultimodalChatRouteTests(unittest.TestCase):
             _cleanup_llm_chat_uploads=lambda *_args: cleaned.append(True),
             _execute_llm_chat=execute,
         )
+        namespace["_validate_llm_chat_request"] = lambda *_args: {
+            "messages": [{"role": "user", "content": "Inspect"}],
+            "guide_ids": [],
+            "system_prompt": "",
+            "selection": {"vision_capable": True},
+            "max_new_tokens": 2048,
+            "temperature": 0.7,
+            "top_p": 0.9,
+        }
+
+        manager = llm_operations.LlmChatOperationManager(ttl_seconds=60)
 
         async def exercise():
-            task = asyncio.create_task(namespace["llm_chat"](Request()))
+            response = await namespace["llm_chat"](Request())
+            self.assertEqual(response.status_code, 202)
             await entered.wait()
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
             self.assertEqual(cleaned, [])
             finish.set()
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            for _ in range(100):
+                status = manager.status(
+                    "33333333333343338333333333333333",
+                    owner_key="owner", project_key="project",
+                )
+                if status and status["status"] == "completed":
+                    return
+                await asyncio.sleep(0.001)
+            self.fail("Chat operation did not complete")
 
-        asyncio.run(exercise())
+        with mock.patch.object(
+            llm_operations, "llm_chat_operation_manager", manager,
+        ):
+            asyncio.run(exercise())
         self.assertEqual(cleaned, [True])
 
     def test_known_text_only_model_rejects_images_before_inference(self):

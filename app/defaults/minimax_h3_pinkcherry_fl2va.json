@@ -12,8 +12,7 @@
         "text_encoder_folder": "minimax_h3",
         "text_encoder_quantization": "int8",
         "nsfw_only": true,
-        "preferred_explicit_fl2va": true,
-        "preferred_explicit_conditioner": true,
+        "h3_convrot": true,
         "model_update": {
             "enabled": true,
             "provider": "huggingface",

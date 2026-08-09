@@ -72,6 +72,7 @@ def _security_namespace():
         "_remote_local_only_denial",
         "_is_loopback_request_client",
         "_runtime_share_registration_is_local",
+        "get_access_context",
         "register_runtime_share_url",
     }
     body = []
@@ -94,7 +95,7 @@ def _security_namespace():
         )
         if selected:
             selected_node = copy.deepcopy(node)
-            if isinstance(selected_node, ast.AsyncFunctionDef):
+            if isinstance(selected_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 selected_node.decorator_list = []
             body.append(selected_node)
     module = ast.Module(body=body, type_ignores=[])
@@ -243,6 +244,34 @@ class OriginPolicyTests(unittest.TestCase):
             self.assertEqual(result, {"status": "ok", "share_url": stable})
             self.assertTrue(classify(request))
             self.assertIsNone(reject(request))
+
+    def test_verified_stable_proxy_is_remote_without_machine_controls_and_keeps_csrf_pair(self):
+        reject = self.security["_reject_cross_origin_mutation"]
+        classify = self.security["_request_is_cloudflare_remote"]
+        access_context = self.security["get_access_context"]
+        stable = "https://maestro.account.workers.dev"
+        quick = "https://current-tunnel.trycloudflare.com"
+        request = _Request(
+            base_url=quick + "/",
+            origin=stable,
+            x_forwarded_proto="https",
+            x_forwarded_host="current-tunnel.trycloudflare.com",
+            cf_ray="abc123-DEN",
+        )
+        with patch.dict(os.environ, {"PINOKIO_SHARE_CLOUDFLARE": "true"}, clear=False):
+            self._register_runtime_share(stable=stable, quick=quick)
+            remote = classify(request)
+            request.state = types.SimpleNamespace(maestro_remote=remote)
+            context = access_context(request)
+            self.assertTrue(remote)
+            self.assertIsNone(reject(request))
+
+        self.assertTrue(context["remote"])
+        self.assertTrue(context["project_password_required"])
+        self.assertFalse(context["machine_controls"])
+        self.assertFalse(context["custom_model_sources"])
+        self.assertFalse(context["classic_ui"])
+        self.assertEqual(context["share_url"], "")
 
     def test_other_workers_dev_origin_is_rejected_on_registered_quick_target(self):
         reject = self.security["_reject_cross_origin_mutation"]
@@ -417,6 +446,9 @@ class OriginPolicyTests(unittest.TestCase):
             )).status_code, 403)
             self.assertEqual(deny(_Request(
                 path="/api/v1/llm/unload", **remote_headers,
+            )).status_code, 403)
+            self.assertEqual(deny(_Request(
+                path="/api/v1/llm/refusal-literals", **remote_headers,
             )).status_code, 403)
             self.assertEqual(deny(_Request(
                 path="/api/v1/llm/stream-status", method="GET", **remote_headers,
@@ -1225,37 +1257,34 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 get_model_def=lambda _model: {},
             ),
         }
-        mature = types.ModuleType("services.mature_policy")
-        mature.request_is_mature = lambda **_kwargs: False
-        with patch.dict(sys.modules, {"services.mature_policy": mature}):
-            exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
-            registry = namespace["_JobRegistry"]()
-            registry["visible"] = {
-                "model_type": "visible-video", "params": {},
-            }
-            explicitly_downgraded = {
-                "model_type": "visible-video", "params": {},
-                "source_remote": False,
-            }
-            registry["explicit-false"] = explicitly_downgraded
-            self.assertTrue(explicitly_downgraded["source_remote"])
-            with self.assertRaises(FakeHTTPException) as raised:
-                registry["hidden-direct"] = {
-                    "model_type": "hidden-video", "params": {},
-                }
-            self.assertEqual(raised.exception.status_code, 404)
-            with self.assertRaises(FakeHTTPException):
-                registry["hidden-segment"] = {
-                    "model_type": "visible-video",
-                    "params": {"_h3_longform": {"segment_models": [
-                        {"model_type": "hidden-ref2va"},
-                    ]}},
-                }
-
-            remote_context.value = False
-            registry["local-hidden"] = {
+        exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
+        registry = namespace["_JobRegistry"]()
+        registry["visible"] = {
+            "model_type": "visible-video", "params": {},
+        }
+        explicitly_downgraded = {
+            "model_type": "visible-video", "params": {},
+            "source_remote": False,
+        }
+        registry["explicit-false"] = explicitly_downgraded
+        self.assertTrue(explicitly_downgraded["source_remote"])
+        with self.assertRaises(FakeHTTPException) as raised:
+            registry["hidden-direct"] = {
                 "model_type": "hidden-video", "params": {},
             }
+        self.assertEqual(raised.exception.status_code, 404)
+        with self.assertRaises(FakeHTTPException):
+            registry["hidden-segment"] = {
+                "model_type": "visible-video",
+                "params": {"_h3_longform": {"segment_models": [
+                    {"model_type": "hidden-ref2va"},
+                ]}},
+            }
+
+        remote_context.value = False
+        registry["local-hidden"] = {
+            "model_type": "hidden-video", "params": {},
+        }
 
     def test_audio_analysis_status_is_opaque_owner_and_project_scoped(self):
         class FakeHTTPException(Exception):

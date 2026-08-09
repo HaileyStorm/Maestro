@@ -15,8 +15,8 @@ import subprocess
 from typing import Any, Callable, Mapping
 
 
-SCHEMA_VERSION = 2
-LEGACY_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
+SCHEMA_VERSION = 4
+LEGACY_SCHEMA_VERSIONS = {1, 2, 3, SCHEMA_VERSION}
 CASE_IDS = ("text_only", "first_frame", "first_last", "ref2va")
 QUICK_TASK = {
     "width": 608,
@@ -48,11 +48,15 @@ class H3BenchmarkError(ValueError):
 
 
 _SAFE_SPEC_FIELDS = {
-    "hardware": {"gpu", "compute_capability", "vram_gb"},
+    "hardware": {"gpu", "compute_capability", "vram_gb", "power_limit_watts"},
     "runtime": {"torch", "cuda", "triton", "model_load_state"},
-    "model": {"id", "family", "quantization", "accelerator"},
+    "model": {"id", "family", "quantization", "accelerator", "accelerator_version"},
     "engine": {"id", "effective_id", "tau", "dense_steps", "dense_blocks", "min_tokens"},
     "encoder": {"id", "quantization"},
+}
+_SAFE_PHASE_FIELDS = {
+    "generation", "model_load", "spectrum_anchor_capture",
+    "spectrum_offline_replay", "postprocess",
 }
 
 
@@ -125,6 +129,8 @@ def build_benchmark_spec(
             "profile", "width", "height", "frame_count", "fps",
             "sampling_steps", "window_count", "processed_frame_count",
             "lora_count", "cache_enabled", "warmup_runs", "measured_runs",
+            "source_audio_mode", "audio_algorithm_version",
+            "video_evaluations", "audio_evaluations", "multirate_profile",
         )
         if key in raw_task and isinstance(raw_task[key], (str, int, float, bool))
     }
@@ -140,6 +146,33 @@ def build_benchmark_spec(
     signature = _safe_input_shape(input_signature)
     if case_id != "text_only" and not signature:
         raise H3BenchmarkError(f"{case_id} requires a content-free reference shape")
+    source_audio_mode = str(resolved_task.get("source_audio_mode") or "native")
+    if source_audio_mode not in {
+        "native", "lock_source", "remix_source", "reference_only",
+    }:
+        raise H3BenchmarkError("Unknown H3 source-audio benchmark mode")
+    audio_algorithm_version = str(
+        resolved_task.get("audio_algorithm_version") or ""
+    )
+    if source_audio_mode == "native":
+        if audio_algorithm_version:
+            raise H3BenchmarkError(
+                "Native H3 benchmark records cannot carry a source-audio algorithm identity"
+            )
+    elif audio_algorithm_version != "maestro_h3_source_audio_v1":
+        raise H3BenchmarkError("Invalid H3 source-audio algorithm identity")
+    multirate = str(resolved_task.get("multirate_profile") or "")
+    if multirate:
+        try:
+            multirate_valid = (
+                multirate == "t8_4v8a_evidence_v1"
+                and int(resolved_task.get("video_evaluations") or 0) == 4
+                and int(resolved_task.get("audio_evaluations") or 0) == 8
+            )
+        except (TypeError, ValueError):
+            multirate_valid = False
+        if not multirate_valid:
+            raise H3BenchmarkError("Invalid H3 multirate benchmark identity")
     spec = {
         "schema_version": SCHEMA_VERSION,
         "case_id": case_id,
@@ -180,6 +213,11 @@ def measure_benchmark(
         output_valid=observed.get("output_valid") is True,
         peak_gpu_memory_bytes=observed.get("peak_gpu_memory_bytes"),
         phase_times_seconds=observed.get("phase_times_seconds"),
+        actual_transformer_calls=observed.get("actual_transformer_calls"),
+        forecast_transformer_calls=observed.get("forecast_transformer_calls"),
+        replay_transformer_calls=observed.get("replay_transformer_calls"),
+        average_power_watts=observed.get("average_power_watts"),
+        energy_joules=observed.get("energy_joules"),
     )
 
 
@@ -191,6 +229,11 @@ def record_observation(
     output_valid: bool,
     peak_gpu_memory_bytes: int | None = None,
     phase_times_seconds: Mapping[str, Any] | None = None,
+    actual_transformer_calls: int | None = None,
+    forecast_transformer_calls: int | None = None,
+    replay_transformer_calls: int | None = None,
+    average_power_watts: float | None = None,
+    energy_joules: float | None = None,
 ) -> dict[str, Any]:
     immutable_spec = json.loads(json.dumps(dict(spec)))
     wall = float(wall_time_seconds)
@@ -201,6 +244,33 @@ def record_observation(
         raise H3BenchmarkError("Benchmark output did not pass finite/artifact validation")
     if peak_gpu_memory_bytes is not None and int(peak_gpu_memory_bytes) < 0:
         raise H3BenchmarkError("peak_gpu_memory_bytes cannot be negative")
+    optional_metrics: dict[str, int | float] = {}
+    for key, value in (
+        ("actual_transformer_calls", actual_transformer_calls),
+        ("forecast_transformer_calls", forecast_transformer_calls),
+        ("replay_transformer_calls", replay_transformer_calls),
+    ):
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or not float(value).is_integer()
+            or int(value) < 0
+        ):
+            raise H3BenchmarkError(f"{key} must be a non-negative whole number")
+        optional_metrics[key] = int(value)
+    for key, value in (
+        ("average_power_watts", average_power_watts),
+        ("energy_joules", energy_joules),
+    ):
+        if value is None:
+            continue
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0:
+            raise H3BenchmarkError(f"{key} must be a finite non-negative number")
+        optional_metrics[key] = numeric
     return {
         "schema_version": SCHEMA_VERSION,
         "cache_key": immutable_spec["cache_key"],
@@ -210,10 +280,19 @@ def record_observation(
         "generation_wall_time_seconds": wall,
         "effective_output_fps": frames / wall,
         "peak_gpu_memory_bytes": None if peak_gpu_memory_bytes is None else int(peak_gpu_memory_bytes),
-        "phase_times_seconds": dict(phase_times_seconds or {}),
+        "phase_times_seconds": {
+            key: float(value)
+            for key, value in dict(phase_times_seconds or {}).items()
+            if key in _SAFE_PHASE_FIELDS
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) >= 0
+        },
         "output_frames": frames,
         "output_valid": True,
         "sample_count": 1,
+        **optional_metrics,
     }
 
 
@@ -230,9 +309,29 @@ def _sanitize_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
             "profile", "width", "height", "frame_count", "fps",
             "sampling_steps", "window_count", "processed_frame_count",
             "lora_count", "cache_enabled", "warmup_runs", "measured_runs",
+            "source_audio_mode", "audio_algorithm_version",
+            "video_evaluations", "audio_evaluations", "multirate_profile",
         )
         if key in raw_task and isinstance(raw_task[key], (str, int, float, bool))
     }
+    source_audio_mode = str(safe_task.get("source_audio_mode") or "native")
+    audio_algorithm_version = str(safe_task.get("audio_algorithm_version") or "")
+    if source_audio_mode not in {
+        "native", "lock_source", "remix_source", "reference_only",
+    }:
+        return None
+    if source_audio_mode == "native":
+        if audio_algorithm_version:
+            return None
+    elif audio_algorithm_version != "maestro_h3_source_audio_v1":
+        return None
+    multirate = str(safe_task.get("multirate_profile") or "")
+    if multirate and not (
+        multirate == "t8_4v8a_evidence_v1"
+        and safe_task.get("video_evaluations") == 4
+        and safe_task.get("audio_evaluations") == 8
+    ):
+        return None
     safe_spec = {
         "schema_version": SCHEMA_VERSION,
         "case_id": str(raw_spec.get("case_id") or "text_only"),
@@ -262,6 +361,23 @@ def _sanitize_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
     observed_day = str(source.get("observed_day_utc") or "")
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", observed_day) is None:
         observed_day = "legacy"
+    safe_metrics: dict[str, int | float] = {}
+    for key in (
+        "actual_transformer_calls", "forecast_transformer_calls",
+        "replay_transformer_calls", "average_power_watts", "energy_joules",
+    ):
+        value = source.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0:
+            continue
+        if key.endswith("_calls"):
+            if not numeric.is_integer():
+                continue
+            safe_metrics[key] = int(numeric)
+        else:
+            safe_metrics[key] = numeric
     return {
         "schema_version": SCHEMA_VERSION,
         "cache_key": safe_spec["cache_key"],
@@ -276,12 +392,14 @@ def _sanitize_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
         "phase_times_seconds": {
             key: float(value)
             for key, value in dict(source.get("phase_times_seconds") or {}).items()
-            if key in {"generation", "model_load"}
-            and isinstance(value, (int, float)) and value >= 0
+            if key in _SAFE_PHASE_FIELDS
+            and isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and value >= 0
         },
         "output_frames": frames,
         "output_valid": True,
         "sample_count": sample_count,
+        **safe_metrics,
     }
 
 
@@ -323,6 +441,23 @@ def normalize_estimate_context(context: Mapping[str, Any]) -> dict[str, Any]:
     custom = context.get("custom_settings")
     if not isinstance(custom, Mapping):
         custom = {}
+    spectrum_profile = str(custom.get("h3_spectrum_profile") or "")
+    spectrum_version = ""
+    lightx2v_profile = str(custom.get("h3_lightx2v_profile") or "")
+    source_audio_mode = str(custom.get("h3_source_audio_mode") or "native")
+    if source_audio_mode not in {
+        "native", "lock_source", "remix_source", "reference_only",
+    }:
+        raise H3BenchmarkError("Unknown H3 source-audio estimate mode")
+    multirate = str(custom.get("h3_multirate_profile") or "")
+    if multirate:
+        # The dual-clock lane has no generation path or honest runtime ETA.
+        raise H3BenchmarkError(
+            "H3 multirate timing is unavailable until live benchmark acceptance"
+        )
+    if spectrum_profile == "spectrum_h3_v1":
+        from models.minimax_h3.spectrum import SPECTRUM_ALGORITHM_VERSION
+        spectrum_version = SPECTRUM_ALGORITHM_VERSION
     reference = context.get("reference_shape")
     if not isinstance(reference, Mapping):
         reference = {}
@@ -336,6 +471,47 @@ def normalize_estimate_context(context: Mapping[str, Any]) -> dict[str, Any]:
     engine_id = str(custom.get("h3_attention_engine") or "sol_attn")
     if engine_id not in {"sdpa", "sol_attn", "sage2"}:
         raise H3BenchmarkError(f"Unknown H3 attention engine: {engine_id}")
+    if lightx2v_profile and engine_id != "sdpa":
+        raise H3BenchmarkError("LightX2V H3 estimates require Dense SDPA")
+    if source_audio_mode != "native":
+        from services.h3_audio import (
+            H3AudioCompatibilityError,
+            resolve_h3_audio_roles,
+        )
+
+        try:
+            primary = int(custom.get("h3_primary_audio_ordinal", 1) or 1)
+        except (TypeError, ValueError):
+            primary = 1
+        structural_guides = tuple(
+            f"audio-slot-{index}" for index in range(1, max(1, primary) + 1)
+        )
+        try:
+            resolve_h3_audio_roles(
+                selected_model_type=str(context.get("model_type") or "minimax_h3"),
+                model_def={
+                    "minimax_h3_reference_mode": str(
+                        context.get("model_type") or "minimax_h3"
+                    ) == "minimax_h3_ref2va",
+                },
+                custom_settings=custom,
+                sampling_steps=steps,
+                attention_engine=engine_id,
+                audio_prompt_type="".join(
+                    "ABC"[index] for index in range(min(3, len(structural_guides)))
+                ),
+                audio_guides=structural_guides,
+                semantic_references=semantic_count > 0,
+                multisegment=window_count > 1,
+                activated_loras=activated,
+                loras_multipliers=context.get("loras_multipliers"),
+                skip_steps_cache_type=context.get("tea_cache"),
+                native_boundary=bool(
+                    custom.get("h3_native_boundary_conditioning")
+                ),
+            )
+        except H3AudioCompatibilityError as exc:
+            raise H3BenchmarkError(str(exc)) from exc
     engine_signature: dict[str, Any] = {"id": engine_id}
     if engine_id == "sol_attn":
         try:
@@ -401,9 +577,19 @@ def normalize_estimate_context(context: Mapping[str, Any]) -> dict[str, Any]:
         "lora_count": lora_count,
         "cache_enabled": bool(context.get("tea_cache")),
         "accelerator": (
-            "turbo"
+            "spectrum"
+            if spectrum_profile == "spectrum_h3_v1"
+            else "lightx2v"
+            if lightx2v_profile == "h3_lightx2v_fl2v_4_v1"
+            else "turbo"
             if str(custom.get("h3_turbo_profile") or "") == "h3_turbo_v4"
             else "native"
+        ),
+        "accelerator_version": spectrum_version or lightx2v_profile,
+        "source_audio_mode": source_audio_mode,
+        "audio_algorithm_version": (
+            "maestro_h3_source_audio_v1"
+            if source_audio_mode != "native" else ""
         ),
         "spatial_upsampling": spatial_upsampling,
         "delivery_width": delivery_width,
@@ -526,6 +712,10 @@ def estimate_h3_output(
         accelerator_match = str(
             spec.get("model", {}).get("accelerator") or "native"
         ) == target["accelerator"]
+        if accelerator_match and target["accelerator"] in {"spectrum", "lightx2v"}:
+            accelerator_match = str(
+                spec.get("model", {}).get("accelerator_version") or ""
+            ) == target["accelerator_version"]
         case_match = str(spec.get("case_id") or "text_only") == target["reference_case"]
         source_engine = dict(spec.get("engine") or {})
         source_engine_id = str(
@@ -555,8 +745,12 @@ def estimate_h3_output(
             and target["engine_id"] in {"sol_attn", "sdpa"}
         )
         cache_match = bool(task.get("cache_enabled")) == target["cache_enabled"]
+        source_audio_mode_match = str(
+            task.get("source_audio_mode") or "native"
+        ) == target["source_audio_mode"]
         if not (
             model_match and accelerator_match and cache_match
+            and source_audio_mode_match
             and (engine_match or compatible_engine)
         ):
             continue
@@ -596,7 +790,11 @@ def estimate_h3_output(
         target["reference_case"],
         f"{target['lora_count']} LoRA" + ("s" if target["lora_count"] != 1 else ""),
         "cache on" if target["cache_enabled"] else "cache off",
+        f"{target['accelerator']} accelerator",
+        f"{target['source_audio_mode']} source-audio mode",
     ]
+    if target["accelerator_version"]:
+        matched_factors.append(target["accelerator_version"])
     if target["engine_id"] == "sol_attn":
         matched_factors.append(
             "Sol " + ", ".join(
@@ -655,8 +853,22 @@ def estimate_h3_output(
         uncertainty.append("No compatible same-PC observation is available yet.")
         if target["engine_id"] == "sage2":
             uncertainty.append("SageAttention2++ has no live MiniMax H3 visual validation yet.")
+        if target["accelerator"] == "spectrum":
+            uncertainty.append(
+                "Spectrum Experimental has no same-PC acceptance record; this baseline assumes no speedup."
+            )
+        if target["accelerator"] == "lightx2v":
+            uncertainty.append(
+                "LightX2V Experimental has no same-PC acceptance record; this baseline assumes native per-step cost."
+            )
     if target["window_count"] > 1:
         uncertainty.append("Window transitions and checkpoint switches can add variance.")
+    if target["source_audio_mode"] != "native":
+        confidence = "low"
+        uncertainty.append(
+            "Experimental source-audio encode/conditioning time is uncalibrated; "
+            "non-native observations are excluded until exact mode identity is captured."
+        )
     model_load_state = "resident" if model_resident is True else "cold" if model_resident is False else "unknown"
     model_load_seconds = 0 if model_resident is True else 150 if model_resident is False else None
     seconds = max(1.0, seconds)
@@ -879,6 +1091,28 @@ class H3BenchmarkCache:
                 safe["effective_output_fps"] = (
                     int(safe["output_frames"]) / safe["generation_wall_time_seconds"]
                 )
+                for key in (
+                    "actual_transformer_calls", "forecast_transformer_calls",
+                    "replay_transformer_calls", "average_power_watts", "energy_joules",
+                ):
+                    old_value = previous.get(key)
+                    new_value = safe.get(key)
+                    if not isinstance(old_value, (int, float)) or isinstance(old_value, bool):
+                        continue
+                    if not isinstance(new_value, (int, float)) or isinstance(new_value, bool):
+                        continue
+                    if key.endswith("_calls"):
+                        if int(old_value) == int(new_value):
+                            safe[key] = int(new_value)
+                        else:
+                            # A call count is structural, not a noisy metric.
+                            # Conflicting values under one configuration key
+                            # are not averaged into a fictitious fractional run.
+                            safe.pop(key, None)
+                    else:
+                        safe[key] = (
+                            float(old_value) * old_count + float(new_value) * new_count
+                        ) / total
             records.append(safe)
             self._write(records)
 

@@ -1,25 +1,18 @@
-from pathlib import Path
-
 import torch
 import torch.nn as nn
 from einops import rearrange
 from PIL import Image
-from transformers import AutoProcessor, Mistral3ForConditionalGeneration, pipeline
+from transformers import AutoProcessor
 from shared.utils import files_locator as fl 
 from .sampling import cap_pixels, concatenate_images
 from .system_messages import (
-    PROMPT_IMAGE_INTEGRITY,
-    PROMPT_IMAGE_INTEGRITY_FOLLOW_UP,
-    PROMPT_TEXT_INTEGRITY,
     SYSTEM_MESSAGE,
     SYSTEM_MESSAGE_UPSAMPLING_I2I,
     SYSTEM_MESSAGE_UPSAMPLING_T2I,
-    SYSTEM_PROMPT_CONTENT_FILTER,
 )
 
 OUTPUT_LAYERS = [10, 20, 30]
 MAX_LENGTH = 512
-NSFW_THRESHOLD = 0.85
 UPSAMPLING_MAX_IMAGE_SIZE = 768**2
 
 from mmgp import offload
@@ -35,14 +28,8 @@ class Mistral3SmallEmbedder(nn.Module):
         file_path = model_spec
         self.model = offload.fast_load_transformers_model(file_path, writable_tensors= False, defaultConfigPath= os.path.join(os.path.dirname(file_path), "config.json"))
         self.processor = AutoProcessor.from_pretrained(os.path.dirname(file_path), use_fast=False)
-        self.yes_token, self.no_token = self.processor.tokenizer.encode(
-            ["yes", "no"], add_special_tokens=False
-        )
-
         self.max_length = MAX_LENGTH
         self.upsampling_max_image_size = UPSAMPLING_MAX_IMAGE_SIZE
-
-        self.nsfw_classifier = None 
 
     def _validate_and_process_images(
         self, img: list[list[Image.Image]] | list[Image.Image]
@@ -237,118 +224,3 @@ class Mistral3SmallEmbedder(nn.Module):
 
         out = torch.stack([output.hidden_states[k] for k in OUTPUT_LAYERS], dim=1)
         return rearrange(out, "b c l d -> b l (c d)")
-
-    def yes_no_logit_processor(
-        self, input_ids: torch.LongTensor, scores: torch.FloatTensor
-    ) -> torch.FloatTensor:
-        """
-        Sets all tokens but yes/no to the minimum.
-        """
-        scores_yes_token = scores[:, self.yes_token].clone()
-        scores_no_token = scores[:, self.no_token].clone()
-        scores_min = scores.min()
-        scores[:, :] = scores_min - 1
-        scores[:, self.yes_token] = scores_yes_token
-        scores[:, self.no_token] = scores_no_token
-        return scores
-
-    def test_image(self, image: Image.Image | str | Path | torch.Tensor) -> bool:
-        if isinstance(image, torch.Tensor):
-            image = rearrange(image[0].clamp(-1.0, 1.0), "c h w -> h w c")
-            image = Image.fromarray((127.5 * (image + 1.0)).cpu().byte().numpy())
-        elif isinstance(image, (str, Path)):
-            image = Image.open(image)
-
-        classification = next(c for c in self.nsfw_classifier(image) if c["label"] == "nsfw")
-        if classification["score"] > NSFW_THRESHOLD:
-            return True
-
-        # 512^2 pixels are enough for checking
-        w, h = image.size
-        f = (512**2 / (w * h)) ** 0.5
-        image = image.resize((int(f * w), int(f * h)))
-
-        chat = [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT_CONTENT_FILTER,
-                    },
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": PROMPT_IMAGE_INTEGRITY,
-                    },
-                    {
-                        "type": "image",
-                        "image": image,
-                    },
-                    {
-                        "type": "text",
-                        "text": PROMPT_IMAGE_INTEGRITY_FOLLOW_UP,
-                    },
-                ],
-            },
-        ]
-
-        inputs = self.processor.apply_chat_template(
-            chat,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(self.model.device)
-        inputs["pixel_values"] = inputs["pixel_values"].to(dtype=self.model.dtype)
-
-        generate_ids = self.model.generate(
-            **inputs,
-            max_new_tokens=1,
-            logits_processor=[self.yes_no_logit_processor],
-            do_sample=False,
-        )
-
-        return generate_ids[0, -1].item() == self.yes_token
-
-    def test_txt(self, txt: str) -> bool:
-        chat = [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT_CONTENT_FILTER,
-                    },
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": PROMPT_TEXT_INTEGRITY.format(prompt=txt),
-                    },
-                ],
-            },
-        ]
-
-        inputs = self.processor.apply_chat_template(
-            chat,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(self.model.device)
-
-        generate_ids = self.model.generate(
-            **inputs,
-            max_new_tokens=1,
-            logits_processor=[self.yes_no_logit_processor],
-            do_sample=False,
-        )
-        return generate_ids[0, -1].item() == self.yes_token

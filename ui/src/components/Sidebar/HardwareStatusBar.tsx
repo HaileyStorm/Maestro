@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { ChevronUp, ChevronDown, Cpu, MemoryStick, Power, Zap } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { releaseModels } from '../../api/client'
+import { POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
 
 // Color a "fullness" bar (VRAM / RAM) by how close to full it is —
 // green well below, amber as it tightens, red near the ceiling. This is
@@ -57,7 +58,7 @@ const COLLAPSE_KEY = 'hwbar_collapsed'
  *     resident model and loaded LLM.
  *   - Collapsed: a single one-line row of tiny status chips (~the height
  *     of the model line), for users who want the readout but not the bulk.
- * Polls GET /api/v1/system-stats every ~2s while mounted (both views);
+ * Polls GET /api/v1/system-stats every ~5s while mounted (both views);
  * pauses when the tab is hidden.
  */
 export function HardwareStatusBar() {
@@ -100,20 +101,10 @@ export function HardwareStatusBar() {
     }
   }
 
-  useEffect(() => {
-    const tick = () => {
-      if (typeof document !== 'undefined' && document.hidden) return
-      loadSystemStats()
-    }
-    tick() // populate immediately, don't wait for the first interval
-    const id = setInterval(tick, 2000)
-    const onVis = () => { if (!document.hidden) loadSystemStats() }
-    document.addEventListener('visibilitychange', onVis)
-    return () => {
-      clearInterval(id)
-      document.removeEventListener('visibilitychange', onVis)
-    }
-  }, [loadSystemStats])
+  useVisibilityPolling(
+    () => loadSystemStats(),
+    POLL_INTERVAL_MS.hardwareVisible,
+  )
 
   const gpu = stats?.gpu
   const ram = stats?.ram

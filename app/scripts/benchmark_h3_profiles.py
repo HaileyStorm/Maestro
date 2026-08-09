@@ -138,6 +138,10 @@ class BenchmarkCase:
     boundary_mode: str = ""
     procedural_edge: bool = False
     expected_frames: int = 124
+    multirate_profile: str = ""
+    video_evaluations: int = 0
+    audio_evaluations: int = 0
+    benchmark_dry_run_only: bool = False
     enabled: bool = True
 
     def public_config(self) -> dict[str, Any]:
@@ -172,6 +176,13 @@ class BenchmarkCase:
                 "spatial_upsampling": self.spatial_upsampling,
                 "delivery_resolution": self.delivery_resolution,
                 "delivery_fit": self.delivery_fit,
+            })
+        if self.multirate_profile:
+            result.update({
+                "multirate_profile": self.multirate_profile,
+                "video_evaluations": self.video_evaluations,
+                "audio_evaluations": self.audio_evaluations,
+                "benchmark_dry_run_only": self.benchmark_dry_run_only,
             })
         return result
 
@@ -253,6 +264,18 @@ DEFAULT_CASES = (
         resolution="1344x768", attention_engine="sdpa",
         spatial_upsampling="flashvsr3",
         delivery_resolution="3840x2160", delivery_fit="center_crop",
+        enabled=False,
+    ),
+    # T8Mars publicly describes a four-video/eight-audio dual-clock lane.
+    # Maestro records only this content-free evidence identity: no generation
+    # code path exists until a live synchronized quality matrix is accepted.
+    BenchmarkCase(
+        "base_t8_multirate_4v8a_evidence", "minimax_h3", 8,
+        attention_engine="sdpa",
+        multirate_profile="t8_4v8a_evidence_v1",
+        video_evaluations=4,
+        audio_evaluations=8,
+        benchmark_dry_run_only=True,
         enabled=False,
     ),
     # Wan2GP 12.44 native-boundary evidence lane. These fixed-seed cases are
@@ -382,7 +405,31 @@ def _validate_case(case: BenchmarkCase) -> BenchmarkCase:
     }
     if delivery not in allowed_delivery:
         raise ValueError(f"delivery settings for {case.case_id} are invalid")
-    for field in ("enabled", "export_frames", "procedural_edge"):
+    if case.multirate_profile:
+        if (
+            case.multirate_profile != "t8_4v8a_evidence_v1"
+            or case.model_type != "minimax_h3"
+            or case.steps != 8
+            or case.attention_engine != "sdpa"
+            or case.turbo
+            or case.semantic_reference
+            or case.video_evaluations != 4
+            or case.audio_evaluations != 8
+            or not case.benchmark_dry_run_only
+            or case.enabled
+        ):
+            raise ValueError(
+                f"multirate evidence case {case.case_id} changed its disabled 4v/8a contract"
+            )
+    elif (
+        case.video_evaluations
+        or case.audio_evaluations
+        or case.benchmark_dry_run_only
+    ):
+        raise ValueError(f"multirate-only settings leaked into {case.case_id}")
+    for field in (
+        "enabled", "export_frames", "procedural_edge", "benchmark_dry_run_only",
+    ):
         if not isinstance(getattr(case, field), bool):
             raise ValueError(f"{field} for {case.case_id} must be boolean")
     return case
@@ -776,6 +823,8 @@ def build_generation_payload(
         })
     if case.turbo:
         custom["h3_turbo_profile"] = "h3_turbo_v4"
+    if case.multirate_profile:
+        custom["h3_multirate_profile"] = case.multirate_profile
     payload: dict[str, Any] = {
         "workspace": project,
         "model_type": case.model_type,
@@ -1266,6 +1315,12 @@ def main(argv: list[str] | None = None) -> int:
             "cases": [case.public_config() for case in matrix],
         }, indent=2, sort_keys=True))
         return 0
+    if any(case.benchmark_dry_run_only for case in matrix):
+        print(
+            "Benchmark matrix error: selected multirate evidence is dry-run only",
+            file=sys.stderr,
+        )
+        return 2
     password = os.environ.get(args.password_env, "")
     try:
         client = MaestroClient(args.base_url, timeout_seconds=120)

@@ -183,9 +183,6 @@ coastal town where you grew up."*
 - Writing SFX descriptions on their own lines — they get parsed as
   speech with malformed cues. Use vocal-action cues or implicit
   context instead.
-- Using age numbers under 18, or describing the speaker as a minor
-  in any intimate context. Always use adult vocabulary if such
-  context is implied.
 - Long compound sentences. Break them. Scenema's chunker splits
   on punctuation, and an awkward split mid-sentence sounds wrong.
 

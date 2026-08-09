@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { Settings, X, Globe, BookMarked } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { useIsMobile } from '../../lib/useIsMobile'
@@ -50,6 +51,8 @@ export function Sidebar() {
   const openLoraBrowser = useStore(s => s.setLoraBrowserOpen)
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
   const isMobile = useIsMobile()
+  const mobileSidebarRef = useRef<HTMLElement>(null)
+  const mobileCloseRef = useRef<HTMLButtonElement>(null)
 
   const isVideo = generationMode === 'video'
   const isImage = generationMode === 'image'
@@ -75,10 +78,52 @@ export function Sidebar() {
     || String(modelOptions?.model_type || '').startsWith('minimax_h3')
   )
 
+  useEffect(() => {
+    if (!isMobile || !sidebarOpen) return
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    mobileCloseRef.current?.focus()
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setSidebarOpen(false)
+        return
+      }
+      if (event.key !== 'Tab' || !mobileSidebarRef.current) return
+      const focusable = Array.from(mobileSidebarRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ))
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      previousFocus?.focus()
+    }
+  }, [isMobile, setSidebarOpen, sidebarOpen])
+
+  const openRecipes = () => {
+    setSidebarOpen(false)
+    useStore.getState().setRecipesOpen(true)
+  }
+
   const modeToggle = (size: 'sm' | 'md') => (
     <div className="flex bg-bg-tertiary rounded-lg p-0.5 border border-border">
       <button
+        type="button"
         onClick={() => setSidebarMode('director')}
+        aria-label="Open Director"
+        aria-pressed={isDirector}
         className={`${size === 'sm' ? 'px-2 py-1 text-[11px]' : 'px-3 py-1 text-xs'} rounded-md transition-all ${
           // bg-toggle-active is flat accent-blue in the default theme
           // (preserves the original blue pill) and a red→orange sunset
@@ -90,7 +135,10 @@ export function Sidebar() {
         Director
       </button>
       <button
+        type="button"
         onClick={() => setSidebarMode('studio')}
+        aria-label="Open Studio"
+        aria-pressed={!isDirector}
         className={`${size === 'sm' ? 'px-2 py-1 text-[11px]' : 'px-3 py-1 text-xs'} rounded-md transition-all ${
           // Studio active intentionally uses bg-toggle-active too so the
           // currently-active mode reads with the same prominence in
@@ -157,7 +205,7 @@ export function Sidebar() {
           the column SCROLL when space is tight (e.g. ID-LoRA voice section
           added + hardware bar expanded), instead of letting flex-shrink
           crush sections into each other. */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4 min-h-0 [&>*]:shrink-0">
+      <div className={`${isMobile ? 'flex-none overflow-visible' : 'flex-1 overflow-y-auto min-h-0'} px-4 py-4 flex flex-col gap-4 [&>*]:shrink-0`}>
         <GenerationModeSelector />
 
         {/* Tools mode: standalone post-processing (upscale / revoice) on any
@@ -239,13 +287,15 @@ export function Sidebar() {
       <div className="px-3 py-2.5 border-t border-border">
         <div className="flex items-center gap-2">
           <AdvancedSettings />
-          {machineControls && <button
-            onClick={() => useStore.getState().setRecipesOpen(true)}
+          <button
+            type="button"
+            onClick={openRecipes}
             className="p-2 rounded-lg bg-bg-tertiary border border-border hover:border-border-light text-text-secondary hover:text-accent-blue transition-colors shrink-0"
             title="Recipes — one-click presets"
+            aria-label="Browse recipes"
           >
             <BookMarked size={14} />
-          </button>}
+          </button>
           {machineControls && !isOutpaint && (
             <button
               onClick={() => openLoraBrowser(true, modelType)}
@@ -272,12 +322,23 @@ export function Sidebar() {
     return (
       <>
         {sidebarOpen && (
-          <div
+          <button
+            type="button"
+            aria-label="Close Studio and Director menu"
+            tabIndex={-1}
             className="fixed inset-0 bg-black/40 z-40"
             onClick={() => setSidebarOpen(false)}
           />
         )}
-        <aside className={`fixed top-0 left-0 h-full w-[380px] max-w-[85vw] bg-bg-secondary border-r border-border z-50 flex flex-col transform transition-transform duration-300 ease-in-out ${
+        <aside
+          id="maestro-mobile-sidebar"
+          ref={mobileSidebarRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Studio and Director menu"
+          aria-hidden={!sidebarOpen}
+          inert={!sidebarOpen}
+          className={`fixed top-0 left-0 h-[100dvh] w-[380px] max-w-[85vw] bg-bg-secondary border-r border-border z-[60] flex flex-col overflow-hidden transform transition-transform duration-300 ease-in-out pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}>
           {/* Header */}
@@ -292,17 +353,24 @@ export function Sidebar() {
             <div className="flex items-center gap-1.5">
               {modeToggle('sm')}
               <button
+                ref={mobileCloseRef}
+                type="button"
                 onClick={() => setSidebarOpen(false)}
                 className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+                aria-label="Close Studio and Director menu"
               >
                 <X size={16} />
               </button>
             </div>
           </div>
-          <GenerationPrivacyControls />
-          <ProjectReferenceLibrary />
-          {isDirector ? <DirectorChat /> : studioControls}
-          {machineControls && <HardwareStatusBar />}
+          <div className={`flex flex-1 min-h-0 flex-col overscroll-contain [-webkit-overflow-scrolling:touch] ${
+            isDirector ? 'overflow-hidden' : 'overflow-y-auto'
+          }`}>
+            <GenerationPrivacyControls />
+            <ProjectReferenceLibrary />
+            {isDirector ? <DirectorChat /> : studioControls}
+            {machineControls && <HardwareStatusBar />}
+          </div>
         </aside>
       </>
     )
@@ -323,9 +391,11 @@ export function Sidebar() {
         <div className="flex items-center gap-2">
           {modeToggle('md')}
           {machineControls && <button
+            type="button"
             onClick={toggleSettings}
             className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
             title="Settings"
+            aria-label="Open machine settings"
           >
             <Settings size={16} />
           </button>}

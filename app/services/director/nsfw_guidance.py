@@ -1,58 +1,53 @@
 """
-Content Safety Guidance — manages safe-mode and mature-mode prompt injection.
+Explicit Content Guidance — manages request-authorized prompt injection.
 
-When mature mode is OFF: injects content safety guardrails into all LLM system
-                        prompts (the public nsfw_off_safety_rules.md).
-When mature mode is ON:  injects clinically-worded mature-content guidance. Each
-                        block is SELF-GATING — it tells the model to apply it
-                        ONLY when the scene is actually sexual and to write
-                        normally otherwise — so it can be injected whenever
-                        mature mode is on without harming clean scenes.
+When mature mode is OFF or the request did not explicitly ask for this
+guidance, Maestro leaves the model prompt unchanged.
+When an explicit request is authorized: injects strong, server-owned explicit
+                        prompt-authoring guidance. Each block is SELF-GATING —
+                        it applies only to adult sexual or graphic-violence
+                        material already requested by the user and forbids
+                        inventing or escalating content.
 
-Mature mode is a *permission* (adult generation is allowed), not an *obligation*
-(every prompt should be explicit).
+The caller must pass ``nsfw=True`` only after the server has verified Mature
+Mode consent, a non-public provider, and literal ``explicit_output: true``.
+Mature Mode alone is permission, not a request to make every prompt explicit.
+Guide text is cached for the life of the Maestro Python process. Installed or
+updated guidance and the routing code that authorizes it take effect after a
+Maestro restart; there is intentionally no production live-reload path.
 
 Architecture (after the Director migration):
-  - Both the safe-mode guardrails (nsfw_off_safety_rules.md) AND the mature-mode
-    guidance — director/nsfw_{screenplay,video,image}_rules.md for the planners,
+  - The mature-mode guidance —
+    director/nsfw_{screenplay,video,image}_rules.md for the planners,
     plus enhance/nsfw_shared.md for the refine path — are VERSION-CONTROLLED and
-    clinically worded. They ship with every install, so Director mature mode
-    works with no supplement pack and no download. Explicit *specifics* come from
-    the uncensored model weights, not from text committed to the repo.
+    explicit prompt-authoring rules. They ship with every install, so Director
+    works with no supplement pack and no download.
   - The old optional "content supplement pack" (a separately-downloaded zip)
     has been fully retired — nothing reads it anymore. Every guide is
-    version-controlled and self-gating (it applies only when the scene is
-    actually sexual).
+    version-controlled and self-gating (it applies only to explicit material
+    already requested by the user).
 """
 
 from .guide_loader import load_guide
 
 
-# ── Public provider list (NSFW not allowed with these) ───────────────
-PUBLIC_PROVIDERS = {"openai", "anthropic"}
+# Durable Director snapshots use this private, server-owned decision bit. A
+# fresh request may never nominate it; recovery may only reuse the persisted
+# literal boolean created after the mature-policy/request gate passed.
+EXPLICIT_GUIDANCE_SNAPSHOT_KEY = "_director_explicit_llm_guidance"
 
 
 # ── Guidance text loaders ────────────────────────────────────────────
-# All mature-content guides are version-controlled and clinically worded
+# All explicit-content guides are version-controlled and server-owned
 # (director/nsfw_{screenplay,video,image}_rules.md + enhance/nsfw_shared.md);
 # load_guide reads them from the repo, so they ship with every install. The
-# safe-mode guardrails (nsfw_off_safety_rules.md) ship publicly too. Each
 # block is self-gating — it applies only when the scene is actually sexual.
 
 
-def get_safe_content_guidance() -> str:
-    """Safety guardrails injected into ALL LLM prompts when mature mode is OFF.
-
-    The safety rules file ships with the public repo (it lists what NOT
-    to do, which is useful baseline guidance regardless of pack state).
-    """
-    return load_guide("nsfw_off_safety_rules.md") or "Keep all content PG-13."
-
-
 def get_nsfw_video_guidance() -> str:
-    """Mature-content guidance block for video prompt generation.
+    """Explicit-content guidance block for video prompt generation.
 
-    Loaded from the VERSION-CONTROLLED, clinically-worded guide under
+    Loaded from the VERSION-CONTROLLED guide under
     llm_guides/director/ (migrated off the optional supplement pack in the
     Director migration), so it ships with every install — Director mature mode
     needs no pack and no download.
@@ -61,19 +56,19 @@ def get_nsfw_video_guidance() -> str:
 
 
 def get_nsfw_image_guidance() -> str:
-    """Mature-content guidance block for image prompt generation (version-controlled)."""
+    """Explicit-content guidance for image prompt generation (version-controlled)."""
     return load_guide("nsfw_image_rules.md")
 
 
 def get_nsfw_screenplay_guidance() -> str:
-    """Mature-content guidance for screenplay writing — narrative voice (version-controlled)."""
+    """Explicit-content guidance for screenplay writing (version-controlled)."""
     return load_guide("nsfw_screenplay_rules.md")
 
 
 def get_nsfw_enhance_guidance() -> str:
-    """Mature-content guidance for the enhance / refine path (Director Pass-3 polish).
+    """Explicit-content guidance for enhance/refine and Director Pass-3 polish.
 
-    Reuses the SAME clinical, version-controlled push as Studio mode's enhancer
+    Reuses the SAME register-faithful, version-controlled guidance as Studio mode's enhancer
     (llm_guides/enhance/nsfw_shared.md), so the two refine paths stay in sync and
     there is a single mature-enhance guide to maintain.
     """
@@ -84,17 +79,20 @@ def get_nsfw_enhance_guidance() -> str:
 def inject_content_guidance(system_prompt: str, nsfw: bool, mode: str = "video") -> str:
     """Inject content guidance into a system prompt.
 
-    When nsfw=True:  Injects mature-content guidance (version-controlled
+    When nsfw=True:  Injects explicit prompt-authoring guidance (version-controlled
                      guides under llm_guides/). If a guide file is
                      missing, this is a no-op — the system prompt is
                      returned unchanged.
-    When nsfw=False: Injects safety guardrails (always available).
+    When nsfw=False: Return the system prompt unchanged.
 
     For video/image modes: injects NEAR THE TOP (after the first paragraph)
     so the LLM sees the directive before absorbing other rules.
     For enhance mode:      appends at the end (shorter prompt, less risk
                            of burying).
     """
+    if not nsfw:
+        return system_prompt
+
     if nsfw:
         guidance = {
             "video": get_nsfw_video_guidance,
@@ -103,7 +101,15 @@ def inject_content_guidance(system_prompt: str, nsfw: bool, mode: str = "video")
             "screenplay": get_nsfw_screenplay_guidance,
         }
 
-        if mode == "both":
+        if mode == "director":
+            content_block = (
+                get_nsfw_screenplay_guidance()
+                + "\n\n"
+                + get_nsfw_video_guidance()
+                + "\n\n"
+                + get_nsfw_image_guidance()
+            )
+        elif mode == "both":
             content_block = (
                 get_nsfw_video_guidance() + "\n\n" + get_nsfw_image_guidance()
             )
@@ -123,20 +129,8 @@ def inject_content_guidance(system_prompt: str, nsfw: bool, mode: str = "video")
             return system_prompt
         print(
             f"[NSFW] inject_content_guidance(mode={mode!r}): "
-            f"injected {len(content_block)} chars of mature-content guidance"
+            f"injected {len(content_block)} chars of explicit-content guidance"
         )
-    else:
-        # Safe mode — use a shorter inline version for enhance to avoid
-        # the LLM reasoning about lists of rules during prompt rewriting.
-        if mode == "enhance":
-            content_block = (
-                "Keep all content PG-13. No nudity, sexual content, or graphic "
-                "violence. If the prompt implies explicit content, rewrite it "
-                "tastefully."
-            )
-        else:
-            content_block = get_safe_content_guidance()
-
     if mode == "enhance":
         return f"{system_prompt}\n\n{content_block}"
 

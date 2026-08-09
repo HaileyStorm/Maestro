@@ -1,20 +1,19 @@
 """
-Clean-repo guard — fails if mature/explicit prose or locally-generated model
-guides have leaked into VERSION-CONTROLLED source.
+Clean-repo guard — fails if unapproved mature/explicit prose or locally-generated
+model guides have leaked into VERSION-CONTROLLED source.
 
 This is the single boundary guard for Maestro's clean-by-construction repo. The
-strategy across the mature-content refactor was to keep all explicit *specifics*
-OUT of git:
-  - Studio + Director mature-mode direction ships as clinically-worded,
-    version-controlled bundled guides.
+strategy across the mature-content refactor is to keep unreviewed explicit
+*specifics* out of git:
+  - Studio + Director ship a small, exact-path allowlisted set of reviewed,
+    self-gating explicit-authoring guides and their regression contract.
   - Per-checkpoint mature prompting is generated locally into the gitignored
     finetunes/*.json (model.enhance_guide_text) from CivitAI/HF metadata.
   - The old optional "content supplement pack" download has been fully retired;
     a leftover local _supplement_pack/ dir on a dev machine stays gitignored.
 
-So nothing explicit should ever be committed. This script enforces that, so a
-public snapshot can never accidentally carry material that is meant to stay
-local.
+All other explicit prose remains forbidden. This script enforces that boundary,
+so a public snapshot cannot accidentally carry material meant to stay local.
 
 It scans git-TRACKED files only — the exact set that gets published — so anything
 gitignored (a leftover supplement-pack dir, finetune inline guides, downloaded
@@ -107,10 +106,21 @@ EXTENDED_PATTERNS = [
     (re.compile(r"large breasts exposed"), "large breasts exposed"),
 ]
 
+# Exact path + pattern provenance for reviewed prompt-authoring examples. These
+# files remain scanned for every other forbidden string and pattern. Additions
+# require individual review and do not exempt sibling guides or unrelated tests.
+ALLOWED_EXACT_PATTERN_MATCHES = {
+    "app/services/llm_guides/director/nsfw_image_rules.md": frozenset({"penis"}),
+    "app/services/llm_guides/director/nsfw_screenplay_rules.md": frozenset({"penis"}),
+    "app/services/llm_guides/director/nsfw_video_rules.md": frozenset({"penis"}),
+    "app/services/llm_guides/enhance/nsfw_shared.md": frozenset({"penis"}),
+    "tests/test_explicit_register_guidance.py": frozenset({"penis"}),
+}
+
 # Allowlisted path fragments — substring match against the '/'-normalized
-# repo-relative path. Upstream Wan2GP code, third-party components, the public
-# safety files, and the polish/safety layers that legitimately reference the
-# vocabulary in code/comments (not user-facing output).
+# repo-relative path. Upstream Wan2GP code, third-party components, and tracked
+# compatibility sources may legitimately reference the vocabulary as source or
+# compatibility data. This is publication hygiene, not runtime moderation.
 ALLOWED_PATH_FRAGMENTS = [
     # This guard embeds the wordlist as data, by design.
     "scripts/verify_clean_repo.py",
@@ -118,29 +128,14 @@ ALLOWED_PATH_FRAGMENTS = [
     "mmaudio",
     # Upstream Wan2GP plugin
     "plugins/wan2gp-configuration",
-    # Upstream Flux NSFW classifier
+    # Upstream Flux compatibility signature
     "flux/util.py",
-    "flux/modules/text_encoder_mistral.py",
-    # Upstream HyVideo pipelines
-    "models/hyvideo",
     # Upstream prompt enhancer (uses 'nsfw' as a parameter name)
     "shared/prompt_enhancer",
-    # Upstream radial attention reference
-    "radial_attention",
     # Upstream READMEs
     "app/README.md",
-    # Public safety-rules file — lists what NOT to do (responsible)
-    "nsfw_off_safety_rules.md",
-    # Public minor-safety scanner — forbidden vocabulary lives in inline
-    # tuples by design (see safety_scan.py docstring) so the rule cannot
-    # be silenced by removing a data file. Verifier must not flag it.
-    "services/director/safety_scan.py",
-    "tests/test_safety_scan.py",
-    "tests/test_prompt_polish_fixes.py",
-    # Polish layer's regex sanitizers and LoRA-trigger-guidance text
-    # legitimately mention act / anatomy vocabulary to teach the LLM when each
-    # leet-coded LoRA trigger applies and what each sentence sanitizer catches.
-    # Strings live in code comments and rule text, not user-facing output.
+    # Prompt-authoring and LoRA-trigger guidance sources intentionally teach
+    # local models exact requested vocabulary.
     "services/director/prompt_polish.py",
     # Maestro internal docs
     "docs/PROMPTS.md",
@@ -195,6 +190,16 @@ def _tracked_files():
     return [p for p in result.stdout.split("\0") if p]
 
 
+def _content_scan_allowed(norm):
+    """Return whether a normalized path has a fragment-level scan exclusion."""
+    return any(allowed in norm for allowed in ALLOWED_PATH_FRAGMENTS)
+
+
+def _extended_pattern_allowed(norm, name):
+    """Return whether one named pattern has exact-path reviewed provenance."""
+    return name in ALLOWED_EXACT_PATTERN_MATCHES.get(norm, ())
+
+
 def main() -> int:
     files = _tracked_files()
     if files is None:
@@ -220,7 +225,7 @@ def main() -> int:
         # Check A — content scan: text files only, skip the allowlist.
         if not norm.endswith(TEXT_EXTENSIONS):
             continue
-        if any(allowed in norm for allowed in ALLOWED_PATH_FRAGMENTS):
+        if _content_scan_allowed(norm):
             continue
 
         fpath = os.path.join(_REPO_ROOT, rel)
@@ -238,6 +243,8 @@ def main() -> int:
                         break
 
         for pattern, name in EXTENDED_PATTERNS:
+            if _extended_pattern_allowed(norm, name):
+                continue
             m = pattern.search(content)
             if m:
                 line_num = content[: m.start()].count("\n") + 1

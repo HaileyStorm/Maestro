@@ -51,13 +51,8 @@ export interface ModelDef {
   supports_ref_images?: boolean
   director?: DirectorModelCompatibility
   is_downloaded?: boolean
-  // True when this model is only available with Mature Mode enabled.
-  // Backend always returns the entry; UI filters it out when
-  // servicesConfig.nsfw_mode is false. When nsfw_mode flips on, the
-  // store auto-adds these models to enabledModels so they appear in
-  // selectors without the user having to enable each one manually.
+  // Upstream catalog metadata; Maestro does not gate model visibility with it.
   nsfw_only?: boolean
-  preferred_explicit_fl2va?: boolean
   update_status?: string
 }
 
@@ -66,8 +61,17 @@ export interface Resolution {
   value: string
 }
 
-export type H3PerformanceProfileId = 'draft' | 'fast' | 'quality' | 'high' | '1080p_delivery' | 'ultra' | '4k_delivery'
+export type H3PerformanceProfileId = 'draft' | 'fast' | 'quality' | 'high' | '1080p_delivery' | 'ultra' | '4k_delivery' | 'spectrum_experimental' | 'lightx2v_experimental'
 export type H3EstimateConfidence = 'calibrating' | 'low' | 'medium' | 'high'
+
+export interface H3SegmentCountEstimate {
+  minimum: number
+  maximum: number
+  likely: number
+  source: string
+  confidence: H3EstimateConfidence
+  reason: string
+}
 
 export interface H3PerformanceEstimate {
   seconds: number
@@ -115,6 +119,7 @@ export interface H3PerformanceProfile {
   delivery_resolution?: string
   settings: H3PerformanceProfileSettings
   estimate: H3PerformanceEstimate
+  segment_count_estimate?: H3SegmentCountEstimate
 }
 
 export interface H3EstimateRequest {
@@ -122,6 +127,11 @@ export interface H3EstimateRequest {
   duration_seconds: number
   window_seconds: number
   window_overlap: number
+  prompt: string
+  /** Director scenes are planned independently by the runtime. */
+  segment_scenes?: { duration_seconds: number; prompt: string }[]
+  h3_adaptive_conditioning: boolean
+  manual_segment_ceiling: boolean
   num_inference_steps: number
   resolution: string
   custom_settings: Record<string, unknown>
@@ -142,7 +152,11 @@ export interface H3EstimateRequest {
 }
 
 export interface H3EstimateResponse {
-  current: { estimate: H3PerformanceEstimate }
+  current: {
+    estimate: H3PerformanceEstimate
+    segment_count_estimate: H3SegmentCountEstimate
+  }
+  segment_count_estimate: H3SegmentCountEstimate
   profiles: H3PerformanceProfile[]
 }
 
@@ -348,21 +362,28 @@ export interface H3SegmentBoundary {
 
 export interface H3SegmentPlanItem {
   index: number
+  /** Compatibility aliases: both retain the generated geometry. */
   frames: number
   duration_seconds: number
+  generated_frames: number
+  published_frames: number
+  generated_duration_seconds: number
+  published_duration_seconds: number
   model_type: 'minimax_h3' | 'minimax_h3_pinkcherry_fl2va' | 'minimax_h3_w4a8_fl2va' | 'minimax_h3_ref2va'
   model_reason: string
   edge_anchor_locked: boolean
   switch_from_previous: boolean
   boundary_from_previous: H3SegmentBoundary | null
-  prompt_preview: string
+  prompt_preview?: string
 }
 
 export interface H3SegmentPlan {
   kind: 'h3_segments'
   clip_count: number
+  fps: number
   requested_frames: number
   planned_frames: number
+  published_frames: number
   adaptive_conditioning: boolean
   checkpoint_switches: number
   segments: H3SegmentPlanItem[]
@@ -603,6 +624,20 @@ export interface MultiClip {
 
 export type SettingsTab = 'performance' | 'integrations'
 
+export type HostTermId = 'lawful_use' | 'minimax_h3_ref2va'
+
+export interface HostTermStatus {
+  current_version: number
+  accepted_version: number | null
+  accepted_at: string | null
+  accepted: boolean
+}
+
+export interface HostTermsStatus {
+  lawful_use: HostTermStatus
+  minimax_h3_ref2va: HostTermStatus
+}
+
 export interface ServicesConfig {
   llm_model_id: string
   llm_device: string
@@ -618,7 +653,6 @@ export interface ServicesConfig {
   anthropic_api_key_set: boolean
   use_director_v2: boolean
   nsfw_mode: boolean
-  nsfw_accepted_at: string | null
   director_prompt_polish: 'off' | 'full_guide' | 'light_guide' | 'third_pass'
   civitai_api_key: string
   civitai_api_key_set: boolean
@@ -814,15 +848,8 @@ export interface LoraInfo {
   recommended_weights: LoraRecommendedWeights | null
   has_guide: boolean
   guide?: string | null
-  /** NSFW flag from the .civitai.json sidecar (or inferred from filename/tags).
-   *  Used to filter out adult-content LoRAs from the Advanced Settings list
-   *  unless the user explicitly opts in. */
+  /** Upstream CivitAI catalog metadata; not used to gate Maestro behavior. */
   nsfw?: boolean
-  /** True when the user has manually overridden the NSFW classification via
-   *  /api/v1/loras/nsfw-override. The UI surfaces this so the user can tell
-   *  at a glance which LoRAs they've corrected vs which are using CivitAI's
-   *  raw flag. */
-  nsfw_overridden?: boolean
   /** ISO timestamp of when the file was downloaded — sidecar `downloadedAt`
    *  when present, else the weight file's mtime. Shown as an age chip in
    *  the Studio/Director LoRA pickers. */
@@ -895,7 +922,7 @@ export interface LlmSpeedEstimate {
 }
 
 /** Live hardware telemetry for the sidebar status indicators.
- *  Backs HardwareStatusBar; polled ~2s via GET /api/v1/system-stats. */
+ *  Backs HardwareStatusBar; polled ~5s via GET /api/v1/system-stats. */
 export interface SystemStats {
   cpu: { percent: number }
   ram: { percent: number; used_gb: number; total_gb: number }
@@ -975,6 +1002,11 @@ export interface LlmChatMessage {
     kind: 'image'
     name: string
   }>
+  performance?: {
+    average_tps: number | null
+    generated_tokens_approx?: number | null
+    elapsed_seconds?: number | null
+  }
 }
 
 export interface AudioBeat {
@@ -1200,23 +1232,6 @@ export interface PipelineClipState {
   video_gen_time_sec: number | null
 }
 
-export interface PipelineLlmPass {
-  pass: string
-  system_prompt: string
-  response_text: string
-  thinking_text: string | null
-}
-
-export interface PipelineLlmLog {
-  provider: string
-  model_id: string
-  passes?: PipelineLlmPass[]
-  system_prompt: string
-  response_text: string
-  thinking_text: string | null
-  planning_time_sec: number
-}
-
 export type PipelineRepairStatus =
   | 'queued'
   | 'running'
@@ -1284,7 +1299,10 @@ export interface SavedPipelineState extends DirectorRecoveryMetadata {
   /** Effective saved behavior. Missing on legacy projects, which require images. */
   shot_image_policy?: DirectorShotImagePolicy
   shot_image_guidance?: DirectorShotImageGuidance
-  llm_log: PipelineLlmLog | null
+  /** Always null in public state; retained only to ignore legacy files safely. */
+  llm_log: null
+  /** Content-free aggregate available on checkpoints created by newer hosts. */
+  llm_planning_time_sec?: number | null
   clips: PipelineClipState[]
   output_files: string[]
   total_time_sec: number | null

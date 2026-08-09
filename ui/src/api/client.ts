@@ -22,11 +22,8 @@ export interface ApiModel {
   supports_ref_images?: boolean
   director?: import('../types').DirectorModelCompatibility
   is_downloaded?: boolean
-  // True when the model JSON declares `"nsfw_only": true` in its
-  // model block. The UI hides it from selectors and the visibility
-  // settings unless servicesConfig.nsfw_mode is enabled.
+  // Upstream catalog metadata; it does not control Maestro visibility.
   nsfw_only?: boolean
-  preferred_explicit_fl2va?: boolean
   update_status?: string
 }
 
@@ -316,7 +313,6 @@ export async function fetchModels(): Promise<{ families: ApiFamily[]; models: Ap
 export interface ModelVisibilitySettings {
   configured: boolean
   enabled_models: string[]
-  initialized_mature_models: string[]
   defaults_version: number
 }
 
@@ -328,7 +324,6 @@ export async function fetchModelVisibility(): Promise<ModelVisibilitySettings> {
 
 export async function updateModelVisibility(params: {
   enabled_models: string[]
-  initialized_mature_models: string[]
   defaults_version: number
 }): Promise<ModelVisibilitySettings> {
   const res = await fetch(`${BASE}/api/v1/model-visibility`, {
@@ -408,6 +403,8 @@ export async function previewGenerationPlan(params: Record<string, unknown>): Pr
   plan: import('../types').H3SegmentPlan | null
   effective_model_type: string
   requirements: import('../types').H3GenerationRequirements
+  h3_estimate: import('../types').H3PerformanceEstimate | null
+  segment_count_estimate: import('../types').H3SegmentCountEstimate | null
 }> {
   const res = await fetch(`${BASE}/api/v1/generate/plan`, {
     method: 'POST',
@@ -626,21 +623,29 @@ export async function scheduleH3DeliveryRecovery(
 // --- Music: LLM song writer (Music mode Simple) ---
 
 export async function writeSong(params: {
+  workspace: string
   description: string
   instrumental?: boolean
   seed?: number
   reference_image_path?: string
-}): Promise<{ style: string; lyrics: string; raw: string }> {
-  const res = await fetch(`${BASE}/api/v1/llm/write-song`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Song writing failed' }))
-    throw new Error(err.detail || 'Song writing failed')
-  }
-  return res.json()
+}, options?: LlmRequestOptions): Promise<{ style: string; lyrics: string; raw: string }> {
+  return withLlmPreparation(
+    { workspace: params.workspace, purpose: 'configured' },
+    options,
+    async () => {
+      const res = await fetch(`${BASE}/api/v1/llm/write-song`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+        signal: options?.signal,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Song writing failed' }))
+        throw new Error(err.detail || 'Song writing failed')
+      }
+      return res.json()
+    },
+  )
 }
 
 // Director Music Video: generate a music track (writes the song first if only
@@ -873,7 +878,46 @@ export interface ProjectAssetOutput {
   relative_path: string
   media_type: string
   label: string
-  metadata: Record<string, unknown>
+  metadata: ProjectAssetOutputMetadata
+}
+
+export type ProjectReferenceSheetMode = 'production' | 'hybrid' | 'draft'
+export type ProjectReferenceAssetType = 'character' | 'setting' | 'item' | 'style'
+export type ProjectReferenceReviewStatus = 'pass' | 'fail' | 'review_unavailable'
+
+export interface ProjectReferenceSheetArtifactMetadata {
+  role?: string
+  model?: string
+  provenance?: Record<string, unknown>
+  reason_codes?: string[]
+}
+
+export interface ProjectAssetOutputMetadata extends Record<string, unknown> {
+  private?: boolean
+  explicit?: boolean
+  reference_sheet?: ProjectReferenceSheetArtifactMetadata
+  lineage?: {
+    parent_job_id?: string
+    candidate_index?: number
+    candidate_count?: number
+    parent_asset_id?: string
+    parent_variant_id?: string | null
+  }
+}
+
+export interface ProjectReferenceSheetVariantMetadata {
+  schema_version?: number
+  planner_version?: string
+  mode?: ProjectReferenceSheetMode
+  asset_type?: ProjectReferenceAssetType
+  model?: string
+  roles?: {
+    sheet?: string
+    panels?: string[]
+    repaired?: string[]
+  }
+  reason_codes?: string[]
+  review_status?: ProjectReferenceReviewStatus
 }
 
 export interface ProjectAssetVariant {
@@ -882,7 +926,19 @@ export interface ProjectAssetVariant {
   label: string
   status: 'candidate' | 'kept' | 'rejected'
   outputs: ProjectAssetOutput[]
-  metadata: Record<string, unknown>
+  metadata: Record<string, unknown> & {
+    reference_sheet?: ProjectReferenceSheetVariantMetadata
+    job?: {
+      id?: string
+      model?: string
+      candidate_index?: number
+      candidate_count?: number
+    }
+    parent?: {
+      asset_id?: string
+      variant_id?: string | null
+    }
+  }
 }
 
 export interface ProjectAsset {
@@ -893,6 +949,135 @@ export interface ProjectAsset {
   tags: string[]
   variants: ProjectAssetVariant[]
   metadata: Record<string, unknown>
+}
+
+export interface ProjectReferenceGenerationSettings {
+  mode?: ProjectReferenceSheetMode
+  model_type?: string
+  editor_model_type?: string
+  candidate_count?: number
+  panel_size?: [number, number]
+  draft_size?: [number, number]
+  resolution?: string | [number, number]
+  columns?: number
+  palette_swatches?: number
+  review?: boolean
+  num_inference_steps?: number
+  guidance_scale?: number
+  seed?: number
+  negative_prompt?: string
+  activated_loras?: string[]
+  loras_multipliers?: string
+  private_output?: boolean
+  explicit_output?: boolean
+}
+
+export interface FreshProjectReferenceGenerationRequest extends ProjectReferenceGenerationSettings {
+  asset_id?: never
+  parent_variant_id?: never
+  edit_instruction?: never
+  name: string
+  asset_type: ProjectReferenceAssetType
+  description?: string
+  tags?: string[]
+  poses?: string
+  outfits?: string
+  style?: string
+  genre?: string
+}
+
+export interface ExistingProjectReferenceGenerationRequest extends ProjectReferenceGenerationSettings {
+  asset_id: string
+  parent_variant_id?: string
+  edit_instruction?: string
+  asset_type?: ProjectReferenceAssetType
+}
+
+export type ProjectReferenceGenerationRequest =
+  | FreshProjectReferenceGenerationRequest
+  | ExistingProjectReferenceGenerationRequest
+
+/** Select the sole semantic reference represented by a reference-sheet variant. */
+export function selectProjectAssetApplyOutput(
+  variant: ProjectAssetVariant,
+): ProjectAssetOutput | undefined {
+  if (variant.variant_type !== 'reference_sheet') return variant.outputs[0]
+  return variant.outputs.find(output => output.metadata?.reference_sheet?.role === 'sheet')
+    // Compatibility with reference-sheet records written before artifact roles.
+    ?? variant.outputs[0]
+}
+
+/** Return display-only components; these must never be applied separately. */
+export function getProjectAssetComponentOutputs(
+  variant: ProjectAssetVariant,
+): ProjectAssetOutput[] {
+  if (variant.variant_type !== 'reference_sheet') return []
+  const sheet = selectProjectAssetApplyOutput(variant)
+  return variant.outputs.filter(output => (
+    output !== sheet && output.metadata?.reference_sheet?.role !== 'sheet'
+  ))
+}
+
+export function projectAssetVariantOperationKey(
+  project: string,
+  assetId: string,
+  variantId: string,
+): string {
+  return JSON.stringify([project, assetId, variantId])
+}
+
+/** Acquire a synchronous per-variant guard before React can rerender. */
+export function lockProjectAssetVariantOperation(
+  locks: Set<string>,
+  project: string,
+  assetId: string,
+  variantId: string,
+): string | null {
+  const key = projectAssetVariantOperationKey(project, assetId, variantId)
+  if (locks.has(key)) return null
+  locks.add(key)
+  return key
+}
+
+export function isProjectAssetOperationCurrent(
+  submittedProject: string,
+  submittedEpoch: number,
+  currentProject: string,
+  currentEpoch: number,
+): boolean {
+  return submittedProject === currentProject && submittedEpoch === currentEpoch
+}
+
+/** Preserve available source settings; layout controls are deliberately current. */
+export function getProjectReferenceRetrySettings(
+  variant: ProjectAssetVariant,
+  fallback: {
+    mode: ProjectReferenceSheetMode
+    model_type: string
+    private_output: boolean
+    explicit_output: boolean
+    review: boolean
+  },
+): typeof fallback {
+  const metadata = variant.metadata.reference_sheet
+  const output = selectProjectAssetApplyOutput(variant)
+  const mode = metadata?.mode
+  const model = metadata?.model
+  return {
+    mode: mode === 'production' || mode === 'hybrid' || mode === 'draft'
+      ? mode
+      : fallback.mode,
+    model_type: typeof model === 'string' && model.length > 0 ? model : fallback.model_type,
+    private_output: typeof output?.metadata.private === 'boolean'
+      ? output.metadata.private
+      : fallback.private_output,
+    explicit_output: typeof output?.metadata.explicit === 'boolean'
+      ? output.metadata.explicit
+      : fallback.explicit_output,
+    // `review_unavailable` is also the no-review representation in v1
+    // metadata, so current user intent is the only unambiguous source here.
+    review: fallback.review,
+  }
 }
 
 export async function fetchProjectAssets(project: string): Promise<ProjectAsset[]> {
@@ -913,7 +1098,10 @@ export async function createProjectAsset(project: string, body: Record<string, u
   return res.json()
 }
 
-export async function generateProjectAssetReferences(project: string, body: Record<string, unknown>): Promise<{ job_id: string; asset: ProjectAsset }> {
+export async function generateProjectAssetReferences(
+  project: string,
+  body: ProjectReferenceGenerationRequest,
+): Promise<{ job_id: string; asset: ProjectAsset }> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/generate`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
@@ -1332,8 +1520,23 @@ export async function fetchGroupClips(groupId: string, workspace: string): Promi
 
 // --- Director Pipeline ---
 
+export interface PipelineLlmProgress {
+  phase: string
+  pass: string
+  activity: string
+  partial_text: string
+  attempt: number
+  attempt_limit: number
+  generated_tokens_approx: number
+  elapsed_seconds: number
+  live_tps: number | null
+  average_tps: number | null
+  done: boolean
+}
+
 export interface PipelineStatus extends DirectorRecoveryMetadata {
   id: string
+  workspace: string
   status: 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'blocked'
   phase: 'registered' | 'planning' | 'polishing_prompts' | 'generating_images' | 'generating_video' | 'post_processing' | 'completed' | 'paused' | 'resuming' | 'blocked_remote_reauth' | 'blocked_input_changed'
   auto_mode: boolean
@@ -1359,7 +1562,10 @@ export interface PipelineStatus extends DirectorRecoveryMetadata {
    *  See `OomInfo` in types/index.ts. */
   oom_info?: import('../types').OomInfo | null
   pause_reason: string | null
-  llm_streaming: boolean
+  /** Process-memory-only telemetry for this exact live Director pipeline. */
+  llm_progress: PipelineLlmProgress | null
+  /** Content-free planning duration; retained after the transient stream ends. */
+  llm_planning_time_sec?: number | null
   /** Non-fatal warnings raised during the run — currently used for
    *  architecture-mismatch advisories when image LoRAs are dropped
    *  because they were trained for a different Flux variant than the
@@ -1469,15 +1675,24 @@ export interface Recipe extends RecipeCard {
   params: Record<string, unknown>
 }
 
-export async function fetchRecipes(): Promise<{ recipes: RecipeCard[] }> {
-  const res = await fetch(`${BASE}/api/v1/recipes`)
-  if (!res.ok) throw new Error('Failed to load recipes')
+function recipeUrl(path: string, workspace: string): string {
+  return `${BASE}${path}?workspace=${encodeURIComponent(workspace)}`
+}
+
+async function recipeRequestError(res: Response, fallback: string): Promise<Error> {
+  const body = await res.json().catch(() => ({ detail: fallback }))
+  return new Error(body.detail || fallback)
+}
+
+export async function fetchRecipes(workspace: string): Promise<{ recipes: RecipeCard[] }> {
+  const res = await fetch(recipeUrl('/api/v1/recipes', workspace), { cache: 'no-store' })
+  if (!res.ok) throw await recipeRequestError(res, 'Failed to load recipes')
   return res.json()
 }
 
-export async function fetchRecipe(id: string): Promise<Recipe> {
-  const res = await fetch(`${BASE}/api/v1/recipes/${encodeURIComponent(id)}`)
-  if (!res.ok) throw new Error('Recipe not found')
+export async function fetchRecipe(id: string, workspace: string): Promise<Recipe> {
+  const res = await fetch(recipeUrl(`/api/v1/recipes/${encodeURIComponent(id)}`, workspace), { cache: 'no-store' })
+  if (!res.ok) throw await recipeRequestError(res, 'Recipe not found')
   return res.json()
 }
 
@@ -1629,7 +1844,9 @@ export async function deletePipeline(pid: string, workspace: string): Promise<{ 
 // --- Director v2 ---
 
 export interface DirectorV2PlanRequest {
+  workspace: string
   skill_type: string
+  explicit_output?: boolean
   scene_description?: string
   story_description?: string
   clips?: unknown[]
@@ -1663,17 +1880,27 @@ export interface DirectorV2PlanResponse {
   skill_type: string
 }
 
-export async function directorV2Plan(params: DirectorV2PlanRequest): Promise<DirectorV2PlanResponse> {
-  const res = await fetch(`${BASE}/api/v1/director/v2/plan`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Plan failed' }))
-    throw new Error(err.detail || 'Director v2 plan failed')
-  }
-  return res.json()
+export async function directorV2Plan(
+  params: DirectorV2PlanRequest,
+  options?: LlmRequestOptions,
+): Promise<DirectorV2PlanResponse> {
+  return withLlmPreparation(
+    { workspace: params.workspace, purpose: 'configured' },
+    options,
+    async () => {
+      const res = await fetch(`${BASE}/api/v1/director/v2/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+        signal: options?.signal,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Plan failed' }))
+        throw new Error(err.detail || 'Director v2 plan failed')
+      }
+      return res.json()
+    },
+  )
 }
 
 // --- Presets ---
@@ -2424,21 +2651,330 @@ export async function updateServicesConfig(
   return res.json()
 }
 
+export async function fetchHostTerms(
+  workspace: string,
+): Promise<{ terms: import('../types').HostTermsStatus }> {
+  const query = new URLSearchParams({ workspace })
+  const res = await fetch(`${BASE}/api/v1/host-terms?${query}`)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to load host notice status' }))
+    throw new Error(err.detail || 'Failed to load host notice status')
+  }
+  return res.json()
+}
+
+export async function acceptHostTerm(
+  term: import('../types').HostTermId,
+  version: number,
+  workspace: string,
+): Promise<{ status: string; terms: import('../types').HostTermsStatus }> {
+  const res = await fetch(`${BASE}/api/v1/host-terms/accept`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ term, version, workspace }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Host notice acceptance failed' }))
+    throw new Error(err.detail || 'Host notice acceptance failed')
+  }
+  return res.json()
+}
+
 // --- LLM Service ---
 
-export async function fetchLlmStatus(): Promise<import('../types').LlmStatus> {
-  const res = await fetch(`${BASE}/api/v1/llm/status`)
+export type LlmPreparationPurpose = 'chat' | 'enhance' | 'configured'
+export type LlmPreparationPhase = 'queued' | 'loading' | 'ready' | 'failed'
+
+export interface LlmPreparationStatus {
+  operation_id: string
+  status: 'preparing' | 'ready' | 'failed'
+  phase: LlmPreparationPhase
+  retryable: boolean
+  error?: {
+    code: string
+    message: string
+    retryable: boolean
+  } | null
+}
+
+export interface LlmPreparationRequest {
+  workspace: string
+  purpose: LlmPreparationPurpose
+  model_id?: string
+  model_type?: string
+  vision_required?: boolean
+}
+
+export interface LlmRequestOptions {
+  signal?: AbortSignal
+  onPreparationStatus?: (status: LlmPreparationStatus) => void
+}
+
+export class LlmPreparationError extends Error {
+  readonly code: string
+  readonly retryable: boolean
+
+  constructor(code: string, message: string, retryable: boolean) {
+    super(message)
+    this.name = 'LlmPreparationError'
+    this.code = code
+    this.retryable = retryable
+  }
+}
+
+export class LlmChatWaitError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'LlmChatWaitError'
+  }
+}
+
+// A 31B local model can take substantially longer to download/load than an
+// HTTP proxy will keep one inference request open. Preparation uses short
+// requests and permits a bounded 45-minute wait without placing creative
+// content in the prepare payload.
+const LLM_PREPARATION_MAX_WAIT_MS = 45 * 60 * 1000
+const LLM_PREPARATION_VISIBLE_POLL_MS = 1_000
+
+class TransientHttpError extends Error {}
+
+function isTransientHttpStatus(status: number): boolean {
+  return status === 408 || (status >= 500 && status <= 599)
+}
+
+function isTransientRequestError(error: unknown): boolean {
+  return error instanceof TypeError || error instanceof TransientHttpError
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException('The browser stopped waiting', 'AbortError')
+}
+
+function waitForPreparationPoll(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal)
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let timer: number | null = null
+    const finish = (error?: unknown) => {
+      if (settled) return
+      settled = true
+      if (timer !== null) window.clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibilityChange)
+      }
+      if (error) reject(error)
+      else resolve()
+    }
+    const onAbort = () => finish(new DOMException('The browser stopped waiting', 'AbortError'))
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        if (timer !== null) window.clearTimeout(timer)
+        timer = null
+      } else {
+        finish()
+      }
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange)
+    }
+    if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
+      timer = window.setTimeout(() => finish(), LLM_PREPARATION_VISIBLE_POLL_MS)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) {
+      onAbort()
+    }
+  })
+}
+
+async function llmPreparationError(
+  res: Response,
+  fallback = 'LLM preparation failed',
+): Promise<LlmPreparationError> {
+  const body = await res.json().catch(() => null) as {
+    detail?: string | { code?: string; message?: string; retryable?: boolean }
+    error?: { code?: string; message?: string; retryable?: boolean }
+    code?: string
+    message?: string
+    retryable?: boolean
+  } | null
+  const detail = body?.error || (typeof body?.detail === 'object' ? body.detail : body)
+  const message = detail?.message
+    || (typeof body?.detail === 'string' ? body.detail : '')
+    || fallback
+  return new LlmPreparationError(
+    detail?.code || 'preparation_failed',
+    message,
+    detail?.retryable !== false,
+  )
+}
+
+export async function startLlmPreparation(
+  request: LlmPreparationRequest,
+  signal?: AbortSignal,
+): Promise<LlmPreparationStatus> {
+  throwIfAborted(signal)
+  const payload: LlmPreparationRequest = {
+    workspace: request.workspace,
+    purpose: request.purpose,
+    ...(request.purpose === 'chat' && request.model_id
+      ? { model_id: request.model_id }
+      : {}),
+    ...(request.purpose === 'enhance' && request.model_type
+      ? { model_type: request.model_type }
+      : {}),
+    ...(request.purpose === 'enhance'
+      ? { vision_required: request.vision_required === true }
+      : {}),
+  }
+  const res = await fetch(`${BASE}/api/v1/llm/prepare`, {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  })
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok) throw await llmPreparationError(res)
+  return res.json()
+}
+
+export async function fetchLlmPreparation(
+  operationId: string,
+  workspace: string,
+  signal?: AbortSignal,
+): Promise<LlmPreparationStatus> {
+  throwIfAborted(signal)
+  const query = new URLSearchParams({ workspace })
+  const res = await fetch(
+    `${BASE}/api/v1/llm/prepare/${encodeURIComponent(operationId)}?${query}`,
+    { cache: 'no-store', signal },
+  )
+  if (res.status === 404) {
+    throw new LlmPreparationError(
+      'preparation_not_found',
+      'LLM preparation expired. Preparing again.',
+      true,
+    )
+  }
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok) throw await llmPreparationError(res, 'LLM preparation is unavailable')
+  return res.json()
+}
+
+export async function prepareLlmForRequest(
+  request: LlmPreparationRequest,
+  options?: LlmRequestOptions,
+): Promise<LlmPreparationStatus> {
+  const startedAt = Date.now()
+  let status: LlmPreparationStatus | null = null
+  while (true) {
+    while (!status) {
+      try {
+        status = await startLlmPreparation(request, options?.signal)
+      } catch (error) {
+        throwIfAborted(options?.signal)
+        if (!isTransientRequestError(error)) throw error
+        if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
+          throw new LlmPreparationError(
+            'preparation_unavailable',
+            'LLM preparation is still unreachable. Try again to resume waiting.',
+            true,
+          )
+        }
+        await waitForPreparationPoll(options?.signal)
+      }
+    }
+    options?.onPreparationStatus?.(status)
+    if (status.status === 'ready') return status
+    if (status.status === 'failed') {
+      throw new LlmPreparationError(
+        status.error?.code || 'preparation_failed',
+        status.error?.message || 'LLM preparation failed',
+        status.error?.retryable ?? status.retryable,
+      )
+    }
+    if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
+      throw new LlmPreparationError(
+        'preparation_timeout',
+        'The LLM is still preparing. Try again to resume waiting.',
+        true,
+      )
+    }
+    await waitForPreparationPoll(options?.signal)
+    try {
+      status = await fetchLlmPreparation(
+        status.operation_id,
+        request.workspace,
+        options?.signal,
+      )
+    } catch (error) {
+      throwIfAborted(options?.signal)
+      if (
+        error instanceof LlmPreparationError
+        && error.code === 'preparation_not_found'
+      ) {
+        // Ready preparations may expire or their model may unload while a tab
+        // is hidden. Re-submit the same content-free selector on return.
+        status = null
+        continue
+      }
+      if (!isTransientRequestError(error)) throw error
+    }
+  }
+}
+
+async function withLlmPreparation<T>(
+  request: LlmPreparationRequest,
+  options: LlmRequestOptions | undefined,
+  inference: () => Promise<T>,
+): Promise<T> {
+  await prepareLlmForRequest(request, options)
+  throwIfAborted(options?.signal)
+  return inference()
+}
+
+async function preparedConfiguredPost<T>(
+  path: string,
+  params: { workspace: string },
+  options: LlmRequestOptions | undefined,
+  fallback: string,
+): Promise<T> {
+  return withLlmPreparation(
+    { workspace: params.workspace, purpose: 'configured' },
+    options,
+    async () => {
+      const res = await fetch(`${BASE}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+        signal: options?.signal,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: fallback }))
+        throw new Error(err.detail || fallback)
+      }
+      return res.json()
+    },
+  )
+}
+
+export async function fetchLlmStatus(signal?: AbortSignal): Promise<import('../types').LlmStatus> {
+  const res = await fetch(`${BASE}/api/v1/llm/status`, { signal })
   if (!res.ok) throw new Error('Failed to fetch LLM status')
   return res.json()
 }
 
 export async function loadLlm(
-  params?: { model_id?: string; device?: string }
+  params?: { model_id?: string; device?: string },
+  signal?: AbortSignal,
 ): Promise<import('../types').LlmStatus & { status: string }> {
   const res = await fetch(`${BASE}/api/v1/llm/load`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params || {}),
+    signal,
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Load failed' }))
@@ -2507,26 +3043,144 @@ export async function deleteLlmChatImage(
   }
 }
 
-export async function llmChat(params: {
-  workspace: string
-  model_id: string
-  messages: import('../types').LlmChatMessage[]
-  guide_ids: string[]
-  image_paths?: string[]
-  max_new_tokens?: number
-}, signal?: AbortSignal): Promise<{ text: string; model_id: string; guide_ids: string[] }> {
-  const request = {
-    ...params,
-    // Attachment display metadata is browser-local. Only role/content and
-    // one-use upload references cross the API boundary.
-    messages: params.messages.map(({ role, content }) => ({ role, content })),
+export interface LlmRefusalLiteralResult {
+  added: boolean
+  count: number
+  revision: string | number
+}
+
+export const LLM_REFUSAL_LITERAL_MAX_CODE_POINTS = 256
+
+function isLlmRefusalWhitespace(codePoint: number): boolean {
+  return codePoint === 0x09
+    || codePoint === 0x0a
+    || codePoint === 0x0d
+    || codePoint === 0x20
+    || codePoint === 0xa0
+    || codePoint === 0x1680
+    || (codePoint >= 0x2000 && codePoint <= 0x200a)
+    || codePoint === 0x2028
+    || codePoint === 0x2029
+    || codePoint === 0x202f
+    || codePoint === 0x205f
+    || codePoint === 0x3000
+}
+
+export function validateLlmRefusalLiteral(literal: string): string | null {
+  const characters = Array.from(literal)
+  if (characters.length === 0) return 'Select refusal wording before continuing.'
+  if (characters.length > LLM_REFUSAL_LITERAL_MAX_CODE_POINTS) {
+    return `Keep refusal wording to ${LLM_REFUSAL_LITERAL_MAX_CODE_POINTS} characters or fewer.`
   }
+  const codePoints = characters.map(character => character.codePointAt(0) ?? 0)
+  if (codePoints.some(codePoint => (
+    (codePoint <= 0x1f && codePoint !== 0x09 && codePoint !== 0x0a && codePoint !== 0x0d)
+    || (codePoint >= 0x7f && codePoint <= 0x9f)
+    || (codePoint >= 0xd800 && codePoint <= 0xdfff)
+  ))) {
+    return 'Refusal wording contains an unsupported control character.'
+  }
+  if (codePoints.every(isLlmRefusalWhitespace)) {
+    return 'Select refusal wording before continuing.'
+  }
+  return null
+}
+
+export async function addLlmRefusalLiteral(
+  literal: string,
+  signal?: AbortSignal,
+): Promise<LlmRefusalLiteralResult> {
+  const validationError = validateLlmRefusalLiteral(literal)
+  if (validationError) throw new Error(validationError)
+  const res = await fetch(`${BASE}/api/v1/llm/refusal-literals`, {
+    method: 'POST',
+    cache: 'no-store',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ literal }),
+    signal,
+  })
+  if (!res.ok) {
+    // The selected wording must not be reflected through an error envelope.
+    throw new Error('Could not add the selected refusal wording')
+  }
+  const body = await res.json() as Partial<LlmRefusalLiteralResult>
+  if (
+    typeof body.added !== 'boolean'
+    || typeof body.count !== 'number'
+    || !Number.isInteger(body.count)
+    || body.count < 0
+    || (typeof body.revision !== 'string' && typeof body.revision !== 'number')
+  ) {
+    throw new Error('The host returned an invalid refusal-wording status')
+  }
+  return {
+    added: body.added,
+    count: body.count,
+    revision: body.revision,
+  }
+}
+
+export interface LlmChatOperationStatus {
+  request_id: string
+  status: 'running' | 'completed' | 'failed'
+  phase: string
+  retryable: boolean
+  partial_text?: string
+  attempt?: number
+  attempt_limit?: number
+  generated_tokens_approx?: number
+  elapsed_seconds?: number
+  live_tps?: number | null
+  average_tps?: number | null
+  result?: {
+    text: string
+    model_id: string
+    guide_ids: string[]
+    generated_tokens_approx?: number
+    elapsed_seconds?: number
+    average_tps?: number | null
+  } | null
+  error?: { code: string; message: string; retryable: boolean } | null
+}
+
+export interface LlmChatResult {
+  text: string
+  model_id: string
+  guide_ids: string[]
+  generated_tokens_approx?: number
+  elapsed_seconds?: number
+  average_tps?: number | null
+}
+
+export function createLlmRequestId(): string {
+  if (typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID()
+  }
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0'))
+  return [
+    hex.slice(0, 4).join(''),
+    hex.slice(4, 6).join(''),
+    hex.slice(6, 8).join(''),
+    hex.slice(8, 10).join(''),
+    hex.slice(10).join(''),
+  ].join('-')
+}
+
+async function submitLlmChat(
+  request: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<LlmChatOperationStatus> {
   const res = await fetch(`${BASE}/api/v1/llm/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
     signal,
   })
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Chat request failed' }))
     throw new Error(err.detail || 'Chat request failed')
@@ -2534,7 +3188,159 @@ export async function llmChat(params: {
   return res.json()
 }
 
+export async function fetchLlmChatOperation(
+  requestId: string,
+  workspace: string,
+  signal?: AbortSignal,
+): Promise<LlmChatOperationStatus | null> {
+  const query = new URLSearchParams({ workspace })
+  const res = await fetch(
+    `${BASE}/api/v1/llm/chat/${encodeURIComponent(requestId)}?${query}`,
+    { cache: 'no-store', signal },
+  )
+  if (res.status === 404) return null
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Chat status is unavailable' }))
+    throw new Error(err.detail || 'Chat status is unavailable')
+  }
+  return res.json()
+}
+
+async function recoverLlmChatSubmission(
+  request: Record<string, unknown>,
+  requestId: string,
+  workspace: string,
+  signal?: AbortSignal,
+): Promise<LlmChatOperationStatus> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < LLM_PREPARATION_MAX_WAIT_MS) {
+    throwIfAborted(signal)
+    try {
+      const existing = await fetchLlmChatOperation(requestId, workspace, signal)
+      if (existing) return existing
+      // If the first POST never reached the host, the same UUID and exact
+      // request can be re-submitted safely. A running operation coalesces.
+      return await submitLlmChat(request, signal)
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      await waitForPreparationPoll(signal)
+    }
+  }
+  throw new LlmChatWaitError('Chat status is still unavailable. Try again to resume waiting.')
+}
+
+export async function waitForLlmChatOperation(
+  requestId: string,
+  workspace: string,
+  signal?: AbortSignal,
+  initial?: LlmChatOperationStatus,
+  onStatus?: (status: LlmChatOperationStatus) => void,
+): Promise<LlmChatResult> {
+  const startedAt = Date.now()
+  let operation: LlmChatOperationStatus | null | undefined = initial
+  while (!operation) {
+    if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
+      throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
+    }
+    try {
+      operation = await fetchLlmChatOperation(requestId, workspace, signal)
+      if (!operation) {
+        throw new Error('This Chat result is no longer available. Retry the turn.')
+      }
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      await waitForPreparationPoll(signal)
+    }
+  }
+  onStatus?.(operation)
+  while (operation.status === 'running') {
+    if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
+      throw new LlmChatWaitError('Chat is still running. Resume waiting to retrieve the result.')
+    }
+    await waitForPreparationPoll(signal)
+    try {
+      const next = await fetchLlmChatOperation(requestId, workspace, signal)
+      if (!next) {
+        throw new Error('This Chat result is no longer available. Retry the turn.')
+      }
+      operation = next
+      onStatus?.(operation)
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      // A retryable proxy/status failure does not end the durable operation.
+    }
+  }
+  if (operation.status === 'completed' && operation.result) {
+    return {
+      ...operation.result,
+      generated_tokens_approx: operation.result.generated_tokens_approx
+        ?? operation.generated_tokens_approx,
+      elapsed_seconds: operation.result.elapsed_seconds ?? operation.elapsed_seconds,
+      average_tps: operation.result.average_tps ?? operation.average_tps,
+    }
+  }
+  throw new Error(operation.error?.message || 'Chat generation failed')
+}
+
+export async function llmChat(params: {
+  workspace: string
+  request_id: string
+  model_id: string
+  messages: import('../types').LlmChatMessage[]
+  guide_ids: string[]
+  explicit_output?: boolean
+  image_paths?: string[]
+  max_new_tokens?: number
+}, signal?: AbortSignal, onPreparationStatus?: LlmRequestOptions['onPreparationStatus'], onOperationStatus?: (status: LlmChatOperationStatus) => void, onSubmissionAttempted?: () => void): Promise<LlmChatResult> {
+  const request = {
+    ...params,
+    // Attachment display metadata is browser-local. Only role/content and
+    // one-use upload references cross the API boundary.
+    messages: params.messages.map(({ role, content }) => ({ role, content })),
+  }
+  await prepareLlmForRequest(
+    {
+      workspace: params.workspace,
+      purpose: 'chat',
+      model_id: params.model_id,
+    },
+    { signal, onPreparationStatus },
+  )
+  throwIfAborted(signal)
+  // From this point a disconnect can hide an accepted 202, so the browser
+  // must retain the request id even before it observes operation status.
+  onSubmissionAttempted?.()
+
+  let operation: LlmChatOperationStatus | null = null
+  try {
+    operation = await submitLlmChat(request, signal)
+  } catch (error) {
+    throwIfAborted(signal)
+    if (!isTransientRequestError(error)) throw error
+    // A transient disconnect may hide a successful 202. Query the durable
+    // request id first; if it never arrived, re-submit the exact same request.
+    operation = await recoverLlmChatSubmission(
+      request,
+      params.request_id,
+      params.workspace,
+      signal,
+    )
+  }
+  return waitForLlmChatOperation(
+    params.request_id,
+    params.workspace,
+    signal,
+    operation,
+    onOperationStatus,
+  )
+}
+
 export async function llmEnhancePrompt(params: {
+  workspace: string
   prompt: string
   mode?: string
   model_type?: string
@@ -2549,17 +3355,55 @@ export async function llmEnhancePrompt(params: {
   tts_enhance_mode?: string
   tts_voice_count?: number
   max_new_tokens?: number
-}): Promise<{ original: string; enhanced: string }> {
-  const res = await fetch(`${BASE}/api/v1/llm/enhance-prompt`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Enhancement failed' }))
-    throw new Error(err.detail || 'Enhancement failed')
-  }
-  return res.json()
+  explicit_output?: boolean
+}, options?: LlmRequestOptions): Promise<{ original: string; enhanced: string }> {
+  return withLlmPreparation(
+    {
+      workspace: params.workspace,
+      purpose: 'enhance',
+      model_type: params.model_type,
+      vision_required: Boolean(params.image_path || params.image_paths?.length),
+    },
+    options,
+    async () => {
+      const res = await fetch(`${BASE}/api/v1/llm/enhance-prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+        signal: options?.signal,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Enhancement failed' }))
+        throw new Error(err.detail || 'Enhancement failed')
+      }
+      return res.json()
+    },
+  )
+}
+
+export async function llmDescribeImage(params: {
+  workspace: string
+  image_path: string
+  prompt?: string
+  max_new_tokens?: number
+}, options?: LlmRequestOptions): Promise<{ description: string }> {
+  return withLlmPreparation(
+    { workspace: params.workspace, purpose: 'configured' },
+    options,
+    async () => {
+      const res = await fetch(`${BASE}/api/v1/llm/describe-image`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+        signal: options?.signal,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Image description failed' }))
+        throw new Error(err.detail || 'Image description failed')
+      }
+      return res.json()
+    },
+  )
 }
 
 // --- Audio Analysis ---
@@ -2639,42 +3483,36 @@ export async function suggestAudioClips(params: {
 // --- Director ---
 
 export async function planAnglePrompts(params: {
+  workspace: string
   style_prompt: string
   num_angles?: number
-}): Promise<{ prompts: string[] }> {
-  const res = await fetch(`${BASE}/api/v1/director/plan-angle-prompts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Angle prompt planning failed' }))
-    throw new Error(err.detail || 'Angle prompt planning failed')
-  }
-  return res.json()
+}, options?: LlmRequestOptions): Promise<{ prompts: string[] }> {
+  return preparedConfiguredPost(
+    '/api/v1/director/plan-angle-prompts',
+    params,
+    options,
+    'Angle prompt planning failed',
+  )
 }
 
 export async function planClipPrompts(params: {
+  workspace: string
   clips: import('../types').SuggestedClip[]
   style_prompt: string
   lyrics?: import('../types').LyricSegment[]
   bpm: number
-}): Promise<{ prompts: string[] }> {
-  const res = await fetch(`${BASE}/api/v1/director/plan-prompts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Prompt planning failed' }))
-    throw new Error(err.detail || 'Prompt planning failed')
-  }
-  return res.json()
+}, options?: LlmRequestOptions): Promise<{ prompts: string[] }> {
+  return preparedConfiguredPost(
+    '/api/v1/director/plan-prompts',
+    params,
+    options,
+    'Prompt planning failed',
+  )
 }
 
 export async function planClipStructure(params: {
   analysis: import('../types').AudioAnalysisResult
-  workspace?: string
+  workspace: string
   director_request_id?: string
   energy_bias?: number
   fps?: number
@@ -2686,43 +3524,37 @@ export async function planClipStructure(params: {
    *  Studio-selected model (possibly a music model) and are only a
    *  fallback when this is absent. */
   video_model?: string
-}): Promise<{ clips: import('../types').PlannedClip[] }> {
-  const res = await fetch(`${BASE}/api/v1/audio/plan-structure`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Structure planning failed' }))
-    throw new Error(err.detail || 'Structure planning failed')
-  }
-  return res.json()
+}, options?: LlmRequestOptions): Promise<{ clips: import('../types').PlannedClip[] }> {
+  return preparedConfiguredPost(
+    '/api/v1/audio/plan-structure',
+    params,
+    options,
+    'Structure planning failed',
+  )
 }
 
 export async function classifySections(params: {
   analysis: import('../types').AudioAnalysisResult
-  workspace?: string
+  workspace: string
   director_request_id?: string
-}): Promise<{
+}, options?: LlmRequestOptions): Promise<{
   sections: import('../types').AudioSection[]
   song_structure: { label: string; display_label: string; start: number }[]
   method: 'llm' | 'heuristic'
 }> {
-  const res = await fetch(`${BASE}/api/v1/director/classify-sections`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Classification failed' }))
-    throw new Error(err.detail || 'Section classification failed')
-  }
-  return res.json()
+  return preparedConfiguredPost(
+    '/api/v1/director/classify-sections',
+    params,
+    options,
+    'Section classification failed',
+  )
 }
 
 export async function planClipPromptsAndImages(params: {
+  workspace: string
   clips: import('../types').PlannedClip[]
   scene_description: string
+  explicit_output?: boolean
   lyrics?: import('../types').LyricSegment[]
   bpm: number
   reference_image_path?: string | null
@@ -2733,43 +3565,38 @@ export async function planClipPromptsAndImages(params: {
   speaker_mappings?: Record<string, { name: string; role: string }>
   prompt_type?: 'image' | 'video' | 'both'
   existing_image_prompts?: string[]
-}): Promise<{ clip_plans: import('../types').ClipPlan[] }> {
-  const res = await fetch(`${BASE}/api/v1/director/plan-prompts-and-images`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Prompt and image planning failed' }))
-    throw new Error(err.detail || 'Prompt and image planning failed')
-  }
-  return res.json()
+}, options?: LlmRequestOptions): Promise<{ clip_plans: import('../types').ClipPlan[] }> {
+  return preparedConfiguredPost(
+    '/api/v1/director/plan-prompts-and-images',
+    params,
+    options,
+    'Prompt and image planning failed',
+  )
 }
 
 // --- Short Film Director ---
 
 export async function planDialogueScenes(params: {
+  workspace: string
   analysis: import('../types').AudioAnalysisResult
   pacing_bias?: number
   fps?: number
   frames_steps?: number
   frames_minimum?: number
-}): Promise<{ clips: import('../types').PlannedClip[] }> {
-  const res = await fetch(`${BASE}/api/v1/director/plan-dialogue-scenes`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Dialogue scene planning failed' }))
-    throw new Error(err.detail || 'Dialogue scene planning failed')
-  }
-  return res.json()
+}, options?: LlmRequestOptions): Promise<{ clips: import('../types').PlannedClip[] }> {
+  return preparedConfiguredPost(
+    '/api/v1/director/plan-dialogue-scenes',
+    params,
+    options,
+    'Dialogue scene planning failed',
+  )
 }
 
 export async function planShortFilmPrompts(params: {
+  workspace: string
   clips: import('../types').PlannedClip[]
   scene_description: string
+  explicit_output?: boolean
   lyrics?: import('../types').LyricSegment[]
   reference_image_path?: string | null
   character_ref_paths?: string[]
@@ -2780,17 +3607,13 @@ export async function planShortFilmPrompts(params: {
   characters?: { name: string; description: string }[]
   prompt_type?: 'image' | 'video' | 'both'
   existing_image_prompts?: string[]
-}): Promise<{ clip_plans: import('../types').ClipPlan[] }> {
-  const res = await fetch(`${BASE}/api/v1/director/plan-short-film-prompts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Short film prompt planning failed' }))
-    throw new Error(err.detail || 'Short film prompt planning failed')
-  }
-  return res.json()
+}, options?: LlmRequestOptions): Promise<{ clip_plans: import('../types').ClipPlan[] }> {
+  return preparedConfiguredPost(
+    '/api/v1/director/plan-short-film-prompts',
+    params,
+    options,
+    'Short film prompt planning failed',
+  )
 }
 
 export async function getLlmStreamStatus(): Promise<{ text: string; done: boolean }> {
@@ -2800,7 +3623,9 @@ export async function getLlmStreamStatus(): Promise<{ text: string; done: boolea
 }
 
 export async function planShortFilmScript(params: {
+  workspace: string
   story_description: string
+  explicit_output?: boolean
   characters?: { name: string; description: string }[]
   reference_image_path?: string | null
   character_ref_paths?: string[]
@@ -2813,17 +3638,13 @@ export async function planShortFilmScript(params: {
   fps?: number
   frames_steps?: number
   frames_minimum?: number
-}): Promise<{ clips: import('../types').PlannedClip[]; clip_plans: import('../types').ClipPlan[] }> {
-  const res = await fetch(`${BASE}/api/v1/director/plan-short-film-script`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Story planning failed' }))
-    throw new Error(err.detail || 'Story planning failed')
-  }
-  return res.json()
+}, options?: LlmRequestOptions): Promise<{ clips: import('../types').PlannedClip[]; clip_plans: import('../types').ClipPlan[] }> {
+  return preparedConfiguredPost(
+    '/api/v1/director/plan-short-film-script',
+    params,
+    options,
+    'Story planning failed',
+  )
 }
 
 // --- CivitAI Browser ---
@@ -3040,9 +3861,6 @@ export interface InstalledLora {
   name: string | null
   base_model: string | null
   nsfw: boolean
-  /** True when the user manually overrode CivitAI's NSFW classification
-   *  via /api/v1/loras/nsfw-override. */
-  nsfw_overridden?: boolean
   /** Stable identifier that survives version updates. Format:
    *  `civitai:{modelId}` when the sidecar exposes a CivitAI modelId,
    *  otherwise `local:{filename}`. Used as the persistence key for

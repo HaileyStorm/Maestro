@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import hmac
+import math
 import os
 from pathlib import Path, PurePath, PurePosixPath
 import re
@@ -377,30 +378,61 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
     allowed_top = {
-        "kind", "clip_count", "requested_frames", "planned_frames",
+        "kind", "clip_count", "fps", "requested_frames", "planned_frames",
+        "published_frames",
         "adaptive_conditioning", "checkpoint_switches",
         "effective_model_count", "effective_models", "segments",
     }
     allowed_segment = {
-        "index", "frames", "duration_seconds", "model_type", "model_reason",
+        "index", "frames", "duration_seconds",
+        "generated_frames", "published_frames",
+        "generated_duration_seconds", "published_duration_seconds",
+        "model_type", "model_reason",
         "edge_anchor_locked", "switch_from_previous", "boundary_from_previous",
     }
-    result = {
-        key: _safe_json(child, path=f"job.h3_segment_plan.{key}")
-        for key, child in value.items()
-        if key in allowed_top and key != "segments"
-    }
+
+    def positive_number(child: Any, *, path: str) -> int | float:
+        if type(child) not in {int, float} or not math.isfinite(child) or child <= 0:
+            raise QueueRecoveryAdapterError(f"{path} must be a positive finite number.")
+        return child
+
+    def positive_integer(child: Any, *, path: str) -> int:
+        if type(child) is not int or child <= 0:
+            raise QueueRecoveryAdapterError(f"{path} must be a positive integer.")
+        return child
+
+    result = {}
+    for key, child in value.items():
+        if key not in allowed_top or key == "segments":
+            continue
+        path = f"job.h3_segment_plan.{key}"
+        if key in {"fps"}:
+            result[key] = positive_number(child, path=path)
+        elif key in {"published_frames"}:
+            result[key] = positive_integer(child, path=path)
+        else:
+            result[key] = _safe_json(child, path=path)
     segments = value.get("segments")
     if isinstance(segments, list):
-        result["segments"] = [
-            {
-                key: _safe_json(child, path=f"job.h3_segment_plan.segments.{key}")
-                for key, child in segment.items()
-                if key in allowed_segment
-            }
-            for segment in segments
-            if isinstance(segment, Mapping)
-        ]
+        safe_segments = []
+        for segment_index, segment in enumerate(segments):
+            if not isinstance(segment, Mapping):
+                continue
+            safe_segment = {}
+            for key, child in segment.items():
+                if key not in allowed_segment:
+                    continue
+                path = f"job.h3_segment_plan.segments[{segment_index}].{key}"
+                if key in {"generated_frames", "published_frames"}:
+                    safe_segment[key] = positive_integer(child, path=path)
+                elif key in {
+                    "generated_duration_seconds", "published_duration_seconds",
+                }:
+                    safe_segment[key] = positive_number(child, path=path)
+                else:
+                    safe_segment[key] = _safe_json(child, path=path)
+            safe_segments.append(safe_segment)
+        result["segments"] = safe_segments
     return result
 
 

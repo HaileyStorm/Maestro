@@ -165,8 +165,7 @@ to pick voice timbre, pitch, age, and baseline delivery.
 
 Good `voice` values bundle several dimensions:
 
-- **Age band**: young adult, adult, older adult, elderly. (Never use
-  age numbers under 18 — use adult vocabulary only.)
+- **Age band**: young, young adult, adult, older adult, elderly.
 - **Demeanor**: confident, anxious, world-weary, eager, deadpan,
   warm, clipped, gruff, breathy.
 - **Vocal quality** (optional): raspy, smooth, gravelly, nasal,
@@ -380,10 +379,6 @@ include the brace once at the top OR build the voice into the cues:
 - Writing SFX as fake dialogue lines — `Speaker 3: [door slam]`
   produces broken audio. Put environmental sound in `scene=` or
   inside a cue on the next dialogue line.
-- Using age numbers under 18 anywhere, or describing any speaker
-  in a romantic/sexual scene as a minor. All speakers in any
-  intimate context must be adults; use adult vocabulary
-  (woman, man, lady, gentleman).
 - Excessively long turns. Keep each turn to 1–3 short sentences.
 - Stage directions in `voice=` — the voice field is the casting
   note, not the blocking. Use `[cue]` for blocking.

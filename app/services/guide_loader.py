@@ -1,8 +1,9 @@
 """Generic loader for LLM prompt guides under app/services/llm_guides/.
 
 Reads .md files from app/services/llm_guides/<category>/<name>.md and
-returns the content as a stripped string. Caches results after the
-first load (guides don't change at runtime).
+returns the content as a stripped string. Results are intentionally cached for
+the life of the Maestro Python process. Installed/updated guides take effect
+after Maestro restarts; production code has no live-reload/cache-clear path.
 
 Two domain-specific loaders already exist for historical reasons and
 remain the right tool for their narrow jobs:
@@ -33,7 +34,8 @@ def load_guide(category: str, name: str) -> str:
 
     Returns empty string if the file is missing or unreadable (caller
     is responsible for handling that case — usually falling back to
-    a built-in default prompt). Cached after first load.
+    a built-in default prompt). Cached after first load; tests may use
+    ``load_guide.cache_clear()`` to model a new process.
 
     Args:
         category: Subfolder under llm_guides/ (e.g. "prompt_enhancer").

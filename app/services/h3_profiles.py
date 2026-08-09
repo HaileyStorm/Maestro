@@ -55,6 +55,33 @@ _PROFILES = (
         "attention_engine": "sol_attn",
     },
     {
+        "id": "spectrum_experimental",
+        "label": "Spectrum Experimental",
+        "description": (
+            "Experimental clean-room H3 forecast accelerator: the High 1344x768 "
+            "20-step Sol bundle captures 11 paired hidden-feature anchors and nine "
+            "causal forecast slots, then replays every step without transformer blocks. "
+            "Audio uses local interpolation only; "
+            "quality and speed still require live validation."
+        ),
+        "accelerator": "spectrum",
+        "num_inference_steps": 20,
+        "resolution": "1344x768",
+        "attention_engine": "sol_attn",
+    },
+    {
+        "id": "lightx2v_experimental",
+        "label": "LightX2V Experimental",
+        "description": (
+            "Manual Base FL2VA four-evaluation adapter at 608x352 with Dense SDPA. "
+            "It is separate from Draft/Fast and requires its pinned managed asset."
+        ),
+        "accelerator": "lightx2v",
+        "num_inference_steps": 4,
+        "resolution": "608x352",
+        "attention_engine": "sdpa",
+    },
+    {
         "id": "1080p_delivery",
         "label": "1080p Delivery",
         "description": (
@@ -150,6 +177,10 @@ def profile_settings(
     }
     if definition["accelerator"] == "turbo":
         settings["custom_settings"]["h3_turbo_profile"] = "h3_turbo_v4"
+    elif definition["accelerator"] == "spectrum":
+        settings["custom_settings"]["h3_spectrum_profile"] = "spectrum_h3_v1"
+    elif definition["accelerator"] == "lightx2v":
+        settings["custom_settings"]["h3_lightx2v_profile"] = "h3_lightx2v_fl2v_4_v1"
     return settings
 
 
@@ -189,6 +220,26 @@ def _sage2_base_context_reason(
     return None
 
 
+def _spectrum_context_reason(
+    context: Mapping[str, Any],
+    reference_shape: Mapping[str, Any],
+) -> str | None:
+    if str(context.get("model_type") or "minimax_h3") != "minimax_h3":
+        return "Spectrum Experimental currently supports only MiniMax H3 Base FL2VA."
+    if any(int(reference_shape.get(key) or 0) > 0 for key in (
+        "image_count", "video_count", "audio_count",
+    )):
+        return "Spectrum Experimental cannot use semantic routing to Ref2VA."
+    segments = context.get("_segment_contexts")
+    if isinstance(segments, list) and any(
+        not isinstance(segment, Mapping)
+        or str(segment.get("model_type") or "") != "minimax_h3"
+        for segment in segments
+    ):
+        return "Spectrum Experimental requires every planned segment to remain on Base FL2VA."
+    return None
+
+
 def build_profile_options(
     context: Mapping[str, Any],
     *,
@@ -196,6 +247,9 @@ def build_profile_options(
     model_downloaded: Callable[[str], bool],
     turbo_status: Mapping[str, Any] | None = None,
     turbo_compatibility: Callable[[Mapping[str, Any]], tuple[bool, str | None]] | None = None,
+    spectrum_compatibility: Callable[[Mapping[str, Any]], tuple[bool, str | None]] | None = None,
+    lightx2v_status: Mapping[str, Any] | None = None,
+    lightx2v_compatibility: Callable[[Mapping[str, Any]], tuple[bool, str | None]] | None = None,
     sage2_status: Mapping[str, Any] | None = None,
     upscale_status: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
@@ -207,10 +261,13 @@ def build_profile_options(
     turbo_status = dict(turbo_status or {})
     sage2_status = dict(sage2_status or {})
     upscale_status = dict(upscale_status or {})
+    lightx2v_status = dict(lightx2v_status or {})
     turbo_registered = bool(turbo_status.get("registered"))
     result: list[dict[str, Any]] = []
     for definition in profile_definitions():
         turbo = definition["accelerator"] == "turbo"
+        spectrum = definition["accelerator"] == "spectrum"
+        lightx2v = definition["accelerator"] == "lightx2v"
         available = True
         reason = None
         # Profiles tune the selected checkpoint. Checkpoint/conditioning
@@ -224,6 +281,17 @@ def build_profile_options(
         # These are ordinary setting writes. Deliberately omit explicit,
         # privacy, adaptive-routing, prompt, duration, and every reference.
         settings = profile_settings(model_type, definition["id"])
+        if spectrum:
+            reason = _spectrum_context_reason(context, reference_shape)
+            available = reason is None
+            if available and spectrum_compatibility is not None:
+                available, reason = spectrum_compatibility(settings)
+        if lightx2v:
+            if selected != "minimax_h3":
+                available = False
+                reason = "LightX2V Experimental supports only MiniMax H3 Base FL2VA."
+            elif lightx2v_compatibility is not None:
+                available, reason = lightx2v_compatibility(settings)
         sage2_context_reason = (
             _sage2_base_context_reason(context, reference_shape)
             if settings["custom_settings"].get("h3_attention_engine") == "sage2"
@@ -292,6 +360,7 @@ def build_profile_options(
             "download_required": bool(
                 available and (
                     (turbo and not bool(turbo_status.get("downloaded")))
+                    or (lightx2v and not bool(lightx2v_status.get("downloaded")))
                     or (model_exists(model_type) and not model_downloaded(model_type))
                     or (upscale and not bool(upscale_status.get("downloaded")))
                 )
@@ -301,6 +370,7 @@ def build_profile_options(
                 for component, required in (
                     ("H3 checkpoint", model_exists(model_type) and not model_downloaded(model_type)),
                     ("Turbo adapter", turbo and not bool(turbo_status.get("downloaded"))),
+                    ("LightX2V adapter", lightx2v and not bool(lightx2v_status.get("downloaded"))),
                     ("FlashVSR", bool(upscale) and not bool(upscale_status.get("downloaded"))),
                 )
                 if required

@@ -272,9 +272,8 @@ class WanPipeline_Sparse(WanPipeline):
 
         Returns:
             [`~WanPipelineOutput`] or `tuple`:
-                If `return_dict` is `True`, [`WanPipelineOutput`] is returned, otherwise a `tuple` is returned where
-                the first element is a list with the generated images and the second element is a list of `bool`s
-                indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
+                If `return_dict` is `True`, [`WanPipelineOutput`] is returned,
+                otherwise the corresponding pipeline output tuple is returned.
         """
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):

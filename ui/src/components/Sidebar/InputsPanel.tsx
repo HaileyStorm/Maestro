@@ -1,8 +1,10 @@
 import { useState, useMemo, useEffect } from 'react'
 import { X, Upload, Plus, Music, Film, Mic } from 'lucide-react'
-import { h3Ref2VATermsAccepted, setH3Ref2VATermsAccepted, useStore } from '../../stores/useStore'
+import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry } from '../../lib/timelinePrompt'
+import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
+import { DOWNLOAD_REFRESH_EVENT } from '../../lib/useVisibilityPolling'
 
 // Unified, media-driven "Inputs" panel for Studio Frames mode (image_mode 0).
 //
@@ -120,6 +122,12 @@ export function InputsPanel() {
   const setGuideVideoFrameCount = useStore(s => s.setGuideVideoFrameCount)
   const guideVideoFrameCount = useStore(s => s.guideVideoFrameCount)
   const voiceRefEnabled = useStore(s => !!s.servicesConfig?.voice_reference_enabled)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const hostTerms = useStore(s => s.hostTerms)
+  const hostTermsLoading = useStore(s => s.hostTermsLoading)
+  const hostTermsError = useStore(s => s.hostTermsError)
+  const loadHostTerms = useStore(s => s.loadHostTerms)
+  const acceptHostTerm = useStore(s => s.acceptHostTerm)
   const directorVoiceRef = useStore(s => s.directorVoiceRef)
   const setDirectorVoiceRef = useStore(s => s.setDirectorVoiceRef)
   const identityScale = useStore(s => s.directorIdentityGuidanceScale)
@@ -181,16 +189,12 @@ export function InputsPanel() {
   const [frameDragKey, setFrameDragKey] = useState<string | null>(null)
   const [frameDragOverKey, setFrameDragOverKey] = useState<string | null>(null)
   const [semanticRefDurations, setSemanticRefDurations] = useState<Record<string, number>>({})
-  const [h3TermsAccepted, setH3TermsAccepted] = useState(h3Ref2VATermsAccepted)
   const [h3DownloadStatus, setH3DownloadStatus] = useState<'idle' | 'downloading' | 'failed'>('idle')
+  const h3TermsAccepted = hostTerms?.minimax_h3_ref2va.accepted === true
 
   useEffect(() => {
-    const syncTerms = (event: Event) => {
-      setH3TermsAccepted((event as CustomEvent<boolean>).detail)
-    }
-    window.addEventListener('maestro:h3-ref2va-terms-change', syncTerms)
-    return () => window.removeEventListener('maestro:h3-ref2va-terms-change', syncTerms)
-  }, [])
+    if (activeWorkspace && !hostTerms && !hostTermsLoading) void loadHostTerms()
+  }, [activeWorkspace, hostTerms, hostTermsLoading, loadHostTerms])
 
   useEffect(() => {
     setSelected(null)
@@ -218,6 +222,7 @@ export function InputsPanel() {
     setH3DownloadStatus('downloading')
     try {
       await api.downloadModel('minimax_h3_ref2va')
+      window.dispatchEvent(new CustomEvent(DOWNLOAD_REFRESH_EVENT))
     } catch {
       setH3DownloadStatus('failed')
     }
@@ -808,19 +813,25 @@ export function InputsPanel() {
               Incompatible fixed plan: pinned Ref2VA cannot use the attached frame anchors. Re-enable automatic model choice or remove them before generating.
             </p>
           )}
-          <label className="flex items-start gap-2 cursor-pointer text-[9px] leading-relaxed text-text-secondary">
-            <input type="checkbox" checked={h3TermsAccepted} className="mt-0.5 accent-accent-blue"
-              onChange={event => {
-                const accepted = event.target.checked
-                setH3TermsAccepted(accepted)
-                setH3Ref2VATermsAccepted(accepted)
-              }} />
-            <span>
-              I confirm I am authorized to use the separately licensed MiniMax H3 weights in my location and accept the
-              applicable model terms. Availability/use may require authorization or a waiver in the US, EU, UK, or South Korea.{' '}
-              <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3" target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Review model terms</a>.
+          <div className="flex flex-col items-stretch gap-2 text-[9px] leading-relaxed text-text-secondary sm:flex-row sm:items-start">
+            <span className="flex-1">
+              {h3TermsAccepted ? 'MiniMax H3 Ref2VA model terms are accepted for this host. ' : `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
+              <a href={HOST_TERM_NOTICES.minimax_h3_ref2va.href} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">{HOST_TERM_NOTICES.minimax_h3_ref2va.linkLabel}</a>.
             </span>
-          </label>
+            {!h3TermsAccepted && hostTerms && (
+              <button
+                type="button"
+                disabled={hostTermsLoading}
+                onClick={() => { void acceptHostTerm('minimax_h3_ref2va') }}
+                className="w-full shrink-0 rounded border border-accent-blue/50 px-2 py-1 text-accent-blue hover:bg-accent-blue/10 disabled:opacity-50 sm:w-auto sm:px-1.5 sm:py-0.5"
+              >
+                Accept for this host
+              </button>
+            )}
+          </div>
+          {!h3TermsAccepted && hostTermsError && (
+            <p className="text-[9px] text-red-300">{hostTermsError}</p>
+          )}
           {ref2vaModel?.is_downloaded !== true && (h3AdaptiveConditioning || dedicatedRef2VAMode || h3HasSemanticInputs) && (
             <button type="button" disabled={!h3TermsAccepted || h3DownloadStatus === 'downloading'} onClick={installH3Ref2VA}
               className="w-full rounded-md border border-accent-blue/50 bg-accent-blue/10 px-2 py-1 text-[10px] text-accent-blue hover:bg-accent-blue/20 disabled:opacity-45 disabled:cursor-not-allowed">

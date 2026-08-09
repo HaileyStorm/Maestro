@@ -27,7 +27,6 @@ from services.output_access import (  # noqa: E402
     can_access_upload,
     decode_session_cookie,
     encode_session_cookie,
-    harden_output_access_for_maturity,
     load_or_create_session_secret,
     output_policy_from_request,
     public_output_policy,
@@ -145,7 +144,7 @@ class OutputPolicyTests(unittest.TestCase):
             {"private": False, "explicit": False},
         )
 
-    def test_mature_job_is_explicit_and_unacknowledged_downgrade_is_private(self):
+    def test_legacy_mature_hint_does_not_override_caller_policy(self):
         for params in ({}, {"explicit_output": False}, {
             "explicit_output": False, "private_output": False,
         }):
@@ -157,10 +156,10 @@ class OutputPolicyTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     policy,
-                    {"private": True, "explicit": True},
+                    {"private": False, "explicit": False},
                 )
 
-    def test_acknowledged_mature_public_override_is_honored(self):
+    def test_explicit_public_override_is_honored(self):
         override = {"private_output": False, "explicit_output": True}
         policy = output_policy_from_request(
             override, mature_output=True, owner_session_id="a" * 32,
@@ -169,26 +168,6 @@ class OutputPolicyTests(unittest.TestCase):
         self.assertTrue(policy["explicit"])
         self.assertNotIn("private_output", override)
         self.assertNotIn("explicit_output", override)
-
-    def test_inherited_director_policy_is_hardened_before_publication(self):
-        forced = harden_output_access_for_maturity(
-            {"private": False, "explicit": False},
-            mature_output=True,
-            owner_session_id="a" * 32,
-        )
-        self.assertEqual(
-            forced,
-            {"private": True, "explicit": True},
-        )
-        deliberate_public = harden_output_access_for_maturity(
-            {"private": False, "explicit": True},
-            mature_output=True,
-            owner_session_id="a" * 32,
-        )
-        self.assertEqual(
-            deliberate_public,
-            {"private": False, "explicit": True},
-        )
 
     def test_policy_flags_reject_string_boolean_coercion(self):
         for key in ("private_output", "explicit_output"):

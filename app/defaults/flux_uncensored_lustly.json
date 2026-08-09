@@ -2,7 +2,7 @@
     "model": {
         "name": "Flux 1 Dev + Lustly Uncensored (Mature)",
         "architecture": "flux",
-        "description": "Mature-mode Flux 1 Dev image generation with the curated Lustly uncensored/NSFW LoRA bundled at its recommended full strength. Hidden unless Explicit mode is enabled; outputs default private.",
+        "description": "Flux 1 Dev image generation with the curated Lustly uncensored/NSFW LoRA bundled at its recommended full strength.",
         "URLs": [
             "https://huggingface.co/DeepBeepMeep/Flux/resolve/main/flux1-dev_bf16.safetensors",
             "https://huggingface.co/DeepBeepMeep/Flux/resolve/main/flux1-dev_quanto_bf16_int8.safetensors"

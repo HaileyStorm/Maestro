@@ -28,12 +28,11 @@ module.exports = {
       if (running.start) {
         let local = info.local("start.js")
         if (local && local.url) {
-          let remote = local.share_url
-          let remoteKind = local.share_kind
-          if (!remote && local.$share && local.$share.cloudflare) {
-            remote = local.$share.cloudflare[local.url] || Object.values(local.$share.cloudflare)[0]
-            remoteKind = "quick"
-          }
+          const stable = local.share_kind === "stable" ? local.share_url : undefined
+          const capturedQuick = local.$share && local.$share.cloudflare
+            ? local.$share.cloudflare[local.url]
+            : undefined
+          const quick = capturedQuick || (local.share_kind === "quick" ? local.share_url : undefined)
           let menu = [{
             default: true,
             icon: "fa-solid fa-rocket",
@@ -48,12 +47,23 @@ module.exports = {
             text: `Terminal · ${local.sharing || "Localhost only"}`,
             href: "start.js",
           }]
-          if (remote) {
-            menu.splice(1, 0, {
+          const remoteMenu = []
+          if (stable) {
+            remoteMenu.push({
               icon: "fa-brands fa-cloudflare",
-              text: `<div><strong>Open / copy Cloudflare ${remoteKind === "stable" ? "stable" : "Quick Tunnel"} URL</strong><div>${remote}</div></div>`,
-              href: remote,
+              text: `<div><strong>Open / copy Cloudflare stable URL</strong><div>${stable}</div></div>`,
+              href: stable,
             })
+          }
+          if (quick && quick !== stable) {
+            remoteMenu.push({
+              icon: "fa-brands fa-cloudflare",
+              text: `<div><strong>Open / copy direct Quick Tunnel URL</strong><div>${quick}</div><div>Bypasses the Worker proxy hop; use if the Worker quota or stable route is unavailable.</div></div>`,
+              href: quick,
+            })
+          }
+          if (remoteMenu.length) {
+            menu.splice(1, 0, ...remoteMenu)
           } else if (local.sharing && local.sharing.includes("Cloudflare")) {
             menu.splice(1, 0, {
               icon: "fa-brands fa-cloudflare",

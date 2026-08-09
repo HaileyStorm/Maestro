@@ -1,6 +1,7 @@
-import { useState, useCallback, useEffect, useRef } from 'react'
+import { useState } from 'react'
 import { RefreshCw, ShieldAlert, ShieldCheck, Lock } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 
 function ApiKeyField({ label, maskedValue, isSet, onSave }: {
   label: string
@@ -58,218 +59,99 @@ function ApiKeyField({ label, maskedValue, isSet, onSave }: {
 
 const PUBLIC_PROVIDERS = new Set(['openai', 'anthropic'])
 
-function NsfwDisclaimerModal({
-  onAccept,
-  onDecline,
-}: {
-  onAccept: () => void
-  onDecline: () => void
-}) {
-  const [scrolledToBottom, setScrolledToBottom] = useState(false)
-  const scrollableRef = useRef<HTMLDivElement>(null)
-
-  // If the modal opens on a window tall enough that all the legal
-  // text fits without scrolling, the onScroll handler never fires
-  // and the Accept button stays disabled forever. Detect "no scroll
-  // needed" on mount + on every viewport resize so the user isn't
-  // stuck.
-  useEffect(() => {
-    const checkScrollable = () => {
-      const el = scrollableRef.current
-      if (!el) return
-      // Add a small buffer so off-by-one rounding doesn't break this.
-      if (el.scrollHeight <= el.clientHeight + 2) {
-        setScrolledToBottom(true)
-      }
-    }
-    checkScrollable()
-    window.addEventListener('resize', checkScrollable)
-    return () => window.removeEventListener('resize', checkScrollable)
-  }, [])
-
-  const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
-    const el = e.currentTarget
-    if (el.scrollHeight - el.scrollTop - el.clientHeight < 20) {
-      setScrolledToBottom(true)
-    }
-  }, [])
-
-  return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60" onClick={onDecline}>
-      <div
-        className="bg-bg-secondary border border-border rounded-xl shadow-2xl w-[480px] max-w-[92vw] max-h-[85vh] flex flex-col overflow-hidden"
-        onClick={e => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="px-5 py-4 border-b border-border flex items-center gap-2.5">
-          <ShieldAlert size={20} className="text-red-400 shrink-0" />
-          <div>
-            <h2 className="text-sm font-semibold text-text-primary">Enable Adult Content Mode</h2>
-            <p className="text-[10px] text-text-muted mt-0.5">Please read and accept before continuing</p>
-          </div>
-        </div>
-
-        {/* Scrollable content */}
-        <div
-          ref={scrollableRef}
-          className="flex-1 overflow-y-auto px-5 py-4 text-xs text-text-secondary leading-relaxed space-y-3"
-          onScroll={handleScroll}
-        >
-          <p className="font-medium text-text-primary">
-            By enabling NSFW mode, you acknowledge and agree to the following:
-          </p>
-
-          <div className="space-y-2">
-            <p><span className="font-medium text-text-primary">1. Age Requirement.</span> You confirm that you are at least 18 years of age (or the age of majority in your jurisdiction, whichever is higher).</p>
-
-            <p><span className="font-medium text-text-primary">2. Legal Responsibility.</span> You are solely responsible for ensuring that all content you generate complies with the laws of your jurisdiction. This includes but is not limited to laws governing obscenity, pornography, intellectual property, privacy, consent, and the depiction of real persons. Maestro and its developers do not monitor, review, or approve generated content.</p>
-
-            <p><span className="font-medium text-text-primary">3. Prohibited Content.</span> You agree to NEVER use this software to generate child sexual abuse material (CSAM) or any content depicting minors in sexual or exploitative contexts. This is strictly prohibited regardless of jurisdiction and may constitute a criminal offense.</p>
-
-            <p><span className="font-medium text-text-primary">4. No Real Person Exploitation.</span> You agree not to generate non-consensual intimate imagery of real, identifiable individuals. Creating realistic explicit content of someone without their consent may violate laws in your jurisdiction.</p>
-
-            <p><span className="font-medium text-text-primary">5. Local Generation.</span> When using local models, all content is generated on your hardware and is never transmitted to external servers. You are responsible for the storage, distribution, and use of any content you create.</p>
-
-            <p><span className="font-medium text-text-primary">6. Public API Providers.</span> NSFW mode is automatically disabled when using public LLM providers (OpenAI, Anthropic) as it violates their terms of service. NSFW mode is only available with local or self-hosted models.</p>
-
-            <p><span className="font-medium text-text-primary">7. No Warranty.</span> This software is provided as-is. The developers assume no liability for content generated by users. You use this feature entirely at your own risk.</p>
-          </div>
-
-          {!scrolledToBottom && (
-            <p className="text-text-muted pt-2">
-              Scroll to the bottom to enable the accept button.
-            </p>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-5 py-3 border-t border-border flex items-center justify-end gap-3">
-          <button
-            onClick={onDecline}
-            className="px-4 py-2 text-xs text-text-secondary hover:text-text-primary border border-border rounded-lg hover:border-border-light transition-colors"
-          >
-            Decline
-          </button>
-          <button
-            onClick={onAccept}
-            disabled={!scrolledToBottom}
-            className="px-4 py-2 text-xs bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-          >
-            I Accept — Enable NSFW
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function NsfwToggleSection() {
   const servicesConfig = useStore(s => s.servicesConfig)
   const servicesConfigLoading = useStore(s => s.servicesConfigLoading)
   const servicesConfigError = useStore(s => s.servicesConfigError)
   const clearServicesConfigError = useStore(s => s.clearServicesConfigError)
   const updateConfig = useStore(s => s.updateServicesConfig)
-  const [showDisclaimer, setShowDisclaimer] = useState(false)
+  const hostTerms = useStore(s => s.hostTerms)
+  const hostTermsLoading = useStore(s => s.hostTermsLoading)
+  const hostTermsError = useStore(s => s.hostTermsError)
+  const acceptHostTerm = useStore(s => s.acceptHostTerm)
 
   if (!servicesConfig) return null
 
   const provider = servicesConfig.llm_provider || 'local'
   const isPublicProvider = PUBLIC_PROVIDERS.has(provider)
   const nsfwEnabled = servicesConfig.nsfw_mode
-  const hasAccepted = !!servicesConfig.nsfw_accepted_at
+  const lawfulUse = hostTerms?.lawful_use
+  const hasAccepted = lawfulUse?.accepted === true
 
-  const handleToggle = () => {
-    if (isPublicProvider || servicesConfigLoading) return // Locked
+  const handleToggle = async () => {
+    if (isPublicProvider || servicesConfigLoading || hostTermsLoading) return
 
     clearServicesConfigError()
 
     if (nsfwEnabled) {
-      // Turning OFF — no confirmation needed.
-      void updateConfig({ nsfw_mode: false })
+      await updateConfig({ nsfw_mode: false })
       return
     }
 
-    // Turning ON — the first enable shows the disclaimer; afterwards
-    // the toggle flips directly. All mature-mode guidance ships
-    // version-controlled with the app — nothing to download.
-    if (!hasAccepted) {
-      setShowDisclaimer(true)
-    } else {
-      void updateConfig({ nsfw_mode: true })
+    if (!hasAccepted && !await acceptHostTerm('lawful_use')) {
+      return
     }
-  }
-
-  const handleDisclaimerAccept = () => {
-    setShowDisclaimer(false)
-    clearServicesConfigError()
-    void updateConfig({
-      nsfw_mode: true,
-      nsfw_accepted_at: new Date().toISOString(),
-    })
+    await updateConfig({ nsfw_mode: true })
   }
 
   return (
-    <>
-      <div className="space-y-3">
-        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Content Settings</h3>
-        <div
-          className={`flex items-center justify-between ${isPublicProvider ? '' : 'cursor-pointer'} group`}
-          onClick={handleToggle}
-        >
-          <div className="flex-1 mr-3">
-            <div className={`text-sm flex items-center gap-1.5 ${
-              isPublicProvider ? 'text-text-muted' : 'text-text-primary group-hover:text-accent-blue transition-colors'
-            }`}>
-              {nsfwEnabled ? (
-                <ShieldAlert size={14} className="text-red-400 shrink-0" />
-              ) : (
-                <ShieldCheck size={14} className="text-indicator-success shrink-0" />
-              )}
-              NSFW Mode
-              {isPublicProvider && <Lock size={11} className="text-text-muted" />}
-            </div>
-            <div className="text-[10px] text-text-muted mt-0.5">
-              {isPublicProvider ? (
-                <>NSFW is unavailable with public LLM providers ({provider}). Switch to a local or self-hosted model to enable.</>
-              ) : nsfwEnabled ? (
-                <>Adult content generation is enabled. LLM prompts include explicit content guidance. Use responsibly.</>
-              ) : (
-                <>Content safety guardrails active. Explicit content is blocked in all LLM outputs.</>
-              )}
-            </div>
+    <div className="space-y-3">
+      <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Content Guidance</h3>
+      <div
+        className={`flex items-center justify-between ${isPublicProvider ? '' : 'cursor-pointer'} group`}
+        onClick={() => { void handleToggle() }}
+      >
+        <div className="flex-1 mr-3">
+          <div className={`text-sm flex items-center gap-1.5 ${
+            isPublicProvider ? 'text-text-muted' : 'text-text-primary group-hover:text-accent-blue transition-colors'
+          }`}>
+            {nsfwEnabled ? (
+              <ShieldAlert size={14} className="text-red-400 shrink-0" />
+            ) : (
+              <ShieldCheck size={14} className="text-indicator-success shrink-0" />
+            )}
+            Mature prompt guidance
+            {isPublicProvider && <Lock size={11} className="text-text-muted" />}
           </div>
-          <div
-            className={`w-9 h-5 rounded-full transition-colors relative shrink-0 ${
-              isPublicProvider || servicesConfigLoading ? 'bg-bg-tertiary border border-border opacity-40 cursor-not-allowed'
-                : nsfwEnabled ? 'bg-red-500' : 'bg-bg-tertiary border border-border'
-            }`}
-          >
-            <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white border border-border shadow transition-transform ${
-              nsfwEnabled && !isPublicProvider ? 'translate-x-4' : 'translate-x-0.5'
-            }`} />
+          <div className="text-[10px] text-text-muted mt-0.5">
+            {isPublicProvider ? (
+              <>Guidance is unavailable with {provider}; provider terms and privacy apply separately. Local generation remains content-neutral.</>
+            ) : nsfwEnabled ? (
+              <>The host can add mature authoring guidance when a job is explicitly marked Explicit.</>
+            ) : (
+              <>Guidance is off. Maestro does not inspect or filter locally processed creative content.</>
+            )}
           </div>
         </div>
-        {servicesConfigError && (
-          <div className="flex items-start justify-between gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[10px] text-red-300">
-            <span>{servicesConfigError}</span>
-            <button
-              type="button"
-              onClick={clearServicesConfigError}
-              className="shrink-0 text-red-200 hover:text-white"
-            >
-              Dismiss
-            </button>
-          </div>
-        )}
+        <div
+          className={`w-9 h-5 rounded-full transition-colors relative shrink-0 ${
+            isPublicProvider || servicesConfigLoading || hostTermsLoading ? 'bg-bg-tertiary border border-border opacity-40 cursor-not-allowed'
+              : nsfwEnabled ? 'bg-red-500' : 'bg-bg-tertiary border border-border'
+          }`}
+        >
+          <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white border border-border shadow transition-transform ${
+            nsfwEnabled && !isPublicProvider ? 'translate-x-4' : 'translate-x-0.5'
+          }`} />
+        </div>
       </div>
 
-      {showDisclaimer && (
-        <NsfwDisclaimerModal
-          onAccept={handleDisclaimerAccept}
-          onDecline={() => setShowDisclaimer(false)}
-        />
+      {lawfulUse && !hasAccepted && (
+        <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-[10px] leading-relaxed text-text-muted">
+          {HOST_TERM_NOTICES.lawful_use.text} Enabling guidance accepts notice v{HOST_TERM_NOTICES.lawful_use.version} once for this host.
+        </div>
       )}
-    </>
+      {lawfulUse?.accepted && (
+        <p className="text-[9px] text-text-muted">Host notice v{lawfulUse.accepted_version} accepted. Each job's Explicit choice remains separate.</p>
+      )}
+      {(servicesConfigError || hostTermsError) && (
+        <div className="flex items-start justify-between gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[10px] text-red-300">
+          <span>{servicesConfigError || hostTermsError}</span>
+          {servicesConfigError && (
+            <button type="button" onClick={clearServicesConfigError} className="shrink-0 text-red-200 hover:text-white">Dismiss</button>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -348,7 +230,7 @@ export function ServicesSettingsPanel() {
             onChange={e => {
               const newProvider = e.target.value
               const updates: Record<string, unknown> = { llm_provider: newProvider }
-              // Auto-disable NSFW when switching to a public provider
+              // Provider compatibility is separate from host notice acceptance.
               if (PUBLIC_PROVIDERS.has(newProvider) && servicesConfig.nsfw_mode) {
                 updates.nsfw_mode = false
               }
@@ -363,6 +245,11 @@ export function ServicesSettingsPanel() {
             <option value="openai">OpenAI API</option>
             <option value="anthropic">Anthropic API</option>
           </select>
+          {!isLocal && (
+            <p className="mt-1.5 rounded border border-amber-500/25 bg-amber-500/5 px-2 py-1.5 text-[9px] leading-relaxed text-text-muted">
+              External provider selected: prompt text and attached context used by LLM features may be sent to {provider}. That provider's terms and privacy policy apply separately from Maestro's host notice.
+            </p>
+          )}
         </div>
 
         {/* Remote URL (for remote/openai providers) */}

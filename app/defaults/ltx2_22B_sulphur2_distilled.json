@@ -2,7 +2,7 @@
     "model": {
         "name": "LTX-2.3 22B Sulphur 2 Distilled FP8 (Mature)",
         "architecture": "ltx2_22B",
-        "description": "Community fine-tune of LTX-2.3 22B distilled (Winnougan/Sulphur-2-LTX-2.3) tuned for explicit content. FP8 quantized for faster generation with ~50% memory reduction. Available only when Mature Mode is enabled.",
+        "description": "Community fine-tune of LTX-2.3 22B distilled (Winnougan/Sulphur-2-LTX-2.3) tuned for explicit content. FP8 quantized for faster generation with ~50% memory reduction.",
         "URLs": [
             "https://huggingface.co/Winnougan/Sulphur-2-LTX-2.3/resolve/main/sulphur_distill_fp8.safetensors"
         ],

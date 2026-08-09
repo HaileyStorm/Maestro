@@ -87,6 +87,54 @@ def _index_runs(indices: torch.Tensor) -> tuple[tuple[int, int, int], ...]:
     return tuple(runs)
 
 
+def _spectrum_finalize_target_hidden(
+    *,
+    final_layer: nn.Module,
+    target_hidden: torch.Tensor,
+    curve: torch.Tensor,
+    turbo_silu_t_emb: torch.Tensor | None,
+    target_timestep_indices: torch.Tensor,
+    num_condition_audio_rows: int,
+    num_condition_video_rows: int,
+    total_audio_rows: int,
+    total_video_rows: int,
+    audio_target_rows: int,
+    return_dict: bool,
+) -> MiniMaxH3TransformerOutput | tuple[torch.Tensor, torch.Tensor]:
+    """Run fresh current-coordinate H3 heads on forecast target rows only."""
+    from .spectrum import SpectrumStateError
+
+    if target_hidden.shape[1] != (
+        total_audio_rows - num_condition_audio_rows
+        + total_video_rows - num_condition_video_rows
+    ):
+        raise SpectrumStateError("Spectrum target hidden rows no longer match H3 layout")
+    # H3's inference FinalLayer may modulate its freshly normalized input in
+    # place. Replay features include archived actual anchors, so never let a
+    # current-coordinate head mutate the sealed hidden-feature history.
+    headed = final_layer(
+        target_hidden.clone(),
+        curve,
+        turbo_silu_t_emb,
+        _index_runs(target_timestep_indices),
+    )
+    audio_hidden = headed[:, :audio_target_rows].to(torch.float32)
+    video_hidden = headed[:, audio_target_rows:].to(torch.float32)
+    audio_target = final_layer.audio_out(audio_hidden)
+    video_target = final_layer.video_out(video_hidden)
+    audio_output = audio_target.new_zeros(
+        (audio_target.shape[0], total_audio_rows, audio_target.shape[-1])
+    )
+    video_output = video_target.new_zeros(
+        (video_target.shape[0], total_video_rows, video_target.shape[-1])
+    )
+    audio_output[:, num_condition_audio_rows:] = audio_target
+    video_output[:, num_condition_video_rows:] = video_target
+    if not return_dict:
+        return video_output, audio_output
+    return MiniMaxH3TransformerOutput(video_output, audio_output)
+
+
 def _modulate_by_runs(
     hidden_states: torch.Tensor,
     shift: torch.Tensor,
@@ -884,6 +932,60 @@ class MiniMaxH3Transformer(nn.Module):
         timestep_indices = timestep_indices.to(device=device, dtype=torch.long)
         token_tags = token_tags.to(device=device, dtype=torch.long)
 
+        spectrum_controller = _kwargs.get("h3_spectrum_controller")
+        spectrum_phase = str(_kwargs.get("h3_spectrum_phase") or "")
+        spectrum_step = int(_kwargs.get("h3_step_index") or 0)
+        spectrum_context = tuple(_kwargs.get("h3_spectrum_context_signature") or ())
+        spectrum_step_signature = tuple(
+            _kwargs.get("h3_spectrum_step_signature") or ()
+        )
+        num_condition_video_rows = int(
+            _kwargs.get("h3_spectrum_num_condition_video_rows") or 0
+        )
+        num_condition_audio_rows = int(
+            _kwargs.get("h3_spectrum_num_condition_audio_rows") or 0
+        )
+        forecast_hidden = None
+        if spectrum_controller is not None:
+            target_audio_indices = audio_indices[num_condition_audio_rows:]
+            target_video_indices = video_indices[num_condition_video_rows:]
+            target_indices = torch.cat((target_audio_indices, target_video_indices))
+            target_timestep_indices = timestep_indices.index_select(0, target_indices)
+            if spectrum_phase == "replay":
+                forecast_hidden = spectrum_controller.replay_feature(
+                    spectrum_step,
+                    context_signature=spectrum_context,
+                    step_signature=spectrum_step_signature,
+                )
+            elif spectrum_phase == "capture" and not spectrum_controller.requires_actual(
+                spectrum_step
+            ):
+                forecast_hidden = spectrum_controller.capture_feature(
+                    spectrum_step,
+                    context_signature=spectrum_context,
+                    step_signature=spectrum_step_signature,
+                    actual_call=None,
+                )
+            elif spectrum_phase != "capture":
+                from .spectrum import SpectrumStateError
+                raise SpectrumStateError("Unknown Spectrum H3 transformer phase")
+        if forecast_hidden is not None:
+            curve = self._curve_at(timestep, device)
+            turbo_silu_t_emb = self._turbo_silu_t_emb_at(timestep, device)
+            return _spectrum_finalize_target_hidden(
+                final_layer=self.final_layer,
+                target_hidden=forecast_hidden,
+                curve=curve,
+                turbo_silu_t_emb=turbo_silu_t_emb,
+                target_timestep_indices=target_timestep_indices,
+                num_condition_audio_rows=num_condition_audio_rows,
+                num_condition_video_rows=num_condition_video_rows,
+                total_audio_rows=audio_indices.numel(),
+                total_video_rows=video_indices.numel(),
+                audio_target_rows=target_audio_indices.numel(),
+                return_dict=return_dict,
+            )
+
         video_dtype = _weight_dtype(self.video_patch_proj, torch.float32)
         audio_dtype = _weight_dtype(self.audio_patch_proj, torch.float32)
         text_dtype = _weight_dtype(self.condition_proj, torch.bfloat16)
@@ -936,6 +1038,21 @@ class MiniMaxH3Transformer(nn.Module):
                 rotary,
                 attention_mask,
                 acceleration,
+            )
+
+        if spectrum_controller is not None:
+            target_hidden = torch.cat(
+                (
+                    packed.index_select(1, target_audio_indices),
+                    packed.index_select(1, target_video_indices),
+                ),
+                dim=1,
+            )
+            spectrum_controller.capture_feature(
+                spectrum_step,
+                context_signature=spectrum_context,
+                step_signature=spectrum_step_signature,
+                actual_call=lambda: target_hidden,
             )
 
         packed = self.final_layer(packed, curve, turbo_silu_t_emb, timestep_runs)

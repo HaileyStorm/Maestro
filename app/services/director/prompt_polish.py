@@ -12,7 +12,7 @@ The setting is stored as `director_prompt_polish` in services config.
 import os
 import re
 from functools import lru_cache
-from typing import Optional
+from typing import Callable, Optional
 
 _ENHANCE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_guides", "enhance")
 _DIALECT_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_guides", "dialect")
@@ -82,27 +82,6 @@ _GARMENT_CHANGE_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Narrative-filler phrases the polish layer strips from image prompts —
-# emotion/atmosphere language the image model can't render (observed Gemma 4B
-# failure cases on mature content). Clinical cinematographic filler, so it's
-# tracked in-repo (clean-by-construction).
-_FILLER_PATTERNS_RAW = [
-    r",?\s*showing the (heat|intensity|peak|throes) of (the )?moment[,.]?",
-    r",?\s*at the peak of (her|his|their) (climax|passion|ecstasy)[,.]?",
-    r",?\s*locked (intimately|passionately) (together|in embrace)[,.]?",
-    r",?\s*in the throes of (passion|ecstasy)[,.]?",
-    r",?\s*lost in (the|their) (moment|passion)[,.]?",
-    r",?\s*in a moment of pure (passion|ecstasy|bliss)[,.]?",
-    r",?\s*overwhelmed (by|with) (passion|desire|ecstasy)[,.]?",
-]
-
-
-@lru_cache(maxsize=1)
-def _get_filler_patterns() -> list:
-    """Compile the narrative-filler regex patterns (cached once per process)."""
-    return [re.compile(p, re.IGNORECASE) for p in _FILLER_PATTERNS_RAW]
-
-
 def _strip_garments(text: str) -> tuple[str, int]:
     """Replace '[modifier] [garment]' → '[modifier]'. Returns (cleaned, count).
 
@@ -129,34 +108,6 @@ def _strip_garments(text: str) -> tuple[str, int]:
 
     cleaned = _GARMENT_RE.sub(_sub, text)
     return cleaned, counter[0]
-
-
-def _strip_narrative_filler(text: str) -> tuple[str, int]:
-    """Remove emotion/narrative phrases the image model can't render.
-
-    Inserts a sentence boundary (". ") when the next non-whitespace
-    character after the removed phrase is an uppercase letter — that
-    signals a new sentence started, and the trailing period was eaten
-    by the regex's "[,.]?" terminator. Otherwise plain removal.
-    """
-    count = 0
-    for pat in _get_filler_patterns():
-        def _resolve(m: "re.Match[str]", t: str = text) -> str:
-            tail = t[m.end():].lstrip()
-            if tail and tail[0].isalpha() and tail[0].isupper():
-                return ". "
-            return ""
-        new_text, n = pat.subn(_resolve, text)
-        if n:
-            count += n
-            text = new_text
-    # Cleanup: collapse double-spaces, orphaned commas, double periods,
-    # and orphan-period-then-space-then-period sequences.
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\s*,\s*,", ",", text)
-    text = re.sub(r"\s+([.,])", r"\1", text)
-    text = re.sub(r"\.\s*\.", ".", text)
-    return text.strip(), count
 
 
 # Object-pronoun targets: after these prepositions, "she/he/they" becomes
@@ -410,81 +361,6 @@ _STORYBOARD_CAMERA_NAME_LEAK_RE = re.compile(
 )
 
 
-# Known sex-act leet trigger tokens from popular NSFW video LoRAs.
-# These appear in `trainedWords` sidecar fields and the LoRA-hint
-# system surfaces them in the LLM system prompt. Smaller LLMs and
-# even Qwen-class models sometimes pepper these into non-sex-act
-# scenes for "energy" — observed production bug: a SFW music video
-# about football had "bl0wj0b" in a keyframe_prompt because the
-# LLM treated leet triggers as generic energy boosters.
-#
-# Detection is by EXACT TOKEN match (case-insensitive), not a regex
-# pattern like "letter+digit" — that would false-positive on legit
-# tokens like RTX4090, model names, scientific terms, etc. The list
-# below is intentionally complete-as-known and easy to extend when
-# new sex-act LoRAs ship.
-_SEX_ACT_LEET_TOKENS = (
-    "bl0wj0b", "bl0w_j0b", "bj0b",
-    "m15510n4ry", "m1ss10n4ry", "m1ssi0nary",
-    "c0wg1rl", "c0wgrl", "c0w_g1rl",
-    "r3v3rs3_c0wg1rl", "rc0wg1rl",
-    "d0gg1e", "d0gg1e_style", "d0ggy",
-    "0r4l", "0r4l_s3x",
-    "h4ndj0b", "hj0b",
-    "f1ng3r1ng", "f1nger1ng",
-    "r1m_j0b", "r1mj0b",
-    "p3n3tr4t10n", "p3n3tr4te",
-    "h4rdc0r3", "s0ftc0r3",
-    "n5fw", "3xpl1c1t",
-    "th1cc",
-    "0n_t0p", "fr0m_b3h1nd",
-)
-
-
-def strip_sex_act_leet_tokens(text: str) -> tuple[str, int]:
-    """Strip sex-act leet-coded LoRA triggers from non-sex-act prompts.
-
-    Catches the literal token in multiple wrapping contexts:
-      - "(c0wg1rl)" in parens (storyboard-mimic format)
-      - "bl0wj0b — description" with em-dash prefix
-      - "bl0wj0b. The man..." starting a sentence
-      - "bl0wj0b The man..." standalone
-
-    Used as a defense-in-depth safety net. The leet warning in the
-    LoRA-hint system prompt tells the LLM not to do this, but smaller
-    LLMs ignore it and drop the tokens into keyframes / image prompts
-    for "energy." Stripping after the LLM removes the embarrassing
-    leak before it reaches downstream models or the user.
-
-    Returns (cleaned_text, num_stripped).
-    """
-    if not text:
-        return text, 0
-    count = 0
-    for token in _SEX_ACT_LEET_TOKENS:
-        esc = re.escape(token)
-        # Try in order of most-specific-first so we strip the trailing
-        # punctuation along with the token.
-        for pat_src in (
-            r"\(\s*" + esc + r"\s*\)\s*[—–-]*\s*",  # (c0wg1rl) —
-            r"\(\s*" + esc + r"\s*\)\s*",                       # (c0wg1rl)
-            r"\b" + esc + r"\s+[—–-]+\s*",            # c0wg1rl —
-            r"\b" + esc + r"\s*\.\s+",                          # c0wg1rl. (start of next sentence)
-            r"\b" + esc + r"\s*\.",                             # c0wg1rl.
-            r"\b" + esc + r"\b\s*",                             # c0wg1rl (catch-all)
-        ):
-            pat = re.compile(pat_src, re.IGNORECASE)
-            new_text, n = pat.subn("", text)
-            if n:
-                text = new_text
-                count += n
-                break  # don't double-strip the same token
-    # Collapse any orphaned multi-space the strip created
-    if count:
-        text = re.sub(r"\s{2,}", " ", text).strip()
-    return text, count
-
-
 def strip_storyboard_camera_name_leaks(text: str) -> tuple[str, int]:
     """Strip character-name leaks from storyboard camera-type parens.
 
@@ -716,8 +592,6 @@ _MOTION_VERBS_RE = re.compile(
     # Body movement / oscillation
     r"rising|falling|bobbing|swaying|rocking|bouncing|jumping|leaping|"
     r"spinning|twisting|rotating|turning|tilting|nodding|shaking|trembling|"
-    # Sex acts (motion-form)
-    r"thrusting|grinding|pumping|stroking|riding|"
     # Gestures (durational)
     r"reaching|grabbing|gesturing|pointing|waving|swinging|"
     # Locomotion variants
@@ -965,7 +839,6 @@ def sanitize_image_prompt(
     # speech tags we're about to delete.
     cleaned, dialogue_dropped = _strip_dialogue(text)
     cleaned, garments = _strip_garments(cleaned)
-    cleaned, fillers = _strip_narrative_filler(cleaned)
     # Motion-verb sanitizer (B): drop sentences containing motion verbs
     # like "rising", "thrusting", "bobbing". Image prompts must be
     # frozen frames; motion verbs are nonsense in a still.
@@ -984,15 +857,13 @@ def sanitize_image_prompt(
     # of the prompt — any other passes might have removed sentences and
     # changed where the boilerplate suffix sits.
     cleaned, orphans = _strip_orphan_before_boilerplate(cleaned)
-    if (dialogue_dropped or garments or fillers or deduped
+    if (dialogue_dropped or garments or deduped
             or motion_dropped or long_poss or double_articles or orphans):
         notes = []
         if dialogue_dropped:
             notes.append(f"{dialogue_dropped} dialogue sentence(s) stripped")
         if garments:
             notes.append(f"{garments} garment(s) stripped")
-        if fillers:
-            notes.append(f"{fillers} filler(s) removed")
         if motion_dropped:
             notes.append(f"{motion_dropped} motion sentence(s) stripped")
         if long_poss:
@@ -1142,45 +1013,6 @@ def load_lora_guides(video_loras: list[str] = None, image_loras: list[str] = Non
     if not trigger_lines:
         return ""
 
-    any_leet = any(any(c.isdigit() for c in ln) for ln in trigger_lines)
-    # Stronger leet block. The previous version ("Copy them EXACTLY as
-    # written") only explained the encoding, not the appropriate-use
-    # rule. Smaller LLMs dropped leet triggers into non-sex-act scenes
-    # for "energy" — observed: a SFW football music video had
-    # "bl0wj0b" in a keyframe prompt. The new block forbids leet
-    # triggers in any context that isn't an explicit sex-act, with
-    # specific examples of what they each mean.
-    leet_block = (
-        "\n\nLEET-CODED TRIGGER WORDS (contain digits like 4/0/3/5/1) — "
-        "STRICT USAGE RULES:\n"
-        "These trigger words name SPECIFIC SEX ACTS or POSITIONS. They are "
-        "NSFW-only. Common ones include:\n"
-        "  bl0wj0b   = oral sex (giving/receiving)\n"
-        "  m15510n4ry = missionary position intercourse\n"
-        "  c0wg1rl    = woman-on-top straddle position\n"
-        "  r3v3rs3_c0wg1rl = reverse cowgirl\n"
-        "  d0gg1e     = doggy-style intercourse\n"
-        "\n"
-        "INCLUDE a leet trigger ONLY when the video_prompt's scene LITERALLY "
-        "DEPICTS that specific act. Use it ONCE per video_prompt — never "
-        "stack multiple leet triggers in one prompt.\n\n"
-        "NEVER use leet triggers in:\n"
-        "  - image_prompt or keyframe_prompts (these are still images; "
-        "    leet triggers are VIDEO LoRA triggers and don't apply)\n"
-        "  - SFW content of any kind (music video, dialogue, action, "
-        "    cooking, drama — anywhere that isn't a sex act)\n"
-        "  - Non-act NSFW content (foreplay before intercourse, "
-        "    undressing, kissing, post-coital aftermath — these are NOT "
-        "    sex acts in themselves)\n"
-        "  - As decoration / energy boosters / 'flavor' tokens\n\n"
-        "If you find yourself wanting to add a leet trigger to a "
-        "scene that doesn't literally depict the named act, the answer "
-        "is to OMIT IT. No leet trigger is better than the wrong one — "
-        "wrong placement breaks the LoRA's trained pattern and produces "
-        "weaker results in BOTH the misplaced scene AND the actual sex "
-        "scenes that needed the trigger."
-    ) if any_leet else ""
-
     print(f"[PromptPolish] Loaded {len(trigger_lines)} LoRA trigger(s) for pass 1-2")
     return (
         "\n\nACTIVE LORA TRIGGER WORDS — include the most relevant trigger "
@@ -1188,7 +1020,7 @@ def load_lora_guides(video_loras: list[str] = None, image_loras: list[str] = Non
         "Do NOT force triggers into image_prompt or keyframe_prompts. "
         "Do NOT include a trigger that does not match the scene. "
         "Do NOT invent new trigger words or write placeholder text like "
-        "'trigger word for LoRA'." + leet_block + "\n"
+        "'trigger word for LoRA'.\n"
         + "\n".join(trigger_lines)
     )
 
@@ -1244,6 +1076,9 @@ def polish_prompts_third_pass(
     preserve_video_character_names: bool = False,
     polish_video_prompts: Optional[bool] = None,
     polish_image_prompts: bool = True,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+    is_active: Optional[Callable[[], bool]] = None,
 ) -> list[dict]:
     """Post-process clip plans through the enhance LLM pipeline (third pass).
 
@@ -1504,74 +1339,13 @@ def polish_prompts_third_pass(
             if not trigger_lines:
                 return ""
 
-            any_leet = any(any(c.isdigit() for c in ln) for ln in trigger_lines)
-            # Leet-coded triggers (tokens containing digits like 4/0/3/5/1)
-            # name a SPECIFIC sex act / position. They're useful only when
-            # the scene actually depicts that act. Earlier guidance made
-            # them mandatory-always — that pushed the polish LLM to prepend
-            # 'm15510n4ry.' or 'bl0wj0b.' to dialogue scenes where no sex
-            # was happening, diluting the LoRA's trained association without
-            # any benefit. Inclusion is now conditional on scene content.
-            leet_block = (
-                "\n\nLEET-CODED TRIGGERS (contain digits like 4/0/3/5/1) — "
-                "INCLUDE ONLY WHEN THE SCENE DEPICTS THE TRIGGER'S ACT:\n"
-                "Triggers like 'bl0wj0b', 'm15510n4ry', 'd0gg1e', 'c0wg1rl' "
-                "name a SPECIFIC position or sex act. They are intentionally "
-                "non-natural-language tokens — the LoRA was trained to "
-                "associate them with the matching act. They are useful "
-                "ONLY when the prompt describes that act:\n"
-                "- 'bl0wj0b'   → use only if the scene shows oral sex\n"
-                "- 'm15510n4ry' → use only if the scene shows missionary position\n"
-                "- 'd0gg1e'    → use only if the scene shows doggy-style\n"
-                "- 'c0wg1rl'   → use only if the scene shows woman-on-top riding\n"
-                "- 'r3v3rs3_c0wg1rl' → use only for reverse-cowgirl specifically\n\n"
-                "If the scene is non-sexual (dialogue only, walking, looking, "
-                "talking, leaning, kissing, undressing, foreplay without "
-                "intercourse, or any other non-act content), OMIT all leet "
-                "triggers. Do not force one in for 'completeness' — the "
-                "non-act prompt won't activate the LoRA's trained pattern "
-                "and may dilute the LoRA's effect on the actual sex scenes "
-                "later.\n\n"
-                "ALSO OMIT leet triggers from CLIMAX, ORGASM, and AFTERMATH "
-                "scenes. These are reaction / resolution shots — the camera "
-                "is on faces flushing, eyes closing, breath hitching, "
-                "characters collapsing into each other, post-coital embrace, "
-                "lying entwined in sheets, breathing slowing, sweat cooling, "
-                "characters separating, fade-out moments. The position-"
-                "specific trigger no longer reflects what the camera is "
-                "showing in these shots — a 'm15510n4ry' tag belongs in "
-                "shots where missionary is ACTIVELY being performed (visible "
-                "thrusting, visible position), not in the orgasm-reaction "
-                "shot that follows it or the lying-tangled aftermath shot. "
-                "The LoRA was trained on shots OF the act, not shots of the "
-                "moments around it. Tagging a non-act shot with the position "
-                "trigger trains the model toward weaker associations.\n\n"
-                "QUICK TEST — ask: 'is the position itself the literal subject "
-                "of this frame?' If yes (visible thrusting / riding / "
-                "penetration in the described pose), include the trigger. "
-                "If no (faces, embraces, expressions, transitions, "
-                "aftermath), OMIT it.\n\n"
-                "When the scene DOES match a trigger, place it verbatim "
-                "using ONE of these forms (do NOT decode it into English — "
-                "'bl0wj0b' stays 'bl0wj0b'):\n"
-                "- First word + period:    'bl0wj0b. The woman dips her head down onto him...'\n"
-                "- Opening parenthetical:  '(m15510n4ry) The man thrusts steadily...'\n"
-                "- Em-dash action prefix:  'c0wg1rl - the woman straddles him and grinds her hips...'\n"
-                "Pick whichever fits the prompt's existing structure. The "
-                "FORBIDDEN PATTERNS below DO NOT apply to leet triggers — "
-                "those are for plain-English triggers only.\n"
-            ) if any_leet else ""
             return (
                 "\n\n[LORA TRIGGER WORDS — these are exact tokens the model was "
                 "trained on. Pick the ONE most relevant trigger per prompt "
-                "and include it. Plain-English triggers (e.g. 'Unchained', "
-                "'BEEG', 'LTXNUDES') follow the natural-prose rule below; "
-                "leet-coded triggers are MANDATORY (see leet block at the end "
-                "of this directive).\n\n"
-                "FOR PLAIN-ENGLISH TRIGGERS — include IF AND ONLY IF it forms a "
+                "and include it exactly as supplied. Include it only if it forms a "
                 "natural, grammatical part of a sentence. If you cannot weave "
                 "it in naturally, OMIT IT ENTIRELY.\n\n"
-                "FORBIDDEN INSERTION PATTERNS for plain-English triggers "
+                "FORBIDDEN INSERTION PATTERNS "
                 "(any of these ruins the prompt):\n"
                 "- At the start as a standalone tag:  'Unchained, the doctor...'\n"
                 "- As a comma-offset appositive:      'the doctor, Unchained, in white...'\n"
@@ -1585,8 +1359,8 @@ def polish_prompts_third_pass(
                 "- Style tag trigger ('Mystic XXX', 'Unchained'): use only when the "
                 "trigger names a genre or action the scene actually depicts. If it "
                 "does not fit grammatically, OMIT IT. Do not force it in.\n\n"
-                "Do NOT invent variants. Do NOT include a plain-English trigger that does not "
-                "match the scene." + leet_block + "]\n"
+                "Do NOT invent variants. Do NOT include a trigger that does not "
+                "match the scene.]\n"
             ) + "\n".join(trigger_lines)
         except Exception:
             pass
@@ -2006,6 +1780,8 @@ def polish_prompts_third_pass(
             lora_system_hint=video_lora_hints,
             duration_seconds=duration_seconds,
             preserve_global_timeline=_is_h3_video,
+            response_assist=response_assist,
+            progress_callback=progress_callback,
         )
         if out:
             cleaned = _strip_markdown(out)
@@ -2076,6 +1852,8 @@ def polish_prompts_third_pass(
             nsfw=nsfw, model_type=image_model,
             system_override=system_prompt,
             lora_system_hint=image_lora_hints,
+            response_assist=response_assist,
+            progress_callback=progress_callback,
         )
         if out:
             cleaned = _strip_markdown(out)
@@ -2180,6 +1958,8 @@ def polish_prompts_third_pass(
             "in narrative prose will not fire."
         )
 
+    may_start_request = is_active or (lambda: True)
+
     for plan_idx, plan in enumerate(clip_plans):
         # Build per-shot character context. The descriptors here reflect
         # THIS shot's positioning and state (per Pass 2's
@@ -2218,6 +1998,8 @@ def polish_prompts_third_pass(
         if polish_video_prompts and not has_windows and not polish_aborted:
             vp = plan.get("video_prompt", "")
             if vp and vp.strip():
+                if not may_start_request():
+                    return clip_plans
                 try:
                     enhanced = _enhance_video(
                         vp, _build_video_system_for(vp), shot_desc_to_name,
@@ -2274,6 +2056,8 @@ def polish_prompts_third_pass(
                         polished_wps.append(wp)
                         _count_outcome(wp, wp)  # count as passthrough
                         continue
+                    if not may_start_request():
+                        return clip_plans
                     try:
                         # Add context so enhancer continues naturally from previous window
                         context = f"[Window {wi+1} of {len(wps)} in a continuous scene. "
@@ -2303,6 +2087,8 @@ def polish_prompts_third_pass(
         if polish_image_prompts and not polish_aborted:
             ip = plan.get("image_prompt", "")
             if ip and ip.strip():
+                if not may_start_request():
+                    return clip_plans
                 try:
                     enhanced = _enhance_image(ip, _build_image_system_for(ip), shot_desc_to_name, shot_name_to_desc)
                     _count_outcome(ip, enhanced)
@@ -2328,6 +2114,8 @@ def polish_prompts_third_pass(
                         polished_kfs.append(kf)
                         continue
                     if isinstance(kf, str) and kf.strip():
+                        if not may_start_request():
+                            return clip_plans
                         try:
                             enhanced = _enhance_image(kf, _build_image_system_for(kf), shot_desc_to_name, shot_name_to_desc)
                             _count_outcome(kf, enhanced)

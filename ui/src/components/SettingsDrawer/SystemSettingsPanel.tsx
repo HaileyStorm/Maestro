@@ -5,6 +5,7 @@ import { useStore, getFamiliesForMode, getModelsForFamily } from '../../stores/u
 import * as api from '../../api/client'
 import type { GenerationMode } from '../../types'
 import { FAMILIES, resolveVariant, onOsThemeChange, type FamilyId, type ThemeMode } from '../../lib/theme'
+import { DOWNLOAD_REFRESH_EVENT, POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
 
 const profileLabels: Record<string, string> = {
   '1': 'Profile 1: High RAM + High VRAM',
@@ -73,11 +74,6 @@ function ModelVisibilitySection() {
   const setAllModelsEnabled = useStore(s => s.setAllModelsEnabled)
   const setModelsEnabled = useStore(s => s.setModelsEnabled)
   const loadModels = useStore(s => s.loadModels)
-  // Mature Mode gate: nsfw_only models are hidden from this list when
-  // Mature Mode is off. When the user enables Mature Mode (via the
-  // Services panel), updateServicesConfig auto-adds them to
-  // enabledModels — they appear here pre-checked and ready to use.
-  const nsfwMode = useStore(s => s.servicesConfig?.nsfw_mode ?? false)
   const modelVisibilityFocus = useStore(s => s.modelVisibilityFocus)
   const clearModelVisibilityFocus = useStore(s => s.clearModelVisibilityFocus)
   // Root open by default so the section is discoverable; mode groups
@@ -131,6 +127,7 @@ function ModelVisibilitySection() {
     setDownloading(prev => new Set(prev).add(modelType))
     try {
       await api.downloadModel(modelType)
+      window.dispatchEvent(new CustomEvent(DOWNLOAD_REFRESH_EVENT))
     } catch (e) {
       console.error('Download start failed:', e)
       setDownloading(prev => { const next = new Set(prev); next.delete(modelType); return next })
@@ -193,9 +190,8 @@ function ModelVisibilitySection() {
     }
   }, [confirmDelete, loadModels])
 
-  // Group models by generation mode, hiding nsfw_only entries when
-  // Mature Mode is off (they reappear instantly when the toggle flips).
-  const visibleModels = models.filter(m => !m.nsfw_only || nsfwMode)
+  // Group every installed/registered model by generation mode.
+  const visibleModels = models
   const modelsByMode = new Map<GenerationMode, { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string }[] }[]>()
   for (const { mode } of MODE_LABELS) {
     const modeFamilies = getFamiliesForMode(mode, families)
@@ -890,21 +886,7 @@ function ResearchCard() {
     }
   }, [])
 
-  useEffect(() => {
-    const controller = new AbortController()
-    let timeout: number | undefined
-    const poll = async () => {
-      await refresh(controller.signal)
-      if (!controller.signal.aborted) {
-        timeout = window.setTimeout(() => { void poll() }, 5000)
-      }
-    }
-    void poll()
-    return () => {
-      controller.abort()
-      if (timeout !== undefined) window.clearTimeout(timeout)
-    }
-  }, [refresh])
+  useVisibilityPolling(refresh, POLL_INTERVAL_MS.researchVisible)
 
   const runNow = useCallback(async () => {
     setAction('research')

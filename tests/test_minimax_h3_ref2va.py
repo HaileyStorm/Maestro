@@ -171,7 +171,9 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("Selected checkpoint:", inputs_panel)
         self.assertIn("Install correct Ref2VA checkpoint", inputs_panel)
         self.assertIn("maestro:minimax-h3-ref2va-terms-v1", store)
-        self.assertIn("setH3Ref2VATermsAccepted", inputs_panel)
+        self.assertIn("acceptHostTerm('minimax_h3_ref2va')", inputs_panel)
+        self.assertIn("Accept for this host", inputs_panel)
+        self.assertIn("HOST_TERM_NOTICES.minimax_h3_ref2va.text", inputs_panel)
         self.assertIn("Pinned FL2VA cannot use semantic references", store)
         self.assertIn("Pinned Ref2VA cannot use first/last-frame anchors", store)
         self.assertIn("'minimax_h3_ref2va'", store)
@@ -212,7 +214,11 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("? [...(params.image_refs as string[])]", store)
         self.assertIn("state.imageRefs.length + (state.params.image_refs?.length ?? 0)", store)
         self.assertIn("restoreGeneration !== _settingsRestoreGeneration", store)
-        self.assertIn("_h3Ref2VATermsSessionAccepted", store)
+        self.assertIn("_h3Ref2VATermsHostAccepted", store)
+        self.assertIn("ref2va.current_version === H3_REF2VA_LEGACY_TERM_VERSION", store)
+        self.assertIn("_clearLegacyH3Ref2VATermsAcceptance", store)
+        self.assertIn("acceptHostTerm('minimax_h3_ref2va')", plan_dialog)
+        self.assertIn("HOST_TERM_NOTICES.minimax_h3_ref2va.text", plan_dialog)
 
         # Fixed checkpoint overrides fail before upload rather than silently
         # stripping inputs, while the plan discloses the actual model/transition.

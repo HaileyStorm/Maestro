@@ -1,6 +1,6 @@
 """
-Unit tests for the four polish-layer bug fixes shipped after the safety
-guardrail work:
+Unit tests for four polish-layer bug fixes shipped after the prompt-polish
+work:
 
 1. _dedupe_descriptors must consume leading article ("the he" / "a she"
    sequences must NOT appear in output).
@@ -121,13 +121,13 @@ class TestLongPossessiveRewrite(unittest.TestCase):
     """Bug 1: D-rewrite must handle bare possessives + multi-word nouns."""
 
     def test_bare_possessive_no_leading_the(self):
-        # Original incident: "woman in white with huge breasts's lower stomach"
+        # Equivalent grammar shape: "woman in white with ornate jewelry's lower stomach"
         # — no leading "the". Old regex required "the" and missed this.
-        text = "woman in white with huge breasts's lower stomach quivers."
+        text = "woman in white with ornate jewelry's lower stomach quivers."
         cleaned, count = _rewrite_long_possessives(text)
         self.assertEqual(count, 1)
         self.assertIn(
-            "the lower stomach of the woman in white with huge breasts",
+            "the lower stomach of the woman in white with ornate jewelry",
             cleaned,
         )
         # The original possessive form must be gone.

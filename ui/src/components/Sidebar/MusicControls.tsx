@@ -75,6 +75,7 @@ export function MusicControls() {
   const setInstrumental = useStore(s => s.setMusicInstrumental)
   const params = useStore(s => s.params)
   const setParam = useStore(s => s.setParam)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
 
   const style = (params.alt_prompt as string) || ''
   const lyrics = (params.prompt as string) || ''
@@ -97,15 +98,27 @@ export function MusicControls() {
 
   const handleWriteSong = async () => {
     if (!description.trim() || writing) return
+    const requestWorkspace = activeWorkspace
+    const controller = new AbortController()
+    const unsubscribe = useStore.subscribe(state => {
+      if (state.activeWorkspace !== requestWorkspace) controller.abort()
+    })
     setWriting(true)
     setWriteError(null)
     try {
-      const r = await api.writeSong({ description: description.trim(), instrumental })
+      const r = await api.writeSong({
+        workspace: requestWorkspace,
+        description: description.trim(),
+        instrumental,
+      }, { signal: controller.signal })
+      if (useStore.getState().activeWorkspace !== requestWorkspace) return
       if (r.style) setStyle(r.style)
       setLyrics(instrumental ? '[Instrumental]' : (r.lyrics || ''))
     } catch (e) {
+      if (controller.signal.aborted) return
       setWriteError(e instanceof Error ? e.message : 'Song writing failed')
     } finally {
+      unsubscribe()
       setWriting(false)
     }
   }

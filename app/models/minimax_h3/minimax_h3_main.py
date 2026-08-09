@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from contextlib import nullcontext
 
 import numpy as np
@@ -111,6 +112,90 @@ VIDEO_LATENTS_STD = (
     2.2816812992095947,
     2.6127843856811523,
 )
+
+
+def _advance_paired_h3_latents(
+    *,
+    video_rows: torch.Tensor,
+    audio_rows: torch.Tensor,
+    prediction,
+    video_timestep,
+    audio_timestep,
+    video_scheduler: MiniMaxH3Scheduler,
+    audio_scheduler: MiniMaxH3Scheduler,
+    num_condition_video_rows: int,
+    num_condition_audio_rows: int,
+    locked_target_audio_rows: torch.Tensor | None = None,
+) -> None:
+    """Advance both members of H3's inseparable video/audio prediction pair."""
+    video_velocity, audio_velocity = prediction
+    video_rows[num_condition_video_rows:] = video_scheduler.step(
+        video_velocity[0, num_condition_video_rows:].float(),
+        video_timestep,
+        video_rows[num_condition_video_rows:],
+        return_dict=False,
+    )[0]
+    next_audio_rows = audio_scheduler.step(
+        audio_velocity[0, num_condition_audio_rows:].float(),
+        audio_timestep,
+        audio_rows[num_condition_audio_rows:],
+        return_dict=False,
+    )[0]
+    if locked_target_audio_rows is not None:
+        if tuple(locked_target_audio_rows.shape) != tuple(next_audio_rows.shape):
+            raise RuntimeError("Locked H3 source audio changed target-row shape")
+        audio_rows[num_condition_audio_rows:] = locked_target_audio_rows
+    else:
+        audio_rows[num_condition_audio_rows:] = next_audio_rows
+
+
+def _fit_h3_source_waveform(
+    waveform: torch.Tensor,
+    target_samples: int,
+) -> torch.Tensor:
+    """Crop or silence-pad stereo source audio to the target latent clock."""
+
+    if waveform.ndim != 2 or waveform.shape[0] != 2:
+        raise ValueError("MiniMax H3 source audio must resolve to 32 kHz stereo")
+    if target_samples < 1:
+        raise ValueError("MiniMax H3 source audio target must contain samples")
+    waveform = waveform[:, :target_samples]
+    if waveform.shape[-1] < target_samples:
+        padding = waveform.new_zeros((2, target_samples - waveform.shape[-1]))
+        waveform = torch.cat((waveform, padding), dim=-1)
+    return waveform.contiguous()
+
+
+def _fit_h3_source_audio_latents(
+    latents: torch.Tensor,
+    target_latents: int,
+) -> torch.Tensor:
+    """Normalize audio-VAE boundary rounding to H3's exact target clock."""
+
+    if latents.ndim != 3 or latents.shape[0] != 2:
+        raise ValueError("MiniMax H3 source audio latents must be stereo")
+    if target_latents < 1:
+        raise ValueError("MiniMax H3 source audio target must contain latents")
+    latents = latents[..., :target_latents]
+    if latents.shape[-1] < target_latents:
+        padding = latents.new_zeros(
+            (*latents.shape[:-1], target_latents - latents.shape[-1])
+        )
+        latents = torch.cat((latents, padding), dim=-1)
+    return latents.contiguous()
+
+
+def _reset_paired_h3_schedulers(
+    video_scheduler: MiniMaxH3Scheduler,
+    audio_scheduler: MiniMaxH3Scheduler,
+    grid_points: int,
+    device: torch.device | str,
+) -> None:
+    """Reset both stateful schedulers before replaying the same H3 grid."""
+    video_scheduler.set_timesteps(grid_points, device=device)
+    audio_scheduler.set_timesteps(grid_points, device=device)
+
+
 AUDIO_LATENTS_MEAN = (
     -0.020211687488382354,
     0.3876466479950502,
@@ -431,6 +516,7 @@ class MiniMaxH3Model:
         self.device = torch.device("cuda")
         self.dtype = dtype
         self.model_def = model_def
+        self.selected_model_type = str(_kwargs.get("selected_model_type") or "")
         self.reference_mode = bool(model_def.get("minimax_h3_reference_mode", False))
         self.assets_root = model_def.get("minimax_h3_assets_root", "minimax_h3")
 
@@ -462,6 +548,7 @@ class MiniMaxH3Model:
         self.scheduler = MiniMaxH3Scheduler(shift=12.0)
         self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
         self._ref2va_handoff_cache = None
+        self._last_spectrum_stats = None
         self.__interrupt = False
 
     @property
@@ -543,14 +630,22 @@ class MiniMaxH3Model:
         audio = torch.as_tensor(waveform, dtype=torch.float32)
         if audio.ndim == 1:
             audio = audio.unsqueeze(0)
-        elif audio.ndim == 2 and audio.shape[0] not in (1, 2) and audio.shape[1] in (1, 2):
-            audio = audio.transpose(0, 1)
-        elif audio.ndim != 2:
+        elif audio.ndim == 2:
+            if audio.shape[0] in (1, 2):
+                pass
+            elif audio.shape[1] in (1, 2):
+                audio = audio.transpose(0, 1)
+            else:
+                raise ValueError(
+                    "MiniMax H3 reference audio must be mono or stereo; "
+                    f"multichannel input has shape {tuple(audio.shape)}."
+                )
+        else:
             raise ValueError(f"MiniMax H3 reference audio must be mono or stereo, got {tuple(audio.shape)}.")
+        if audio.shape[-1] < 1:
+            raise ValueError("MiniMax H3 reference audio cannot be empty")
         if audio.shape[0] == 1:
             audio = audio.repeat(2, 1)
-        elif audio.shape[0] != 2:
-            audio = audio[:2]
         sample_rate = int(sample_rate or 32000)
         if sample_rate != 32000:
             from torchaudio.functional import resample
@@ -727,6 +822,7 @@ class MiniMaxH3Model:
         **_kwargs,
     ):
         self._interrupt = False
+        self._last_spectrum_stats = None
         custom_settings = _kwargs.get("custom_settings")
         if not isinstance(custom_settings, dict):
             custom_settings = {}
@@ -761,6 +857,104 @@ class MiniMaxH3Model:
                     f"MiniMax H3 SageAttention2++ cannot start: {reason}. "
                     "Select Dense SDPA explicitly to continue."
                 )
+        from .spectrum import validate_spectrum_request
+
+        def spectrum_input_present(value) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, torch.Tensor):
+                return value.numel() > 0
+            if isinstance(value, (str, bytes, list, tuple, dict, set)):
+                return len(value) > 0
+            return True
+
+        spectrum_semantic_inputs = spectrum_input_present(
+            input_ref_images
+        ) or any(
+            spectrum_input_present(item)
+            for item in (
+                input_frames, input_frames2, input_frames3,
+                input_waveform, audio_guide, audio_guide2, audio_guide3,
+            )
+        )
+        spectrum_config = validate_spectrum_request(
+            selected_model_type=str(
+                getattr(self, "selected_model_type", None)
+                or getattr(self, "transformer_type", None)
+                or "minimax_h3"
+            ),
+            model_def=getattr(self, "model_def", None),
+            reference_mode=bool(
+                getattr(self, "reference_mode", False) or spectrum_semantic_inputs
+            ),
+            sampling_steps=sampling_steps,
+            attention_engine=attention_engine,
+            custom_settings=custom_settings,
+            activated_loras=_kwargs.get("activated_loras"),
+            loras_multipliers=_kwargs.get("loras_multipliers"),
+            skip_steps_cache_type=(
+                _kwargs.get("skip_steps_cache_type") or _kwargs.get("tea_cache")
+            ),
+            native_boundary=native_boundary_enabled,
+        )
+        from services.h3_lightx2v import (
+            lightx2v_scheduler_grid_points, validate_lightx2v_request,
+        )
+        lightx2v_enabled = validate_lightx2v_request(
+            selected_model_type=str(
+                getattr(self, "selected_model_type", None)
+                or getattr(self, "transformer_type", None)
+                or "minimax_h3"
+            ),
+            model_def=getattr(self, "model_def", None) or {},
+            custom_settings=custom_settings,
+            authored_steps=sampling_steps,
+            semantic_references=spectrum_semantic_inputs,
+            multisegment=(
+                isinstance(_kwargs.get("multi_clip_info"), dict)
+                and int(_kwargs["multi_clip_info"].get("total", 1) or 1) > 1
+            ),
+            activated_loras=_kwargs.get("activated_loras"),
+            loras_multipliers=_kwargs.get("loras_multipliers"),
+            skip_steps_cache_type=_kwargs.get("skip_steps_cache_type") or _kwargs.get("tea_cache"),
+            native_boundary=native_boundary_enabled,
+        )
+        from services.h3_audio import resolve_h3_audio_roles, source_audio_requested
+
+        experimental_source_audio = source_audio_requested(custom_settings)
+        declared_semantic_references = (
+            bool(input_ref_images)
+            or "V" in (video_prompt_type or "")
+            or (
+                not experimental_source_audio
+                and any(letter in (audio_prompt_type or "") for letter in "ABCK")
+            )
+        )
+        source_audio_roles = resolve_h3_audio_roles(
+            selected_model_type=str(
+                getattr(self, "selected_model_type", None)
+                or getattr(self, "transformer_type", None)
+                or "minimax_h3"
+            ),
+            model_def=getattr(self, "model_def", None) or {},
+            custom_settings=custom_settings,
+            sampling_steps=sampling_steps,
+            attention_engine=attention_engine,
+            audio_prompt_type=audio_prompt_type,
+            audio_guides=(audio_guide, audio_guide2, audio_guide3),
+            final_audio=_kwargs.get("audio_source"),
+            semantic_references=declared_semantic_references,
+            multisegment=(
+                isinstance(_kwargs.get("multi_clip_info"), dict)
+                and int(_kwargs["multi_clip_info"].get("total", 1) or 1) > 1
+            ),
+            activated_loras=_kwargs.get("activated_loras"),
+            loras_multipliers=_kwargs.get("loras_multipliers"),
+            skip_steps_cache_type=(
+                _kwargs.get("skip_steps_cache_type") or _kwargs.get("tea_cache")
+            ),
+            native_boundary=native_boundary_enabled,
+        )
         if turbo_enabled:
             validate_turbo_request(
                 base_model_type="minimax_h3_ref2va" if self.reference_mode else "minimax_h3",
@@ -868,6 +1062,20 @@ class MiniMaxH3Model:
             self._load_waveform(path)
             for path in (audio_guide, audio_guide2, audio_guide3)
         ]
+        source_audio_waveforms: list[torch.Tensor] = []
+        if source_audio_roles.experimental:
+            source_audio_waveforms = [
+                self._load_waveform(path)
+                for path in (
+                    source_audio_roles.reference_audios
+                    if source_audio_roles.mode == "reference_only"
+                    else (source_audio_roles.drive_audio,)
+                )
+            ]
+            if any(waveform is None for waveform in source_audio_waveforms):
+                raise ValueError(
+                    "MiniMax H3 source-audio slots must resolve to readable audio"
+                )
         soundtrack_mode = "K" in (audio_prompt_type or "")
         video_soundtracks = (
             loaded_audio_guides[: len(video_refs)]
@@ -879,7 +1087,7 @@ class MiniMaxH3Model:
                 "MiniMax H3 Ref2VA soundtrack references require one extracted audio track per reference video."
             )
         audio_refs = []
-        if not soundtrack_mode:
+        if not soundtrack_mode and not source_audio_roles.experimental:
             if "A" in (audio_prompt_type or ""):
                 first_audio = loaded_audio_guides[0]
                 if first_audio is None:
@@ -1008,6 +1216,35 @@ class MiniMaxH3Model:
         latent_width = width // self.vae.spatial_compression_ratio
         num_audio_latents = audio_latent_num_frames(target_frame_num)
 
+        source_audio_target_rows = None
+        source_audio_condition_rows = None
+        source_audio_condition_anchors = ()
+        if source_audio_roles.experimental:
+            # H3's audio VAE advances at 40 latents/s with an 800-sample hop.
+            # Resolve the target clock structurally; no waveform content is
+            # inspected to choose a mode, role, or ordinal.
+            target_samples = num_audio_latents * (32000 // MINIMAX_H3_AUDIO_LATENTS_PER_SECOND)
+            encoded_sources = [
+                _fit_h3_source_audio_latents(
+                    self._encode_reference_audio(
+                        _fit_h3_source_waveform(waveform, target_samples)
+                    ),
+                    num_audio_latents,
+                )
+                for waveform in source_audio_waveforms
+            ]
+            if source_audio_roles.mode == "reference_only":
+                source_audio_condition_rows = torch.cat(
+                    [_audio_rows(latent) for latent in encoded_sources]
+                ).to(self.device)
+                source_audio_condition_anchors = tuple(
+                    ("first", int(latent.shape[-1])) for latent in encoded_sources
+                )
+            else:
+                source_audio_target_rows = _audio_rows(encoded_sources[0]).to(
+                    self.device
+                )
+
         boundary_video_rows = None
         if native_continuation:
             report_phase("Encoding H3 native boundary history")
@@ -1099,7 +1336,11 @@ class MiniMaxH3Model:
 
         prompt_presentation = list(reference_presentation)
         prompt_keyframes = keyframes or None
-        if native_boundary_enabled and keyframes:
+        if source_audio_roles.experimental:
+            prompt_presentation.extend(
+                {"type": "audio"} for _ in source_audio_waveforms
+            )
+        if (native_boundary_enabled or prompt_presentation) and keyframes:
             prompt_presentation = [
                 {
                     "type": "image",
@@ -1111,15 +1352,43 @@ class MiniMaxH3Model:
             ] + prompt_presentation
             prompt_keyframes = None
 
+        from services.h3_audio import (
+            remap_prompt_audio_ordinals,
+            validate_prompt_media_ordinals,
+        )
+
+        prompt_for_conditioner = input_prompt
+        if source_audio_roles.audio_ordinal_remap:
+            prompt_for_conditioner = remap_prompt_audio_ordinals(
+                prompt_for_conditioner,
+                dict(source_audio_roles.audio_ordinal_remap),
+            )
+        validate_prompt_media_ordinals(
+            prompt_for_conditioner,
+            picture_count=(
+                sum(item.get("type") == "image" for item in prompt_presentation)
+                if prompt_presentation else len(keyframes)
+            ),
+            video_count=sum(
+                item.get("type") == "video" for item in prompt_presentation
+            ),
+            audio_count=(
+                sum(item.get("type") == "audio" for item in prompt_presentation)
+            ),
+        )
+
         report_phase("Encoding H3 prompt")
         prompt_embeds, text_tags = self.conditioner(
-            input_prompt,
+            prompt_for_conditioner,
             self.device,
             prompt_keyframes,
             presentation=prompt_presentation or None,
         )
         if prompt_embeds is None or self._interrupt:
             return None
+        audio_condition_anchors = (
+            tuple(boundary_audio_anchors) + tuple(source_audio_condition_anchors)
+        )
         if self.reference_mode:
             layout = build_ref2va_packed_sequence(
                 text_tags,
@@ -1130,7 +1399,7 @@ class MiniMaxH3Model:
                 num_audio_latents,
                 self.patch_size,
                 keyframe_anchors=anchors,
-                audio_condition_anchors=boundary_audio_anchors,
+                audio_condition_anchors=audio_condition_anchors,
             )
         else:
             layout = build_packed_sequence(
@@ -1141,7 +1410,11 @@ class MiniMaxH3Model:
                 num_audio_latents,
                 self.patch_size,
                 anchors,
-                audio_condition_anchors=boundary_audio_anchors,
+                audio_condition_anchors=audio_condition_anchors,
+                target_condition_audio_latents=(
+                    num_audio_latents
+                    if source_audio_roles.mode == "lock_source" else 0
+                ),
             )
 
         video_noise = randn_tensor(
@@ -1157,6 +1430,18 @@ class MiniMaxH3Model:
             device=self.device,
             dtype=torch.float32,
         )
+        locked_target_audio_rows = None
+        if source_audio_target_rows is not None:
+            if source_audio_roles.mode == "lock_source":
+                audio_rows = source_audio_target_rows.clone()
+                locked_target_audio_rows = source_audio_target_rows.clone()
+            elif source_audio_roles.mode == "remix_source":
+                remix_noise = audio_rows
+                audio_rows = self.audio_scheduler.scale_noise(
+                    source_audio_target_rows,
+                    1.0 - source_audio_roles.remix_strength,
+                    remix_noise,
+                )
         condition_video_parts = [
             rows for rows in (condition_rows, reference_video_rows)
             if rows is not None
@@ -1167,12 +1452,34 @@ class MiniMaxH3Model:
             audio_rows = torch.cat([reference_audio_rows, audio_rows])
         if boundary_audio_rows is not None:
             audio_rows = torch.cat([boundary_audio_rows, audio_rows])
+        if source_audio_condition_rows is not None:
+            audio_rows = torch.cat([source_audio_condition_rows, audio_rows])
 
-        scheduler_points = (
-            scheduler_grid_points(sampling_steps) if turbo_enabled else int(sampling_steps)
-        )
+        if lightx2v_enabled:
+            scheduler_points = lightx2v_scheduler_grid_points(sampling_steps)
+        elif spectrum_config is not None:
+            from .spectrum import spectrum_scheduler_grid_points
+
+            scheduler_points = spectrum_scheduler_grid_points(sampling_steps)
+        else:
+            scheduler_points = (
+                scheduler_grid_points(sampling_steps)
+                if turbo_enabled else int(sampling_steps)
+            )
         self.scheduler.set_timesteps(scheduler_points, device=self.device)
         self.audio_scheduler.set_timesteps(scheduler_points, device=self.device)
+        if source_audio_roles.mode == "remix_source":
+            # Preserve the paired call count while beginning only the audio
+            # clock at the requested source-denoise strength.  The two row
+            # modalities already carry independent timestep values.
+            remix_sigmas = (
+                self.audio_scheduler.sigmas.detach().float().cpu()
+                * source_audio_roles.remix_strength
+            )
+            self.audio_scheduler.set_timesteps(
+                sigmas=remix_sigmas,
+                device=self.device,
+            )
         timesteps = self.scheduler.timesteps
         audio_timesteps = self.audio_scheduler.timesteps
         if len(timesteps) != len(audio_timesteps):
@@ -1201,57 +1508,217 @@ class MiniMaxH3Model:
 
         if callback is not None:
             callback(-1, None, True, override_num_inference_steps=len(timesteps))
-        # The first transformer invocation also warms the selected attention
-        # runtime/kernels. It has no safe inner denominator, so keep this
-        # named phase indeterminate until the first completed denoising step.
-        report_phase("Running first H3 denoising step (runtime warmup)")
-        with tqdm(total=len(timesteps), desc="MiniMax H3 denoising") as progress:
-            for index, (video_timestep, audio_timestep) in enumerate(zip(timesteps, audio_timesteps)):
-                if self._interrupt:
-                    return None
-                unique_timesteps, timestep_indices = row_plan[index]
-                prediction = self.transformer(
-                    hidden_states=video_rows[None],
-                    audio_hidden_states=audio_rows[None],
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=unique_timesteps,
-                    timestep_indices=timestep_indices,
-                    token_tags=token_tags,
-                    position_ids=position_ids,
-                    video_indices=video_indices,
-                    audio_indices=audio_indices,
-                    text_indices=text_indices,
-                    h3_attention_engine=attention_engine,
-                    h3_step_index=index,
-                    h3_sol_tau=custom_settings.get("h3_sol_tau", 1.0),
-                    h3_sol_dense_steps=custom_settings.get("h3_sol_dense_steps", 10),
-                    h3_sol_dense_blocks=custom_settings.get("h3_sol_dense_blocks", 2),
-                    h3_sol_min_tokens=custom_settings.get("h3_sol_min_tokens", 4096),
-                    h3_sol_sink_tokens=int(
-                        layout.video_indices[layout.num_condition_video_rows].item()
+        def run_transformer_step(
+            index, unique_timesteps, timestep_indices, spectrum_phase=None,
+        ):
+            transformer_kwargs = dict(
+                hidden_states=video_rows[None],
+                audio_hidden_states=audio_rows[None],
+                encoder_hidden_states=prompt_embeds,
+                timestep=unique_timesteps,
+                timestep_indices=timestep_indices,
+                token_tags=token_tags,
+                position_ids=position_ids,
+                video_indices=video_indices,
+                audio_indices=audio_indices,
+                text_indices=text_indices,
+                h3_attention_engine=attention_engine,
+                h3_step_index=index,
+                h3_sol_tau=custom_settings.get("h3_sol_tau", 1.0),
+                h3_sol_dense_steps=custom_settings.get("h3_sol_dense_steps", 10),
+                h3_sol_dense_blocks=custom_settings.get("h3_sol_dense_blocks", 2),
+                h3_sol_min_tokens=custom_settings.get("h3_sol_min_tokens", 4096),
+                h3_sol_sink_tokens=int(
+                    layout.video_indices[layout.num_condition_video_rows].item()
+                ),
+                return_dict=False,
+            )
+            if spectrum_phase is not None:
+                transformer_kwargs.update({
+                    "h3_spectrum_controller": controller,
+                    "h3_spectrum_phase": spectrum_phase,
+                    "h3_spectrum_context_signature": context_signature,
+                    "h3_spectrum_step_signature": step_signatures[index],
+                    "h3_spectrum_num_condition_video_rows": (
+                        layout.num_condition_video_rows
                     ),
-                    return_dict=False,
+                    "h3_spectrum_num_condition_audio_rows": (
+                        layout.num_condition_audio_rows
+                    ),
+                })
+            return self.transformer(**transformer_kwargs)
+
+        def advance_latents(prediction, video_timestep, audio_timestep):
+            _advance_paired_h3_latents(
+                video_rows=video_rows,
+                audio_rows=audio_rows,
+                prediction=prediction,
+                video_timestep=video_timestep,
+                audio_timestep=audio_timestep,
+                video_scheduler=self.scheduler,
+                audio_scheduler=self.audio_scheduler,
+                num_condition_video_rows=layout.num_condition_video_rows,
+                num_condition_audio_rows=layout.num_condition_audio_rows,
+                locked_target_audio_rows=locked_target_audio_rows,
+            )
+
+        def reset_denoising_schedulers():
+            _reset_paired_h3_schedulers(
+                self.scheduler,
+                self.audio_scheduler,
+                scheduler_points,
+                self.device,
+            )
+
+        def run_native_denoising(*, progress_label="MiniMax H3 denoising"):
+            report_phase("Running first H3 denoising step (runtime warmup)")
+            with tqdm(total=len(timesteps), desc=progress_label) as progress:
+                for index, (video_timestep, audio_timestep) in enumerate(
+                    zip(timesteps, audio_timesteps)
+                ):
+                    if self._interrupt:
+                        return False
+                    unique_timesteps, timestep_indices = row_plan[index]
+                    prediction = run_transformer_step(
+                        index, unique_timesteps, timestep_indices
+                    )
+                    if prediction is None or self._interrupt:
+                        return False
+                    if index == 0:
+                        report_phase("H3 denoising")
+                    advance_latents(prediction, video_timestep, audio_timestep)
+                    if callback is not None:
+                        callback(index, None)
+                    progress.update()
+            return True
+
+        if spectrum_config is None:
+            if not run_native_denoising():
+                return None
+        else:
+            from .spectrum import (
+                SpectrumGenerationController,
+                SpectrumStateError,
+                run_length_tensor_signature,
+                small_tensor_signature,
+                tensor_identity,
+            )
+
+            initial_video_rows = video_rows.detach().clone()
+            initial_audio_rows = audio_rows.detach().clone()
+            context_signature = (
+                tensor_identity(prompt_embeds),
+                tensor_identity(token_tags),
+                tensor_identity(position_ids),
+                tensor_identity(video_indices),
+                tensor_identity(audio_indices),
+                tensor_identity(text_indices),
+                tensor_identity(video_rows),
+                tensor_identity(audio_rows),
+                int(layout.num_condition_video_rows),
+                int(layout.num_condition_audio_rows),
+                int(num_latent_frames),
+                int(latent_height),
+                int(latent_width),
+                int(num_audio_latents),
+            )
+            step_signatures = tuple(
+                (
+                    float(video_timestep),
+                    float(audio_timestep),
+                    small_tensor_signature(unique_timesteps),
+                    run_length_tensor_signature(timestep_indices),
                 )
-                if prediction is None or self._interrupt:
+                for (video_timestep, audio_timestep), (
+                    unique_timesteps,
+                    timestep_indices,
+                ) in zip(zip(timesteps, audio_timesteps), row_plan)
+            )
+            controller = SpectrumGenerationController(
+                spectrum_config,
+                total_steps=len(timesteps),
+                context_signature=context_signature,
+                step_signatures=step_signatures,
+                audio_row_count=(
+                    audio_rows.shape[0] - layout.num_condition_audio_rows
+                ),
+                video_row_count=(
+                    video_rows.shape[0] - layout.num_condition_video_rows
+                ),
+            )
+            spectrum_reset_reason = "completed"
+            spectrum_capture_seconds = None
+            spectrum_replay_seconds = None
+            try:
+                report_phase("Spectrum H3 anchor capture")
+                capture_started = time.perf_counter()
+                with tqdm(total=len(timesteps), desc="Spectrum H3 capture") as progress:
+                    for index, (video_timestep, audio_timestep) in enumerate(
+                        zip(timesteps, audio_timesteps)
+                    ):
+                        if self._interrupt:
+                            spectrum_reset_reason = "cancelled"
+                            return None
+                        unique_timesteps, timestep_indices = row_plan[index]
+                        prediction = run_transformer_step(
+                            index,
+                            unique_timesteps,
+                            timestep_indices,
+                            spectrum_phase="capture",
+                        )
+                        if prediction is None or self._interrupt:
+                            spectrum_reset_reason = "cancelled"
+                            return None
+                        advance_latents(prediction, video_timestep, audio_timestep)
+                        progress.update()
+                spectrum_capture_seconds = time.perf_counter() - capture_started
+                controller.seal_capture()
+                video_rows.copy_(initial_video_rows)
+                audio_rows.copy_(initial_audio_rows)
+                reset_denoising_schedulers()
+                report_phase("Spectrum H3 offline smoothing replay")
+                replay_started = time.perf_counter()
+                for index, (video_timestep, audio_timestep) in enumerate(
+                    zip(timesteps, audio_timesteps)
+                ):
+                    if self._interrupt:
+                        spectrum_reset_reason = "cancelled"
+                        return None
+                    unique_timesteps, timestep_indices = row_plan[index]
+                    prediction = run_transformer_step(
+                        index,
+                        unique_timesteps,
+                        timestep_indices,
+                        spectrum_phase="replay",
+                    )
+                    if prediction is None or self._interrupt:
+                        spectrum_reset_reason = "cancelled"
+                        return None
+                    advance_latents(prediction, video_timestep, audio_timestep)
+                    if callback is not None:
+                        callback(index, None)
+                spectrum_replay_seconds = time.perf_counter() - replay_started
+            except SpectrumStateError:
+                spectrum_reset_reason = "native_fallback"
+                video_rows.copy_(initial_video_rows)
+                audio_rows.copy_(initial_audio_rows)
+                reset_denoising_schedulers()
+                report_phase("Spectrum H3 fallback to native denoising")
+                if not run_native_denoising(progress_label="MiniMax H3 native fallback"):
+                    spectrum_reset_reason = "cancelled"
                     return None
-                if index == 0:
-                    report_phase("H3 denoising")
-                video_velocity, audio_velocity = prediction
-                video_rows[layout.num_condition_video_rows :] = self.scheduler.step(
-                    video_velocity[0, layout.num_condition_video_rows :].float(),
-                    video_timestep,
-                    video_rows[layout.num_condition_video_rows :],
-                    return_dict=False,
-                )[0]
-                audio_rows[layout.num_condition_audio_rows :] = self.audio_scheduler.step(
-                    audio_velocity[0, layout.num_condition_audio_rows :].float(),
-                    audio_timestep,
-                    audio_rows[layout.num_condition_audio_rows :],
-                    return_dict=False,
-                )[0]
-                if callback is not None:
-                    callback(index, None)
-                progress.update()
+            finally:
+                stats = controller.stats()
+                stats["reset_reason"] = spectrum_reset_reason
+                if spectrum_capture_seconds is not None:
+                    stats["anchor_capture_seconds"] = spectrum_capture_seconds
+                if spectrum_replay_seconds is not None:
+                    stats["offline_replay_seconds"] = spectrum_replay_seconds
+                self._last_spectrum_stats = stats
+                controller.reset(spectrum_reset_reason)
+                del controller
+                del initial_video_rows
+                del initial_audio_rows
 
         if self._interrupt:
             return None

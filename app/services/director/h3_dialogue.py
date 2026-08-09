@@ -66,6 +66,17 @@ _H3_REF2VA_FIELDS = (
     "non_diegetic_music",
 )
 _H3_ALL_FIELDS = tuple(dict.fromkeys((*_H3_REF2VA_FIELDS, *_H3_BASE_FIELDS)))
+_H3_CANONICAL_TIME = r"(?:(?:\d{1,2}:){1,2})?\d+(?:\.\d+)?"
+_H3_CANONICAL_RECORD_RE = re.compile(
+    rf"^\[Shot (?P<number>[1-9]\d*)\] "
+    rf"\[(?P<start>{_H3_CANONICAL_TIME})s-(?P<end>{_H3_CANONICAL_TIME})s\] "
+    r"shot_name: (?P<name>[^|\r\n]+) \| "
+    r"audiovisual_description: (?P<description>[^|\r\n]+) \| "
+    r"dialogue_and_vocalizations: (?P<vocals>[^\r\n]+)$",
+)
+_H3_TOP_LEVEL_LABEL_RE = re.compile(
+    r"(?mi)^\s*([A-Za-z][A-Za-z0-9_ ]{1,64})\s*:"
+)
 _H3_CUSTOM_SECTION_RE = re.compile(
     r"\s+(?:OPENING CONTINUITY|FINAL BLOCKING|"
     r"DIALOGUE AND VOCAL PERFORMANCE|SILENCE AND VOCAL PERFORMANCE)\s*:.*?"
@@ -554,6 +565,200 @@ def _extract_h3_fields(text: str) -> dict[str, str]:
     return fields
 
 
+def _canonical_h3_record_lines(body: str) -> list[str]:
+    """Return exact non-empty physical record lines, or an empty list."""
+
+    lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
+    if not lines or not all(_H3_CANONICAL_RECORD_RE.fullmatch(line) for line in lines):
+        return []
+    return lines
+
+
+def _normalize_h3_record_body(body: str) -> str:
+    """Normalize outer whitespace without flattening canonical shot records."""
+
+    lines = _canonical_h3_record_lines(body)
+    return "\n".join(lines) if lines else _normalized_space(body)
+
+
+def _augment_h3_record_description(
+    body: str,
+    addition: str,
+    *,
+    last: bool = False,
+) -> str:
+    """Add deterministic continuity prose inside one canonical record."""
+
+    lines = _canonical_h3_record_lines(body)
+    addition = _trim_sentence(addition)
+    if not lines or not addition:
+        return body
+    index = len(lines) - 1 if last else 0
+    match = _H3_CANONICAL_RECORD_RE.fullmatch(lines[index])
+    if match is None:
+        return body
+    description = match.group("description").strip()
+    description = (
+        f"{description.rstrip(' .')} {addition}."
+        if last else f"{addition}. {description}"
+    )
+    lines[index] = (
+        f"[Shot {match.group('number')}] "
+        f"[{match.group('start')}s-{match.group('end')}s] "
+        f"shot_name: {match.group('name').strip()} | "
+        f"audiovisual_description: {description.strip()} | "
+        f"dialogue_and_vocalizations: {match.group('vocals').strip()}"
+    )
+    return "\n".join(lines)
+
+
+def _seconds_from_h3_token(value: str) -> float | None:
+    try:
+        parts = [float(part) for part in str(value or "").split(":")]
+    except (TypeError, ValueError):
+        return None
+    if not parts or len(parts) > 3 or any(part < 0 for part in parts):
+        return None
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60.0 + part
+    return seconds
+
+
+def validate_h3_context_ir_records(
+    prompt: str,
+    *,
+    mode: str = "t2va",
+    duration_seconds: float | None = None,
+) -> list[str]:
+    """Validate H3 fields and physical records through the production parser.
+
+    This is deliberately structural. It does not judge subject matter or ask a
+    model to interpret the prompt. Literal record text remains authoritative.
+    """
+
+    text = normalize_h3_text(prompt).strip()
+    mode = str(mode or "t2va").strip().lower()
+    expected = _H3_REF2VA_FIELDS if mode == "ref2va" else _H3_BASE_FIELDS
+    errors: list[str] = []
+    positions: list[int] = []
+    for field in expected:
+        matches = list(re.finditer(rf"(?mi)^\s*{re.escape(field)}\s*:", text))
+        if len(matches) != 1:
+            errors.append(f"expected one {field} field, found {len(matches)}")
+        else:
+            positions.append(matches[0].start())
+    if len(positions) == len(expected) and positions != sorted(positions):
+        errors.append("Context-IR fields are out of order")
+    for field in set(_H3_ALL_FIELDS) - set(expected):
+        if re.search(rf"(?mi)^\s*{re.escape(field)}\s*:", text):
+            errors.append(f"unexpected {field} field for {mode}")
+
+    fields = _extract_h3_fields(text)
+    if len(positions) == len(expected):
+        first_field = re.search(
+            rf"(?mi)^\s*{re.escape(expected[0])}\s*:", text,
+        )
+        prefix = text[:first_field.start()].strip() if first_field else ""
+        prefix_is_one_line = bool(prefix) and "\n" not in prefix and "\r" not in prefix
+        if mode in {"t2va", "ref2va"} and prefix:
+            errors.append("unexpected wrapper text precedes the first Context-IR field")
+        elif mode == "i2va" and not (
+            prefix_is_one_line
+            and prefix.startswith(
+                "For the target video, at 0.00 seconds into the target video, "
+                "<Picture 1>"
+            )
+            and prefix.endswith("is fully referenced.")
+        ):
+            errors.append("I2VA alignment header is missing or contains wrapper text")
+        elif mode in {"fl2va", "l2va"} and not (
+            prefix_is_one_line
+            and prefix.startswith("How the reference pictures align with the target video")
+            and prefix.endswith("mark of the target video.")
+        ):
+            errors.append(
+                f"{mode.upper()} alignment header is missing or contains wrapper text"
+            )
+
+    expected_labels = {field.casefold() for field in expected}
+    for match in _H3_TOP_LEVEL_LABEL_RE.finditer(text):
+        if match.group(1).strip().casefold() not in expected_labels:
+            errors.append(f"unexpected top-level field {match.group(1).strip()}")
+    for field in expected:
+        value = fields.get(field, "").strip()
+        if not value:
+            errors.append(f"{field} field is empty")
+    for field in ("overall_soundscape", "non_diegetic_music"):
+        value = fields.get(field, "").strip()
+        if value and len(value.splitlines()) != 1:
+            errors.append(f"{field} must be exactly one physical line")
+
+    visual_name = (
+        "detailed_description" if mode == "ref2va"
+        else "integrated_multimodal_description"
+    )
+    visual = fields.get(visual_name, "")
+    lines = [line.strip() for line in visual.splitlines() if line.strip()]
+    matches = [_H3_CANONICAL_RECORD_RE.fullmatch(line) for line in lines]
+    if not lines or not all(matches):
+        errors.append(
+            f"{visual_name} must contain only canonical physical-line shot records"
+        )
+        return list(dict.fromkeys(errors))
+
+    typed_matches = [match for match in matches if match is not None]
+    numbers = [int(match.group("number")) for match in typed_matches]
+    if numbers != list(range(1, len(numbers) + 1)):
+        errors.append("shot record numbers are not sequential")
+
+    # Use the same parser that drives global-timeline execution, but isolate
+    # the visual field so Context-IR metadata cannot be mistaken for events.
+    from shared.utils.prompt_parser import parse_global_timeline_prompt
+
+    global_lines, events = parse_global_timeline_prompt(visual)
+    if global_lines or len(events) != len(lines) or any(
+        event.get("kind") != "range" for event in events
+    ):
+        errors.append("production timeline parser did not recognize every canonical record")
+
+    ranges: list[tuple[float, float]] = []
+    for match in typed_matches:
+        start = _seconds_from_h3_token(match.group("start"))
+        end = _seconds_from_h3_token(match.group("end"))
+        if start is None or end is None or end <= start:
+            errors.append(f"Shot {match.group('number')} has an invalid time range")
+            continue
+        ranges.append((start, end))
+    if ranges:
+        if not math.isclose(ranges[0][0], 0.0, abs_tol=1e-6):
+            errors.append("first shot record does not start at 0.00 seconds")
+        for previous, current in zip(ranges, ranges[1:]):
+            if not math.isclose(previous[1], current[0], abs_tol=1e-6):
+                errors.append("shot record ranges are not contiguous")
+                break
+        if duration_seconds is not None:
+            try:
+                duration = float(duration_seconds)
+            except (TypeError, ValueError):
+                errors.append("duration is not numeric")
+            else:
+                if duration > 0 and not math.isclose(
+                    ranges[-1][1], duration, abs_tol=0.01,
+                ):
+                    errors.append(
+                        "final shot record does not end at the requested duration"
+                    )
+
+    spans, malformed = _dialogue_spans(text)
+    if malformed:
+        errors.append("dialogue tags are nested or unbalanced")
+    for index, (start, end) in enumerate(spans, start=1):
+        if not _H3_STRICT_DIALOGUE_RE.fullmatch(text[start:end].strip()):
+            errors.append(f"dialogue block {index} is not canonical")
+    return list(dict.fromkeys(errors))
+
+
 def _strip_h3_custom_sections(text: str) -> str:
     previous = None
     result = str(text or "")
@@ -645,21 +850,38 @@ def _source_prompt_parts(
         body,
         flags=re.IGNORECASE,
     )
-    body = re.sub(r"^\s*\[Shot\s+1\]\s*", "", body, flags=re.IGNORECASE)
-    body = _normalized_space(body)
+    canonical_body = bool(_canonical_h3_record_lines(body))
+    if not canonical_body:
+        body = re.sub(r"^\s*\[Shot\s+1\]\s*", "", body, flags=re.IGNORECASE)
+    body = _normalize_h3_record_body(body)
 
     context = _normalized_space(normalize_h3_text(project_context))
     if context and not _meaningful_context_present(context, body):
         if len(context) > 360:
             context = context[:360].rsplit(" ", 1)[0].rstrip(" ,;:-") + "..."
-        body = f"Project context: {context}. {body}".strip()
+        if canonical_body:
+            body = _augment_h3_record_description(
+                body, f"Project context: {context}",
+            )
+        else:
+            body = f"Project context: {context}. {body}".strip()
 
     opening = _normalized_space(normalize_h3_text(opening_blocking))
     if opening and opening.casefold() not in body.casefold():
-        body = f"Opening composition: {opening}. {body}".strip()
+        if canonical_body:
+            body = _augment_h3_record_description(
+                body, f"Opening composition: {opening}",
+            )
+        else:
+            body = f"Opening composition: {opening}. {body}".strip()
     closing = _normalized_space(normalize_h3_text(closing_blocking))
     if closing and closing.casefold() not in body.casefold():
-        body = f"{body} By the final beat, {closing}.".strip()
+        if canonical_body:
+            body = _augment_h3_record_description(
+                body, f"By the final beat, {closing}", last=True,
+            )
+        else:
+            body = f"{body} By the final beat, {closing}.".strip()
 
     plan = audio_plan if isinstance(audio_plan, Mapping) else {}
     if not _trim_sentence(soundscape):
@@ -905,7 +1127,7 @@ def _compile_official_dialogue(
                 body = f"{body} {silence}".strip()
             contract = silence
 
-    body = _normalized_space(body)
+    body = _normalize_h3_record_body(body)
     return body, contract
 
 
@@ -1167,7 +1389,11 @@ def _label_ref2va_subjects_in_body(
         if not count:
             missing.append(f"{label} ({name}) is visible in the described blocking.")
     if missing:
-        result = f"{' '.join(missing)} {result}".strip()
+        addition = " ".join(missing)
+        if _canonical_h3_record_lines(result):
+            result = _augment_h3_record_description(result, addition)
+        else:
+            result = f"{addition} {result}".strip()
     return result
 
 
@@ -1247,8 +1473,10 @@ def compile_h3_official_prompt(
         existing_blocks,
         has_driving_audio=has_driving_audio,
     )
-    body = re.sub(r"^\s*\[Shot\s+1\]\s*", "", body, flags=re.IGNORECASE)
-    body = f"[Shot 1] {body}".strip()
+    canonical_body = bool(_canonical_h3_record_lines(body))
+    if not canonical_body:
+        body = re.sub(r"^\s*\[Shot\s+1\]\s*", "", body, flags=re.IGNORECASE)
+        body = f"[Shot 1] {body}".strip()
 
     if mode == "ref2va":
         subject_definitions = _ref2va_subject_definitions(
@@ -1276,8 +1504,13 @@ def compile_h3_official_prompt(
             f"{summary or 'A complete audiovisual shot matching the mapped subjects and requested action.'}"
         )
         if detail_bindings:
-            body = re.sub(r"^\[Shot\s+1\]\s*", "", body, flags=re.IGNORECASE)
-            body = f"[Shot 1] {' '.join(detail_bindings)} {body}".strip()
+            if _canonical_h3_record_lines(body):
+                body = _augment_h3_record_description(
+                    body, " ".join(detail_bindings),
+                )
+            else:
+                body = re.sub(r"^\[Shot\s+1\]\s*", "", body, flags=re.IGNORECASE)
+                body = f"[Shot 1] {' '.join(detail_bindings)} {body}".strip()
         if has_driving_audio and music == "N/A":
             music = "Use the mapped driving audio according to retention_analysis."
         compiled = (
@@ -1305,7 +1538,18 @@ def compile_h3_official_prompt(
         )
         if header:
             compiled = f"{header}\n\n{compiled}"
-    return normalize_h3_text(compiled).strip(), vocal_contract
+    compiled = normalize_h3_text(compiled).strip()
+    if canonical_body:
+        errors = validate_h3_context_ir_records(
+            compiled,
+            mode=mode,
+            duration_seconds=(duration_seconds if duration_seconds else None),
+        )
+        if errors:
+            raise H3DialogueContractError(
+                "Invalid canonical MiniMax H3 Context-IR: " + "; ".join(errors)
+            )
+    return compiled, vocal_contract
 
 
 def validate_h3_prompt_contract(
@@ -1314,6 +1558,7 @@ def validate_h3_prompt_contract(
     *,
     mode: str = "t2va",
     references: Sequence[Mapping[str, Any]] | None = None,
+    duration_seconds: float | None = None,
 ) -> list[str]:
     """Validate the official field order plus Maestro's exact dialogue data."""
 
@@ -1341,6 +1586,12 @@ def validate_h3_prompt_contract(
     visual = extracted_fields.get(visual_field, "")
     if not re.match(r"^\s*\[Shot\s+1\]", visual, flags=re.IGNORECASE):
         errors.append(f"{visual_field} does not begin with [Shot 1]")
+    if re.search(r"(?m)^\s*\[Shot\s+\d+\]\s+\[", visual, re.IGNORECASE):
+        errors.extend(validate_h3_context_ir_records(
+            text,
+            mode=mode,
+            duration_seconds=duration_seconds,
+        ))
     if re.search(
         r"\b(?:PROJECT CONTINUITY|OPENING CONTINUITY|FINAL BLOCKING|"
         r"DIALOGUE AND VOCAL PERFORMANCE|SILENCE AND VOCAL PERFORMANCE)\s*:",
@@ -1486,6 +1737,7 @@ def compile_h3_clip_plans(
             beats,
             mode=mode,
             references=references,
+            duration_seconds=duration,
         )
         if errors:
             raise H3DialogueContractError(

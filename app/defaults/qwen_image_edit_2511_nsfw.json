@@ -2,7 +2,7 @@
     "model": {
         "name": "Qwen Image Edit 2511 + Uncensored LoRA (Mature)",
         "architecture": "qwen_image_edit_plus2_20B",
-        "description": "Mature-mode Qwen Image Edit 2511 with a curated OpenRAIL++ uncensored edit LoRA. Use one or more source images and describe the desired edit. Hidden unless Explicit mode is enabled; outputs default private.",
+        "description": "Qwen Image Edit 2511 with a curated OpenRAIL++ uncensored edit LoRA. Use one or more source images and describe the desired edit.",
         "URLs": [
             "https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_8steps_v1.0.safetensors"
         ],

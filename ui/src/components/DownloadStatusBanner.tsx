@@ -1,21 +1,21 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Download, AlertTriangle } from 'lucide-react'
 import { fetchActiveDownloads, type ActiveDownload } from '../api/client'
+import { useStore } from '../stores/useStore'
+import { boundedBackoffDelay, DOWNLOAD_REFRESH_EVENT, POLL_INTERVAL_MS, useVisibilityPolling } from '../lib/useVisibilityPolling'
 
 /**
  * DownloadStatusBanner — fixed-position overlay shown while
  * model files are being downloaded from HuggingFace (or other CDNs).
  *
- * Polls /api/v1/downloads/active every 2s and renders nothing when
- * the list is empty. When downloads are active, shows a compact
+ * Polls /api/v1/downloads/active every 2s during a transfer and every
+ * 30s while idle. When downloads are active, shows a compact
  * banner with the current file's progress + a "stalled / retrying"
  * badge if the byte counter hasn't advanced in >15s.
  *
- * Polling is unconditional (vs gated on "is a job running") because
+ * Polling is not gated on "is a job running" because
  * model downloads can fire from several paths in Maestro: job
- * submission, model selection, etc. Polling
- * is cheap (a 2s GET every 2s) and only ever returns data when the
- * banner needs to be visible.
+ * submission, model selection, etc. Hidden tabs pause the loop entirely.
  *
  * Pairs with services/safe_download.py — that module patches HF
  * downloads to detect mid-stream stalls and recover automatically.
@@ -24,27 +24,59 @@ import { fetchActiveDownloads, type ActiveDownload } from '../api/client'
  */
 export function DownloadStatusBanner() {
   const [downloads, setDownloads] = useState<ActiveDownload[]>([])
+  const [emptyPollAttempt, setEmptyPollAttempt] = useState(0)
+  const mounted = useRef(false)
+  const downloadsRef = useRef<ActiveDownload[]>([])
+  const workActivity = useStore(s => (
+    s.jobs.some(job => job.status === 'queued' || job.status === 'running')
+    || s.llmLoading
+    || s.isEnhancing
+    || s.llmStatus?.loading === true
+  ))
 
   useEffect(() => {
-    let cancelled = false
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
-    const tick = async () => {
-      try {
-        const result = await fetchActiveDownloads()
-        if (!cancelled) setDownloads(result.downloads)
-      } catch {
-        // Endpoint not available (older backend) or transient — ignore
-        if (!cancelled) setDownloads([])
-      }
-    }
-
-    tick()
-    const interval = setInterval(tick, 2000)
-    return () => {
-      cancelled = true
-      clearInterval(interval)
+  const refreshDownloads = useCallback(async () => {
+    try {
+      const result = await fetchActiveDownloads()
+      if (!mounted.current) return
+      const wasActive = downloadsRef.current.length > 0
+      downloadsRef.current = result.downloads
+      setDownloads(result.downloads)
+      if (result.downloads.length > 0 || wasActive) setEmptyPollAttempt(0)
+      else setEmptyPollAttempt(attempt => Math.min(attempt + 1, 16))
+    } catch {
+      // Preserve an active banner through transient failures. The 2s latch
+      // remains until a successful response authoritatively reports empty.
     }
   }, [])
+
+  const refreshNow = useVisibilityPolling(
+    refreshDownloads,
+    downloads.length > 0
+      ? POLL_INTERVAL_MS.downloadsActiveVisible
+      : workActivity
+        ? POLL_INTERVAL_MS.downloadsActiveVisible
+        : boundedBackoffDelay(
+            emptyPollAttempt,
+            POLL_INTERVAL_MS.accessContextInitial,
+            POLL_INTERVAL_MS.downloadsIdleVisible,
+          ),
+    { immediate: false },
+  )
+
+  useEffect(() => {
+    refreshNow()
+    const onDownloadRefresh = () => {
+      setEmptyPollAttempt(0)
+      refreshNow()
+    }
+    window.addEventListener(DOWNLOAD_REFRESH_EVENT, onDownloadRefresh)
+    return () => window.removeEventListener(DOWNLOAD_REFRESH_EVENT, onDownloadRefresh)
+  }, [refreshNow])
 
   if (downloads.length === 0) return null
 

@@ -5,6 +5,7 @@
   "compatibility_date": "2026-08-01",
   "workers_dev": true,
   "observability": { "enabled": false },
+  "vars": { "SHARE_MODE": "proxy" },
   "kv_namespaces": [
     { "binding": "MAESTRO_TARGETS", "id": "" }
   ]

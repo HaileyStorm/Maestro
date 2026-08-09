@@ -65,8 +65,17 @@ _pipeline_starting: set[str] = set()
 _pipeline_operations: set[str] = set()
 _pipeline_deleting: set[str] = set()
 _pipeline_repairs: dict[str, dict] = {}
+# Ephemeral only: these objects are deliberately excluded from pipeline JSON,
+# recovery journals, and public state.  A pass token binds callbacks to the
+# exact live pipeline generation that created them, so a late callback from an
+# older request cannot publish into a resumed/replaced pipeline with the same
+# short id.
+_pipeline_llm_contexts: dict[str, dict] = {}
+_pipeline_llm_tokens: dict[str, object] = {}
 _REPAIR_ACTIVE_STATUSES = {"queued", "running", "cancelling"}
 _GENERATION_SETTLE_GRACE_S = 10.0
+_DIRECTOR_LLM_PARTIAL_LIMIT = 8192
+_DIRECTOR_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _CANCELLED_ARTIFACT_FIELDS = {
     "output_files",
     "clip_images",
@@ -80,6 +89,38 @@ _DIRECTOR_REPAIR_FAILED_CODE = "director_repair_failed"
 _DIRECTOR_REPAIR_FAILED_MESSAGE = "Director repair stopped after an internal error."
 _DIRECTOR_WORKER_FAILED_CODE = "director_worker_start_failed"
 _DIRECTOR_WORKER_FAILED_MESSAGE = "Director could not start its worker."
+
+
+class _DirectorLlmCancelled(RuntimeError):
+    """Internal content-free signal for Stop winning an LLM pass."""
+
+
+def _fresh_explicit_guidance_decision(params: dict) -> bool:
+    """Authorize explicit LLM guidance for one new Director request.
+
+    The decision is made once before the first durable state write. Recovery
+    reuses the persisted literal boolean instead of mixing a saved request with
+    whatever Mature Mode/provider is configured after a restart.
+    """
+    if params.get("explicit_output") is not True or _wgp is None:
+        return False
+    from services.mature_policy import mature_mode_allowed
+    services = getattr(_wgp, "server_config", {}).get("services", {})
+    return mature_mode_allowed(services)
+
+
+def _normalize_explicit_guidance_snapshot(params: dict) -> dict:
+    """Fail closed for missing, legacy, or non-boolean recovery metadata."""
+    from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
+    params[EXPLICIT_GUIDANCE_SNAPSHOT_KEY] = (
+        params.get(EXPLICIT_GUIDANCE_SNAPSHOT_KEY) is True
+    )
+    return params
+
+
+def _explicit_guidance_from_snapshot(params: dict) -> bool:
+    from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
+    return params.get(EXPLICIT_GUIDANCE_SNAPSHOT_KEY) is True
 
 
 def _director_failure_details(exc: BaseException, *, code: str) -> dict:
@@ -276,7 +317,7 @@ def _director_params_from_saved_state(state: dict) -> dict:
         if state.get(key) is not None:
             params[key] = state[key]
     params["_director_shot_image_policy"] = _saved_pipeline_shot_image_policy(state)
-    return params
+    return _normalize_explicit_guidance_snapshot(params)
 
 
 def _limit_director_image_refs(
@@ -807,7 +848,10 @@ def _save_pipeline_state_locked(pid: str) -> bool:
         "video_loras": params.get("video_loras", {}),
         "image_params": params.get("image_params", {}),
         "video_params": params.get("video_params", {}),
-        "llm_log": p.get("_llm_log"),
+        # Raw LLM requests/responses are transient inference material. New
+        # checkpoints never persist them; untouched historical files remain
+        # readable but are filtered from public responses by launch.py.
+        "llm_log": None,
         "clips": clips,
         "output_files": p.get("output_files", []),
         # Failure state is already normalized before it reaches the live
@@ -1408,7 +1452,6 @@ def _rerun_clip_image_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     _style_prefix = _style_prefix_for((state.get("_params_snapshot") or {}).get("_reference_style") or "")
     if _style_prefix and not prompt.lower().startswith("maintain the same"):
         prompt = _style_prefix + prompt
-
     # Get image gen params from the saved pipeline state
     image_model = state.get("image_model") or "flux2_klein_9b"
     image_loras = state.get("image_loras") or {}
@@ -1606,7 +1649,6 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     prompt = prompt_override or clip.get("video_prompt", "")
     if not prompt:
         raise ValueError("No video prompt for this clip")
-
     snapshot = state.get("_params_snapshot") or {}
     video_model = state.get("video_model") or "ltx2_22B_distilled_1_1"
     video_loras = state.get("video_loras") or {}
@@ -2047,7 +2089,6 @@ def _plan_pipeline_repair(out_dir: str, pid: str, state: dict) -> dict:
         raise ValueError(f"Pipeline {pid} not found")
     clip_out_dir = os.path.dirname(pipeline_file)
     clips = state.get("clips") or []
-
     requires_shot_images = shot_images_required(
         _saved_pipeline_shot_image_policy(state)
     )
@@ -3162,6 +3203,217 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
     raise _GenerationTimeoutError(_director_job_outputs(settled))
 
 
+def _director_llm_number(value, *, minimum: float = 0.0):
+    """Return one finite non-negative telemetry number or ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < minimum:
+        return None
+    return number
+
+
+def _begin_pipeline_llm_pass(
+    pid: str,
+    *,
+    phase: str,
+    pass_name: str,
+    attempt_limit: int,
+):
+    """Publish one pipeline-bound, process-memory-only LLM progress stream."""
+    token = object()
+    with _pipeline_lock:
+        pipeline = _pipelines.get(pid)
+        if (
+            not pipeline
+            or pipeline.get("status") in _DIRECTOR_TERMINAL_STATUSES
+        ):
+            raise _DirectorLlmCancelled("Director LLM pass is no longer active")
+        _pipeline_llm_tokens[pid] = token
+        pipeline["llm_progress"] = {
+            "phase": str(phase or "planning")[:64],
+            "pass": str(pass_name or "llm")[:96],
+            "activity": "starting",
+            "partial_text": "",
+            "attempt": 1,
+            "attempt_limit": max(1, min(2, int(attempt_limit))),
+            "generated_tokens_approx": 0,
+            "elapsed_seconds": 0.0,
+            "live_tps": None,
+            "average_tps": None,
+            "done": False,
+        }
+
+    def publish(event: dict) -> None:
+        if not isinstance(event, dict):
+            return
+        with _pipeline_lock:
+            pipeline = _pipelines.get(pid)
+            if (
+                not pipeline
+                or _pipeline_llm_tokens.get(pid) is not token
+                or pipeline.get("status") in _DIRECTOR_TERMINAL_STATUSES
+            ):
+                return
+            current = pipeline.get("llm_progress")
+            if not isinstance(current, dict):
+                return
+            raw_attempt = event.get("attempt")
+            attempt = (
+                raw_attempt
+                if isinstance(raw_attempt, int) and not isinstance(raw_attempt, bool)
+                else current.get("attempt", 1)
+            )
+            attempt = max(1, min(current["attempt_limit"], int(attempt)))
+            activity = str(event.get("phase") or "generating")[:32]
+            new_attempt = attempt > int(current.get("attempt") or 1)
+            retrying = activity == "retrying"
+            text = event.get("text")
+            partial = text if isinstance(text, str) else ""
+            # The runtime emits cumulative visible text.  Retain only a
+            # bounded tail and immediately discard a rejected attempt.
+            if new_attempt or retrying or event.get("done") is True:
+                partial = ""
+            elif len(partial) > _DIRECTOR_LLM_PARTIAL_LIMIT:
+                partial = partial[-_DIRECTOR_LLM_PARTIAL_LIMIT:]
+            generated = event.get("generated_tokens_approx")
+            generated = (
+                generated
+                if isinstance(generated, int)
+                and not isinstance(generated, bool)
+                and generated >= 0
+                else 0
+            )
+            elapsed = _director_llm_number(event.get("elapsed_seconds"))
+            live_tps = _director_llm_number(event.get("live_tps"))
+            average_tps = _director_llm_number(event.get("average_tps"))
+            current.update({
+                "activity": activity,
+                "partial_text": partial,
+                "attempt": attempt,
+                "generated_tokens_approx": generated,
+                "elapsed_seconds": elapsed if elapsed is not None else 0.0,
+                "live_tps": live_tps,
+            })
+            if average_tps is not None:
+                current["average_tps"] = average_tps
+
+    return token, publish
+
+
+def _finish_pipeline_llm_pass(
+    pid: str,
+    token: object,
+    *,
+    failed: bool = False,
+) -> None:
+    """Finalize metrics without allowing a late pass to overwrite Stop."""
+    with _pipeline_lock:
+        if _pipeline_llm_tokens.get(pid) is not token:
+            return
+        _pipeline_llm_tokens.pop(pid, None)
+        pipeline = _pipelines.get(pid)
+        if (
+            not pipeline
+            or pipeline.get("status") in _DIRECTOR_TERMINAL_STATUSES
+        ):
+            return
+        progress = pipeline.get("llm_progress")
+        if not isinstance(progress, dict):
+            return
+        progress.update({
+            "activity": "failed" if failed else "complete",
+            "partial_text": "",
+            "live_tps": None,
+            "done": True,
+        })
+
+
+def _pipeline_llm_pass_active(pid: str, token: object) -> bool:
+    """Return whether a composite pass may start another model request."""
+    with _pipeline_lock:
+        pipeline = _pipelines.get(pid)
+        return bool(
+            pipeline
+            and _pipeline_llm_tokens.get(pid) is token
+            and pipeline.get("status") not in _DIRECTOR_TERMINAL_STATUSES
+        )
+
+
+def _pipeline_llm_call(
+    pid: str,
+    phase: str,
+    pass_name: str,
+    function,
+    /,
+    *args,
+    allow_response_assist: bool = True,
+    liveness_kwarg: Optional[str] = None,
+    **kwargs,
+):
+    """Run one inference call with pipeline-scoped progress and finality."""
+    with _pipeline_lock:
+        pipeline_present = pid in _pipelines
+        context = dict(_pipeline_llm_contexts.get(pid) or {})
+    # Keep direct unit/legacy helper calls that do not own a live pipeline
+    # source-compatible. Production Director calls always have a pipeline.
+    if not pipeline_present:
+        return function(*args, **kwargs)
+    response_assist = (
+        context.get("response_assist")
+        if allow_response_assist and kwargs.get("json_schema") is None
+        else None
+    )
+    attempt_limit = 2 if (
+        isinstance(response_assist, dict)
+        and response_assist.get("retry_on_refusal") is True
+    ) else 1
+    token, callback = _begin_pipeline_llm_pass(
+        pid,
+        phase=phase,
+        pass_name=pass_name,
+        attempt_limit=attempt_limit,
+    )
+    kwargs["progress_callback"] = callback
+    if liveness_kwarg:
+        kwargs[liveness_kwarg] = lambda: _pipeline_llm_pass_active(pid, token)
+    if response_assist:
+        kwargs["response_assist"] = response_assist
+    failed = True
+    try:
+        selection = context.get("selection")
+        if isinstance(selection, dict) and selection:
+            from services import llm_service
+            with llm_service.loaded_model_lease(**selection):
+                result = function(*args, **kwargs)
+        else:
+            result = function(*args, **kwargs)
+        with _pipeline_lock:
+            pipeline = _pipelines.get(pid)
+            cancelled = (
+                not pipeline or pipeline.get("status") == "cancelled"
+            )
+        if cancelled:
+            raise _DirectorLlmCancelled("Director LLM pass was cancelled")
+        failed = False
+        return result
+    finally:
+        _finish_pipeline_llm_pass(pid, token, failed=failed)
+
+
+def _cancel_pipeline_llm_progress(pid: str) -> None:
+    """Make the active callback inert at the same lock boundary as Stop."""
+    _pipeline_llm_tokens.pop(pid, None)
+    progress = (_pipelines.get(pid) or {}).get("llm_progress")
+    if isinstance(progress, dict):
+        progress.update({
+            "activity": "cancelled",
+            "partial_text": "",
+            "live_tps": None,
+            "done": True,
+        })
+
+
 def _update_pipeline(pid: str, **kwargs):
     """Thread-safe update; cancellation is an absorbing terminal state."""
     with _pipeline_lock:
@@ -3232,6 +3484,22 @@ def start_pipeline(params: dict) -> str:
     # pipeline's generated anchor and later influence repair/cleanup behavior.
     params.pop("generated_reference_image_filename", None)
     params.pop("_director_shot_image_policy", None)
+    from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
+    # A caller may not nominate this private decision bit. Recompute it from
+    # the literal request flag and authoritative consent/provider policy, then
+    # persist the result in the initial Director state snapshot.
+    params.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
+    explicit_guidance = _fresh_explicit_guidance_decision(params)
+    params[EXPLICIT_GUIDANCE_SNAPSHOT_KEY] = explicit_guidance
+    if explicit_guidance:
+        # Bind the authorized request to the same non-public provider that
+        # passed the gate. This prevents a client provider override—and a
+        # later settings change during recovery—from sending explicit guidance
+        # to a public provider.
+        services = getattr(_wgp, "server_config", {}).get("services", {})
+        params["llm_provider"] = str(
+            services.get("llm_provider") or "local"
+        ).strip().lower()
     params["_director_shot_image_policy"] = _resolve_fresh_shot_image_policy(params)
     _validate_director_models(params)
     pid = uuid.uuid4().hex[:8]
@@ -3284,8 +3552,7 @@ def start_pipeline(params: dict) -> str:
         "workspace": workspace,
         "out_dir": out_dir,
         "source_remote": source_remote,
-        # For LLM streaming: the frontend polls /api/v1/llm/stream-status
-        "llm_streaming": False,
+        "llm_progress": None,
     }
 
     # The parent JSON and queue identity must both be durable before the
@@ -3527,7 +3794,6 @@ def _resume_pipeline_reserved(
             c.get("video_filename") for c in saved_clips
         ],
         "output_files": data.get("output_files", []) or [],
-        "_llm_log": data.get("llm_log"),
         "error": None,
         "created_at": data.get("created_at") or time.time(),
         "params": params,
@@ -3535,7 +3801,9 @@ def _resume_pipeline_reserved(
         "workspace": workspace,
         "out_dir": resume_out_dir,
         "source_remote": bool(data.get("source_remote", False)),
-        "llm_streaming": False,
+        # Interrupted inference is never resumable state. A resumed pipeline
+        # starts with no partial text or stale meters.
+        "llm_progress": None,
     }
     with _pipeline_lock:
         previous = _pipelines.get(pid) or {}
@@ -3569,9 +3837,10 @@ def restore_registered_pipeline(
     pid = str(data.get("pipeline_id") or "")
     if not pid or pipeline_state_filename(pid) != os.path.basename(state_path):
         raise ValueError("Director recovery state identity is invalid")
-    params = data.get("_params_snapshot")
-    if not isinstance(params, dict):
+    raw_params = data.get("_params_snapshot")
+    if not isinstance(raw_params, dict):
         raise ValueError("Director recovery request is unavailable")
+    params = _normalize_explicit_guidance_snapshot(dict(raw_params))
     saved_clips = data.get("clips", []) or []
     clip_plans = [{
         "image_prompt": clip.get("image_prompt", ""),
@@ -3602,10 +3871,6 @@ def restore_registered_pipeline(
         _DIRECTOR_PIPELINE_FAILED_CODE: _DIRECTOR_PIPELINE_FAILED_MESSAGE,
         _DIRECTOR_WORKER_FAILED_CODE: _DIRECTOR_WORKER_FAILED_MESSAGE,
         "cuda_oom": "Director generation stopped after a GPU memory error.",
-        "safety_policy_refusal": (
-            "Generation was blocked by the safety policy. Revise the concept "
-            "so every depicted character is an adult (18+)."
-        ),
     }
     if saved_status == "failed" and restored_error_code not in restored_error_messages:
         restored_error_code = _DIRECTOR_PIPELINE_FAILED_CODE
@@ -3679,7 +3944,6 @@ def restore_registered_pipeline(
             clip.get("video_filename") for clip in saved_clips
         ],
         "output_files": data.get("output_files", []) or [],
-        "_llm_log": data.get("llm_log"),
         "error": restored_error,
         "error_code": restored_error_code or None,
         "failure_details": restored_failure_details,
@@ -3693,7 +3957,7 @@ def restore_registered_pipeline(
         ),
         "out_dir": os.path.dirname(state_path),
         "source_remote": bool(data.get("source_remote", False)),
-        "llm_streaming": False,
+        "llm_progress": None,
         "_recovery_parent": dict(recovery_parent),
         "_recovery_owner_digest": recovery_parent.get("owner_digest"),
         "_recovery_project_digest": recovery_parent.get("project_digest"),
@@ -3855,6 +4119,8 @@ def stop_pipeline(pid: str) -> bool:
             "step": 0,
             "total_steps": 0,
         }
+        _cancel_pipeline_llm_progress(pid)
+        _pipeline_llm_contexts.pop(pid, None)
     _abort_pipeline_jobs(pid)
     persisted = _save_pipeline_state(pid)
     with _pipeline_lock:
@@ -3920,8 +4186,15 @@ def _run_pipeline(pid: str, resume: bool = False):
             return  # cancelled while waiting
 
         # ── Phase 1: LLM Planning ──────────────────────────────────────
-        _update_pipeline(pid, phase="planning", llm_streaming=True,
-                         progress={"current": 0, "total": 1, "message": "Planning with LLM...", "step": 0, "total_steps": 0})
+        _update_pipeline(
+            pid,
+            phase="planning",
+            progress={
+                "current": 0, "total": 1,
+                "message": "Planning with LLM...",
+                "step": 0, "total_steps": 0,
+            },
+        )
 
         planning_start = time.time()
         if resume_plans:
@@ -3932,12 +4205,15 @@ def _run_pipeline(pid: str, resume: bool = False):
         else:
             try:
                 clip_plans, planned_clips = _run_planning(pid, params, pipeline_type)
-            except Exception as plan_err:
-                print(f"[Pipeline] Planning error: {plan_err}")
-                import traceback
-                traceback.print_exc()
+            except _DirectorLlmCancelled:
+                return
+            except Exception:
+                print("[Pipeline] Planning failed")
                 raise
         planning_time = time.time() - planning_start
+
+        if _pipelines.get(pid, {}).get("status") == "cancelled":
+            return
 
         if not clip_plans:
             raise RuntimeError("Planning produced no clip plans")
@@ -3945,36 +4221,9 @@ def _run_pipeline(pid: str, resume: bool = False):
         # Store planned clips for persistence
         _update_pipeline(pid, _planned_clips=planned_clips)
 
-        # Capture LLM logs — collect all passes from the pipeline's accumulated log
-        try:
-            from services import llm_service
-            # The pipeline accumulates logs via _append_llm_log during planning
-            accumulated = _pipelines.get(pid, {}).get("_llm_passes", [])
-            # Also capture the final state as a fallback
-            if not accumulated:
-                accumulated = [{
-                    "pass": "planning",
-                    "system_prompt": getattr(llm_service, '_last_system_prompt', '') or '',
-                    "user_prompt": getattr(llm_service, '_last_user_prompt', '') or '',
-                    "response_text": getattr(llm_service, '_stream_buffer', '') or '',
-                    "thinking_text": getattr(llm_service, '_last_thinking_text', None),
-                }]
-            llm_log = {
-                "provider": params.get("llm_provider", "local"),
-                "model_id": params.get("llm_model_id", ""),
-                "passes": accumulated,
-                # Keep flat fields for backward compat — use last pass
-                "system_prompt": accumulated[-1].get("system_prompt", "") if accumulated else "",
-                "response_text": accumulated[-1].get("response_text", "") if accumulated else "",
-                "thinking_text": accumulated[-1].get("thinking_text") if accumulated else None,
-                "planning_time_sec": round(planning_time, 2),
-            }
-            # On resume, keep the rehydrated original log instead of clobbering
-            # it with an empty re-capture (there was no fresh planning stream).
-            if not resume_plans:
-                _update_pipeline(pid, _llm_log=llm_log)
-        except Exception:
-            pass
+        # Only content-free terminal timing is retained in memory. Raw system,
+        # user, thinking, and response text are neither captured nor durable.
+        _update_pipeline(pid, llm_planning_time_sec=round(planning_time, 2))
 
         # ── Optional: Third-pass prompt polish ────────────────────────
         services = _wgp.server_config.get("services", {}) if _wgp else {}
@@ -3998,8 +4247,7 @@ def _run_pipeline(pid: str, resume: bool = False):
                     polish_prompts_third_pass,
                     should_polish_director_video_prompts,
                 )
-                provider = services.get("llm_provider", "local")
-                nsfw = services.get("nsfw_mode", False) and provider not in {"openai", "anthropic"}
+                nsfw = _explicit_guidance_from_snapshot(params)
                 video_model = params.get("video_model", "")
                 image_model = params.get("image_model", "")
                 polish_video_prompts = should_polish_director_video_prompts(
@@ -4015,7 +4263,6 @@ def _run_pipeline(pid: str, resume: bool = False):
                     _update_pipeline(
                         pid,
                         phase="polishing_prompts",
-                        llm_streaming=False,
                         progress={
                             "current": 0,
                             "total": len(clip_plans),
@@ -4047,7 +4294,11 @@ def _run_pipeline(pid: str, resume: bool = False):
                 # the same list passed to the planner.
                 characters = params.get("characters", []) or []
                 if polish_video_prompts or polish_image_prompts:
-                    clip_plans = polish_prompts_third_pass(
+                    clip_plans = _pipeline_llm_call(
+                        pid,
+                        "polishing_prompts",
+                        "third_pass_polish",
+                        polish_prompts_third_pass,
                         clip_plans, video_model, image_model, nsfw,
                         video_loras=video_loras, image_loras=image_loras,
                         image_paths=ref_paths or None,
@@ -4061,19 +4312,21 @@ def _run_pipeline(pid: str, resume: bool = False):
                         ),
                         polish_video_prompts=polish_video_prompts,
                         polish_image_prompts=polish_image_prompts,
+                        liveness_kwarg="is_active",
                     )
-                    _capture_llm_pass(pid, "third_pass_polish")
                     print(
                         "[Pipeline] Model-aware third-pass polish completed "
                         f"for {len(clip_plans)} clips"
                     )
-            except Exception as e:
-                print(f"[Pipeline] Prompt polish failed (non-fatal): {e}")
+            except _DirectorLlmCancelled:
+                return
+            except Exception:
+                print("[Pipeline] Prompt polish failed (non-fatal)")
         elif polish_mode in ("full_guide", "light_guide"):
             # For inject modes, polish happened inside the planner — note it in the log
             _update_pipeline(pid, _polish_mode_used=polish_mode)
 
-        _update_pipeline(pid, clip_plans=clip_plans, llm_streaming=False)
+        _update_pipeline(pid, clip_plans=clip_plans)
         _require_pipeline_checkpoint(pid, "committed-plan")
 
         # Check cancellation
@@ -4122,7 +4375,11 @@ def _run_pipeline(pid: str, resume: bool = False):
             _style_phrase = ""
             try:
                 if llm_service.is_loaded() and getattr(llm_service, "_vision_available", False):
-                    _style_raw = llm_service.generate(
+                    _style_raw = _pipeline_llm_call(
+                        pid,
+                        "reference_style",
+                        "reference_style_vlm",
+                        llm_service.generate,
                         _STYLE_DESCRIBE_PROMPT,
                         max_new_tokens=48,
                         temperature=0.1,
@@ -4130,9 +4387,17 @@ def _run_pipeline(pid: str, resume: bool = False):
                         enable_thinking=False,
                     )
                     _style_phrase = _normalize_style_phrase(_style_raw)
-                    print(f"[Pipeline {pid}] Reference art style: {_style_phrase!r} (raw: {str(_style_raw)[:80]!r})")
-            except Exception as e:
-                print(f"[Pipeline {pid}] Style detection skipped (non-fatal): {e}")
+                    print(
+                        f"[Pipeline {pid}] Reference art style detection "
+                        f"completed (recognized={bool(_style_phrase)})"
+                    )
+            except _DirectorLlmCancelled:
+                return
+            except Exception:
+                print(
+                    f"[Pipeline {pid}] Reference art style detection "
+                    "skipped (non-fatal)"
+                )
             # Record even when empty ("" = photographic / undetected) so
             # resume doesn't re-run the detection.
             params["_reference_style"] = _style_phrase
@@ -4282,6 +4547,14 @@ def _run_pipeline(pid: str, resume: bool = False):
         _require_pipeline_checkpoint(pid, "completed")
 
     except Exception as e:
+        if isinstance(e, _DirectorLlmCancelled):
+            with _pipeline_lock:
+                cancelled = (
+                    (_pipelines.get(pid) or {}).get("status") == "cancelled"
+                )
+            if cancelled:
+                _save_pipeline_state(pid)
+                return
         import traceback
         partial_outputs = getattr(e, "output_files", None)
         if partial_outputs:
@@ -4297,33 +4570,6 @@ def _run_pipeline(pid: str, resume: bool = False):
                 if clip_slots:
                     artifact_updates["_clip_video_files"] = clip_slots
             _update_pipeline(pid, **artifact_updates)
-        # Special-case the safety scanner. Don't print a stack trace for
-        # safety violations — they're a clean refusal, not a crash, and
-        # the user-visible message is purpose-built. Other exceptions
-        # keep the existing traceback dump for debugging.
-        try:
-            from services.director.safety_scan import SafetyViolationError
-        except Exception:
-            SafetyViolationError = None  # type: ignore
-        if SafetyViolationError is not None and isinstance(e, SafetyViolationError):
-            print(f"[Pipeline {pid}] Safety scan blocked generation")
-            user_msg = (
-                "Generation was blocked by the safety policy. Revise the "
-                "concept so every depicted character is an adult (18+)."
-            )
-            _update_pipeline(
-                pid, status="failed", error=user_msg,
-                error_code="safety_policy_refusal",
-                failure_details=_director_failure_details(
-                    e, code="safety_policy_refusal",
-                ),
-                _completed_at=time.time(),
-                progress={"current": 0, "total": 0,
-                          "message": "Generation aborted (safety policy)",
-                          "step": 0, "total_steps": 0},
-            )
-            _save_pipeline_state(pid)
-            return
         traceback.print_exc()
         # Tag with OOM info if applicable so the UI can surface the
         # OOM recovery banner. detect_oom returns None for non-OOM
@@ -4357,6 +4603,8 @@ def _run_pipeline(pid: str, resume: bool = False):
         _save_pipeline_state(pid)  # Save on failure too
     finally:
         with _pipeline_lock:
+            _pipeline_llm_tokens.pop(pid, None)
+            _pipeline_llm_contexts.pop(pid, None)
             current = _pipeline_threads.get(pid)
             if current is threading.current_thread():
                 _pipeline_threads.pop(pid, None)
@@ -4401,10 +4649,8 @@ def _wait_for_gpu(pid: str, poll_interval: float = 2.0):
 
 # ── Planning Phase ──────────────────────────────────────────────────────
 
-def _ensure_llm_loaded(params: dict):
-    """Load/reload LLM if needed. Shared between legacy and new planning."""
-    from services import llm_service
-
+def _director_llm_selection(params: dict) -> dict:
+    """Resolve one exact server-owned model/provider identity for this run."""
     services_cfg = _wgp.server_config.get("services", {}) if _wgp else {}
     desired_model = params.get("llm_model_id") or services_cfg.get("llm_model_id", "Abhiray/gemma-4-E4B-it-heretic-GGUF")
     desired_device = params.get("llm_device") or services_cfg.get("llm_device", "cpu")
@@ -4415,6 +4661,64 @@ def _ensure_llm_loaded(params: dict):
         desired_api_key = services_cfg.get("openai_api_key", "")
     elif desired_provider == "anthropic":
         desired_api_key = services_cfg.get("anthropic_api_key", "")
+    return {
+        "model_id": desired_model,
+        "device": desired_device,
+        "provider": desired_provider,
+        "remote_url": desired_remote_url,
+        "api_key": desired_api_key,
+        "local_gguf_path": "",
+        "gguf_file_override": "",
+    }
+
+
+def _resolve_pipeline_llm_context(
+    pid: str,
+    params: dict,
+    selection: dict,
+) -> dict:
+    """Freeze response assistance only after the exact local lease is held."""
+    response_assist = None
+    if (
+        _explicit_guidance_from_snapshot(params)
+        and str(selection.get("provider") or "local").strip().lower() == "local"
+        and not str(selection.get("remote_url") or "").strip()
+        and not str(selection.get("api_key") or "").strip()
+    ):
+        try:
+            from services.llm_response_assist import (
+                build_server_response_assist,
+                response_assist_corpus_snapshot,
+            )
+            corpus_snapshot = response_assist_corpus_snapshot()
+            response_assist = build_server_response_assist(
+                corpus_snapshot=corpus_snapshot,
+            )
+        except Exception:
+            # Response assistance is best-effort and must fail open.
+            response_assist = None
+    context = {
+        "selection": dict(selection),
+        "response_assist": response_assist,
+    }
+    with _pipeline_lock:
+        pipeline = _pipelines.get(pid)
+        if (
+            not pipeline
+            or pipeline.get("status") in _DIRECTOR_TERMINAL_STATUSES
+        ):
+            raise _DirectorLlmCancelled("Director LLM context is no longer active")
+        _pipeline_llm_contexts[pid] = context
+    return context
+
+
+def _ensure_llm_loaded(params: dict) -> dict:
+    """Load the exact Director selection and return its reusable lease args."""
+    from services import llm_service
+
+    selection = _director_llm_selection(params)
+    desired_provider = selection["provider"]
+    desired_device = selection["device"]
 
     # Free GPU memory before running a local CUDA LLM. Director planning
     # fires right after image edits / audio analysis: memory profiles keep
@@ -4452,40 +4756,13 @@ def _ensure_llm_loaded(params: dict):
     # A model/provider-only shortcut here left stale devices and mmproj files
     # resident after settings or downloaded artifacts changed.
     llm_service.load_model(
-        model_id=desired_model,
-        device=desired_device,
-        provider=desired_provider,
-        remote_url=desired_remote_url,
-        api_key=desired_api_key,
+        model_id=selection["model_id"],
+        device=selection["device"],
+        provider=selection["provider"],
+        remote_url=selection["remote_url"],
+        api_key=selection["api_key"],
     )
-
-
-def _capture_llm_pass(pid: str, pass_name: str):
-    """Capture the current LLM state as a pass and append to the pipeline's log.
-
-    Captures both system_prompt AND user_prompt so the Director Dashboard
-    can render the full LLM input. Previously the dashboard only stored
-    system_prompt, which made it look like the user's story description
-    was missing from Pass 1's input — but it was always being sent as
-    a separate user message; the dashboard just wasn't capturing it.
-    """
-    try:
-        from services import llm_service
-        pass_entry = {
-            "pass": pass_name,
-            "system_prompt": getattr(llm_service, '_last_system_prompt', '') or '',
-            "user_prompt": getattr(llm_service, '_last_user_prompt', '') or '',
-            "response_text": getattr(llm_service, '_stream_buffer', '') or '',
-            "thinking_text": getattr(llm_service, '_last_thinking_text', None),
-        }
-        with _pipeline_lock:
-            p = _pipelines.get(pid)
-            if p:
-                passes = p.get("_llm_passes", [])
-                passes.append(pass_entry)
-                p["_llm_passes"] = passes
-    except Exception:
-        pass
+    return selection
 
 
 def _run_planning(pid: str, params: dict, pipeline_type: str):
@@ -4494,7 +4771,9 @@ def _run_planning(pid: str, params: dict, pipeline_type: str):
     Uses the new DirectorOrchestrator when use_director_v2 flag is set,
     otherwise falls back to legacy llm_service calls.
     """
-    _ensure_llm_loaded(params)
+    from services import llm_service
+
+    selection = _ensure_llm_loaded(params)
 
     # Default v2 — see launch.py services-config comment for rationale.
     # The params dict is built from servicesConfig in the frontend, so
@@ -4503,9 +4782,13 @@ def _run_planning(pid: str, params: dict, pipeline_type: str):
     # default here so the legacy path isn't accidentally hit.
     use_v2 = params.get("use_director_v2", True)
 
-    if use_v2:
-        return _run_planning_v2(pid, params, pipeline_type)
-    else:
+    # Hold the exact provider/model identity across every coherent planning
+    # call. The lock is re-entrant inside generate(), so concurrent Chat or
+    # enhancer requests cannot swap the singleton between Director passes.
+    with llm_service.loaded_model_lease(**selection):
+        _resolve_pipeline_llm_context(pid, params, selection)
+        if use_v2:
+            return _run_planning_v2(pid, params, pipeline_type)
         return _run_planning_legacy(pid, params, pipeline_type)
 
 
@@ -4518,24 +4801,36 @@ def _run_planning_v2(pid: str, params: dict, pipeline_type: str):
     flags_dict = params.get("director_flags", {})
     flags = DirectorFlags.from_dict(flags_dict) if flags_dict else DirectorFlags()
 
-    # Wrap LLM functions to capture each pass for the dashboard log
+    # Wrap every planner call in a pipeline-bound progress token. Structured
+    # JSON calls intentionally bypass response assistance while retaining the
+    # same request-scoped streaming/TPS telemetry.
     _pass_counter = [0]
-    def _logged_generate(*args, **kwargs):
-        result = llm_service.generate(*args, **kwargs)
+    def _pipeline_generate(*args, **kwargs):
         _pass_counter[0] += 1
-        _capture_llm_pass(pid, f"generate_{_pass_counter[0]}")
-        return result
+        return _pipeline_llm_call(
+            pid,
+            "planning",
+            f"generate_{_pass_counter[0]}",
+            llm_service.generate,
+            *args,
+            **kwargs,
+        )
 
-    def _logged_streaming(*args, **kwargs):
-        result = llm_service.generate_streaming(*args, **kwargs)
+    def _pipeline_streaming(*args, **kwargs):
         _pass_counter[0] += 1
-        _capture_llm_pass(pid, f"streaming_{_pass_counter[0]}")
-        return result
+        return _pipeline_llm_call(
+            pid,
+            "planning",
+            f"streaming_{_pass_counter[0]}",
+            llm_service.generate_streaming,
+            *args,
+            **kwargs,
+        )
 
     # Create orchestrator with logged LLM functions
     director = DirectorOrchestrator(
-        llm_generate=_logged_generate,
-        llm_generate_streaming=_logged_streaming,
+        llm_generate=_pipeline_generate,
+        llm_generate_streaming=_pipeline_streaming,
         flags=flags,
     )
 
@@ -4554,9 +4849,10 @@ def _run_planning_v2(pid: str, params: dict, pipeline_type: str):
     reference_image_path = params.get("reference_image_path")
     planned_clips = params.get("planned_clips", [])
 
-    # Read NSFW from server config (persisted setting, not per-request)
+    # Reuse the server-authorized request-local decision persisted before the
+    # worker started. A restart or settings change cannot mix prompt modes.
     services_cfg = _wgp.server_config.get("services", {}) if _wgp else {}
-    nsfw = services_cfg.get("nsfw_mode", False)
+    nsfw = _explicit_guidance_from_snapshot(params)
     # Multi-shot LoRA mode — passes through to Pass 2 so it can emit
     # storyboard-format video_prompts for medium-length shots. See
     # the toggle's comment in launch.py for behavior details.
@@ -4716,13 +5012,16 @@ def _run_planning_legacy(pid: str, params: dict, pipeline_type: str):
     fps = params.get("fps", 16)
     frames_steps = params.get("frames_steps", 8)
     frames_minimum = params.get("frames_minimum", 41)
+    explicit_guidance = _explicit_guidance_from_snapshot(params)
 
     if pipeline_type == "short_film_story":
         # Path C: Full story-based planning
         target_duration = params.get("target_duration", 60)
         narrative_mode = params.get("narrative_mode", False)
 
-        result = llm_service.plan_short_film_from_story(
+        result = _pipeline_llm_call(
+            pid, "planning", "legacy_short_film_story",
+            llm_service.plan_short_film_from_story,
             story_description=scene_description,
             characters=characters,
             reference_image_path=reference_image_path,
@@ -4731,13 +5030,17 @@ def _run_planning_legacy(pid: str, params: dict, pipeline_type: str):
             fps=fps,
             frames_steps=frames_steps,
             frames_minimum=frames_minimum,
+            nsfw=explicit_guidance,
+            allow_response_assist=False,
         )
         planned_clips = result.get("clips", [])
         clip_plans = result.get("clip_plans", [])
 
     elif pipeline_type == "short_film_audio":
         # Path B: Short film with uploaded dialogue audio
-        result = llm_service.plan_short_film_prompts(
+        result = _pipeline_llm_call(
+            pid, "planning", "legacy_short_film_audio",
+            llm_service.plan_short_film_prompts,
             clips=planned_clips,
             scene_description=scene_description,
             lyrics=params.get("lyrics", ""),
@@ -4745,12 +5048,16 @@ def _run_planning_legacy(pid: str, params: dict, pipeline_type: str):
             speaker_mappings=speaker_mappings,
             characters=characters,
             prompt_type="both",
+            nsfw=explicit_guidance,
+            allow_response_assist=False,
         )
         clip_plans = result if isinstance(result, list) else result.get("clip_plans", [])
 
     else:
         # Music video flow
-        result = llm_service.plan_clip_prompts_and_images(
+        result = _pipeline_llm_call(
+            pid, "planning", "legacy_music_video",
+            llm_service.plan_clip_prompts_and_images,
             clips=planned_clips,
             scene_description=scene_description,
             lyrics=params.get("lyrics", ""),
@@ -4758,6 +5065,8 @@ def _run_planning_legacy(pid: str, params: dict, pipeline_type: str):
             reference_image_path=reference_image_path,
             speaker_mappings=speaker_mappings,
             prompt_type="both",
+            nsfw=explicit_guidance,
+            allow_response_assist=False,
         )
         clip_plans = result if isinstance(result, list) else result.get("clip_plans", [])
 
@@ -5228,6 +5537,16 @@ _H3_FL2VA_MODELS = {
 }
 _H3_VIDEO_MODELS = _H3_FL2VA_MODELS | {_H3_REF2VA_MODEL}
 _DIRECTOR_CLIP_SEPARATOR = "\n---CLIP_BOUNDARY---\n"
+_DIRECTOR_H3_RECORD_PAYLOAD_RE = re.compile(
+    r"^(?:\[Shot\s+\d+\]\s*)?"
+    r"shot_name:\s*(?P<name>[^|\r\n]+?)\s*\|\s*"
+    r"audiovisual_description:\s*(?P<description>[^|\r\n]+?)\s*"
+    r"(?:\|\s*dialogue_and_vocalizations:\s*"
+    r"(?P<vocals>[^\r\n]+?))?\s*$",
+)
+_DIRECTOR_H3_DIALOGUE_RE = re.compile(
+    r"<d>\s*\[[^\]\r\n]+\]\s+.*?</d>", re.IGNORECASE | re.DOTALL,
+)
 
 
 def _director_h3_json_value(value):
@@ -5282,12 +5601,244 @@ def _attach_director_h3_shot_contracts(
             planned_clips[index]["_h3_shot"] = contract
 
 
+def _director_h3_time_token(seconds: float) -> str:
+    """Use a stable frame-precise token for deterministic Director ranges."""
+    return f"{max(0.0, float(seconds)):.3f}"
+
+
+def _director_h3_record_payload(text: str, number: int) -> tuple[str, str, str]:
+    """Return canonical fields without interpreting creative subject matter."""
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    compact = re.sub(r"^\[Shot\s+\d+\]\s*", "", compact)
+    exact = _DIRECTOR_H3_RECORD_PAYLOAD_RE.fullmatch(compact)
+    if exact:
+        return (
+            exact.group("name").strip(),
+            exact.group("description").strip(),
+            (exact.group("vocals") or "none").strip(),
+        )
+    if "|" in compact or re.search(
+        r"\b(?:shot_name|audiovisual_description|"
+        r"dialogue_and_vocalizations)\s*:", compact,
+    ):
+        raise ValueError(
+            "Director H3 record labels are malformed; exact mapping is unavailable"
+        )
+    dialogue = _DIRECTOR_H3_DIALOGUE_RE.findall(compact)
+    description = _DIRECTOR_H3_DIALOGUE_RE.sub(" ", compact)
+    description = re.sub(r"\s+", " ", description).strip()
+    if not description:
+        description = "Dialogue"
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", description)
+    shot_name = " ".join(words[:8]) or f"Shot {number}"
+    return shot_name, description, " ".join(dialogue) if dialogue else "none"
+
+
+def _director_h3_canonical_prompt(
+    prompt: str,
+    *,
+    duration_seconds: float,
+    events: list[dict] | None = None,
+) -> str:
+    """Map one Director source/segment to strict physical Context-IR records."""
+    from services.director.h3_dialogue import validate_h3_context_ir_records
+    from shared.utils.prompt_parser import parse_global_timeline_prompt
+
+    source = str(prompt or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    # The shared splitter may carry FINAL BLOCKING onto its own line between
+    # a record's visual and vocal fields. Rejoin only that known deterministic
+    # shape before parsing; both literal payloads remain unchanged.
+    source = re.sub(
+        r"(?m)^(?P<record>\[[^\r\n]+\|\s*"
+        r"audiovisual_description:[^\r\n|]+)\s*$\n"
+        r"FINAL BLOCKING:\s*(?P<blocking>[^\r\n|]+?)\s*\|\s*"
+        r"dialogue_and_vocalizations:\s*(?P<vocals>[^\r\n]+)\s*$",
+        lambda match: (
+            f"{match.group('record')} | dialogue_and_vocalizations: "
+            f"{match.group('vocals').strip()}\n"
+            f"FINAL BLOCKING: {match.group('blocking').strip()}"
+        ),
+        source,
+    )
+    duration = float(duration_seconds)
+    if duration <= 0:
+        raise ValueError("Director H3 prompt duration must be positive")
+    existing_errors = validate_h3_context_ir_records(
+        source, mode="t2va", duration_seconds=duration,
+    )
+    if not existing_errors:
+        return source
+
+    first_field = re.search(
+        r"(?mi)^\s*integrated_multimodal_description\s*:", source,
+    )
+    if first_field and source[:first_field.start()].strip():
+        raise ValueError(
+            "Director H3 prompt contains wrapper text; exact mapping is unavailable"
+        )
+
+    soundscape = "N/A"
+    music = "N/A"
+    context_lines: list[str] = []
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        sound_match = re.fullmatch(
+            r"overall_soundscape\s*:\s*(.+)", line, re.IGNORECASE,
+        )
+        music_match = re.fullmatch(
+            r"non_diegetic_music\s*:\s*(.+)", line, re.IGNORECASE,
+        )
+        if sound_match:
+            soundscape = sound_match.group(1).strip()
+            continue
+        if music_match:
+            music = music_match.group(1).strip()
+            continue
+        if re.fullmatch(
+            r"integrated_multimodal_description\s*:\s*", line,
+            re.IGNORECASE,
+        ):
+            continue
+        if parse_global_timeline_prompt(line)[1]:
+            continue
+        legacy_context = re.match(
+            r"^(?:subject_definitions|cast|setting|location|environment|"
+            r"visual_style|lighting)\s*:\s*(.*)$",
+            line,
+            re.IGNORECASE,
+        )
+        if not first_field and legacy_context:
+            if legacy_context.group(1).strip():
+                context_lines.append(legacy_context.group(1).strip())
+            continue
+        if first_field and re.match(
+            r"^[A-Za-z][A-Za-z0-9_ ]{1,64}\s*:", line,
+        ) and not re.match(
+            r"^(?:VISUAL CONTINUITY|OPENING BLOCKING|FINAL BLOCKING)\s*:",
+            line,
+            re.IGNORECASE,
+        ):
+            raise ValueError(
+                "Director H3 prompt has an unexpected field; exact mapping is unavailable"
+            )
+        context_lines.append(line)
+
+    parsed_globals, parsed_events = parse_global_timeline_prompt(source)
+    mapped_events = list(events if events is not None else parsed_events)
+    if not mapped_events:
+        body = " ".join(context_lines).strip() or source
+        mapped_events = [{
+            "kind": "range",
+            "start": 0.0,
+            "end": duration,
+            "text": body,
+            "order": 0,
+        }]
+        context_lines = []
+    else:
+        event_texts = {
+            re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+            for item in mapped_events
+        }
+        globals_from_parser = {
+            re.sub(r"\s+", " ", str(line or "")).strip()
+            for line in parsed_globals
+        }
+        context_lines = [
+            line for line in context_lines
+            if re.sub(r"\s+", " ", line).strip() not in event_texts
+            and re.sub(r"\s+", " ", line).strip() not in globals_from_parser
+        ] + [
+            str(line).strip() for line in parsed_globals
+            if str(line).strip()
+            and not re.match(
+                r"^(?:integrated_multimodal_description|overall_soundscape|"
+                r"non_diegetic_music|subject_definitions|cast|setting|"
+                r"location|environment|visual_style|lighting)\s*:",
+                str(line).strip(),
+                re.IGNORECASE,
+            )
+        ]
+
+    ordered = sorted(mapped_events, key=lambda item: int(item.get("order", 0)))
+    records: list[str] = []
+    ranges: list[tuple[float, float]] = []
+    for index, event in enumerate(ordered):
+        start = float(event.get("start", 0.0))
+        end = float(event.get("end", start))
+        if event.get("kind") == "shot" or end <= start:
+            end = (
+                float(ordered[index + 1].get("start", duration))
+                if index + 1 < len(ordered) else duration
+            )
+        if start < 0 or end <= start or end > duration + 0.01:
+            raise ValueError(
+                "Director H3 timeline cannot be mapped to exact positive ranges"
+            )
+        ranges.append((start, min(end, duration)))
+
+    if (
+        not ranges
+        or abs(ranges[0][0]) > 1e-6
+        or abs(ranges[-1][1] - duration) > 0.01
+        or any(abs(left[1] - right[0]) > 1e-6 for left, right in zip(ranges, ranges[1:]))
+    ):
+        raise ValueError(
+            "Director H3 timeline is not contiguous; exact mapping is unavailable"
+        )
+
+    opening = " ".join(
+        line for line in context_lines
+        if not re.match(r"^FINAL BLOCKING\s*:", line, re.IGNORECASE)
+    ).strip()
+    closing = " ".join(
+        line for line in context_lines
+        if re.match(r"^FINAL BLOCKING\s*:", line, re.IGNORECASE)
+    ).strip()
+    for index, (event, (start, end)) in enumerate(zip(ordered, ranges), start=1):
+        name, description, vocals = _director_h3_record_payload(
+            str(event.get("text") or ""), index,
+        )
+        if index == 1 and opening:
+            description = f"{opening} {description}".strip()
+        if index == len(ordered) and closing:
+            description = f"{description} {closing}".strip()
+        if "|" in description or "|" in vocals:
+            raise ValueError(
+                "Director H3 record payload contains an ambiguous separator"
+            )
+        records.append(
+            f"[Shot {index}] [{_director_h3_time_token(start)}s-"
+            f"{_director_h3_time_token(end)}s] shot_name: {name} | "
+            f"audiovisual_description: {description} | "
+            f"dialogue_and_vocalizations: {vocals}"
+        )
+
+    result = (
+        "integrated_multimodal_description:\n"
+        + "\n".join(records)
+        + f"\noverall_soundscape: {soundscape}"
+        + f"\nnon_diegetic_music: {music}"
+    )
+    errors = validate_h3_context_ir_records(
+        result, mode="t2va", duration_seconds=duration,
+    )
+    if errors:
+        raise ValueError(
+            "Director H3 canonical prompt validation failed: " + "; ".join(errors)
+        )
+    return result
+
+
 def _director_h3_scene_prompt(
     plan: dict, *, frame_count: int, fps: float,
 ) -> str:
-    """Preserve Director window intent as one scene-local H3 timeline."""
-    from shared.utils.prompt_parser import has_global_timeline
-
+    """Preserve one scene as canonical physical H3 records."""
+    fps_value = float(fps)
+    total = max(1, int(frame_count))
+    duration = total / fps_value
     windows = [
         str(item.get("prompt", item.get("text", "")))
         if isinstance(item, dict) else str(item)
@@ -5295,35 +5846,31 @@ def _director_h3_scene_prompt(
     ]
     windows = [item.strip() for item in windows if item.strip()]
     if not windows:
-        return str(plan.get("video_prompt") or "").strip()
-    if len(windows) == 1:
-        return windows[0]
+        raw_prompt = str(plan.get("video_prompt") or "").strip()
+        if not raw_prompt:
+            return ""
+        return _director_h3_canonical_prompt(
+            raw_prompt,
+            duration_seconds=duration,
+        )
 
-    joined = "\n".join(windows)
-    if has_global_timeline(joined):
-        return joined
-
-    # Older Director plans describe each ~20s window without timestamps.
-    # Give those descriptions exact scene-local ranges before the shared H3
-    # planner re-slices them into <=15s native clips.
-    total = max(1, int(frame_count))
-    lines: list[str] = []
+    events: list[dict] = []
     cursor = 0
     for index, window in enumerate(windows):
         end = total if index == len(windows) - 1 else round(
             total * (index + 1) / len(windows)
         )
-        start_seconds = cursor / float(fps)
-        end_seconds = end / float(fps)
-        content_lines = [line.strip() for line in window.splitlines() if line.strip()]
-        if not content_lines:
-            content_lines = [window]
-        for content in content_lines:
-            lines.append(
-                f"[{start_seconds:.3f}-{end_seconds:.3f}s] {content}"
-            )
+        events.append({
+            "kind": "range",
+            "start": cursor / fps_value,
+            "end": end / fps_value,
+            "text": window,
+            "order": index,
+        })
         cursor = end
-    return "\n".join(lines)
+    return _director_h3_canonical_prompt(
+        "", duration_seconds=duration, events=events,
+    )
 
 
 def _director_h3_preferred_fl2va(params: dict, selected: str) -> str:
@@ -5544,19 +6091,54 @@ def _normalize_director_h3_keyframe_refs(gen_params: dict) -> list:
     return director_keyframe_refs
 
 
+def _canonicalize_director_h3_shot_plan(
+    shot_plan: dict,
+    *,
+    published_frames: list[int] | None = None,
+) -> list[str]:
+    """Canonicalize and validate every persistent Director child prompt."""
+    prompts = list(shot_plan.get("clip_prompts") or [])
+    published = list(
+        published_frames
+        if published_frames is not None
+        else (shot_plan.get("clip_published_frames") or [])
+    )
+    try:
+        fps = float(shot_plan.get("fps") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Saved Director H3 shot-plan FPS is invalid") from exc
+    if not prompts or fps <= 0 or len(prompts) != len(published):
+        raise ValueError("Saved Director H3 child prompts are incomplete")
+
+    canonical = [
+        _director_h3_canonical_prompt(
+            prompt,
+            duration_seconds=int(frames) / fps,
+        )
+        for prompt, frames in zip(prompts, published)
+    ]
+    shot_plan["clip_prompts"] = canonical
+    shots = shot_plan.get("shots")
+    if not isinstance(shots, list) or len(shots) != len(canonical):
+        raise ValueError("Saved Director H3 shot records are incomplete")
+    for index, prompt in enumerate(canonical):
+        if not isinstance(shots[index], dict):
+            raise ValueError("Saved Director H3 shot record is invalid")
+        shots[index]["prompt"] = prompt
+    return canonical
+
+
 def _rehydrate_director_h3_longform(gen_params: dict, plan: dict) -> bool:
     """Restore a committed Director H3 plan without invoking planning."""
     import copy
 
+    plan = copy.deepcopy(plan)
     shot_plan = plan.get("shot_plan")
     if not isinstance(shot_plan, dict) or int(shot_plan.get("version") or 0) != 1:
         return False
-    prompts = list(shot_plan.get("clip_prompts") or [])
     root_frames = plan.get("clip_frames")
     shot_frames = shot_plan.get("clip_frames")
     frames = list(root_frames or shot_frames or [])
-    if not prompts or len(prompts) != len(frames):
-        raise ValueError("Saved Director H3 shot plan is incomplete")
     root_published = plan.get("clip_published_frames")
     shot_published = shot_plan.get("clip_published_frames")
     root_trims = plan.get("clip_trim_tail_frames")
@@ -5614,6 +6196,67 @@ def _rehydrate_director_h3_longform(gen_params: dict, plan: dict) -> bool:
         )
     ):
         raise ValueError("Saved Director H3 publication totals disagree")
+    # Upgrade pre-publication-geometry v1 plans before prompt migration so
+    # every subsequently persisted replay uses one complete modern contract.
+    plan["clip_frames"] = list(frames)
+    plan["clip_published_frames"] = list(published)
+    plan["clip_trim_tail_frames"] = list(trims)
+    plan["published_frames"] = requested_total
+    shot_plan["clip_frames"] = list(frames)
+    shot_plan["clip_published_frames"] = list(published)
+    shot_plan["clip_trim_tail_frames"] = list(trims)
+    shot_plan["published_frames"] = requested_total
+    prompts = _canonicalize_director_h3_shot_plan(
+        shot_plan, published_frames=published,
+    )
+    if len(prompts) != len(frames):
+        raise ValueError("Saved Director H3 shot plan is incomplete")
+    # Legacy committed plans may duplicate a pre-Context-IR source in either
+    # global prompt field. Preserve already-canonical multi-scene provenance;
+    # migrate only fields whose parsed events include bare range records.
+    from services.director.h3_dialogue import _H3_CANONICAL_RECORD_RE
+    from shared.utils.prompt_parser import parse_global_timeline_prompt
+
+    for container in (shot_plan, plan):
+        global_prompt = str(container.get("global_prompt") or "").strip()
+        if not global_prompt:
+            continue
+        _, global_events = parse_global_timeline_prompt(global_prompt)
+        canonical_records = sum(
+            1 for line in global_prompt.splitlines()
+            if _H3_CANONICAL_RECORD_RE.fullmatch(line.strip())
+        )
+        if not global_events and not canonical_records:
+            container["global_prompt"] = (
+                _director_h3_canonical_prompt(
+                    global_prompt,
+                    duration_seconds=requested_total / float(shot_plan["fps"]),
+                )
+                if len(prompts) == 1
+                else _DIRECTOR_CLIP_SEPARATOR.join(prompts)
+            )
+        elif global_events and canonical_records != len(global_events):
+            contiguous = (
+                abs(float(global_events[0].get("start", 0.0))) <= 1e-6
+                and all(
+                    abs(
+                        float(left.get("end", left.get("start", 0.0)))
+                        - float(right.get("start", 0.0))
+                    ) <= 1e-6
+                    for left, right in zip(global_events, global_events[1:])
+                )
+            )
+            if contiguous:
+                container["global_prompt"] = _director_h3_canonical_prompt(
+                    global_prompt,
+                    duration_seconds=requested_total / float(shot_plan["fps"]),
+                )
+            else:
+                # Multi-scene legacy aggregates restart local time at zero;
+                # the canonical child records are the only exact, already
+                # validated mapping for that persisted aggregate.
+                container["global_prompt"] = _DIRECTOR_CLIP_SEPARATOR.join(prompts)
+    plan["clip_prompt_previews"] = [prompt[:240] for prompt in prompts]
     first_anchor = plan.get("original_image_start")
     last_anchor = plan.get("original_image_end")
     native = plan.get("native_boundary_conditioning") is True
@@ -5654,6 +6297,8 @@ def _prepare_director_h3_longform(
     fps: float,
 ) -> dict | None:
     """Normalize long Director H3 scenes to native, timestamped clips."""
+    import copy
+
     selected = str(gen_params.get("model_type") or "")
     if selected not in _H3_VIDEO_MODELS:
         return None
@@ -5664,9 +6309,29 @@ def _prepare_director_h3_longform(
     director_keyframe_refs = _normalize_director_h3_keyframe_refs(gen_params)
 
     persisted = params.get("_h3_longform")
-    if isinstance(persisted, dict) and _rehydrate_director_h3_longform(
-        gen_params, persisted,
-    ):
+    if isinstance(persisted, dict):
+        if not _rehydrate_director_h3_longform(gen_params, persisted):
+            raise ValueError("Saved Director H3 plan version is unsupported")
+        restored_plan = gen_params["_h3_longform"]
+        restored_models = [
+            str(item.get("model_type") or "")
+            for item in (restored_plan.get("segment_models") or [])
+            if isinstance(item, dict)
+        ]
+        restored_uses_ref2va = (
+            str(restored_plan.get("model_type") or "") == _H3_REF2VA_MODEL
+            or _H3_REF2VA_MODEL in restored_models
+        )
+        if (
+            restored_uses_ref2va
+            and params.get("h3_ref2va_terms_accepted") is not True
+        ):
+            raise ValueError(
+                "This saved Director generation uses the separately licensed "
+                "MiniMax H3 Ref2VA checkpoint. Review and accept its model "
+                "terms before submitting."
+            )
+        params["_h3_longform"] = copy.deepcopy(gen_params["_h3_longform"])
         gen_params["h3_ref2va_terms_accepted"] = bool(
             params.get("h3_ref2va_terms_accepted") is True
         )
@@ -5719,33 +6384,6 @@ def _prepare_director_h3_longform(
         plan_h3_native_shots,
     )
 
-    requested_scene_frames: list[int] = []
-    scene_prompts: list[str] = []
-    fallback_prompts = list(gen_params.get("per_clip_prompts") or [])
-    for index, plan in enumerate(clip_plans):
-        planned = planned_clips[index] if index < len(planned_clips) else {}
-        try:
-            duration = float(
-                planned.get("duration_sec")
-                or (float(planned.get("end", 0)) - float(planned.get("start", 0)))
-            )
-        except (TypeError, ValueError):
-            duration = 0.0
-        if duration <= 0:
-            duration = 20.0
-        frame_count = max(1, round(duration * float(fps)))
-        requested_scene_frames.append(frame_count)
-        scene_prompt = _director_h3_scene_prompt(
-            plan, frame_count=frame_count, fps=fps,
-        )
-        if not scene_prompt and index < len(fallback_prompts):
-            scene_prompt = str(fallback_prompts[index])
-        scene_prompts.append(scene_prompt or str(gen_params.get("prompt") or ""))
-
-    if not requested_scene_frames:
-        requested_scene_frames = [max(1, int(gen_params.get("video_length") or 1))]
-        scene_prompts = [str(gen_params.get("prompt") or "")]
-
     first_anchor = _director_h3_edge_anchor(gen_params.get("image_start"))
     last_anchor = _director_h3_edge_anchor(
         params.get("image_end") or gen_params.get("image_end"), last=True,
@@ -5760,9 +6398,6 @@ def _prepare_director_h3_longform(
             "Manual Ref2VA cannot honor Director first/end-frame anchors. "
             "Enable adaptive H3 conditioning or select an FL2VA checkpoint."
         )
-    # H3 FL2VA cannot consume arbitrary KFI timing. The normalization above
-    # preserves Director keyframes as documented Ref2VA semantic references;
-    # the original timing intent remains in the committed long-form metadata.
     semantic_image_refs = list(gen_params.get("image_refs") or [])
     semantic_references = bool(semantic_image_refs) or any(
         gen_params.get(key)
@@ -5783,6 +6418,75 @@ def _prepare_director_h3_longform(
             "Manual FL2VA cannot consume Director semantic references. "
             "Enable adaptive H3 conditioning, select Ref2VA, or remove the references."
         )
+
+    requested_scene_frames: list[int] = []
+    scene_prompts: list[str] = []
+    scene_geometry_prompts: list[str] = []
+    fallback_prompts = list(gen_params.get("per_clip_prompts") or [])
+    for index, plan in enumerate(clip_plans):
+        planned = planned_clips[index] if index < len(planned_clips) else {}
+        try:
+            duration = float(
+                planned.get("duration_sec")
+                or (float(planned.get("end", 0)) - float(planned.get("start", 0)))
+            )
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration <= 0:
+            duration = 20.0
+        frame_count = max(1, round(duration * float(fps)))
+        requested_scene_frames.append(frame_count)
+        scene_prompt = _director_h3_scene_prompt(
+            plan, frame_count=frame_count, fps=fps,
+        )
+        if not scene_prompt and index < len(fallback_prompts):
+            fallback = str(fallback_prompts[index] or "").strip()
+            if fallback:
+                scene_prompt = _director_h3_canonical_prompt(
+                    fallback, duration_seconds=frame_count / float(fps),
+                )
+        if not scene_prompt:
+            fallback = str(gen_params.get("prompt") or "").strip()
+            if fallback:
+                scene_prompt = _director_h3_canonical_prompt(
+                    fallback, duration_seconds=frame_count / float(fps),
+                )
+        if not scene_prompt:
+            raise ValueError("Director H3 scene prompt is empty")
+        scene_prompts.append(scene_prompt)
+        raw_windows = [
+            str(item.get("prompt", item.get("text", "")))
+            if isinstance(item, dict) else str(item)
+            for item in (plan.get("window_prompts") or [])
+        ]
+        raw_windows = [item.strip() for item in raw_windows if item.strip()]
+        raw_prompt = (
+            "\n".join(raw_windows)
+            if raw_windows else str(plan.get("video_prompt") or "").strip()
+        )
+        if not raw_prompt and index < len(fallback_prompts):
+            raw_prompt = str(fallback_prompts[index])
+        # Window boundaries are authored structure; otherwise retain the raw
+        # prompt solely for geometry/profile decisions so deterministic
+        # canonical wrappers do not turn untimed prose into authored timing.
+        scene_geometry_prompts.append(
+            scene_prompt if raw_windows else raw_prompt or scene_prompt
+        )
+
+    if not requested_scene_frames:
+        requested_scene_frames = [max(1, int(gen_params.get("video_length") or 1))]
+        raw_prompt = str(gen_params.get("prompt") or "").strip()
+        if not raw_prompt:
+            raise ValueError("Director H3 scene prompt is empty")
+        scene_geometry_prompts = [raw_prompt]
+        scene_prompts = [_director_h3_canonical_prompt(
+            raw_prompt,
+            duration_seconds=requested_scene_frames[0] / float(fps),
+        )]
+
+    # H3 FL2VA cannot consume arbitrary KFI timing. The normalization above
+    # preserves Director keyframes as documented Ref2VA semantic references;
+    # the original timing intent remains in the committed long-form metadata.
     requested_frames = sum(requested_scene_frames)
     end_anchor_tail = int(model_def.get("frames_steps") or 0) if last_anchor else 0
     generation_scene_frames = list(requested_scene_frames)
@@ -5802,12 +6506,12 @@ def _prepare_director_h3_longform(
         if key in params:
             profile_context[key] = params[key]
     profile_id = infer_h3_profile_id(profile_context)
-    for scene_index, (scene_frames, scene_prompt) in enumerate(
-        zip(generation_scene_frames, scene_prompts)
+    for scene_index, (scene_frames, scene_prompt, geometry_prompt) in enumerate(
+        zip(generation_scene_frames, scene_prompts, scene_geometry_prompts)
     ):
         planned_frames, scene_policy = plan_h3_clip_frames(
             scene_frames,
-            prompt=scene_prompt,
+            prompt=geometry_prompt,
             fps=fps,
             minimum_frames=minimum,
             maximum_frames=segment_maximum,
@@ -5883,7 +6587,7 @@ def _prepare_director_h3_longform(
         segment_frames_maximum=segment_maximum,
         segment_policy=segment_policy,
     )
-    segment_prompts = list(shot_plan["clip_prompts"])
+    segment_prompts = _canonicalize_director_h3_shot_plan(shot_plan)
     segment_boundaries = list(shot_plan["clip_boundaries"])
     clip_published_frames = list(shot_plan["clip_published_frames"])
     clip_trim_tail_frames = list(shot_plan["clip_trim_tail_frames"])
@@ -5911,6 +6615,8 @@ def _prepare_director_h3_longform(
             gen_params["h3_ref2va_terms_accepted"] = True
         if effective != selected:
             gen_params["model_type"] = effective
+        gen_params["prompt"] = segment_prompts[0]
+        gen_params["per_clip_prompts"] = list(segment_prompts)
         if (
             effective == _H3_REF2VA_MODEL
             and params.get("h3_native_boundary_conditioning") is not True
@@ -6008,7 +6714,6 @@ def _prepare_director_h3_longform(
         else "E" if last_anchor
         else ""
     )
-    import copy
     params["_h3_longform"] = copy.deepcopy(gen_params["_h3_longform"])
     return gen_params["_h3_longform"]
 

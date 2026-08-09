@@ -130,6 +130,45 @@ class TestH3BenchmarkMatrix(unittest.TestCase):
             self.assertEqual(payload["delivery_resolution"], case.delivery_resolution)
             self.assertEqual(payload["delivery_fit"], case.delivery_fit)
 
+    def test_t8_multirate_evidence_is_disabled_and_dry_run_only(self):
+        case_id = "base_t8_multirate_4v8a_evidence"
+        self.assertNotIn(case_id, [case.case_id for case in runner.build_matrix()])
+        case = runner.build_matrix([case_id])[0]
+        self.assertEqual(case.multirate_profile, "t8_4v8a_evidence_v1")
+        self.assertEqual((case.video_evaluations, case.audio_evaluations), (4, 8))
+        self.assertTrue(case.benchmark_dry_run_only)
+        payload = runner.build_generation_payload(
+            case, project="synthetic-project", seed=7, reference_path=None,
+        )
+        self.assertEqual(
+            payload["custom_settings"]["h3_multirate_profile"],
+            "t8_4v8a_evidence_v1",
+        )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = runner.main([
+                "--base-url", "http://127.0.0.1:7860",
+                "--project", "synthetic-project",
+                "--case", case_id,
+                "--dry-run",
+            ])
+        self.assertEqual(result, 0)
+        dry = json.loads(stdout.getvalue())
+        self.assertEqual(dry["cases"][0]["video_evaluations"], 4)
+        self.assertEqual(dry["cases"][0]["audio_evaluations"], 8)
+
+        stderr = io.StringIO()
+        with mock.patch.object(runner, "MaestroClient") as client, contextlib.redirect_stderr(stderr):
+            result = runner.main([
+                "--base-url", "http://127.0.0.1:7860",
+                "--project", "synthetic-project",
+                "--case", case_id,
+            ])
+        self.assertEqual(result, 2)
+        client.assert_not_called()
+        self.assertIn("dry-run only", stderr.getvalue())
+
     def test_matrix_config_rejects_prompts_paths_and_model_replacement(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "matrix.json"

@@ -318,76 +318,6 @@ class MusicVideoPlanner(BasePlanner):
         except Exception as e:
             print(f"[MusicVideoPlanner] Image-prompt sanitization skipped: {e}")
 
-        # ── Sex-act leet trigger strip (always-on safety net) ────────
-        # User-reported leak: a SFW music video about a football coach
-        # had "bl0wj0b" in a keyframe_prompt because the LLM treated
-        # leet-coded LoRA triggers as generic energy boosters. The
-        # leet tokens (bl0wj0b, m15510n4ry, c0wg1rl, etc.) are SEX-ACT
-        # video-LoRA triggers — they should NEVER appear in:
-        #   - image_prompt or keyframe_prompts (still images, video
-        #     LoRA triggers don't apply)
-        #   - SFW content of any kind
-        # Strip runs on EVERY prompt field unconditionally for image
-        # and keyframe fields. For video_prompt and window_prompts,
-        # strip only when the surrounding screenplay/scene context
-        # is SFW (handled below via nsfw flag).
-        try:
-            from ..prompt_polish import strip_sex_act_leet_tokens
-            total_stripped = 0
-            for sd in shot_dicts:
-                if not isinstance(sd, dict):
-                    continue
-                # Image + keyframe: always strip (still images don't
-                # use video LoRA triggers regardless of NSFW mode).
-                ip = sd.get("image_prompt") or ""
-                if ip:
-                    new_ip, n = strip_sex_act_leet_tokens(ip)
-                    if n:
-                        sd["image_prompt"] = new_ip
-                        total_stripped += n
-                kfs = sd.get("keyframe_prompts") or []
-                if isinstance(kfs, list):
-                    new_kfs = []
-                    for kf in kfs:
-                        if isinstance(kf, str):
-                            new_kf, n = strip_sex_act_leet_tokens(kf)
-                            new_kfs.append(new_kf)
-                            total_stripped += n
-                        else:
-                            new_kfs.append(kf)
-                    sd["keyframe_prompts"] = new_kfs
-                # Video / windows: strip only if NSFW mode is OFF
-                # (effective_nsfw could differ from request nsfw; we
-                # use the planner's own nsfw flag which is wired
-                # from services config).
-                if not nsfw:
-                    vp = sd.get("video_prompt") or ""
-                    if vp:
-                        new_vp, n = strip_sex_act_leet_tokens(vp)
-                        if n:
-                            sd["video_prompt"] = new_vp
-                            total_stripped += n
-                    wps = sd.get("window_prompts") or []
-                    if isinstance(wps, list):
-                        new_wps = []
-                        for w in wps:
-                            if isinstance(w, str):
-                                new_w, n = strip_sex_act_leet_tokens(w)
-                                new_wps.append(new_w)
-                                total_stripped += n
-                            else:
-                                new_wps.append(w)
-                        sd["window_prompts"] = new_wps
-            if total_stripped:
-                print(
-                    f"[MusicVideoPlanner] Stripped {total_stripped} sex-act "
-                    f"leet trigger token(s) (bl0wj0b/m15510n4ry/c0wg1rl/etc.) "
-                    f"from prompts that should never contain them. The LLM "
-                    f"misplaced trigger words from the active LoRA selection."
-                )
-        except Exception as e:
-            print(f"[MusicVideoPlanner] Leet trigger strip skipped: {e}")
-
         # Convert LLM output to ShotPlan objects
         shots = self._convert_to_shots(
             shot_dicts=shot_dicts,
@@ -704,7 +634,7 @@ Output exactly {len(clips)} objects. Go:"""
         if polish_block:
             system_prompt = f"{system_prompt}\n\n{polish_block}"
 
-        # Inject content guidance (NSFW or safety guardrails)
+        # Inject explicit guidance only when the request-scoped gate allowed it.
         system_prompt = inject_nsfw_if_enabled(
             system_prompt,
             nsfw,

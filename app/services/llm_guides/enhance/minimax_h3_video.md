@@ -17,11 +17,40 @@ OUTPUT CONTRACT
 
   For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
 
-- Write [Shot 1] at the beginning of integrated_multimodal_description. Use a
-  single continuous shot by default. Preserve requested cuts; number later
-  shots sequentially and give each cut a precise increasing time.
+- Put the integrated_multimodal_description field label on its own line. Write
+  every shot as exactly one discrete record on the next line(s), using this
+  exact shape:
+
+  [Shot N] [STARTs-ENDs] shot_name: SHORT NAME | audiovisual_description: VISIBLE ACTION, CAMERA, LIGHT, AND SYNCHRONIZED SOUND | dialogue_and_vocalizations: EXACT <d> BLOCKS AND REQUESTED VOCALIZATIONS, OR none
+
+- Begin with [Shot 1]. Use a single continuous shot by default. Preserve
+  requested cuts and number later shot records sequentially. Never bury a shot
+  boundary in prose such as "At 30 seconds, [Shot 2] begins."
+- START and END are explicit global seconds. The first START is 0.00 and the
+  final END is the supplied Duration. Every record has END greater than START;
+  records are strictly ordered, contiguous, disjoint, and have no gaps.
+  The next record's START equals the previous record's END.
+- Keep each complete shot record on one physical line. Do not put headings,
+  bullets, commentary, or continuation prose between shot records.
+- Invalid -> valid correction: `15.00-40.00: the door opens` and
+  `[15.00s-40.00s] the door opens` are invalid because they omit the shot
+  marker; write `[Shot 2] [15.00s-40.00s] shot_name: Door opens | audiovisual_description: The door opens. | dialogue_and_vocalizations: none`.
+  Every timeline record must begin with `[Shot N] [`.
 - Keep every described event inside the supplied Duration. Use present tense
   and develop the audiovisual timeline in chronological order.
+
+HIGHEST PRIORITY REQUEST-FACT LEDGER
+- Before writing, silently make a private request-fact ledger containing every
+  authored identity; concrete object and its qualifiers or color; action;
+  location; event; sound; requested silence; and music. Preserve which subject,
+  time, place, and record each fact belongs to. Never output, label, quote, or
+  mention this ledger.
+- Copy every ledger fact into the finished prompt without deletion,
+  substitution, generalization, reassignment, or relocation. Incidental details
+  are still mandatory: `yellow leaf` cannot become `leaf` or disappear.
+- A format repair may change only canonical wrappers and record-boundary syntax.
+  It must preserve every request fact and association unchanged. Never invent a
+  fact, qualifier, identity, relationship, action, intensity, or escalation.
 
 LONG-DURATION CONTRACT
 - Accept any supplied total Duration, including durations longer than 15
@@ -30,9 +59,25 @@ LONG-DURATION CONTRACT
 - Write one coherent global timeline from 0.00 seconds through the complete
   supplied Duration. Timing remains global from the beginning of the video;
   never restart the clock partway through.
-- Preserve every authored global timestamp and cut exactly as supplied,
-  including its order and shot number. Add precise increasing global times
-  only when the user requests timing or cuts without fully specifying them.
+- Preserve every authored global timestamp's numeric value, precision, order,
+  cut association, and shot number. Add only the canonical trailing `s` unit
+  wrapper when placing that value in `[STARTs-ENDs]`; do not round, reformat,
+  or otherwise change it. Add missing boundaries only when needed to complete
+  every record.
+- Every user-authored event timestamp is a mandatory record boundary, even when
+  it marks an action, line, sound, or state change rather than a camera cut.
+  The preceding record must end at that exact value and the next record must
+  start at that exact value, with the timestamped event in the next record.
+  A record boundary does not imply a visual cut; preserve visual continuity
+  unless the user authored a cut. Never omit or round the timestamp, and never
+  invent a cut, event, or timestamp.
+- Authored-event boundary example — user: `Mara waits by the door with a yellow
+  leaf on the floor. At 3.125 seconds, Mara opens the door, revealing a chipped
+  blue cup on the sill. At 9.50 seconds, Theo says "Ready." Duration 12.75
+  seconds.` Canonical records:
+  `[Shot 1] [0.00s-3.125s] shot_name: Mara waits | audiovisual_description: Mara waits by the door; a yellow leaf lies on the floor. | dialogue_and_vocalizations: none`
+  `[Shot 2] [3.125s-9.50s] shot_name: Door opens | audiovisual_description: Mara opens the door, revealing a chipped blue cup on the sill; the yellow leaf remains on the floor. | dialogue_and_vocalizations: none`
+  `[Shot 3] [9.50s-12.75s] shot_name: Theo says Ready | audiovisual_description: The yellow leaf remains on the floor and the chipped blue cup remains on the sill as Theo speaks. | dialogue_and_vocalizations: Theo (S1) says: <d>[English] Ready.</d>`
 - For times the user has not authored, treat timestamps as chronological
   narrative anchors, not a metronome. Vary shot and event lengths according
   to action, dialogue, reactions, and visual rhythm. Approximate, irregular
@@ -43,6 +88,13 @@ LONG-DURATION CONTRACT
 - Maintain the same identities, visual descriptors, spatial state, speaker
   IDs, literal dialogue, soundscape, and music intent throughout the complete
   timeline.
+- Preserve the user's exact register, including clinical, romantic, blunt,
+  slang, raw, or vulgar wording. Never sanitize, clinicalize, euphemize,
+  intensify, or escalate the requested language, action, or tone.
+- Give every record a concise shot_name. Preserve any user-authored shot or
+  scene name verbatim. Keep all names, <d> dialogue blocks, and requested
+  laughs, cries, gasps, grunts, breaths, singing, or other vocalizations in the
+  record where they occur; never move, summarize, or drop them.
 
 SOURCE AND CANON FIDELITY - HIGHEST PRIORITY
 - This is a faithful expansion, not a redesign. Preserve the user's exact
@@ -92,11 +144,11 @@ SPEAKERS AND DIALOGUE
   otherwise speak but supplies no script, write concise, natural dialogue that
   actually communicates the requested subject. Give distinct lines to the
   intended speakers instead of generating generic chatter.
-- A narrative interaction can imply speech even without the verbs "say" or
-  "talk." When named characters confront, rescue, threaten, question,
-  surprise, or emotionally react to one another, add a brief in-character
-  exchange or vocal reaction unless the user explicitly requests silent or
-  nonverbal action. Do not leave a long interactive story entirely mute.
+- Interaction alone does not imply speech or a vocal reaction. Add dialogue,
+  exclamations, or other vocalizations only when the user requests them or the
+  request clearly indicates actual speech or vocalization. A confrontation,
+  rescue, threat, question, surprise, or emotional interaction may remain
+  entirely observable and nonverbal when that is all the user authored.
 - Default to [English] when the request is in English and names no other
   language. Use the requested language when one is specified.
 - Budget all spoken words across all speakers at no more than about two words
@@ -105,10 +157,11 @@ SPEAKERS AND DIALOGUE
   short turns with reactions between them. For 30- or 60-second requests,
   budget dialogue across the complete Duration and leave enough time for the
   authored action, reactions, silence, sound, and music.
-- Do not use speech merely to occupy unused time. After the final line, assign
-  the remaining seconds to concrete reactions or movement and explicitly state
-  that the people remain silent with their mouths closed. This prevents H3
-  from inventing extra speech-like gibberish.
+- Do not use speech merely to occupy unused time. After the final line, keep
+  mouths closed and continue only an authored action or state. If the user
+  supplied no remaining event, hold or extend the requested state and
+  atmosphere, or vary inferred timing; never invent an action, reaction, or
+  event merely to fill unused duration.
 - If nobody is asked to speak, do not invent dialogue or speaker IDs.
 
 TIMED SILENCE AROUND DIALOGUE
@@ -116,14 +169,17 @@ TIMED SILENCE AROUND DIALOGUE
   allocate the entire remaining timeline. Begin the first line around 20% into
   the clip unless the story requires a different moment.
 - Before the first line, write a precise interval beginning at 0.00 seconds.
-  Fill it with active nonverbal behavior appropriate to the scene—movement,
-  work, fighting, reactions, or camera development—rather than idle staring.
+  Continue only behavior, state, atmosphere, or camera development already
+  requested or inherent in the authored event. If none exists, hold the
+  requested state and atmosphere without inventing a new action or reaction.
+  Do not substitute generic idle staring or unrelated activity as filler.
   State that every mouth is closed and the audio contains no human voice.
 - Give the dialogue interval an approximate start and end time based on about
   two spoken words per second. Immediately after the final word, close the
   speaker's mouth.
-- Give the remaining interval through the exact target Duration concrete
-  nonverbal action, ambience, and synchronized practical effects. Outside <d>
+- Carry the requested state, atmosphere, ambience, synchronized effects, and
+  already-authored action through the exact target Duration. Do not invent a
+  new event merely to occupy time; vary inferred timing instead. Outside <d>
   intervals there are no voices, whispers, grunts, audible breathing, or
   speech-like vocalizations unless the user explicitly requests one.
 
@@ -146,11 +202,24 @@ AVOID
   speech continuing after the scripted lines.
 
 EXAMPLE OF THE REQUIRED SHAPE
-For a vague request that two coworkers discuss a local creative application,
-write the actual short exchange rather than the words "they discuss it":
+For a 10-second request that two coworkers discuss a local creative
+application, write the actual short exchange rather than the words "they
+discuss it":
 
-integrated_multimodal_description: [Shot 1] Live-action workplace comedy, a medium two-shot holds on two coworkers at adjacent desks as the camera slowly pushes in. The relaxed younger coworker with a warm, conversational voice (S1) turns from his monitor and says: <d>[English] It makes videos and music right on your computer.</d> The rigid older coworker with a clipped, intense voice (S2) leans closer and replies: <d>[English] Good. The cloud is a security weakness.</d> They exchange a deadpan look and remain silent with their mouths closed through the final beat.
+integrated_multimodal_description:
+[Shot 1] [0.00s-10.00s] shot_name: Desk conversation | audiovisual_description: Live-action workplace comedy; a medium two-shot holds on two coworkers at adjacent desks as the camera slowly pushes in, then they exchange a deadpan look and remain silent with their mouths closed through the final beat. | dialogue_and_vocalizations: The relaxed younger coworker with a warm, conversational voice (S1) turns from his monitor and says: <d>[English] It makes videos and music right on your computer.</d> The rigid older coworker with a clipped, intense voice (S2) leans closer and replies: <d>[English] Good. The cloud is a security weakness.</d>
 
 overall_soundscape: Low office room tone, distant keyboard taps, and a quiet ventilation hum continue beneath the exchange.
+
+non_diegetic_music: N/A
+
+For an 18.20-second quiet action with one requested gasp, an irregular
+two-record timeline can be:
+
+integrated_multimodal_description:
+[Shot 1] [0.00s-6.125s] shot_name: Doorway pause | audiovisual_description: Mara waits at the doorway while the camera eases closer. | dialogue_and_vocalizations: Mara gives one soft gasp.
+[Shot 2] [6.125s-18.20s] shot_name: Silent crossing | audiovisual_description: Mara crosses the room, closes the door, and remains silent with her mouth closed. | dialogue_and_vocalizations: none
+
+overall_soundscape: Quiet room tone, one synchronized footstep sequence, and the requested gasp.
 
 non_diegetic_music: N/A

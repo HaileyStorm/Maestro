@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import types
 import unittest
 import urllib.request
@@ -19,6 +20,55 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 from services import llm_service  # noqa: E402
+
+
+class _HealthyResponse:
+    status_code = 200
+    text = '{"status":"ok"}'
+
+    @staticmethod
+    def json():
+        return {"status": "ok"}
+
+
+class _FakeLlamaProcess:
+    def __init__(self, *, returncode=None, stdout=None):
+        self.returncode = returncode
+        self.stdout = stdout if stdout is not None else io.BytesIO()
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+class _RecordingTimer:
+    instances = []
+
+    def __init__(self, interval, function, args=(), kwargs=None):
+        self.interval = interval
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
 
 
 def _tar_bytes(entries):
@@ -121,9 +171,9 @@ class LlmRuntimeTests(unittest.TestCase):
             if isinstance(node, ast.AsyncFunctionDef)
             and node.name == "llm_enhance_prompt"
         ))
-        self.assertIn("await asyncio.to_thread(_prepare_enhance_model)", endpoint)
-        self.assertIn("await asyncio.to_thread(_ensure_llm_loaded)", endpoint)
-        self.assertIn("result = await asyncio.to_thread(", endpoint)
+        self.assertIn("result = await run_blocking_shielded(", endpoint)
+        self.assertIn("_run_authorized_llm_with_selection", endpoint)
+        self.assertNotIn("llm_service.load_model(", endpoint)
 
     def test_gguf_download_is_visible_through_llm_status(self):
         observed = {}
@@ -223,14 +273,38 @@ class LlmRuntimeTests(unittest.TestCase):
         self.assertIn("keep every timestamp token exactly unchanged", built)
         self.assertNotIn("Write EXACTLY 2 paragraphs", built)
 
-    def test_gemma_31b_uses_current_projector_filename(self):
+    def test_gemma_31b_heavy_default_is_exact_text_only_q4(self):
         entry = llm_service.MODEL_REGISTRY[
-            "paperscarecrow/Gemma-4-31B-it-abliterated-gguf"
+            "MoonRide/gemma-4-31B-it-heretic-ara-GGUF"
         ]
         self.assertEqual(
-            entry["mmproj_file"], "mmproj-gemma-4-31B-it-BF16.gguf"
+            entry["gguf_file"], "gemma-4-31B-it-heretic-ara-Q4_K_M.gguf"
         )
-        self.assertEqual(entry["mmproj_repo"], "ggml-org/gemma-4-31B-it-GGUF")
+        self.assertIsNone(entry["mmproj_file"])
+        self.assertEqual(
+            llm_service.DEFAULT_HF_REPO,
+            "MoonRide/gemma-4-31B-it-heretic-ara-GGUF",
+        )
+
+    def test_private_31b_refinement_model_is_loadable_hidden_and_not_retired(self):
+        model_id = "paperscarecrow/Gemma-4-31B-it-abliterated-gguf"
+        entry = llm_service.MODEL_REGISTRY[model_id]
+        self.assertEqual(
+            entry["gguf_file"], "gemma-4-31b-abliterated-Q4_K_M.gguf",
+        )
+        self.assertEqual(
+            entry["mmproj_file"], "mmproj-gemma-4-31B-it-BF16.gguf",
+        )
+        self.assertEqual(
+            entry["mmproj_repo"], "ggml-org/gemma-4-31B-it-GGUF",
+        )
+        self.assertNotIn(model_id, llm_service._PUBLIC_MODEL_ORDER)
+        self.assertNotIn(model_id, llm_service.RETIRED_MODEL_IDS)
+        self.assertEqual(llm_service._migrate_retired_model_id(model_id), model_id)
+        self.assertEqual(
+            llm_service.DEFAULT_HF_REPO,
+            "MoonRide/gemma-4-31B-it-heretic-ara-GGUF",
+        )
 
     def test_registered_text_model_skips_projector_but_legacy_custom_repo_probes(self):
         downloads = []
@@ -264,7 +338,8 @@ class LlmRuntimeTests(unittest.TestCase):
             llm_service._vision_available = False
 
         registered_without_key = "unsloth/Qwen3.5-2B-GGUF"
-        supergemma = "Jiunsong/supergemma4-26b-uncensored-gguf-v2"
+        heavy_text = "MoonRide/gemma-4-31B-it-heretic-ara-GGUF"
+        private_vision = "paperscarecrow/Gemma-4-31B-it-abliterated-gguf"
         custom_repo = "example/legacy-custom-GGUF"
         self.addCleanup(reset_loaded_state)
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
@@ -292,11 +367,29 @@ class LlmRuntimeTests(unittest.TestCase):
 
             downloads.clear()
             reset_loaded_state()
-            llm_service.load_model(supergemma)
+            llm_service.load_model(heavy_text)
             self.assertEqual(
                 downloads,
-                [(supergemma, llm_service.MODEL_REGISTRY[supergemma]["gguf_file"])],
+                [(
+                    heavy_text,
+                    llm_service.MODEL_REGISTRY[heavy_text]["gguf_file"],
+                )],
             )
+
+            downloads.clear()
+            reset_loaded_state()
+            llm_service.load_model(private_vision)
+            self.assertEqual(downloads, [
+                (
+                    private_vision,
+                    llm_service.MODEL_REGISTRY[private_vision]["gguf_file"],
+                ),
+                (
+                    "ggml-org/gemma-4-31B-it-GGUF",
+                    llm_service.MODEL_REGISTRY[private_vision]["mmproj_file"],
+                ),
+            ])
+            self.assertTrue(llm_service._vision_available)
 
             downloads.clear()
             reset_loaded_state()
@@ -304,6 +397,364 @@ class LlmRuntimeTests(unittest.TestCase):
             self.assertEqual(downloads[-1], (custom_repo, llm_service.DEFAULT_MMPROJ_FILE))
 
         reset_loaded_state()
+
+    def test_concurrent_same_key_cold_load_is_single_flight(self):
+        processes = []
+        errors = []
+        first_health_entered = threading.Event()
+        release_first_health = threading.Event()
+        second_attempting = threading.Event()
+
+        def popen(*_args, **_kwargs):
+            process = _FakeLlamaProcess()
+            processes.append(process)
+            return process
+
+        def health(*_args, **_kwargs):
+            if not first_health_entered.is_set():
+                first_health_entered.set()
+                release_first_health.wait(timeout=2)
+            return _HealthyResponse()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"model")
+            with mock.patch.object(
+                llm_service, "_get_server_exe", return_value="llama-server",
+            ), mock.patch.object(
+                llm_service, "_find_free_port", return_value=54321,
+            ), mock.patch.object(
+                llm_service.subprocess, "Popen", side_effect=popen,
+            ), mock.patch.object(
+                llm_service.requests, "get", side_effect=health,
+            ), mock.patch.object(
+                llm_service.threading, "Timer", _RecordingTimer,
+            ):
+                def load(attempting=None):
+                    try:
+                        if attempting is not None:
+                            attempting.set()
+                        llm_service.load_model(
+                            "linked:model", local_gguf_path=str(model),
+                        )
+                    except Exception as error:  # pragma: no cover - asserted
+                        errors.append(error)
+
+                workers = [
+                    threading.Thread(target=load),
+                    threading.Thread(target=load, args=(second_attempting,)),
+                ]
+                workers[0].start()
+                self.assertTrue(first_health_entered.wait(timeout=1))
+                workers[1].start()
+                self.assertTrue(second_attempting.wait(timeout=1))
+                time.sleep(0.03)
+                self.assertTrue(workers[1].is_alive())
+                self.assertEqual(len(processes), 1)
+                release_first_health.set()
+                for worker in workers:
+                    worker.join(timeout=2)
+
+                self.assertFalse(any(worker.is_alive() for worker in workers))
+                self.assertEqual(errors, [])
+                self.assertEqual(len(processes), 1)
+                self.assertTrue(llm_service.is_loaded())
+                self.assertIsNotNone(llm_service._idle_timer)
+                llm_service.unload_model()
+
+    def test_failed_cold_load_cleans_state_and_retries(self):
+        class DelayedStream(io.BytesIO):
+            def readline(self, size=-1):
+                # Delay every read, including the final EOF observation. This
+                # forces the exit path to use the explicit completion event
+                # rather than a fixed join that happens to cover one chunk.
+                time.sleep(0.35)
+                return super().readline(size)
+
+        failed = _FakeLlamaProcess(
+            returncode=7,
+            stdout=DelayedStream(
+                b"private prompt-shaped first chunk\n"
+                b"private second chunk; CUDA fatal error\n"
+            ),
+        )
+        healthy = _FakeLlamaProcess()
+        processes = iter((failed, OSError("synthetic spawn failure"), healthy))
+
+        def popen(*_args, **_kwargs):
+            result = next(processes)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"model")
+            with mock.patch.object(
+                llm_service, "_get_server_exe", return_value="llama-server",
+            ), mock.patch.object(
+                llm_service, "_find_free_port", return_value=54321,
+            ), mock.patch.object(
+                llm_service.subprocess, "Popen", side_effect=popen,
+            ) as popen, mock.patch.object(
+                llm_service.requests, "get", return_value=_HealthyResponse(),
+            ), mock.patch.object(
+                llm_service.threading, "Timer", _RecordingTimer,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exited with code 7") as caught:
+                    llm_service.load_model(
+                        "linked:model", local_gguf_path=str(model),
+                    )
+                diagnostic = str(caught.exception)
+                self.assertNotIn("private prompt-shaped", diagnostic)
+                self.assertNotIn("private second chunk", diagnostic)
+                self.assertIn("chunk 1:", diagnostic)
+                self.assertIn("chunk 2:", diagnostic)
+                self.assertIn("signals=cuda,failure", diagnostic)
+                self.assertFalse(llm_service.is_loaded())
+                self.assertEqual(llm_service._loaded_model_key, ())
+                self.assertIsNone(llm_service._idle_timer)
+
+                with self.assertRaisesRegex(OSError, "spawn failure"):
+                    llm_service.load_model(
+                        "linked:model", local_gguf_path=str(model),
+                    )
+                self.assertFalse(llm_service.is_loaded())
+                self.assertEqual(llm_service._loaded_model_key, ())
+                self.assertEqual(llm_service._loading_model_id, "")
+
+                llm_service.load_model(
+                    "linked:model", local_gguf_path=str(model),
+                )
+
+                self.assertEqual(popen.call_count, 3)
+                self.assertTrue(llm_service.is_loaded())
+                llm_service.unload_model()
+
+    def test_download_failure_clears_loading_state_and_allows_retry(self):
+        calls = 0
+
+        def download(_repo, filename, cache_dir):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("synthetic download failure")
+            path = Path(cache_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"model")
+            return str(path)
+
+        repo = "unsloth/Qwen3.5-2B-GGUF"
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            llm_service, "get_model_dir", return_value=tmp,
+        ), mock.patch.object(
+            llm_service, "_download_gguf", side_effect=download,
+        ), mock.patch.object(
+            llm_service, "_get_server_exe", return_value="llama-server",
+        ), mock.patch.object(
+            llm_service, "_find_free_port", return_value=54321,
+        ), mock.patch.object(
+            llm_service.subprocess, "Popen", return_value=_FakeLlamaProcess(),
+        ), mock.patch.object(
+            llm_service.requests, "get", return_value=_HealthyResponse(),
+        ), mock.patch.object(
+            llm_service.threading, "Timer", _RecordingTimer,
+        ):
+            with self.assertRaisesRegex(OSError, "download failure"):
+                llm_service.load_model(repo)
+            status = llm_service.get_status()
+            self.assertFalse(status["loaded"])
+            self.assertFalse(status["loading"])
+            self.assertEqual(llm_service._loaded_model_key, ())
+            self.assertIsNone(llm_service._idle_timer)
+
+            llm_service.load_model(repo)
+            self.assertTrue(llm_service.is_loaded())
+            llm_service.unload_model()
+
+    def test_cold_load_starts_one_content_free_drain_before_health(self):
+        drain_started = threading.Event()
+
+        class SignallingStream(io.BytesIO):
+            def readline(self, size=-1):
+                drain_started.set()
+                return super().readline(size)
+
+        process = _FakeLlamaProcess(
+            stdout=SignallingStream(b"private model output\nCUDA fatal error\n"),
+        )
+        reader_generation = llm_service._log_reader_generation
+
+        def health(*_args, **_kwargs):
+            self.assertTrue(drain_started.wait(timeout=1))
+            return _HealthyResponse()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"model")
+            with mock.patch.object(
+                llm_service, "_get_server_exe", return_value="llama-server",
+            ), mock.patch.object(
+                llm_service, "_find_free_port", return_value=54321,
+            ), mock.patch.object(
+                llm_service.subprocess, "Popen", return_value=process,
+            ), mock.patch.object(
+                llm_service.requests, "get", side_effect=health,
+            ), mock.patch.object(
+                llm_service.threading, "Timer", _RecordingTimer,
+            ):
+                llm_service.load_model(
+                    "linked:model", local_gguf_path=str(model),
+                )
+                llm_service._log_reader.join(timeout=1)
+                tail = llm_service._server_log_tail()
+
+                self.assertEqual(
+                    llm_service._log_reader_generation, reader_generation + 1,
+                )
+                self.assertIn("bytes", tail)
+                self.assertIn("signals=cuda,failure", tail)
+                self.assertNotIn("private model output", tail)
+                self.assertNotIn("CUDA fatal error", tail)
+                llm_service.unload_model()
+
+    def test_terminal_generation_failure_rearms_only_the_same_identity(self):
+        _RecordingTimer.instances.clear()
+        with mock.patch.object(
+            llm_service.threading, "Timer", _RecordingTimer,
+        ):
+            llm_service.load_model(
+                "remote-a", provider="remote",
+                remote_url="http://remote-a.invalid",
+            )
+            identity_a = llm_service._loaded_model_key
+            with mock.patch.object(
+                llm_service.requests, "post",
+                side_effect=llm_service.requests.ConnectionError("synthetic"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    llm_service.generate("prompt")
+            failed_request_timer = llm_service._idle_timer
+            self.assertTrue(failed_request_timer.started)
+
+            llm_service.load_model(
+                "remote-b", provider="remote",
+                remote_url="http://remote-b.invalid",
+            )
+            model_b_timer = llm_service._idle_timer
+
+            self.assertFalse(llm_service._finish_model_activity(identity_a))
+            self.assertIs(llm_service._idle_timer, model_b_timer)
+            llm_service.unload_model()
+
+    def test_nested_loaded_model_lease_arms_one_timer_per_terminal_outcome(self):
+        class Response:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {
+                    "choices": [{
+                        "message": {"content": "answer"},
+                        "finish_reason": "stop",
+                    }],
+                }
+
+        for should_fail in (False, True):
+            with self.subTest(should_fail=should_fail), mock.patch.object(
+                llm_service.threading, "Timer", _RecordingTimer,
+            ):
+                llm_service.unload_model()
+                _RecordingTimer.instances.clear()
+                post_result = (
+                    llm_service.requests.ConnectionError("synthetic")
+                    if should_fail else Response()
+                )
+                with mock.patch.object(
+                    llm_service.requests, "post",
+                    side_effect=post_result if should_fail else None,
+                    return_value=None if should_fail else post_result,
+                ):
+                    if should_fail:
+                        with self.assertRaises(RuntimeError):
+                            with llm_service.loaded_model_lease(
+                                model_id="remote-a", provider="remote",
+                                remote_url="http://remote-a.invalid",
+                            ):
+                                llm_service.generate("prompt")
+                    else:
+                        with llm_service.loaded_model_lease(
+                            model_id="remote-a", provider="remote",
+                            remote_url="http://remote-a.invalid",
+                        ):
+                            self.assertEqual(
+                                llm_service.generate("prompt"), "answer",
+                            )
+
+                self.assertEqual(len(_RecordingTimer.instances), 1)
+                self.assertTrue(_RecordingTimer.instances[0].started)
+                self.assertIs(
+                    llm_service._idle_timer, _RecordingTimer.instances[0],
+                )
+                llm_service.unload_model()
+
+        with mock.patch.object(
+            llm_service.threading, "Timer", _RecordingTimer,
+        ):
+            _RecordingTimer.instances.clear()
+            llm_service.load_model(
+                "remote-load-only", provider="remote",
+                remote_url="http://remote-load-only.invalid",
+            )
+            self.assertEqual(len(_RecordingTimer.instances), 1)
+            llm_service.unload_model()
+
+    def test_generate_lease_blocks_unload_until_failure_finalizes(self):
+        request_started = threading.Event()
+        release_request = threading.Event()
+        unload_done = threading.Event()
+        errors = []
+
+        def post(*_args, **_kwargs):
+            request_started.set()
+            release_request.wait(timeout=2)
+            raise llm_service.requests.ConnectionError("synthetic")
+
+        with mock.patch.object(
+            llm_service.threading, "Timer", _RecordingTimer,
+        ):
+            llm_service.load_model(
+                "remote-a", provider="remote",
+                remote_url="http://remote-a.invalid",
+            )
+
+            def generate():
+                try:
+                    llm_service.generate("prompt")
+                except RuntimeError as error:
+                    errors.append(error)
+
+            def unload():
+                llm_service.unload_model()
+                unload_done.set()
+
+            with mock.patch.object(llm_service.requests, "post", side_effect=post):
+                generation = threading.Thread(target=generate)
+                generation.start()
+                self.assertTrue(request_started.wait(timeout=1))
+                unloading = threading.Thread(target=unload)
+                unloading.start()
+                self.assertFalse(unload_done.wait(timeout=0.05))
+                release_request.set()
+                generation.join(timeout=2)
+                unloading.join(timeout=2)
+
+            self.assertEqual(len(errors), 1)
+            self.assertTrue(unload_done.is_set())
+            self.assertFalse(llm_service.is_loaded())
+            self.assertIsNone(llm_service._idle_timer)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux runtime test")
     def test_linux_tar_extraction_preserves_only_safe_relative_symlinks(self):
@@ -928,8 +1379,8 @@ class LlmRuntimeTests(unittest.TestCase):
         self.assertEqual(llm_service._api_key, "")
 
     def test_speed_observations_are_content_free_and_calibrate_catalog(self):
-        observed_model = "Abhiray/gemma-4-E4B-it-heretic-GGUF"
-        larger_model = "paperscarecrow/Gemma-4-31B-it-abliterated-gguf"
+        observed_model = "unsloth/Qwen3.5-4B-GGUF"
+        larger_model = "MoonRide/gemma-4-31B-it-heretic-ara-GGUF"
         state_names = (
             "_provider", "_model_id", "_runtime_backend",
             "_runtime_model_size_gb", "_runtime_timings",

@@ -12,6 +12,32 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestPinokioGpuCompatibility(unittest.TestCase):
+    def _render_launcher_menu(self, *, running, locals_by_script):
+        loader = r"""
+const launcher = require('./pinokio.js');
+const state = JSON.parse(process.argv[1]);
+const info = {
+  exists: (filepath) => filepath === 'app/env',
+  running: (filepath) => Boolean(state.running[filepath]),
+  local: (filepath) => state.locals[filepath] || {},
+};
+Promise.resolve(launcher.menu({}, info))
+  .then((menu) => process.stdout.write(JSON.stringify(menu)))
+  .catch((error) => { console.error(error); process.exit(1); });
+"""
+        completed = subprocess.run(
+            [
+                "node", "-e", loader,
+                json.dumps({"running": running, "locals": locals_by_script}),
+            ],
+            cwd=_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return json.loads(completed.stdout)
+
     def test_installed_app_menu_is_not_hidden_by_early_gpu_detection(self):
         launcher = (_ROOT / "pinokio.js").read_text(encoding="utf-8")
 
@@ -46,7 +72,97 @@ class TestPinokioGpuCompatibility(unittest.TestCase):
         self.assertIn("Cloudflare app sharing is enabled by default", launcher)
         self.assertNotIn("env.PINOKIO_SHARE_PASSCODE", launcher)
         self.assertIn("local.$share.cloudflare", launcher)
-        self.assertIn("Open / copy Cloudflare ${", launcher)
+        self.assertIn("Open / copy Cloudflare stable URL", launcher)
+        self.assertIn("Open / copy direct Quick Tunnel URL", launcher)
+
+    def test_verified_stable_share_never_erases_direct_quick_tunnel(self):
+        local_url = "http://127.0.0.1:7860"
+        stable = "https://maestro.example.workers.dev"
+        quick = "https://current-session.trycloudflare.com"
+        menu = self._render_launcher_menu(
+            running={"start.js": True},
+            locals_by_script={"start.js": {
+                "url": local_url,
+                "share_url": stable,
+                "share_kind": "stable",
+                "$share": {"cloudflare": {local_url: quick}},
+                "sharing": f"Cloudflare stable: {stable}",
+            }},
+        )
+
+        hrefs = [item.get("href") for item in menu]
+        self.assertIn(stable, hrefs)
+        self.assertIn(quick, hrefs)
+        self.assertLess(hrefs.index(stable), hrefs.index(quick))
+        quick_item = next(item for item in menu if item.get("href") == quick)
+        self.assertIn("direct Quick Tunnel", quick_item["text"])
+        self.assertIn("Worker proxy hop", quick_item["text"])
+        self.assertIn("Worker quota", quick_item["text"])
+        self.assertIn("stable route is unavailable", quick_item["text"])
+        self.assertNotIn("100 MB", quick_item["text"])
+        self.assertNotIn("upload", quick_item["text"].lower())
+
+    def test_quick_tunnel_is_shown_independently_without_stable_share(self):
+        local_url = "http://127.0.0.1:7860"
+        quick = "https://current-session.trycloudflare.com"
+        menu = self._render_launcher_menu(
+            running={"start.js": True},
+            locals_by_script={"start.js": {
+                "url": local_url,
+                "share_url": quick,
+                "share_kind": "quick",
+                "$share": {"cloudflare": {local_url: quick}},
+            }},
+        )
+
+        quick_items = [item for item in menu if item.get("href") == quick]
+        self.assertEqual(len(quick_items), 1)
+        self.assertIn("direct Quick Tunnel", quick_items[0]["text"])
+
+    def test_identical_stable_and_quick_urls_are_not_duplicated(self):
+        local_url = "http://127.0.0.1:7860"
+        shared = "https://maestro.example.workers.dev"
+        menu = self._render_launcher_menu(
+            running={"start.js": True},
+            locals_by_script={"start.js": {
+                "url": local_url,
+                "share_url": shared,
+                "share_kind": "stable",
+                "$share": {"cloudflare": {local_url: shared}},
+            }},
+        )
+
+        self.assertEqual(sum(item.get("href") == shared for item in menu), 1)
+
+    def test_share_links_leave_local_and_classic_entries_unchanged(self):
+        local_url = "http://127.0.0.1:7860"
+        menu = self._render_launcher_menu(
+            running={"start.js": True},
+            locals_by_script={"start.js": {
+                "url": local_url,
+                "share_url": "https://maestro.example.workers.dev",
+                "share_kind": "stable",
+                "$share": {"cloudflare": {
+                    local_url: "https://current-session.trycloudflare.com",
+                }},
+            }},
+        )
+
+        local_item = next(item for item in menu if item.get("href") == local_url)
+        classic_item = next(
+            item for item in menu if item.get("href") == local_url + "/classic"
+        )
+        self.assertTrue(local_item["default"])
+        self.assertEqual(local_item["text"], "Open Web UI")
+        self.assertEqual(classic_item["text"], "Open Classic UI")
+
+        classic_menu = self._render_launcher_menu(
+            running={"start_classic.js": True},
+            locals_by_script={"start_classic.js": {"url": local_url}},
+        )
+        self.assertEqual(classic_menu[0]["href"], local_url)
+        self.assertEqual(classic_menu[0]["text"], "Open Classic UI")
+        self.assertTrue(classic_menu[0]["default"])
 
     def test_install_materializes_cloudflare_default_without_overriding_choice(self):
         installer = (_ROOT / "install.js").read_text(encoding="utf-8")

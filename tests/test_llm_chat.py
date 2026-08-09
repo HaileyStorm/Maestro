@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -13,6 +16,7 @@ import threading
 import time
 import types
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -23,7 +27,12 @@ LLM_CHAT_UI_PATH = ROOT / "ui" / "src" / "components" / "LlmChat.tsx"
 PROMPT_POLISH_PATH = APP / "services" / "director" / "prompt_polish.py"
 sys.path.insert(0, str(APP))
 
-from services import llm_service  # noqa: E402
+from services import (  # noqa: E402
+    llm_operations,
+    llm_refusal_corpus,
+    llm_response_assist,
+    llm_service,
+)
 
 
 class _ChatResponse:
@@ -40,6 +49,26 @@ class _ChatResponse:
                 "finish_reason": "stop",
             }],
         }
+
+
+class _ChatTimer:
+    instances = []
+
+    def __init__(self, interval, function, args=(), kwargs=None):
+        self.interval = interval
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
 
 
 class ChatPolicyTests(unittest.TestCase):
@@ -340,6 +369,119 @@ class ChatRuntimeTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(maximum, 1)
 
+    def test_all_generation_entrypoints_finalize_idle_timer_on_success_and_failure(self):
+        class StreamingResponse:
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def iter_lines(decode_unicode=True):
+                return iter((
+                    'data: {"choices":[{"delta":{"content":"answer"}}]}',
+                    "data: [DONE]",
+                ))
+
+        _ChatTimer.instances.clear()
+        with mock.patch.object(llm_service.threading, "Timer", _ChatTimer):
+            llm_service.load_model(
+                "remote-chat-model", provider="remote",
+                remote_url="http://remote.invalid",
+            )
+
+            successful_calls = (
+                lambda: llm_service.generate("prompt"),
+                lambda: llm_service.generate_streaming(
+                    "prompt", enable_thinking=False,
+                ),
+                lambda: llm_service.generate_chat(
+                    [{"role": "user", "content": "hello"}],
+                    model_id="remote-chat-model", provider="remote",
+                    remote_url="http://remote.invalid",
+                ),
+            )
+            successful_responses = (
+                _ChatResponse(), StreamingResponse(), _ChatResponse(),
+            )
+            for call, response in zip(successful_calls, successful_responses):
+                previous = llm_service._idle_timer
+                with mock.patch.object(
+                    llm_service.requests, "post", return_value=response,
+                ):
+                    self.assertEqual(call(), "answer")
+                self.assertIsNot(llm_service._idle_timer, previous)
+                self.assertTrue(llm_service._idle_timer.started)
+
+            failing_calls = (
+                lambda: llm_service.generate("prompt"),
+                lambda: llm_service.generate_streaming(
+                    "prompt", enable_thinking=False,
+                ),
+                lambda: llm_service.generate_chat(
+                    [{"role": "user", "content": "hello"}],
+                    model_id="remote-chat-model", provider="remote",
+                    remote_url="http://remote.invalid",
+                ),
+            )
+            for call in failing_calls:
+                previous = llm_service._idle_timer
+                with mock.patch.object(
+                    llm_service.requests, "post",
+                    side_effect=llm_service.requests.ConnectionError("synthetic"),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        call()
+                self.assertIsNot(llm_service._idle_timer, previous)
+                self.assertTrue(llm_service._idle_timer.started)
+                self.assertTrue(llm_service.is_loaded())
+
+    def test_loaded_model_lease_blocks_exact_identity_switch_until_callback_exits(self):
+        lease_entered = threading.Event()
+        release_lease = threading.Event()
+        switch_started = threading.Event()
+        switch_done = threading.Event()
+        identities = []
+        errors = []
+
+        def hold_lease():
+            try:
+                with llm_service.loaded_model_lease(
+                    model_id="remote-a", provider="remote",
+                    remote_url="http://remote-a.invalid",
+                ) as identity:
+                    identities.append(identity)
+                    lease_entered.set()
+                    release_lease.wait(timeout=2)
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        def switch_model():
+            switch_started.set()
+            llm_service.load_model(
+                "remote-b", provider="remote",
+                remote_url="http://remote-b.invalid",
+            )
+            switch_done.set()
+
+        with mock.patch.object(llm_service.threading, "Timer", _ChatTimer):
+            holder = threading.Thread(target=hold_lease)
+            holder.start()
+            self.assertTrue(lease_entered.wait(timeout=1))
+            switcher = threading.Thread(target=switch_model)
+            switcher.start()
+            self.assertTrue(switch_started.wait(timeout=1))
+            self.assertFalse(switch_done.wait(timeout=0.05))
+            self.assertEqual(llm_service._loaded_model_key, identities[0])
+
+            release_lease.set()
+            holder.join(timeout=2)
+            switcher.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(switch_done.is_set())
+        self.assertEqual(llm_service.get_status()["model_id"], "remote-b")
+        self.assertNotEqual(llm_service._loaded_model_key, identities[0])
+
     def test_stale_idle_callback_cannot_unload_after_active_turn_resets_timer(self):
         llm_service.load_model(
             "remote-chat-model", provider="remote",
@@ -425,6 +567,15 @@ def _launch_chat_namespace(**overrides):
         "_llm_chat_request_is_external",
         "_llm_model_catalog",
         "_resolve_llm_chat_model",
+        "_emit_llm_progress",
+        "_llm_chat_sampling_options",
+        "_validate_llm_chat_request",
+        "_resolved_local_response_assist",
+        "_llm_route_progress_callback",
+        "_run_llm_route_operation",
+        "_normalize_llm_chat_request_id",
+        "_llm_chat_request_digest",
+        "_explicit_llm_guidance_allowed",
         "_execute_llm_chat",
         "llm_chat",
     }
@@ -438,10 +589,29 @@ def _launch_chat_namespace(**overrides):
     namespace = {
         "Request": object,
         "asyncio": asyncio,
+        "hashlib": hashlib,
+        "hmac": hmac,
         "ipaddress": ipaddress,
+        "json": json,
+        "math": __import__("math"),
+        "uuid": uuid,
+        "JSONResponse": __import__(
+            "fastapi.responses", fromlist=["JSONResponse"],
+        ).JSONResponse,
         "traceback": types.SimpleNamespace(print_exc=lambda: None),
         "_request_external_origins": lambda _request: ["http://127.0.0.1"],
         "_approved_local_origin": lambda origin: origin == "http://127.0.0.1",
+        "_run_llm_with_selection": (
+            lambda _selection, operation, *args, **kwargs:
+            operation(*args, **kwargs)
+        ),
+        "_run_authorized_llm_with_selection": (
+            lambda _request, _selection, operation, *args, **kwargs:
+            operation(*args, **kwargs)
+        ),
+        "_resolve_llm_chat_images": lambda *_args: [],
+        "_llm_operation_scope": lambda *_args: ("owner", "project"),
+        "_session_secret": lambda: b"test-session-secret",
         "_llm_chat_admission": threading.BoundedSemaphore(1),
         **overrides,
     }
@@ -450,6 +620,251 @@ def _launch_chat_namespace(**overrides):
 
 
 class ChatRouteTests(unittest.TestCase):
+    def test_response_assist_requires_literal_opt_in_current_consent_and_locality(self):
+        namespace = _launch_chat_namespace()
+        namespace["_explicit_llm_guidance_allowed"] = (
+            lambda body: body.get("consent") is True
+        )
+        resolve = namespace["_resolved_local_response_assist"]
+        body = {
+            "explicit_output": True,
+            "consent": True,
+        }
+        local = {
+            "provider": "local", "remote_url": "", "api_key": "",
+        }
+        allowed = resolve(body, local)
+        self.assertEqual(
+            allowed, llm_response_assist.build_server_response_assist(),
+        )
+        self.assertTrue(allowed["retry_on_refusal"])
+
+        for changed_body, changed_selection in (
+            ({**body, "explicit_output": 1}, local),
+            ({**body, "consent": False}, local),
+            (body, {**local, "provider": "openai"}),
+            (body, {**local, "provider": "remote"}),
+            (body, {**local, "remote_url": "https://provider.invalid"}),
+            (body, {**local, "api_key": "secret"}),
+        ):
+            with self.subTest(body=changed_body, selection=changed_selection):
+                self.assertIsNone(resolve(changed_body, changed_selection))
+
+    def test_response_assist_is_server_owned_and_body_cannot_override_it(self):
+        namespace = _launch_chat_namespace()
+        namespace["_explicit_llm_guidance_allowed"] = lambda _body: True
+        resolve = namespace["_resolved_local_response_assist"]
+        selection = {
+            "provider": "local", "remote_url": "", "api_key": "",
+        }
+        expected = llm_response_assist.build_server_response_assist()
+        self.assertEqual(resolve({"explicit_output": True}, selection), expected)
+        self.assertEqual(resolve({
+            "explicit_output": True,
+            "response_assist": {
+                "assistant_prefill": "malicious override",
+                "refusal_profile": "disabled",
+                "retry_on_refusal": False,
+            },
+        }, selection), expected)
+
+    def test_eligible_chat_passes_assist_and_disables_thinking_for_prefill(self):
+        captured = {}
+        progress = []
+        service = types.SimpleNamespace(
+            CHAT_MAX_NEW_TOKENS=8192,
+            validate_chat_messages=lambda value: value,
+            load_chat_guides=lambda _ids: ([], "base guide"),
+            generate_chat=lambda *_args, **kwargs: (
+                captured.update(kwargs) or "answer"
+            ),
+        )
+        namespace = _launch_chat_namespace()
+        namespace["_resolve_llm_chat_model"] = lambda *_args: {
+                "model_id": "local/model",
+                "response_model_id": "local/model",
+                "device": "cuda",
+                "provider": "local",
+                "remote_url": "",
+                "api_key": "",
+                "local_gguf_path": "",
+                "gguf_file_override": "",
+                "vision_capable": True,
+            }
+        namespace["_explicit_llm_guidance_allowed"] = lambda _body: True
+        body = {
+            "model_id": "local/model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "explicit_output": True,
+        }
+        with mock.patch.object(sys.modules["services"], "llm_service", service):
+            result = asyncio.run(namespace["_execute_llm_chat"](
+                types.SimpleNamespace(), body, [], progress.append,
+            ))
+
+        self.assertEqual(result["text"], "answer")
+        self.assertEqual(
+            captured["response_assist"],
+            llm_response_assist.build_server_response_assist(),
+        )
+        self.assertIs(captured["enable_thinking"], False)
+        self.assertTrue(callable(captured["progress_callback"]))
+        self.assertEqual(progress[-1]["attempt_cap"], 2)
+
+    def test_direct_llm_route_injects_server_assist_and_request_progress(self):
+        namespace = _launch_chat_namespace()
+        namespace["_explicit_llm_guidance_allowed"] = lambda _body: True
+        events = []
+        captured = {}
+        callback = events.append
+        request = types.SimpleNamespace(state=types.SimpleNamespace(
+            maestro_llm_progress_callback=callback,
+        ))
+
+        result = namespace["_run_llm_route_operation"](
+            request,
+            {"explicit_output": True},
+            {"provider": "local", "remote_url": "", "api_key": ""},
+            lambda **kwargs: captured.update(kwargs) or "answer",
+        )
+
+        self.assertEqual(result, "answer")
+        self.assertEqual(
+            captured["response_assist"],
+            llm_response_assist.build_server_response_assist(),
+        )
+        self.assertIs(captured["progress_callback"], callback)
+
+    def test_request_digest_binds_every_public_inference_option(self):
+        namespace = _launch_chat_namespace()
+        digest = namespace["_llm_chat_request_digest"]
+        base = {
+            "model_id": "curated/model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "guide_ids": [],
+            "max_new_tokens": 64,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "explicit_output": True,
+        }
+        original = digest(base, workspace="project", image_paths=[])
+        mutations = (
+            {"max_new_tokens": 65},
+            {"temperature": 0.8},
+            {"top_p": 0.8},
+            {"explicit_output": False},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(
+                    original,
+                    digest(
+                        {**base, **mutation},
+                        workspace="project", image_paths=[],
+                    ),
+                )
+        self.assertEqual(
+            original,
+            digest(
+                {**base, "response_assist": {"assistant_prefill": "ignored"}},
+                workspace="project", image_paths=[],
+            ),
+        )
+        with mock.patch.object(
+            llm_response_assist,
+            "SERVER_RESPONSE_ASSIST_IDENTITY",
+            {"version": "future-test-version", "profile": "high_confidence"},
+        ):
+            self.assertNotEqual(
+                original,
+                digest(base, workspace="project", image_paths=[]),
+            )
+
+    def test_request_digest_binds_corpus_revision_but_never_literal_text(self):
+        namespace = _launch_chat_namespace()
+        digest = namespace["_llm_chat_request_digest"]
+        body = {
+            "model_id": "curated/model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "explicit_output": True,
+        }
+        revision_one = llm_refusal_corpus.RefusalCorpusSnapshot(
+            revision=1, literals=("first private literal",),
+        )
+        same_revision = llm_refusal_corpus.RefusalCorpusSnapshot(
+            revision=1, literals=("different private literal",),
+        )
+        revision_two = llm_refusal_corpus.RefusalCorpusSnapshot(
+            revision=2, literals=("first private literal",),
+        )
+        first = digest(
+            body, workspace="project", image_paths=[],
+            response_assist_snapshot=revision_one,
+        )
+        self.assertEqual(first, digest(
+            body, workspace="project", image_paths=[],
+            response_assist_snapshot=same_revision,
+        ))
+        self.assertNotEqual(first, digest(
+            body, workspace="project", image_paths=[],
+            response_assist_snapshot=revision_two,
+        ))
+
+    def test_in_flight_chat_uses_frozen_corpus_and_next_resolution_uses_latest(self):
+        captured = {}
+        service = types.SimpleNamespace(
+            CHAT_MAX_NEW_TOKENS=8192,
+            validate_chat_messages=lambda value: value,
+            load_chat_guides=lambda _ids: ([], "base guide"),
+            generate_chat=lambda *_args, **kwargs: (
+                captured.update(kwargs) or "answer"
+            ),
+        )
+        namespace = _launch_chat_namespace()
+        namespace["_resolve_llm_chat_model"] = lambda *_args: {
+            "model_id": "local/model",
+            "response_model_id": "local/model",
+            "device": "cuda",
+            "provider": "local",
+            "remote_url": "",
+            "api_key": "",
+            "local_gguf_path": "",
+            "gguf_file_override": "",
+            "vision_capable": True,
+        }
+        namespace["_explicit_llm_guidance_allowed"] = lambda _body: True
+        body = {
+            "model_id": "local/model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "explicit_output": True,
+        }
+        frozen = llm_refusal_corpus.RefusalCorpusSnapshot(
+            revision=1, literals=("old literal",),
+        )
+        latest = llm_refusal_corpus.RefusalCorpusSnapshot(
+            revision=2, literals=("new literal",),
+        )
+        with mock.patch.object(sys.modules["services"], "llm_service", service):
+            asyncio.run(namespace["_execute_llm_chat"](
+                types.SimpleNamespace(),
+                body,
+                [],
+                response_assist_snapshot=frozen,
+            ))
+        self.assertEqual(captured["response_assist"]["refusal_literals"], [
+            "old literal",
+        ])
+        with mock.patch.object(
+            llm_response_assist,
+            "response_assist_corpus_snapshot",
+            return_value=latest,
+        ):
+            next_options = namespace["_resolved_local_response_assist"](
+                body,
+                namespace["_resolve_llm_chat_model"](None, None),
+            )
+        self.assertEqual(next_options["refusal_literals"], ["new literal"])
+
     def test_same_origin_lan_client_is_external_for_chat(self):
         namespace = _launch_chat_namespace(
             _request_external_origins=lambda _request: ["http://192.168.1.20:7860"],
@@ -499,7 +914,10 @@ class ChatRouteTests(unittest.TestCase):
             _get_linked_model_folders=lambda: ["/linked"],
             _llm_default_device=lambda: "cpu",
         )
-        with mock.patch.dict(sys.modules, {"services": fake_package}):
+        with mock.patch.dict(sys.modules, {
+            "services": fake_package,
+            "services.llm_operations": llm_operations,
+        }):
             catalog = namespace["_llm_model_catalog"](request, "openai")
 
         self.assertEqual(calls, [{
@@ -561,13 +979,21 @@ class ChatRouteTests(unittest.TestCase):
                     "messages": [{"role": "user", "content": "hello"}],
                     "guide_ids": ["flux_image"],
                     "max_new_tokens": 64,
+                    "request_id": "11111111-1111-4111-8111-111111111111",
                 }
+
+        generated_kwargs = {}
+
+        def generate_chat(*_args, **kwargs):
+            generated_kwargs.update(kwargs)
+            events.append("generate")
+            return "answer"
 
         fake_service = types.SimpleNamespace(
             CHAT_MAX_NEW_TOKENS=8192,
             validate_chat_messages=lambda value: events.append("validate") or value,
             load_chat_guides=lambda _ids: (["flux_image"], "guide"),
-            generate_chat=lambda *_args, **_kwargs: events.append("generate") or "answer",
+            generate_chat=generate_chat,
         )
         fake_package = types.SimpleNamespace(llm_service=fake_service)
         namespace = _launch_chat_namespace(
@@ -583,14 +1009,38 @@ class ChatRouteTests(unittest.TestCase):
                 "gguf_file_override": "",
             }
         )
-        with mock.patch.dict(sys.modules, {"services": fake_package}):
-            result = asyncio.run(namespace["llm_chat"](FakeRequest()))
+        manager = llm_operations.LlmChatOperationManager(ttl_seconds=60)
+
+        async def exercise():
+            response = await namespace["llm_chat"](FakeRequest())
+            for _ in range(100):
+                status = manager.status(
+                    "11111111111141118111111111111111",
+                    owner_key="owner", project_key="project",
+                )
+                if status and status["status"] == "completed":
+                    return response, status
+                await asyncio.sleep(0.001)
+            self.fail("Chat operation did not complete")
+
+        with mock.patch.dict(sys.modules, {
+            "services": fake_package,
+            "services.llm_operations": llm_operations,
+        }), mock.patch.object(
+            llm_operations, "llm_chat_operation_manager", manager,
+        ):
+            response, result = asyncio.run(exercise())
 
         self.assertEqual(events, ["authorize", "validate", "resolve", "generate"])
-        self.assertEqual(result, {
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(result["result"], {
             "text": "answer", "model_id": "curated/model",
             "guide_ids": ["flux_image"],
         })
+        self.assertIsNone(generated_kwargs["response_assist"])
+        self.assertTrue(callable(generated_kwargs["progress_callback"]))
+        self.assertEqual(generated_kwargs["temperature"], 0.7)
+        self.assertEqual(generated_kwargs["top_p"], 0.9)
 
     def test_chat_rejects_a_second_queued_turn_with_429(self):
         class FakeHTTPException(Exception):
@@ -602,7 +1052,10 @@ class ChatRouteTests(unittest.TestCase):
             state = types.SimpleNamespace(maestro_remote=False)
 
             async def json(self):
-                return {"workspace": "project"}
+                return {
+                    "workspace": "project",
+                    "request_id": "22222222-2222-4222-8222-222222222222",
+                }
 
         admission = threading.BoundedSemaphore(1)
         self.assertTrue(admission.acquire(blocking=False))
@@ -611,10 +1064,121 @@ class ChatRouteTests(unittest.TestCase):
             _require_project_access=lambda *_args: None,
             _llm_chat_admission=admission,
         )
-        with self.assertRaises(FakeHTTPException) as raised:
+        namespace["_validate_llm_chat_request"] = lambda *_args: {
+            "messages": [],
+            "guide_ids": [],
+            "system_prompt": "",
+            "selection": {},
+            "max_new_tokens": 1,
+            "temperature": 0.7,
+            "top_p": 0.9,
+        }
+        manager = llm_operations.LlmChatOperationManager(ttl_seconds=60)
+        with mock.patch.object(
+            llm_operations, "llm_chat_operation_manager", manager,
+        ), self.assertRaises(FakeHTTPException) as raised:
             asyncio.run(namespace["llm_chat"](FakeRequest()))
         admission.release()
         self.assertEqual(raised.exception.status_code, 429)
+
+    def test_invalid_inputs_are_rejected_before_chat_operation_admission(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code = status_code
+                self.detail = detail
+
+        class FakeRequest:
+            state = types.SimpleNamespace(maestro_remote=False)
+
+            def __init__(self, body):
+                self.body = body
+
+            async def json(self):
+                return dict(self.body)
+
+        admitted = []
+        manager = types.SimpleNamespace(
+            submit=lambda **_kwargs: admitted.append(True),
+        )
+
+        def validate_messages(value):
+            if value == "invalid":
+                raise ValueError("invalid messages")
+            return value
+
+        def load_guides(value):
+            if value == ["invalid"]:
+                raise ValueError("invalid guide")
+            return value, "guide"
+
+        service = types.SimpleNamespace(
+            CHAT_MAX_NEW_TOKENS=8192,
+            validate_chat_messages=validate_messages,
+            load_chat_guides=load_guides,
+        )
+        package = types.SimpleNamespace(llm_service=service)
+        namespace = _launch_chat_namespace(
+            HTTPException=FakeHTTPException,
+            _require_project_access=lambda *_args: None,
+            _resolve_llm_chat_images=(
+                lambda _request, body, _workspace:
+                ["/authorized/image.png"] if body.get("image_paths") else []
+            ),
+        )
+
+        def resolve_model(_request, model_id):
+            if model_id == "invalid/model":
+                raise ValueError("invalid model")
+            return {
+                "model_id": model_id,
+                "response_model_id": model_id,
+                "device": "cpu",
+                "provider": "local",
+                "remote_url": "",
+                "api_key": "",
+                "local_gguf_path": "",
+                "gguf_file_override": "",
+                "vision_capable": model_id != "text/model",
+            }
+
+        namespace["_resolve_llm_chat_model"] = resolve_model
+        base = {
+            "workspace": "project",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "model_id": "vision/model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "guide_ids": [],
+            "max_new_tokens": 64,
+            "temperature": 0.7,
+            "top_p": 0.9,
+        }
+        invalid_requests = (
+            {**base, "messages": "invalid"},
+            {**base, "guide_ids": ["invalid"]},
+            {**base, "model_id": "invalid/model"},
+            {**base, "model_id": "text/model", "image_paths": ["image"]},
+            {**base, "max_new_tokens": 0},
+            {**base, "temperature": float("nan")},
+            {**base, "top_p": 0},
+        )
+        with mock.patch.dict(sys.modules, {
+            "services": package,
+            "services.llm_operations": types.SimpleNamespace(
+                ChatAdmissionError=llm_operations.ChatAdmissionError,
+                ChatRequestMismatchError=llm_operations.ChatRequestMismatchError,
+                LlmOperationCapacityError=llm_operations.LlmOperationCapacityError,
+                llm_chat_operation_manager=manager,
+                run_blocking_shielded=llm_operations.run_blocking_shielded,
+            ),
+        }):
+            for invalid in invalid_requests:
+                with self.subTest(invalid=invalid), self.assertRaises(
+                    FakeHTTPException,
+                ) as raised:
+                    asyncio.run(namespace["llm_chat"](FakeRequest(invalid)))
+                self.assertEqual(raised.exception.status_code, 400)
+
+        self.assertEqual(admitted, [])
 
     def test_route_source_keeps_models_and_guides_contract(self):
         source = LAUNCH_PATH.read_text(encoding="utf-8")
@@ -637,7 +1201,12 @@ class ChatRouteTests(unittest.TestCase):
         execute_source = ast.get_source_segment(source, execute)
         self.assertIn('"models": _llm_model_catalog', listing_source)
         self.assertIn('"guides": llm_service.get_chat_guides()', listing_source)
-        self.assertIn("await asyncio.to_thread(", execute_source)
+        self.assertIn("await run_blocking_shielded(", execute_source)
+        self.assertIn("_validate_llm_chat_request", chat_source)
+        self.assertLess(
+            chat_source.index("_validate_llm_chat_request"),
+            chat_source.index("llm_chat_operation_manager.submit"),
+        )
         self.assertIn("status_code=429", chat_source)
         self.assertLess(
             chat_source.index("_require_project_access"),

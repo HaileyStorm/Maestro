@@ -151,7 +151,13 @@ class family_handler:
                 "h3_sol_min_tokens",
                 "h3_benchmark_capture",
                 "h3_turbo_profile",
+                "h3_spectrum_profile",
+                "h3_lightx2v_profile",
                 "h3_native_boundary_conditioning",
+                "h3_source_audio_mode",
+                "h3_primary_audio_ordinal",
+                "h3_audio_remix_strength",
+                "h3_multirate_profile",
             ],
             "h3_native_boundary_conditioning": native_boundary_enabled,
             "minimax_h3_native_boundary_image_prompt_types_allowed": (
@@ -237,6 +243,150 @@ class family_handler:
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
         custom_settings = inputs.get("custom_settings")
+        from services.h3_audio import (
+            H3AudioCompatibilityError,
+            H3MediaMapError,
+            remap_prompt_audio_ordinals,
+            resolve_h3_audio_roles,
+            source_audio_requested,
+            validate_prompt_media_ordinals,
+        )
+
+        custom_for_audio = custom_settings if isinstance(custom_settings, dict) else {}
+        audio_prompt_type = inputs.get("audio_prompt_type") or ""
+        video_prompt_type = inputs.get("video_prompt_type") or ""
+        image_refs = inputs.get("image_refs") or []
+        try:
+            experimental_source_audio = source_audio_requested(custom_for_audio)
+            semantic_references = (
+                bool(image_refs)
+                or "V" in video_prompt_type
+                or (
+                    not experimental_source_audio
+                    and any(letter in audio_prompt_type for letter in "ABCK")
+                )
+            )
+            audio_roles = resolve_h3_audio_roles(
+                selected_model_type=str(base_model_type or ""),
+                model_def=model_def or {},
+                custom_settings=custom_for_audio,
+                sampling_steps=inputs.get("num_inference_steps"),
+                attention_engine=str(
+                    custom_for_audio.get("h3_attention_engine") or "sol_attn"
+                ),
+                audio_prompt_type=audio_prompt_type,
+                audio_guides=tuple(
+                    inputs.get(key)
+                    for key in ("audio_guide", "audio_guide2", "audio_guide3")
+                ),
+                final_audio=inputs.get("audio_source"),
+                semantic_references=semantic_references,
+                multisegment=(
+                    isinstance(inputs.get("multi_clip_info"), dict)
+                    and int(inputs["multi_clip_info"].get("total", 1) or 1) > 1
+                ),
+                activated_loras=inputs.get("activated_loras"),
+                loras_multipliers=inputs.get("loras_multipliers"),
+                skip_steps_cache_type=(
+                    inputs.get("skip_steps_cache_type") or inputs.get("tea_cache")
+                ),
+                native_boundary=bool(
+                    custom_for_audio.get("h3_native_boundary_conditioning")
+                    or inputs.get("h3_native_boundary_conditioning")
+                ),
+            )
+            prompt_for_ordinals = str(inputs.get("prompt") or "")
+            if audio_roles.audio_ordinal_remap:
+                prompt_for_ordinals = remap_prompt_audio_ordinals(
+                    prompt_for_ordinals,
+                    dict(audio_roles.audio_ordinal_remap),
+                )
+            picture_count = (
+                len(image_refs)
+                if _is_reference_mode(base_model_type)
+                else sum(inputs.get(key) is not None for key in ("image_start", "image_end"))
+            )
+            selected_video_slots = []
+            if "V" in video_prompt_type:
+                selected_video_slots.append(inputs.get("video_guide"))
+                if "+" in video_prompt_type:
+                    selected_video_slots.append(inputs.get("video_guide2"))
+                if "++" in video_prompt_type or inputs.get("video_guide3") is not None:
+                    selected_video_slots.append(inputs.get("video_guide3"))
+            video_count_for_ordinals = sum(
+                slot is not None for slot in selected_video_slots
+            )
+            legacy_audio_count = (
+                video_count_for_ordinals
+                if "K" in audio_prompt_type
+                else sum(
+                    letter in audio_prompt_type and inputs.get(key) is not None
+                    for letter, key in (
+                        ("A", "audio_guide"),
+                        ("B", "audio_guide2"),
+                        ("C", "audio_guide3"),
+                    )
+                )
+            )
+            validate_prompt_media_ordinals(
+                prompt_for_ordinals,
+                picture_count=picture_count,
+                video_count=video_count_for_ordinals,
+                audio_count=(
+                    len(audio_roles.reference_audios)
+                    if audio_roles.mode == "reference_only"
+                    else legacy_audio_count
+                ),
+            )
+        except (H3AudioCompatibilityError, H3MediaMapError) as error:
+            return str(error)
+        if isinstance(custom_settings, dict) and custom_settings.get("h3_spectrum_profile"):
+            from .spectrum import SpectrumCompatibilityError, validate_spectrum_request
+
+            try:
+                validate_spectrum_request(
+                    selected_model_type=str(base_model_type or ""),
+                    model_def=model_def,
+                    reference_mode=bool(
+                        (model_def or {}).get("minimax_h3_reference_mode")
+                    ),
+                    sampling_steps=inputs.get("num_inference_steps"),
+                    attention_engine=str(
+                        custom_settings.get("h3_attention_engine") or "sol_attn"
+                    ),
+                    custom_settings=custom_settings,
+                    activated_loras=inputs.get("activated_loras"),
+                    loras_multipliers=inputs.get("loras_multipliers"),
+                    skip_steps_cache_type=(
+                        inputs.get("skip_steps_cache_type")
+                        or inputs.get("tea_cache")
+                    ),
+                    native_boundary=bool(
+                        custom_settings.get("h3_native_boundary_conditioning")
+                        or inputs.get("h3_native_boundary_conditioning")
+                    ),
+                )
+            except SpectrumCompatibilityError as error:
+                return str(error)
+        if isinstance(custom_settings, dict) and custom_settings.get("h3_lightx2v_profile"):
+            from services.h3_lightx2v import H3LightX2VCompatibilityError, validate_lightx2v_request
+            try:
+                validate_lightx2v_request(
+                    selected_model_type=str(base_model_type or ""), model_def=model_def or {},
+                    custom_settings=custom_settings,
+                    authored_steps=inputs.get("num_inference_steps"),
+                    semantic_references=bool((model_def or {}).get("minimax_h3_reference_mode")),
+                    multisegment=(
+                        isinstance(inputs.get("multi_clip_info"), dict)
+                        and int(inputs["multi_clip_info"].get("total", 1) or 1) > 1
+                    ),
+                    activated_loras=inputs.get("activated_loras"),
+                    loras_multipliers=inputs.get("loras_multipliers"),
+                    skip_steps_cache_type=inputs.get("skip_steps_cache_type") or inputs.get("tea_cache"),
+                    native_boundary=bool(custom_settings.get("h3_native_boundary_conditioning")),
+                )
+            except H3LightX2VCompatibilityError as error:
+                return str(error)
         if isinstance(custom_settings, dict) and custom_settings.get("h3_turbo_profile"):
             from services.h3_turbo import H3TurboCompatibilityError, validate_turbo_request
 
@@ -255,12 +405,10 @@ class family_handler:
                 )
             except H3TurboCompatibilityError as error:
                 return str(error)
-        image_refs = inputs.get("image_refs") or []
-        video_prompt_type = inputs.get("video_prompt_type") or ""
-        audio_prompt_type = inputs.get("audio_prompt_type") or ""
-        has_semantic_references = bool(image_refs) or "V" in video_prompt_type or any(
-            letter in audio_prompt_type for letter in "ABCK"
-        )
+        # Experimental source-audio modes intentionally reuse the existing
+        # audio-guide slots.  Those slots are drive/reference audio for the
+        # Base pipeline, not a request to switch to Ref2VA.
+        has_semantic_references = semantic_references
         if (
             inputs.get("h3_native_boundary_conditioning") is True
             and os.environ.get("MAESTRO_H3_NATIVE_BOUNDARY_EXPERIMENTAL") != "1"
@@ -377,6 +525,7 @@ class family_handler:
             text_encoder_filename=text_encoder_filename,
             dtype=dtype,
             load_status_callback=kwargs.get("load_status_callback"),
+            selected_model_type=str(model_type or base_model_type or ""),
         )
         pipe = {
             "transformer": model.transformer,

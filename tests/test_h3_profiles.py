@@ -44,7 +44,8 @@ class H3ProfileTests(unittest.TestCase):
         self.assertEqual(
             [item["id"] for item in definitions],
             [
-                "draft", "fast", "quality", "high", "1080p_delivery",
+                "draft", "fast", "quality", "high", "spectrum_experimental",
+                "lightx2v_experimental", "1080p_delivery",
                 "ultra", "4k_delivery",
             ],
         )
@@ -65,6 +66,17 @@ class H3ProfileTests(unittest.TestCase):
             (profiles["high"]["attention_engine"], profiles["high"]["num_inference_steps"], profiles["high"]["resolution"]),
             ("sol_attn", 20, "1344x768"),
         )
+        self.assertEqual(
+            (
+                profiles["spectrum_experimental"]["accelerator"],
+                profiles["spectrum_experimental"]["attention_engine"],
+                profiles["spectrum_experimental"]["num_inference_steps"],
+                profiles["spectrum_experimental"]["resolution"],
+            ),
+            ("spectrum", "sol_attn", 20, "1344x768"),
+        )
+        self.assertIn("11 paired hidden-feature anchors", profiles["spectrum_experimental"]["description"])
+        self.assertIn("quality and speed still require live validation", profiles["spectrum_experimental"]["description"])
         self.assertEqual(
             (profiles["ultra"]["attention_engine"], profiles["ultra"]["num_inference_steps"], profiles["ultra"]["resolution"]),
             ("sdpa", 30, "1344x768"),
@@ -169,6 +181,74 @@ class H3ProfileTests(unittest.TestCase):
         self.assertEqual(
             draft["settings"]["custom_settings"]["h3_attention_engine"],
             "sage2",
+        )
+
+    def test_spectrum_is_explicit_non_default_and_only_available_for_all_base_plans(self):
+        common = dict(
+            model_exists=lambda _model: True,
+            model_downloaded=lambda _model: True,
+        )
+        options = build_profile_options(
+            {"model_type": "minimax_h3", "reference_shape": {}},
+            **common,
+        )
+        spectrum = next(item for item in options if item["id"] == "spectrum_experimental")
+        self.assertTrue(spectrum["available"])
+        self.assertEqual(
+            spectrum["settings"]["custom_settings"],
+            {
+                "h3_attention_engine": "sol_attn",
+                "h3_spectrum_profile": "spectrum_h3_v1",
+            },
+        )
+        self.assertEqual(spectrum["settings"]["activated_loras"], [])
+        self.assertEqual(spectrum["settings"]["tea_cache"], 0)
+        self.assertEqual(DEFAULT_H3_PROFILE_ID, "high")
+
+        for context in (
+            {"model_type": "minimax_h3_ref2va", "reference_shape": {}},
+            {
+                "model_type": "minimax_h3",
+                "reference_shape": {},
+                "_segment_contexts": [
+                    {"model_type": "minimax_h3"},
+                    {"model_type": "minimax_h3_ref2va"},
+                ],
+            },
+            {
+                "model_type": "minimax_h3",
+                "reference_shape": {"image_count": 1},
+            },
+        ):
+            with self.subTest(context=context):
+                candidates = build_profile_options(context, **common)
+                candidate = next(
+                    item for item in candidates if item["id"] == "spectrum_experimental"
+                )
+                self.assertFalse(candidate["available"])
+                self.assertTrue(any(
+                    token in candidate["fallback_reason"]
+                    for token in ("Base", "Ref2VA")
+                ))
+
+    def test_spectrum_profile_uses_runtime_compatibility_gate(self):
+        seen = []
+        options = build_profile_options(
+            {"model_type": "minimax_h3", "reference_shape": {}},
+            model_exists=lambda _model: True,
+            model_downloaded=lambda _model: True,
+            spectrum_compatibility=lambda settings: (
+                seen.append(settings) or False,
+                "runtime matrix rejected this configuration",
+            ),
+        )
+        spectrum = next(item for item in options if item["id"] == "spectrum_experimental")
+        self.assertFalse(spectrum["available"])
+        self.assertIn("runtime matrix", spectrum["fallback_reason"])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(
+            seen[0]["custom_settings"]["h3_spectrum_profile"],
+            "spectrum_h3_v1",
         )
 
     def test_fast_keeps_sage_settings_but_waits_for_its_exact_geometry_gate(self):

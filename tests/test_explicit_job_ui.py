@@ -26,6 +26,9 @@ APP_SOURCE = (ROOT / "ui/src/App.tsx").read_text(encoding="utf-8")
 SERVICES = (
     ROOT / "ui/src/components/SettingsDrawer/ServicesSettingsPanel.tsx"
 ).read_text(encoding="utf-8")
+SETTINGS_DRAWER = (
+    ROOT / "ui/src/components/SettingsDrawer/SettingsDrawer.tsx"
+).read_text(encoding="utf-8")
 H3_PROFILES = (
     ROOT / "ui/src/components/Sidebar/H3PerformanceProfiles.tsx"
 ).read_text(encoding="utf-8")
@@ -35,11 +38,16 @@ MODEL_SELECTOR = (
 H3_PLAN_DIALOG = (
     ROOT / "ui/src/components/H3GenerationPlanDialog.tsx"
 ).read_text(encoding="utf-8")
+INPUTS_PANEL = (
+    ROOT / "ui/src/components/Sidebar/InputsPanel.tsx"
+).read_text(encoding="utf-8")
+WELCOME = (ROOT / "ui/src/components/WelcomeModal.tsx").read_text(encoding="utf-8")
 TYPES = (ROOT / "ui/src/types/index.ts").read_text(encoding="utf-8")
 PROJECT_REFS = (
     ROOT / "ui/src/components/Sidebar/ProjectReferenceLibrary.tsx"
 ).read_text(encoding="utf-8")
 CLIENT = (ROOT / "ui/src/api/client.ts").read_text(encoding="utf-8")
+LLM_CHAT = (ROOT / "ui/src/components/LlmChat.tsx").read_text(encoding="utf-8")
 LORAS = (
     ROOT / "ui/src/components/SettingsDrawer/LoraSelector.tsx"
 ).read_text(encoding="utf-8")
@@ -59,6 +67,7 @@ REFERENCE_LIBRARY = (
 MAIN_CONTENT = (
     ROOT / "ui/src/components/MainContent/MainContent.tsx"
 ).read_text(encoding="utf-8")
+HOST_TERMS_UI = (ROOT / "ui/src/lib/hostTerms.ts").read_text(encoding="utf-8")
 
 
 class ExplicitSessionPolicyTests(unittest.TestCase):
@@ -177,16 +186,105 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         )
         self.assertIn("body: JSON.stringify(params)", music_client)
 
-    def test_host_consent_stays_local_and_errors_are_visible(self):
+    def test_llm_prompt_requests_send_request_local_explicit_intent(self):
+        enhance_call = STORE[
+            STORE.index("const result = await api.llmEnhancePrompt({"):
+            STORE.index("set(s => ({", STORE.index("const result = await api.llmEnhancePrompt({"))
+        ]
+        self.assertIn("explicit_output: state.explicitOutput", enhance_call)
+
+        chat_submit = LLM_CHAT[
+            LLM_CHAT.index("const submitBranch = async ("):
+            LLM_CHAT.index("\n\n  const send = async () => {", LLM_CHAT.index("const submitBranch = async ("))
+        ]
+        self.assertIn(
+            "const requestExplicitOutput = useStore.getState().explicitOutput",
+            chat_submit,
+        )
+        self.assertIn("explicit_output: requestExplicitOutput", chat_submit)
+
+        for function_name in ("llmChat", "llmEnhancePrompt"):
+            declaration = CLIENT[
+                CLIENT.index(f"export async function {function_name}"):
+                CLIENT.index("): Promise<", CLIENT.index(f"export async function {function_name}"))
+            ]
+            self.assertIn("explicit_output?: boolean", declaration)
+
+    def test_director_preview_requests_capture_request_local_explicit_intent(self):
+        preview_actions = (
+            ("directorPlanPrompts: async () => {", "directorPlanVideoPrompts: async () => {", 2),
+            ("directorPlanVideoPrompts: async () => {", "directorGenerateStartImages: async", 1),
+            ("shortFilmPlanPrompts: async () => {", "shortFilmPlanVideoPrompts: async () => {", 2),
+            ("shortFilmPlanVideoPrompts: async () => {", "shortFilmPlanFromStory: async () => {", 1),
+            ("shortFilmPlanFromStory: async () => {", "selectModel: async", 2),
+        )
+        for start, end, expected_calls in preview_actions:
+            with self.subTest(action=start):
+                action = STORE[STORE.index(start):STORE.index(end, STORE.index(start))]
+                capture = "const requestExplicitOutput = get().explicitOutput"
+                self.assertIn(capture, action)
+                self.assertEqual(action.count(capture), 1)
+                self.assertEqual(action.count("get().explicitOutput"), 1)
+                self.assertNotIn("set({ explicitOutput", action)
+                if "await get()._uploadDirectorRefs()" in action:
+                    self.assertLess(
+                        action.index(capture),
+                        action.index("await get()._uploadDirectorRefs()"),
+                    )
+                self.assertEqual(
+                    action.count("explicit_output: requestExplicitOutput"),
+                    expected_calls,
+                )
+
+        request_types = (
+            ("export interface DirectorV2PlanRequest", "export interface DirectorV2PlanResponse"),
+            ("export async function planClipPromptsAndImages", "// --- Short Film Director ---"),
+            ("export async function planShortFilmPrompts", "export async function getLlmStreamStatus"),
+            ("export async function planShortFilmScript", "// --- CivitAI Browser ---"),
+        )
+        for start, end in request_types:
+            with self.subTest(request=start):
+                declaration = CLIENT[CLIENT.index(start):CLIENT.index(end, CLIENT.index(start))]
+                self.assertIn("explicit_output?: boolean", declaration)
+
+    def test_host_notice_is_shared_while_per_job_explicit_intent_stays_local(self):
         self.assertIn("{machineControls && <SettingsDrawer />}", APP_SOURCE)
+        self.assertIn("Accept for this host", CONTROLS)
+        self.assertIn("acceptHostTerm('lawful_use')", CONTROLS)
+        self.assertIn("HOST_TERM_NOTICES.lawful_use.text", CONTROLS)
+        self.assertIn("version: 1", HOST_TERMS_UI)
+        self.assertIn("provider's terms and privacy policy apply separately", CONTROLS)
+        self.assertIn("/api/v1/host-terms/accept", CLIENT)
+        self.assertIn("state.activeWorkspace", STORE)
+        self.assertIn("_queueHostTermsOperation", STORE)
+        self.assertIn("document.current_version !== HOST_TERM_NOTICES[term].version", STORE)
         self.assertIn("const servicesConfigError = useStore", SERVICES)
-        self.assertIn("{servicesConfigError}", SERVICES)
         self.assertIn("clearServicesConfigError", SERVICES)
-        self.assertIn("nsfw_accepted_at: new Date().toISOString()", SERVICES)
-        self.assertIn("void updateConfig({", SERVICES)
+        self.assertNotIn("nsfw_accepted_at", SERVICES)
+        self.assertIn("await updateConfig({ nsfw_mode: true })", SERVICES)
+        self.assertIn("Each job's Explicit choice remains separate", SERVICES)
         self.assertIn("servicesConfigError: message", STORE)
 
-    def test_profiles_and_mature_output_restore_enforce_job_policy(self):
+    def test_mobile_notice_actions_are_reachable_in_scrollable_safe_area_surfaces(self):
+        self.assertIn("h-[100dvh]", SETTINGS_DRAWER)
+        self.assertIn("min-h-0 flex-1 overflow-y-auto overscroll-contain", SETTINGS_DRAWER)
+        self.assertIn("safe-area-inset-bottom", SETTINGS_DRAWER)
+        self.assertNotIn("h-[calc(100%-96px)]", SETTINGS_DRAWER)
+
+        for source in (CONTROLS, INPUTS_PANEL, H3_PLAN_DIALOG):
+            with self.subTest(source=source[:40]):
+                self.assertIn("flex-col items-stretch", source)
+                self.assertIn("w-full shrink-0 rounded", source)
+                self.assertIn("sm:w-auto", source)
+
+        self.assertIn("max-h-[calc(100dvh-1.5rem)]", H3_PLAN_DIALOG)
+        self.assertIn("safe-area-inset-bottom", H3_PLAN_DIALOG)
+        self.assertIn("min-h-0 overflow-y-auto overscroll-contain", H3_PLAN_DIALOG)
+        self.assertIn("max-h-[calc(100dvh-1.5rem)]", WELCOME)
+        self.assertIn("sticky bottom-0", WELCOME)
+        self.assertIn("safe-area-inset-bottom", WELCOME)
+
+    def test_profiles_and_output_restore_preserve_only_user_policy(self):
         profile_block = STORE[
             STORE.index("applyH3PerformanceProfile: async (id) => {"):
             STORE.index("loadModelOptions: async", STORE.index("applyH3PerformanceProfile: async (id) => {"))
@@ -204,12 +302,13 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
             STORE.index("const defaultParams:", STORE.index("async function _applyH3ServerProfile("))
         ]
         self.assertIn("_applyH3ServerProfile(profile, id, seq, get, set)", profile_block)
-        self.assertIn("_modelTypeIsMature(state, target)", profile_helper)
-        self.assertIn("explicitOutput: true, privateOutput: true", profile_helper)
+        self.assertNotIn("_modelTypeIsMature", profile_helper)
+        self.assertNotIn("explicitOutput: true, privateOutput: true", profile_helper)
         self.assertNotIn("params:", explicit_setter)
         self.assertIn("const restoredExplicitOutput", output_restore)
         self.assertIn("selectedOutputMeta.explicit === true", output_restore)
-        self.assertIn("!!model?.nsfw_only", output_restore)
+        self.assertNotIn("!!model?.nsfw_only", output_restore)
+        self.assertNotIn("_loraNeedsExplicit", output_restore)
         self.assertIn("explicitOutput: true, privateOutput: true", output_restore)
 
     def test_h3_pinkcherry_reconciliation_uses_server_fallback_truth(self):
@@ -262,43 +361,34 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("normalizeH3EditableProfile", output_restore)
         self.assertIn("h3ProfileMatches(profile, state.params", STORE)
 
-    def test_mature_model_and_lora_selections_lock_explicit_on(self):
-        self.assertIn("disabled={matureSelectionActive}", CONTROLS)
-        self.assertIn("A selected mature model or LoRA requires", CONTROLS)
-        self.assertIn(
-            "if (!enabled && _activeSelectionHasMatureComponent(get())) return",
-            STORE,
-        )
-        self.assertIn("_modelTypeIsMature(s, modelType)", STORE)
-        self.assertIn("_matureLoraKey(modelType, filename)", STORE)
-        self.assertIn("classifiedLoraNames", STORE)
-        self.assertIn("_loraNeedsExplicit", STORE)
-        self.assertIn("registerMatureLoraFlags(modelType, r.loras)", LORAS)
-        self.assertIn("registerMatureLoraFlags(modelType, r.loras)", DIRECTOR_LORAS)
-        self.assertIn(
-            "activatedLoras.includes(name) || loraDetailsReady",
-            DIRECTOR_LORAS,
-        )
+    def test_model_and_lora_selections_do_not_lock_explicit_on(self):
+        for token in (
+            "matureSelectionActive",
+            "_activeSelectionHasMatureComponent",
+            "_modelTypeIsMature",
+            "_matureLoraKey",
+            "classifiedLoraNames",
+            "_loraNeedsExplicit",
+            "registerMatureLoraFlags",
+        ):
+            with self.subTest(token=token):
+                self.assertNotIn(token, STORE + CONTROLS + LORAS + DIRECTOR_LORAS)
         sidebar_mode = STORE[
             STORE.index("setSidebarMode: (mode) => {"):
             STORE.index("directorUploadAndAnalyze:", STORE.index("setSidebarMode: (mode) => {"))
         ]
-        self.assertIn("_activeSelectionHasMatureComponent(get())", sidebar_mode)
-        self.assertIn("explicitOutput: true, privateOutput: true", sidebar_mode)
+        self.assertNotIn("explicitOutput: true, privateOutput: true", sidebar_mode)
         pipeline_restore = STORE[
             STORE.index("loadDirectorFromPipeline: async"):
             STORE.index("loraBrowserOpen:", STORE.index("loadDirectorFromPipeline: async"))
         ]
-        self.assertIn("_activeSelectionHasMatureComponent(get())", pipeline_restore)
-        self.assertIn("explicitOutput: true, privateOutput: true", pipeline_restore)
+        self.assertNotIn("explicitOutput: true, privateOutput: true", pipeline_restore)
 
-    def test_lora_selection_fails_closed_until_mature_metadata_is_known(self):
+    def test_lora_selection_does_not_wait_for_content_metadata(self):
         for source in (LORAS, DIRECTOR_LORAS):
-            self.assertIn("loraDetailsReady", source)
-            self.assertIn("New selections are disabled", source)
+            self.assertNotIn("loraDetailsReady", source)
+            self.assertNotIn("New selections are disabled", source)
             self.assertIn("detailsRequest !== loraDetailsRequest.current", source)
-        self.assertIn("if (!loraDetailsReady && !isActivated) return false", LORAS)
-        self.assertIn("{loraDetailsReady && (", DIRECTOR_LORAS)
         self.assertIn("<DirectorPresetPicker", DIRECTOR_LORAS)
 
     def test_fresh_studio_video_defaults_to_h3_high(self):

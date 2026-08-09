@@ -79,7 +79,7 @@ class TestDirectorFailureUi(unittest.TestCase):
 
     def test_chat_generation_state_uses_active_predicate_not_phase_presence(self):
         self.assertIn(
-            "const pipelineActive = useStore(s => isDirectorPipelineActive(s.pipelineStatus))",
+            "const pipelineActive = isDirectorPipelineActive(pipelineStatus)",
             CHAT,
         )
         self.assertIn("isGenerating={isGenerating || pipelineActive}", CHAT)
@@ -97,14 +97,14 @@ class TestDirectorFailureUi(unittest.TestCase):
         self.assertIn("directorLoading: false", update)
         self.assertIn("directorLoading: true", update)
         self.assertIn("pipelinePolling: false", update)
-        self.assertIn("llmStreamDone: true", update)
+        self.assertNotIn("llmStreamDone", update)
         self.assertIn("directorError: status.error || 'Pipeline stopped'", update)
         self.assertIn("status: 'error'", update)
         self.assertIn("const pipelineBlocked = status.status === 'blocked'", update)
         self.assertIn("pipelineTerminal || pipelineBlocked", update)
 
         transitions = re.search(
-            r"// Handle phase transitions([\s\S]+?)// Handle LLM streaming",
+            r"// Handle phase transitions([\s\S]+?)// The exact pipeline status",
             STORE,
         )
         self.assertIsNotNone(transitions)

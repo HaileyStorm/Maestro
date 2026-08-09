@@ -9,13 +9,26 @@ import os
 import gc
 import hashlib
 import functools
+import math
+import re
 import time
 import subprocess
 import threading
 import logging
 import requests
+from contextlib import contextmanager
 from urllib.parse import unquote, urlsplit
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
+
+from services.llm_response_assist import (
+    PrefixEchoStripper,
+    RequestProgress,
+    apply_local_assistant_prefill,
+    normalize_response_assist,
+    response_assist_refused,
+    response_assist_retry_enabled,
+    strip_one_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +59,14 @@ _speed_hardware_identity_cache: dict[str, tuple[str, dict]] = {}
 _SPEED_OBSERVATION_VERSION = 2
 _MAX_SPEED_OBSERVATIONS = 96
 
-# Rolling tail of llama-server's stdout/stderr, drained by a background
-# thread once the server is up. Two jobs: (1) keep the OS pipe from
-# filling — an undrained PIPE deadlocks the server after ~64 KB of logs,
-# which looked like a permanent "frozen at Planning…" hang on long runs;
-# (2) give us the last lines to quote when the subprocess dies mid-request
-# so the pipeline error is actionable instead of a bare ConnectionError.
+# Bounded, content-free diagnostics for llama-server's combined stdout/stderr.
+# The pipe is drained immediately after launch so cold-load output cannot fill
+# it and deadlock the child. Raw lines are never retained or written to disk.
 import collections as _collections
 _server_log: "_collections.deque[str]" = _collections.deque(maxlen=200)
 _log_reader: Optional[threading.Thread] = None
+_log_reader_generation: int = 0
+_LOG_DRAIN_EXIT_WAIT_SEC: float = 2.0
 
 # Provider state: "local" | "remote" | "openai" | "anthropic"
 _provider: str = "local"
@@ -74,6 +86,23 @@ _stream_lock = threading.Lock()
 _download_state_lock = threading.Lock()
 _download_state: dict = {}
 _loading_model_id: str = ""
+_model_activity = threading.local()
+
+
+def _begin_model_activity() -> None:
+    """Enter a re-entrant activity scope on the current worker thread."""
+    _model_activity.depth = getattr(_model_activity, "depth", 0) + 1
+
+
+def _end_model_activity(identity: tuple) -> bool:
+    """Finalize idle expiry once, when the outermost activity exits."""
+    depth = getattr(_model_activity, "depth", 0)
+    if depth > 1:
+        _model_activity.depth = depth - 1
+        return False
+    if hasattr(_model_activity, "depth"):
+        del _model_activity.depth
+    return _finish_model_activity(identity)
 
 
 def _with_model_lease(function):
@@ -81,8 +110,96 @@ def _with_model_lease(function):
     @functools.wraps(function)
     def wrapped(*args, **kwargs):
         with _lock:
-            return function(*args, **kwargs)
+            _begin_model_activity()
+            identity = _loaded_model_key
+            try:
+                return function(*args, **kwargs)
+            finally:
+                # generate_chat may cold-load or intentionally switch the
+                # model inside this re-entrant lease. External switches cannot
+                # race the lock, so the terminal resident identity is the
+                # activity identity in that case. A crash/unload leaves it
+                # empty and cannot accidentally re-arm the prior model.
+                _end_model_activity(_loaded_model_key or identity)
     return wrapped
+
+
+def _with_stream_done_finally(function):
+    """Publish terminal legacy stream state even when cancellation escapes."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        global _stream_done
+        try:
+            return function(*args, **kwargs)
+        finally:
+            with _stream_lock:
+                _stream_done = True
+    return wrapped
+
+
+def _with_failed_load_cleanup(function):
+    """Leave either the prior exact model or a fully unloaded retry state."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        global _loading_model_id
+        try:
+            return function(*args, **kwargs)
+        except Exception:
+            with _lock:
+                if _loaded_model_key and is_loaded():
+                    # Artifact/runtime preparation can fail before the prior
+                    # resident model is replaced. Preserve it, but clear the
+                    # attempted model's transient status.
+                    with _runtime_status_lock:
+                        _loading_model_id = ""
+                else:
+                    # A newly spawned server is not a valid resident until its
+                    # exact load key is committed after /health succeeds.
+                    _unload_inner()
+            raise
+    return wrapped
+
+
+@contextmanager
+def loaded_model_lease(
+    *,
+    model_id: str = "",
+    device: str = "cpu",
+    force_reload: bool = False,
+    provider: str = "local",
+    remote_url: str = "",
+    api_key: str = "",
+    local_gguf_path: str = "",
+    gguf_file_override: str = "",
+):
+    """Hold one exact loaded-model identity across caller-owned inference.
+
+    This synchronous lease is intended for route/worker code that must keep a
+    cold load and a subsequent callback on the same singleton model. Calls to
+    :func:`generate` are safe inside the lease because the lock is re-entrant.
+    The yielded tuple is the exact resident identity used for finalization.
+    """
+    with _lock:
+        _begin_model_activity()
+        identity = _loaded_model_key
+        try:
+            load_model(
+                model_id=model_id,
+                device=device,
+                force_reload=force_reload,
+                provider=provider,
+                remote_url=remote_url,
+                api_key=api_key,
+                local_gguf_path=local_gguf_path,
+                gguf_file_override=gguf_file_override,
+            )
+            identity = _loaded_model_key
+            if not identity or not is_loaded():
+                raise RuntimeError("LLM did not finish loading")
+            _cancel_idle_timer()
+            yield identity
+        finally:
+            _end_model_activity(_loaded_model_key or identity)
 
 # Last call state — for pipeline dashboard capture. The user prompt is
 # captured alongside the system prompt so the Director Dashboard can
@@ -94,14 +211,27 @@ _last_system_prompt: str = ""
 _last_user_prompt: str = ""
 _last_thinking_text: str = ""
 
-# Defaults — Gemma 4 4B as of 2026-05-03. Smaller (~5 GB weights vs the
-# Qwen3.5 9B Opus build's ~6.85 GB), runs comfortably on lower-VRAM
-# machines, and is fast enough that Director planning feels snappy
-# rather than ponderous. Keep these in sync with the matching MODELS
-# entry below (Abhiray/gemma-4-E4B-it-heretic-GGUF).
-DEFAULT_HF_REPO = "Abhiray/gemma-4-E4B-it-heretic-GGUF"
-DEFAULT_GGUF_FILE = "gemma-4-E4B-it-heretic-Q4_K_M.gguf"
+# Heavy text-only authoring and Director planning use the strongest local
+# abliterated model by default. Generic sparkle/pre-generation enhancement is
+# lighter rewrite work and uses the faster Qwen 27B model, whose projector also
+# makes it safe for image-bearing enhancement. Generation models with their own
+# compatible ``prompt_enhancer_model`` still override the generic selection.
+DEFAULT_HF_REPO = "MoonRide/gemma-4-31B-it-heretic-ara-GGUF"
+DEFAULT_ENHANCE_HF_REPO = (
+    "Youssofal/Qwen3.6-27B-Abliterated-Heretic-Uncensored-GGUF"
+)
+DEFAULT_GGUF_FILE = "gemma-4-31B-it-heretic-ara-Q4_K_M.gguf"
 DEFAULT_MMPROJ_FILE = "mmproj-F16.gguf"
+RETIRED_MODEL_IDS = frozenset({
+    "Abhiray/gemma-4-E4B-it-heretic-GGUF",
+    "Jiunsong/supergemma4-26b-uncensored-gguf-v2",
+})
+
+
+def _migrate_retired_model_id(model_id: str) -> str:
+    return DEFAULT_HF_REPO if model_id in RETIRED_MODEL_IDS else model_id
+
+
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CACHE_DIR = os.path.join(_BASE_DIR, "..", "ckpts", "llm")
 DEFAULT_BIN_DIR = os.path.join(DEFAULT_CACHE_DIR, "bin")
@@ -140,6 +270,46 @@ def _strip_thinking_tags(text: str) -> str:
     text = _GEMMA_THINKING_UNCLOSED_RE.sub("", text)
     return text
 
+
+def _public_response_text(
+    raw_content: str,
+    assistant_prefix: str,
+    *,
+    strip_prefix: bool,
+) -> str:
+    """Return exactly the response text eligible for publication/detection."""
+    return strip_one_prefix(
+        _strip_thinking_tags(raw_content),
+        assistant_prefix,
+        enabled=strip_prefix,
+    )
+
+
+def _inline_thinking_blocks(raw_content: str) -> str:
+    """Extract exact inline reasoning blocks for the legacy dashboard only."""
+    if not isinstance(raw_content, str) or not raw_content:
+        return ""
+    matches = []
+    for pattern in (
+        _THINKING_TAG_RE,
+        _THINKING_TAG_UNCLOSED_RE,
+        _GEMMA_THINKING_RE,
+        _GEMMA_THINKING_UNCLOSED_RE,
+    ):
+        matches.extend(
+            (match.start(), match.end(), match.group(0))
+            for match in pattern.finditer(raw_content)
+        )
+    matches.sort(key=lambda item: (item[0], item[1]))
+    blocks = []
+    last_end = -1
+    for start, end, value in matches:
+        if start < last_end:
+            continue
+        blocks.append(value)
+        last_end = end
+    return "".join(blocks)
+
 # ─── VRAM estimator ────────────────────────────────────────────────────
 # Each registry entry below carries:
 #   weights_gb: GB on disk for the .gguf weights (≈ VRAM when loaded)
@@ -164,7 +334,6 @@ LLM_ARCHITECTURES = {
     # Gemma 3/4: 5:1 local:global attention pattern, local window 4096.
     # Most layers' KV is bounded by the window regardless of total ctx.
     "gemma4-2b":  {"layers": 26, "kv_heads": 4,  "head_dim": 256, "sliding_window": 4096, "global_layer_ratio": 1/6},
-    "gemma4-4b":  {"layers": 34, "kv_heads": 4,  "head_dim": 256, "sliding_window": 4096, "global_layer_ratio": 1/6},
     # Gemma 4 12B "unified" — 48 layers per the model card. kv_heads/head_dim
     # mirror Gemma 3 12B as an approximation; this only feeds the VRAM size hint,
     # not functional loading, so refine if the real config differs.
@@ -350,17 +519,6 @@ MODEL_REGISTRY = {
             "frequency_penalty": 0, "presence_penalty": 0,
         },
     },
-    "Abhiray/gemma-4-E4B-it-heretic-GGUF": {
-        "label": "Gemma 4 4B Heretic Uncensored (Vision, Fast) (Recommended)",
-        "gguf_file": "gemma-4-E4B-it-heretic-Q4_K_M.gguf",
-        "mmproj_file": "mmproj-F16.gguf",
-        "weights_gb": 4.97, "mmproj_gb": 0.92, "arch": "gemma4-4b",
-        "thinking_style": "gemma",
-        "sampling_defaults": {
-            "temperature": 1.0, "top_p": 0.95, "top_k": 64,
-            "frequency_penalty": 0, "presence_penalty": 0,
-        },
-    },
     "SulphurAI/Sulphur-2-base": {
         # Sulphur-2's own uncensored prompt enhancer — a ~9.6B multimodal
         # (text+image) llama.cpp model the checkpoint author trained to prompt
@@ -379,110 +537,33 @@ MODEL_REGISTRY = {
             "frequency_penalty": 0, "presence_penalty": 0,
         },
     },
-    "Jiunsong/supergemma4-26b-uncensored-gguf-v2": {
-        "label": "Gemma 4 26B MoE Uncensored (Fast)",
-        "gguf_file": "supergemma4-26b-uncensored-fast-v2-Q4_K_M.gguf",
-        # No mmproj — the upstream repo doesn't publish one, and the
-        # supergemma fine-tune fused the vision adapter back into the
-        # base weights. Text-only model.
+    "MoonRide/gemma-4-31B-it-heretic-ara-GGUF": {
+        "label": "Gemma 4 31B Heretic ARA Q4_K_M (Text)",
+        "gguf_file": "gemma-4-31B-it-heretic-ara-Q4_K_M.gguf",
         "mmproj_file": None,
-        "weights_gb": 16.8, "mmproj_gb": 0.0, "arch": "gemma4-26b",
-        # Use the embedded jinja template (default behavior — no
-        # disable_jinja flag set). Earlier attempts tried forcing
-        # `--chat-template gemma` to override what appeared to be a
-        # broken "Neutral" embedded template, but that produced a
-        # near-empty 3-token prompt at runtime — llama-server's gemma
-        # template either isn't recognized in this build or doesn't
-        # round-trip OpenAI-format messages correctly. The embedded
-        # template is fine; the original failure was missing
-        # repeat_penalty (below) AND no thinking budget allocation.
-        #
-        # `thinking_style: "gemma_prefix"` — the SuperGemma fine-tune's
-        # embedded "Neutral" chat template doesn't honor
-        # chat_template_kwargs.enable_thinking. Verified empirically:
-        # with thinking_style="gemma" (kwarg-based activation), the
-        # streaming finalizer reported `reasoning_content: 0 chars,
-        # gemma_inline_thinking: 0 chars` despite the kwarg being sent.
-        # The model just generated 29,521 chars of raw content that
-        # eventually degraded into Unicode garbage.
-        #
-        # This is still a Gemma 4 variant — same trained-in thinking
-        # activation token (`<|think|>`) as the Heretic / Abliterated
-        # fine-tunes whose templates DO honor the kwarg. The
-        # `gemma_prefix` style reproduces what the kwarg-aware path
-        # would have done: injects the literal `<|think|>` at the top
-        # of the system prompt. llama.cpp's tokenizer recognizes it as
-        # the model's special activation token regardless of whether
-        # the string came from the chat template's emission or from
-        # raw system-prompt text.
-        #
-        # If a future fine-tune of this model fixes the template to
-        # honor enable_thinking, flip back to thinking_style="gemma".
-        "thinking_style": "gemma_prefix",
-        #
-        # Sampling: escalated past LM Studio's defaults because
-        # Director Pass 1 in Music Video mode sends a 5-10k token
-        # prompt (rules + audio analysis + structured JSON ask) that
-        # most chat-app interactions never approach. LM Studio's
-        # baseline `repeat_penalty: 1.1` over a 64-token window was
-        # enough for classification (200-token prompts) but Pass 1
-        # still collapsed into single-suffix repetition like
-        # "ness ness ness ness..." — a common BPE token the model
-        # locks onto when the long prompt overwhelms attention.
-        #
-        # Stack:
-        #   - temperature: 0.7 (down from 0.8) — less random sampling
-        #     starves the cascade of variation that lets it rebuild
-        #     after the penalty knocks it down
-        #   - top_p: 0.92 (down from 0.95) — tighter nucleus
-        #   - top_k: 40, min_p: 0.05 — LM Studio standard
-        #   - repeat_penalty: 1.15 (up from 1.1) — stronger logit
-        #     divisor against repeated tokens
-        #   - repeat_last_n: 256 (default is 64) — wider penalty
-        #     window protects against word-spaced repetition that
-        #     can build up across multi-sentence stretches
-        #   - frequency_penalty: 0.1 — OpenAI-style accumulating
-        #     penalty as belt-and-suspenders against the same token
-        #     surviving the repeat_penalty hit
-        #   - presence_penalty: 0.1 — diversity nudge
-        #
-        # These are more aggressive than LM Studio's defaults, which
-        # is fine: LM Studio's default user is doing chat, not
-        # 8k-token Director planning. We're paying for the larger
-        # prompt with tighter sampling.
+        "weights_gb": 18.7, "mmproj_gb": 0.0, "arch": "gemma4-27b",
+        "thinking_style": "gemma",
         "sampling_defaults": {
-            "temperature": 0.7, "top_p": 0.92, "top_k": 40,
-            "min_p": 0.05,
-            "repeat_penalty": 1.15,
-            "repeat_last_n": 256,
-            "frequency_penalty": 0.1, "presence_penalty": 0.1,
+            "temperature": 1.0, "top_p": 0.95, "top_k": 64,
+            "frequency_penalty": 0, "presence_penalty": 0,
         },
-        # 26B-A4B MoE: 26B total params on disk (16.8 GB at Q4_K_M),
-        # but only ~4B active per token thanks to the mixture-of-
-        # experts routing → generation speed closer to a 4B model
-        # despite the bigger weight footprint and 26B-scale quality.
-        #
-        # KV cache: q8_0 instead of q4_0. MoE attention is more
-        # sensitive to cache lossy-ness because routing decisions are
-        # amplified through the small active expert subset.
-        #
-        # Context: 32k. Director Mode screenplay generation rarely
-        # needs more, and the lower ceiling offsets the q8_0 memory
-        # bump so VRAM stays comparable to the 31B Abliterated entry.
         "extra_flags": [
-            "-c", "32768",
+            "-c", "65536",
             "-np", "1",
             "-fa", "on",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0",
+            "--cache-type-k", "q4_0",
+            "--cache-type-v", "q4_0",
         ],
     },
     "paperscarecrow/Gemma-4-31B-it-abliterated-gguf": {
+        # Registry-only refinement model. It remains selectable by exact ID
+        # for owner-authorized local evaluation but is intentionally omitted
+        # from the curated public picker below.
         "label": "Gemma 4 31B Abliterated Q4_K_M (Vision)",
         "gguf_file": "gemma-4-31b-abliterated-Q4_K_M.gguf",
         "mmproj_file": "mmproj-gemma-4-31B-it-BF16.gguf",
-        "mmproj_repo": "ggml-org/gemma-4-31B-it-GGUF",  # mmproj from official repo
-        "weights_gb": 17.4, "mmproj_gb": 1.12, "arch": "gemma4-27b",
+        "mmproj_repo": "ggml-org/gemma-4-31B-it-GGUF",
+        "weights_gb": 18.7, "mmproj_gb": 1.2, "arch": "gemma4-27b",
         "thinking_style": "gemma",
         "sampling_defaults": {
             "temperature": 1.0, "top_p": 0.95, "top_k": 64,
@@ -505,7 +586,7 @@ MODEL_REGISTRY = {
         # passes did not fix it): gemma4_unified support in llama.cpp is brand-new
         # (PR #24118, 2026-06-04) and this is an abliterated build, which erodes
         # long-form structured coherence. Kept selectable; revisit when llama.cpp's
-        # unified support matures. For Director use the 4B / 26B / 31B entries.
+        # unified support matures. Prefer the registered 31B text authoring model.
         "label": "Gemma 4 12B Abliterated (Text, Experimental)",
         "gguf_file": "gemma-4-12B-it-abliterated-uncensored.i1-Q4_K_M.gguf",
         # Encoder-free "gemma4_unified" architecture: its multimodal projector
@@ -518,8 +599,6 @@ MODEL_REGISTRY = {
         # Template (verified from the GGUF) honors enable_thinking and activates
         # with <|think|>; Maestro already sends the kwarg + launches with --jinja,
         # so "gemma" (kwarg) activation is correct here — do NOT switch to
-        # gemma_prefix (this template emits an empty <|channel>thought<channel|>
-        # when thinking is off, which would fight a manually-injected token).
         "thinking_style": "gemma",
         # Repeat-loop fix — COMPLEMENT the caller, don't clobber it.
         # registry sampling_defaults OVERRIDE per-call values (see
@@ -542,6 +621,10 @@ MODEL_REGISTRY = {
     },
 }
 
+# Defensive removal keeps retired IDs out of every effective registry lookup.
+for _retired_model_id in RETIRED_MODEL_IDS:
+    MODEL_REGISTRY.pop(_retired_model_id, None)
+
 # Build size_hint strings once at module load. Re-runs if you `import importlib;
 # importlib.reload(llm_service)` after editing the registry.
 for _repo_id, _info in MODEL_REGISTRY.items():
@@ -558,9 +641,7 @@ for _repo_id, _info in MODEL_REGISTRY.items():
 _PUBLIC_MODEL_ORDER = [
     "Youssofal/Qwen3.6-27B-Abliterated-Heretic-Uncensored-GGUF",
     "Nesuwka/gemma-4-E2B-it-heretic-ara-Q4_K_M-GGUF",
-    "Abhiray/gemma-4-E4B-it-heretic-GGUF",                         # default (Recommended)
-    "Jiunsong/supergemma4-26b-uncensored-gguf-v2",
-    "paperscarecrow/Gemma-4-31B-it-abliterated-gguf",
+    "MoonRide/gemma-4-31B-it-heretic-ara-GGUF",                   # Director default
 ]
 
 CHAT_MAX_MESSAGES = 64
@@ -1151,6 +1232,50 @@ def _apply_model_defaults(temperature: float, top_p: float, payload: dict) -> tu
     return temperature, top_p
 
 
+def _apply_request_sampling(
+    payload: dict,
+    temperature: float,
+    top_p: float,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+) -> tuple[float, float]:
+    """Merge caller sampling options and model defaults in one stable order."""
+    if frequency_penalty > 0:
+        payload["frequency_penalty"] = frequency_penalty
+    if presence_penalty > 0:
+        payload["presence_penalty"] = presence_penalty
+    temperature, top_p = _apply_model_defaults(temperature, top_p, payload)
+    payload["temperature"] = max(temperature, 0.01)
+    payload["top_p"] = top_p
+    return temperature, top_p
+
+
+def _build_user_content(prompt: str, image_paths) -> tuple[object, bool]:
+    """Encode authorized images or fail closed before constructing a request."""
+    if not image_paths:
+        return prompt, False
+    if (
+        isinstance(image_paths, (str, bytes))
+        or not isinstance(image_paths, Sequence)
+        or len(image_paths) > 8
+        or any(not isinstance(path, str) or not path for path in image_paths)
+    ):
+        raise ValueError("image_paths must be a list of at most 8 image files")
+    if not _vision_available:
+        raise ValueError("The selected LLM has no available vision projector")
+    content_parts = []
+    for image_path in image_paths:
+        data_url = _image_to_data_url(image_path)
+        if not data_url:
+            raise ValueError("An authorized image is unavailable")
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": data_url},
+        })
+    content_parts.append({"type": "text", "text": prompt})
+    return content_parts, True
+
+
 def _prepare_thinking(system_prompt: str, enable_thinking: Optional[bool], thinking_budget: int) -> tuple[str, Optional[bool], int]:
     """Handle model-specific thinking mode activation.
 
@@ -1164,15 +1289,9 @@ def _prepare_thinking(system_prompt: str, enable_thinking: Optional[bool], think
     `<|channel>thought\\n...<channel|>` and switches to its actual
     answer after the closing marker.
 
-    Do NOT inject `<|think|>` into the system message text WHEN THE
-    CHAT TEMPLATE ALREADY EMITS IT — for Heretic/Abliterated fine-tunes
-    whose templates honor enable_thinking, manual injection is
-    redundant and risks double-tokenization. For fine-tunes whose
-    templates ignore the kwarg entirely (e.g. SuperGemma's "Neutral"
-    template), see the separate `gemma_prefix` style below — that path
-    relies on llama.cpp's tokenizer recognizing the special token even
-    when it appears in raw system-prompt text rather than from the
-    chat template's emission.
+    Do not inject `<|think|>` into the system message text when the chat
+    template already emits it. Manual injection is redundant and risks
+    double-tokenization.
 
     Qwen 3.x: same `enable_thinking` kwarg path. The Qwen chat template
     inserts `<think>` automatically when the kwarg is true.
@@ -1209,69 +1328,6 @@ def _prepare_thinking(system_prompt: str, enable_thinking: Optional[bool], think
         stripped = system_prompt.lstrip()
         if stripped.startswith("<|think|>"):
             system_prompt = stripped[len("<|think|>"):].lstrip("\n")
-    elif style == "gemma_prefix":
-        # For Gemma 4 fine-tunes whose embedded chat template doesn't
-        # honor chat_template_kwargs.enable_thinking — symptom: both
-        # "gemma" and "qwen" styles produce 0 chars of reasoning_content
-        # because the kwarg never reaches the model.
-        #
-        # Strategy: inject the canonical Gemma 4 thinking-activation
-        # token literally at the top of the system prompt. The base
-        # Gemma 4 chat templates do exactly the same thing when the
-        # enable_thinking kwarg is honored — they emit the string
-        # `<|think|>` at the top of the system turn — so injecting it
-        # ourselves reproduces what the kwarg-aware path would have
-        # done. llama.cpp's tokenizer recognizes `<|think|>` as a
-        # special token from the model's added_tokens, and tokenizes
-        # the injected text the same way regardless of whether it
-        # came from a chat template or raw user text.
-        #
-        # The earlier "DO NOT inject <|think|>" comment in this file
-        # was based on testing against the Heretic fine-tune, where
-        # the kwarg already worked and manual injection was redundant
-        # + risked double-tokenization. For models where the kwarg
-        # doesn't work at all (SuperGemma's "Neutral" template), this
-        # is the right and only option.
-        #
-        # Honor explicit opt-out from caller.
-        if enable_thinking is False:
-            return system_prompt, False, 0
-        # Return None for enable_thinking — the calling code (generate /
-        # generate_streaming) only includes the kwarg in the payload when
-        # `enable_thinking is not None`. Returning False here would send
-        # `enable_thinking: False` to the chat template, which on any
-        # template that DOES honor the kwarg would EXPLICITLY DISABLE
-        # thinking — actively fighting our `<|think|>` prefix injection.
-        # Returning None skips the kwarg entirely, letting the literal
-        # token activation be the sole signal.
-        enable_thinking = None
-        if thinking_budget <= 0:
-            # Empirical sizing for SuperGemma-style verbose thinkers:
-            # at 4096 the classification call (caller max_new_tokens=400)
-            # produced 14,598 chars (~3650 tokens) of reasoning_content
-            # and hit max_tokens still mid-thought — never reached the
-            # closing `<channel|>` marker, parser put everything into
-            # reasoning_content, content came back empty. Bumping the
-            # default to 12288 gives the model room to wrap its
-            # reasoning AND emit the final answer; if a future caller
-            # needs more, it can override explicitly.
-            #
-            # Why so much higher than the "gemma" style's 2048 default:
-            #   - "gemma" path uses framework-level activation; thinking
-            #     streams via the separate `reasoning_content` channel
-            #     and doesn't compete with the content for max_tokens.
-            #   - "gemma_prefix" path uses inline activation; thinking
-            #     and content share one max_tokens budget, so the
-            #     budget must cover BOTH.
-            #   - SuperGemma in particular is more verbose than the
-            #     Heretic variants — observed 3500+ tokens for what
-            #     should be a short classification task.
-            thinking_budget = 12288
-        # Avoid double-prefixing if the activator is already present
-        # (e.g. a previous pass injected it, or the caller did manually).
-        stripped = system_prompt.lstrip()
-        if not stripped.startswith("<|think|>"):
-            system_prompt = "<|think|>\n" + system_prompt
     return system_prompt, enable_thinking, thinking_budget
 
 
@@ -3230,6 +3286,7 @@ def _build_llama_server_command(
     return cmd
 
 
+@_with_failed_load_cleanup
 def load_model(
     model_id: str = "",
     device: str = "cpu",
@@ -3276,6 +3333,7 @@ def load_model(
         )
         with _lock:
             if is_loaded() and _loaded_model_key == load_key and not force_reload:
+                _reset_idle_timer(load_key)
                 return
             if is_loaded() or _process is not None:
                 _unload_inner()
@@ -3298,10 +3356,14 @@ def load_model(
                 _runtime_speed_variant_digest = ""
                 _loaded_model_key = load_key
             print(f"[LLM] Connected to {provider} provider: model={model_id}, url={remote_url or 'API'}")
-            _reset_idle_timer()
+            _reset_idle_timer(load_key)
         return
 
     repo_id = model_id or DEFAULT_HF_REPO
+    migrated_repo_id = _migrate_retired_model_id(repo_id)
+    if migrated_repo_id != repo_id:
+        print("[LLM] Retired saved model selection migrated to the text default")
+        repo_id = migrated_repo_id
     requested_device = "cuda" if str(device).lower() == "cuda" else "cpu"
 
     with _lock:
@@ -3394,6 +3456,7 @@ def load_model(
             _runtime_launch_identity(server_exe, extra_flags, disable_jinja),
         )
         if is_loaded() and _loaded_model_key == load_key and not force_reload:
+            _reset_idle_timer(load_key)
             return
         if is_loaded() or _process is not None:
             _unload_inner()
@@ -3439,6 +3502,9 @@ def load_model(
         )
         with _runtime_status_lock:
             _process = process
+        # Start the sole stdout consumer immediately. Cold loads can emit far
+        # more than a pipe buffer before /health becomes ready.
+        log_drain_done = _start_log_reader(process)
 
         # Wait for server to be ready (poll /health)
         # Scale timeout with model size — large models need more time to load
@@ -3447,11 +3513,19 @@ def load_model(
         ready = False
         for i in range(load_timeout):
             if _process.poll() is not None:
-                # Process exited — read output for error details
+                # The background reader is the sole stdout consumer.
                 exit_code = _process.returncode
-                output = _process.stdout.read().decode(errors="replace") if _process.stdout else ""
+                # A confirmed process exit closes the pipe. Wait for this
+                # process's own reader to observe EOF and publish every
+                # bounded diagnostic chunk, but never wait indefinitely for a
+                # misbehaving stream implementation.
+                log_drain_done.wait(timeout=_LOG_DRAIN_EXIT_WAIT_SEC)
+                output = _server_log_tail(20)
                 _unload_inner()
-                raise RuntimeError(f"llama-server exited with code {exit_code}:\n{output[-2000:]}")
+                raise RuntimeError(
+                    f"llama-server exited with code {exit_code}. "
+                    f"Content-free diagnostic tail:\n{output}"
+                )
             try:
                 resp = requests.get(f"{_server_url()}/health", timeout=1)
                 if resp.status_code == 200:
@@ -3467,33 +3541,11 @@ def load_model(
             time.sleep(1)
 
         if not ready:
-            # Capture process output for debugging
-            server_output = ""
-            if _process and _process.stdout:
-                import select
-                try:
-                    # Non-blocking read of whatever output is available
-                    _process.stdout.flush()
-                    import threading
-                    lines = []
-                    def _read():
-                        try:
-                            for line in iter(_process.stdout.readline, b''):
-                                lines.append(line.decode(errors="replace"))
-                                if len(lines) > 50:
-                                    break
-                        except Exception:
-                            pass
-                    t = threading.Thread(target=_read, daemon=True)
-                    t.start()
-                    t.join(timeout=2)
-                    server_output = "".join(lines[-20:])
-                except Exception:
-                    pass
+            server_output = _server_log_tail(20)
             _unload_inner()
             raise RuntimeError(
                 f"llama-server did not become ready within {load_timeout}s (model: {file_size_gb:.1f}GB)\n"
-                f"Server output:\n{server_output}"
+                f"Content-free diagnostic tail:\n{server_output}"
             )
 
         with _runtime_status_lock:
@@ -3506,10 +3558,7 @@ def load_model(
             f"[LLM] Model loaded: {repo_id} ({file_size:.0f}MB) on "
             f"{profile['backend']}, port {_server_port}"
         )
-
-        # Start draining the server's output now that it's up. Without this
-        # the PIPE fills on a long run and the server blocks on write.
-        _start_log_reader(_process)
+        _reset_idle_timer(load_key)
 
 
 def _cancel_idle_timer():
@@ -3523,9 +3572,14 @@ def _cancel_idle_timer():
         _idle_timer = None
 
 
-def _reset_idle_timer():
+def _reset_idle_timer(expected_identity: Optional[tuple] = None) -> bool:
     """Reset the idle-unload timer. Called after each LLM request."""
     global _idle_timer
+    if getattr(_model_activity, "depth", 0) > 0:
+        return False
+    identity = _loaded_model_key if expected_identity is None else expected_identity
+    if not identity or _loaded_model_key != identity or not is_loaded():
+        return False
     _cancel_idle_timer()
     generation = _idle_timer_generation
     _idle_timer = threading.Timer(
@@ -3533,6 +3587,14 @@ def _reset_idle_timer():
     )
     _idle_timer.daemon = True
     _idle_timer.start()
+    return True
+
+
+def _finish_model_activity(identity: tuple) -> bool:
+    """Arm idle expiry only while the activity's exact model still resides."""
+    if not identity or _loaded_model_key != identity or not is_loaded():
+        return False
+    return _reset_idle_timer(identity)
 
 
 def _auto_unload(generation: Optional[int] = None):
@@ -3547,60 +3609,57 @@ def _auto_unload(generation: Optional[int] = None):
             _unload_inner()
 
 
-def _start_log_reader(proc: subprocess.Popen) -> None:
-    """Drain llama-server's stdout into `_server_log` in the background.
+def _start_log_reader(proc: subprocess.Popen) -> threading.Event:
+    """Immediately drain stdout into bounded, content-free diagnostics.
 
-    Prevents the OS pipe from filling (which deadlocks the server) and
-    keeps a rolling tail for crash diagnosis. The thread ends on its own
-    when the pipe closes (i.e. the process exits).
-
-    Also mirrors every line to logs/llm/llama-server.log (fresh file per
-    server launch) — the in-memory tail dies with the process, and a
-    server crash mid-request is exactly the moment a postmortem needs
-    the full output."""
-    global _log_reader
+    This function owns the only reader for ``proc.stdout``. Each raw chunk is
+    reduced to its byte count and a small runtime-signal vocabulary; neither
+    model output nor prompt-like text is retained or logged.
+    """
+    global _log_reader, _log_reader_generation
+    _log_reader_generation += 1
+    generation = _log_reader_generation
     _server_log.clear()
-    log_path = None
-    try:
-        log_dir = os.path.join(_BASE_DIR, "..", "..", "logs", "llm")
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "llama-server.log")
-    except Exception:
-        pass
+    done = threading.Event()
 
     def _drain():
-        log_file = None
-        if log_path:
-            try:
-                log_file = open(log_path, "w", encoding="utf-8", errors="replace")
-            except Exception:
-                log_file = None
         try:
-            for raw in iter(proc.stdout.readline, b""):
-                line = raw.decode(errors="replace").rstrip("\n")
-                _server_log.append(line)
-                if log_file:
-                    try:
-                        log_file.write(line + "\n")
-                        log_file.flush()
-                    except Exception:
-                        log_file = None
+            if proc.stdout is None:
+                return
+            sequence = 0
+            for raw in iter(lambda: proc.stdout.readline(4096), b""):
+                sequence += 1
+                lowered = raw.lower()
+                signals = []
+                if any(marker in lowered for marker in (
+                    b"out of memory", b"cudamalloc", b"erralloc",
+                    b"alloc failed",
+                )):
+                    signals.append("memory-allocation")
+                if b"cuda" in lowered:
+                    signals.append("cuda")
+                if any(marker in lowered for marker in (
+                    b"error", b"failed", b"fatal", b"abort",
+                )):
+                    signals.append("failure")
+                suffix = f"; signals={','.join(signals)}" if signals else ""
+                if generation == _log_reader_generation:
+                    _server_log.append(
+                        f"chunk {sequence}: {len(raw)} bytes{suffix}"
+                    )
         except Exception:
             pass
         finally:
-            if log_file:
-                try:
-                    log_file.close()
-                except Exception:
-                    pass
+            done.set()
 
     _log_reader = threading.Thread(target=_drain, name="llama-log-reader", daemon=True)
     _log_reader.start()
+    return done
 
 
 def _server_log_tail(n: int = 20) -> str:
     lines = list(_server_log)[-n:]
-    return "\n".join(lines) if lines else "(no server output captured)"
+    return "\n".join(lines) if lines else "(no diagnostic chunks captured)"
 
 
 def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
@@ -3608,15 +3667,14 @@ def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
 
     Distinguishes "the llama-server subprocess died" (the common cause of a
     frozen Director run — bad GGUF quant, VRAM OOM at load, wrong binary)
-    from a transient network blip, and quotes the server's last output so
-    the pipeline error the user sees names the real cause.
+    from a transient network blip and includes only content-free diagnostics.
     """
     proc = _process
     if _provider == "local" and proc is not None:
         # A reset socket usually means the subprocess is mid-death; poll()
         # can race the actual exit by a moment. Give it a beat to finish
         # dying so a crash is reported as a crash (with the server's last
-        # words) instead of a generic connection error.
+        # diagnostics) instead of a generic connection error.
         try:
             proc.wait(timeout=3)
         except Exception:
@@ -3625,21 +3683,19 @@ def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
         code = proc.returncode
         tail = _server_log_tail(40)
         _unload_inner()  # reset singleton so the next call relaunches cleanly
-        # Only use OOM wording when the server log actually shows an OOM —
+        # Only use OOM wording when the diagnostic signals show an OOM —
         # services/oom_detect.py substring-matches "out of memory" on error
         # text, so speculative OOM wording here made every server crash pop
         # the "lower VRAM headroom?" recovery banner even when the GPU was
         # nearly empty (e.g. the clip.cpp image-batch abort).
-        tail_l = tail.lower()
-        if any(s in tail_l for s in ("out of memory", "cudamalloc", "erralloc", "alloc failed")):
+        if "signals=memory-allocation" in tail:
             cause = "The GPU ran out of memory mid-request (e.g. a video/image model was still resident)."
         else:
             cause = "This is an internal llama-server failure; see its last output below."
         return RuntimeError(
             f"The local LLM server (llama-server) crashed while generating "
             f"(exit code {code}). {cause} "
-            f"Full log: logs/llm/llama-server.log. "
-            f"Last server output:\n{tail}"
+            f"Content-free diagnostic tail:\n{tail}"
         )
     if _provider == "local" and proc is None:
         return RuntimeError(
@@ -3651,7 +3707,7 @@ def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
         # can surface as dropped requests without killing the process.
         tail = _server_log_tail(15)
         return RuntimeError(
-            f"LLM request failed: {exc}\nRecent llama-server output:\n{tail}"
+            f"LLM request failed: {exc}\nContent-free diagnostic tail:\n{tail}"
         )
     # Remote provider — a real network/timeout issue.
     return RuntimeError(f"LLM request failed: {exc}")
@@ -3758,6 +3814,9 @@ def generate_chat(
     max_new_tokens: int = 2048,
     temperature: float = 0.7,
     top_p: float = 0.9,
+    enable_thinking: Optional[bool] = None,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> str:
     """Atomically load the selected model and run a role-preserving chat.
 
@@ -3765,6 +3824,7 @@ def generate_chat(
     the re-entrant model lease across resolution, load, and inference prevents
     an idle unload or another request from swapping the process mid-turn.
     """
+    global _stream_done
     clean_messages = validate_chat_messages(messages)
     if (
         isinstance(max_new_tokens, bool)
@@ -3798,39 +3858,41 @@ def generate_chat(
     if not is_loaded():
         raise RuntimeError("LLM did not finish loading")
     if image_paths and not _vision_available:
-        _reset_idle_timer()
         raise ValueError("The selected LLM has no available vision projector")
 
     _cancel_idle_timer()
     prepared_system, enable_thinking, thinking_budget = _prepare_thinking(
-        system_prompt, None, 0,
+        system_prompt, enable_thinking, 0,
     )
     api_messages = []
     if prepared_system:
         api_messages.append({"role": "system", "content": prepared_system})
     api_messages.extend(clean_messages)
     if image_paths:
-        try:
-            image_content = [
-                {"type": "text", "text": api_messages[-1]["content"]},
-            ]
-            for image_path in image_paths:
-                data_url = _image_to_data_url(image_path)
-                if not data_url:
-                    raise ValueError("An authorized chat image is unavailable")
-                image_content.append({
-                    "type": "image_url", "image_url": {"url": data_url},
-                })
-            api_messages[-1] = {"role": "user", "content": image_content}
-        except Exception:
-            if is_loaded():
-                _reset_idle_timer()
-            raise
+        image_content = [
+            {"type": "text", "text": api_messages[-1]["content"]},
+        ]
+        for image_path in image_paths:
+            data_url = _image_to_data_url(image_path)
+            if not data_url:
+                raise ValueError("An authorized chat image is unavailable")
+            image_content.append({
+                "type": "image_url", "image_url": {"url": data_url},
+            })
+        api_messages[-1] = {"role": "user", "content": image_content}
 
     payload = {
         "messages": api_messages,
         "max_tokens": max_new_tokens + thinking_budget,
     }
+    assistant_prefix = apply_local_assistant_prefill(
+        api_messages,
+        payload,
+        options=response_assist,
+        provider=_provider,
+        structured=False,
+        enable_thinking=enable_thinking,
+    )
     if _provider == "local":
         payload["cache_prompt"] = not bool(image_paths)
     temperature, top_p = _apply_model_defaults(temperature, top_p, payload)
@@ -3849,41 +3911,178 @@ def generate_chat(
             "<|channel|>",
         ]
 
-    try:
-        if _provider == "anthropic":
+    normalized_assist = normalize_response_assist(response_assist)
+    retry_enabled = (
+        _provider == "local"
+        and response_assist_retry_enabled(response_assist)
+    )
+    use_stream = progress_callback is not None or retry_enabled
+    response_data = {}
+    if _provider == "anthropic":
+        if progress_callback is not None:
+            content = _generate_streaming_anthropic(
+                api_messages,
+                max_new_tokens + thinking_budget,
+                max(temperature, 0.01),
+                top_p,
+                progress_callback=progress_callback,
+            )
+        else:
             content = _generate_anthropic(
                 api_messages,
                 max_new_tokens + thinking_budget,
                 max(temperature, 0.01),
                 top_p,
             )
-        else:
+    elif use_stream:
+        progress = RequestProgress(progress_callback)
+        content = ""
+        for attempt in range(1, 3 if retry_enabled else 2):
+            if attempt > 1:
+                progress.retrying(attempt=attempt)
+            else:
+                progress.emit("generating", "", attempt=attempt)
+            raw_content = ""
+            reasoning_content = ""
+            normalized_content = ""
+            prefix_stripper = PrefixEchoStripper(
+                assistant_prefix,
+                enabled=normalized_assist.strip_assistant_prefill,
+            )
+            response_data = {}
+            refused = False
+            response = None
+            attempt_payload = dict(payload)
+            attempt_payload["stream"] = True
             try:
                 response = requests.post(
                     f"{_server_url()}/v1/chat/completions",
-                    json=payload,
+                    json=attempt_payload,
                     headers=_api_headers(),
                     timeout=(10, 600),
+                    stream=True,
                 )
                 response.raise_for_status()
+                import json as _json_mod
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data: "):
+                        continue
+                    encoded = line[6:]
+                    if encoded.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = _json_mod.loads(encoded)
+                        if isinstance(chunk, dict):
+                            for section in ("timings", "usage"):
+                                values = chunk.get(section)
+                                if isinstance(values, dict):
+                                    response_data.setdefault(
+                                        section, {},
+                                    ).update(values)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        reasoning_token = delta.get("reasoning_content", "")
+                        token = delta.get("content", "")
+                        if reasoning_token:
+                            reasoning_content += reasoning_token
+                        if token:
+                            raw_content += token
+                            next_normalized = _strip_thinking_tags(raw_content)
+                            if next_normalized.startswith(normalized_content):
+                                visible = prefix_stripper.feed(
+                                    next_normalized[len(normalized_content):],
+                                )
+                            else:
+                                # A malformed/non-monotonic thinking marker is
+                                # fail-open: preserve the normalized output.
+                                prefix_stripper = PrefixEchoStripper(
+                                    assistant_prefix,
+                                    enabled=(
+                                        normalized_assist
+                                        .strip_assistant_prefill
+                                    ),
+                                )
+                                visible = prefix_stripper.feed(next_normalized)
+                            normalized_content = next_normalized
+                        if token or reasoning_token:
+                            progress.emit(
+                                "generating" if token else "thinking",
+                                visible if token else prefix_stripper.feed(""),
+                                attempt=attempt,
+                                meter_text=reasoning_content + raw_content,
+                            )
+                        if (
+                            attempt == 1
+                            and retry_enabled
+                            and response_assist_refused(
+                                prefix_stripper.feed(""),
+                                response_assist,
+                            )
+                        ):
+                            refused = True
+                            break
+                    except Exception:
+                        continue
             except requests.exceptions.RequestException as error:
                 raise _diagnose_llm_request_failure(error) from error
-            try:
-                response_data = response.json()
-                message = response_data["choices"][0]["message"]
-            except (KeyError, IndexError, TypeError, ValueError) as error:
-                raise RuntimeError("LLM returned an invalid chat response") from error
-            content = _strip_thinking_tags(message.get("content") or "").strip()
-        if not content:
-            raise RuntimeError("LLM returned an empty chat response")
-        if _provider != "anthropic":
-            _record_response_metrics(
-                response_data, multimodal=bool(image_paths),
+            finally:
+                close_response = getattr(response, "close", None)
+                if callable(close_response):
+                    close_response()
+                with _stream_lock:
+                    _stream_done = True
+            if refused:
+                print("[LLM] Response-assist retry 1/1")
+                continue
+            content = _strip_thinking_tags(prefix_stripper.finish()).strip()
+            break
+        usage = response_data.get("usage", {})
+        timings = response_data.get("timings", {})
+        final_tokens = usage.get("completion_tokens")
+        if not isinstance(final_tokens, int) or isinstance(final_tokens, bool):
+            final_tokens = None
+        average_tps = timings.get("predicted_per_second")
+        if (
+            not isinstance(average_tps, (int, float))
+            or isinstance(average_tps, bool)
+        ):
+            average_tps = None
+        progress.emit(
+            "complete",
+            content,
+            attempt=attempt,
+            done=True,
+            final_tokens=final_tokens,
+            average_tps=average_tps,
+        )
+    else:
+        try:
+            response = requests.post(
+                f"{_server_url()}/v1/chat/completions",
+                json=payload,
+                headers=_api_headers(),
+                timeout=(10, 600),
             )
-        return content
-    finally:
-        if is_loaded():
-            _reset_idle_timer()
+            response.raise_for_status()
+        except requests.exceptions.RequestException as error:
+            raise _diagnose_llm_request_failure(error) from error
+        try:
+            response_data = response.json()
+            message = response_data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise RuntimeError("LLM returned an invalid chat response") from error
+        raw_content = message.get("content") or ""
+        content = _public_response_text(
+            raw_content,
+            assistant_prefix,
+            strip_prefix=normalized_assist.strip_assistant_prefill,
+        ).strip()
+    if not content:
+        raise RuntimeError("LLM returned an empty chat response")
+    if _provider != "anthropic":
+        _record_response_metrics(
+            response_data, multimodal=bool(image_paths),
+        )
+    return content
 
 
 @_with_model_lease
@@ -3901,6 +4100,8 @@ def generate(
     presence_penalty: float = 0.0,
     stop: Optional[list[str]] = None,
     json_schema: Optional[dict] = None,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> str:
     """Generate text via llama-server's OpenAI-compatible chat endpoint.
 
@@ -3920,6 +4121,28 @@ def generate(
     """
     if not is_loaded():
         raise RuntimeError("LLM not loaded. Call load_model() first.")
+
+    # A request-scoped callback opts this otherwise synchronous API into the
+    # shared SSE path. No streamed text is added to durable/global status by
+    # the callback facility itself.
+    if progress_callback is not None:
+        return generate_streaming(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=-1 if seed is None else seed,
+            image_paths=image_paths,
+            thinking_budget=thinking_budget,
+            enable_thinking=enable_thinking,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            stop=stop,
+            json_schema=json_schema,
+            response_assist=response_assist,
+            progress_callback=progress_callback,
+        )
 
     # Cancel idle timer during active request — prevents auto-unload mid-generation.
     # Timer is reset at the END of the request (after response is received).
@@ -3945,36 +4168,30 @@ def generate(
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
 
-    # Build user message — multimodal if images provided and vision is available
-    if image_paths and _vision_available:
-        content_parts = []
-        for img_path in image_paths:
-            data_url = _image_to_data_url(img_path)
-            if data_url:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": data_url},
-                })
-        content_parts.append({"type": "text", "text": prompt})
-        messages.append({"role": "user", "content": content_parts})
-    else:
-        messages.append({"role": "user", "content": prompt})
+    user_content, multimodal = _build_user_content(prompt, image_paths)
+    messages.append({"role": "user", "content": user_content})
 
     payload = {
         "messages": messages,
         "max_tokens": total_tokens,
     }
+    assistant_prefix = apply_local_assistant_prefill(
+        messages,
+        payload,
+        options=response_assist,
+        provider=_provider,
+        structured=json_schema is not None,
+        enable_thinking=enable_thinking,
+    )
     if _provider == "local":
         payload["cache_prompt"] = not bool(image_paths)
-    # Per-model sampling defaults (e.g. Gemma 4 wants temp=1.0, top_k=64)
-    temperature, top_p = _apply_model_defaults(temperature, top_p, payload)
-    payload["temperature"] = max(temperature, 0.01)
-    payload["top_p"] = top_p
-
-    if frequency_penalty > 0:
-        payload["frequency_penalty"] = frequency_penalty
-    if presence_penalty > 0:
-        payload["presence_penalty"] = presence_penalty
+    temperature, top_p = _apply_request_sampling(
+        payload,
+        temperature,
+        top_p,
+        frequency_penalty,
+        presence_penalty,
+    )
     if seed is not None and seed >= 0:
         payload["seed"] = seed
     # Qwen thinking mode via chat template kwargs (Gemma handled by _prepare_thinking)
@@ -3992,7 +4209,7 @@ def generate(
     # protection — covers Gemma 4 fine-tunes that auto-activate thinking
     # mode despite chat_template_kwargs saying otherwise. Both Qwen-style
     # (`<think>`) and Gemma-style (`<channel>`, `<|think|>`) markers are
-    # included since the supergemma fine-tune emits the latter format.
+        # included because Gemma variants can emit the latter format.
     combined_stop = list(stop) if stop else []
     if _active_registry_entry().get("disable_thinking", False):
         for tok in ("<think>", "<thinking>", "<|think|>", "<channel>", "<|channel|>"):
@@ -4015,22 +4232,45 @@ def generate(
     if _provider == "anthropic":
         return _generate_anthropic(messages, total_tokens, max(temperature, 0.01), top_p)
 
-    try:
-        resp = requests.post(
-            f"{_server_url()}/v1/chat/completions",
-            json=payload,
-            headers=_api_headers(),
-            # (connect, read): fail fast if the server socket is gone;
-            # allow a long read for actual generation.
-            timeout=(10, 600),
+    retry_enabled = (
+        _provider == "local"
+        and response_assist_retry_enabled(response_assist)
+    )
+    data = {}
+    raw_content = ""
+    for attempt in range(1, 3 if retry_enabled else 2):
+        attempt_payload = dict(payload)
+        if attempt > 1 and isinstance(payload.get("seed"), int):
+            attempt_payload["seed"] = payload["seed"] + attempt - 1
+        try:
+            resp = requests.post(
+                f"{_server_url()}/v1/chat/completions",
+                json=attempt_payload,
+                headers=_api_headers(),
+                # (connect, read): fail fast if the server socket is gone;
+                # allow a long read for actual generation.
+                timeout=(10, 600),
+            )
+            resp.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            # A dead subprocess surfaces here as a ConnectionError; translate it
+            # into an actionable error naming the real cause (see the helper).
+            raise _diagnose_llm_request_failure(e) from e
+        data = resp.json()
+        raw_content = data["choices"][0]["message"]["content"] or ""
+        public_content = _public_response_text(
+            raw_content,
+            assistant_prefix,
+            strip_prefix=normalize_response_assist(
+                response_assist,
+            ).strip_assistant_prefill,
         )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        # A dead subprocess surfaces here as a ConnectionError; translate it
-        # into an actionable error naming the real cause (see the helper).
-        raise _diagnose_llm_request_failure(e) from e
-    data = resp.json()
-    raw_content = data["choices"][0]["message"]["content"] or ""
+        if attempt == 1 and retry_enabled and response_assist_refused(
+            public_content, response_assist,
+        ):
+            print("[LLM] Response-assist retry 1/1")
+            continue
+        break
     finish_reason = data["choices"][0].get("finish_reason", "unknown")
     usage = data.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens", "?")
@@ -4043,15 +4283,17 @@ def generate(
         if reasoning:
             print(f"[LLM] Reasoning content detected ({len(reasoning)} chars) — model used thinking mode. reasoning_budget=0 may not be active.")
 
-    content = _strip_thinking_tags(raw_content)
+    content = public_content
 
     if not content.strip() and raw_content:
-        print(f"[LLM] WARNING: Model spent all {completion_tokens} tokens on <think> reasoning with nothing left for the answer. Raw starts with: {raw_content[:200]!r}")
+        print(
+            f"[LLM] WARNING: Model spent all {completion_tokens} tokens on "
+            f"reasoning with no answer content ({len(raw_content)} raw chars)"
+        )
 
     _record_response_metrics(
-        data, multimodal=bool(image_paths and _vision_available),
+        data, multimodal=multimodal,
     )
-    _reset_idle_timer()
     return content.strip()
 
 
@@ -4062,6 +4304,7 @@ def get_stream_status() -> dict:
 
 
 @_with_model_lease
+@_with_stream_done_finally
 def generate_streaming(
     prompt: str,
     system_prompt: str = "",
@@ -4074,7 +4317,10 @@ def generate_streaming(
     enable_thinking: bool = None,
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
+    stop: Optional[list[str]] = None,
     json_schema: Optional[dict] = None,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> str:
     """Generate text using SSE streaming, populating the stream buffer in real-time.
 
@@ -4090,10 +4336,11 @@ def generate_streaming(
             thinking OFF (see generate() for the rationale).
     """
     global _stream_buffer, _stream_done, _last_system_prompt, _last_user_prompt, _last_thinking_text
-    import re as _re
 
     if not is_loaded():
         raise RuntimeError("LLM not loaded. Call load_model() first.")
+
+    request_scoped_progress = progress_callback is not None
 
     # Grammar-constrained JSON mode requires thinking OFF — same rationale
     # as the matching block in generate(): the grammar masks sampling from
@@ -4107,9 +4354,10 @@ def generate_streaming(
 
     # Store for pipeline dashboard capture (system + user prompt both,
     # so the dashboard can render the full LLM input).
-    _last_system_prompt = system_prompt
-    _last_user_prompt = prompt
-    _last_thinking_text = ""
+    if not request_scoped_progress:
+        _last_system_prompt = system_prompt
+        _last_user_prompt = prompt
+        _last_thinking_text = ""
 
     # Cancel idle timer during active request — prevents auto-unload mid-streaming.
     # Timer is reset at the END of the request (after streaming completes).
@@ -4117,52 +4365,40 @@ def generate_streaming(
 
     total_tokens = max_new_tokens + thinking_budget
 
-    with _stream_lock:
-        _stream_buffer = ""
-        _stream_done = False
+    if not request_scoped_progress:
+        with _stream_lock:
+            _stream_buffer = ""
+            _stream_done = False
 
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
 
-    # Build user message — multimodal if images provided and vision is available
-    if image_paths and _vision_available:
-        content_parts = []
-        for img_path in image_paths:
-            data_url = _image_to_data_url(img_path)
-            if data_url:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": data_url},
-                })
-        content_parts.append({"type": "text", "text": prompt})
-        messages.append({"role": "user", "content": content_parts})
-    else:
-        messages.append({"role": "user", "content": prompt})
+    user_content, multimodal = _build_user_content(prompt, image_paths)
+    messages.append({"role": "user", "content": user_content})
 
     payload = {
         "messages": messages,
         "max_tokens": total_tokens,
         "stream": True,
     }
+    assistant_prefix = apply_local_assistant_prefill(
+        messages,
+        payload,
+        options=response_assist,
+        provider=_provider,
+        structured=json_schema is not None,
+        enable_thinking=enable_thinking,
+    )
     if _provider == "local":
         payload["cache_prompt"] = not bool(image_paths)
-    # Apply caller's penalty values FIRST so they're in the payload
-    # before _apply_model_defaults runs. The registry-defaults pass below
-    # then overrides them when the active model has tuned values
-    # (Gemma 4 → no penalty; Qwen 3.x → penalty stays as caller suggested).
-    payload["temperature"] = max(temperature, 0.01)
-    payload["top_p"] = top_p
-    if frequency_penalty > 0:
-        payload["frequency_penalty"] = frequency_penalty
-    if presence_penalty > 0:
-        payload["presence_penalty"] = presence_penalty
-    # Per-model sampling defaults — registry wins over caller for any
-    # field it specifies. Models without sampling_defaults (e.g. Qwen
-    # 3.x) pass through unchanged. See _apply_model_defaults().
-    temperature, top_p = _apply_model_defaults(temperature, top_p, payload)
-    payload["temperature"] = max(temperature, 0.01)
-    payload["top_p"] = top_p
+    temperature, top_p = _apply_request_sampling(
+        payload,
+        temperature,
+        top_p,
+        frequency_penalty,
+        presence_penalty,
+    )
     if seed is not None and seed >= 0:
         payload["seed"] = seed
     # Qwen thinking mode via chat template kwargs (Gemma handled by _prepare_thinking)
@@ -4176,10 +4412,16 @@ def generate_streaming(
     # the enable_thinking=false kwarg and auto-enter reasoning mode anyway,
     # burning the entire token budget on `reasoning_content` and returning
     # empty `content`. Stopping on the marker token caps wasted tokens at 1.
+    combined_stop = list(stop) if stop else []
     if _active_registry_entry().get("disable_thinking", False):
-        stop_tokens = ["<think>", "<thinking>", "<|think|>", "<channel>", "<|channel|>"]
-        existing = payload.get("stop") or []
-        payload["stop"] = list(existing) + [t for t in stop_tokens if t not in existing]
+        for token in (
+            "<think>", "<thinking>", "<|think|>", "<channel>",
+            "<|channel|>",
+        ):
+            if token not in combined_stop:
+                combined_stop.append(token)
+    if combined_stop:
+        payload["stop"] = combined_stop
 
     # Grammar-constrained JSON output — local llama-server only (see the
     # matching block in generate() for the full rationale).
@@ -4223,75 +4465,159 @@ def generate_streaming(
         pass
 
     if _provider == "anthropic":
-        return _generate_streaming_anthropic(messages, total_tokens, max(temperature, 0.01), top_p)
+        return _generate_streaming_anthropic(
+            messages, total_tokens, max(temperature, 0.01), top_p,
+            progress_callback=progress_callback,
+        )
 
+    normalized_assist = normalize_response_assist(response_assist)
+    retry_enabled = (
+        _provider == "local"
+        and response_assist_retry_enabled(response_assist)
+    )
+    progress = RequestProgress(progress_callback)
     raw_content = ""
     reasoning_content = ""
-    in_reasoning = False
     completed_stream_metrics = {}
     stream_completed = False
-    try:
-        resp = requests.post(
-            f"{_server_url()}/v1/chat/completions",
-            json=payload,
-            headers=_api_headers(),
-            timeout=(10, 600),
-            stream=True,
+    for attempt in range(1, 3 if retry_enabled else 2):
+        if attempt > 1:
+            progress.retrying(attempt=attempt)
+            if not request_scoped_progress:
+                with _stream_lock:
+                    _stream_buffer = ""
+        else:
+            progress.emit("generating", "", attempt=attempt)
+        raw_content = ""
+        reasoning_content = ""
+        normalized_content = ""
+        prefix_stripper = PrefixEchoStripper(
+            assistant_prefix,
+            enabled=normalized_assist.strip_assistant_prefill,
         )
-        resp.raise_for_status()
+        completed_stream_metrics = {}
+        stream_completed = False
+        refused = False
+        resp = None
+        attempt_payload = dict(payload)
+        if attempt > 1 and isinstance(payload.get("seed"), int):
+            attempt_payload["seed"] = payload["seed"] + attempt - 1
+        try:
+            resp = requests.post(
+                f"{_server_url()}/v1/chat/completions",
+                json=attempt_payload,
+                headers=_api_headers(),
+                timeout=(10, 600),
+                stream=True,
+            )
+            resp.raise_for_status()
 
-        import json as _json_mod
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "):
-                continue
-            data_str = line[6:]  # strip "data: "
-            if data_str.strip() == "[DONE]":
-                stream_completed = True
-                break
-            try:
-                chunk = _json_mod.loads(data_str)
-                if isinstance(chunk, dict):
-                    for section in ("timings", "usage"):
-                        values = chunk.get(section)
-                        if isinstance(values, dict):
-                            completed_stream_metrics.setdefault(section, {}).update(
-                                values
+            import json as _json_mod
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]  # strip "data: "
+                if data_str.strip() == "[DONE]":
+                    stream_completed = True
+                    break
+                try:
+                    chunk = _json_mod.loads(data_str)
+                    if isinstance(chunk, dict):
+                        for section in ("timings", "usage"):
+                            values = chunk.get(section)
+                            if isinstance(values, dict):
+                                completed_stream_metrics.setdefault(
+                                    section, {},
+                                ).update(values)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+
+                    reasoning_token = delta.get("reasoning_content", "")
+                    if reasoning_token:
+                        reasoning_content += reasoning_token
+
+                    token = delta.get("content", "")
+                    if token:
+                        raw_content += token
+                        next_normalized = _strip_thinking_tags(raw_content)
+                        if next_normalized.startswith(normalized_content):
+                            visible_content = prefix_stripper.feed(
+                                next_normalized[len(normalized_content):],
                             )
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        else:
+                            prefix_stripper = PrefixEchoStripper(
+                                assistant_prefix,
+                                enabled=(
+                                    normalized_assist.strip_assistant_prefill
+                                ),
+                            )
+                            visible_content = prefix_stripper.feed(
+                                next_normalized,
+                            )
+                        normalized_content = next_normalized
 
-                # With --jinja, Qwen3.5 may send reasoning via separate field
-                reasoning_token = delta.get("reasoning_content", "")
-                if reasoning_token:
-                    reasoning_content += reasoning_token
-                    if not in_reasoning:
-                        in_reasoning = True
-                    # Show reasoning in the stream buffer wrapped in <think> tags
-                    with _stream_lock:
-                        _stream_buffer = f"<think>{reasoning_content}</think>"
+                    if reasoning_token or token:
+                        legacy_display = ""
+                        if reasoning_content:
+                            legacy_display = (
+                                f"<think>{reasoning_content}</think>\n"
+                            )
+                        else:
+                            inline_blocks = _inline_thinking_blocks(raw_content)
+                            if inline_blocks:
+                                legacy_display = inline_blocks + "\n"
+                        public_display = (
+                            visible_content
+                            if token
+                            else prefix_stripper.feed("")
+                        )
+                        legacy_display += public_display
+                        if not request_scoped_progress:
+                            with _stream_lock:
+                                _stream_buffer = legacy_display
+                        progress.emit(
+                            "generating" if token else "thinking",
+                            public_display,
+                            attempt=attempt,
+                            meter_text=reasoning_content + raw_content,
+                        )
 
-                token = delta.get("content", "")
-                if token:
-                    raw_content += token
-                    # Build display: thinking (if any) + content so far
-                    display = ""
-                    if reasoning_content:
-                        display = f"<think>{reasoning_content}</think>\n"
-                    display += raw_content
-                    with _stream_lock:
-                        _stream_buffer = display
-            except Exception:
-                continue
+                    # Only an explicitly enabled local retry evaluates the
+                    # cumulative generated response. Prompts/messages are
+                    # never passed to the detector.
+                    if (
+                        attempt == 1
+                        and retry_enabled
+                        and response_assist_refused(
+                            prefix_stripper.feed(""),
+                            response_assist,
+                        )
+                    ):
+                        refused = True
+                        break
+                except Exception:
+                    continue
 
-    except requests.exceptions.RequestException as e:
-        # Server socket died mid-stream (common: subprocess crash). Surface
-        # the real cause so the Director run reports it instead of hanging.
-        with _stream_lock:
-            _stream_done = True
-        raise _diagnose_llm_request_failure(e) from e
-    except Exception:
-        with _stream_lock:
-            _stream_done = True
-        raise
+        except requests.exceptions.RequestException as e:
+            # Server socket died mid-stream (common: subprocess crash). Surface
+            # the real cause so the Director run reports it instead of hanging.
+            if not request_scoped_progress:
+                with _stream_lock:
+                    _stream_done = True
+            raise _diagnose_llm_request_failure(e) from e
+        except Exception:
+            if not request_scoped_progress:
+                with _stream_lock:
+                    _stream_done = True
+            raise
+        finally:
+            close_response = getattr(resp, "close", None)
+            if callable(close_response):
+                close_response()
+
+        if refused:
+            print("[LLM] Response-assist retry 1/1")
+            continue
+        break
 
     # Capture thinking text for the pipeline dashboard. Two sources:
     #   1. reasoning_content — populated by chat templates that emit
@@ -4303,38 +4629,60 @@ def generate_streaming(
     # Prefer (1) when present, fall back to (2).
     inline_gemma_match = _GEMMA_THINKING_INNER_RE.search(raw_content)
     inline_gemma_thinking = inline_gemma_match.group(1) if inline_gemma_match else ""
-    _last_thinking_text = reasoning_content or inline_gemma_thinking
+    if not request_scoped_progress:
+        _last_thinking_text = reasoning_content or inline_gemma_thinking
     print(
         f"[LLM] Streaming complete: {len(raw_content)} chars, "
         f"reasoning_content: {len(reasoning_content)} chars, "
         f"gemma_inline_thinking: {len(inline_gemma_thinking)} chars"
     )
 
-    # Build full raw for the UI (includes thinking)
-    full_raw = ""
+    # Build full raw for the legacy dashboard (includes captured thinking),
+    # while public callbacks/detection use only normalized response text.
+    thinking_raw = ""
     if reasoning_content:
-        full_raw = f"<think>{reasoning_content}</think>\n"
-    full_raw += raw_content
+        thinking_raw = f"<think>{reasoning_content}</think>\n"
+    else:
+        inline_blocks = _inline_thinking_blocks(raw_content)
+        if inline_blocks:
+            thinking_raw = inline_blocks + "\n"
+    full_raw = thinking_raw + prefix_stripper.finish()
 
     # Strip thinking/reasoning blocks for the return value
     content = _strip_thinking_tags(full_raw)
 
-    with _stream_lock:
-        _stream_buffer = full_raw  # keep full raw for the UI to show thinking
-        _stream_done = True
+    if not request_scoped_progress:
+        with _stream_lock:
+            _stream_buffer = full_raw  # keep full raw for the UI to show thinking
+            _stream_done = True
 
     if stream_completed and completed_stream_metrics:
         _record_response_metrics(
             completed_stream_metrics,
-            multimodal=bool(image_paths and _vision_available),
+            multimodal=multimodal,
         )
-    _reset_idle_timer()
-    return content.strip()
+    usage = completed_stream_metrics.get("usage", {})
+    timings = completed_stream_metrics.get("timings", {})
+    final_tokens = usage.get("completion_tokens")
+    if not isinstance(final_tokens, int) or isinstance(final_tokens, bool):
+        final_tokens = None
+    average_tps = timings.get("predicted_per_second")
+    if not isinstance(average_tps, (int, float)) or isinstance(average_tps, bool):
+        average_tps = None
+    final_content = content.strip()
+    progress.emit(
+        "complete",
+        final_content,
+        attempt=attempt,
+        done=True,
+        final_tokens=final_tokens,
+        average_tps=average_tps,
+    )
+    return final_content
 
 
 def _generate_anthropic(messages: list, max_tokens: int, temperature: float, top_p: float) -> str:
     """Non-streaming generation via Anthropic Messages API."""
-    import re as _re
     # Anthropic uses system as a top-level param, not in messages
     system_text = ""
     api_messages = []
@@ -4373,14 +4721,20 @@ def _generate_anthropic(messages: list, max_tokens: int, temperature: float, top
     print(f"[LLM/Anthropic] Response: {usage.get('output_tokens', '?')} tokens (prompt={usage.get('input_tokens', '?')})")
 
     content = _strip_thinking_tags(raw_content)
-    _reset_idle_timer()
     return content.strip()
 
 
-def _generate_streaming_anthropic(messages: list, max_tokens: int, temperature: float, top_p: float) -> str:
+def _generate_streaming_anthropic(
+    messages: list,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    *,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+) -> str:
     """Streaming generation via Anthropic Messages API with SSE."""
     global _stream_buffer, _stream_done
-    import re as _re
+    request_scoped_progress = progress_callback is not None
 
     system_text = ""
     api_messages = []
@@ -4401,7 +4755,10 @@ def _generate_streaming_anthropic(messages: list, max_tokens: int, temperature: 
     if system_text:
         payload["system"] = system_text
 
+    progress = RequestProgress(progress_callback)
+    progress.emit("generating", "", attempt=1)
     raw_content = ""
+    resp = None
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -4433,24 +4790,35 @@ def _generate_streaming_anthropic(messages: list, max_tokens: int, temperature: 
                 if delta.get("type") == "text_delta":
                     text = delta.get("text", "")
                     raw_content += text
-                    with _stream_lock:
-                        _stream_buffer = raw_content
+                    if not request_scoped_progress:
+                        with _stream_lock:
+                            _stream_buffer = raw_content
+                    progress.emit("generating", raw_content, attempt=1)
 
     except Exception as e:
         print(f"[LLM/Anthropic] Streaming error: {e}")
-        with _stream_lock:
-            _stream_buffer = raw_content or f"Error: {e}"
-            _stream_done = True
+        if not request_scoped_progress:
+            with _stream_lock:
+                _stream_buffer = raw_content or f"Error: {e}"
+                _stream_done = True
         return ""
+    finally:
+        close_response = getattr(resp, "close", None)
+        if callable(close_response):
+            close_response()
+        with _stream_lock:
+            _stream_done = True
 
     content = _strip_thinking_tags(raw_content)
 
-    with _stream_lock:
-        _stream_buffer = raw_content
-        _stream_done = True
+    if not request_scoped_progress:
+        with _stream_lock:
+            _stream_buffer = raw_content
+            _stream_done = True
 
-    _reset_idle_timer()
-    return content.strip()
+    final_content = content.strip()
+    progress.emit("complete", final_content, attempt=1, done=True)
+    return final_content
 
 
 def _build_enhance_user_prompt(
@@ -4516,6 +4884,466 @@ def _clean_enhancer_output(text):
     return "\n".join(out).strip()
 
 
+_H3_EXACT_DIALOGUE_RE = re.compile(
+    r"<d>\s*\[[^\]\r\n]+\]\s+.*?</d>", re.IGNORECASE | re.DOTALL,
+)
+_H3_REFERENCE_LABEL_RE = re.compile(
+    r"<(?:Subject|Picture|Video|Audio)\s+\d+>", re.IGNORECASE,
+)
+_H3_SPEAKER_ID_RE = re.compile(r"\(S\d+\)", re.IGNORECASE)
+_H3_LOOSE_TIME = r"(?:(?:\d{1,2}:){1,2})?\d+(?:\.\d+)?"
+_H3_LOOSE_RANGE_RE = re.compile(
+    rf"^\s*(?:\[?\s*(?:Shot|Scene)\s+\d+\s*\]?\s*)?"
+    rf"\[?\s*(?P<start>{_H3_LOOSE_TIME})\s*s?\s*"
+    rf"(?:-|–|—|\bto\b)\s*(?P<end>{_H3_LOOSE_TIME})\s*s?\s*"
+    r"\]?\s*:?[ \t]*(?P<text>.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_h3_context_ir_output(text: str) -> str:
+    """Remove only an outer response wrapper; H3 record text is opaque."""
+
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    fenced = re.fullmatch(r"```(?:text|plaintext)?\s*\n(.*?)\n```", value, re.DOTALL)
+    if fenced:
+        value = fenced.group(1).strip()
+    value = re.sub(
+        r"^(?:Enhanced Prompt|Prompt|Output|Result)\s*:\s*"
+        r"(?=(?:subject_definitions|integrated_multimodal_description)\s*:)",
+        "",
+        value,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return "\n".join(line.rstrip() for line in value.splitlines()).strip()
+
+
+def _h3_timeline_boundaries(value: str) -> list[float]:
+    from shared.utils.prompt_parser import parse_global_timeline_prompt
+
+    _, events = parse_global_timeline_prompt(value)
+    boundaries: list[float] = []
+    for event in sorted(events, key=lambda item: int(item.get("order", 0))):
+        start = float(event.get("start", 0.0))
+        end = float(event.get("end", start))
+        boundaries.append(start)
+        if not math.isclose(end, start, abs_tol=1e-9):
+            boundaries.append(end)
+    return boundaries
+
+
+def _ordered_float_subsequence(needles: Sequence[float], values: Sequence[float]) -> bool:
+    cursor = 0
+    for needle in needles:
+        while cursor < len(values) and not math.isclose(
+            float(needle), float(values[cursor]), abs_tol=0.001,
+        ):
+            cursor += 1
+        if cursor >= len(values):
+            return False
+        cursor += 1
+    return True
+
+
+def _h3_locked_content_errors(source: str, candidate: str) -> list[str]:
+    """Check only literal authored anchors, never creative subject matter."""
+
+    errors: list[str] = []
+    source_dialogue = _H3_EXACT_DIALOGUE_RE.findall(source or "")
+    if source_dialogue and _H3_EXACT_DIALOGUE_RE.findall(candidate or "") != source_dialogue:
+        errors.append("literal dialogue blocks changed")
+    for label_re, label in (
+        (_H3_REFERENCE_LABEL_RE, "reference labels"),
+        (_H3_SPEAKER_ID_RE, "speaker IDs"),
+    ):
+        required = [match.group(0) for match in label_re.finditer(source or "")]
+        present = [match.group(0) for match in label_re.finditer(candidate or "")]
+        if any(present.count(value) < required.count(value) for value in set(required)):
+            errors.append(f"authored {label} changed")
+    source_times = _h3_timeline_boundaries(source)
+    if source_times and not _ordered_float_subsequence(
+        source_times, _h3_timeline_boundaries(candidate),
+    ):
+        errors.append("authored timestamp values or order changed")
+    quoted = re.findall(r"[\"“]([^\"”\r\n]+)[\"”]", source or "")
+    if any(fragment not in candidate for fragment in quoted):
+        errors.append("quoted authored text changed")
+    errors.extend(_h3_event_association_errors(source, candidate))
+    return errors
+
+
+def _h3_event_association_errors(source: str, candidate: str) -> list[str]:
+    """Keep authored labels, speakers, and words bound to their time range."""
+
+    from shared.utils.prompt_parser import parse_global_timeline_prompt
+
+    _, source_events = parse_global_timeline_prompt(source)
+    if not source_events:
+        source_events = _h3_loose_visual_events(source)
+    _, candidate_events = parse_global_timeline_prompt(candidate)
+    errors: list[str] = []
+    for source_event in source_events:
+        source_start = float(source_event.get("start", 0.0))
+        source_end = float(source_event.get("end", source_start))
+        is_range = not math.isclose(source_start, source_end, abs_tol=1e-9)
+        matches = [
+            event for event in candidate_events
+            if math.isclose(
+                float(event.get("start", 0.0)), source_start, abs_tol=0.001,
+            )
+            and (
+                not is_range
+                or math.isclose(
+                    float(event.get("end", event.get("start", 0.0))),
+                    source_end,
+                    abs_tol=0.001,
+                )
+            )
+        ]
+        if not matches:
+            errors.append("authored timestamp-to-record association changed")
+            continue
+        source_text = str(source_event.get("text") or "")
+        candidate_text = " ".join(str(event.get("text") or "") for event in matches)
+        for pattern, label in (
+            (_H3_REFERENCE_LABEL_RE, "reference"),
+            (_H3_SPEAKER_ID_RE, "speaker"),
+            (_H3_EXACT_DIALOGUE_RE, "dialogue"),
+        ):
+            required = [match.group(0) for match in pattern.finditer(source_text)]
+            present = [match.group(0) for match in pattern.finditer(candidate_text)]
+            if any(present.count(value) < required.count(value) for value in set(required)):
+                errors.append(f"authored {label}-to-timestamp association changed")
+    return list(dict.fromkeys(errors))
+
+
+def _h3_time_value(value: str) -> float | None:
+    try:
+        parts = [float(part) for part in str(value or "").split(":")]
+    except (TypeError, ValueError):
+        return None
+    if not parts or len(parts) > 3:
+        return None
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60.0 + part
+    return seconds
+
+
+def _h3_loose_visual_events(source: str) -> list[dict]:
+    """Recover explicit ranges rejected by the conservative Studio parser."""
+
+    from services.director.h3_dialogue import _extract_h3_fields
+
+    fields = _extract_h3_fields(source)
+    visual = (
+        fields.get("detailed_description")
+        or fields.get("integrated_multimodal_description")
+        or ""
+    )
+    events: list[dict] = []
+    for order, line in enumerate(visual.splitlines()):
+        match = _H3_LOOSE_RANGE_RE.fullmatch(line.strip())
+        if not match:
+            continue
+        start = _h3_time_value(match.group("start"))
+        end = _h3_time_value(match.group("end"))
+        if start is None or end is None or end <= start:
+            continue
+        events.append({
+            "kind": "range",
+            "start": start,
+            "end": end,
+            "text": match.group("text").strip(),
+            "order": order,
+        })
+    return events
+
+
+def _h3_repair_semantic_fragments(before: str) -> list[str]:
+    """Extract literal visual payloads even when timeline syntax is malformed."""
+
+    from services.director.h3_dialogue import (
+        _H3_CANONICAL_RECORD_RE,
+        _extract_h3_fields,
+    )
+
+    fields = _extract_h3_fields(before)
+    visual = (
+        fields.get("detailed_description")
+        or fields.get("integrated_multimodal_description")
+        or ""
+    )
+    fragments: list[str] = []
+    for raw_line in visual.splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+        canonical = _H3_CANONICAL_RECORD_RE.fullmatch(line)
+        if canonical:
+            fragments.extend(
+                canonical.group(name).strip()
+                for name in ("name", "description", "vocals")
+                if canonical.group(name).strip()
+            )
+            continue
+        line = re.sub(
+            r"^\[?\s*(?:Shot|Scene)\s+\d+[^\]\d]*\]?\s*",
+            "",
+            line,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        line = re.sub(
+            r"^\[?\s*(?:(?:\d{1,2}:){1,2})?\d+(?:\.\d+)?\s*s?\s*"
+            r"(?:-|–|—|\bto\b)\s*"
+            r"(?:(?:\d{1,2}:){1,2})?\d+(?:\.\d+)?\s*s?\s*\]?\s*:?[ \t]*",
+            "",
+            line,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        parts = line.split("|") if "|" in line else [line]
+        for part in parts:
+            payload = re.sub(
+                r"^\s*(?:shot_name|audiovisual_description|"
+                r"dialogue_and_vocalizations)\s*:\s*",
+                "",
+                part,
+                count=1,
+                flags=re.IGNORECASE,
+            ).strip()
+            if payload:
+                fragments.append(payload)
+    return list(dict.fromkeys(fragments))
+
+
+def _h3_format_repair_lock_errors(before: str, after: str) -> list[str]:
+    """Require a repair to wrap source payloads instead of rewriting them."""
+
+    from services.director.h3_dialogue import _extract_h3_fields
+    from shared.utils.prompt_parser import parse_global_timeline_prompt
+
+    errors = _h3_locked_content_errors(before, after)
+    before_fields = _extract_h3_fields(before)
+    after_compact = " ".join(str(after or "").split())
+    for field, value in before_fields.items():
+        if field in {"detailed_description", "integrated_multimodal_description"}:
+            continue
+        compact = " ".join(value.split())
+        after_value = " ".join(_extract_h3_fields(after).get(field, "").split())
+        if compact and compact != after_value:
+            errors.append(f"format repair changed {field}")
+
+    # Bare authored timeline prose has no schema labels to reconstruct. Its
+    # exact normalized wording must survive inside the repaired record.
+    _, events = parse_global_timeline_prompt(before)
+    _, repaired_events = parse_global_timeline_prompt(after)
+    for event in events:
+        fragment = re.sub(
+            r"^\[\s*(?:Shot|Scene)\s+\d+[^\]]*\]\s*",
+            "",
+            str(event.get("text") or ""),
+            flags=re.IGNORECASE,
+        )
+        compact = " ".join(fragment.split())
+        start = float(event.get("start", 0.0))
+        end = float(event.get("end", start))
+        matching_text = " ".join(
+            " ".join(str(repaired_event.get("text") or "").split())
+            for repaired_event in repaired_events
+            if math.isclose(
+                float(repaired_event.get("start", 0.0)), start, abs_tol=0.001,
+            )
+            and math.isclose(
+                float(repaired_event.get("end", repaired_event.get("start", 0.0))),
+                end,
+                abs_tol=0.001,
+            )
+        )
+        if compact and compact not in matching_text:
+            errors.append("format repair rewrote timed record content")
+            break
+    for fragment in _h3_repair_semantic_fragments(before):
+        if " ".join(fragment.split()) not in after_compact:
+            errors.append("format repair rewrote visual content")
+            break
+    errors.extend(_h3_exact_repair_payload_errors(before, after))
+    return list(dict.fromkeys(errors))
+
+
+def _h3_exact_repair_payload_errors(before: str, after: str) -> list[str]:
+    """Reject every semantic addition; only record syntax may be added."""
+    from services.director.h3_dialogue import _H3_CANONICAL_RECORD_RE, _extract_h3_fields
+
+    def records(value: str) -> list[dict]:
+        fields = _extract_h3_fields(value)
+        visual = fields.get("detailed_description") or fields.get("integrated_multimodal_description") or ""
+        rows = []
+        for line in visual.splitlines():
+            text = line.strip()
+            exact = _H3_CANONICAL_RECORD_RE.fullmatch(text)
+            if exact:
+                rows.append({
+                    "start": _h3_time_value(exact.group("start")),
+                    "end": _h3_time_value(exact.group("end")),
+                    "name": exact.group("name").strip(),
+                    "description": exact.group("description").strip(),
+                    "vocals": exact.group("vocals").strip(),
+                    "canonical": True,
+                })
+                continue
+            loose = _H3_LOOSE_RANGE_RE.fullmatch(text)
+            if loose:
+                rows.append({
+                    "start": _h3_time_value(loose.group("start")),
+                    "end": _h3_time_value(loose.group("end")),
+                    "payload": " ".join(loose.group("text").split()),
+                    "canonical": False,
+                })
+        return rows
+
+    source_rows, repaired_rows = records(before), records(after)
+    errors: list[str] = []
+    if not source_rows and repaired_rows:
+        return [
+            "format repair cannot prove an exact record mapping from the "
+            "malformed source"
+        ]
+    if source_rows and len(source_rows) != len(repaired_rows):
+        return ["format repair added or removed shot records"]
+    for source in source_rows:
+        matched = [row for row in repaired_rows if math.isclose(row["start"], source["start"], abs_tol=0.001) and math.isclose(row["end"], source["end"], abs_tol=0.001)]
+        if len(matched) != 1:
+            errors.append("format repair changed shot timing associations")
+            continue
+        repaired = matched[0]
+        if not repaired["canonical"]:
+            errors.append("format repair did not produce a canonical record")
+            continue
+        if source["canonical"]:
+            if any(" ".join(source[key].split()) != " ".join(repaired[key].split()) for key in ("name", "description", "vocals")):
+                errors.append("format repair changed canonical record payload")
+            continue
+        payload = source["payload"]
+        if " ".join(repaired["description"].split()) != payload or repaired["vocals"].casefold() not in {"none", "n/a"}:
+            errors.append("format repair added or changed visual or vocal content")
+        source_words = {word.casefold() for word in re.findall(r"[A-Za-z0-9']+", payload)}
+        name_words = {word.casefold() for word in re.findall(r"[A-Za-z0-9']+", repaired["name"])}
+        if not name_words.issubset(source_words | {"shot", "scene"}):
+            errors.append("format repair invented shot-name content")
+    for pattern, label in ((_H3_REFERENCE_LABEL_RE, "reference labels"), (_H3_SPEAKER_ID_RE, "speaker IDs"), (_H3_EXACT_DIALOGUE_RE, "dialogue")):
+        before_values = [match.group(0) for match in pattern.finditer(before)]
+        after_values = [match.group(0) for match in pattern.finditer(after)]
+        if before_values != after_values:
+            errors.append(f"format repair added or changed {label}")
+    return list(dict.fromkeys(errors))
+
+
+def _h3_enhance_contract_errors(
+    candidate: str,
+    source_prompt: str,
+    *,
+    ref2va: bool,
+    duration_seconds: Optional[float],
+) -> list[str]:
+    from services.director.h3_dialogue import (
+        validate_h3_context_ir_records,
+        validate_h3_prompt_contract,
+    )
+
+    mode = "ref2va" if ref2va else "t2va"
+    errors = [
+        error for error in validate_h3_prompt_contract(candidate, mode=mode)
+        if error != "silent prompt has no explicit H3 silence contract"
+    ]
+    errors.extend(validate_h3_context_ir_records(
+        candidate,
+        mode=mode,
+        duration_seconds=duration_seconds,
+    ))
+    errors.extend(_h3_locked_content_errors(source_prompt, candidate))
+    return list(dict.fromkeys(errors))
+
+
+def _finalize_h3_enhance_output(
+    result: str,
+    source_prompt: str,
+    *,
+    ref2va: bool,
+    duration_seconds: Optional[float],
+    max_new_tokens: int,
+    response_assist: Optional[dict],
+    progress_callback: Optional[Callable[[dict], None]],
+) -> str:
+    """Validate H3 output, make one local format-only repair, then fail closed."""
+
+    candidate = _clean_h3_context_ir_output(result)
+    errors = _h3_enhance_contract_errors(
+        candidate,
+        source_prompt,
+        ref2va=ref2va,
+        duration_seconds=duration_seconds,
+    )
+    if not errors:
+        return candidate
+    mode_name = "Ref2VA" if ref2va else "Base"
+    repair_system = (
+        f"FORMAT-ONLY MINIMAX H3 {mode_name.upper()} REPAIR. Output only the "
+        "complete corrected Context-IR. Use physical records exactly as "
+        "[Shot N] [STARTs-ENDs] shot_name: ... | audiovisual_description: ... "
+        "| dialogue_and_vocalizations: .... Change only missing or malformed "
+        "field labels, brackets, timestamp wrappers, shot numbering, and record "
+        "separators. Copy all names, descriptive terms, actions, reference "
+        "labels, speaker IDs, timestamp values and associations, dialogue, "
+        "vocalizations, sound, and music exactly. Do not summarize, expand, "
+        "sanitize, or invent content."
+    )
+    repair_prompt = (
+        "Contract errors:\n"
+        + "\n".join(f"- {error}" for error in errors)
+        + "\n\nORIGINAL REQUEST (literal anchors are immutable):\n"
+        + str(source_prompt or "")
+        + "\n\nPREVIOUS OUTPUT (repair only its format):\n"
+        + candidate
+    )
+    # Provider selection is singleton state. Hold its re-entrant model lock
+    # across the locality check and repair call so another request cannot swap
+    # in a remote provider between those two operations.
+    with _lock:
+        if _provider != "local":
+            raise ValueError(
+                "MiniMax H3 output violated its Context-IR contract and local "
+                "repair is unavailable"
+            )
+        repaired = generate(
+            prompt=repair_prompt,
+            system_prompt=repair_system,
+            max_new_tokens=max(768, int(max_new_tokens or 0)),
+            temperature=0.2,
+            enable_thinking=False,
+            thinking_budget=0,
+            response_assist=response_assist,
+            progress_callback=progress_callback,
+        )
+    repaired = _clean_h3_context_ir_output(repaired)
+    final_errors = _h3_enhance_contract_errors(
+        repaired,
+        source_prompt,
+        ref2va=ref2va,
+        duration_seconds=duration_seconds,
+    )
+    final_errors.extend(_h3_format_repair_lock_errors(candidate, repaired))
+    final_errors = list(dict.fromkeys(final_errors))
+    if final_errors:
+        raise ValueError(
+            "MiniMax H3 output still violated its Context-IR contract after "
+            "one format-only repair: " + "; ".join(final_errors)
+        )
+    return repaired
+
+
 def enhance_prompt(
     prompt: str,
     mode: str = "video",
@@ -4533,6 +5361,8 @@ def enhance_prompt(
     lora_system_hint: str = "",
     raw_enhancer_mode: bool = False,
     preserve_global_timeline: bool = False,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> str:
     is_h3_context_ir = (
         mode in ("video", "avatar")
@@ -4610,6 +5440,8 @@ def enhance_prompt(
             temperature=temperature,
             enable_thinking=False,
             stop=["<think>", "<thinking>"],
+            response_assist=response_assist,
+            progress_callback=progress_callback,
         )
         if is_h3_context_ir and result:
             # Director has already authored the complete Context-IR. Semantic
@@ -4623,12 +5455,24 @@ def enhance_prompt(
                     "[Enhance] H3 Director refinement changed locked Context-IR; "
                     "preserving the original global timeline"
                 )
-                return prompt
+                result = prompt
+        if is_h3_context_ir:
+            return _finalize_h3_enhance_output(
+                result or prompt,
+                prompt,
+                ref2va=is_h3_ref2va,
+                duration_seconds=duration_seconds,
+                max_new_tokens=override_max_tokens,
+                response_assist=response_assist,
+                progress_callback=progress_callback,
+            )
         return result.strip() if result else prompt
 
     # Dedicated per-model enhancer (e.g. Sulphur's uncensored enhancer): the
-    # model is trained to enhance directly. Send the user's prompt (+ optional
-    # image) with NO system prompt / guide and no thinking.
+    # model is trained to enhance directly. Ordinary requests retain raw
+    # passthrough with no system prompt. An explicitly authorized request gets
+    # the same server-owned explicit-authoring context as every other enhancer;
+    # without it, abliterated/uncensored fine-tunes often sanitize the output.
     if raw_enhancer_mode:
         # The fine-tuned enhancer (a) doesn't reliably honor a "write N
         # paragraphs" instruction and (b) likes to prepend a bogus "rendered
@@ -4650,9 +5494,17 @@ def enhance_prompt(
                     ),
                 ),
             )
+        raw_system_prompt = ""
+        if nsfw:
+            from services.director.nsfw_guidance import inject_content_guidance
+            raw_system_prompt = inject_content_guidance(
+                "", True, "enhance",
+            ).strip()
         gen_kw = dict(
-            system_prompt="", max_new_tokens=raw_max_tokens,
+            system_prompt=raw_system_prompt, max_new_tokens=raw_max_tokens,
             temperature=temperature, enable_thinking=False,
+            response_assist=response_assist,
+            progress_callback=progress_callback,
         )
         lines = [ln.strip() for ln in (prompt or "").split("\n") if ln.strip()]
         if (
@@ -4678,6 +5530,16 @@ def enhance_prompt(
         )
         print(f"[Enhance] Raw enhancer ({model_type}, images={bool(image_paths)}, windows={window_count})")
         result = generate(prompt=raw_prompt, image_paths=image_paths, **gen_kw)
+        if is_h3_context_ir:
+            return _finalize_h3_enhance_output(
+                result or prompt,
+                prompt,
+                ref2va=is_h3_ref2va,
+                duration_seconds=duration_seconds,
+                max_new_tokens=raw_max_tokens,
+                response_assist=response_assist,
+                progress_callback=progress_callback,
+            )
         return _clean_enhancer_output(result) or prompt
 
     # Try to load a model-specific guide
@@ -4806,20 +5668,16 @@ def enhance_prompt(
             picked = "dialogue" if (tts_enhance_mode in ("dialogue", "dialogue_fast") and tts_voice_count == 2 and model_specific_dialogue) else ("monologue" if model_specific_monologue else "generic")
             print(f"[Enhance] Using model-specific {picked} prompt for {model_type}")
 
-    # Inject NSFW enhance guidance when mature mode is on. Uses a SHARED,
+    # Inject explicit enhance guidance only after the request-local server gate
+    # has passed. Uses a SHARED,
     # VERSION-CONTROLLED guide (llm_guides/enhance/nsfw_shared.md) so it ships
     # via git to every install — the previous path read from the gitignored
     # supplement pack, which never travels through `git pull` (so edits never
-    # reached the runtime). The guide is semi-clean: it LICENSES and DIRECTS
-    # explicit anatomy, natural mature dialogue, and intensifier preservation
-    # without containing graphic examples; the uncensored LLM supplies the
-    # actual words. Applies to every nsfw_only model (Sulphur, 10Eros, ...) on
-    # top of its clean per-model enhance_guide.
+    # reached the runtime). The shared guide preserves the request's authorized
+    # detail and linguistic register while retaining strict scope fidelity.
     if nsfw:
-        from services.guide_loader import load_guide as _load_nsfw_guide
-        nsfw_block = _load_nsfw_guide("enhance", "nsfw_shared")
-        if nsfw_block:
-            system = f"{system}\n\n{nsfw_block}"
+        from services.director.nsfw_guidance import inject_content_guidance
+        system = inject_content_guidance(system, True, "enhance")
 
     # Shared video-enhance rules — e.g. reference characters by a stable visual
     # appearance, not by name/relationship/pronoun (the model has no memory of
@@ -4947,25 +5805,23 @@ def enhance_prompt(
         thinking_budget=16384 if use_thinking else 4096,
         frequency_penalty=0.3,  # prevent repetition loops
         presence_penalty=0.1,   # encourage variety
+        response_assist=response_assist,
+        progress_callback=progress_callback,
     )
 
-    # Post-process: strip any markdown headers, labels, or explanation the model added
+    # Post-process. H3's repeated record labels are required syntax, so its
+    # output bypasses the generic repetition-loop truncator entirely.
     if result:
         if is_h3_context_ir:
-            import re
-            literal_dialogue = []
-
-            def _protect_dialogue(match):
-                literal_dialogue.append(match.group(0))
-                return f"\x00H3_DIALOGUE_{len(literal_dialogue) - 1}\x00"
-
-            protected = re.sub(
-                r"<d>.*?</d>", _protect_dialogue, result,
-                flags=re.IGNORECASE | re.DOTALL,
+            result = _finalize_h3_enhance_output(
+                result,
+                prompt,
+                ref2va=is_h3_ref2va,
+                duration_seconds=duration_seconds,
+                max_new_tokens=effective_max_tokens,
+                response_assist=response_assist,
+                progress_callback=progress_callback,
             )
-            result = _clean_enhance_output(protected)
-            for index, dialogue in enumerate(literal_dialogue):
-                result = result.replace(f"\x00H3_DIALOGUE_{index}\x00", dialogue)
         else:
             result = _clean_enhance_output(result)
     if preserve_global_timeline and result:
@@ -5014,20 +5870,52 @@ def _clean_enhance_output(text: str) -> str:
 
 
 def describe_image(
-    image_path: str,
+    image_path: str = "",
     prompt: str = "Describe this image in detail for use as a video generation prompt.",
     max_new_tokens: int = 256,
+    *,
+    image_paths: Optional[Sequence[str]] = None,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> str:
-    """Describe an image. Vision support requires multimodal GGUF (future)."""
-    if not os.path.isfile(image_path):
-        raise FileNotFoundError(f"Image not found: {image_path}")
+    """Describe one or more caller-authorized images with a vision model."""
+    if image_paths is None:
+        authorized_paths = [image_path] if image_path else []
+    else:
+        if (
+            isinstance(image_paths, (str, bytes))
+            or not isinstance(image_paths, Sequence)
+            or len(image_paths) > 8
+            or any(not isinstance(path, str) or not path for path in image_paths)
+        ):
+            raise ValueError("image_paths must be a list of at most 8 image files")
+        authorized_paths = list(image_paths)
+        if image_path and image_path not in authorized_paths:
+            if len(authorized_paths) >= 8:
+                raise ValueError("image_paths must be a list of at most 8 image files")
+            authorized_paths.insert(0, image_path)
+    if not authorized_paths:
+        raise ValueError("At least one authorized image path is required")
+    for authorized_path in authorized_paths:
+        if not os.path.isfile(authorized_path):
+            raise FileNotFoundError(f"Image not found: {authorized_path}")
+    if not _vision_available:
+        raise ValueError("The selected LLM has no available vision projector")
 
-    basename = os.path.basename(image_path)
+    basename = os.path.basename(authorized_paths[0])
     return generate(
         prompt=f"The user has an image file named '{basename}'. {prompt}",
         system_prompt="You are a helpful assistant that generates creative, detailed video prompts.",
         max_new_tokens=max_new_tokens,
         temperature=0.4,
+        image_paths=authorized_paths,
+        enable_thinking=(
+            False
+            if normalize_response_assist(response_assist).assistant_prefill
+            else None
+        ),
+        response_assist=response_assist,
+        progress_callback=progress_callback,
     )
 
 
@@ -5074,12 +5962,53 @@ def _build_clip_description(clip: dict, index: int, lyrics: Optional[list] = Non
     )
 
 
+def _inject_authorized_explicit_planner_guidance(
+    system_prompt: str,
+    explicit_guidance: bool,
+    mode: str,
+) -> str:
+    """Compose explicit planner rules without changing ordinary legacy calls.
+
+    Request/provider authorization belongs to the HTTP or durable-pipeline
+    boundary. False remains a byte-for-byte no-op here.
+    """
+    if explicit_guidance is not True:
+        return system_prompt
+    from services.director.nsfw_guidance import inject_content_guidance
+    return inject_content_guidance(system_prompt, True, mode)
+
+
+_STRUCTURED_RESPONSE_ASSIST_PLANNERS = frozenset({
+    "classify_song_sections",
+    "plan_clip_prompts_and_images",
+    "plan_short_film_prompts",
+    "plan_short_film_from_story",
+})
+_PREFILL_RESPONSE_ASSIST_PLANNERS = frozenset({
+    "plan_angle_prompts",
+    "plan_clip_prompts",
+})
+
+
+def _planner_assist_thinking_mode(helper_name: str, response_assist):
+    """Disable thinking for prefilled prose helpers, never structured ones."""
+    if helper_name not in _PREFILL_RESPONSE_ASSIST_PLANNERS:
+        return None
+    if normalize_response_assist(response_assist).assistant_prefill:
+        return False
+    return None
+
+
 def plan_clip_prompts(
     clips: list,
     style_prompt: str,
     lyrics: Optional[list] = None,
     bpm: float = 120.0,
     max_new_tokens: int = 150,
+    nsfw: bool = False,
+    *,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> list:
     """Generate per-clip video prompts based on audio analysis and style.
 
@@ -5119,6 +6048,9 @@ def plan_clip_prompts(
         "Output numbered prompts like '1. prompt text'. Keep each under 40 words. "
         "Output ONLY the numbered prompts, nothing else."
     )
+    system_prompt = _inject_authorized_explicit_planner_guidance(
+        system_prompt, nsfw, "video",
+    )
 
     for batch_start in range(0, len(clips), BATCH_SIZE):
         batch = clips[batch_start:batch_start + BATCH_SIZE]
@@ -5150,6 +6082,11 @@ def plan_clip_prompts(
             system_prompt=system_prompt,
             max_new_tokens=tokens_for_batch,
             temperature=0.8,
+            enable_thinking=_planner_assist_thinking_mode(
+                "plan_clip_prompts", response_assist,
+            ),
+            response_assist=response_assist,
+            progress_callback=progress_callback,
         )
 
         # Parse numbered lines
@@ -5191,6 +6128,10 @@ ANGLE_CATEGORIES = [
 def plan_angle_prompts(
     style_prompt: str,
     num_angles: int = 4,
+    nsfw: bool = False,
+    *,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> list:
     """Generate image-edit prompts for camera angle variations of a reference photo.
 
@@ -5218,6 +6159,9 @@ def plan_angle_prompts(
         "Incorporate the user's style into each prompt. "
         "Output numbered prompts like '1. prompt text'. Output ONLY the numbered prompts."
     )
+    system_prompt = _inject_authorized_explicit_planner_guidance(
+        system_prompt, nsfw, "image",
+    )
 
     user_prompt = (
         f"Visual style: {style_prompt}\n\n"
@@ -5231,6 +6175,11 @@ def plan_angle_prompts(
         system_prompt=system_prompt,
         max_new_tokens=len(angles) * 60,
         temperature=0.7,
+        enable_thinking=_planner_assist_thinking_mode(
+            "plan_angle_prompts", response_assist,
+        ),
+        response_assist=response_assist,
+        progress_callback=progress_callback,
     )
 
     import re
@@ -5758,6 +6707,9 @@ def classify_song_sections(
     sections: list,
     lyrics: list,
     duration: float,
+    *,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """Classify song sections using repetition detection, with LLM fallback.
 
@@ -5837,6 +6789,11 @@ def classify_song_sections(
         system_prompt=system_prompt,
         max_new_tokens=400,
         temperature=0.2,
+        enable_thinking=_planner_assist_thinking_mode(
+            "classify_song_sections", response_assist,
+        ),
+        response_assist=response_assist,
+        progress_callback=progress_callback,
     )
 
     print(f"[LLM] Raw classification output:\n{raw}")
@@ -6064,6 +7021,10 @@ def plan_clip_prompts_and_images(
     speaker_mappings: Optional[dict] = None,
     prompt_type: str = "both",
     existing_image_prompts: Optional[list] = None,
+    nsfw: bool = False,
+    *,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> list:
     """Generate per-clip prompts.  Supports three modes via *prompt_type*:
 
@@ -6353,6 +7314,15 @@ def plan_clip_prompts_and_images(
     if reference_roles:
         system_prompt += f"\n\nREFERENCE IMAGE ORDER:\n{reference_roles}"
 
+    explicit_mode = (
+        "image" if prompt_type == "image"
+        else "video" if prompt_type == "video"
+        else "both"
+    )
+    system_prompt = _inject_authorized_explicit_planner_guidance(
+        system_prompt, nsfw, explicit_mode,
+    )
+
     print(f"[LLM] Planning prompts: prompt_type={prompt_type}, {len(clips)} clips")
 
     for batch_start in range(0, len(clips), BATCH_SIZE):
@@ -6424,6 +7394,11 @@ def plan_clip_prompts_and_images(
             temperature=0.8,
             image_paths=batch_images,
             thinking_budget=thinking_budget,
+            enable_thinking=_planner_assist_thinking_mode(
+                "plan_clip_prompts_and_images", response_assist,
+            ),
+            response_assist=response_assist,
+            progress_callback=progress_callback,
         )
 
         print(f"[LLM] Output:\n{raw}")
@@ -6569,6 +7544,10 @@ def plan_short_film_prompts(
     characters: Optional[list] = None,
     prompt_type: str = "both",
     existing_image_prompts: Optional[list] = None,
+    nsfw: bool = False,
+    *,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> list:
     """Generate per-clip prompts for short film mode.
 
@@ -6777,6 +7756,15 @@ def plan_short_film_prompts(
     if reference_roles:
         system_prompt += f"\n\nREFERENCE IMAGE ORDER:\n{reference_roles}"
 
+    explicit_mode = (
+        "image" if prompt_type == "image"
+        else "video" if prompt_type == "video"
+        else "both"
+    )
+    system_prompt = _inject_authorized_explicit_planner_guidance(
+        system_prompt, nsfw, explicit_mode,
+    )
+
     print(f"[LLM] Short film prompts: prompt_type={prompt_type}, {len(clips)} clips")
 
     # Process all clips in one batch for narrative coherence
@@ -6837,6 +7825,11 @@ def plan_short_film_prompts(
         temperature=0.8,
         image_paths=batch_images,
         thinking_budget=thinking_budget,
+        enable_thinking=_planner_assist_thinking_mode(
+            "plan_short_film_prompts", response_assist,
+        ),
+        response_assist=response_assist,
+        progress_callback=progress_callback,
     )
 
     print(f"[LLM] Output:\n{raw}")
@@ -6904,6 +7897,10 @@ def plan_short_film_from_story(
     frames_steps: int = 4,
     frames_minimum: int = 5,
     max_new_tokens: int = 1024,
+    nsfw: bool = False,
+    *,
+    response_assist: Optional[dict] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """Plan a short film scene structure from a story description.
 
@@ -7141,6 +8138,10 @@ def plan_short_film_from_story(
     if reference_roles:
         system_prompt += f"\n\nREFERENCE IMAGE ORDER:\n{reference_roles}"
 
+    system_prompt = _inject_authorized_explicit_planner_guidance(
+        system_prompt, nsfw, "director",
+    )
+
     print(f"[LLM] Planning short film from story: {target_scenes} scenes, {target_duration}s")
     print(f"[LLM] Story: {story_description}")
     print(f"[LLM] Token budget: {target_scenes * 400 + 256} content + 8192 thinking = {target_scenes * 400 + 256 + 8192} total")
@@ -7160,6 +8161,11 @@ def plan_short_film_from_story(
         temperature=0.8,
         image_paths=batch_images,
         thinking_budget=thinking_budget,
+        enable_thinking=_planner_assist_thinking_mode(
+            "plan_short_film_from_story", response_assist,
+        ),
+        response_assist=response_assist,
+        progress_callback=progress_callback,
     )
 
     print(f"[LLM] Story plan output:\n{raw}")
@@ -7290,6 +8296,11 @@ def plan_short_film_from_story(
             max_new_tokens=len(over_budget) * 200,
             temperature=0.5,
             thinking_budget=1024,
+            enable_thinking=_planner_assist_thinking_mode(
+                "plan_short_film_from_story", response_assist,
+            ),
+            response_assist=response_assist,
+            progress_callback=progress_callback,
         )
         print(f"[LLM] Rewrite output:\n{rewrite_raw}")
 

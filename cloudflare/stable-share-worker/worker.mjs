@@ -1,8 +1,43 @@
 const TARGET_KEY = "quick-tunnel-origin"
 const HEALTH_PATH = "/.well-known/maestro-share/health"
 const UPDATE_PATH = "/.well-known/maestro-share/target"
+const DIRECT_PATH = "/.well-known/maestro-share/direct"
 const ORIGIN_HEALTH_PATH = "/health"
 const HEALTH_CACHE_SECONDS = 8
+const REDIRECT_STATUSES = new Set([300, 301, 302, 303, 307, 308])
+const REQUEST_HEADERS_TO_DROP = new Set([
+  "cdn-loop",
+  "cf-connecting-ip",
+  "cf-connecting-ipv6",
+  "cf-ew-via",
+  "cf-ray",
+  "connection",
+  "forwarded",
+  "host",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "true-client-ip",
+  "upgrade",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-real-ip",
+])
+const RESPONSE_HEADERS_TO_DROP = new Set([
+  "connection",
+  "content-length",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+])
 
 const OFFLINE_HTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -155,6 +190,131 @@ const offlineResponse = (request) => {
   })
 }
 
+const upstreamRequest = (request, destination) => {
+  const headers = new Headers(request.headers)
+  for (const name of REQUEST_HEADERS_TO_DROP) headers.delete(name)
+
+  // Constructing from the original Request preserves a streaming body without
+  // buffering uploads.  The second Request forces redirects to remain visible
+  // to this Worker instead of replaying cookies or Authorization elsewhere.
+  return new Request(new Request(destination, request), {
+    headers,
+    redirect: "manual",
+  })
+}
+
+const setCookieValues = (headers) => {
+  try {
+    if (typeof headers.getAll === "function") {
+      return headers.getAll("Set-Cookie")
+    }
+    if (typeof headers.getSetCookie === "function") {
+      return headers.getSetCookie()
+    }
+  } catch {}
+  const single = headers.get("Set-Cookie")
+  return single ? [single] : []
+}
+
+const proxyResponseHeaders = (response) => {
+  const headers = new Headers()
+  const cookies = setCookieValues(response.headers)
+  response.headers.forEach((value, name) => {
+    const lower = name.toLowerCase()
+    if (lower !== "set-cookie" && !RESPONSE_HEADERS_TO_DROP.has(lower)) {
+      headers.append(name, value)
+    }
+  })
+  for (const cookie of cookies) headers.append("Set-Cookie", cookie)
+  // Cloudflare owns transfer framing for streamed Worker responses. Do not
+  // promise an upstream Content-Length that the runtime may strip or replace.
+  headers.set("Cache-Control", "no-store")
+  headers.set("Referrer-Policy", "no-referrer")
+  headers.set("X-Content-Type-Options", "nosniff")
+  return headers
+}
+
+const stableRedirect = (value, destination, target, stableOrigin) => {
+  let redirected
+  try {
+    redirected = new URL(value, destination)
+  } catch {
+    return null
+  }
+  if (
+    redirected.origin !== target
+    || redirected.username
+    || redirected.password
+  ) return null
+
+  const stable = new URL(stableOrigin)
+  stable.pathname = redirected.pathname
+  stable.search = redirected.search
+  stable.hash = redirected.hash
+  return stable.href
+}
+
+const proxyToTarget = async (request, env, target, incoming) => {
+  const destination = new URL(target)
+  destination.pathname = incoming.pathname
+  destination.search = incoming.search
+
+  let response
+  try {
+    const targetFetch = env.__TEST_FETCH || globalThis.fetch
+    response = await targetFetch(upstreamRequest(request, destination.href))
+  } catch {
+    return offlineResponse(request)
+  }
+
+  const headers = proxyResponseHeaders(response)
+  const location = response.headers.get("Location")
+  if (location && REDIRECT_STATUSES.has(response.status)) {
+    const rewritten = stableRedirect(
+      location, destination.href, target, incoming.origin,
+    )
+    if (!rewritten) {
+      try { await response.body?.cancel() } catch {}
+      return jsonResponse({ ok: false, detail: "Maestro returned an unsafe redirect" }, 502)
+    }
+    headers.set("Location", rewritten)
+  }
+
+  const contentLocation = response.headers.get("Content-Location")
+  if (contentLocation) {
+    const rewritten = stableRedirect(
+      contentLocation, destination.href, target, incoming.origin,
+    )
+    if (rewritten) headers.set("Content-Location", rewritten)
+    else headers.delete("Content-Location")
+  }
+
+  // Passing the body stream through keeps polling responses, uploads, and
+  // downloads incremental and avoids charging Worker CPU for media buffering.
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+const directTunnelResponse = (target, incoming = null) => {
+  const destination = new URL(target)
+  if (incoming) {
+    destination.pathname = incoming.pathname
+    destination.search = incoming.search
+  }
+  return new Response(null, {
+    status: 307,
+    headers: {
+      "Cache-Control": "no-store",
+      Location: destination.href,
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+  })
+}
+
 export default {
   async fetch(request, env) {
     const incoming = new URL(request.url)
@@ -166,21 +326,17 @@ export default {
       if (request.method !== "PUT") return jsonResponse({ ok: false }, 405)
       return updateTarget(request, env)
     }
+    if (incoming.pathname === DIRECT_PATH && request.method !== "GET") {
+      return jsonResponse({ ok: false }, 405)
+    }
 
     const target = canonicalQuickTunnelOrigin(await env.MAESTRO_TARGETS.get(TARGET_KEY))
     if (!target || !(await cachedOriginHealth(target, env))) return offlineResponse(request)
-    const destination = new URL(target)
-    destination.pathname = incoming.pathname
-    destination.search = incoming.search
-    return new Response(null, {
-      status: 307,
-      headers: {
-        "Cache-Control": "no-store",
-        Location: destination.href,
-        "Referrer-Policy": "no-referrer",
-      },
-    })
+    if (incoming.pathname === DIRECT_PATH) return directTunnelResponse(target)
+    const shareMode = String(env.SHARE_MODE || "proxy").trim().toLowerCase()
+    if (shareMode === "proxy") return proxyToTarget(request, env, target, incoming)
+    return directTunnelResponse(target, incoming)
   },
 }
 
-export const paths = { HEALTH_PATH, UPDATE_PATH }
+export const paths = { DIRECT_PATH, HEALTH_PATH, UPDATE_PATH }

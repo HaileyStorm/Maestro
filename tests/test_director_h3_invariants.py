@@ -1,6 +1,7 @@
 """Model-free Director regressions for MiniMax H3 child generation."""
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import tempfile
@@ -17,6 +18,9 @@ if _APP_DIR not in sys.path:
 
 from services import director_pipeline as pipeline  # noqa: E402
 from services import llm_service  # noqa: E402
+from services.director.h3_dialogue import (  # noqa: E402
+    validate_h3_context_ir_records,
+)
 
 
 class _H3Wgp:
@@ -130,7 +134,20 @@ class TestDirectorH3Invariants(unittest.TestCase):
                 self.assertEqual(len(body["per_clip_prompts"]), plan["clip_count"])
                 self.assertTrue(all(124 <= value <= 345 for value in plan["clip_frames"]))
                 self.assertTrue(all(value % 17 == 5 for value in plan["clip_frames"]))
-                self.assertIn("At 00:15.000", plan["global_prompt"])
+                self.assertIn("[15.000s-", plan["global_prompt"])
+                self.assertTrue(all(
+                    not validate_h3_context_ir_records(
+                        prompt,
+                        mode="t2va",
+                        duration_seconds=(
+                            published / plan["shot_plan"]["fps"]
+                        ),
+                    )
+                    for prompt, published in zip(
+                        body["per_clip_prompts"],
+                        plan["clip_published_frames"],
+                    )
+                ))
                 self.assertTrue(any(
                     boundary["type"] in {"precut", "cut"}
                     for boundary in plan["clip_boundaries"]
@@ -249,10 +266,11 @@ class TestDirectorH3Invariants(unittest.TestCase):
                 self.assertEqual(cut_boundary["at_seconds"], 15.0)
                 self.assertEqual(cut_boundary["source"], "explicit_cut")
                 self.assertIn(
-                    "[0-", body["per_clip_prompts"][cut_index + 1],
+                    "[Shot 1] [0.000s-",
+                    body["per_clip_prompts"][cut_index + 1],
                 )
                 self.assertIn(
-                    "[Shot 2] cut to a close-up as the train arrives.",
+                    "cut to a close-up as the train arrives",
                     body["per_clip_prompts"][cut_index + 1],
                 )
                 if final_frame:
@@ -296,8 +314,6 @@ class TestDirectorH3Invariants(unittest.TestCase):
         body.pop("image_start")
         body["image_prompt_type"] = ""
         body["video_length"] = 240
-        original = dict(body)
-
         plan = pipeline._prepare_director_h3_longform(
             body,
             params={"explicit_output": True},
@@ -307,7 +323,14 @@ class TestDirectorH3Invariants(unittest.TestCase):
         )
 
         self.assertIsNone(plan)
-        self.assertEqual(body, original)
+        self.assertEqual(body["model_type"], pipeline._H3_BASE_FL2VA_MODEL)
+        self.assertEqual(body["per_clip_prompts"], [body["prompt"]])
+        self.assertEqual(
+            validate_h3_context_ir_records(
+                body["prompt"], mode="t2va", duration_seconds=10,
+            ),
+            [],
+        )
         self.assertEqual(
             pipeline._director_h3_preferred_fl2va(
                 {"explicit_output": True},
@@ -441,6 +464,282 @@ class TestDirectorH3Invariants(unittest.TestCase):
         )
         self.assertTrue(restored["manual_segment_ceiling"])
         self.assertTrue(fresh_body["h3_ref2va_terms_accepted"])
+        for prompt, frames in zip(
+            fresh_body["per_clip_prompts"], restored["clip_published_frames"],
+        ):
+            self.assertEqual(
+                validate_h3_context_ir_records(
+                    prompt, mode="t2va", duration_seconds=frames / 24,
+                ),
+                [],
+            )
+
+    def test_legacy_bare_saved_child_prompts_recompile_to_canonical(self):
+        import copy
+
+        clips = [{"video_prompt": "Beat one. Beat two. Beat three."}]
+        planned = [{"start": 0, "end": 20, "duration_sec": 20}]
+        body = self._base_generation_params()
+        params = {"h3_ref2va_terms_accepted": True}
+        pipeline._prepare_director_h3_longform(
+            body,
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        saved = copy.deepcopy(params["_h3_longform"])
+        legacy = []
+        for index, frames in enumerate(saved["clip_published_frames"], start=1):
+            prompt = (
+                f"[0-{frames / 24:g}s] Saved child {index} keeps "
+                f"<Subject {index}> (S{index}) in place."
+            )
+            legacy.append(prompt)
+            saved["shot_plan"]["shots"][index - 1]["prompt"] = prompt
+        saved["shot_plan"]["clip_prompts"] = legacy
+        saved["global_prompt"] = "Legacy plain root global scene."
+        saved["shot_plan"]["global_prompt"] = (
+            "Legacy plain shot-plan global scene."
+        )
+        replay_params = {
+            "h3_ref2va_terms_accepted": True,
+            "_h3_longform": saved,
+        }
+        replay_body = self._base_generation_params()
+        restored = pipeline._prepare_director_h3_longform(
+            replay_body,
+            params=replay_params,
+            clip_plans=[],
+            planned_clips=[],
+            fps=24,
+        )
+
+        for index, (prompt, frames) in enumerate(zip(
+            replay_body["per_clip_prompts"], restored["clip_published_frames"],
+        )):
+            self.assertEqual(
+                validate_h3_context_ir_records(
+                    prompt, mode="t2va", duration_seconds=frames / 24,
+                ),
+                [],
+            )
+            self.assertEqual(
+                restored["shot_plan"]["shots"][index]["prompt"], prompt,
+            )
+            self.assertNotRegex(prompt, r"(?m)^\[\d+(?:\.\d+)?-")
+        self.assertEqual(
+            replay_params["_h3_longform"]["shot_plan"]["clip_prompts"],
+            replay_body["per_clip_prompts"],
+        )
+        canonical_global = pipeline._DIRECTOR_CLIP_SEPARATOR.join(
+            replay_body["per_clip_prompts"],
+        )
+        self.assertEqual(restored["global_prompt"], canonical_global)
+        self.assertEqual(
+            restored["shot_plan"]["global_prompt"], canonical_global,
+        )
+        self.assertEqual(
+            replay_params["_h3_longform"]["global_prompt"], canonical_global,
+        )
+        self.assertNotRegex(canonical_global, r"(?m)^\[\d+(?:\.\d+)?-")
+
+    def test_multi_scene_legacy_globals_recompile_from_canonical_children(self):
+        import copy
+
+        clips = [
+            {"video_prompt": "Legacy scene A keeps <Subject 1>."},
+            {"video_prompt": "Legacy scene B keeps <Subject 2>."},
+        ]
+        planned = [
+            {"start": 0, "end": 10, "duration_sec": 10},
+            {"start": 10, "end": 20, "duration_sec": 10},
+        ]
+        body = self._base_generation_params()
+        params = {"h3_ref2va_terms_accepted": True}
+        pipeline._prepare_director_h3_longform(
+            body, params=params, clip_plans=clips, planned_clips=planned, fps=24,
+        )
+        saved = copy.deepcopy(params["_h3_longform"])
+        legacy_global = "[0-10s] Legacy scene A.\n\n[0-10s] Legacy scene B."
+        saved["global_prompt"] = legacy_global
+        saved["shot_plan"]["global_prompt"] = legacy_global
+        replay_params = {
+            "h3_ref2va_terms_accepted": True,
+            "_h3_longform": saved,
+        }
+        restored = pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=replay_params,
+            clip_plans=[],
+            planned_clips=[],
+            fps=24,
+        )
+        canonical_global = pipeline._DIRECTOR_CLIP_SEPARATOR.join(
+            restored["shot_plan"]["clip_prompts"],
+        )
+        self.assertEqual(restored["global_prompt"], canonical_global)
+        self.assertEqual(
+            restored["shot_plan"]["global_prompt"], canonical_global,
+        )
+        self.assertIn("<Subject 1>", canonical_global)
+        self.assertIn("<Subject 2>", canonical_global)
+
+    def test_empty_scene_uses_canonical_fallback_and_never_invents_dialogue(self):
+        body = self._base_generation_params()
+        body["per_clip_prompts"] = ["Fallback keeps <Subject 1> at the door."]
+        result = pipeline._prepare_director_h3_longform(
+            body,
+            params={},
+            clip_plans=[{"video_prompt": "", "window_prompts": []}],
+            planned_clips=[{"start": 0, "end": 10, "duration_sec": 10}],
+            fps=24,
+        )
+        self.assertIsNone(result)
+        self.assertIn("Fallback keeps <Subject 1> at the door.", body["prompt"])
+        self.assertNotIn("audiovisual_description: Dialogue", body["prompt"])
+        self.assertEqual(
+            validate_h3_context_ir_records(
+                body["prompt"], mode="t2va", duration_seconds=10,
+            ),
+            [],
+        )
+
+        empty_body = self._base_generation_params()
+        empty_body["prompt"] = ""
+        with self.assertRaisesRegex(ValueError, "scene prompt is empty"):
+            pipeline._prepare_director_h3_longform(
+                empty_body,
+                params={},
+                clip_plans=[{"video_prompt": "", "window_prompts": []}],
+                planned_clips=[{"start": 0, "end": 10, "duration_sec": 10}],
+                fps=24,
+            )
+
+    def test_invalid_saved_version_and_unaccepted_ref2va_fail_closed(self):
+        body = self._base_generation_params()
+        with (
+            patch(
+                "services.h3_shot_planner.plan_h3_native_shots",
+                side_effect=AssertionError("invalid saved plan must not replan"),
+            ),
+            self.assertRaisesRegex(ValueError, "version is unsupported"),
+        ):
+            pipeline._prepare_director_h3_longform(
+                body,
+                params={"_h3_longform": {"shot_plan": {"version": 2}}},
+                clip_plans=[],
+                planned_clips=[],
+                fps=24,
+            )
+
+        clips, planned = self._scene(20.0)
+        params = {"h3_ref2va_terms_accepted": True}
+        pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        saved = copy.deepcopy(params["_h3_longform"])
+        saved["segment_models"][0]["model_type"] = pipeline._H3_REF2VA_MODEL
+        with self.assertRaisesRegex(ValueError, "saved Director generation.*Ref2VA"):
+            pipeline._prepare_director_h3_longform(
+                self._base_generation_params(),
+                params={"_h3_longform": saved},
+                clip_plans=[],
+                planned_clips=[],
+                fps=24,
+            )
+
+    def test_legacy_saved_geometry_is_migrated_before_prompt_recompile(self):
+        import copy
+
+        clips, planned = self._scene(20.0)
+        params = {"h3_ref2va_terms_accepted": True}
+        pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        saved = copy.deepcopy(params["_h3_longform"])
+        for container in (saved, saved["shot_plan"]):
+            container.pop("clip_published_frames", None)
+            container.pop("clip_trim_tail_frames", None)
+        replay_params = {
+            "h3_ref2va_terms_accepted": True,
+            "_h3_longform": saved,
+        }
+        restored = pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=replay_params,
+            clip_plans=[],
+            planned_clips=[],
+            fps=24,
+        )
+        self.assertEqual(
+            restored["clip_published_frames"],
+            restored["shot_plan"]["clip_published_frames"],
+        )
+        self.assertEqual(
+            restored["clip_trim_tail_frames"],
+            restored["shot_plan"]["clip_trim_tail_frames"],
+        )
+        self.assertEqual(
+            replay_params["_h3_longform"]["clip_published_frames"],
+            restored["clip_published_frames"],
+        )
+
+    def test_director_multi_window_scene_prompt_is_canonical(self):
+        prompt = pipeline._director_h3_scene_prompt(
+            {
+                "video_prompt": "",
+                "window_prompts": [
+                    "Mara waits beside <Subject 1> (S1).",
+                    "Theo replies <d>[English] Keep this exact.</d>",
+                ],
+            },
+            frame_count=480,
+            fps=24,
+        )
+        self.assertEqual(
+            validate_h3_context_ir_records(
+                prompt, mode="t2va", duration_seconds=20,
+            ),
+            [],
+        )
+        self.assertIn("[Shot 1] [0.000s-10.000s]", prompt)
+        self.assertIn("[Shot 2] [10.000s-20.000s]", prompt)
+        self.assertIn("<Subject 1> (S1)", prompt)
+        self.assertIn("<d>[English] Keep this exact.</d>", prompt)
+        self.assertNotRegex(prompt, r"(?m)^\[\d+(?:\.\d+)?-")
+
+    def test_director_h3_rejects_wrapper_around_canonical_context_ir(self):
+        canonical = pipeline._director_h3_scene_prompt(
+            {"video_prompt": "Mara waits.", "window_prompts": []},
+            frame_count=240,
+            fps=24,
+        )
+        with self.assertRaisesRegex(ValueError, "wrapper text"):
+            pipeline._director_h3_canonical_prompt(
+                "NOTE: hidden wrapper\n" + canonical,
+                duration_seconds=10,
+            )
+
+    def test_non_h3_longform_control_is_unchanged(self):
+        body = {"model_type": "ltx2_22B_distilled", "prompt": "Keep me."}
+        original = dict(body)
+        self.assertIsNone(pipeline._prepare_director_h3_longform(
+            body,
+            params={},
+            clip_plans=[{"video_prompt": "Keep me."}],
+            planned_clips=[{"duration_sec": 10}],
+            fps=24,
+        ))
+        self.assertEqual(body, original)
 
     def test_corrupt_committed_publication_geometry_is_rejected(self):
         import copy
@@ -697,7 +996,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
                 self.assertEqual(boundary["type"], override)
                 self.assertEqual(boundary["continuity_mode"], expected)
 
-    def test_studio_and_director_share_byte_and_boundary_semantics(self):
+    def test_studio_and_director_share_geometry_while_director_is_canonical(self):
         from tests.test_studio_prompt_windows import H3LongStudioPlanningTests
 
         prompt = "Beat one. Beat two. Beat three. Beat four."
@@ -727,12 +1026,21 @@ class TestDirectorH3Invariants(unittest.TestCase):
         )
         self.assertEqual(director["clip_frames"], studio["clip_frames"])
         self.assertEqual(
-            director["shot_plan"]["clip_prompts"],
-            studio["shot_plan"]["clip_prompts"],
-        )
-        self.assertEqual(
             director["clip_boundaries"], studio["clip_boundaries"],
         )
+        for child_prompt, frames in zip(
+            director["shot_plan"]["clip_prompts"],
+            director["clip_published_frames"],
+        ):
+            self.assertEqual(
+                validate_h3_context_ir_records(
+                    child_prompt,
+                    mode="t2va",
+                    duration_seconds=frames / 24,
+                ),
+                [],
+            )
+            self.assertNotRegex(child_prompt, r"(?m)^\[\d+(?:\.\d+)?-")
 
     def test_unequal_timed_studio_director_and_recovery_are_exact(self):
         from tests.test_studio_prompt_windows import H3LongStudioPlanningTests
@@ -783,10 +1091,18 @@ class TestDirectorH3Invariants(unittest.TestCase):
             self.assertIn(
                 "guest faces camera", plan["shot_plan"]["clip_prompts"][1],
             )
-        self.assertEqual(
+        for child_prompt, frames in zip(
             director["shot_plan"]["clip_prompts"],
-            studio["shot_plan"]["clip_prompts"],
-        )
+            director["clip_published_frames"],
+        ):
+            self.assertEqual(
+                validate_h3_context_ir_records(
+                    child_prompt,
+                    mode="t2va",
+                    duration_seconds=frames / 24,
+                ),
+                [],
+            )
 
         recovered_body = self._base_generation_params()
         with patch(
@@ -807,6 +1123,10 @@ class TestDirectorH3Invariants(unittest.TestCase):
         self.assertEqual(recovered["clip_published_frames"], [144, 336])
         self.assertEqual(recovered["clip_trim_tail_frames"], [14, 9])
         self.assertEqual(recovered_body["per_clip_frames"], [158, 345])
+        self.assertEqual(
+            recovered_body["per_clip_prompts"],
+            director["shot_plan"]["clip_prompts"],
+        )
 
     def test_seamless_keyframes_use_supported_ref2va_semantic_conditioning(self):
         clips = [{"video_prompt": "One continuous tracking shot."}]

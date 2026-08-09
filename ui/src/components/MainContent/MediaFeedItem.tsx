@@ -104,7 +104,6 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   const toggleOutputSelection = useStore(s => s.toggleOutputSelection)
 
   const saveRecipeFromOutput = useStore(s => s.saveRecipeFromOutput)
-  const nsfwMode = useStore(s => !!s.servicesConfig?.nsfw_mode)
 
   const [meta, setMeta] = useState<OutputMetadata | null>(null)
   const [metaLoaded, setMetaLoaded] = useState(false)
@@ -924,7 +923,6 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
       </div>
       {showSaveRecipe && (
         <SaveRecipeDialog
-          defaultNsfw={nsfwMode}
           onCancel={() => setShowSaveRecipe(false)}
           onSave={async (name, description, nsfw) => {
             await saveRecipeFromOutput(file.name, name, description, nsfw)

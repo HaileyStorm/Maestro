@@ -1,17 +1,53 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Bot, ImagePlus, Loader2, Send, Trash2, UserRound, X } from 'lucide-react'
+import { Bot, Flag, ImagePlus, Loader2, Pencil, RotateCcw, Send, Trash2, UserRound, X } from 'lucide-react'
 import * as api from '../api/client'
 import { useStore } from '../stores/useStore'
 import type { LlmChatMessage, LlmModelOption, LlmPromptGuideOption } from '../types'
 
 const STORAGE_PREFIX = 'maestro:llm-chat:'
+const OPERATION_STORAGE_PREFIX = 'maestro:llm-chat-operation:'
 const MAX_HISTORY_MESSAGES = 62
 const MAX_IMAGE_ATTACHMENTS = 4
 const MAX_IMAGE_BYTES = 32 * 1024 * 1024
 const IMAGE_EXTENSION = /\.(avif|bmp|gif|jpe?g|png|webp)$/i
 
+interface RefusalCapture {
+  messageIndex: number
+  literal: string
+}
+
+interface RefusalCaptureError {
+  messageIndex: number
+  message: string
+}
+
+interface RefusalSelectionResult {
+  literal?: string
+  error?: string
+}
+
+interface RefusalSelectionSnapshot {
+  messageIndex: number
+  result: RefusalSelectionResult
+}
+
+interface RefusalLiteralSaveRequest {
+  token: number
+  workspace: string
+  projectInstance: string
+  controller: AbortController
+}
+
 function storageKey(workspace: string, projectInstance: string): string {
   return `${STORAGE_PREFIX}${encodeURIComponent(workspace)}:${projectInstance}`
+}
+
+function pendingKey(workspace: string, projectInstance: string): string {
+  return `${workspace}\0${projectInstance}`
+}
+
+function operationStorageKey(workspace: string, projectInstance: string): string {
+  return `${OPERATION_STORAGE_PREFIX}${encodeURIComponent(workspace)}:${projectInstance}`
 }
 
 function restoreMessages(workspace: string, projectInstance: string): LlmChatMessage[] {
@@ -34,6 +70,21 @@ function restoreMessages(workspace: string, projectInstance: string): LlmChatMes
               && attachment.name.length <= 255
             ))
             .map(attachment => ({ kind: 'image' as const, name: attachment.name }))
+          : undefined,
+        performance: item.role === 'assistant'
+          && item.performance
+          && (item.performance.average_tps === null
+            || (typeof item.performance.average_tps === 'number'
+              && Number.isFinite(item.performance.average_tps)))
+          ? {
+              average_tps: item.performance.average_tps,
+              generated_tokens_approx: typeof item.performance.generated_tokens_approx === 'number'
+                ? item.performance.generated_tokens_approx
+                : undefined,
+              elapsed_seconds: typeof item.performance.elapsed_seconds === 'number'
+                ? item.performance.elapsed_seconds
+                : undefined,
+            }
           : undefined,
       }))
   } catch {
@@ -183,6 +234,7 @@ interface PendingChatRequest {
   workspace: string
   projectInstance: string
   controller: AbortController
+  requestId: string
   modelId: string
   customModel: string
   effectiveModelId: string
@@ -193,12 +245,143 @@ interface PendingChatRequest {
   draft: string
   images: File[]
   retainedHistory: LlmChatMessage[]
+  submittedMessages: LlmChatMessage[]
   uploadedRefs: string[]
-  chatSubmitted: boolean
+  submissionAttempted: boolean
+  requiresFreshImage: boolean
+  editingTurn: EditingTurn | null
+  latestStatus?: api.LlmChatOperationStatus
+}
+
+type ChatRequestPhase = 'idle' | 'uploading' | 'queued' | 'preparing' | 'generating'
+interface EditingTurn {
+  index: number
+  requiresFreshImage: boolean
+}
+
+interface ScopedChatStatus {
+  workspace: string
+  projectInstance: string
+  requestId: string
+  status: api.LlmChatOperationStatus
+}
+
+function operationRequestPhase(phase: string): ChatRequestPhase {
+  if (phase === 'queued') return 'queued'
+  if (phase === 'loading') return 'preparing'
+  return 'generating'
+}
+
+function boundedChatHistory(messages: LlmChatMessage[]): LlmChatMessage[] {
+  const bounded = messages.slice(-MAX_HISTORY_MESSAGES)
+  return bounded[0]?.role === 'assistant' ? bounded.slice(1) : bounded
+}
+
+function retryChatBranch(
+  messages: LlmChatMessage[],
+  assistantIndex: number,
+): LlmChatMessage[] | null {
+  if (messages[assistantIndex]?.role !== 'assistant') return null
+  const branch = boundedChatHistory(messages.slice(0, assistantIndex))
+  if (branch.some(message => message.attachments?.length)) return null
+  return branch.length > 0 && branch.at(-1)?.role === 'user' ? branch : null
+}
+
+function editedChatBranch(
+  messages: LlmChatMessage[],
+  userIndex: number,
+  editedUser: LlmChatMessage,
+): LlmChatMessage[] | null {
+  if (messages[userIndex]?.role !== 'user' || editedUser.role !== 'user') return null
+  const prefix = boundedChatHistory(messages.slice(0, userIndex))
+  if (prefix.some(message => message.attachments?.length)) return null
+  return [...prefix, editedUser]
+}
+
+const suspendedChatRequests = new Map<string, PendingChatRequest>()
+
+function persistPendingOperation(pending: PendingChatRequest): void {
+  try {
+    localStorage.setItem(operationStorageKey(pending.workspace, pending.projectInstance), JSON.stringify({
+      requestId: pending.requestId,
+      workspace: pending.workspace,
+      projectInstance: pending.projectInstance,
+      modelId: pending.modelId,
+      customModel: pending.customModel,
+      effectiveModelId: pending.effectiveModelId,
+      useGuide: pending.useGuide,
+      guideId: pending.guideId,
+      requestGuideId: pending.requestGuideId,
+      guideTargetOverridden: pending.guideTargetOverridden,
+      draft: pending.draft,
+      retainedHistory: pending.retainedHistory,
+      submittedMessages: pending.submittedMessages,
+      requires_fresh_image: pending.requiresFreshImage,
+      editingTurn: pending.editingTurn,
+    }))
+  } catch { /* In-memory recovery remains available for this browser session. */ }
+}
+
+function removePendingOperation(workspace: string, projectInstance: string): void {
+  try { localStorage.removeItem(operationStorageKey(workspace, projectInstance)) } catch { /* private mode */ }
+}
+
+function restorePendingOperation(
+  workspace: string,
+  projectInstance: string,
+): PendingChatRequest | null {
+  try {
+    const raw = localStorage.getItem(operationStorageKey(workspace, projectInstance))
+    if (!raw) return null
+    const value = JSON.parse(raw) as Partial<PendingChatRequest> & {
+      requires_fresh_image?: unknown
+    }
+    if (
+      typeof value.requestId !== 'string'
+      || value.workspace !== workspace
+      || value.projectInstance !== projectInstance
+      || !Array.isArray(value.retainedHistory)
+      || !Array.isArray(value.submittedMessages)
+    ) return null
+    return {
+      workspace,
+      projectInstance,
+      controller: new AbortController(),
+      requestId: value.requestId,
+      modelId: typeof value.modelId === 'string' ? value.modelId : '',
+      customModel: typeof value.customModel === 'string' ? value.customModel : '',
+      effectiveModelId: typeof value.effectiveModelId === 'string' ? value.effectiveModelId : '',
+      useGuide: value.useGuide === true,
+      guideId: typeof value.guideId === 'string' ? value.guideId : '',
+      requestGuideId: typeof value.requestGuideId === 'string' ? value.requestGuideId : '',
+      guideTargetOverridden: value.guideTargetOverridden === true,
+      draft: typeof value.draft === 'string' ? value.draft : '',
+      images: [],
+      retainedHistory: value.retainedHistory,
+      submittedMessages: value.submittedMessages,
+      uploadedRefs: [],
+      submissionAttempted: true,
+      requiresFreshImage: value.requires_fresh_image === true,
+      editingTurn: value.editingTurn
+        && typeof value.editingTurn.index === 'number'
+        ? {
+            index: value.editingTurn.index,
+            requiresFreshImage: value.editingTurn.requiresFreshImage === true,
+          }
+        : null,
+    }
+  } catch {
+    return null
+  }
+}
+
+function hasPendingOperation(workspace: string, projectInstance: string): boolean {
+  return suspendedChatRequests.has(pendingKey(workspace, projectInstance))
+    || restorePendingOperation(workspace, projectInstance) !== null
 }
 
 function cleanupUnsubmittedUploads(pending: PendingChatRequest): void {
-  if (pending.chatSubmitted || pending.uploadedRefs.length === 0) return
+  if (pending.submissionAttempted || pending.uploadedRefs.length === 0) return
   const filenames = pending.uploadedRefs.splice(0)
   for (const filename of filenames) {
     void api.deleteLlmChatImage(pending.workspace, filename).catch(() => {
@@ -224,40 +407,90 @@ export function LlmChat() {
   const [loadingCatalog, setLoadingCatalog] = useState(true)
   const [sending, setSending] = useState(false)
   const [uploadingImages, setUploadingImages] = useState(false)
+  const [requestPhase, setRequestPhase] = useState<ChatRequestPhase>('idle')
+  const [resumeAvailable, setResumeAvailable] = useState(false)
+  const [resumeNonce, setResumeNonce] = useState(0)
+  const [editingTurn, setEditingTurn] = useState<EditingTurn | null>(null)
+  const [freshImagesRequired, setFreshImagesRequired] = useState(false)
+  const [liveChatStatus, setLiveChatStatus] = useState<ScopedChatStatus | null>(null)
+  const [refusalCapture, setRefusalCapture] = useState<RefusalCapture | null>(null)
+  const [refusalCaptureError, setRefusalCaptureError] = useState<RefusalCaptureError | null>(null)
+  const [refusalCaptureNotice, setRefusalCaptureNotice] = useState<string | null>(null)
+  const [savingRefusalLiteral, setSavingRefusalLiteral] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const refusalLiteralInputRef = useRef<HTMLTextAreaElement>(null)
+  const assistantContentRefs = useRef(new Map<number, HTMLDivElement>())
+  const refusalCaptureTriggerRefs = useRef(new Map<number, HTMLButtonElement>())
+  const refusalCaptureErrorRefs = useRef(new Map<number, HTMLParagraphElement>())
+  const refusalSelectionSnapshotRef = useRef<RefusalSelectionSnapshot | null>(null)
+  const refusalLiteralSaveRef = useRef<RefusalLiteralSaveRequest | null>(null)
+  const refusalLiteralSaveTokenRef = useRef(0)
   const requestRef = useRef<PendingChatRequest | null>(null)
   const projectInstanceRef = useRef('')
   const guidesRef = useRef<LlmPromptGuideOption[]>([])
   const modelSelectionTouched = useRef(false)
   const guideTargetOverridden = useRef(false)
   const canUseCustomModel = accessContext?.custom_model_sources === true
+  const canManageRefusalLiterals = accessContext?.machine_controls === true
+
+  const cancelActiveRefusalLiteralSave = useCallback(() => {
+    refusalLiteralSaveTokenRef.current += 1
+    refusalLiteralSaveRef.current?.controller.abort()
+    refusalLiteralSaveRef.current = null
+    setSavingRefusalLiteral(false)
+  }, [])
 
   const adoptProjectInstance = useCallback((nextProjectInstance: string) => {
     if (
       !nextProjectInstance
       || nextProjectInstance === projectInstanceRef.current
     ) return false
+    cancelActiveRefusalLiteralSave()
+    refusalSelectionSnapshotRef.current = null
     const pending = requestRef.current
     if (pending) {
       pending.controller.abort()
-      persistMessages(
-        pending.workspace,
-        pending.projectInstance,
-        pending.retainedHistory,
-      )
-      cleanupUnsubmittedUploads(pending)
+      if (pending.submissionAttempted) {
+        suspendedChatRequests.set(
+          pendingKey(pending.workspace, pending.projectInstance),
+          pending,
+        )
+        persistPendingOperation(pending)
+        persistMessages(
+          pending.workspace,
+          pending.projectInstance,
+          pending.submittedMessages,
+        )
+      } else {
+        persistMessages(
+          pending.workspace,
+          pending.projectInstance,
+          pending.retainedHistory,
+        )
+        cleanupUnsubmittedUploads(pending)
+      }
       requestRef.current = null
     }
     projectInstanceRef.current = nextProjectInstance
     setProjectInstance(nextProjectInstance)
     setMessages(restoreMessages(activeWorkspace, nextProjectInstance))
     setDraft('')
+    setEditingTurn(null)
+    setFreshImagesRequired(false)
+    setLiveChatStatus(null)
+    setRefusalCapture(null)
+    setRefusalCaptureError(null)
+    setRefusalCaptureNotice(null)
+    setSavingRefusalLiteral(false)
     setUseGuide(false)
     setSelectedImages([])
     setSending(false)
     setUploadingImages(false)
+    setRequestPhase('idle')
+    setResumeAvailable(hasPendingOperation(activeWorkspace, nextProjectInstance))
     setError(null)
     guideTargetOverridden.current = false
     setGuideId(matchingVideoGuideId(
@@ -269,13 +502,24 @@ export function LlmChat() {
     // deleted and recreated. Never import it into this project instance.
     try { localStorage.removeItem(`${STORAGE_PREFIX}${encodeURIComponent(activeWorkspace)}`) } catch { /* private mode */ }
     return true
-  }, [activeWorkspace])
+  }, [activeWorkspace, cancelActiveRefusalLiteralSave])
 
   useEffect(() => {
+    cancelActiveRefusalLiteralSave()
+    refusalSelectionSnapshotRef.current = null
     setSending(false)
     setUploadingImages(false)
+    setRequestPhase('idle')
+    setResumeAvailable(false)
     setSelectedImages([])
     setDraft('')
+    setEditingTurn(null)
+    setFreshImagesRequired(false)
+    setLiveChatStatus(null)
+    setRefusalCapture(null)
+    setRefusalCaptureError(null)
+    setRefusalCaptureNotice(null)
+    setSavingRefusalLiteral(false)
     setUseGuide(false)
     guideTargetOverridden.current = false
     setGuideId('')
@@ -285,18 +529,37 @@ export function LlmChat() {
     setMessages([])
     setError(null)
     return () => {
+      const refusalSave = refusalLiteralSaveRef.current
+      if (refusalSave?.workspace === activeWorkspace) {
+        refusalLiteralSaveTokenRef.current += 1
+        refusalSave.controller.abort()
+        refusalLiteralSaveRef.current = null
+      }
       const pending = requestRef.current
       if (pending?.workspace !== activeWorkspace) return
       pending.controller.abort()
-      persistMessages(
-        pending.workspace,
-        pending.projectInstance,
-        pending.retainedHistory,
-      )
-      cleanupUnsubmittedUploads(pending)
+      if (pending.submissionAttempted) {
+        suspendedChatRequests.set(
+          pendingKey(pending.workspace, pending.projectInstance),
+          pending,
+        )
+        persistPendingOperation(pending)
+        persistMessages(
+          pending.workspace,
+          pending.projectInstance,
+          pending.submittedMessages,
+        )
+      } else {
+        persistMessages(
+          pending.workspace,
+          pending.projectInstance,
+          pending.retainedHistory,
+        )
+        cleanupUnsubmittedUploads(pending)
+      }
       requestRef.current = null
     }
-  }, [activeWorkspace])
+  }, [activeWorkspace, cancelActiveRefusalLiteralSave])
 
   useEffect(() => {
     let cancelled = false
@@ -338,10 +601,42 @@ export function LlmChat() {
   }, [guides, selectedVideoModel])
 
   useEffect(() => {
+    if (canManageRefusalLiterals) return
+    cancelActiveRefusalLiteralSave()
+    refusalSelectionSnapshotRef.current = null
+    setRefusalCapture(null)
+    setRefusalCaptureError(null)
+    setRefusalCaptureNotice(null)
+  }, [canManageRefusalLiterals, cancelActiveRefusalLiteralSave])
+
+  useEffect(() => {
+    setRefusalCapture(current => (
+      current && messages[current.messageIndex]?.role === 'assistant'
+        ? current
+        : null
+    ))
+  }, [messages])
+
+  useEffect(() => {
     if (!sending) return
     let cancelled = false
-    const refresh = () => {
-      api.fetchLlmModels(activeWorkspace)
+    let refreshing = false
+    let timer: number | null = null
+    const schedule = () => {
+      if (
+        cancelled
+        || (typeof document !== 'undefined' && document.visibilityState === 'hidden')
+      ) return
+      timer = window.setTimeout(run, 1000)
+    }
+    const run = () => {
+      if (
+        cancelled
+        || refreshing
+        || (typeof document !== 'undefined' && document.visibilityState === 'hidden')
+      ) return
+      refreshing = true
+      void api.fetchLlmModels(activeWorkspace)
         .then(data => {
           if (cancelled) return
           guidesRef.current = data.guides
@@ -358,18 +653,135 @@ export function LlmChat() {
           ))
         })
         .catch(() => { /* The active request will surface actionable errors. */ })
+        .finally(() => {
+          refreshing = false
+          schedule()
+        })
     }
-    refresh()
-    const timer = window.setInterval(refresh, 1000)
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        if (timer !== null) window.clearTimeout(timer)
+        timer = null
+      } else if (timer === null) {
+        run()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    run()
     return () => {
       cancelled = true
-      window.clearInterval(timer)
+      if (timer !== null) window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
     }
   }, [activeWorkspace, adoptProjectInstance, sending])
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages, sending])
+
+  useEffect(() => {
+    if (!activeWorkspace || !projectInstance) return
+    const key = pendingKey(activeWorkspace, projectInstance)
+    const pending = suspendedChatRequests.get(key)
+      ?? restorePendingOperation(activeWorkspace, projectInstance)
+    if (!pending || requestRef.current) return
+    suspendedChatRequests.set(key, pending)
+    const controller = new AbortController()
+    pending.controller = controller
+    requestRef.current = pending
+    const stillOwnsProject = () => (
+      requestRef.current === pending
+      && projectInstanceRef.current === pending.projectInstance
+    )
+    setResumeAvailable(false)
+    setSending(true)
+    setUploadingImages(false)
+    setRequestPhase('queued')
+    setLiveChatStatus(pending.latestStatus ? {
+      workspace: pending.workspace,
+      projectInstance: pending.projectInstance,
+      requestId: pending.requestId,
+      status: pending.latestStatus,
+    } : null)
+    setError(null)
+    void api.waitForLlmChatOperation(
+      pending.requestId,
+      pending.workspace,
+      controller.signal,
+      undefined,
+      status => {
+        if (!stillOwnsProject()) return
+        pending.latestStatus = status
+        setLiveChatStatus({
+          workspace: pending.workspace,
+          projectInstance: pending.projectInstance,
+          requestId: pending.requestId,
+          status,
+        })
+        setRequestPhase(operationRequestPhase(status.phase))
+      },
+    ).then(response => {
+      if (!stillOwnsProject()) return
+      suspendedChatRequests.delete(key)
+      removePendingOperation(pending.workspace, pending.projectInstance)
+      const completed = [
+        ...pending.submittedMessages,
+        {
+          role: 'assistant' as const,
+          content: response.text,
+          performance: response.average_tps != null
+            || response.generated_tokens_approx != null
+            || response.elapsed_seconds != null
+            ? {
+                average_tps: response.average_tps ?? null,
+                generated_tokens_approx: response.generated_tokens_approx,
+                elapsed_seconds: response.elapsed_seconds,
+              }
+            : undefined,
+        },
+      ]
+      setMessages(completed)
+      setLiveChatStatus(null)
+      persistMessages(pending.workspace, pending.projectInstance, completed)
+      guideTargetOverridden.current = false
+      setUseGuide(false)
+      setGuideId(matchingVideoGuideId(
+        useStore.getState().selectedModelPerMode.video || '',
+        guidesRef.current,
+      ))
+    }).catch(error => {
+      if (!stillOwnsProject()) return
+      if (controller.signal.aborted || error instanceof api.LlmChatWaitError) {
+        persistPendingOperation(pending)
+        setResumeAvailable(true)
+        setError(
+          error instanceof api.LlmChatWaitError
+            ? error.message
+            : 'Stopped waiting. The host may still be generating; resume to retrieve the result.',
+        )
+        return
+      }
+      suspendedChatRequests.delete(key)
+      removePendingOperation(pending.workspace, pending.projectInstance)
+      setLiveChatStatus(null)
+      setMessages(pending.retainedHistory)
+      persistMessages(pending.workspace, pending.projectInstance, pending.retainedHistory)
+      setDraft(pending.draft)
+      setSelectedImages(pending.images)
+      setFreshImagesRequired(
+        pending.requiresFreshImage && pending.images.length === 0,
+      )
+      setEditingTurn(pending.editingTurn)
+      setError(error instanceof Error ? error.message : String(error))
+    }).finally(() => {
+      if (stillOwnsProject()) {
+        requestRef.current = null
+        setSending(false)
+        setRequestPhase('idle')
+      }
+    })
+    return () => controller.abort()
+  }, [activeWorkspace, projectInstance, resumeNonce])
 
   const effectiveModelId = canUseCustomModel && customModel.trim() ? customModel.trim() : modelId
   const selectedModel = useMemo(
@@ -391,25 +803,47 @@ export function LlmChat() {
   )
   const selectedGuide = videoGuides.find(guide => guide.id === guideId)
   const canonicalGuideId = selectedGuide?.id || ''
+  const interactionLocked = sending || resumeAvailable || savingRefusalLiteral
+  const branchControlsLocked = interactionLocked || editingTurn !== null
   const unavailableReason = !activeWorkspace
     ? 'Select or create a project before chatting.'
     : !projectInstance
       ? 'Opening the project conversation…'
     : !effectiveModelId
       ? 'Choose an LLM first.'
+      : resumeAvailable
+        ? 'Resume the accepted request before starting another message.'
       : useGuide && !canonicalGuideId
         ? 'Choose a video prompting target for this message.'
+      : freshImagesRequired && selectedImages.length === 0
+        ? 'Reattach at least one image before sending this image turn.'
       : selectedImages.length > 0 && !modelAcceptsImages
         ? 'The selected LLM is text only. Remove the image attachment or choose a vision model.'
       : null
+  const activeLiveStatus = liveChatStatus
+    && liveChatStatus.workspace === activeWorkspace
+    && liveChatStatus.projectInstance === projectInstance
+    ? liveChatStatus.status
+    : null
 
   const clearConversation = () => {
+    if (interactionLocked || refusalLiteralSaveRef.current) return
     const pending = requestRef.current
     pending?.controller.abort()
     if (pending) cleanupUnsubmittedUploads(pending)
     requestRef.current = null
+    suspendedChatRequests.delete(pendingKey(activeWorkspace, projectInstance))
+    removePendingOperation(activeWorkspace, projectInstance)
     setSending(false)
     setUploadingImages(false)
+    setRequestPhase('idle')
+    setResumeAvailable(false)
+    setEditingTurn(null)
+    setFreshImagesRequired(false)
+    setLiveChatStatus(null)
+    setRefusalCapture(null)
+    setRefusalCaptureError(null)
+    setRefusalCaptureNotice(null)
     setMessages([])
     setSelectedImages([])
     guideTargetOverridden.current = false
@@ -441,28 +875,28 @@ export function LlmChat() {
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  const send = async () => {
-    const content = draft.trim()
-    if (!content || sending || unavailableReason) return
+  const submitBranch = async (
+    nextMessages: LlmChatMessage[],
+    retainedHistory: LlmChatMessage[],
+    requestImages: File[],
+    retainedDraft: string,
+    clearComposer: boolean,
+  ) => {
+    if (interactionLocked || refusalLiteralSaveRef.current || !nextMessages.length) return
+    refusalSelectionSnapshotRef.current = null
+    setRefusalCapture(null)
+    setRefusalCaptureError(null)
     const requestWorkspace = activeWorkspace
     const requestProjectInstance = projectInstance
-    const retainedHistory = messages.slice(-MAX_HISTORY_MESSAGES)
-    const requestImages = [...selectedImages]
     const requestGuideId = useGuide ? canonicalGuideId : ''
-    const userMessage: LlmChatMessage = {
-      role: 'user',
-      content,
-      attachments: requestImages.length
-        ? requestImages.map(file => ({ kind: 'image', name: file.name }))
-        : undefined,
-    }
-    const nextMessages: LlmChatMessage[] = [...retainedHistory, userMessage]
+    const requestExplicitOutput = useStore.getState().explicitOutput
     const controller = new AbortController()
     requestRef.current?.controller.abort()
     const pending: PendingChatRequest = {
       workspace: requestWorkspace,
       projectInstance: requestProjectInstance,
       controller,
+      requestId: api.createLlmRequestId(),
       modelId,
       customModel,
       effectiveModelId,
@@ -470,11 +904,14 @@ export function LlmChat() {
       guideId,
       requestGuideId,
       guideTargetOverridden: guideTargetOverridden.current,
-      draft: content,
+      draft: retainedDraft,
       images: requestImages,
       retainedHistory,
+      submittedMessages: nextMessages,
       uploadedRefs: [],
-      chatSubmitted: false,
+      submissionAttempted: false,
+      requiresFreshImage: requestImages.length > 0,
+      editingTurn,
     }
     requestRef.current = pending
     const pendingStillOwnsProject = () => (
@@ -482,6 +919,9 @@ export function LlmChat() {
       && projectInstanceRef.current === pending.projectInstance
     )
     setSending(true)
+    setResumeAvailable(false)
+    setLiveChatStatus(null)
+    setRequestPhase(requestImages.length > 0 ? 'uploading' : 'queued')
     setError(null)
     try {
       setUploadingImages(requestImages.length > 0)
@@ -501,34 +941,89 @@ export function LlmChat() {
         }
       }
       setUploadingImages(false)
+      setRequestPhase('queued')
       setMessages(nextMessages)
-      persistMessages(requestWorkspace, requestProjectInstance, nextMessages)
-      setDraft('')
-      setSelectedImages([])
-      if (fileInputRef.current) fileInputRef.current.value = ''
-      pending.chatSubmitted = true
+      if (clearComposer) {
+        setDraft('')
+        setSelectedImages([])
+        setEditingTurn(null)
+        setFreshImagesRequired(false)
+        if (fileInputRef.current) fileInputRef.current.value = ''
+      }
       const response = await api.llmChat({
         workspace: requestWorkspace,
+        request_id: pending.requestId,
         model_id: pending.effectiveModelId,
         messages: nextMessages,
         guide_ids: pending.useGuide && pending.requestGuideId ? [pending.requestGuideId] : [],
+        explicit_output: requestExplicitOutput,
         image_paths: pending.uploadedRefs,
         max_new_tokens: 2048,
-      }, controller.signal)
+      }, controller.signal, status => {
+        if (!pendingStillOwnsProject()) return
+        setRequestPhase(
+          status.phase === 'queued'
+            ? 'queued'
+            : status.phase === 'loading'
+              ? 'preparing'
+              : 'queued',
+        )
+      }, status => {
+        pending.latestStatus = status
+        persistPendingOperation(pending)
+        if (pendingStillOwnsProject()) {
+          setLiveChatStatus({
+            workspace: pending.workspace,
+            projectInstance: pending.projectInstance,
+            requestId: pending.requestId,
+            status,
+          })
+          setRequestPhase(operationRequestPhase(status.phase))
+        }
+      }, () => {
+        pending.submissionAttempted = true
+        persistPendingOperation(pending)
+        if (pendingStillOwnsProject()) {
+          persistMessages(
+            requestWorkspace,
+            requestProjectInstance,
+            pending.submittedMessages,
+          )
+        }
+      })
       if (!pendingStillOwnsProject()) return
       setMessages(current => {
-        const completed = [...current, { role: 'assistant' as const, content: response.text }]
+        const completed = [
+          ...current,
+          {
+            role: 'assistant' as const,
+            content: response.text,
+            performance: response.average_tps != null
+              || response.generated_tokens_approx != null
+              || response.elapsed_seconds != null
+              ? {
+                  average_tps: response.average_tps ?? null,
+                  generated_tokens_approx: response.generated_tokens_approx,
+                  elapsed_seconds: response.elapsed_seconds,
+                }
+              : undefined,
+          },
+        ]
         persistMessages(requestWorkspace, requestProjectInstance, completed)
         return completed
       })
+      setLiveChatStatus(null)
       guideTargetOverridden.current = false
       setUseGuide(false)
       setGuideId(matchingVideoGuideId(
         useStore.getState().selectedModelPerMode.video || '',
         guidesRef.current,
       ))
+      suspendedChatRequests.delete(pendingKey(requestWorkspace, requestProjectInstance))
+      removePendingOperation(requestWorkspace, requestProjectInstance)
+      setLiveChatStatus(null)
     } catch (err) {
-      if (!pending.chatSubmitted) cleanupUnsubmittedUploads(pending)
+      if (!pending.submissionAttempted) cleanupUnsubmittedUploads(pending)
       if (!pendingStillOwnsProject()) return
       setModelId(pending.modelId)
       setCustomModel(pending.customModel)
@@ -542,6 +1037,44 @@ export function LlmChat() {
             guidesRef.current,
           ),
       )
+      if (controller.signal.aborted || err instanceof api.LlmChatWaitError) {
+        if (pending.submissionAttempted) {
+          suspendedChatRequests.set(
+            pendingKey(requestWorkspace, requestProjectInstance),
+            pending,
+          )
+          persistPendingOperation(pending)
+          setMessages(pending.submittedMessages)
+          persistMessages(
+            requestWorkspace,
+            requestProjectInstance,
+            pending.submittedMessages,
+          )
+          setResumeAvailable(true)
+          setError(
+            err instanceof api.LlmChatWaitError
+              ? err.message
+              : 'Stopped waiting. The host may still be generating; resume to retrieve the result.',
+          )
+        } else {
+          setMessages(pending.retainedHistory)
+          persistMessages(
+            requestWorkspace,
+            requestProjectInstance,
+            pending.retainedHistory,
+          )
+          setDraft(pending.draft)
+          setSelectedImages(pending.images)
+          setFreshImagesRequired(
+            pending.requiresFreshImage && pending.images.length === 0,
+          )
+          setEditingTurn(pending.editingTurn)
+          setLiveChatStatus(null)
+        }
+        return
+      }
+      suspendedChatRequests.delete(pendingKey(requestWorkspace, requestProjectInstance))
+      removePendingOperation(requestWorkspace, requestProjectInstance)
       setMessages(pending.retainedHistory)
       persistMessages(
         requestWorkspace,
@@ -550,16 +1083,191 @@ export function LlmChat() {
       )
       setDraft(pending.draft)
       setSelectedImages(pending.images)
-      if (controller.signal.aborted) {
-        return
-      }
+      setFreshImagesRequired(
+        pending.requiresFreshImage && pending.images.length === 0,
+      )
+      setEditingTurn(pending.editingTurn)
+      setLiveChatStatus(null)
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      if (!pending.chatSubmitted) cleanupUnsubmittedUploads(pending)
+      if (!pending.submissionAttempted) cleanupUnsubmittedUploads(pending)
       if (pendingStillOwnsProject()) {
         requestRef.current = null
         setSending(false)
         setUploadingImages(false)
+        setRequestPhase('idle')
+      }
+    }
+  }
+
+  const send = async () => {
+    const content = draft.trim()
+    if (!content || interactionLocked || unavailableReason) return
+    const requestImages = [...selectedImages]
+    const userMessage: LlmChatMessage = {
+      role: 'user',
+      content,
+      attachments: requestImages.length
+        ? requestImages.map(file => ({ kind: 'image', name: file.name }))
+        : undefined,
+    }
+    const nextMessages = editingTurn
+      ? editedChatBranch(messages, editingTurn.index, userMessage)
+      : [...boundedChatHistory(messages), userMessage]
+    if (!nextMessages) {
+      setError('This image-bearing branch cannot be edited without starting a new message and reattaching its images.')
+      return
+    }
+    await submitBranch(nextMessages, messages, requestImages, content, true)
+  }
+
+  const retryAssistantTurn = async (assistantIndex: number) => {
+    if (branchControlsLocked || refusalLiteralSaveRef.current) return
+    const branch = retryChatBranch(messages, assistantIndex)
+    if (!branch) {
+      setError('Retry is unavailable because this branch contains a one-use image. Start a new message and attach the image again.')
+      return
+    }
+    await submitBranch(branch, messages, [], draft, false)
+  }
+
+  const editUserTurn = (userIndex: number) => {
+    if (branchControlsLocked || refusalLiteralSaveRef.current) return
+    const message = messages[userIndex]
+    if (message?.role !== 'user') return
+    if (messages.slice(0, userIndex).some(item => item.attachments?.length)) {
+      setError('Edit is unavailable because earlier context contains a one-use image. Start a new message and attach the image again.')
+      return
+    }
+    setEditingTurn({
+      index: userIndex,
+      requiresFreshImage: !!message.attachments?.length,
+    })
+    setFreshImagesRequired(!!message.attachments?.length)
+    setDraft(message.content)
+    setSelectedImages([])
+    if (fileInputRef.current) fileInputRef.current.value = ''
+    setError(message.attachments?.length
+      ? 'This turn used one-use images. Reattach fresh images before sending the edit.'
+      : null)
+    window.requestAnimationFrame(() => textareaRef.current?.focus())
+  }
+
+  const readRefusalSelection = (messageIndex: number): RefusalSelectionResult => {
+    const content = assistantContentRefs.current.get(messageIndex)
+    const selection = window.getSelection()
+    if (!content || !selection || selection.rangeCount !== 1 || selection.isCollapsed) {
+      return { error: 'Select refusal wording inside this assistant response first.' }
+    }
+    const range = selection.getRangeAt(0)
+    if (
+      !content.contains(range.startContainer)
+      || !content.contains(range.endContainer)
+      || !content.contains(range.commonAncestorContainer)
+    ) {
+      return { error: 'Keep the selection entirely inside this assistant response.' }
+    }
+    const literal = selection.toString()
+    const validationError = api.validateLlmRefusalLiteral(literal)
+    return validationError ? { error: validationError } : { literal }
+  }
+
+  const showRefusalCaptureError = (messageIndex: number, message: string) => {
+    setRefusalCaptureError({ messageIndex, message })
+    window.requestAnimationFrame(() => (
+      refusalCaptureErrorRefs.current.get(messageIndex)?.focus()
+    ))
+  }
+
+  const snapshotRefusalSelection = (messageIndex: number) => {
+    refusalSelectionSnapshotRef.current = {
+      messageIndex,
+      result: readRefusalSelection(messageIndex),
+    }
+  }
+
+  const beginRefusalCapture = (messageIndex: number, usePointerSnapshot: boolean) => {
+    setRefusalCapture(null)
+    setRefusalCaptureNotice(null)
+    setRefusalCaptureError(null)
+    if (!canManageRefusalLiterals || messages[messageIndex]?.role !== 'assistant') return
+    const snapshot = refusalSelectionSnapshotRef.current
+    refusalSelectionSnapshotRef.current = null
+    const result = usePointerSnapshot && snapshot?.messageIndex === messageIndex
+      ? snapshot.result
+      : readRefusalSelection(messageIndex)
+    if (result.error || result.literal == null) {
+      showRefusalCaptureError(
+        messageIndex,
+        result.error || 'Select refusal wording inside this assistant response first.',
+      )
+      return
+    }
+    setRefusalCapture({ messageIndex, literal: result.literal })
+    window.requestAnimationFrame(() => refusalLiteralInputRef.current?.focus())
+  }
+
+  const cancelRefusalCapture = () => {
+    const messageIndex = refusalCapture?.messageIndex
+    setRefusalCapture(null)
+    setRefusalCaptureError(null)
+    if (messageIndex != null) {
+      window.requestAnimationFrame(() => (
+        refusalCaptureTriggerRefs.current.get(messageIndex)?.focus()
+      ))
+    }
+  }
+
+  const submitRefusalCapture = async () => {
+    if (!refusalCapture || !canManageRefusalLiterals || savingRefusalLiteral) return
+    const capture = refusalCapture
+    const validationError = api.validateLlmRefusalLiteral(capture.literal)
+    if (validationError) {
+      showRefusalCaptureError(capture.messageIndex, validationError)
+      return
+    }
+    const saveRequest: RefusalLiteralSaveRequest = {
+      token: refusalLiteralSaveTokenRef.current + 1,
+      workspace: activeWorkspace,
+      projectInstance,
+      controller: new AbortController(),
+    }
+    refusalLiteralSaveTokenRef.current = saveRequest.token
+    refusalLiteralSaveRef.current = saveRequest
+    setSavingRefusalLiteral(true)
+    setRefusalCaptureError(null)
+    const isCurrentSave = () => (
+      refusalLiteralSaveRef.current === saveRequest
+      && refusalLiteralSaveTokenRef.current === saveRequest.token
+      && useStore.getState().activeWorkspace === saveRequest.workspace
+      && projectInstanceRef.current === saveRequest.projectInstance
+      && useStore.getState().accessContext?.machine_controls === true
+    )
+    try {
+      const result = await api.addLlmRefusalLiteral(
+        capture.literal,
+        saveRequest.controller.signal,
+      )
+      if (!isCurrentSave()) return
+      setRefusalCapture(null)
+      setRefusalCaptureNotice(
+        `${result.added ? 'Added to' : 'Already in'} local refusal retries. `
+        + `${result.count} phrase${result.count === 1 ? '' : 's'} · revision ${result.revision}.`,
+      )
+      window.getSelection()?.removeAllRanges()
+      window.requestAnimationFrame(() => (
+        refusalCaptureTriggerRefs.current.get(capture.messageIndex)?.focus()
+      ))
+    } catch {
+      if (!isCurrentSave()) return
+      showRefusalCaptureError(
+        capture.messageIndex,
+        'Could not add the selected refusal wording. Try again locally.',
+      )
+    } finally {
+      if (refusalLiteralSaveRef.current === saveRequest) {
+        refusalLiteralSaveRef.current = null
+        setSavingRefusalLiteral(false)
       }
     }
   }
@@ -591,7 +1299,7 @@ export function LlmChat() {
                   setError('Image attachments were removed because that LLM is text only.')
                 }
               }}
-              disabled={loadingCatalog || sending}
+              disabled={loadingCatalog || interactionLocked}
               className="mt-1 w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-xs text-text-primary"
             >
               {models.length === 0 && <option value="">{loadingCatalog ? 'Loading models…' : 'No models available'}</option>}
@@ -612,14 +1320,14 @@ export function LlmChat() {
                   modelSelectionTouched.current = true
                   setCustomModel(event.target.value)
                 }}
-                disabled={sending}
+                disabled={interactionLocked}
                 placeholder="org/model or https://huggingface.co/org/model"
                 className="mt-1 w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-xs text-text-primary placeholder:text-text-muted"
               />
             </label>
           )}
 
-          <button type="button" onClick={clearConversation} disabled={!messages.length || sending} className="flex items-center gap-1 rounded-md border border-border px-3 py-2 text-xs text-text-secondary disabled:opacity-40">
+          <button type="button" onClick={clearConversation} disabled={!messages.length || interactionLocked} className="flex items-center gap-1 rounded-md border border-border px-3 py-2 text-xs text-text-secondary disabled:opacity-40">
             <Trash2 size={13} /> Clear
           </button>
         </div>
@@ -645,35 +1353,252 @@ export function LlmChat() {
               Start a project-scoped conversation with the selected LLM.
             </div>
           )}
-          {messages.map((message, index) => (
-            <article key={`${message.role}-${index}`} className={`flex gap-3 rounded-xl border p-3 ${message.role === 'user' ? 'border-accent-blue/30 bg-accent-blue/5' : 'border-border bg-bg-secondary'}`}>
-              <div className="mt-0.5 shrink-0 text-text-muted">{message.role === 'user' ? <UserRound size={16} /> : <Bot size={16} />}</div>
-              <div className="min-w-0 text-sm leading-6 text-text-primary">
-                {!!message.attachments?.length && (
-                  <div className="mb-2 flex flex-wrap gap-1.5">
-                    {message.attachments.map((attachment, attachmentIndex) => (
-                      <span key={`${attachment.name}-${attachmentIndex}`} className="rounded border border-border bg-bg-tertiary px-2 py-0.5 text-[10px] text-text-muted">
-                        Image: {attachment.name}
-                      </span>
-                    ))}
+          {messages.map((message, index) => {
+            const precedingHasImages = messages
+              .slice(0, index)
+              .some(item => item.attachments?.length)
+            const retryUnavailable = message.role === 'assistant' && precedingHasImages
+            const editUnavailable = message.role === 'user' && precedingHasImages
+            return (
+              <article key={`${message.role}-${index}`} className={`flex gap-3 rounded-xl border p-3 ${message.role === 'user' ? 'border-accent-blue/30 bg-accent-blue/5' : 'border-border bg-bg-secondary'}`}>
+                <div className="mt-0.5 shrink-0 text-text-muted">{message.role === 'user' ? <UserRound size={16} /> : <Bot size={16} />}</div>
+                <div className="min-w-0 flex-1 text-sm leading-6 text-text-primary">
+                  {!!message.attachments?.length && (
+                    <div className="mb-2 flex flex-wrap gap-1.5">
+                      {message.attachments.map((attachment, attachmentIndex) => (
+                        <span key={`${attachment.name}-${attachmentIndex}`} className="rounded border border-border bg-bg-tertiary px-2 py-0.5 text-[10px] text-text-muted">
+                          Image: {attachment.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div
+                    ref={message.role === 'assistant'
+                      ? node => {
+                          if (node) assistantContentRefs.current.set(index, node)
+                          else assistantContentRefs.current.delete(index)
+                        }
+                      : undefined}
+                    data-assistant-response-content={message.role === 'assistant' ? index : undefined}
+                    className="whitespace-pre-wrap break-words"
+                  >
+                    {message.content}
                   </div>
-                )}
-                <div className="whitespace-pre-wrap break-words">{message.content}</div>
+                  {message.role === 'assistant' && message.performance && (
+                    <div className="mt-2 text-[10px] leading-4 text-text-muted" aria-label="Final response performance">
+                      Final average: {message.performance.average_tps != null
+                        ? `${message.performance.average_tps.toFixed(1)} TPS`
+                        : 'unavailable'}
+                      {message.performance.generated_tokens_approx != null
+                        ? ` · approximately ${message.performance.generated_tokens_approx} generated tokens`
+                        : ''}
+                    </div>
+                  )}
+                  {message.role === 'assistant'
+                    && refusalCapture?.messageIndex === index && (
+                    <form
+                      aria-label="Confirm selected refusal wording"
+                      onSubmit={event => {
+                        event.preventDefault()
+                        void submitRefusalCapture()
+                      }}
+                      className="mt-3 rounded-lg border border-border bg-bg-tertiary p-3"
+                    >
+                      <label
+                        htmlFor={`refusal-literal-${index}`}
+                        className="block text-[10px] font-medium text-text-secondary"
+                      >
+                        Add this exact wording to local refusal retries
+                      </label>
+                      <textarea
+                        ref={refusalLiteralInputRef}
+                        id={`refusal-literal-${index}`}
+                        aria-describedby={`refusal-literal-help-${index}`}
+                        value={refusalCapture.literal}
+                        rows={3}
+                        onChange={event => {
+                          const literal = event.target.value
+                          setRefusalCapture({ messageIndex: index, literal })
+                          const validationError = api.validateLlmRefusalLiteral(literal)
+                          setRefusalCaptureError(validationError
+                            ? { messageIndex: index, message: validationError }
+                            : null)
+                        }}
+                        onKeyDown={event => {
+                          if (event.key === 'Escape') {
+                            event.preventDefault()
+                            cancelRefusalCapture()
+                          }
+                        }}
+                        disabled={savingRefusalLiteral}
+                        className="mt-1 min-h-[72px] w-full resize-y rounded-md border border-border bg-bg-secondary px-2 py-1.5 text-xs leading-5 text-text-primary disabled:opacity-50"
+                      />
+                      <p id={`refusal-literal-help-${index}`} className="mt-1 text-[10px] leading-4 text-text-muted">
+                        Literal match only, stored on this host. Maximum {api.LLM_REFUSAL_LITERAL_MAX_CODE_POINTS} characters.
+                      </p>
+                      {refusalCaptureError?.messageIndex === index && (
+                        <p
+                          ref={node => {
+                            if (node) refusalCaptureErrorRefs.current.set(index, node)
+                            else refusalCaptureErrorRefs.current.delete(index)
+                          }}
+                          role="alert"
+                          tabIndex={-1}
+                          className="mt-1 text-[10px] leading-4 text-red-300"
+                        >
+                          {refusalCaptureError.message}
+                        </p>
+                      )}
+                      <div className="mt-2 flex flex-wrap justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={cancelRefusalCapture}
+                          disabled={savingRefusalLiteral}
+                          className="min-h-9 rounded-md border border-border px-3 text-xs text-text-secondary disabled:opacity-40"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={savingRefusalLiteral || !!api.validateLlmRefusalLiteral(refusalCapture.literal)}
+                          className="flex min-h-9 items-center gap-1.5 rounded-md bg-accent-blue px-3 text-xs font-medium text-white disabled:opacity-40"
+                        >
+                          {savingRefusalLiteral && <Loader2 size={13} className="animate-spin" />}
+                          Confirm exact wording
+                        </button>
+                      </div>
+                    </form>
+                  )}
+                  {message.role === 'assistant'
+                    && refusalCapture?.messageIndex !== index
+                    && refusalCaptureError?.messageIndex === index && (
+                    <p
+                      ref={node => {
+                        if (node) refusalCaptureErrorRefs.current.set(index, node)
+                        else refusalCaptureErrorRefs.current.delete(index)
+                      }}
+                      role="alert"
+                      tabIndex={-1}
+                      className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-[10px] leading-4 text-red-300"
+                    >
+                      {refusalCaptureError.message}
+                    </p>
+                  )}
+                </div>
+                <div className="flex shrink-0 flex-col items-start gap-1">
+                  {message.role === 'user' ? (
+                    <button
+                      type="button"
+                      aria-label={`Edit user turn ${index + 1}`}
+                      title={editUnavailable
+                        ? 'Edit unavailable: earlier context contains one-use images. Start a new message and reattach them.'
+                        : message.attachments?.length
+                          ? 'Edit this turn; its one-use images must be attached again'
+                          : 'Edit this turn and replace its descendants'}
+                      onClick={() => editUserTurn(index)}
+                      disabled={branchControlsLocked || editUnavailable}
+                      className="flex h-9 w-9 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40"
+                    >
+                      <Pencil size={13} />
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        aria-label={`Retry assistant turn ${index + 1}`}
+                        title={retryUnavailable
+                          ? 'Retry unavailable: this branch contains one-use images. Start a new message and reattach them.'
+                          : 'Retry this response and replace its descendants'}
+                        onClick={() => void retryAssistantTurn(index)}
+                        disabled={branchControlsLocked || retryUnavailable}
+                        className="flex h-9 w-9 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40"
+                      >
+                        <RotateCcw size={13} />
+                      </button>
+                      {canManageRefusalLiterals && (
+                        <button
+                          ref={node => {
+                            if (node) refusalCaptureTriggerRefs.current.set(index, node)
+                            else refusalCaptureTriggerRefs.current.delete(index)
+                          }}
+                          type="button"
+                          aria-label={`Add selected refusal wording from assistant turn ${index + 1}`}
+                          title="Select refusal wording in this response, then add the exact selection to local retries"
+                          onPointerDown={() => snapshotRefusalSelection(index)}
+                          onPointerCancel={() => {
+                            if (refusalSelectionSnapshotRef.current?.messageIndex === index) {
+                              refusalSelectionSnapshotRef.current = null
+                            }
+                          }}
+                          onClick={event => beginRefusalCapture(index, event.detail > 0)}
+                          disabled={savingRefusalLiteral}
+                          className="flex h-9 w-9 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40"
+                        >
+                          <Flag size={13} />
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              </article>
+            )
+          })}
+          {refusalCaptureNotice && (
+            <div role="status" aria-live="polite" className="rounded-md border border-border bg-bg-secondary px-3 py-2 text-xs text-text-secondary">
+              {refusalCaptureNotice}
+            </div>
+          )}
+          {activeLiveStatus?.partial_text && (sending || resumeAvailable) && (
+            <article
+              role="log"
+              aria-live="polite"
+              aria-relevant="additions text"
+              aria-atomic="false"
+              aria-label="Streaming assistant response"
+              className="flex gap-3 rounded-xl border border-border bg-bg-secondary p-3"
+            >
+              <div className="mt-0.5 shrink-0 text-text-muted"><Bot size={16} /></div>
+              <div className="min-w-0 whitespace-pre-wrap break-words text-sm leading-6 text-text-primary">
+                {activeLiveStatus.partial_text}
               </div>
             </article>
-          ))}
+          )}
           {sending && (
-            <div role="status" aria-live="polite" className="flex items-center gap-2 rounded-xl border border-border bg-bg-secondary p-3 text-xs text-text-muted">
+            <div aria-label="LLM request status" className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-bg-secondary p-3 text-xs text-text-muted">
+              <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+                {requestPhase === 'uploading'
+                  ? 'Uploading attached images.'
+                  : requestPhase === 'queued'
+                    ? 'LLM request queued.'
+                    : requestPhase === 'preparing'
+                      ? 'Preparing the selected LLM.'
+                      : 'The selected LLM is generating.'}
+              </span>
               <Loader2 size={14} className="animate-spin" />
               {uploadingImages
                 ? `Uploading ${selectedImages.length || 'attached'} image${selectedImages.length === 1 ? '' : 's'}…`
-                : selectedModel?.loading
-                  ? `Preparing ${selectedModel.label}${downloadProgress(selectedModel) ? ` (${downloadProgress(selectedModel)})` : ''}…`
-                  : selectedModel?.downloaded === false || !selectedModel
-                    ? 'Preparing model (download may be required), then generating…'
-                    : `Generating with ${selectedModel.label}…`}
+                : requestPhase === 'queued'
+                  ? 'Queued for the selected LLM…'
+                  : requestPhase === 'preparing'
+                    ? `Preparing ${selectedModel?.label || 'the selected LLM'}${downloadProgress(selectedModel) ? ` (${downloadProgress(selectedModel)})` : ''}…`
+                    : `Generating with ${selectedModel?.label || 'the selected LLM'}…`}
+              {activeLiveStatus && (
+                <span>
+                  Phase: {activeLiveStatus.phase || requestPhase}
+                  {activeLiveStatus.attempt != null
+                    ? ` · Attempt ${activeLiveStatus.attempt}${activeLiveStatus.attempt_limit != null ? `/${activeLiveStatus.attempt_limit}` : ''}`
+                    : ''}
+                  {activeLiveStatus.live_tps != null
+                    ? ` · Live ${activeLiveStatus.live_tps.toFixed(1)} TPS`
+                    : ''}
+                  {activeLiveStatus.average_tps != null
+                    ? ` · Average ${activeLiveStatus.average_tps.toFixed(1)} TPS`
+                    : ''}
+                </span>
+              )}
               <button
                 type="button"
+                aria-label="Cancel waiting for this LLM request"
                 onClick={() => requestRef.current?.controller.abort()}
                 className="ml-auto rounded border border-border px-2 py-1 text-[10px] text-text-secondary"
               >
@@ -681,13 +1606,59 @@ export function LlmChat() {
               </button>
             </div>
           )}
-          {error && <div role="alert" className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
+          {error && (
+            <div role="alert" className="flex items-center gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+              <span>{error}</span>
+              {resumeAvailable && (
+                <button
+                  type="button"
+                  onClick={() => setResumeNonce(value => value + 1)}
+                  className="ml-auto rounded border border-red-400/40 px-2 py-1 text-[10px] text-red-200"
+                >
+                  Resume wait
+                </button>
+              )}
+            </div>
+          )}
+          {resumeAvailable && activeLiveStatus && (
+            <div role="status" aria-live="polite" aria-label="Paused LLM request status" className="rounded-md border border-border bg-bg-secondary px-3 py-2 text-[10px] text-text-muted">
+              Phase: {activeLiveStatus.phase}
+              {activeLiveStatus.attempt != null
+                ? ` · Attempt ${activeLiveStatus.attempt}${activeLiveStatus.attempt_limit != null ? `/${activeLiveStatus.attempt_limit}` : ''}`
+                : ''}
+              {activeLiveStatus.live_tps != null ? ` · Last live rate ${activeLiveStatus.live_tps.toFixed(1)} TPS` : ''}
+            </div>
+          )}
           <div ref={endRef} />
         </div>
       </div>
 
       <div className="border-t border-border bg-bg-secondary px-3 py-3 md:px-6">
         <div className="mx-auto max-w-4xl">
+          {editingTurn && (
+            <div className="mb-2 flex items-center gap-2 rounded-md border border-accent-blue/30 bg-accent-blue/5 px-3 py-2 text-xs text-text-secondary">
+              <span>
+                Editing user turn {editingTurn.index + 1}. Sending replaces this turn and all descendants.
+                {editingTurn.requiresFreshImage ? ' Fresh images are required.' : ''}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setEditingTurn(null)
+                  setFreshImagesRequired(false)
+                  setDraft('')
+                  setSelectedImages([])
+                  setError(null)
+                  if (fileInputRef.current) fileInputRef.current.value = ''
+                  window.requestAnimationFrame(() => textareaRef.current?.focus())
+                }}
+                disabled={interactionLocked}
+                className="ml-auto rounded border border-border px-2 py-1 text-[10px] disabled:opacity-40"
+              >
+                Cancel edit
+              </button>
+            </div>
+          )}
           {!!selectedImages.length && (
             <div className="mb-2 flex flex-wrap gap-2">
               {selectedImages.map((file, index) => (
@@ -698,7 +1669,7 @@ export function LlmChat() {
                     type="button"
                     aria-label={`Remove ${file.name}`}
                     onClick={() => setSelectedImages(current => current.filter((_, itemIndex) => itemIndex !== index))}
-                    disabled={sending}
+                    disabled={interactionLocked}
                     className="shrink-0 text-text-muted hover:text-text-primary disabled:opacity-40"
                   >
                     <X size={12} />
@@ -708,16 +1679,21 @@ export function LlmChat() {
             </div>
           )}
           <textarea
+            ref={textareaRef}
             aria-label="Message the selected language model"
             value={draft}
             onChange={event => setDraft(event.target.value)}
             onKeyDown={event => {
-              if (event.key === 'Enter' && !event.shiftKey) {
+              if (
+                event.key === 'Enter'
+                && !event.shiftKey
+                && !event.nativeEvent.isComposing
+              ) {
                 event.preventDefault()
                 void send()
               }
             }}
-            disabled={sending || !!unavailableReason}
+            disabled={interactionLocked || !activeWorkspace || !projectInstance || !effectiveModelId}
             rows={3}
             placeholder={unavailableReason || 'Message the model… (Shift+Enter for a new line)'}
             className="min-h-[74px] w-full resize-y rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted"
@@ -729,7 +1705,7 @@ export function LlmChat() {
               accept="image/*,.avif,.bmp,.gif,.jpg,.jpeg,.png,.webp"
               multiple
               onChange={event => selectImages(event.target.files)}
-              disabled={sending || !effectiveModelId || !modelAcceptsImages}
+              disabled={interactionLocked || !effectiveModelId || !modelAcceptsImages}
               className="sr-only"
             />
             <button
@@ -737,7 +1713,7 @@ export function LlmChat() {
               aria-label="Attach images"
               title={!modelAcceptsImages ? 'Vision is unavailable for this LLM' : 'Attach up to four images'}
               onClick={() => fileInputRef.current?.click()}
-              disabled={sending || !effectiveModelId || !modelAcceptsImages || selectedImages.length >= MAX_IMAGE_ATTACHMENTS}
+              disabled={interactionLocked || !effectiveModelId || !modelAcceptsImages || selectedImages.length >= MAX_IMAGE_ATTACHMENTS}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border text-text-secondary disabled:opacity-40"
             >
               <ImagePlus size={16} />
@@ -747,7 +1723,7 @@ export function LlmChat() {
                 type="checkbox"
                 checked={useGuide}
                 onChange={event => setUseGuide(event.target.checked)}
-                disabled={!videoGuides.length || sending}
+                disabled={!videoGuides.length || interactionLocked}
               />
               Add a prompting guide to this message
             </label>
@@ -760,7 +1736,7 @@ export function LlmChat() {
                   guideTargetOverridden.current = true
                   setGuideId(event.target.value)
                 }}
-                disabled={!useGuide || !videoGuides.length || sending}
+                disabled={!useGuide || !videoGuides.length || interactionLocked}
                 className="mt-0.5 w-full rounded-md border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-primary disabled:opacity-50"
               >
                 {!guideId && (
@@ -780,8 +1756,8 @@ export function LlmChat() {
                   ? 'Following Studio / Director video model'
                   : 'No Studio / Director video model selected'}
             </span>
-            <button type="button" onClick={() => void send()} disabled={!draft.trim() || sending || !!unavailableReason} className="ml-auto flex h-10 items-center gap-2 rounded-lg bg-accent-blue px-4 text-xs font-medium text-white disabled:opacity-40">
-              {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />} Send
+            <button type="button" onClick={() => void send()} disabled={!draft.trim() || interactionLocked || !!unavailableReason} className="ml-auto flex h-10 items-center gap-2 rounded-lg bg-accent-blue px-4 text-xs font-medium text-white disabled:opacity-40">
+              {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />} {editingTurn ? 'Send edit' : 'Send'}
             </button>
           </div>
           <p id="chat-data-disclosure" className="mt-2 text-[10px] leading-4 text-text-muted">

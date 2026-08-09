@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, Component, type ReactNode } from 'react'
-import { X, ChevronDown, ChevronRight, Play, ImageIcon, Check, AlertTriangle, Clock, Brain, Sparkles, Loader2, Camera, Film, Combine, Pencil, Trash2 } from 'lucide-react'
+import { X, Play, ImageIcon, Check, AlertTriangle, Clock, Brain, Sparkles, Loader2, Camera, Film, Combine, Pencil, Trash2 } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { getFileUrl } from '../../api/client'
 import type { PipelineClipState, SavedPipelineState } from '../../types'
@@ -46,7 +46,7 @@ function formatDate(ts: number): string {
 
 function PipelineProgressBar({ pipeline }: { pipeline: SavedPipelineState }) {
   const phases = [
-    { key: 'planning', label: 'LLM Planning', time: pipeline.llm_log?.planning_time_sec },
+    { key: 'planning', label: 'LLM Planning', time: pipeline.llm_planning_time_sec },
     { key: 'images', label: 'Image Gen', time: pipeline.clips.reduce((sum, c) => sum + (c.image_gen_time_sec || 0), 0) || null },
     { key: 'video', label: 'Video Gen', time: pipeline.clips.reduce((sum, c) => sum + (c.video_gen_time_sec || 0), 0) || null },
   ]
@@ -80,105 +80,18 @@ function PipelineProgressBar({ pipeline }: { pipeline: SavedPipelineState }) {
   )
 }
 
-function LlmPassView({ pass: p, index }: { pass: { pass: string; system_prompt: string; user_prompt?: string; response_text: string; thinking_text?: string | null }; index: number }) {
-  const [showSystem, setShowSystem] = useState(false)
-  const [showUser, setShowUser] = useState(false)
-  const [showResponse, setShowResponse] = useState(false)
-  const [showThinking, setShowThinking] = useState(false)
-  const label = p.pass.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
-
+function PlanningTelemetryPanel({ pipeline }: { pipeline: SavedPipelineState }) {
+  const planningTime = pipeline.llm_planning_time_sec
   return (
-    <div className="border border-border rounded p-2 space-y-1.5">
-      <div className="text-[10px] font-medium text-text-primary">Step {index + 1}: {label}</div>
-
-      <button onClick={() => setShowSystem(!showSystem)}
-        className="flex items-center gap-1 text-[9px] text-text-secondary hover:text-text-primary w-full text-left">
-        {showSystem ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-        Planner instructions
-      </button>
-      {showSystem && (
-        <pre className="text-[8px] text-text-muted bg-bg-tertiary rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono">
-          {p.system_prompt || '(empty)'}
-        </pre>
-      )}
-
-      {/* User Prompt — the actual story description / screenplay sent
-          alongside the system prompt. Renders only when present so old
-          pipeline JSON files (captured before user_prompt was tracked)
-          don't show an "(empty)" row. */}
-      {p.user_prompt !== undefined && p.user_prompt !== null && (
+    <div className="flex items-center gap-2 text-[10px] text-text-muted">
+      <Brain size={12} className="text-chip-purple" />
+      {typeof planningTime === 'number' && Number.isFinite(planningTime) ? (
         <>
-          <button onClick={() => setShowUser(!showUser)}
-            className="flex items-center gap-1 text-[9px] text-text-secondary hover:text-text-primary w-full text-left">
-            {showUser ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-            Your prompt
-          </button>
-          {showUser && (
-            <pre className="text-[8px] text-text-muted bg-bg-tertiary rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono">
-              {p.user_prompt || '(empty)'}
-            </pre>
-          )}
+          <span>LLM planning</span>
+          <span className="ml-auto">{formatTime(planningTime)}</span>
         </>
-      )}
-
-      {p.thinking_text && (
-        <>
-          <button onClick={() => setShowThinking(!showThinking)}
-            className="flex items-center gap-1 text-[9px] text-indicator-warning hover:text-indicator-warning/80 w-full text-left">
-            {showThinking ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-            <Sparkles size={8} /> Model reasoning
-          </button>
-          {showThinking && (
-            <pre className="text-[8px] text-text-muted bg-bg-tertiary rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono">
-              {p.thinking_text}
-            </pre>
-          )}
-        </>
-      )}
-
-      <button onClick={() => setShowResponse(!showResponse)}
-        className="flex items-center gap-1 text-[9px] text-text-secondary hover:text-text-primary w-full text-left">
-        {showResponse ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-        Planner result
-      </button>
-      {showResponse && (
-        <pre className="text-[8px] text-text-muted bg-bg-tertiary rounded p-2 max-h-48 overflow-auto whitespace-pre-wrap font-mono">
-          {p.response_text || '(empty)'}
-        </pre>
-      )}
-    </div>
-  )
-}
-
-function LlmLogPanel({ pipeline }: { pipeline: SavedPipelineState }) {
-  const log = pipeline.llm_log
-  if (!log) return <p className="text-xs text-text-muted italic">No planning details available</p>
-
-  const passes = log.passes
-
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center gap-2 text-[10px] text-text-muted">
-        <Brain size={12} className="text-chip-purple" />
-        <span>{log.provider}/{log.model_id || 'unknown'}</span>
-        <span className="ml-1 text-text-muted">({passes?.length || 1} pass{(passes?.length || 1) > 1 ? 'es' : ''})</span>
-        <span className="ml-auto">{formatTime(log.planning_time_sec)}</span>
-      </div>
-
-      {passes && passes.length > 0 ? (
-        <div className="space-y-2">
-          {passes.map((p, i) => (
-            <LlmPassView key={i} pass={p} index={i} />
-          ))}
-        </div>
       ) : (
-        /* Fallback: show flat log (backward compat) */
-        <LlmPassView pass={{
-          pass: 'planning',
-          system_prompt: log.system_prompt || '',
-          response_text: log.response_text || '',
-          thinking_text: log.thinking_text,
-        }} index={0} />
+        <span className="italic">No planning timing available</span>
       )}
     </div>
   )
@@ -850,10 +763,10 @@ function DirectorDashboardInner() {
               <PipelineProgressBar pipeline={selectedPipeline} />
             </div>
 
-            {/* LLM Log */}
+            {/* Content-free planning telemetry. Raw planner transcripts are transient. */}
             <div className="bg-bg-secondary rounded-lg border border-border p-3">
-              <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium mb-2">Planning details</h3>
-              <LlmLogPanel pipeline={selectedPipeline} />
+              <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium mb-2">Planning telemetry</h3>
+              <PlanningTelemetryPanel pipeline={selectedPipeline} />
             </div>
 
             {/* Clip Grid */}

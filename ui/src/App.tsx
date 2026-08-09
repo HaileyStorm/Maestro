@@ -15,6 +15,7 @@ import { H3GenerationPlanDialog } from './components/H3GenerationPlanDialog'
 import { RecipesOverlay } from './components/Recipes/RecipesOverlay'
 import { useStore } from './stores/useStore'
 import { useIsMobile } from './lib/useIsMobile'
+import { POLL_INTERVAL_MS, useVisibilityPolling } from './lib/useVisibilityPolling'
 import * as api from './api/client'
 
 const BOOTSTRAP_TIMEOUT_MS = 15_000
@@ -46,9 +47,13 @@ function App() {
   const loadLlmModels = useStore(s => s.loadLlmModels)
   const loadPipelineList = useStore(s => s.loadPipelineList)
   const toggleSidebar = useStore(s => s.toggleSidebar)
+  const sidebarOpen = useStore(s => s.sidebarOpen)
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const toggleSettings = useStore(s => s.toggleSettings)
   const appVersion = useStore(s => s.systemConfig?.app_version)
+  const llmLoading = useStore(s => s.llmLoading)
+  const llmEnhancing = useStore(s => s.isEnhancing)
+  const llmStatusLoading = useStore(s => s.llmStatus?.loading === true)
   const isMobile = useIsMobile()
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
   const remote = useStore(s => s.accessContext?.remote === true)
@@ -96,12 +101,16 @@ function App() {
     return () => { cancelled = true }
   }, [bootstrapAttempt, loadAccessContext, loadModels, loadOutputs, loadSystemConfig, loadServicesConfig, loadLlmStatus, loadLlmModels, loadPipelineList, reconnectJobs])
 
-  // Poll LLM status to stay in sync with backend auto-load/unload
-  useEffect(() => {
-    if (bootstrapState !== 'ready') return
-    const interval = setInterval(loadLlmStatus, 15000)
-    return () => clearInterval(interval)
-  }, [bootstrapState, loadLlmStatus])
+  // Backend-driven load/enhance transitions stay responsive; steady state is
+  // a low-rate safety refresh. Hidden tabs make no baseline LLM requests.
+  const llmTransitionActive = llmLoading || llmEnhancing || llmStatusLoading
+  useVisibilityPolling(
+    () => loadLlmStatus(),
+    llmTransitionActive
+      ? POLL_INTERVAL_MS.llmActiveVisible
+      : POLL_INTERVAL_MS.llmIdleVisible,
+    { enabled: bootstrapState === 'ready', immediate: false },
+  )
 
   // Establish the signed Maestro session cookie before mounting any child
   // component. Several children poll immediately; allowing those requests to
@@ -149,13 +158,17 @@ function App() {
     <div className="flex min-w-0 flex-col md:flex-row h-full w-full bg-bg-primary overflow-hidden">
       {/* Mobile header */}
       {isMobile && (
-        <header className={`h-12 shrink-0 border-b border-border bg-bg-secondary px-4 flex items-center ${machineControls ? 'justify-between' : 'justify-center'}`}>
-          {machineControls && <button
+        <header className="h-12 shrink-0 border-b border-border bg-bg-secondary px-4 flex items-center justify-between">
+          {!remoteProjectRequired ? <button
+            type="button"
             onClick={toggleSidebar}
             className="p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+            aria-label={sidebarOpen ? 'Close Studio and Director menu' : 'Open Studio and Director menu'}
+            aria-expanded={sidebarOpen}
+            aria-controls="maestro-mobile-sidebar"
           >
             <Menu size={20} />
-          </button>}
+          </button> : <span className="w-9" aria-hidden="true" />}
           <div className="flex items-center gap-2">
             <div className="w-7 h-7 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
               M
@@ -163,12 +176,16 @@ function App() {
             <span className="font-semibold text-sm">Maestro</span>
             {appVersion && <span className="text-[10px] text-text-muted font-normal mt-0.5">v{appVersion}</span>}
           </div>
-          {machineControls && <button
-            onClick={() => { setSidebarOpen(false); toggleSettings() }}
-            className="p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
-          >
-            <Settings size={20} />
-          </button>}
+          {machineControls ? (
+            <button
+              type="button"
+              onClick={() => { setSidebarOpen(false); toggleSettings() }}
+              className="p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+              aria-label="Open machine settings"
+            >
+              <Settings size={20} />
+            </button>
+          ) : <span className="w-9" aria-hidden="true" />}
         </header>
       )}
 
@@ -178,7 +195,7 @@ function App() {
       {machineControls && <LoraBrowser />}
       <DirectorDashboard />
       {machineControls && <StorageDashboard />}
-      {machineControls && <RecipesOverlay />}
+      <RecipesOverlay />
       <RetakeDialog />
       <H3GenerationPlanDialog />
       {/* OomRecoveryBanner is a fixed-position overlay — renders nothing
@@ -190,8 +207,8 @@ function App() {
           environment is missing ffmpeg / CUDA or low on disk. Renders
           nothing when everything checks out. */}
       {machineControls && <PreflightBanner />}
-      {/* DownloadStatusBanner — fixed bottom-right overlay, polls
-          /api/v1/downloads/active every 2s. Renders nothing unless
+      {/* DownloadStatusBanner — fixed bottom-right overlay, polls quickly
+          only during an active transfer. Renders nothing unless
           a model file is being downloaded. Highlights stalled
           downloads in amber so users know the system is recovering
           rather than frozen. */}

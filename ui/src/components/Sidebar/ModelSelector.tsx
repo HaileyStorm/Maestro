@@ -19,11 +19,6 @@ export function ModelSelector() {
   )
   const refreshH3Compatibility = useStore(s => s.refreshH3ModelProfileCompatibility)
   const openModelVisibility = useStore(s => s.openModelVisibility)
-  // Mature Mode gate: models with nsfw_only flag are hidden from the
-  // selector unless servicesConfig.nsfw_mode is enabled. Backend always
-  // ships the entry (so the toggle can show/hide without a model reload)
-  // but the UI clamps visibility here.
-  const nsfwMode = useStore(s => s.servicesConfig?.nsfw_mode ?? false)
 
   const [open, setOpen] = useState(false)
   const [w4a8Capability, setW4a8Capability] = useState<{ available: boolean; reason: string } | null>(null)
@@ -57,9 +52,9 @@ export function ModelSelector() {
   ]))
 
   useEffect(() => {
-    if (!open || !nsfwMode || h3SelectedProfile === 'custom') return
+    if (!open || h3SelectedProfile === 'custom') return
     void refreshH3Compatibility('minimax_h3_pinkcherry_fl2va')
-  }, [open, nsfwMode, h3SelectedProfile, h3CompatibilitySignature, refreshH3Compatibility])
+  }, [open, h3SelectedProfile, h3CompatibilitySignature, refreshH3Compatibility])
 
   useEffect(() => {
     if (!open) return
@@ -87,26 +82,18 @@ export function ModelSelector() {
   const effectiveAudioSubMode = generationMode === 'audio' ? audioSubMode : undefined
   const modeFamilies = getFamiliesForMode(generationMode, families, effectiveSubMode, effectiveAudioSubMode)
 
-  // Build grouped model list, filtered by:
-  //   1. enabledModels (Settings → System → Model Visibility),
-  //   2. nsfw_only gate (Mature Mode must be on for those to appear).
+  // Build grouped model list from the user's model-visibility choices.
   const groups = modeFamilies.map(family => ({
     family,
     models: getModelsForFamily(family.id, models, generationMode, effectiveSubMode)
       .filter(m => enabledModels.has(m.model_type))
-      .filter(m => !m.nsfw_only || nsfwMode)
-      .sort((left, right) => (
-        nsfwMode
-          ? Number(!!right.preferred_explicit_fl2va) - Number(!!left.preferred_explicit_fl2va)
-          : 0
-      )),
+      .sort((left, right) => left.name.localeCompare(right.name)),
   })).filter(g => g.models.length > 0)
 
   // How many models are available for this mode but NOT enabled — powers the
   // "+N" hint that nudges users toward Settings → Enabled Models.
   const disabledCount = modeFamilies.reduce((n, family) => {
     const avail = getModelsForFamily(family.id, models, generationMode, effectiveSubMode)
-      .filter(m => !m.nsfw_only || nsfwMode)
     return n + avail.filter(m => !enabledModels.has(m.model_type)).length
   }, 0)
 

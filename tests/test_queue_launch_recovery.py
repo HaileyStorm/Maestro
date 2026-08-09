@@ -489,7 +489,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
         checkpoints = []
         namespace = _isolated_functions(
             self.launch,
-            ("_queue_recovery_register_and_publish",),
+            (
+                "_queue_recovery_register_and_publish",
+                "_stamp_h3_lightx2v_recovery_identity",
+            ),
             {
                 "_jobs": registry,
                 "_stamp_job_origin": lambda job: job,
@@ -999,7 +1002,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         }
         namespace = _isolated_functions(
             self.launch,
-            ("get_status",),
+            ("_public_job_prompt_fields", "get_status"),
             {
                 "api": fake_api,
                 "Request": object,

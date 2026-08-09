@@ -73,6 +73,109 @@ class H3BenchmarkTests(unittest.TestCase):
         self.assertNotEqual(native["cache_key"], other_gpu["cache_key"])
         self.assertNotEqual(native["cache_key"], long_window["cache_key"])
 
+    def test_audio_and_multirate_identity_are_safe_cache_factors(self):
+        native = spec()
+        remix = build_benchmark_spec(
+            case_id="text_only",
+            hardware=native["hardware"], runtime=native["runtime"],
+            model=native["model"], engine=native["engine"],
+            encoder=native["encoder"],
+            task={
+                "source_audio_mode": "remix_source",
+                "audio_algorithm_version": "maestro_h3_source_audio_v1",
+            },
+        )
+        evidence = build_benchmark_spec(
+            case_id="text_only",
+            hardware=native["hardware"], runtime=native["runtime"],
+            model=native["model"], engine=native["engine"],
+            encoder=native["encoder"],
+            task={
+                "profile": "observed_job",
+                "sampling_steps": 8,
+                "multirate_profile": "t8_4v8a_evidence_v1",
+                "video_evaluations": 4,
+                "audio_evaluations": 8,
+            },
+        )
+        self.assertNotEqual(native["cache_key"], remix["cache_key"])
+        self.assertNotEqual(native["cache_key"], evidence["cache_key"])
+        encoded = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn("path", encoded)
+        self.assertNotIn("prompt", encoded)
+
+    def test_audio_identity_cannot_smuggle_paths_through_safe_task_fields(self):
+        baseline = spec()
+        common = {
+            "case_id": "text_only",
+            "hardware": baseline["hardware"],
+            "runtime": baseline["runtime"],
+            "model": baseline["model"],
+            "engine": baseline["engine"],
+            "encoder": baseline["encoder"],
+        }
+        for mode in ("native", "remix_source"):
+            with self.subTest(mode=mode), self.assertRaises(H3BenchmarkError):
+                build_benchmark_spec(**common, task={
+                    "source_audio_mode": mode,
+                    "audio_algorithm_version": "/private/source.wav",
+                })
+
+    def test_power_limit_is_safe_identity_and_spectrum_metrics_are_content_free(self):
+        powered = build_benchmark_spec(
+            case_id="text_only",
+            hardware={"gpu": "test", "power_limit_watts": 575, "device_path": "/dev/private"},
+            runtime={"torch": "2", "model_load_state": "resident"},
+            model={"id": "minimax_h3", "accelerator": "spectrum"},
+            engine={"id": "sol_attn"},
+            encoder={"id": "nvfp4"},
+        )
+        unpowered = build_benchmark_spec(
+            case_id="text_only",
+            hardware={"gpu": "test", "power_limit_watts": 450},
+            runtime={"torch": "2", "model_load_state": "resident"},
+            model={"id": "minimax_h3", "accelerator": "spectrum"},
+            engine={"id": "sol_attn"},
+            encoder={"id": "nvfp4"},
+        )
+        self.assertNotEqual(powered["cache_key"], unpowered["cache_key"])
+        record = record_observation(
+            powered,
+            wall_time_seconds=42,
+            output_frames=124,
+            output_valid=True,
+            actual_transformer_calls=11,
+            forecast_transformer_calls=9,
+            replay_transformer_calls=0,
+            average_power_watts=401.5,
+            energy_joules=16863,
+            phase_times_seconds={
+                "spectrum_anchor_capture": 40,
+                "spectrum_offline_replay": 2,
+                "private_media_path": 999,
+            },
+        )
+        encoded = json.dumps(record, sort_keys=True)
+        self.assertNotIn("device_path", encoded)
+        self.assertNotIn("private_media_path", encoded)
+        self.assertEqual(record["actual_transformer_calls"], 11)
+        self.assertEqual(record["forecast_transformer_calls"], 9)
+        self.assertEqual(record["replay_transformer_calls"], 0)
+        self.assertEqual(record["average_power_watts"], 401.5)
+        self.assertEqual(record["energy_joules"], 16863)
+
+    def test_invalid_power_and_call_metrics_are_rejected(self):
+        with self.assertRaisesRegex(H3BenchmarkError, "actual_transformer_calls"):
+            record_observation(
+                spec(), wall_time_seconds=1, output_frames=124, output_valid=True,
+                actual_transformer_calls=1.5,
+            )
+        with self.assertRaisesRegex(H3BenchmarkError, "energy_joules"):
+            record_observation(
+                spec(), wall_time_seconds=1, output_frames=124, output_valid=True,
+                energy_joules=float("nan"),
+            )
+
     def test_reference_case_requires_content_free_shape(self):
         with self.assertRaisesRegex(H3BenchmarkError, "content-free"):
             spec("ref2va")
@@ -131,9 +234,11 @@ class H3BenchmarkTests(unittest.TestCase):
             cache = H3BenchmarkCache(Path(directory) / "cache.json")
             first = record_observation(
                 spec(), wall_time_seconds=2, output_frames=124, output_valid=True,
+                actual_transformer_calls=11,
             )
             second = record_observation(
                 spec(), wall_time_seconds=1, output_frames=124, output_valid=True,
+                actual_transformer_calls=11,
             )
             cache.put(first)
             cache.put(second)
@@ -141,6 +246,7 @@ class H3BenchmarkTests(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0]["sample_count"], 2)
             self.assertEqual(loaded[0]["generation_wall_time_seconds"], 1.5)
+            self.assertEqual(loaded[0]["actual_transformer_calls"], 11)
 
     def test_legacy_cache_migrates_without_media_hash_or_exact_timestamp(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -224,6 +330,61 @@ class H3BenchmarkTests(unittest.TestCase):
             "reference_shape": {},
         }, [observed])
         self.assertEqual(turbo["source"], "rtx_5090_baseline")
+
+    def test_native_observation_never_answers_spectrum_profile(self):
+        observed = record_observation(
+            spec(engine="sol_attn"), wall_time_seconds=100,
+            output_frames=124, output_valid=True,
+        )
+        spectrum = estimate_h3_output({
+            "model_type": "minimax_h3", "duration_seconds": 124 / 24,
+            "window_seconds": 15, "num_inference_steps": 20,
+            "resolution": "608x352", "tea_cache": 0,
+            "custom_settings": {
+                "h3_attention_engine": "sol_attn",
+                "h3_spectrum_profile": "spectrum_h3_v1",
+            },
+            "reference_shape": {},
+        }, [observed])
+        self.assertEqual(spectrum["source"], "rtx_5090_baseline")
+        self.assertIn("spectrum accelerator", spectrum["matched_factors"])
+        self.assertIn("assumes no speedup", " ".join(spectrum["uncertainty_reasons"]))
+
+    def test_previous_spectrum_algorithm_version_never_calibrates_current_profile(self):
+        old_spec = build_benchmark_spec(
+            case_id="text_only",
+            hardware={"gpu": "test"},
+            runtime={"torch": "2", "cuda": "13", "model_load_state": "resident"},
+            model={
+                "id": "minimax_h3", "accelerator": "spectrum",
+                "accelerator_version": "maestro-clean-room-1",
+            },
+            engine={
+                "id": "sol_attn", "tau": 1.0, "dense_steps": 10,
+                "dense_blocks": 2, "min_tokens": 4096,
+            },
+            encoder={"id": "nvfp4"},
+            task={
+                "profile": "observed_job", "width": 608, "height": 352,
+                "frame_count": 124, "processed_frame_count": 124,
+                "sampling_steps": 20,
+            },
+        )
+        observed = record_observation(
+            old_spec, wall_time_seconds=10, output_frames=124, output_valid=True,
+        )
+        estimate = estimate_h3_output({
+            "model_type": "minimax_h3", "duration_seconds": 124 / 24,
+            "window_seconds": 15, "num_inference_steps": 20,
+            "resolution": "608x352", "tea_cache": 0,
+            "custom_settings": {
+                "h3_attention_engine": "sol_attn",
+                "h3_spectrum_profile": "spectrum_h3_v1",
+            },
+            "reference_shape": {},
+        }, [observed])
+        self.assertEqual(estimate["source"], "rtx_5090_baseline")
+        self.assertIn("maestro-clean-room-2", estimate["matched_factors"])
 
     def test_window_overlap_is_interpreted_as_frames(self):
         context = normalize_estimate_context({

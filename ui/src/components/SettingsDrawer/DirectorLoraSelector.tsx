@@ -18,11 +18,9 @@ function serializeMultipliers(loras: string[], weights: Record<string, number[]>
 /**
  * Compact preset picker for Director mode LoRA sections.
  */
-function DirectorPresetPicker({ mode, modelType, nsfwEnabled, nsfwFlags }: {
+function DirectorPresetPicker({ mode, modelType }: {
   mode: 'image' | 'video'
   modelType: string
-  nsfwEnabled: boolean
-  nsfwFlags: Record<string, boolean>
 }) {
   const presets = useStore(s => s.presets)
   const loadPresets = useStore(s => s.loadPresets)
@@ -35,7 +33,6 @@ function DirectorPresetPicker({ mode, modelType, nsfwEnabled, nsfwFlags }: {
     p.mode === mode
     && p.model_type === modelType
     && p.activated_loras.length > 0
-    && (nsfwEnabled || p.activated_loras.every(name => !nsfwFlags[name]))
   )
 
   if (modePresets.length === 0) return null
@@ -80,8 +77,6 @@ export function DirectorLoraSelector({ mode, modelType }: {
 }) {
   const savedLora = useStore(s => s.savedLoraPerMode[mode])
   const directorSetLora = useStore(s => s.directorSetLora)
-  const registerMatureLoraFlags = useStore(s => s.registerMatureLoraFlags)
-  const nsfwEnabled = useStore(s => s.servicesConfig?.nsfw_mode ?? false)
   const openBrowser = useStore(s => s.setLoraBrowserOpen)
 
   const [availableLoras, setAvailableLoras] = useState<string[]>(savedLora?.availableLoras || [])
@@ -94,9 +89,6 @@ export function DirectorLoraSelector({ mode, modelType }: {
   const [guideStatus, setGuideStatus] = useState<Record<string, 'none' | 'exists' | 'generating' | 'done'>>({})
   const [guideTexts, setGuideTexts] = useState<Record<string, string>>({})
   const [loraDates, setLoraDates] = useState<Record<string, LoraDates>>({})
-  const [nsfwFlags, setNsfwFlags] = useState<Record<string, boolean>>({})
-  const [loraDetailsModel, setLoraDetailsModel] = useState('')
-  const [loraDetailsError, setLoraDetailsError] = useState<{ modelType: string; message: string } | null>(null)
   const loraDetailsRequest = useRef(0)
   // Sticky list order shared with the Studio picker via the store.
   const sortMode = useStore(s => s.loraPickerSort)
@@ -171,7 +163,6 @@ export function DirectorLoraSelector({ mode, modelType }: {
       const guides: Record<string, string> = {}
       const statuses: Record<string, 'exists' | 'none'> = {}
       const dates: Record<string, LoraDates> = {}
-      const mature: Record<string, boolean> = {}
       for (const info of r.loras) {
         if (info.recommended_weights) recs[info.filename] = info.recommended_weights
         if (info.guide) { guides[info.filename] = info.guide; statuses[info.filename] = 'exists' }
@@ -179,16 +170,11 @@ export function DirectorLoraSelector({ mode, modelType }: {
         if (info.released_at || info.downloaded_at) {
           dates[info.filename] = { released: info.released_at, downloaded: info.downloaded_at }
         }
-        mature[info.filename] = !!info.nsfw
       }
       setLoraWeightRecs(recs)
       setGuideTexts(prev => ({ ...prev, ...guides }))
       setGuideStatus(prev => ({ ...prev, ...statuses }))
       setLoraDates(dates)
-      setNsfwFlags(mature)
-      registerMatureLoraFlags(modelType, r.loras)
-      setLoraDetailsModel(modelType)
-      setLoraDetailsError(null)
 
       // Auto-apply recommended defaults to newly activated LoRAs at 1.0 fill
       for (const lora of activatedLoras) {
@@ -211,10 +197,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
       }
     }).catch(error => {
       if (detailsRequest !== loraDetailsRequest.current) return
-      setLoraDetailsError({
-        modelType,
-        message: error instanceof Error ? error.message : 'Could not classify LoRAs',
-      })
+      console.error('Could not load Director LoRA details:', error)
     })
 
     // Check guide status for activated LoRAs
@@ -287,15 +270,9 @@ export function DirectorLoraSelector({ mode, modelType }: {
   const displayName = (filename: string) =>
     filename.replace(/\.(safetensors|sft)$/i, '')
 
-  const loraDetailsReady = loraDetailsModel === modelType
-  const currentLoraDetailsError = loraDetailsError?.modelType === modelType
-    ? loraDetailsError.message
-    : null
   const filtered = sortLoraNames(
     availableLoras.filter(name =>
-      (activatedLoras.includes(name) || loraDetailsReady)
-      && (activatedLoras.includes(name) || nsfwEnabled || !nsfwFlags[name])
-      && displayName(name).toLowerCase().includes(search.toLowerCase())
+      displayName(name).toLowerCase().includes(search.toLowerCase())
     ),
     sortMode,
     loraDates,
@@ -327,26 +304,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
   return (
     <div>
       {/* Preset picker */}
-      {loraDetailsReady && (
-        <DirectorPresetPicker
-          mode={mode}
-          modelType={modelType}
-          nsfwEnabled={nsfwEnabled}
-          nsfwFlags={nsfwFlags}
-        />
-      )}
-
-      {!loraDetailsReady && (
-        <div className={`mb-2 rounded-lg border px-3 py-2 text-[10px] ${
-          currentLoraDetailsError
-            ? 'border-red-500/30 bg-red-500/10 text-red-300'
-            : 'border-border bg-bg-tertiary text-text-muted'
-        }`}>
-          {currentLoraDetailsError
-            ? `LoRA safety metadata unavailable: ${currentLoraDetailsError}. New selections are disabled.`
-            : 'Checking LoRA safety metadata before enabling selections…'}
-        </div>
-      )}
+      <DirectorPresetPicker mode={mode} modelType={modelType} />
 
       {/* Header with Browse */}
       <div className="flex items-center justify-between mb-1.5">
