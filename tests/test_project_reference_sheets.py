@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import sys
@@ -24,6 +25,7 @@ from services.reference_sheets import (
     ArtifactProvenance,
     PACK_ROLE_RECIPES,
     PackIntelligenceSelection,
+    PackLoraSelection,
     PackModelSchedule,
     PackOperationRoute,
     ReferencePackArtifact,
@@ -178,6 +180,100 @@ class ReferenceSheetTests(unittest.TestCase):
             )
         with self.assertRaises(TypeError):
             ROLE_RECIPES["character"] = ()
+
+    def test_parameterized_lora_values_are_private_and_public_summary_is_digest_only(self):
+        selection = PackLoraSelection(
+            lora_id="owner-control.safetensors",
+            multiplier=1.2,
+            requested_scope="auto",
+            resolved_scopes=("generation", "editing"),
+            roles=("canonical_identity", "turnaround"),
+            revision="local",
+            source_sha256="a" * 64,
+            parameter_schema_digest="b" * 64,
+            parameter_commitment_context="9" * 64,
+            parameter_values=(("body_scale", "PRIVATE_OWNER_VALUE"),),
+            parameter_values_digest="c" * 64,
+            parameter_expansion_digest="d" * 64,
+        )
+        plan = self._pack_plan(additional_loras=(selection,))
+        public = plan.public_preview()["additional_loras"]["applied"][0]
+        self.assertEqual(public["parameters"], {
+            "count": 1,
+            "ids": ["body_scale"],
+            "schema_digest": "b" * 64,
+            "values_digest": "c" * 64,
+            "expansion_digest": "d" * 64,
+        })
+        self.assertNotIn("PRIVATE_OWNER_VALUE", json.dumps(public))
+        private = plan.private_authored_settings()[
+            "additional_lora_parameters"
+        ][0]
+        self.assertEqual(
+            private["values"],
+            [{"id": "body_scale", "value": "PRIVATE_OWNER_VALUE"}],
+        )
+        skipped = replace(selection, skipped_reason="incompatible")
+        skipped_public = skipped.public_metadata()
+        self.assertEqual(skipped_public["parameters"], public["parameters"])
+        self.assertNotIn("PRIVATE_OWNER_VALUE", json.dumps(skipped_public))
+        trigger_only = replace(
+            selection,
+            parameter_values=(),
+            parameter_values_digest="e" * 64,
+            parameter_expansion_digest="f" * 64,
+        )
+        trigger_public = trigger_only.public_metadata()
+        self.assertEqual(trigger_public["parameters"]["count"], 0)
+        self.assertEqual(trigger_public["parameters"]["ids"], [])
+        trigger_plan = self._pack_plan(additional_loras=(trigger_only,))
+        self.assertEqual(
+            trigger_plan.private_authored_settings()[
+                "additional_lora_parameters"
+            ][0]["values"],
+            [],
+        )
+
+        malformed_digest = replace(selection, parameter_schema_digest=123)
+        with self.assertRaisesRegex(ValueError, "sealed selections"):
+            self._pack_plan(additional_loras=(malformed_digest,))
+        malformed_context = replace(
+            selection, parameter_commitment_context="short",
+        )
+        with self.assertRaisesRegex(ValueError, "sealed selections"):
+            self._pack_plan(additional_loras=(malformed_context,))
+
+        snapshot = plan.private_authored_settings()
+        duplicate_lora = copy.deepcopy(snapshot)
+        duplicate_lora["additional_lora_parameters"].append(copy.deepcopy(
+            duplicate_lora["additional_lora_parameters"][0]
+        ))
+        with self.assertRaisesRegex(ValueError, "private authored"):
+            reference_sheets.reference_pack_authored_settings_seal(
+                duplicate_lora,
+            )
+        duplicate_parameter = copy.deepcopy(snapshot)
+        duplicate_parameter["additional_lora_parameters"][0]["values"].append({
+            "id": "body_scale", "value": "duplicate",
+        })
+        with self.assertRaisesRegex(ValueError, "private authored"):
+            reference_sheets.reference_pack_authored_settings_seal(
+                duplicate_parameter,
+            )
+        nonfinite = copy.deepcopy(snapshot)
+        nonfinite["additional_lora_parameters"][0]["values"][0]["value"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "private authored"):
+            reference_sheets.reference_pack_authored_settings_seal(nonfinite)
+        too_many = copy.deepcopy(snapshot)
+        too_many["additional_lora_parameters"] = [
+            {
+                **copy.deepcopy(snapshot["additional_lora_parameters"][0]),
+                "id": f"lora-{index}.safetensors",
+            }
+            for index in range(65)
+        ]
+        with self.assertRaisesRegex(ValueError, "private authored"):
+            reference_sheets.reference_pack_authored_settings_seal(too_many)
 
     def test_deterministic_collage_geometry_order_labels_and_no_clipping(self):
         plan = self._plan()

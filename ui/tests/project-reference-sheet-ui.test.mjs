@@ -15,12 +15,18 @@ import {
   getProjectAssetComponentOutputs,
   getProjectReferenceEditorModels,
   getProjectReferenceGenerationModels,
+  getProjectReferenceQueueBlockers,
+  getProjectReferenceVisibilityHints,
+  getLoraParameterDefaults,
+  getLoraParameterValue,
+  hasProjectReferenceLoraParameterSummary,
   getProjectReferenceRepairCopy,
   getProjectReferenceRetrySettings,
   isProjectReferenceReviewMandatory,
   isProjectReferenceReviewerEligible,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
+  loraParameterSchemasConflict,
   normalizeProjectReferenceAssetType,
   normalizeProjectReferenceAnchorPrivacy,
   ProjectAssetRequestError,
@@ -32,6 +38,7 @@ import {
   selectProjectReferenceModel,
   selectProjectAssetApplyOutput,
   setProjectAssetVariantStatus,
+  validateLoraParameterValues,
 } from '../src/api/client.ts'
 
 const componentUrl = new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url)
@@ -401,6 +408,155 @@ test('Reference Studio model helpers filter the server catalog and preserve loca
   assert.equal(selectProjectReferenceModel(generation, 'missing', 'image'), 'image')
   assert.equal(selectProjectReferenceModel(editors, 'missing'), 'editor')
   assert.equal(selectProjectReferenceModel([], 'missing'), '')
+})
+
+test('Moody Krea 2 recipes are generation-selectable but never presented as editors', () => {
+  const catalog = [
+    { model_type: 'krea2_moody_mix_v7_fp8', name: 'Moody Mix', image_outputs: true, supports_ref_images: false },
+    { model_type: 'krea2_moody_cutie_v4_fp8', name: 'Moody Cutie', image_outputs: true, supports_ref_images: false },
+  ]
+  assert.deepEqual(
+    getProjectReferenceGenerationModels(catalog).map(model => model.model_type),
+    ['krea2_moody_mix_v7_fp8', 'krea2_moody_cutie_v4_fp8'],
+  )
+  assert.deepEqual(getProjectReferenceEditorModels(catalog), [])
+})
+
+test('LoRA parameter defaults and validation remain server-schema authoritative', () => {
+  const schema = {
+    schema_version: 1,
+    schema_digest: 'schema-1',
+    parameters: [
+      { id: 'category', label: 'Category', type: 'enum', required: true, default: 'medium', scopes: ['generation'], roles: [], options: [{ value: 'small', label: 'Small' }, { value: 'medium', label: 'Medium' }] },
+      { id: 'amount', label: 'Amount', type: 'number', required: true, scopes: ['generation'], roles: [], minimum: 0, maximum: 2, step: 0.1 },
+      { id: 'count', label: 'Count', type: 'integer', required: false, scopes: ['editing'], roles: [], minimum: 1, maximum: 5, step: 2 },
+      { id: 'enabled', label: 'Enabled', type: 'boolean', required: true, default: false, scopes: ['generation'], roles: [] },
+      { id: 'note', label: 'Note', type: 'text', required: false, scopes: ['generation'], roles: [], min_length: 2, max_length: 5 },
+    ],
+  }
+  assert.deepEqual(getLoraParameterDefaults(schema), { category: 'medium', enabled: false })
+  assert.deepEqual(validateLoraParameterValues(schema, {
+    category: 'small', amount: 1.5, count: 3, enabled: true, note: 'short',
+  }), [])
+  assert.deepEqual(validateLoraParameterValues(schema, {
+    category: 'large', amount: 3, count: 2.5, enabled: 'true', note: 'too long', extra: 1,
+  }), [
+    'Unknown parameter: extra.',
+    'Category must use one of the published choices.',
+    'Amount must be at most 2.',
+    'Count must be a whole number.',
+    'Count must follow the published step of 2.',
+    'Enabled must be Yes or No.',
+    'Note must be at most 5 characters.',
+  ])
+  assert.deepEqual(validateLoraParameterValues(undefined, { amount: 1 }), [
+    'This LoRA no longer publishes a parameter schema.',
+  ])
+  assert.deepEqual(validateLoraParameterValues(schema, {
+    category: 'small', amount: 0.15, count: 3, enabled: true, note: 'a',
+  }), [
+    'Amount must follow the published step of 0.1.',
+    'Note must be at least 2 characters.',
+  ])
+  assert.deepEqual(validateLoraParameterValues(schema, {
+    category: 'small', amount: 0.2, count: 3, enabled: true, note: 'a\n',
+  }), ['Note cannot contain control characters.'])
+  assert.deepEqual(validateLoraParameterValues(schema, {
+    category: 'small', amount: 0.2, count: 3, enabled: true, note: '😀😀',
+  }), [])
+  assert.deepEqual(validateLoraParameterValues(schema, {
+    category: 'small', amount: 0.2, count: 3, enabled: true, note: '😀😀😀😀😀😀',
+  }), ['Note must be at most 5 characters.'])
+  const category = schema.parameters[0]
+  assert.equal(getLoraParameterValue(category, {}), 'medium')
+  assert.equal(getLoraParameterValue(category, { category: 'small' }), 'small')
+  const note = schema.parameters[4]
+  assert.equal(getLoraParameterValue(note, { note: '' }), '')
+})
+
+test('ambiguous JSON-equivalent enum choices block Queue while distinct numeric choices remain valid', () => {
+  const enumSchema = options => ({
+    schema_version: 1,
+    schema_digest: 'numeric-enum',
+    parameters: [{
+      id: 'size', label: 'Size', type: 'enum', required: true, scopes: ['generation'], roles: [], options,
+    }],
+  })
+  const ambiguousErrors = validateLoraParameterValues(enumSchema([
+    { value: 1, label: 'Integer one' },
+    { value: 1.0, label: 'Float one after JSON parsing' },
+  ]), { size: 1 })
+  assert.deepEqual(ambiguousErrors, ['Size publishes ambiguous duplicate choices.'])
+  const optionalAmbiguousSchema = enumSchema([
+    { value: 1, label: 'Integer one' },
+    { value: 1.0, label: 'Float one after JSON parsing' },
+  ])
+  optionalAmbiguousSchema.parameters[0].required = false
+  assert.deepEqual(validateLoraParameterValues(optionalAmbiguousSchema, {}), [
+    'Size publishes ambiguous duplicate choices.',
+  ])
+  const blockers = getProjectReferenceQueueBlockers({
+    submitting: false, project_locked: false, loading: false, name_missing: false,
+    capabilities_unavailable: false, deliverables_unavailable: false,
+    generation_model_missing: false, editor_model_missing: false, terms_pending: false,
+    manual_verification_pending: false, incompatible_lora: false,
+    invalid_lora_multiplier: false, invalid_lora_parameters: ambiguousErrors.length > 0,
+    invalid_authored_settings: false, review_unavailable: false,
+  })
+  assert.deepEqual(blockers.map(blocker => blocker.id), ['invalid_lora_parameters'])
+
+  const validSchema = enumSchema([
+    { value: 1, label: 'One' },
+    { value: 1.5, label: 'One and a half' },
+  ])
+  assert.deepEqual(validateLoraParameterValues(validSchema, { size: 1 }), [])
+  assert.deepEqual(validateLoraParameterValues(validSchema, { size: 1.5 }), [])
+})
+
+test('zero-value parameter contracts, auto-scope conflicts, and LAN-hidden visibility stay explicit', () => {
+  assert.equal(hasProjectReferenceLoraParameterSummary({
+    parameters: {
+      count: 0, ids: [], schema_digest: 'schema', values_digest: 'values', expansion_digest: 'expansion',
+    },
+  }), true)
+  const generation = { schema_version: 1, schema_digest: 'generation', parameters: [] }
+  const editing = { schema_version: 1, schema_digest: 'editing', parameters: [] }
+  assert.equal(loraParameterSchemasConflict(generation, editing, 'auto', true, true), true)
+  assert.equal(loraParameterSchemasConflict(generation, undefined, 'auto', true, true), true)
+  assert.equal(loraParameterSchemasConflict(generation, undefined, 'auto', true, false), false)
+  assert.equal(loraParameterSchemasConflict(generation, editing, 'generation', true, true), false)
+  assert.deepEqual(getProjectReferenceVisibilityHints(
+    ['krea2_moody_mix_v7_fp8', 'krea2_moody_cutie_v4_fp8'],
+    new Set(),
+    [],
+    true,
+  ), {
+    disabled: ['krea2_moody_mix_v7_fp8', 'krea2_moody_cutie_v4_fp8'],
+    enabled_missing: [],
+  })
+  assert.deepEqual(getProjectReferenceVisibilityHints(
+    ['krea2_moody_mix_v7_fp8'],
+    new Set(['krea2_moody_mix_v7_fp8']),
+    [],
+    true,
+  ), { disabled: [], enabled_missing: ['krea2_moody_mix_v7_fp8'] })
+})
+
+test('Queue blockers are the executable source of every disabled reason', () => {
+  const clear = {
+    submitting: false, project_locked: false, loading: false, name_missing: false,
+    capabilities_unavailable: false, deliverables_unavailable: false,
+    generation_model_missing: false, editor_model_missing: false, terms_pending: false,
+    manual_verification_pending: false, incompatible_lora: false,
+    invalid_lora_multiplier: false, invalid_lora_parameters: false,
+    invalid_authored_settings: false, review_unavailable: false,
+  }
+  assert.deepEqual(getProjectReferenceQueueBlockers(clear), [])
+  const all = getProjectReferenceQueueBlockers(Object.fromEntries(
+    Object.keys(clear).map(key => [key, true]),
+  ))
+  assert.deepEqual(all.map(blocker => blocker.id), Object.keys(clear))
+  assert.ok(all.every(blocker => blocker.message.endsWith('.')))
 })
 
 test('panel repair policy is bounded and disabled for Draft or review-off', () => {
@@ -809,6 +965,11 @@ test('private authored settings use the exact owner route and no-store request',
         operation: 'enhance', source_role: 'canonical_identity',
       }],
     },
+    additional_loras: [{
+      id: 'shape.safetensors', multiplier: 0.8, scope: 'generation',
+      parameter_schema_digest: 'schema-digest', parameter_values: { amount: 1.25, enabled: false },
+      parameter_values_digest: 'values-digest', parameter_expansion_digest: 'expansion-digest',
+    }],
   }
   let request
   globalThis.fetch = async (url, options) => {
@@ -1008,6 +1169,29 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /getProjectReferenceEditorModels\(catalogModels\)/)
   assert.match(source, /aria-label="Reference Studio generation model"/)
   assert.match(source, /aria-label="Reference Studio editor model"/)
+  assert.match(source, /Open Settings → System → Enabled Models/)
+  assert.match(source, /model\.manual_installation\.filename/)
+  assert.match(source, /model\.manual_installation\.destination_hint/)
+  assert.match(source, /model\.manual_installation\.sha256/)
+  assert.match(source, /model\.manual_installation\.local_verification_required/)
+  assert.match(source, /Local host only · required/)
+  assert.match(source, /Open exact manual download/)
+  assert.match(source, /Verification is intentionally unavailable from LAN sessions/)
+  assert.match(source, /fetchLoraDetails\(referenceModelType\)/)
+  assert.match(source, /parameter_schema_digest: schema\?\.schema_digest/)
+  assert.match(source, /parameter_values: schema \? getLoraParameterDefaults\(schema\)/)
+  assert.match(source, /<LoraParameterFields/)
+  assert.match(source, /aria-invalid=\{fieldErrors\.length > 0\}/)
+  assert.match(source, /const describedBy = \[parameter\.description \? helpId/)
+  assert.match(source, /loraParameterSnapshots\.current\.set/)
+  assert.match(source, /response\.additional_loras/)
+  assert.match(source, /privateLora\?\.parameter_schema_digest === recorded\.schemaDigest/)
+  assert.match(source, /privateLora\.parameter_values_digest === recorded\.valuesDigest/)
+  assert.match(source, /privateLora\.parameter_expansion_digest === recorded\.expansionDigest/)
+  assert.match(source, /privateIds\.every\(\(id, index\) => id === recorded\.ids\[index\]\)/)
+  assert.match(source, /Retry private replay/)
+  assert.match(source, /its published parameter schema changed/)
+  assert.match(source, /values will not be guessed or migrated/)
   assert.match(source, /aria-label="Reference Studio planning model"/)
   assert.match(source, /aria-label="Reference Studio visual review model"/)
   assert.match(source, /Auto \(local only\)/)
@@ -1027,7 +1211,10 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /Uncensored-capable review is pinned to/)
   assert.match(source, /it never falls back to a remote or generic reviewer/)
   assert.match(source, /intelligencePolicy === 'standard_auto' && selectedReviewModel/)
-  assert.match(source, /reviewSelectionUnavailable \|\| pendingRecipeTermRequirements/)
+  assert.match(source, /const queueBlockers = getProjectReferenceQueueBlockers\(/)
+  assert.match(source, /disabled=\{queueBlockers\.length > 0\}/)
+  assert.match(source, /aria-describedby=\{queueBlockers\.length > 0 \? 'project-reference-queue-blockers'/)
+  assert.match(source, />Queue blocked by</)
   assert.match(source, /Automatic · unavailable/)
   assert.match(source, /content_capability: contentCapability/)
   assert.match(source, /review: mandatoryReview \|\| reviewModel !== 'off'/)
@@ -1044,8 +1231,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /route\.recipe_id/)
   assert.match(source, /route\.verification_status/)
   assert.match(source, /route\.reason/)
-  assert.match(source, /fetchLoras\(referenceModelType\)/)
-  assert.match(source, /fetchLoras\(editorModelType\)/)
+  assert.match(source, /fetchLoraDetails\(referenceModelType\)/)
+  assert.match(source, /fetchLoraDetails\(editorModelType\)/)
   assert.match(source, /Auto compatible/)
   assert.match(source, /Create \/ anchor/)
   assert.match(source, /Edit \/ derivative/)
@@ -1065,7 +1252,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /getProjectReferenceRetrySettings\(variant/)
   assert.match(source, /projectReferenceRetryNeedsPrivateAuthoring\(variant\)/)
   assert.match(source, /fetchProjectReferenceAuthoring\(/)
-  assert.match(source, /response\.authored_settings\.seal !== target\.seal/)
+  assert.match(source, /response\.authored_settings\.seal !== target\.authoredSeal/)
   assert.match(source, /Exact custom authoring is unavailable for this candidate/)
   assert.match(source, /disabled=\{Boolean\(pendingAction\) \|\| !exactRetryReady\}/)
   assert.match(source, /resolveProjectReferenceRetryReview\(/)
@@ -1081,7 +1268,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /provenance: 'imported'/)
   assert.match(source, /max_repair_attempts: effectiveMaxRepairAttempts/)
   assert.match(source, /id="project-reference-max-repairs" aria-label="Maximum panel repair attempts" type="number" min=\{1\} max=\{5\}/)
-  assert.match(source, /disabled=\{submitting \|\| !name\.trim\(\) \|\| !referenceCapabilities \|\| deliverables\.length !== sheetCount \|\| hasInvalidExplicitLora \|\| hasInvalidLoraMultiplier \|\| hasInvalidAuthoredSettings \|\| reviewSelectionUnavailable \|\| pendingRecipeTermRequirements\.length > 0 \|\| pendingManualModels\.length > 0 \|\| !referenceModelType/)
+  assert.match(source, /disabled=\{queueBlockers\.length > 0\}/)
   assert.doesNotMatch(source, /!name\.trim\(\) \|\| !description\.trim\(\)/)
   assert.match(source, /const \[loadError, setLoadError\] = useState\(''\)/)
   assert.match(source, /const \[actionError, setActionError\] = useState\(''\)/)

@@ -141,6 +141,7 @@ def _list_models_namespace(registry):
         "_versioned_model_updater": _Updater(),
         "_versioned_model_update_status": {},
         "_check_model_downloaded": lambda model_type: True,
+        "_public_manual_installation_manifest": lambda model_def: None,
     }
     exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
     return namespace

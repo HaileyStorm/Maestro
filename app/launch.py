@@ -36,7 +36,7 @@ import traceback
 import requests
 import socket
 from pathlib import Path, PureWindowsPath
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 # --- Bootstrap: CWD must be app/ and sys.argv must be patched before importing wgp ---
 _app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -6703,6 +6703,97 @@ def _public_model_availability(
     return model_availability_policy(model_type, definitions)
 
 
+def _public_manual_installation_manifest(model_def):
+    """Project one exact, token-free manual artifact recipe to the catalog."""
+    def safe_public_url(value, *, path, expected_query):
+        if not isinstance(value, str) or len(value) > 2_048:
+            return False
+        try:
+            parsed = urlsplit(value)
+            query = parse_qsl(parsed.query, keep_blank_values=True)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            parsed.scheme == "https"
+            and parsed.netloc == "civitai.com"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path == path
+            and not parsed.fragment
+            and len(query) == len(expected_query)
+            and dict(query) == expected_query
+        )
+
+    if (
+        not isinstance(model_def, dict)
+        or model_def.get("manual_installation_ready") is not True
+        or model_def.get("downloadable") is not False
+    ):
+        return None
+    provenance = model_def.get("artifact_provenance")
+    checkpoint = (
+        provenance.get("checkpoint") if isinstance(provenance, dict) else None
+    )
+    if not isinstance(checkpoint, dict):
+        return None
+    filename = checkpoint.get("filename")
+    size_bytes = checkpoint.get("size_bytes")
+    sha256 = checkpoint.get("sha256")
+    source_url = checkpoint.get("source_url")
+    download_url = checkpoint.get("download_url")
+    model_id = checkpoint.get("model_id")
+    version_id = checkpoint.get("version_id")
+    precision = checkpoint.get("precision")
+    declared_urls = model_def.get("URLs")
+    if (
+        checkpoint.get("provider") != "civitai"
+        or not isinstance(filename, str)
+        or not filename
+        or os.path.basename(filename) != filename
+        or not isinstance(size_bytes, int)
+        or isinstance(size_bytes, bool)
+        or size_bytes <= 0
+        or not isinstance(sha256, str)
+        or re.fullmatch(r"[0-9A-Fa-f]{64}", sha256) is None
+        or isinstance(model_id, bool)
+        or not isinstance(model_id, int)
+        or model_id <= 0
+        or isinstance(version_id, bool)
+        or not isinstance(version_id, int)
+        or version_id <= 0
+        or not isinstance(precision, str)
+        or re.fullmatch(r"[A-Za-z0-9._+-]{1,32}", precision) is None
+        or not safe_public_url(
+            source_url,
+            path=f"/models/{model_id}",
+            expected_query={"modelVersionId": str(version_id)},
+        )
+        or not safe_public_url(
+            download_url,
+            path=f"/api/download/models/{version_id}",
+            expected_query={
+                "type": "Diffusion Model",
+                "format": "SafeTensor",
+                "fp": precision,
+            },
+        )
+        or not isinstance(declared_urls, list)
+        or filename not in declared_urls
+        or checkpoint.get("download_policy") != "manual_hash_verified_only"
+        or checkpoint.get("loader_auto_download") is not False
+    ):
+        return None
+    return {
+        "filename": filename,
+        "size_bytes": size_bytes,
+        "sha256": sha256.lower(),
+        "source_url": source_url,
+        "download_url": download_url,
+        "destination_hint": "app/ckpts",
+        "local_verification_required": True,
+    }
+
+
 def _require_model_download_available(
     model_type: str,
     model_def: dict,
@@ -6777,6 +6868,7 @@ def list_models(request: Request):
             manual_verification_required = bool(
                 manual_required(mt, md, wgp.models_def)
             )
+        manual_installation = _public_manual_installation_manifest(md)
         models.append({
             "model_type": mt,
             "name": md.get("name", mt),
@@ -6829,6 +6921,10 @@ def list_models(request: Request):
                 bool(manual_ready(mt, md, wgp.models_def))
                 if manual_verification_required and callable(manual_ready)
                 else False
+            ),
+            **(
+                {"manual_installation": manual_installation}
+                if manual_installation is not None else {}
             ),
             # Upstream descriptive metadata retained for catalog compatibility.
             # It does not gate visibility, execution, or publication.
@@ -7336,6 +7432,572 @@ def _compute_lora_id(filename: str, sidecar_meta: dict | None) -> str:
                 # Some sidecars store modelId as a string; pass through.
                 return f"civitai:{model_id}"
     return f"local:{filename}"
+
+
+_PROJECT_REFERENCE_LORA_SCHEMA_KEY = "maestro_lora_parameter_schema"
+_PROJECT_REFERENCE_LORA_PARAMETER_TYPES = frozenset({
+    "enum", "number", "integer", "boolean", "text",
+})
+_PROJECT_REFERENCE_LORA_PARAMETER_SCOPES = frozenset({
+    "generation", "editing",
+})
+
+
+def _project_reference_private_commitment(value) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(_session_secret(), encoded, hashlib.sha256).hexdigest()
+
+
+def _project_reference_snapshot_commitment(context, kind, value) -> str:
+    if (
+        not isinstance(context, str)
+        or re.fullmatch(r"[0-9a-f]{64}", context) is None
+        or kind not in {"values", "expansions"}
+    ):
+        raise ValueError("LoRA parameter commitment context is invalid")
+    return _project_reference_private_commitment({
+        "context": context,
+        "kind": kind,
+        "value": value,
+    })
+
+
+def _project_reference_lora_schema_sidecars(model_type, weight_path):
+    """Return deterministic owner-sidecar then imported-sidecar candidates.
+
+    A primary-dir ``.maestro.json`` can describe a linked read-only weight
+    without modifying that other installation. Imported CivitAI metadata is a
+    fallback only, so a metadata refresh cannot erase an owner-authored schema.
+    Paths never leave the server.
+    """
+    own_base = os.path.splitext(os.path.realpath(weight_path))[0]
+    bases = []
+    try:
+        primary_dir = wgp.get_lora_dir(model_type)
+    except Exception:
+        primary_dir = None
+    if isinstance(primary_dir, str) and primary_dir:
+        bases.append(os.path.join(
+            os.path.abspath(primary_dir), os.path.basename(own_base),
+        ))
+    bases.append(own_base)
+    unique_bases = list(dict.fromkeys(os.path.normpath(base) for base in bases))
+    return [
+        *((base + ".maestro.json", "maestro_sidecar") for base in unique_bases),
+        *((base + ".civitai.json", "civitai_sidecar") for base in unique_bases),
+    ]
+
+
+def _project_reference_lora_schema_scopes(value, *, field):
+    if value is None:
+        return ["generation", "editing"]
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > 2
+        or len(set(value)) != len(value)
+        or any(scope not in _PROJECT_REFERENCE_LORA_PARAMETER_SCOPES for scope in value)
+    ):
+        raise ValueError(f"{field} scopes are invalid")
+    return [scope for scope in ("generation", "editing") if scope in value]
+
+
+def _project_reference_lora_schema_roles(value, *, field):
+    if value is None:
+        return []
+    if (
+        not isinstance(value, list)
+        or len(value) > 64
+        or len(set(value)) != len(value)
+        or any(
+            not isinstance(role, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", role) is None
+            for role in value
+        )
+    ):
+        raise ValueError(f"{field} roles are invalid")
+    return list(value)
+
+
+def _project_reference_lora_prompt_template(value, *, field):
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or len(value) > 500
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or value.count("{value}") != 1
+        or "{" in value.replace("{value}", "")
+        or "}" in value.replace("{value}", "")
+    ):
+        raise ValueError(f"{field} prompt template is invalid")
+    return value
+
+
+def _project_reference_lora_fragment(value, *, field, allow_empty=False):
+    if value is None and allow_empty:
+        return ""
+    if (
+        not isinstance(value, str)
+        or (not allow_empty and not value.strip())
+        or value != value.strip()
+        or len(value) > 500
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(f"{field} prompt fragment is invalid")
+    return value
+
+
+def _normalize_lora_parameter_schema(value):
+    """Strictly normalize one explicit, versioned local parameter schema."""
+    if not isinstance(value, dict) or not set(value).issubset({
+        "schema_version", "parameters", "trigger_fragments",
+    }) or set(value) < {"schema_version", "parameters"}:
+        raise ValueError("LoRA parameter schema is invalid")
+    if value.get("schema_version") != 1:
+        raise ValueError("LoRA parameter schema version is unsupported")
+    parameters = value.get("parameters")
+    if not isinstance(parameters, list) or not parameters or len(parameters) > 64:
+        raise ValueError("LoRA parameter definitions are invalid")
+    normalized_parameters = []
+    seen_ids = set()
+    scalar_types = {str, int, float, bool}
+    common_keys = {
+        "id", "label", "description", "type", "default", "required",
+        "scopes", "roles",
+    }
+    type_keys = {
+        "enum": {"options"},
+        "number": {"minimum", "maximum", "step", "prompt_template"},
+        "integer": {"minimum", "maximum", "step", "prompt_template"},
+        "boolean": {"true_prompt_fragment", "false_prompt_fragment"},
+        "text": {"min_length", "max_length", "prompt_template"},
+    }
+    for definition in parameters:
+        if not isinstance(definition, dict):
+            raise ValueError("LoRA parameter definition is invalid")
+        parameter_type = definition.get("type")
+        if parameter_type not in _PROJECT_REFERENCE_LORA_PARAMETER_TYPES:
+            raise ValueError("LoRA parameter type is invalid")
+        if set(definition) - (common_keys | type_keys[parameter_type]):
+            raise ValueError("LoRA parameter definition contains unknown fields")
+        if not {"id", "label", "type"}.issubset(definition):
+            raise ValueError("LoRA parameter definition is incomplete")
+        parameter_id = definition.get("id")
+        label = definition.get("label")
+        description = definition.get("description")
+        required = definition.get("required", False)
+        if (
+            not isinstance(parameter_id, str)
+            or re.fullmatch(r"[A-Za-z][A-Za-z0-9._:-]{0,63}", parameter_id) is None
+            or parameter_id in seen_ids
+            or not isinstance(label, str)
+            or not label.strip()
+            or label != label.strip()
+            or len(label) > 120
+            or "\x00" in label
+            or (description is not None and (
+                not isinstance(description, str)
+                or description != description.strip()
+                or len(description) > 500
+                or "\x00" in description
+            ))
+            or type(required) is not bool
+        ):
+            raise ValueError("LoRA parameter identity is invalid")
+        seen_ids.add(parameter_id)
+        normalized = {
+            "id": parameter_id,
+            "label": label,
+            "type": parameter_type,
+            "required": required,
+            "scopes": _project_reference_lora_schema_scopes(
+                definition.get("scopes"), field=parameter_id,
+            ),
+            "roles": _project_reference_lora_schema_roles(
+                definition.get("roles"), field=parameter_id,
+            ),
+        }
+        if description is not None:
+            normalized["description"] = description
+        has_default = "default" in definition
+        default = definition.get("default")
+        if parameter_type == "enum":
+            options = definition.get("options")
+            if not isinstance(options, list) or not options or len(options) > 64:
+                raise ValueError("LoRA enum options are invalid")
+            normalized_options = []
+            option_keys = set()
+            for option in options:
+                if not isinstance(option, dict) or set(option) != {
+                    "value", "label", "prompt_fragment",
+                }:
+                    raise ValueError("LoRA enum option is invalid")
+                option_value = option.get("value")
+                option_label = option.get("label")
+                if (
+                    type(option_value) not in scalar_types
+                    or (
+                        isinstance(option_value, float)
+                        and (
+                            not math.isfinite(option_value)
+                            or option_value.is_integer()
+                        )
+                    )
+                    or (
+                        type(option_value) is int
+                        and abs(option_value) > 9_007_199_254_740_991
+                    )
+                    or (
+                        isinstance(option_value, str)
+                        and (
+                            len(option_value) > 256
+                            or any(
+                                ord(character) < 32 or ord(character) == 127
+                                for character in option_value
+                            )
+                        )
+                    )
+                    or not isinstance(option_label, str)
+                    or not option_label.strip()
+                    or option_label != option_label.strip()
+                    or len(option_label) > 120
+                    or "\x00" in option_label
+                ):
+                    raise ValueError("LoRA enum option is invalid")
+                # JSON clients retain booleans as a distinct scalar, but all
+                # integers/floats share one number type. Integral floats are
+                # rejected above; canonicalize the remaining numeric domain
+                # together so duplicate identity matches the wire format.
+                option_kind = (
+                    "boolean" if type(option_value) is bool
+                    else "number" if type(option_value) in {int, float}
+                    else "string"
+                )
+                key = (option_kind, json.dumps(
+                    option_value, sort_keys=True, ensure_ascii=False,
+                    allow_nan=False,
+                ))
+                if key in option_keys:
+                    raise ValueError("LoRA enum option values must be unique")
+                option_keys.add(key)
+                normalized_options.append({
+                    "value": option_value,
+                    "label": option_label,
+                    "_prompt_fragment": _project_reference_lora_fragment(
+                        option.get("prompt_fragment"), field=parameter_id,
+                    ),
+                })
+            if has_default and not any(
+                type(default) is type(option["value"])
+                and default == option["value"]
+                for option in normalized_options
+            ):
+                raise ValueError("LoRA enum default is invalid")
+            if has_default:
+                normalized["default"] = default
+            normalized["options"] = normalized_options
+        elif parameter_type in {"number", "integer"}:
+            minimum = definition.get("minimum")
+            maximum = definition.get("maximum")
+            step = definition.get("step")
+            numeric_values = (minimum, maximum, step)
+            if (
+                any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in numeric_values)
+                or any(not math.isfinite(float(item)) for item in numeric_values)
+                or not -1_000_000 <= float(minimum) < float(maximum) <= 1_000_000
+                or not 0 < float(step) <= float(maximum) - float(minimum)
+                or (
+                    has_default
+                    and (
+                        isinstance(default, bool)
+                        or not isinstance(default, (int, float))
+                        or not math.isfinite(float(default))
+                        or not float(minimum) <= float(default) <= float(maximum)
+                        or not math.isclose(
+                            (float(default) - float(minimum)) / float(step),
+                            round(
+                                (float(default) - float(minimum)) / float(step)
+                            ),
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                    )
+                )
+                or (
+                    parameter_type == "integer"
+                    and (
+                        any(not isinstance(item, int) for item in numeric_values)
+                        or (has_default and not isinstance(default, int))
+                    )
+                )
+            ):
+                raise ValueError("LoRA numeric bounds or default are invalid")
+            normalized.update({
+                "minimum": float(minimum) if parameter_type == "number" else minimum,
+                "maximum": float(maximum) if parameter_type == "number" else maximum,
+                "step": float(step) if parameter_type == "number" else step,
+                "_prompt_template": _project_reference_lora_prompt_template(
+                    definition.get("prompt_template"), field=parameter_id,
+                ),
+            })
+            if has_default:
+                normalized["default"] = (
+                    float(default) if parameter_type == "number" else default
+                )
+        elif parameter_type == "boolean":
+            if has_default and type(default) is not bool:
+                raise ValueError("LoRA boolean default is invalid")
+            normalized.update({
+                "_true_prompt_fragment": _project_reference_lora_fragment(
+                    definition.get("true_prompt_fragment"), field=parameter_id,
+                ),
+                "_false_prompt_fragment": _project_reference_lora_fragment(
+                    definition.get("false_prompt_fragment", ""),
+                    field=parameter_id, allow_empty=True,
+                ),
+            })
+            if has_default:
+                normalized["default"] = default
+        else:
+            min_length = definition.get("min_length", 0)
+            max_length = definition.get("max_length")
+            if (
+                not isinstance(min_length, int)
+                or isinstance(min_length, bool)
+                or not isinstance(max_length, int)
+                or isinstance(max_length, bool)
+                or not 0 <= min_length <= max_length <= 500
+                or (
+                    has_default
+                    and (
+                        not isinstance(default, str)
+                        or not min_length <= len(default) <= max_length
+                        or any(
+                            ord(character) < 32 or ord(character) == 127
+                            for character in default
+                        )
+                    )
+                )
+            ):
+                raise ValueError("LoRA text bounds or default are invalid")
+            normalized.update({
+                "min_length": min_length,
+                "max_length": max_length,
+                "_prompt_template": _project_reference_lora_prompt_template(
+                    definition.get("prompt_template"), field=parameter_id,
+                ),
+            })
+            if has_default:
+                normalized["default"] = default
+        normalized_parameters.append(normalized)
+    triggers = value.get("trigger_fragments", [])
+    if not isinstance(triggers, list) or len(triggers) > 16:
+        raise ValueError("LoRA trigger fragments are invalid")
+    normalized_triggers = []
+    for index, trigger in enumerate(triggers):
+        if not isinstance(trigger, dict) or set(trigger) - {"text", "scopes", "roles"} or "text" not in trigger:
+            raise ValueError("LoRA trigger fragment is invalid")
+        normalized_triggers.append({
+            "_text": _project_reference_lora_fragment(
+                trigger.get("text"), field=f"trigger {index}",
+            ),
+            "scopes": _project_reference_lora_schema_scopes(
+                trigger.get("scopes"), field=f"trigger {index}",
+            ),
+            "roles": _project_reference_lora_schema_roles(
+                trigger.get("roles"), field=f"trigger {index}",
+            ),
+        })
+    if len(normalized_parameters) + len(normalized_triggers) > 64:
+        raise ValueError("LoRA parameter expansion count exceeds the schema limit")
+    normalized_schema = {
+        "schema_version": 1,
+        "parameters": normalized_parameters,
+        "trigger_fragments": normalized_triggers,
+    }
+    if len(json.dumps(
+        normalized_schema, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")) > 65_536:
+        raise ValueError("LoRA parameter schema exceeds its resource budget")
+    normalized_schema["schema_digest"] = _project_reference_private_commitment(
+        normalized_schema,
+    )
+    return normalized_schema
+
+
+def _read_lora_parameter_schema(candidates):
+    for path, source in candidates:
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+        try:
+            sidecar_size = os.path.getsize(path)
+        except OSError as error:
+            raise ValueError("LoRA parameter sidecar is invalid") from error
+        if sidecar_size > 1_048_576:
+            raise ValueError("LoRA parameter sidecar exceeds its size limit")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except (OSError, TypeError, ValueError) as error:
+            raise ValueError("LoRA parameter sidecar is invalid") from error
+        if not isinstance(metadata, dict) or _PROJECT_REFERENCE_LORA_SCHEMA_KEY not in metadata:
+            continue
+        schema = _normalize_lora_parameter_schema(
+            metadata[_PROJECT_REFERENCE_LORA_SCHEMA_KEY],
+        )
+        schema["schema_source"] = source
+        return schema
+    return None
+
+
+def _public_lora_parameter_schema(schema):
+    if not isinstance(schema, dict):
+        return None
+    public_parameters = []
+    for definition in schema["parameters"]:
+        public = {
+            key: copy.deepcopy(value)
+            for key, value in definition.items()
+            if not key.startswith("_")
+        }
+        if public["type"] == "enum":
+            public["options"] = [
+                {"value": item["value"], "label": item["label"]}
+                for item in definition["options"]
+            ]
+        public_parameters.append(public)
+    return {
+        "schema_version": 1,
+        "schema_digest": schema["schema_digest"],
+        "schema_source": schema["schema_source"],
+        "parameters": public_parameters,
+    }
+
+
+def _normalize_lora_parameter_values(
+    schema, values, *, commitment_context=None,
+):
+    if not isinstance(schema, dict):
+        if values is not None:
+            raise ValueError("Strength-only LoRA does not accept parameters")
+        return (), None, None, []
+    if values is None:
+        values = {}
+    if commitment_context is None:
+        commitment_context = os.urandom(32).hex()
+    if (
+        not isinstance(commitment_context, str)
+        or re.fullmatch(r"[0-9a-f]{64}", commitment_context) is None
+    ):
+        raise ValueError("LoRA parameter commitment context is invalid")
+    if not isinstance(values, dict) or len(values) > 64:
+        raise ValueError("LoRA parameter values are invalid")
+    definitions = {item["id"]: item for item in schema["parameters"]}
+    if any(not isinstance(key, str) or key not in definitions for key in values):
+        raise ValueError("LoRA parameter identifier is invalid")
+    normalized_values = []
+    expansions = []
+    for definition in schema["parameters"]:
+        parameter_id = definition["id"]
+        if parameter_id in values:
+            value = values[parameter_id]
+        elif "default" in definition:
+            value = definition["default"]
+        elif definition["required"]:
+            raise ValueError("Required LoRA parameter value is missing")
+        else:
+            continue
+        parameter_type = definition["type"]
+        if parameter_type == "enum":
+            selected = next((
+                option for option in definition["options"]
+                if type(value) is type(option["value"]) and value == option["value"]
+            ), None)
+            if selected is None:
+                raise ValueError("LoRA enum parameter value is invalid")
+            fragment = selected["_prompt_fragment"]
+        elif parameter_type == "number":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not definition["minimum"] <= float(value) <= definition["maximum"]
+            ):
+                raise ValueError("LoRA number parameter value is invalid")
+            value = float(value)
+            offset = (value - definition["minimum"]) / definition["step"]
+            if not math.isclose(offset, round(offset), rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("LoRA number parameter step is invalid")
+            fragment = definition["_prompt_template"].replace(
+                "{value}", json.dumps(value, ensure_ascii=False),
+            )
+        elif parameter_type == "integer":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not definition["minimum"] <= value <= definition["maximum"]
+                or (value - definition["minimum"]) % definition["step"] != 0
+            ):
+                raise ValueError("LoRA integer parameter value is invalid")
+            fragment = definition["_prompt_template"].replace("{value}", str(value))
+        elif parameter_type == "boolean":
+            if type(value) is not bool:
+                raise ValueError("LoRA boolean parameter value is invalid")
+            fragment = (
+                definition["_true_prompt_fragment"]
+                if value else definition["_false_prompt_fragment"]
+            )
+        else:
+            if (
+                not isinstance(value, str)
+                or not definition["min_length"] <= len(value) <= definition["max_length"]
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in value
+                )
+            ):
+                raise ValueError("LoRA text parameter value is invalid")
+            fragment = definition["_prompt_template"].replace("{value}", value)
+        normalized_values.append((parameter_id, value))
+        if fragment:
+            expansions.append({
+                "parameter_id": parameter_id,
+                "text": fragment,
+                "scopes": list(definition["scopes"]),
+                "roles": list(definition["roles"]),
+            })
+    expansions = [
+        *(
+            {
+                "parameter_id": None,
+                "text": trigger["_text"],
+                "scopes": list(trigger["scopes"]),
+                "roles": list(trigger["roles"]),
+            }
+            for trigger in schema["trigger_fragments"]
+        ),
+        *expansions,
+    ]
+    if len(expansions) > 64 or sum(len(item["text"]) for item in expansions) > 8_000:
+        raise ValueError("LoRA parameter expansion exceeds its resource budget")
+    values_payload = [
+        {"id": parameter_id, "value": value}
+        for parameter_id, value in normalized_values
+    ]
+    return (
+        tuple(normalized_values),
+        _project_reference_snapshot_commitment(
+            commitment_context, "values", values_payload,
+        ),
+        _project_reference_snapshot_commitment(
+            commitment_context, "expansions", expansions,
+        ),
+        expansions,
+    )
 
 
 # ── System-managed LoRA detection ────────────────────────────────────
@@ -9503,6 +10165,19 @@ def list_loras_details(model_type: str):
                     info["preview_url"] = images[0]["url"]
             except Exception:
                 meta = None
+        try:
+            parameter_schema = _read_lora_parameter_schema(
+                _project_reference_lora_schema_sidecars(model_type, f),
+            )
+        except ValueError:
+            parameter_schema = None
+            info["parameter_schema_status"] = "invalid"
+        else:
+            if parameter_schema is not None:
+                info["parameter_schema"] = _public_lora_parameter_schema(
+                    parameter_schema,
+                )
+                info["parameter_schema_status"] = "ready"
         # Downloaded-date fallback for HF/hand-installed files without a
         # CivitAI sidecar: the weight file's mtime.
         if not info.get("downloaded_at"):
@@ -14833,6 +15508,22 @@ def _project_reference_private_authored_snapshot(variant: dict) -> dict:
     )
     try:
         from services.reference_sheets import reference_pack_authored_settings_seal
+        for selection in (
+            private.get("additional_lora_parameters", [])
+            if isinstance(private, dict) else []
+        ):
+            if selection.get("schema_digest") is None:
+                continue
+            expected_values_digest = _project_reference_snapshot_commitment(
+                selection.get("commitment_context"),
+                "values",
+                selection.get("values"),
+            )
+            if not hmac.compare_digest(
+                expected_values_digest,
+                str(selection.get("values_digest") or ""),
+            ):
+                raise ValueError("private LoRA parameter commitment changed")
         actual_seal = reference_pack_authored_settings_seal(private)
     except (TypeError, ValueError):
         raise HTTPException(
@@ -14845,11 +15536,16 @@ def _project_reference_private_authored_snapshot(variant: dict) -> dict:
         raise HTTPException(
             status_code=409, detail="Reference authoring snapshot unavailable",
         )
-    return {
+    snapshot = {
         "seal": actual_seal,
         "type_fields": copy.deepcopy(private["type_fields"]),
         "detail_callouts": copy.deepcopy(private["detail_callouts"]),
     }
+    if "additional_lora_parameters" in private:
+        snapshot["additional_lora_parameters"] = copy.deepcopy(
+            private["additional_lora_parameters"],
+        )
+    return snapshot
 
 
 @api.get(
@@ -14872,14 +15568,42 @@ def get_project_reference_authoring(
             item for item in asset.get("variants") or []
             if item.get("id") == variant_id
         )
-        return {
+        private_snapshot = _project_reference_private_authored_snapshot(
+            variant,
+        )
+        authored_settings = {
+            key: copy.deepcopy(value)
+            for key, value in private_snapshot.items()
+            if key != "additional_lora_parameters"
+        }
+        response = {
             "schema_version": 2,
             "asset_id": asset_id,
             "variant_id": variant_id,
-            "authored_settings": _project_reference_private_authored_snapshot(
-                variant,
-            ),
+            "authored_settings": authored_settings,
         }
+        if "additional_lora_parameters" in private_snapshot:
+            response["additional_loras"] = []
+            for item in private_snapshot["additional_lora_parameters"]:
+                selection = {
+                    "id": item["id"],
+                    "multiplier": item["multiplier"],
+                    "scope": item["scope"],
+                }
+                if item.get("schema_digest") is not None:
+                    selection.update({
+                        "parameter_schema_digest": item["schema_digest"],
+                        "parameter_values": {
+                            value["id"]: value["value"]
+                            for value in item["values"]
+                        },
+                        "parameter_values_digest": item["values_digest"],
+                        "parameter_expansion_digest": item[
+                            "expansion_digest"
+                        ],
+                    })
+                response["additional_loras"].append(selection)
+        return response
     except Exception as error:
         raise _project_asset_error(error) from error
 
@@ -15500,7 +16224,7 @@ def _project_reference_sha256_file(path):
 
 def _project_reference_resolve_additional_loras(
     value, *, generation_model, editor_model, operation_models=None,
-    freeze=False,
+    freeze=False, commitment_contexts=None,
 ):
     """Validate compatibility cheaply, then optionally freeze file identity.
 
@@ -15511,6 +16235,16 @@ def _project_reference_resolve_additional_loras(
         return []
     if not isinstance(value, list) or len(value) > 64:
         raise HTTPException(status_code=400, detail="Invalid additional LoRA selection")
+    if commitment_contexts is not None and (
+        not isinstance(commitment_contexts, dict)
+        or any(
+            not isinstance(lora_id, str)
+            or not isinstance(context, str)
+            or re.fullmatch(r"[0-9a-f]{64}", context) is None
+            for lora_id, context in commitment_contexts.items()
+        )
+    ):
+        raise RuntimeError("reference_lora_commitment_context_invalid")
     if operation_models is None:
         operation_models = {
             "generation": (generation_model,),
@@ -15529,8 +16263,18 @@ def _project_reference_resolve_additional_loras(
     resolved = []
     seen = set()
     for item in value:
-        if not isinstance(item, dict) or set(item) != {"id", "multiplier", "scope"}:
+        legacy_keys = {"id", "multiplier", "scope"}
+        parameterized_keys = {
+            *legacy_keys, "parameter_schema_digest", "parameter_values",
+        }
+        if (
+            not isinstance(item, dict)
+            or frozenset(item) not in {
+                frozenset(legacy_keys), frozenset(parameterized_keys),
+            }
+        ):
             raise HTTPException(status_code=400, detail="Invalid additional LoRA selection")
+        parameterized_request = set(item) == parameterized_keys
         lora_id = item.get("id")
         multiplier = item.get("multiplier")
         requested_scope = item.get("scope")
@@ -15566,7 +16310,21 @@ def _project_reference_resolve_additional_loras(
                 ):
                     paths = []
                     break
-                paths.append((model, os.path.realpath(path)))
+                real_path = os.path.realpath(path)
+                parameter_schema = None
+                if parameterized_request:
+                    try:
+                        parameter_schema = _read_lora_parameter_schema(
+                            _project_reference_lora_schema_sidecars(
+                                model, real_path,
+                            ),
+                        )
+                    except ValueError as error:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Additional LoRA parameter schema is invalid",
+                        ) from error
+                paths.append((model, real_path, parameter_schema))
             if paths:
                 compatible[scope] = tuple(paths)
         required = () if requested_scope == "auto" else (requested_scope,)
@@ -15580,6 +16338,11 @@ def _project_reference_resolve_additional_loras(
             if requested_scope == "auto" else required
         )
         if not resolved_scopes:
+            if parameterized_request:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Additional LoRA parameter scope is unavailable",
+                )
             resolved.append({
                 "id": lora_id,
                 "multiplier": float(multiplier),
@@ -15587,15 +16350,84 @@ def _project_reference_resolve_additional_loras(
                 "resolved_scopes": (),
                 "revision": "unavailable",
                 "source_sha256": hashlib.sha256(lora_id.encode("utf-8")).hexdigest(),
+                "parameter_schema_digest": None,
+                "parameter_commitment_context": None,
+                "parameter_values": (),
+                "parameter_values_digest": None,
+                "parameter_expansion_digest": None,
+                "parameter_expansions": [],
                 "skipped_reason": "incompatible",
             })
             continue
+        selected_schemas = [
+            schema
+            for scope in resolved_scopes
+            for _model, _path, schema in compatible[scope]
+        ]
+        schema_digests = {
+            schema["schema_digest"]
+            for schema in selected_schemas
+            if schema is not None
+        }
+        if (
+            len(schema_digests) > 1
+            or (schema_digests and any(schema is None for schema in selected_schemas))
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Additional LoRA parameter schemas differ across selected scopes",
+            )
+        selected_schema = next(
+            (schema for schema in selected_schemas if schema is not None), None,
+        )
+        if selected_schema is None and parameterized_request:
+            raise HTTPException(
+                status_code=400,
+                detail="Strength-only LoRA does not accept parameters",
+            )
+        if selected_schema is not None and parameterized_request:
+            requested_schema_digest = item.get("parameter_schema_digest")
+            if (
+                not isinstance(requested_schema_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", requested_schema_digest) is None
+                or not hmac.compare_digest(
+                    requested_schema_digest, selected_schema["schema_digest"],
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Additional LoRA parameter schema changed; refresh and retry",
+                )
+        parameter_commitment_context = None
+        if selected_schema is not None:
+            parameter_commitment_context = (
+                commitment_contexts.get(lora_id)
+                if commitment_contexts is not None else os.urandom(32).hex()
+            )
+            if parameter_commitment_context is None:
+                raise RuntimeError("reference_lora_commitment_context_missing")
+        try:
+            (
+                parameter_values,
+                parameter_values_digest,
+                parameter_expansion_digest,
+                parameter_expansions,
+            ) = _normalize_lora_parameter_values(
+                selected_schema,
+                item.get("parameter_values") if parameterized_request else None,
+                commitment_context=parameter_commitment_context,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid additional LoRA parameter values",
+            ) from error
         sources = {}
         revisions = {}
         for scope in resolved_scopes:
             scope_sources = {}
             scope_revisions = {}
-            for model, path in compatible[scope]:
+            for model, path, _schema in compatible[scope]:
                 if freeze:
                     scope_sources[model] = _project_reference_sha256_file(path)
                 sidecar = os.path.splitext(path)[0] + ".civitai.json"
@@ -15624,8 +16456,30 @@ def _project_reference_resolve_additional_loras(
                 ).hexdigest()
                 if freeze else "pending"
             ),
+            "parameter_schema_digest": (
+                selected_schema["schema_digest"]
+                if selected_schema is not None else None
+            ),
+            "parameter_commitment_context": parameter_commitment_context,
+            "parameter_values": parameter_values,
+            "parameter_values_digest": parameter_values_digest,
+            "parameter_expansion_digest": parameter_expansion_digest,
+            "parameter_expansions": parameter_expansions,
             "skipped_reason": None,
         })
+    for operation_scope in ("generation", "editing"):
+        expansion_characters = sum(
+            len(expansion["text"])
+            for selection in resolved
+            if operation_scope in selection.get("resolved_scopes", ())
+            for expansion in selection.get("parameter_expansions") or ()
+            if operation_scope in expansion.get("scopes", ())
+        )
+        if expansion_characters > 32_000:
+            raise HTTPException(
+                status_code=400,
+                detail="Additional LoRA parameter expansions exceed the operation budget",
+            )
     return resolved
 
 
@@ -15733,7 +16587,7 @@ def get_project_reference_capabilities(project: str, request: Request):
 
 
 def _project_reference_request_config(
-    body, request, *, existing_asset_type=None,
+    body, request, *, existing_asset_type=None, commitment_contexts=None,
 ):
     """Validate one v2 pack request before any asset or job can be created."""
     from services.reference_sheets import (
@@ -16088,6 +16942,7 @@ def _project_reference_request_config(
         generation_model=model_type,
         editor_model=editor_model_type,
         operation_models=operation_models,
+        commitment_contexts=commitment_contexts,
     )
 
     asset_id = body.get("asset_id")
@@ -16212,7 +17067,7 @@ def _project_reference_creative_request(asset, config):
 
 def _project_reference_generation_params(
     config, *, model_type, prompt, size, seed, reference_path=None,
-    operation_scope="generation",
+    operation_scope="generation", operation_role=None,
 ):
     schedule = config["model_schedules"][model_type]
     params = {
@@ -16240,8 +17095,21 @@ def _project_reference_generation_params(
         item for item in config.get("additional_loras") or []
         if operation_scope in item.get("resolved_scopes", ())
     ]
+    prompt_fragments = []
     for item in scoped:
         params["activated_loras"].append(item["id"])
+        for expansion in item.get("parameter_expansions") or []:
+            scopes = expansion.get("scopes")
+            roles = expansion.get("roles")
+            if (
+                operation_scope in scopes
+                and (not roles or operation_role in roles)
+                and isinstance(expansion.get("text"), str)
+                and expansion["text"]
+            ):
+                prompt_fragments.append(expansion["text"])
+    if prompt_fragments:
+        params["prompt"] = " ".join((params["prompt"], *prompt_fragments))
     if scoped:
         additions = " ".join(str(item["multiplier"]) for item in scoped)
         params["loras_multipliers"] = " ".join(
@@ -16916,6 +17784,7 @@ async def generate_project_asset_references(project: str, request: Request):
     owner_session_id = request.state.maestro_session_id
     existing_asset = None
     existing_asset_type = None
+    restored_lora_commitment_contexts = None
     if isinstance(body, dict):
         requested_asset_id = body.get("asset_id")
         if (
@@ -16938,7 +17807,10 @@ async def generate_project_asset_references(project: str, request: Request):
                 raise _project_asset_error(error) from error
         parent_variant_id = body.get("parent_variant_id")
         restore_private_fields = any(
-            field not in body for field in ("type_fields", "detail_callouts")
+            field not in body
+            for field in (
+                "type_fields", "detail_callouts", "additional_loras",
+            )
         )
         if (
             restore_private_fields
@@ -16971,12 +17843,48 @@ async def generate_project_asset_references(project: str, request: Request):
                         "detail_callouts",
                         private_snapshot["detail_callouts"],
                     )
+                    if (
+                        "additional_loras" not in body
+                        and isinstance(
+                            private_snapshot.get("additional_lora_parameters"),
+                            list,
+                        )
+                    ):
+                        restored_loras = []
+                        for item in private_snapshot[
+                            "additional_lora_parameters"
+                        ]:
+                            restored = {
+                                "id": item["id"],
+                                "multiplier": item["multiplier"],
+                                "scope": item["scope"],
+                            }
+                            if item.get("schema_digest") is not None:
+                                restored.update({
+                                    "parameter_schema_digest": item[
+                                        "schema_digest"
+                                    ],
+                                    "parameter_values": {
+                                        value["id"]: value["value"]
+                                        for value in item["values"]
+                                    },
+                                })
+                            restored_loras.append(restored)
+                        body["additional_loras"] = restored_loras
+                        restored_lora_commitment_contexts = {
+                            item["id"]: item["commitment_context"]
+                            for item in private_snapshot[
+                                "additional_lora_parameters"
+                            ]
+                            if item.get("commitment_context") is not None
+                        }
             except Exception as error:
                 raise _project_asset_error(error) from error
     config = _project_reference_request_config(
         body,
         request,
         existing_asset_type=existing_asset_type,
+        commitment_contexts=restored_lora_commitment_contexts,
     )
     _require_remote_visible_models(
         request,
@@ -17107,6 +18015,13 @@ async def generate_project_asset_references(project: str, request: Request):
             roles=tuple(dict.fromkeys(roles)),
             revision=selection["revision"],
             source_sha256=selection["source_sha256"],
+            parameter_schema_digest=selection["parameter_schema_digest"],
+            parameter_commitment_context=selection[
+                "parameter_commitment_context"
+            ],
+            parameter_values=tuple(selection["parameter_values"]),
+            parameter_values_digest=selection["parameter_values_digest"],
+            parameter_expansion_digest=selection["parameter_expansion_digest"],
             skipped_reason=selection["skipped_reason"],
         ))
     if sealed_loras:
@@ -17174,6 +18089,13 @@ async def generate_project_asset_references(project: str, request: Request):
                 "roles": list(item.roles),
                 "revision": item.revision,
                 "source_sha256": item.source_sha256,
+                "parameter_schema_digest": item.parameter_schema_digest,
+                "parameter_count": len(item.parameter_values),
+                "parameter_ids": [
+                    parameter_id for parameter_id, _value in item.parameter_values
+                ],
+                "parameter_values_digest": item.parameter_values_digest,
+                "parameter_expansion_digest": item.parameter_expansion_digest,
                 "skipped_reason": item.skipped_reason,
             }
             for item in sealed_loras
@@ -17275,7 +18197,34 @@ async def generate_project_asset_references(project: str, request: Request):
                     editor_model=config.get("editor_model_type"),
                     operation_models=config["operation_models"],
                     freeze=True,
+                    commitment_contexts={
+                        item["id"]: item["parameter_commitment_context"]
+                        for item in config["additional_loras"]
+                        if item.get("parameter_commitment_context") is not None
+                    },
                 )
+                pending_by_id = {
+                    item["id"]: item for item in config["additional_loras"]
+                }
+                if (
+                    len(pending_by_id) != len(frozen_loras)
+                    or any(
+                        selection["id"] not in pending_by_id
+                        or any(
+                            pending_by_id[selection["id"]].get(key)
+                            != selection.get(key)
+                            for key in (
+                                "multiplier", "requested_scope",
+                                "resolved_scopes", "parameter_schema_digest",
+                                "parameter_commitment_context",
+                                "parameter_values", "parameter_values_digest",
+                                "parameter_expansion_digest", "skipped_reason",
+                            )
+                        )
+                        for selection in frozen_loras
+                    )
+                ):
+                    raise RuntimeError("reference_lora_selection_changed")
                 frozen_selections = []
                 for selection in frozen_loras:
                     roles = []
@@ -17297,6 +18246,19 @@ async def generate_project_asset_references(project: str, request: Request):
                         roles=tuple(dict.fromkeys(roles)),
                         revision=selection["revision"],
                         source_sha256=selection["source_sha256"],
+                        parameter_schema_digest=selection[
+                            "parameter_schema_digest"
+                        ],
+                        parameter_commitment_context=selection[
+                            "parameter_commitment_context"
+                        ],
+                        parameter_values=tuple(selection["parameter_values"]),
+                        parameter_values_digest=selection[
+                            "parameter_values_digest"
+                        ],
+                        parameter_expansion_digest=selection[
+                            "parameter_expansion_digest"
+                        ],
                         skipped_reason=selection["skipped_reason"],
                     ))
                 config["additional_loras"] = frozen_loras
@@ -17352,6 +18314,14 @@ async def generate_project_asset_references(project: str, request: Request):
                         "roles": list(item.roles),
                         "revision": item.revision,
                         "source_sha256": item.source_sha256,
+                        "parameter_schema_digest": item.parameter_schema_digest,
+                        "parameter_count": len(item.parameter_values),
+                        "parameter_ids": [
+                            parameter_id
+                            for parameter_id, _value in item.parameter_values
+                        ],
+                        "parameter_values_digest": item.parameter_values_digest,
+                        "parameter_expansion_digest": item.parameter_expansion_digest,
                         "skipped_reason": item.skipped_reason,
                     }
                     for item in frozen_selections
@@ -17477,6 +18447,7 @@ async def generate_project_asset_references(project: str, request: Request):
                         size=sheet_request.sheet_size,
                         seed=adjusted_seed(sheet_request.index),
                         operation_scope="generation",
+                        operation_role=sheet_request.role,
                     )
                     return _run_project_reference_image_job(
                         parent_job, params,
@@ -17513,6 +18484,7 @@ async def generate_project_asset_references(project: str, request: Request):
                         seed=adjusted_seed(sheet_request.index),
                         reference_path=[primary_path, anchor_path],
                         operation_scope="editing",
+                        operation_role=sheet_request.role,
                     )
                     return _run_project_reference_image_job(
                         parent_job, params,
@@ -17548,6 +18520,7 @@ async def generate_project_asset_references(project: str, request: Request):
                         seed=adjusted_seed(plan.output_roles.index(repair_request.role) + 50),
                         reference_path=[original_path, anchor_path],
                         operation_scope="editing",
+                        operation_role=repair_request.role,
                     )
                     return _run_project_reference_image_job(
                         parent_job, params,

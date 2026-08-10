@@ -9,7 +9,7 @@ import {
   deleteProjectAssetVariant,
   generateProjectAssetReferences,
   fetchModels,
-  fetchLoras,
+  fetchLoraDetails,
   fetchLlmModels,
   getEffectiveProjectReferenceRepairAttempts,
   getProjectAssetApplyOutputs,
@@ -18,12 +18,19 @@ import {
   getProjectReferenceEditorModels,
   getProjectReferenceGenerationModels,
   getProjectReferenceModelAvailabilityCopy,
+  getProjectReferenceQueueBlockers,
+  getProjectReferenceVisibilityHints,
+  getLoraParameterDefaults,
+  getLoraParameterOptionToken,
+  getLoraParameterValue,
   getProjectReferenceRepairCopy,
   getProjectReferenceRetrySettings,
+  hasProjectReferenceLoraParameterSummary,
   isProjectReferenceReviewMandatory,
   isProjectReferenceReviewerEligible,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
+  loraParameterSchemasConflict,
   projectAssetRequestError,
   projectAssetOutputNeedsInitialBlur,
   projectAssetVariantOperationKey,
@@ -35,6 +42,7 @@ import {
   selectProjectReferenceModel,
   setProjectAssetVariantStatus,
   uploadImage,
+  validateLoraParameterValues,
   verifyManualCheckpoint,
   type ApiModel,
   type ProjectAsset,
@@ -55,7 +63,7 @@ import {
   type ProjectReferenceTypeFields,
   type ProjectReferenceTypeFieldItem,
 } from '../../api/client'
-import type { LlmModelOption } from '../../types'
+import type { LlmModelOption, LoraParameterSchema, LoraParameterValue } from '../../types'
 import { BlenderSceneTool } from './BlenderSceneTool'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 import { hidePrivatePreview, privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../../lib/privatePreview'
@@ -83,6 +91,142 @@ const DEPTH_OPTIONS: Array<{ value: ProjectReferenceDepth; label: string; descri
   { value: 'comprehensive', label: 'Comprehensive', description: '3–5 sheets; resolves to 5' },
   { value: 'custom', label: 'Custom', description: 'Choose 1–5 sheets' },
 ]
+
+const MOODY_MODEL_TYPES = [
+  'krea2_moody_mix_v7_fp8',
+  'krea2_moody_cutie_v4_fp8',
+] as const
+const MOODY_MODEL_NAMES: Record<typeof MOODY_MODEL_TYPES[number], string> = {
+  krea2_moody_mix_v7_fp8: 'Moody Krea 2 Mix v7 FP8',
+  krea2_moody_cutie_v4_fp8: 'Moody Cutie Mix Krea 2 v4 FP8',
+}
+
+function cloneAdditionalLoras(
+  loras: ProjectReferenceAdditionalLora[],
+): ProjectReferenceAdditionalLora[] {
+  return loras.map(lora => ({
+    id: lora.id,
+    multiplier: lora.multiplier,
+    scope: lora.scope,
+    ...(lora.parameter_schema_digest ? {
+      parameter_schema_digest: lora.parameter_schema_digest,
+      parameter_values: { ...(lora.parameter_values ?? {}) },
+    } : {}),
+  }))
+}
+
+function formatManualBytes(size: number): string {
+  if (!Number.isFinite(size) || size < 0) return 'Unknown size'
+  return `${(size / (1024 ** 3)).toFixed(2)} GiB (${size.toLocaleString()} bytes)`
+}
+
+function LoraParameterFields({
+  loraId,
+  schema,
+  values,
+  errors,
+  onChange,
+}: {
+  loraId: string
+  schema: LoraParameterSchema
+  values: Record<string, LoraParameterValue>
+  errors: string[]
+  onChange: (id: string, value: LoraParameterValue | undefined) => void
+}) {
+  return (
+    <fieldset className="mt-1.5 space-y-1.5 rounded border border-accent-blue/20 bg-bg-primary/40 p-1.5">
+      <legend className="px-1 text-[8px] font-medium text-accent-blue">LoRA inputs</legend>
+      {schema.parameters.map(parameter => {
+        const value = getLoraParameterValue(parameter, values)
+        const helpId = `${loraId}-${parameter.id}-help`.replace(/[^a-zA-Z0-9_-]/g, '-')
+        const errorId = `${loraId}-${parameter.id}-error`.replace(/[^a-zA-Z0-9_-]/g, '-')
+        const fieldErrors = errors.filter(error => error.startsWith(`${parameter.label} `))
+        const describedBy = [parameter.description ? helpId : '', fieldErrors.length > 0 ? errorId : '']
+          .filter(Boolean).join(' ') || undefined
+        const commonLabel = `${parameter.label}${parameter.required ? ' (required)' : ''}`
+        return (
+          <label key={parameter.id} className="block text-[8px] text-text-secondary">
+            <span>{commonLabel}</span>
+            {parameter.type === 'enum' ? (
+              <select
+                aria-label={`${loraId} ${parameter.label}`}
+                aria-describedby={describedBy}
+                aria-invalid={fieldErrors.length > 0}
+                value={value === undefined ? '' : getLoraParameterOptionToken(value)}
+                onChange={event => {
+                  const option = parameter.options?.find(candidate => (
+                    getLoraParameterOptionToken(candidate.value) === event.target.value
+                  ))
+                  onChange(parameter.id, option?.value)
+                }}
+                className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary"
+              >
+                <option value="">Choose…</option>
+                {parameter.options?.map(option => (
+                  <option key={getLoraParameterOptionToken(option.value)} value={getLoraParameterOptionToken(option.value)}>{option.label}</option>
+                ))}
+              </select>
+            ) : parameter.type === 'boolean' ? (
+              <select
+                aria-label={`${loraId} ${parameter.label}`}
+                aria-describedby={describedBy}
+                aria-invalid={fieldErrors.length > 0}
+                value={typeof value === 'boolean' ? String(value) : ''}
+                onChange={event => onChange(
+                  parameter.id,
+                  event.target.value === '' ? undefined : event.target.value === 'true',
+                )}
+                className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary"
+              >
+                <option value="">Choose…</option>
+                <option value="true">Yes</option>
+                <option value="false">No</option>
+              </select>
+            ) : parameter.type === 'text' ? (
+              <input
+                aria-label={`${loraId} ${parameter.label}`}
+                aria-describedby={describedBy}
+                aria-invalid={fieldErrors.length > 0}
+                type="text"
+                value={typeof value === 'string' ? value : ''}
+                onChange={event => onChange(parameter.id, event.target.value)}
+                className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary"
+              />
+            ) : (
+              <input
+                aria-label={`${loraId} ${parameter.label}`}
+                aria-describedby={describedBy}
+                aria-invalid={fieldErrors.length > 0}
+                type="number"
+                min={parameter.minimum}
+                max={parameter.maximum}
+                step={parameter.step}
+                value={typeof value === 'number' ? value : ''}
+                onChange={event => onChange(
+                  parameter.id,
+                  event.target.value === '' || !Number.isFinite(event.target.valueAsNumber)
+                    ? undefined
+                    : event.target.valueAsNumber,
+                )}
+                className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary"
+              />
+            )}
+            {parameter.description && <span id={helpId} className="mt-0.5 block text-[8px] text-text-muted">{parameter.description}</span>}
+            {fieldErrors.length > 0 && <span id={errorId} role="status" className="mt-0.5 block text-[8px] text-red-300">{fieldErrors.join(' ')}</span>}
+            {(parameter.scopes.length > 0 || parameter.roles.length > 0) && (
+              <span className="mt-0.5 block text-[7px] text-text-muted">
+                Applies to {parameter.scopes.join(' / ') || 'compatible operations'}{parameter.roles.length > 0 ? ` · ${parameter.roles.join(', ')}` : ''}
+              </span>
+            )}
+          </label>
+        )
+      })}
+      {errors.filter(error => !schema.parameters.some(parameter => (
+        error.startsWith(`${parameter.label} `)
+      ))).map(error => <p key={error} role="status" className="text-[8px] text-red-300">{error}</p>)}
+    </fieldset>
+  )
+}
 
 type ReferenceSectionId = 'views' | 'poses' | 'expressions' | 'wardrobe' | 'details'
   | 'zones' | 'lighting' | 'functions' | 'scale' | 'mechanisms' | 'anatomy'
@@ -487,6 +631,9 @@ export function ProjectReferenceLibrary() {
   const loadHostTerms = useStore(s => s.loadHostTerms)
   const acceptHostTerm = useStore(s => s.acceptHostTerm)
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
+  const enabledModels = useStore(s => s.enabledModels)
+  const modelsLoaded = useStore(s => s.modelsLoaded)
+  const openModelVisibility = useStore(s => s.openModelVisibility)
   const [open, setOpen] = useState(false)
   const [assets, setAssets] = useState<ProjectAsset[]>([])
   const [loading, setLoading] = useState(false)
@@ -528,6 +675,8 @@ export function ProjectReferenceLibrary() {
   const [intelligenceCustomized, setIntelligenceCustomized] = useState(false)
   const [generationLoras, setGenerationLoras] = useState<string[]>([])
   const [editingLoras, setEditingLoras] = useState<string[]>([])
+  const [generationLoraSchemas, setGenerationLoraSchemas] = useState<Record<string, LoraParameterSchema>>({})
+  const [editingLoraSchemas, setEditingLoraSchemas] = useState<Record<string, LoraParameterSchema>>({})
   const [additionalLoras, setAdditionalLoras] = useState<ProjectReferenceAdditionalLora[]>([])
   const [pendingLoraScope, setPendingLoraScope] = useState<ProjectReferenceLoraScope>('auto')
   const [pendingLoraId, setPendingLoraId] = useState('')
@@ -552,12 +701,14 @@ export function ProjectReferenceLibrary() {
     jobId: string | null
   }>>({})
   const [authoringAvailability, setAuthoringAvailability] = useState<Record<string, ReferenceAuthoringAvailability>>({})
+  const [privateReplayRetry, setPrivateReplayRetry] = useState(0)
   const requestSequence = useRef(0)
   const projectEpoch = useRef(0)
   const previousProject = useRef(project)
   const currentProject = useRef(project)
   const pendingSheetActionLocks = useRef(new Set<string>())
   const authoredSettingsSnapshots = useRef(new Map<string, ReferenceAuthoredSnapshot>())
+  const loraParameterSnapshots = useRef(new Map<string, ProjectReferenceAdditionalLora[]>())
   const authoringAvailabilityRef = useRef(new Map<string, ReferenceAuthoringAvailability>())
   const openButtonRef = useRef<HTMLButtonElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
@@ -567,11 +718,31 @@ export function ProjectReferenceLibrary() {
   ))
   const privateAuthoringTargets = useMemo(() => assets.flatMap(asset => (
     asset.variants.flatMap(variant => {
-      if (!projectReferenceRetryNeedsPrivateAuthoring(variant)) return []
+      const packMetadata = variant.metadata.reference_pack
+      const summarizedLoras = [
+        ...(packMetadata?.additional_loras?.applied ?? []),
+        ...(packMetadata?.additional_loras?.skipped ?? []),
+      ]
+      const needsAuthoring = projectReferenceRetryNeedsPrivateAuthoring(variant)
+      const needsLoraParameters = summarizedLoras.some(hasProjectReferenceLoraParameterSummary)
+      if (!needsAuthoring && !needsLoraParameters) return []
       return [{
         assetId: asset.id,
         variantId: variant.id,
-        seal: variant.metadata.reference_pack?.authored_settings?.seal ?? '',
+        authoredSeal: packMetadata?.authored_settings?.seal ?? '',
+        planSeal: packMetadata?.plan_seal ?? '',
+        needsAuthoring,
+        needsLoraParameters,
+        parameterRecords: summarizedLoras.flatMap(lora => lora.parameters
+          ? [{
+              id: lora.id,
+              count: lora.parameters.count,
+              ids: lora.parameters.ids,
+              schemaDigest: lora.parameters.schema_digest,
+              valuesDigest: lora.parameters.values_digest,
+              expansionDigest: lora.parameters.expansion_digest,
+            }]
+          : []),
       }]
     })
   )), [assets])
@@ -742,6 +913,24 @@ export function ProjectReferenceLibrary() {
     const alreadySelected = new Set(additionalLoras.map(lora => lora.id))
     return [...new Set(source)].filter(id => !alreadySelected.has(id)).sort((left, right) => left.localeCompare(right))
   }, [additionalLoras, editingLoras, generationLoras, pendingLoraScope])
+  const resolveLoraSchema = useCallback((id: string, scope: ProjectReferenceLoraScope) => {
+    const generationSchema = generationLoraSchemas[id]
+    const editingSchema = editingLoraSchemas[id]
+    if (scope === 'generation') return generationSchema
+    if (scope === 'editing') return editingSchema
+    if (generationSchema && editingSchema
+      && generationSchema.schema_digest !== editingSchema.schema_digest) return undefined
+    return generationSchema ?? editingSchema
+  }, [editingLoraSchemas, generationLoraSchemas])
+  const hasLoraSchemaConflict = useCallback((id: string, scope: ProjectReferenceLoraScope) => (
+    loraParameterSchemasConflict(
+      generationLoraSchemas[id],
+      editingLoraSchemas[id],
+      scope,
+      generationLoras.includes(id),
+      sheetMode !== 'draft' && editingLoras.includes(id),
+    )
+  ), [editingLoraSchemas, editingLoras, generationLoraSchemas, generationLoras, sheetMode])
   const loraScopes = referenceCapabilities?.lora_scopes ?? []
   const contentCapabilities = referenceCapabilities?.content_capabilities ?? []
   const intelligencePolicies = referenceCapabilities?.intelligence_policies ?? []
@@ -752,6 +941,45 @@ export function ProjectReferenceLibrary() {
     (lora.scope === 'generation' && !generationLoras.includes(lora.id))
     || (lora.scope === 'editing' && (sheetMode === 'draft' || !editingLoras.includes(lora.id)))
   ))
+  const loraParameterErrors = additionalLoras.flatMap(lora => {
+    if (hasLoraSchemaConflict(lora.id, lora.scope)) {
+      return [`${lora.id}: generation and editing publish different parameter schemas; choose an explicit compatible scope.`]
+    }
+    if (!lora.parameter_schema_digest) return []
+    const schema = resolveLoraSchema(lora.id, lora.scope)
+    if (!schema) return [`${lora.id}: its published parameter schema is unavailable for the selected model scope.`]
+    if (schema.schema_digest !== lora.parameter_schema_digest) {
+      return [`${lora.id}: its published parameter schema changed. Remove and add it again to review the new inputs.`]
+    }
+    return validateLoraParameterValues(schema, lora.parameter_values)
+      .map(error => `${lora.id}: ${error}`)
+  })
+  const hasInvalidLoraParameters = loraParameterErrors.length > 0
+  const pendingLoraSchemaConflict = Boolean(
+    pendingLoraId && hasLoraSchemaConflict(pendingLoraId, pendingLoraScope),
+  )
+  const moodyVisibilityHints = getProjectReferenceVisibilityHints(
+    MOODY_MODEL_TYPES, enabledModels, catalogModels, modelsLoaded,
+  )
+  const disabledMoodyModels = moodyVisibilityHints.disabled as Array<typeof MOODY_MODEL_TYPES[number]>
+  const enabledMissingMoodyModels = moodyVisibilityHints.enabled_missing as Array<typeof MOODY_MODEL_TYPES[number]>
+  const queueBlockers = getProjectReferenceQueueBlockers({
+    submitting,
+    project_locked: projectExplicitlyLocked,
+    loading: loading && assets.length === 0,
+    name_missing: !name.trim(),
+    capabilities_unavailable: !referenceCapabilities,
+    deliverables_unavailable: deliverables.length !== sheetCount,
+    generation_model_missing: !referenceModelType,
+    editor_model_missing: sheetMode !== 'draft' && !editorModelType,
+    terms_pending: pendingRecipeTermRequirements.length > 0,
+    manual_verification_pending: pendingManualModels.length > 0,
+    incompatible_lora: hasInvalidExplicitLora,
+    invalid_lora_multiplier: hasInvalidLoraMultiplier,
+    invalid_lora_parameters: hasInvalidLoraParameters,
+    invalid_authored_settings: hasInvalidAuthoredSettings,
+    review_unavailable: reviewSelectionUnavailable,
+  })
   currentProject.current = project
 
   useEffect(() => {
@@ -824,6 +1052,8 @@ export function ProjectReferenceLibrary() {
     setIntelligenceCustomized(false)
     setGenerationLoras([])
     setEditingLoras([])
+    setGenerationLoraSchemas({})
+    setEditingLoraSchemas({})
     setAdditionalLoras([])
     setPendingLoraScope('auto')
     setPendingLoraId('')
@@ -836,6 +1066,7 @@ export function ProjectReferenceLibrary() {
     setImporting(null)
     pendingSheetActionLocks.current.clear()
     authoredSettingsSnapshots.current.clear()
+    loraParameterSnapshots.current.clear()
     authoringAvailabilityRef.current.clear()
     setAuthoringAvailability({})
     setPendingSheetActions({})
@@ -854,6 +1085,7 @@ export function ProjectReferenceLibrary() {
     requestSequence.current += 1
     pendingSheetActionLocks.current.clear()
     authoredSettingsSnapshots.current.clear()
+    loraParameterSnapshots.current.clear()
     authoringAvailabilityRef.current.clear()
     setAuthoringAvailability({})
     setOpen(false)
@@ -885,6 +1117,8 @@ export function ProjectReferenceLibrary() {
     setIntelligenceCustomized(false)
     setGenerationLoras([])
     setEditingLoras([])
+    setGenerationLoraSchemas({})
+    setEditingLoraSchemas({})
     setAdditionalLoras([])
     setPendingLoraScope('auto')
     setPendingLoraId('')
@@ -949,10 +1183,14 @@ export function ProjectReferenceLibrary() {
   useEffect(() => {
     let active = true
     setGenerationLoras([])
+    setGenerationLoraSchemas({})
     if (!referenceModelType) return () => { active = false }
-    void fetchLoras(referenceModelType).then(result => {
+    void fetchLoraDetails(referenceModelType).then(result => {
       if (!active) return
-      setGenerationLoras(result.loras)
+      setGenerationLoras(result.loras.map(lora => lora.filename))
+      setGenerationLoraSchemas(Object.fromEntries(result.loras.flatMap(lora => (
+        lora.parameter_schema ? [[lora.filename, lora.parameter_schema]] : []
+      ))))
       setLoraLoadError('')
     }).catch(() => {
       if (!active) return
@@ -964,10 +1202,14 @@ export function ProjectReferenceLibrary() {
   useEffect(() => {
     let active = true
     setEditingLoras([])
+    setEditingLoraSchemas({})
     if (!editorModelType || sheetMode === 'draft') return () => { active = false }
-    void fetchLoras(editorModelType).then(result => {
+    void fetchLoraDetails(editorModelType).then(result => {
       if (!active) return
-      setEditingLoras(result.loras)
+      setEditingLoras(result.loras.map(lora => lora.filename))
+      setEditingLoraSchemas(Object.fromEntries(result.loras.flatMap(lora => (
+        lora.parameter_schema ? [[lora.filename, lora.parameter_schema]] : []
+      ))))
       setLoraLoadError('')
     }).catch(() => {
       if (!active) return
@@ -1150,7 +1392,18 @@ export function ProjectReferenceLibrary() {
     const targets = JSON.parse(privateAuthoringTargetSignature) as Array<{
       assetId: string
       variantId: string
-      seal: string
+      authoredSeal: string
+      planSeal: string
+      needsAuthoring: boolean
+      needsLoraParameters: boolean
+      parameterRecords: Array<{
+        id: string
+        count: number
+        ids: string[]
+        schemaDigest: string
+        valuesDigest: string
+        expansionDigest: string
+      }>
     }>
     const controller = new AbortController()
     const epoch = projectEpoch.current
@@ -1164,15 +1417,20 @@ export function ProjectReferenceLibrary() {
     }
     for (const target of targets) {
       const key = projectAssetVariantOperationKey(project, target.assetId, target.variantId)
-      if (!target.seal) {
+      if ((target.needsAuthoring && !target.authoredSeal)
+        || (target.needsLoraParameters && !target.planSeal)) {
         publish(key, 'unavailable')
         continue
       }
-      if (authoredSettingsSnapshots.current.has(target.seal)) {
+      const authoringReady = !target.needsAuthoring
+        || authoredSettingsSnapshots.current.has(target.authoredSeal)
+      const loraParametersReady = !target.needsLoraParameters
+        || loraParameterSnapshots.current.has(target.planSeal)
+      if (authoringReady && loraParametersReady) {
         publish(key, 'ready')
         continue
       }
-      if (availabilityCache.has(key)) continue
+      if (availabilityCache.get(key) === 'loading') continue
       publish(key, 'loading')
       startedKeys.push(key)
       void fetchProjectReferenceAuthoring(
@@ -1183,17 +1441,37 @@ export function ProjectReferenceLibrary() {
         if (response.schema_version !== 2
           || response.asset_id !== target.assetId
           || response.variant_id !== target.variantId
-          || response.authored_settings.seal !== target.seal) {
+          || (target.needsAuthoring && response.authored_settings.seal !== target.authoredSeal)) {
           publish(key, 'unavailable')
           return
         }
-        authoredSettingsSnapshots.current.set(
-          target.seal,
-          cloneReferenceAuthoredSnapshot(
-            response.authored_settings.type_fields,
-            response.authored_settings.detail_callouts,
-          ),
-        )
+        if (target.needsAuthoring) {
+          authoredSettingsSnapshots.current.set(
+            target.authoredSeal,
+            cloneReferenceAuthoredSnapshot(
+              response.authored_settings.type_fields,
+              response.authored_settings.detail_callouts,
+            ),
+          )
+        }
+        if (target.needsLoraParameters) {
+          const privateLoras = response.additional_loras
+          const privateById = new Map((privateLoras ?? []).map(lora => [lora.id, lora]))
+          const exactReplay = target.parameterRecords.every(recorded => {
+            const privateLora = privateById.get(recorded.id)
+            const privateIds = Object.keys(privateLora?.parameter_values ?? {})
+            return privateLora?.parameter_schema_digest === recorded.schemaDigest
+              && privateLora.parameter_values_digest === recorded.valuesDigest
+              && privateLora.parameter_expansion_digest === recorded.expansionDigest
+              && privateIds.length === recorded.count
+              && privateIds.every((id, index) => id === recorded.ids[index])
+          })
+          if (!privateLoras || !exactReplay) {
+            publish(key, 'unavailable')
+            return
+          }
+          loraParameterSnapshots.current.set(target.planSeal, cloneAdditionalLoras(privateLoras))
+        }
         publish(key, 'ready')
       }).catch(() => {
         if (controller.signal.aborted
@@ -1209,7 +1487,7 @@ export function ProjectReferenceLibrary() {
         }
       }
     }
-  }, [browsingUploads, open, privateAuthoringTargetSignature, project, projectExplicitlyLocked])
+  }, [browsingUploads, open, privateAuthoringTargetSignature, privateReplayRetry, project, projectExplicitlyLocked])
 
   useEffect(() => {
     requestSequence.current += 1
@@ -1354,11 +1632,15 @@ export function ProjectReferenceLibrary() {
   const addAdditionalLora = () => {
     if (!pendingLoraId || !Number.isFinite(pendingLoraMultiplier)
       || pendingLoraMultiplier < -10 || pendingLoraMultiplier > 10
+      || pendingLoraSchemaConflict
       || additionalLoras.length >= 64) return
+    const schema = resolveLoraSchema(pendingLoraId, pendingLoraScope)
     setAdditionalLoras(current => [...current, {
       id: pendingLoraId,
       multiplier: pendingLoraMultiplier,
       scope: pendingLoraScope,
+      parameter_schema_digest: schema?.schema_digest,
+      parameter_values: schema ? getLoraParameterDefaults(schema) : undefined,
     }])
     setPendingLoraId('')
     setPendingLoraMultiplier(1)
@@ -1366,6 +1648,20 @@ export function ProjectReferenceLibrary() {
 
   const updateAdditionalLora = (id: string, patch: Partial<ProjectReferenceAdditionalLora>) => {
     setAdditionalLoras(current => current.map(lora => lora.id === id ? { ...lora, ...patch } : lora))
+  }
+
+  const updateAdditionalLoraParameter = (
+    id: string,
+    parameterId: string,
+    value: LoraParameterValue | undefined,
+  ) => {
+    setAdditionalLoras(current => current.map(lora => {
+      if (lora.id !== id) return lora
+      const parameterValues = { ...(lora.parameter_values ?? {}) }
+      if (value === undefined) delete parameterValues[parameterId]
+      else parameterValues[parameterId] = value
+      return { ...lora, parameter_values: parameterValues }
+    }))
   }
 
   const loraCompatibilityCopy = (lora: ProjectReferenceAdditionalLora) => {
@@ -1509,12 +1805,7 @@ export function ProjectReferenceLibrary() {
   }
 
   const generate = async () => {
-    if (!name.trim() || !referenceCapabilities || deliverables.length !== sheetCount
-      || hasInvalidExplicitLora || hasInvalidLoraMultiplier || hasInvalidAuthoredSettings
-      || reviewSelectionUnavailable
-      || pendingRecipeTermRequirements.length > 0
-      || pendingManualModels.length > 0
-      || !referenceModelType || (sheetMode !== 'draft' && !editorModelType)) return
+    if (queueBlockers.length > 0) return
     const epoch = projectEpoch.current
     const submittedProject = project
     setSubmitting(true)
@@ -1564,6 +1855,12 @@ export function ProjectReferenceLibrary() {
           cloneReferenceAuthoredSnapshot(typeFields, detailCallouts),
         )
       }
+      if (response.plan?.plan_seal) {
+        loraParameterSnapshots.current.set(
+          response.plan.plan_seal,
+          cloneAdditionalLoras(additionalLoras),
+        )
+      }
       await reconnectJobs()
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setName('')
@@ -1604,6 +1901,19 @@ export function ProjectReferenceLibrary() {
     const sourceAuthoredSnapshot = sourceAuthoredSeal
       ? authoredSettingsSnapshots.current.get(sourceAuthoredSeal)
       : undefined
+    const sourcePackMetadata = variant.metadata.reference_pack
+    const sourcePlanSeal = sourcePackMetadata?.plan_seal
+    const summarizedParameterizedLoras = [
+      ...(sourcePackMetadata?.additional_loras?.applied ?? []),
+      ...(sourcePackMetadata?.additional_loras?.skipped ?? []),
+    ].filter(hasProjectReferenceLoraParameterSummary)
+    const privateLoraSnapshot = sourcePlanSeal
+      ? loraParameterSnapshots.current.get(sourcePlanSeal)
+      : undefined
+    if (summarizedParameterizedLoras.length > 0 && !privateLoraSnapshot) {
+      setActionError('Exact private LoRA inputs are unavailable for this candidate. Retry and Edit stay disabled so parameter values are never guessed or silently dropped; create a new pack instead.')
+      return
+    }
     const sourceSettings = getProjectReferenceRetrySettings(variant, {
       mode: sheetMode,
       model_type: referenceModelType,
@@ -1638,6 +1948,64 @@ export function ProjectReferenceLibrary() {
         ? undefined
         : selectedReviewModel?.provider,
     }, referenceCapabilities ?? undefined)
+    if (privateLoraSnapshot) {
+      sourceSettings.additional_loras = cloneAdditionalLoras(privateLoraSnapshot)
+    }
+    const parameterizedSelections = (sourceSettings.additional_loras ?? []).filter(
+      lora => Boolean(lora.parameter_schema_digest),
+    )
+    if (parameterizedSelections.length > 0) {
+      const sourceModels = [...new Set([
+        sourceSettings.model_type,
+        ...(sourceSettings.mode !== 'draft' && sourceSettings.editor_model_type
+          ? [sourceSettings.editor_model_type]
+          : []),
+      ])]
+      try {
+        const detailResponses = await Promise.all(sourceModels.map(async modelType => ({
+          modelType,
+          details: await fetchLoraDetails(modelType),
+        })))
+        const generationDetails = detailResponses.find(
+          response => response.modelType === sourceSettings.model_type,
+        )?.details
+        const editingDetails = sourceSettings.mode !== 'draft' && sourceSettings.editor_model_type
+          ? detailResponses.find(response => (
+              response.modelType === sourceSettings.editor_model_type
+            ))?.details
+          : undefined
+        for (const lora of parameterizedSelections) {
+          const generationLora = generationDetails?.loras.find(candidate => candidate.filename === lora.id)
+          const editingLora = editingDetails?.loras.find(candidate => candidate.filename === lora.id)
+          if (loraParameterSchemasConflict(
+            generationLora?.parameter_schema,
+            editingLora?.parameter_schema,
+            lora.scope,
+            Boolean(generationLora),
+            Boolean(editingLora),
+          )) {
+            throw new Error(`${lora.id} no longer publishes one matching parameter schema across its recorded operation models.`)
+          }
+          const schema = lora.scope === 'generation'
+            ? generationLora?.parameter_schema
+            : lora.scope === 'editing'
+              ? editingLora?.parameter_schema
+              : generationLora?.parameter_schema ?? editingLora?.parameter_schema
+          if (!schema || schema.schema_digest !== lora.parameter_schema_digest) {
+            throw new Error(`${lora.id} no longer has the exact recorded parameter schema. Retry and Edit are disabled until the LoRA is restored; values will not be guessed or migrated.`)
+          }
+          const errors = validateLoraParameterValues(schema, lora.parameter_values)
+          if (errors.length > 0) {
+            throw new Error(`${lora.id} has invalid recorded inputs: ${errors.join(' ')}`)
+          }
+        }
+      } catch (error) {
+        setActionError(error instanceof Error
+          ? `Could not verify exact LoRA inputs: ${error.message}`
+          : 'Could not verify exact LoRA inputs for Retry or Edit.')
+        return
+      }
+    }
     const retryReview = resolveProjectReferenceRetryReview(
       sourceSettings,
       { review_model: reviewModel, review_provider: selectedReviewModel?.provider },
@@ -1716,6 +2084,12 @@ export function ProjectReferenceLibrary() {
             sourceSettings.type_fields,
             sourceSettings.detail_callouts,
           ),
+        )
+      }
+      if (response.plan?.plan_seal) {
+        loraParameterSnapshots.current.set(
+          response.plan.plan_seal,
+          cloneAdditionalLoras(sourceSettings.additional_loras ?? []),
         )
       }
       await reconnectJobs()
@@ -2115,6 +2489,24 @@ export function ProjectReferenceLibrary() {
                     </select>
                   </label>
                 )}
+                {disabledMoodyModels.length > 0 && (
+                  <div role="status" className="mt-2 rounded border border-border bg-bg-tertiary/60 px-2 py-1.5 text-[9px] text-text-secondary">
+                    <p>Moody Krea 2 recipes are available but are not enabled for this host: {disabledMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')}.</p>
+                    {machineControls ? (
+                      <button type="button" onClick={() => openModelVisibility('image')} className="mt-1 rounded border border-accent-blue/40 px-1.5 py-0.5 text-accent-blue hover:bg-accent-blue/10">
+                        Open Settings → System → Enabled Models
+                      </button>
+                    ) : (
+                      <p className="mt-1 text-amber-200">Open Maestro at localhost on the host machine, then enable them under Settings → System → Enabled Models → Image → Krea 2.</p>
+                    )}
+                  </div>
+                )}
+                {enabledMissingMoodyModels.length > 0 && (
+                  <div role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] text-amber-100">
+                    <p>{enabledMissingMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')} {enabledMissingMoodyModels.length === 1 ? 'is' : 'are'} enabled host-wide but missing from this session’s Reference Studio catalog.</p>
+                    <p className="mt-1">Refresh Reference Studio after the host catalog finishes loading. From a LAN session, complete terms, installation, and verification at localhost; host-machine controls are intentionally hidden remotely.</p>
+                  </div>
+                )}
                 {modelLoadError && <p role="status" className="mt-2 text-[10px] text-red-300">{modelLoadError}</p>}
                 {pendingRecipeTermRequirements.map(requirement => {
                   const notice = HOST_TERM_NOTICES[requirement.term]
@@ -2132,6 +2524,23 @@ export function ProjectReferenceLibrary() {
                 {pendingManualModels.map(model => (
                   <div key={model.model_type} role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
                     <p>{model.name} requires the exact checkpoint to be installed and verified locally. Maestro will not download it.</p>
+                    {model.manual_installation ? (
+                      <dl className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[8px]">
+                        <dt className="text-amber-200">Filename</dt><dd className="break-all font-mono select-all">{model.manual_installation.filename}</dd>
+                        <dt className="text-amber-200">Place in</dt><dd className="font-mono select-all">{model.manual_installation.destination_hint}</dd>
+                        <dt className="text-amber-200">Size</dt><dd>{formatManualBytes(model.manual_installation.size_bytes)}</dd>
+                        <dt className="text-amber-200">SHA-256</dt><dd className="break-all font-mono select-all">{model.manual_installation.sha256}</dd>
+                        <dt className="text-amber-200">Verification</dt><dd>{model.manual_installation.local_verification_required ? 'Local host only · required' : 'Not required by this manifest'}</dd>
+                      </dl>
+                    ) : (
+                      <p className="mt-1 text-red-300">The exact public manual-install manifest is unavailable; installation cannot be verified safely.</p>
+                    )}
+                    {model.manual_installation && (
+                      <div className="mt-1 flex flex-wrap gap-2">
+                        <a href={model.manual_installation.source_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Open source page</a>
+                        <a href={model.manual_installation.download_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Open exact manual download</a>
+                      </div>
+                    )}
                     {model.manual_checkpoint_verification_required && machineControls ? (
                       <button
                         type="button"
@@ -2162,7 +2571,7 @@ export function ProjectReferenceLibrary() {
                     ) : !model.manual_checkpoint_verification_required ? (
                       <p className="mt-1 text-red-300">No supported exact verification contract is available for this recipe.</p>
                     ) : (
-                      <p className="mt-1 text-amber-200">Verify this host-global checkpoint from Maestro on the local machine.</p>
+                      <p className="mt-1 text-amber-200">After placing the exact file, open Maestro at localhost on the host machine and choose Verify local checkpoint. Verification is intentionally unavailable from LAN sessions.</p>
                     )}
                   </div>
                 ))}
@@ -2180,11 +2589,22 @@ export function ProjectReferenceLibrary() {
                       <option value="">{availablePendingLoras.length > 0 ? 'Select a compatible LoRA' : 'No compatible LoRAs'}</option>
                       {availablePendingLoras.map(id => <option key={id} value={id}>{id}</option>)}
                     </select>
-                    <button type="button" onClick={addAdditionalLora} disabled={!pendingLoraId || pendingLoraMultiplier < -10 || pendingLoraMultiplier > 10 || additionalLoras.length >= 64} className="rounded border border-border px-2 py-1 text-[9px] text-text-secondary disabled:opacity-40">Add</button>
+                    <button type="button" onClick={addAdditionalLora} disabled={!pendingLoraId || pendingLoraMultiplier < -10 || pendingLoraMultiplier > 10 || pendingLoraSchemaConflict || additionalLoras.length >= 64} className="rounded border border-border px-2 py-1 text-[9px] text-text-secondary disabled:opacity-40">Add</button>
                   </div>
+                  {pendingLoraSchemaConflict && <p role="status" className="mt-1 text-[8px] text-red-300">This LoRA publishes different generation and editing input schemas. Choose Create / anchor or Edit / derivative before adding it.</p>}
                   {additionalLoras.length > 0 && (
                     <div className="mt-2 space-y-1">
-                      {additionalLoras.map(lora => (
+                      {additionalLoras.map(lora => {
+                        const parameterSchema = resolveLoraSchema(lora.id, lora.scope)
+                        const parameterErrors = lora.parameter_schema_digest
+                          ? loraParameterErrors.filter(error => error.startsWith(`${lora.id}:`))
+                          : []
+                        const parameterFieldsReady = Boolean(
+                          lora.parameter_schema_digest
+                          && parameterSchema
+                          && parameterSchema.schema_digest === lora.parameter_schema_digest,
+                        )
+                        return (
                         <div key={lora.id} className="rounded border border-border/70 bg-bg-tertiary/40 p-1.5">
                           <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-1">
                             <span className="truncate text-[8px] text-text-secondary" title={lora.id}>{lora.id}</span>
@@ -2197,13 +2617,27 @@ export function ProjectReferenceLibrary() {
                             {loraScopes.includes('editing') && <option value="editing" disabled={sheetMode === 'draft' || !editingLoras.includes(lora.id)}>Edit / derivative</option>}
                           </select>
                           <p className={`mt-0.5 text-[8px] ${lora.scope !== 'auto' && loraCompatibilityCopy(lora).startsWith('Incompatible') ? 'text-red-300' : 'text-text-muted'}`}>{loraCompatibilityCopy(lora)}</p>
+                          {parameterFieldsReady && parameterSchema && (
+                            <LoraParameterFields
+                              loraId={lora.id}
+                              schema={parameterSchema}
+                              values={lora.parameter_values ?? {}}
+                              errors={parameterErrors.map(error => error.slice(lora.id.length + 2))}
+                              onChange={(parameterId, value) => updateAdditionalLoraParameter(lora.id, parameterId, value)}
+                            />
+                          )}
+                          {!parameterFieldsReady && parameterErrors.map(error => (
+                            <p key={error} role="status" className="mt-1 text-[8px] text-red-300">{error.slice(lora.id.length + 2)}</p>
+                          ))}
                         </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   )}
                   {loraLoadError && <p role="status" className="mt-1 text-[8px] text-red-300">{loraLoadError}</p>}
                   {hasInvalidExplicitLora && <p role="status" className="mt-1 text-[8px] text-red-300">An explicitly scoped LoRA is incompatible with its selected operation model; change its scope or remove it.</p>}
                   {hasInvalidLoraMultiplier && <p role="status" className="mt-1 text-[8px] text-red-300">LoRA multipliers must be between -10 and 10.</p>}
+                  {hasInvalidLoraParameters && <p role="status" className="mt-1 text-[8px] text-red-300">Resolve the published LoRA input errors above before queueing.</p>}
                 </fieldset>
                 <label className="mt-3 flex items-center justify-between text-[10px] text-text-secondary">
                   Candidate packs
@@ -2260,7 +2694,22 @@ export function ProjectReferenceLibrary() {
                 )}
                 {capabilitiesLoadError && <p role="status" className="mt-2 text-[10px] text-red-300">{capabilitiesLoadError}</p>}
                 {hasInvalidAuthoredSettings && <p role="status" className="mt-2 text-[9px] text-red-300">Authored values must be unique, bounded, and free of leading or trailing spaces; every detail output also needs an available source sheet.</p>}
-                <button onClick={() => void generate()} disabled={submitting || !name.trim() || !referenceCapabilities || deliverables.length !== sheetCount || hasInvalidExplicitLora || hasInvalidLoraMultiplier || hasInvalidAuthoredSettings || reviewSelectionUnavailable || pendingRecipeTermRequirements.length > 0 || pendingManualModels.length > 0 || !referenceModelType || (sheetMode !== 'draft' && !editorModelType)} className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent-blue px-3 py-2 text-xs font-medium text-white disabled:opacity-40">
+                {queueBlockers.length > 0 && (
+                  <section id="project-reference-queue-blockers" aria-label="Queue blocked by" className="mt-3 rounded border border-red-400/30 bg-red-400/5 px-2 py-1.5">
+                    <h4 className="text-[9px] font-medium text-red-200">Queue blocked by</h4>
+                    <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[8px] text-red-200/90">
+                      {queueBlockers.map(blocker => <li key={blocker.id}>{blocker.message}</li>)}
+                    </ul>
+                  </section>
+                )}
+                <button
+                  onClick={() => void generate()}
+                  disabled={queueBlockers.length > 0}
+                  aria-disabled={queueBlockers.length > 0}
+                  aria-describedby={queueBlockers.length > 0 ? 'project-reference-queue-blockers' : undefined}
+                  title={queueBlockers.length > 0 ? `Queue blocked: ${queueBlockers.map(blocker => blocker.message).join(' ')}` : 'Queue reference packs'}
+                  className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent-blue px-3 py-2 text-xs font-medium text-white disabled:opacity-40"
+                >
                   {submitting ? <Loader2 size={13} className="animate-spin" /> : <ImagePlus size={13} />} Queue reference packs
                 </button>
                 <p className="mt-2 text-[9px] leading-relaxed text-text-muted">Each candidate is one ordered reference pack containing the planned number of sheets. Candidate count creates alternatives; sheet count controls deliverables inside each pack. Keep one or more; originals and rejected candidates remain recorded until you delete them.</p>
@@ -2333,8 +2782,19 @@ export function ProjectReferenceLibrary() {
                               && Boolean(authoredSeal && authoredSettingsSnapshots.current.has(authoredSeal))
                             )
                             const exactAuthoringCopy = authoringAvailability[pendingKey] === 'unavailable'
-                              ? 'Exact custom authoring is unavailable. Retry and Edit are disabled so custom fields and details are never silently dropped; create a new authored pack instead.'
+                              ? 'Exact custom authoring is unavailable. Retry the owner-private replay; Retry and Edit remain disabled so custom fields and details are never silently dropped.'
                               : 'Loading the exact private custom authoring needed for safe Retry and Edit…'
+                            const summarizedLoras = [
+                              ...(packMetadata?.additional_loras?.applied ?? []),
+                              ...(packMetadata?.additional_loras?.skipped ?? []),
+                            ]
+                            const requiresPrivateLoraInputs = summarizedLoras.some(
+                              hasProjectReferenceLoraParameterSummary,
+                            )
+                            const exactLoraInputsReady = !requiresPrivateLoraInputs || Boolean(
+                              packMetadata?.plan_seal
+                              && loraParameterSnapshots.current.has(packMetadata.plan_seal),
+                            )
                             const recordedReviewModel = packMetadata?.review?.resolved_model
                               ?? packMetadata?.review?.requested_model
                               ?? 'off'
@@ -2355,7 +2815,7 @@ export function ProjectReferenceLibrary() {
                               reviewModels,
                               referenceCapabilities,
                             )
-                            const exactRetryReady = exactAuthoringReady && retryReview.ready
+                            const exactRetryReady = exactAuthoringReady && exactLoraInputsReady && retryReview.ready
                             const pendingJob = pendingAction?.jobId
                               ? jobs.find(candidate => candidate.id === pendingAction.jobId)
                               : undefined
@@ -2411,6 +2871,9 @@ export function ProjectReferenceLibrary() {
                                           Additional LoRAs: {packMetadata.additional_loras.applied.length} applied
                                           {packMetadata.additional_loras.applied.length > 0 ? ` (${packMetadata.additional_loras.applied.map(lora => `${lora.id}: ${lora.resolved_scope.join(' + ')}`).join('; ')})` : ''}
                                           {packMetadata.additional_loras.skipped.length > 0 ? ` · ${packMetadata.additional_loras.skipped.length} skipped (${packMetadata.additional_loras.skipped.map(lora => `${lora.id}: ${lora.reason}`).join('; ')})` : ''}
+                                          {summarizedLoras.some(hasProjectReferenceLoraParameterSummary)
+                                            ? ` · ${summarizedLoras.filter(hasProjectReferenceLoraParameterSummary).length} parameter ${summarizedLoras.filter(hasProjectReferenceLoraParameterSummary).length === 1 ? 'schema' : 'schemas'} sealed (${summarizedLoras.reduce((count, lora) => count + (lora.parameters?.count ?? 0), 0)} private values)`
+                                            : ''}
                                         </p>
                                       )}
                                     </div>
@@ -2459,6 +2922,11 @@ export function ProjectReferenceLibrary() {
                                     </div>
                                   )}
                                   {requiresPrivateAuthoring && !exactAuthoringReady && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{exactAuthoringCopy}</p>}
+                                  {requiresPrivateLoraInputs && !exactLoraInputsReady && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">Exact private LoRA inputs are loading or unavailable from the owner-private replay record. Retry and Edit are disabled so values are never guessed or silently dropped.</p>}
+                                  {authoringAvailability[pendingKey] === 'unavailable'
+                                    && ((requiresPrivateAuthoring && !exactAuthoringReady) || (requiresPrivateLoraInputs && !exactLoraInputsReady)) && (
+                                    <button type="button" onClick={() => setPrivateReplayRetry(current => current + 1)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5 text-[8px] text-amber-100">Retry private replay</button>
+                                  )}
                                   {!retryReview.ready && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">Retry and Edit require a compatible vision reviewer for this unrestricted or explicit source pack. Load and select an eligible reviewer first.</p>}
                                   {retryReview.use_current_reviewer && <p role="status" className="mt-1 text-[8px] leading-relaxed text-text-muted">The recorded reviewer is unavailable; Retry or Edit will use the current compatible reviewer.</p>}
                                   {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry/Edit preserves recorded source mode, resolved model pair, privacy, repair, planning, and review policy. The kept parent remains unchanged.</p>}

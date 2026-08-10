@@ -662,15 +662,33 @@ class PackLoraSelection:
     roles: tuple[str, ...]
     revision: str
     source_sha256: str
+    parameter_schema_digest: str | None = None
+    parameter_commitment_context: str | None = None
+    parameter_values: tuple[tuple[str, Any], ...] = ()
+    parameter_values_digest: str | None = None
+    parameter_expansion_digest: str | None = None
     skipped_reason: str | None = None
 
     def public_metadata(self) -> dict[str, Any]:
+        parameter_metadata = (
+            {
+                "parameters": {
+                    "count": len(self.parameter_values),
+                    "ids": [parameter_id for parameter_id, _value in self.parameter_values],
+                    "schema_digest": self.parameter_schema_digest,
+                    "values_digest": self.parameter_values_digest,
+                    "expansion_digest": self.parameter_expansion_digest,
+                },
+            }
+            if self.parameter_schema_digest is not None else {}
+        )
         if self.skipped_reason is not None:
             return {
                 "id": self.lora_id,
                 "weight": self.multiplier,
                 "requested_scope": self.requested_scope,
                 "reason": self.skipped_reason,
+                **parameter_metadata,
             }
         return {
             "id": self.lora_id,
@@ -678,6 +696,7 @@ class PackLoraSelection:
             "requested_scope": self.requested_scope,
             "resolved_scope": list(self.resolved_scopes),
             "roles": list(self.roles),
+            **parameter_metadata,
         }
 
 
@@ -767,7 +786,7 @@ class ReferencePackPlan:
         return (*self.sheet_roles, *(item.target_role for item in self.detail_callouts))
 
     def private_authored_settings(self) -> dict[str, Any]:
-        return {
+        settings = {
             "type_fields": {
                 field: [item.private_metadata() for item in items]
                 for field, items in self.type_fields
@@ -776,6 +795,25 @@ class ReferencePackPlan:
                 item.private_metadata() for item in self.detail_callouts
             ],
         }
+        parameterized_loras = [
+            {
+                "id": item.lora_id,
+                "multiplier": item.multiplier,
+                "scope": item.requested_scope,
+                "schema_digest": item.parameter_schema_digest,
+                "commitment_context": item.parameter_commitment_context,
+                "values": [
+                    {"id": parameter_id, "value": value}
+                    for parameter_id, value in item.parameter_values
+                ],
+                "values_digest": item.parameter_values_digest,
+                "expansion_digest": item.parameter_expansion_digest,
+            }
+            for item in self.additional_loras
+        ]
+        if parameterized_loras:
+            settings["additional_lora_parameters"] = parameterized_loras
+        return settings
 
     def public_authored_settings(self) -> dict[str, Any]:
         return {
@@ -2386,12 +2424,18 @@ def _pack_seal(payload: Mapping[str, Any]) -> str:
 
 def reference_pack_authored_settings_seal(value: object) -> str:
     """Validate and seal one private, prompt-free authored-settings snapshot."""
-    if not isinstance(value, Mapping) or set(value) != {
-        "type_fields", "detail_callouts",
-    }:
+    allowed_keys = {
+        "type_fields", "detail_callouts", "additional_lora_parameters",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or not {"type_fields", "detail_callouts"}.issubset(value)
+        or not set(value).issubset(allowed_keys)
+    ):
         raise ValueError("private authored settings are invalid")
     type_fields = value.get("type_fields")
     detail_callouts = value.get("detail_callouts")
+    parameterized_loras = value.get("additional_lora_parameters", [])
     if (
         not isinstance(type_fields, Mapping)
         or any(
@@ -2401,13 +2445,123 @@ def reference_pack_authored_settings_seal(value: object) -> str:
         )
         or not isinstance(detail_callouts, list)
         or any(not isinstance(item, Mapping) for item in detail_callouts)
+        or not isinstance(parameterized_loras, list)
+        or len(parameterized_loras) > 64
     ):
         raise ValueError("private authored settings are invalid")
+    seen_loras = set()
+    for item in parameterized_loras:
+        if not isinstance(item, Mapping) or set(item) != {
+            "id", "multiplier", "scope", "schema_digest",
+            "commitment_context", "values",
+            "values_digest", "expansion_digest",
+        }:
+            raise ValueError("private authored settings are invalid")
+        lora_id = item.get("id")
+        multiplier = item.get("multiplier")
+        schema_digest = item.get("schema_digest")
+        commitment_context = item.get("commitment_context")
+        values_digest = item.get("values_digest")
+        expansion_digest = item.get("expansion_digest")
+        parameters = item.get("values")
+        if (
+            not isinstance(lora_id, str)
+            or not lora_id
+            or len(lora_id) > 512
+            or os.path.basename(lora_id) != lora_id
+            or lora_id in seen_loras
+            or isinstance(multiplier, bool)
+            or not isinstance(multiplier, (int, float))
+            or not math.isfinite(float(multiplier))
+            or not -10 <= float(multiplier) <= 10
+            or item.get("scope") not in {"auto", "generation", "editing"}
+            or not isinstance(parameters, list)
+            or len(parameters) > 64
+            or (
+                schema_digest is None
+                and (
+                    parameters
+                    or commitment_context is not None
+                    or values_digest is not None
+                    or expansion_digest is not None
+                )
+            )
+            or (
+                schema_digest is not None
+                and (
+                    not isinstance(schema_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", schema_digest) is None
+                    or not isinstance(commitment_context, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}", commitment_context,
+                    ) is None
+                    or not isinstance(values_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", values_digest) is None
+                    or not isinstance(expansion_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", expansion_digest) is None
+                )
+            )
+        ):
+            raise ValueError("private authored settings are invalid")
+        seen_loras.add(lora_id)
+        seen_parameters = set()
+        for parameter in parameters:
+            if not isinstance(parameter, Mapping) or set(parameter) != {
+                "id", "value",
+            }:
+                raise ValueError("private authored settings are invalid")
+            parameter_id = parameter.get("id")
+            parameter_value = parameter.get("value")
+            if (
+                not isinstance(parameter_id, str)
+                or re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9._:-]{0,63}", parameter_id,
+                ) is None
+                or parameter_id in seen_parameters
+                or type(parameter_value) not in {str, int, float, bool}
+                or (
+                    isinstance(parameter_value, float)
+                    and not math.isfinite(parameter_value)
+                )
+                or (
+                    isinstance(parameter_value, str)
+                    and (
+                        len(parameter_value) > 500
+                        or any(
+                            ord(character) < 32 or ord(character) == 127
+                            for character in parameter_value
+                        )
+                    )
+                )
+            ):
+                raise ValueError("private authored settings are invalid")
+            seen_parameters.add(parameter_id)
     try:
-        return _pack_seal({
+        payload = {
             "type_fields": dict(type_fields),
             "detail_callouts": list(detail_callouts),
-        })
+        }
+        if "additional_lora_parameters" in value:
+            payload["additional_lora_parameters"] = [
+                {
+                    "id": item["id"],
+                    "multiplier": item["multiplier"],
+                    "scope": item["scope"],
+                    "schema_digest": item["schema_digest"],
+                    "commitment_context": item["commitment_context"],
+                    "parameter_ids": [
+                        parameter["id"] for parameter in item["values"]
+                    ],
+                    "values_digest": item["values_digest"],
+                    "expansion_digest": item["expansion_digest"],
+                }
+                for item in parameterized_loras
+            ]
+        if len(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")) > 262_144:
+            raise ValueError("private authored settings are invalid")
+        return _pack_seal(payload)
     except (TypeError, ValueError) as error:
         raise ValueError("private authored settings are invalid") from error
 
@@ -2653,6 +2807,96 @@ def build_reference_pack_plan(
     ):
         raise ValueError("additional_loras must contain sealed selections")
     sealed_loras = tuple(additional_loras)
+    for selection in sealed_loras:
+        if (
+            not isinstance(selection.parameter_values, tuple)
+            or any(
+                not isinstance(parameter, tuple) or len(parameter) != 2
+                for parameter in selection.parameter_values
+            )
+        ):
+            raise ValueError("additional_loras must contain sealed selections")
+        parameter_ids = [
+            parameter_id for parameter_id, _value in selection.parameter_values
+        ]
+        if (
+            not isinstance(selection.lora_id, str)
+            or not selection.lora_id
+            or len(selection.lora_id) > 512
+            or isinstance(selection.multiplier, bool)
+            or not isinstance(selection.multiplier, (int, float))
+            or not math.isfinite(float(selection.multiplier))
+            or not -10 <= float(selection.multiplier) <= 10
+            or selection.requested_scope not in {"auto", "generation", "editing"}
+            or not isinstance(selection.resolved_scopes, tuple)
+            or any(
+                scope not in {"generation", "editing"}
+                for scope in selection.resolved_scopes
+            )
+            or len(set(selection.resolved_scopes)) != len(selection.resolved_scopes)
+            or not isinstance(selection.roles, tuple)
+            or any(
+                not isinstance(role, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", role)
+                is None
+                for role in selection.roles
+            )
+            or not isinstance(selection.revision, str)
+            or not selection.revision
+            or len(selection.revision) > 10_000
+            or not isinstance(selection.source_sha256, str)
+            or (
+                selection.source_sha256 != "pending"
+                and re.fullmatch(r"[0-9a-f]{64}", selection.source_sha256) is None
+            )
+            or len(selection.parameter_values) > 64
+            or len(parameter_ids) != len(set(parameter_ids))
+            or any(
+                not isinstance(parameter_id, str)
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9._:-]{0,63}", parameter_id)
+                is None
+                or type(parameter_value) not in {str, int, float, bool}
+                or (
+                    isinstance(parameter_value, float)
+                    and not math.isfinite(parameter_value)
+                )
+                for parameter_id, parameter_value in selection.parameter_values
+            )
+            or (
+                selection.parameter_schema_digest is None
+                and (
+                    selection.parameter_values
+                    or selection.parameter_commitment_context is not None
+                    or selection.parameter_values_digest is not None
+                    or selection.parameter_expansion_digest is not None
+                )
+            )
+            or (
+                selection.parameter_schema_digest is not None
+                and (
+                    not isinstance(selection.parameter_schema_digest, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}", selection.parameter_schema_digest,
+                    ) is None
+                    or not isinstance(
+                        selection.parameter_commitment_context, str,
+                    )
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        selection.parameter_commitment_context,
+                    ) is None
+                    or not isinstance(selection.parameter_values_digest, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}", selection.parameter_values_digest,
+                    ) is None
+                    or not isinstance(selection.parameter_expansion_digest, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}", selection.parameter_expansion_digest,
+                    ) is None
+                )
+            )
+        ):
+            raise ValueError("additional_loras must contain sealed selections")
     if (
         isinstance(user_lora_count, bool)
         or not isinstance(user_lora_count, int)
@@ -2756,6 +3000,26 @@ def build_reference_pack_plan(
         },
         "detail_callouts": [item.private_metadata() for item in callouts],
     }
+    parameterized_loras = [
+        {
+            "id": item.lora_id,
+            "multiplier": item.multiplier,
+            "scope": item.requested_scope,
+            "schema_digest": item.parameter_schema_digest,
+            "commitment_context": item.parameter_commitment_context,
+            "values": [
+                {"id": parameter_id, "value": value}
+                for parameter_id, value in item.parameter_values
+            ],
+            "values_digest": item.parameter_values_digest,
+            "expansion_digest": item.parameter_expansion_digest,
+        }
+        for item in sealed_loras
+    ]
+    if parameterized_loras:
+        private_authored_settings["additional_lora_parameters"] = (
+            parameterized_loras
+        )
     authored_settings_seal = reference_pack_authored_settings_seal(
         private_authored_settings,
     )
@@ -2777,7 +3041,6 @@ def build_reference_pack_plan(
         ),
         "managed_layout_assist": managed_layout_assist,
         "user_lora_count": user_lora_count,
-        "authored_settings": private_authored_settings,
         "authored_settings_seal": authored_settings_seal,
         "generation_model": create_model,
         "editor_model": resolved_editor,
@@ -2800,6 +3063,12 @@ def build_reference_pack_plan(
             "requested_scope": item.requested_scope,
             "resolved_scopes": list(item.resolved_scopes),
             "roles": list(item.roles),
+            "parameter_schema_digest": item.parameter_schema_digest,
+            "parameter_values_digest": item.parameter_values_digest,
+            "parameter_expansion_digest": item.parameter_expansion_digest,
+            "parameter_ids": [
+                parameter_id for parameter_id, _value in item.parameter_values
+            ],
             "skipped_reason": item.skipped_reason,
         } for item in sealed_loras],
         "generation_schedule": (
@@ -2817,7 +3086,26 @@ def build_reference_pack_plan(
     plan_seal = _pack_seal(seal_payload)
     resource_seal = _pack_seal({
         "plan_seal": plan_seal,
-        "additional_loras": [item.__dict__ for item in sealed_loras],
+        "additional_loras": [
+            {
+                "id": item.lora_id,
+                "weight": item.multiplier,
+                "requested_scope": item.requested_scope,
+                "resolved_scopes": list(item.resolved_scopes),
+                "roles": list(item.roles),
+                "revision": item.revision,
+                "source_sha256": item.source_sha256,
+                "parameter_schema_digest": item.parameter_schema_digest,
+                "parameter_ids": [
+                    parameter_id
+                    for parameter_id, _value in item.parameter_values
+                ],
+                "parameter_values_digest": item.parameter_values_digest,
+                "parameter_expansion_digest": item.parameter_expansion_digest,
+                "skipped_reason": item.skipped_reason,
+            }
+            for item in sealed_loras
+        ],
     })
     role_brief_seal = _pack_seal({
         "plan_seal": plan_seal,

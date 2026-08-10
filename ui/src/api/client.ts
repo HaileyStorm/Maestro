@@ -6,6 +6,7 @@ import type {
   ProjectReferenceAnchorBasis,
   ProjectReferenceAnchorPrivacy,
   ProjectReferenceAdditionalLora,
+  ProjectReferencePrivateAdditionalLora,
   ProjectReferenceAdditionalLoraSummary,
   ProjectReferenceAssetType,
   ProjectReferenceDepth,
@@ -16,6 +17,10 @@ import type {
   ProjectReferenceLegacyAssetType,
   ProjectReferenceLegacyAnchorPrivacy,
   ProjectReferenceLoraScope,
+  LoraParameterSchema,
+  LoraParameterDefinition,
+  LoraParameterValue,
+  ModelManualInstallation,
   ProjectReferenceManagedLayoutAssistMode,
   ProjectReferencePackPlan,
   ProjectReferencePreset,
@@ -75,6 +80,7 @@ export interface ApiModel {
   availability_status?: string
   manual_checkpoint_verification_required?: boolean
   manual_checkpoint_verified?: boolean
+  manual_installation?: ModelManualInstallation
   supported_operations?: string[]
   automatic_routing?: boolean
   verified?: boolean
@@ -1411,6 +1417,8 @@ export interface ProjectReferenceAuthoringSnapshot {
     type_fields: ProjectReferenceTypeFields
     detail_callouts: ProjectReferenceDetailCallout[]
   }
+  /** Owner-private, no-store replay values. Public pack metadata contains digests only. */
+  additional_loras?: ProjectReferencePrivateAdditionalLora[]
 }
 
 export interface ProjectReferenceModelCatalogEntry {
@@ -1422,6 +1430,123 @@ export interface ProjectReferenceModelCatalogEntry {
   downloadable?: boolean
   manual_checkpoint_verification_required?: boolean
   manual_checkpoint_verified?: boolean
+  manual_installation?: ModelManualInstallation
+}
+
+export function getLoraParameterDefaults(
+  schema: LoraParameterSchema | undefined,
+): Record<string, LoraParameterValue> {
+  if (!schema) return {}
+  return Object.fromEntries(schema.parameters.flatMap(parameter => (
+    parameter.default === undefined ? [] : [[parameter.id, parameter.default]]
+  )))
+}
+
+export function getLoraParameterValue(
+  parameter: LoraParameterDefinition,
+  values: Record<string, LoraParameterValue> | undefined,
+): LoraParameterValue | undefined {
+  return values && Object.prototype.hasOwnProperty.call(values, parameter.id)
+    ? values[parameter.id]
+    : parameter.default
+}
+
+export function getLoraParameterOptionToken(value: LoraParameterValue): string {
+  return JSON.stringify([typeof value, value])
+}
+
+export function validateLoraParameterValues(
+  schema: LoraParameterSchema | undefined,
+  values: Record<string, LoraParameterValue> | undefined,
+): string[] {
+  if (!schema) return values && Object.keys(values).length > 0
+    ? ['This LoRA no longer publishes a parameter schema.']
+    : []
+  const current = values ?? {}
+  const definitions = new Map(schema.parameters.map(parameter => [parameter.id, parameter]))
+  const errors: string[] = []
+  for (const id of Object.keys(current)) {
+    if (!definitions.has(id)) errors.push(`Unknown parameter: ${id}.`)
+  }
+  for (const parameter of schema.parameters) {
+    if (parameter.type === 'enum') {
+      const optionTokens = (parameter.options ?? []).map(option => (
+        getLoraParameterOptionToken(option.value)
+      ))
+      if (new Set(optionTokens).size !== optionTokens.length) {
+        errors.push(`${parameter.label} publishes ambiguous duplicate choices.`)
+      }
+    }
+    const value = getLoraParameterValue(parameter, current)
+    if (value === undefined) {
+      if (parameter.required) errors.push(`${parameter.label} is required.`)
+      continue
+    }
+    if (parameter.type === 'boolean') {
+      if (typeof value !== 'boolean') errors.push(`${parameter.label} must be Yes or No.`)
+      continue
+    }
+    if (parameter.type === 'text') {
+      if (typeof value !== 'string') errors.push(`${parameter.label} must be text.`)
+      else if ([...value].some(character => {
+        const code = character.charCodeAt(0)
+        return code < 32 || code === 127
+      })) {
+        errors.push(`${parameter.label} cannot contain control characters.`)
+      } else if (parameter.min_length !== undefined && [...value].length < parameter.min_length) {
+        errors.push(`${parameter.label} must be at least ${parameter.min_length} characters.`)
+      } else if (parameter.max_length !== undefined && [...value].length > parameter.max_length) {
+        errors.push(`${parameter.label} must be at most ${parameter.max_length} characters.`)
+      }
+      continue
+    }
+    if (parameter.type === 'enum') {
+      const matches = parameter.options?.some(option => (
+        typeof option.value === typeof value && option.value === value
+      )) === true
+      if (!matches) errors.push(`${parameter.label} must use one of the published choices.`)
+      continue
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      errors.push(`${parameter.label} must be a finite number.`)
+      continue
+    }
+    if (parameter.type === 'integer' && !Number.isInteger(value)) {
+      errors.push(`${parameter.label} must be a whole number.`)
+    }
+    if (parameter.minimum !== undefined && value < parameter.minimum) {
+      errors.push(`${parameter.label} must be at least ${parameter.minimum}.`)
+    }
+    if (parameter.maximum !== undefined && value > parameter.maximum) {
+      errors.push(`${parameter.label} must be at most ${parameter.maximum}.`)
+    }
+    if (parameter.minimum !== undefined && parameter.step !== undefined) {
+      const offset = (value - parameter.minimum) / parameter.step
+      if (!Number.isFinite(offset) || Math.abs(offset - Math.round(offset)) > 1e-9) {
+        errors.push(`${parameter.label} must follow the published step of ${parameter.step}.`)
+      }
+    }
+  }
+  return errors
+}
+
+export function loraParameterSchemasConflict(
+  generationSchema: LoraParameterSchema | undefined,
+  editingSchema: LoraParameterSchema | undefined,
+  scope: ProjectReferenceLoraScope,
+  generationCompatible: boolean,
+  editingCompatible: boolean,
+): boolean {
+  if (scope !== 'auto' || !generationCompatible || !editingCompatible) return false
+  if (Boolean(generationSchema) !== Boolean(editingSchema)) return true
+  return Boolean(generationSchema && editingSchema)
+    && generationSchema?.schema_digest !== editingSchema?.schema_digest
+}
+
+export function hasProjectReferenceLoraParameterSummary(
+  item: { parameters?: unknown },
+): boolean {
+  return item.parameters !== undefined
 }
 
 export function getProjectReferenceModelAvailabilityCopy(
@@ -1447,6 +1572,74 @@ export function getProjectReferenceEditorModels<T extends ProjectReferenceModelC
   return models.filter(model => (
     model.image_outputs === true && model.supports_ref_images === true
   ))
+}
+
+export interface ProjectReferenceQueueBlockerState {
+  submitting: boolean
+  project_locked: boolean
+  loading: boolean
+  name_missing: boolean
+  capabilities_unavailable: boolean
+  deliverables_unavailable: boolean
+  generation_model_missing: boolean
+  editor_model_missing: boolean
+  terms_pending: boolean
+  manual_verification_pending: boolean
+  incompatible_lora: boolean
+  invalid_lora_multiplier: boolean
+  invalid_lora_parameters: boolean
+  invalid_authored_settings: boolean
+  review_unavailable: boolean
+}
+
+export interface ProjectReferenceQueueBlocker {
+  id: keyof ProjectReferenceQueueBlockerState
+  message: string
+}
+
+const PROJECT_REFERENCE_QUEUE_BLOCKER_COPY: Record<
+  keyof ProjectReferenceQueueBlockerState,
+  string
+> = {
+  submitting: 'A reference pack is already being submitted.',
+  project_locked: 'Unlock this project before queueing a reference pack.',
+  loading: 'Wait for Reference Studio project data to finish loading.',
+  name_missing: 'Enter a reference name.',
+  capabilities_unavailable: 'Reference Studio capabilities are unavailable.',
+  deliverables_unavailable: 'The authoritative pack layout is unavailable.',
+  generation_model_missing: 'Select an available generation model.',
+  editor_model_missing: 'Select an available reference-image editor for this mode.',
+  terms_pending: 'Review and accept every selected model notice.',
+  manual_verification_pending: 'Install and locally verify every selected manual checkpoint.',
+  incompatible_lora: 'Change or remove LoRAs that are incompatible with their selected operation.',
+  invalid_lora_multiplier: 'Set every LoRA multiplier between -10 and 10.',
+  invalid_lora_parameters: 'Complete every required LoRA parameter with a valid published value.',
+  invalid_authored_settings: 'Fix invalid or unavailable authored reference details.',
+  review_unavailable: 'Load and select the required compatible local vision reviewer.',
+}
+
+export function getProjectReferenceQueueBlockers(
+  state: ProjectReferenceQueueBlockerState,
+): ProjectReferenceQueueBlocker[] {
+  return (Object.keys(PROJECT_REFERENCE_QUEUE_BLOCKER_COPY) as Array<keyof ProjectReferenceQueueBlockerState>)
+    .filter(id => state[id])
+    .map(id => ({ id, message: PROJECT_REFERENCE_QUEUE_BLOCKER_COPY[id] }))
+}
+
+export function getProjectReferenceVisibilityHints(
+  modelTypes: readonly string[],
+  enabledModels: ReadonlySet<string>,
+  catalog: readonly ProjectReferenceModelCatalogEntry[],
+  loaded: boolean,
+): { disabled: string[]; enabled_missing: string[] } {
+  if (!loaded) return { disabled: [], enabled_missing: [] }
+  const catalogTypes = new Set(catalog.map(model => model.model_type))
+  return {
+    disabled: modelTypes.filter(modelType => !enabledModels.has(modelType)),
+    enabled_missing: modelTypes.filter(modelType => (
+      enabledModels.has(modelType) && !catalogTypes.has(modelType)
+    )),
+  }
 }
 
 export function selectProjectReferenceModel(

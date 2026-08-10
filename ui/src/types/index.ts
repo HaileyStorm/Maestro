@@ -60,6 +60,8 @@ export interface ModelDef {
   availability_status?: string
   manual_checkpoint_verification_required?: boolean
   manual_checkpoint_verified?: boolean
+  /** Public, host-path-neutral instructions for owner-managed checkpoints. */
+  manual_installation?: ModelManualInstallation
   supported_operations?: string[]
   automatic_routing?: boolean
   verified?: boolean
@@ -71,6 +73,16 @@ export interface ModelDef {
   nsfw_only?: boolean
   update_status?: string
   required_host_terms?: ModelHostTermRequirement[]
+}
+
+export interface ModelManualInstallation {
+  filename: string
+  size_bytes: number
+  sha256: string
+  source_url: string
+  download_url: string
+  destination_hint: 'app/ckpts' | string
+  local_verification_required: boolean
 }
 
 export interface ModelHostTermRequirement {
@@ -134,10 +146,50 @@ export interface ProjectReferenceTypeFieldItem {
 
 export type ProjectReferenceLoraScope = 'auto' | 'generation' | 'editing'
 
+export type LoraParameterValue = string | number | boolean
+export type LoraParameterType = 'enum' | 'number' | 'integer' | 'boolean' | 'text'
+
+export interface LoraParameterOption {
+  value: LoraParameterValue
+  label: string
+}
+
+export interface LoraParameterDefinition {
+  id: string
+  label: string
+  type: LoraParameterType
+  description?: string
+  required: boolean
+  default?: LoraParameterValue
+  scopes: ProjectReferenceLoraScope[]
+  roles: string[]
+  minimum?: number
+  maximum?: number
+  step?: number
+  options?: LoraParameterOption[]
+  min_length?: number
+  max_length?: number
+}
+
+export interface LoraParameterSchema {
+  schema_version: 1
+  schema_digest: string
+  schema_source?: 'maestro_sidecar' | 'civitai_sidecar'
+  parameters: LoraParameterDefinition[]
+}
+
 export interface ProjectReferenceAdditionalLora {
   id: string
   multiplier: number
   scope: ProjectReferenceLoraScope
+  parameter_schema_digest?: string
+  parameter_values?: Record<string, LoraParameterValue>
+}
+
+export interface ProjectReferencePrivateAdditionalLora extends ProjectReferenceAdditionalLora {
+  /** Owner-private replay proof; strip before submitting the public request shape. */
+  parameter_values_digest?: string
+  parameter_expansion_digest?: string
 }
 
 export interface ProjectReferenceAdditionalLoraSummary {
@@ -147,13 +199,23 @@ export interface ProjectReferenceAdditionalLoraSummary {
     requested_scope: ProjectReferenceLoraScope
     resolved_scope: ProjectReferenceLoraScope[]
     roles: string[]
+    parameters?: ProjectReferenceLoraParameterSummary
   }>
   skipped: Array<{
     id: string
     weight: number
     requested_scope: ProjectReferenceLoraScope
     reason: string
+    parameters?: ProjectReferenceLoraParameterSummary
   }>
+}
+
+export interface ProjectReferenceLoraParameterSummary {
+  count: number
+  ids: string[]
+  schema_digest: string
+  values_digest: string
+  expansion_digest: string
 }
 
 export interface ProjectReferencePlannedDetailCallout {
@@ -1126,6 +1188,8 @@ export interface LoraInfo {
    *  activations, weights, and other LoRA-keyed state instead of the
    *  filename, so updating a LoRA from v1.2 → v1.5 carries settings forward. */
   lora_id: string
+  /** Optional public input contract. Private trigger/template expansion stays server-side. */
+  parameter_schema?: LoraParameterSchema
   /** Update status from the cached CivitAI manifest. Populated by
    *  /api/v1/loras/check-updates and surfaced through this endpoint
    *  without an extra round-trip. The UI uses this to render badges. */

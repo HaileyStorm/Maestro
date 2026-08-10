@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import copy
+import glob
 import hashlib
 import hmac
 import json
@@ -16,6 +17,7 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 from unittest import mock
 
 from fastapi import HTTPException
@@ -52,6 +54,17 @@ def _load_route_symbols(namespace):
         "_project_reference_intelligence_selection",
         "_project_reference_model_schedule",
         "_project_reference_operation_routing",
+        "_project_reference_private_commitment",
+        "_project_reference_snapshot_commitment",
+        "_project_reference_lora_schema_sidecars",
+        "_project_reference_lora_schema_scopes",
+        "_project_reference_lora_schema_roles",
+        "_project_reference_lora_prompt_template",
+        "_project_reference_lora_fragment",
+        "_normalize_lora_parameter_schema",
+        "_read_lora_parameter_schema",
+        "_public_lora_parameter_schema",
+        "_normalize_lora_parameter_values",
         "_project_reference_sha256_file",
         "_project_reference_resolve_additional_loras",
         "_project_reference_capabilities",
@@ -71,6 +84,9 @@ def _load_route_symbols(namespace):
         "_recover_project_reference_publication",
         "_queue_recovery_worker",
         "_public_model_availability",
+        "_public_manual_installation_manifest",
+        "_compute_lora_id",
+        "list_loras_details",
         "list_models",
         "list_project_assets",
         "get_project_reference_authoring",
@@ -155,6 +171,7 @@ class _ModelRegistry:
     }
     displayed_model_types = tuple(definitions)
     models_def = definitions
+    lora_dir = ""
     families_infos = {
         "flux": (1, "Flux"),
         "unknown": (99, "Unknown"),
@@ -211,6 +228,16 @@ class _ModelRegistry:
             "video_only": {"num_inference_steps": 20, "guidance_scale": 1},
         }[model]
 
+    @classmethod
+    def get_lora_dir(cls, model):
+        if not cls.lora_dir:
+            raise RuntimeError("No synthetic LoRA directory")
+        return cls.lora_dir
+
+    @classmethod
+    def get_lora_search_dirs(cls, model):
+        return [cls.get_lora_dir(model)]
+
     @staticmethod
     def resolve_lora_path(model, filename):
         return ""
@@ -259,18 +286,22 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.visibility_calls = []
         self.workspace_events = []
         self.review = self._passing_review
+        _ModelRegistry.lora_dir = ""
 
         namespace = {
             "HTTPException": HTTPException,
             "Request": object,
             "Path": Path,
             "copy": copy,
+            "glob": glob,
             "hashlib": hashlib,
             "hmac": hmac,
             "json": json,
             "math": math,
             "os": os,
             "re": re,
+            "parse_qsl": parse_qsl,
+            "urlsplit": urlsplit,
             "time": time,
             "types": types,
             "uuid": uuid,
@@ -282,6 +313,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "_gen_lock": object(),
             "_active_gen_states": {},
             "_request_remote": ContextVar("route_test_remote", default=False),
+            "_session_secret": lambda: b"reference-route-test-secret",
             "_project_asset_store": lambda: self.store,
             "_asset_scope": self._asset_scope,
             "_require_project_access": lambda request, project: str(self.output),
@@ -297,6 +329,17 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             ),
             "_versioned_model_update_status": {},
             "_check_model_downloaded": lambda model: False,
+            "_load_lora_manifest": lambda: {},
+            "_build_lora_max_version_map": lambda _root: {},
+            "_resolve_per_file_update_status": (
+                lambda **_kwargs: {
+                    "update_status": "local",
+                    "latest_version_id": None,
+                    "current_version_id": None,
+                    "latest_published_at": None,
+                    "latest_changelog": None,
+                }
+            ),
             "_http_output_policy_from_request": self._output_policy,
             "_begin_workspace_operation": lambda project: self.workspace_events.append(("begin", project)),
             "_end_workspace_operation": lambda project: self.workspace_events.append(("end", project)),
@@ -3178,6 +3221,631 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             )
         self.assertEqual(digest.call_count, 2)
         self.assertEqual(len(frozen[0]["source_sha256"]), 64)
+
+    def test_v2_parameterized_lora_schema_is_explicit_private_and_retry_exact(self):
+        lora = self.root / "parameterized.safetensors"
+        lora.write_bytes(b"parameterized-test-lora")
+        schema_payload = {
+            "schema_version": 1,
+            "parameters": [{
+                "id": "body_scale",
+                "label": "Body scale",
+                "type": "enum",
+                "required": True,
+                "scopes": ["generation"],
+                "options": [
+                    {
+                        "value": "owner-small-private",
+                        "label": "Small",
+                        "prompt_fragment": "PRIVATE_PARAMETER_SMALL",
+                    },
+                    {
+                        "value": "owner-large-private",
+                        "label": "Large",
+                        "prompt_fragment": "PRIVATE_PARAMETER_EXPANSION",
+                    },
+                ],
+            }],
+            "trigger_fragments": [{
+                "text": "PRIVATE_PARAMETER_TRIGGER",
+                "scopes": ["generation"],
+            }],
+        }
+        lora.with_suffix(".maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": schema_payload,
+        }))
+        schema = self.ns["_read_lora_parameter_schema"]([
+            (str(lora.with_suffix(".maestro.json")), "maestro_sidecar"),
+        ])
+        enumerable_schema = copy.deepcopy(schema)
+        enumerable_schema.pop("schema_digest")
+        enumerable_schema.pop("schema_source")
+        self.assertNotEqual(
+            schema["schema_digest"],
+            hashlib.sha256(json.dumps(
+                enumerable_schema, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()).hexdigest(),
+        )
+        public_schema = self.ns["_public_lora_parameter_schema"](schema)
+        self.assertEqual(public_schema["schema_source"], "maestro_sidecar")
+        self.assertNotIn("PRIVATE_PARAMETER", json.dumps(public_schema))
+        first_commitment = self.ns["_normalize_lora_parameter_values"](
+            schema, {"body_scale": "owner-large-private"},
+        )
+        second_commitment = self.ns["_normalize_lora_parameter_values"](
+            schema, {"body_scale": "owner-large-private"},
+        )
+        self.assertNotEqual(first_commitment[1], second_commitment[1])
+        self.assertNotEqual(first_commitment[2], second_commitment[2])
+        with mock.patch.object(
+            _ModelRegistry, "resolve_lora_path", return_value=str(lora),
+        ):
+            legacy = self.ns["_project_reference_resolve_additional_loras"]([{
+                "id": lora.name, "multiplier": 1.0, "scope": "generation",
+            }], generation_model="flux2_klein_9b", editor_model=None)
+        self.assertIsNone(legacy[0]["parameter_schema_digest"])
+        self.assertEqual(legacy[0]["parameter_values"], ())
+        self.assertEqual(legacy[0]["parameter_expansions"], [])
+
+        selection = {
+            "id": lora.name,
+            "multiplier": 1.15,
+            "scope": "auto",
+            "parameter_schema_digest": schema["schema_digest"],
+            "parameter_values": {"body_scale": "owner-large-private"},
+        }
+        with mock.patch.object(
+            _ModelRegistry, "resolve_lora_path", return_value=str(lora),
+        ):
+            first = self._run(self._body(additional_loras=[selection]))
+        first_call_count = len(self.calls)
+        self.assertIn("PRIVATE_PARAMETER_TRIGGER", self.calls[0]["prompt"])
+        self.assertIn("PRIVATE_PARAMETER_EXPANSION", self.calls[0]["prompt"])
+        self.assertTrue(all(
+            "PRIVATE_PARAMETER" not in call["prompt"]
+            for call in self.calls[1:first_call_count]
+        ))
+        first_variant = self._assets()[0]["variants"][0]
+        public_pack = first_variant["metadata"]["reference_pack"]
+        applied = public_pack["additional_loras"]["applied"][0]
+        self.assertEqual(applied["parameters"]["count"], 1)
+        self.assertEqual(applied["parameters"]["ids"], ["body_scale"])
+        enumerable_sha = hashlib.sha256(json.dumps(
+            [{"id": "body_scale", "value": "owner-large-private"}],
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode()).hexdigest()
+        self.assertNotEqual(
+            applied["parameters"]["values_digest"], enumerable_sha,
+        )
+        public_serialized = json.dumps(public_pack)
+        self.assertNotIn("owner-large-private", public_serialized)
+        self.assertNotIn("PRIVATE_PARAMETER", public_serialized)
+        self.assertNotIn("commitment_context", public_serialized)
+        private = first_variant["metadata"]["private_authored_settings"]
+        self.assertRegex(
+            private["additional_lora_parameters"][0]["commitment_context"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            private["additional_lora_parameters"][0]["values"],
+            [{"id": "body_scale", "value": "owner-large-private"}],
+        )
+        corrupted = copy.deepcopy(first_variant)
+        corrupted["metadata"]["private_authored_settings"][
+            "additional_lora_parameters"
+        ][0]["values"][0]["value"] = "owner-small-private"
+        with self.assertRaises(HTTPException) as corrupt_error:
+            self.ns["_project_reference_private_authored_snapshot"](corrupted)
+        self.assertEqual(corrupt_error.exception.status_code, 409)
+        authoring = self.ns["get_project_reference_authoring"](
+            "project", first["asset"]["id"], first_variant["id"], _Request({}),
+        )
+        self.assertEqual(authoring["additional_loras"], [{
+            **selection,
+            "parameter_values_digest": applied["parameters"]["values_digest"],
+            "parameter_expansion_digest": applied["parameters"][
+                "expansion_digest"
+            ],
+        }])
+        self.assertNotIn("commitment_context", json.dumps(authoring))
+        self.assertNotIn(
+            "additional_lora_parameters", authoring["authored_settings"],
+        )
+
+        with mock.patch.object(
+            _ModelRegistry, "resolve_lora_path", return_value=str(lora),
+        ):
+            retry = self._run(self._body(
+                asset_id=first["asset"]["id"],
+                parent_variant_id=first_variant["id"],
+                type_fields=private["type_fields"],
+                detail_callouts=private["detail_callouts"],
+            ))
+        retry_private = self.jobs[retry["job_id"]]["params"][
+            "reference_pack"
+        ]["private_authored_settings"]
+        self.assertEqual(
+            retry_private["additional_lora_parameters"],
+            private["additional_lora_parameters"],
+        )
+        self.assertIn(
+            "PRIVATE_PARAMETER_EXPANSION", self.calls[first_call_count]["prompt"],
+        )
+        explicit_empty = self._run(self._body(
+            asset_id=first["asset"]["id"],
+            parent_variant_id=first_variant["id"],
+            type_fields=private["type_fields"],
+            detail_callouts=private["detail_callouts"],
+            additional_loras=[],
+        ))
+        self.assertNotIn(
+            "additional_lora_parameters",
+            self.jobs[explicit_empty["job_id"]]["params"]["reference_pack"][
+                "private_authored_settings"
+            ],
+        )
+
+    def test_v2_lora_parameter_schema_required_optional_and_control_validation(self):
+        normalize = self.ns["_normalize_lora_parameter_schema"]
+        normalize_values = self.ns["_normalize_lora_parameter_values"]
+        schema = normalize({
+            "schema_version": 1,
+            "parameters": [
+                {
+                    "id": "required_choice",
+                    "label": "Required choice",
+                    "type": "enum",
+                    "required": True,
+                    "options": [{
+                        "value": "selected",
+                        "label": "Selected",
+                        "prompt_fragment": "required selected",
+                    }],
+                },
+                {
+                    "id": "optional_note",
+                    "label": "Optional note",
+                    "type": "text",
+                    "required": False,
+                    "max_length": 40,
+                    "prompt_template": "note {value}",
+                },
+                {
+                    "id": "amount",
+                    "label": "Amount",
+                    "type": "number",
+                    "default": 1.0,
+                    "minimum": 0.0,
+                    "maximum": 2.0,
+                    "step": 0.5,
+                    "prompt_template": "amount {value}",
+                },
+                {
+                    "id": "count",
+                    "label": "Count",
+                    "type": "integer",
+                    "required": True,
+                    "minimum": 1,
+                    "maximum": 5,
+                    "step": 2,
+                    "prompt_template": "count {value}",
+                },
+                {
+                    "id": "enabled",
+                    "label": "Enabled",
+                    "type": "boolean",
+                    "default": True,
+                    "true_prompt_fragment": "enabled",
+                },
+            ],
+        })
+        with self.assertRaisesRegex(ValueError, "Required"):
+            normalize_values(schema, {})
+        values, _values_digest, _expansion_digest, expansions = normalize_values(
+            schema, {"required_choice": "selected", "count": 3},
+        )
+        self.assertEqual(values, (
+            ("required_choice", "selected"),
+            ("amount", 1.0),
+            ("count", 3),
+            ("enabled", True),
+        ))
+        self.assertEqual(len(expansions), 4)
+        with self.assertRaisesRegex(ValueError, "text parameter"):
+            normalize_values(schema, {
+                "required_choice": "selected",
+                "optional_note": "line one\nline two",
+                "count": 3,
+            })
+        with self.assertRaisesRegex(ValueError, "number parameter step"):
+            normalize_values(schema, {
+                "required_choice": "selected", "amount": 0.3, "count": 3,
+            })
+        with self.assertRaisesRegex(ValueError, "integer parameter"):
+            normalize_values(schema, {
+                "required_choice": "selected", "count": 2,
+            })
+        with self.assertRaisesRegex(ValueError, "boolean parameter"):
+            normalize_values(schema, {
+                "required_choice": "selected", "count": 3,
+                "enabled": 1,
+            })
+        with self.assertRaisesRegex(ValueError, "unknown fields"):
+            normalize({
+                "schema_version": 1,
+                "parameters": [{
+                    "id": "x", "label": "X", "type": "boolean",
+                    "true_prompt_fragment": "x", "unexpected": 1,
+                }],
+            })
+        with self.assertRaisesRegex(ValueError, "enum option"):
+            normalize({
+                "schema_version": 1,
+                "parameters": [{
+                    "id": "long", "label": "Long", "type": "enum",
+                    "options": [{
+                        "value": "v" * 257,
+                        "label": "Long",
+                        "prompt_fragment": "long",
+                    }],
+                }],
+            })
+        for ambiguous_options in (
+            [
+                {"value": 1.0, "label": "Float", "prompt_fragment": "float"},
+            ],
+            [
+                {
+                    "value": -0.0,
+                    "label": "Negative zero",
+                    "prompt_fragment": "negative zero",
+                },
+            ],
+            [
+                {"value": 1, "label": "Integer", "prompt_fragment": "integer"},
+                {"value": 1.0, "label": "Float", "prompt_fragment": "float"},
+            ],
+            [
+                {
+                    "value": 9_007_199_254_740_992,
+                    "label": "Unsafe integer",
+                    "prompt_fragment": "unsafe integer",
+                },
+            ],
+        ):
+            with self.subTest(ambiguous_options=ambiguous_options):
+                with self.assertRaisesRegex(ValueError, "enum option"):
+                    normalize({
+                        "schema_version": 1,
+                        "parameters": [{
+                            "id": "ambiguous",
+                            "label": "Ambiguous",
+                            "type": "enum",
+                            "options": ambiguous_options,
+                        }],
+                    })
+        distinct_json_scalars = normalize({
+            "schema_version": 1,
+            "parameters": [{
+                "id": "json_scalar",
+                "label": "JSON scalar",
+                "type": "enum",
+                "options": [
+                    {"value": True, "label": "Boolean", "prompt_fragment": "bool"},
+                    {"value": 1, "label": "Integer", "prompt_fragment": "integer"},
+                    {"value": 1.5, "label": "Float", "prompt_fragment": "float"},
+                    {
+                        "value": -9_007_199_254_740_991,
+                        "label": "Minimum safe integer",
+                        "prompt_fragment": "minimum safe integer",
+                    },
+                    {
+                        "value": 9_007_199_254_740_991,
+                        "label": "Maximum safe integer",
+                        "prompt_fragment": "maximum safe integer",
+                    },
+                ],
+            }],
+        })
+        for scalar in (
+            True, 1, 1.5,
+            -9_007_199_254_740_991, 9_007_199_254_740_991,
+        ):
+            with self.subTest(scalar=scalar):
+                values, _value_digest, _expansion_digest, _expansions = (
+                    normalize_values(
+                        distinct_json_scalars, {"json_scalar": scalar},
+                    )
+                )
+                self.assertEqual(type(values[0][1]), type(scalar))
+                self.assertEqual(values[0][1], scalar)
+        large_options = [
+            {
+                "value": f"value-{index}",
+                "label": f"Value {index}",
+                "prompt_fragment": "x" * 500,
+            }
+            for index in range(64)
+        ]
+        with self.assertRaisesRegex(ValueError, "schema exceeds"):
+            normalize({
+                "schema_version": 1,
+                "parameters": [
+                    {
+                        "id": f"large{index}",
+                        "label": f"Large {index}",
+                        "type": "enum",
+                        "options": copy.deepcopy(large_options),
+                    }
+                    for index in range(2)
+                ],
+            })
+        oversized_sidecar = self.root / "oversized.maestro.json"
+        oversized_sidecar.write_text(" " * 1_048_577)
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            self.ns["_read_lora_parameter_schema"]([
+                (str(oversized_sidecar), "maestro_sidecar"),
+            ])
+
+    def test_v2_lora_parameter_sidecar_precedence_and_strength_only_rejection(self):
+        lora = self.root / "precedence.safetensors"
+        lora.write_bytes(b"precedence-lora")
+        civitai_schema = {
+            "schema_version": 1,
+            "parameters": [{
+                "id": "source", "label": "Imported", "type": "boolean",
+                "default": False, "true_prompt_fragment": "imported",
+            }],
+        }
+        owner_schema = copy.deepcopy(civitai_schema)
+        owner_schema["parameters"][0]["label"] = "Owner override"
+        lora.with_suffix(".civitai.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": civitai_schema,
+        }))
+        lora.with_suffix(".maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": owner_schema,
+        }))
+        schema = self.ns["_read_lora_parameter_schema"](
+            self.ns["_project_reference_lora_schema_sidecars"](
+                "flux2_klein_9b", str(lora),
+            ),
+        )
+        self.assertEqual(schema["parameters"][0]["label"], "Owner override")
+        self.assertEqual(schema["schema_source"], "maestro_sidecar")
+
+        primary = self.root / "primary"
+        linked = self.root / "linked"
+        primary.mkdir()
+        linked.mkdir()
+        linked_lora = linked / "shared.safetensors"
+        linked_lora.write_bytes(b"linked-lora")
+        primary_schema = copy.deepcopy(owner_schema)
+        primary_schema["parameters"][0]["label"] = "Primary override"
+        linked_schema = copy.deepcopy(owner_schema)
+        linked_schema["parameters"][0]["label"] = "Linked metadata"
+        (primary / "shared.maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": primary_schema,
+        }))
+        linked_lora.with_suffix(".maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": linked_schema,
+        }))
+        _ModelRegistry.lora_dir = str(primary)
+        linked_result = self.ns["_read_lora_parameter_schema"](
+            self.ns["_project_reference_lora_schema_sidecars"](
+                "flux2_klein_9b", str(linked_lora),
+            ),
+        )
+        self.assertEqual(
+            linked_result["parameters"][0]["label"], "Primary override",
+        )
+
+        strength_only = self.root / "strength-only.safetensors"
+        strength_only.write_bytes(b"strength-only")
+        with mock.patch.object(
+            _ModelRegistry, "resolve_lora_path", return_value=str(strength_only),
+        ), self.assertRaises(HTTPException) as raised:
+            self.ns["_project_reference_resolve_additional_loras"]([{
+                "id": strength_only.name,
+                "multiplier": 1.0,
+                "scope": "generation",
+                "parameter_schema_digest": "a" * 64,
+                "parameter_values": {"anything": True},
+            }], generation_model="flux2_klein_9b", editor_model=None)
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_generic_lora_details_exposes_only_sanitized_owner_schema(self):
+        _ModelRegistry.lora_dir = str(self.root)
+        lora = self.root / "details.safetensors"
+        lora.write_bytes(b"details-lora")
+        lora.with_suffix(".maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": {
+                "schema_version": 1,
+                "parameters": [{
+                    "id": "shape",
+                    "label": "Shape",
+                    "type": "enum",
+                    "default": "rounded",
+                    "options": [{
+                        "value": "rounded",
+                        "label": "Rounded",
+                        "prompt_fragment": "PRIVATE_DETAILS_FRAGMENT",
+                    }],
+                }],
+            },
+        }))
+        details = self.ns["list_loras_details"]("flux2_klein_9b")
+        row = details["loras"][0]
+        self.assertEqual(row["filename"], lora.name)
+        self.assertEqual(row["parameter_schema_status"], "ready")
+        self.assertEqual(
+            row["parameter_schema"]["parameters"][0]["id"], "shape",
+        )
+        self.assertEqual(
+            row["parameter_schema"]["schema_source"], "maestro_sidecar",
+        )
+        self.assertNotIn("PRIVATE_DETAILS_FRAGMENT", json.dumps(row))
+
+        primary = self.root / "catalog-primary"
+        linked = self.root / "catalog-linked"
+        primary.mkdir()
+        linked.mkdir()
+        linked_lora = linked / "shared.safetensors"
+        linked_lora.write_bytes(b"linked-catalog-lora")
+        (primary / "shared.maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": {
+                "schema_version": 1,
+                "parameters": [{
+                    "id": "source", "label": "Primary catalog override",
+                    "type": "boolean", "default": True,
+                    "true_prompt_fragment": "PRIVATE_PRIMARY_FRAGMENT",
+                }],
+            },
+        }))
+        linked_lora.with_suffix(".maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": {
+                "schema_version": 1,
+                "parameters": [{
+                    "id": "source", "label": "Linked catalog metadata",
+                    "type": "boolean", "default": True,
+                    "true_prompt_fragment": "PRIVATE_LINKED_FRAGMENT",
+                }],
+            },
+        }))
+        _ModelRegistry.lora_dir = str(primary)
+        with mock.patch.object(
+            _ModelRegistry, "get_lora_search_dirs", return_value=[str(linked)],
+        ):
+            linked_details = self.ns["list_loras_details"]("flux2_klein_9b")
+        linked_schema = linked_details["loras"][0]["parameter_schema"]
+        self.assertEqual(
+            linked_schema["parameters"][0]["label"],
+            "Primary catalog override",
+        )
+        self.assertNotIn("PRIVATE_", json.dumps(linked_schema))
+
+    def test_v2_lora_parameter_expansion_budgets_bound_schema_and_operation(self):
+        fragment = "x" * 500
+        parameters = [
+            {
+                "id": f"p{index}",
+                "label": f"Parameter {index}",
+                "type": "enum",
+                "default": "on",
+                "options": [{
+                    "value": "on",
+                    "label": "On",
+                    "prompt_fragment": fragment,
+                }],
+            }
+            for index in range(16)
+        ]
+        bounded_schema = {
+            "schema_version": 1,
+            "parameters": parameters,
+        }
+        normalized = self.ns["_normalize_lora_parameter_schema"](
+            bounded_schema,
+        )
+        values, _values_digest, _expansion_digest, expansions = self.ns[
+            "_normalize_lora_parameter_values"
+        ](normalized, {})
+        self.assertEqual(len(values), 16)
+        self.assertEqual(sum(len(item["text"]) for item in expansions), 8_000)
+
+        overflow_schema = copy.deepcopy(bounded_schema)
+        overflow_schema["parameters"].append({
+            "id": "overflow",
+            "label": "Overflow",
+            "type": "enum",
+            "default": "on",
+            "options": [{
+                "value": "on", "label": "On", "prompt_fragment": fragment,
+            }],
+        })
+        overflow_normalized = self.ns["_normalize_lora_parameter_schema"](
+            overflow_schema,
+        )
+        with self.assertRaisesRegex(ValueError, "resource budget"):
+            self.ns["_normalize_lora_parameter_values"](
+                overflow_normalized, {},
+            )
+
+        lora = self.root / "budget.safetensors"
+        lora.write_bytes(b"budget-lora")
+        lora.with_suffix(".maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": bounded_schema,
+        }))
+        selections = [
+            {
+                "id": f"budget-{index}.safetensors",
+                "multiplier": 1.0,
+                "scope": "generation",
+                "parameter_schema_digest": normalized["schema_digest"],
+                "parameter_values": {},
+            }
+            for index in range(5)
+        ]
+        with mock.patch.object(
+            _ModelRegistry, "resolve_lora_path", return_value=str(lora),
+        ):
+            boundary = self.ns["_project_reference_resolve_additional_loras"](
+                selections[:4],
+                generation_model="flux2_klein_9b",
+                editor_model=None,
+            )
+            self.assertEqual(len(boundary), 4)
+            with self.assertRaises(HTTPException) as raised:
+                self.ns["_project_reference_resolve_additional_loras"](
+                    selections,
+                    generation_model="flux2_klein_9b",
+                    editor_model=None,
+                )
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_moody_manual_catalog_manifest_is_exact_and_token_free(self):
+        expected = {
+            "krea2_moody_mix_v7_fp8": (
+                "moodyKrea2Mix_v70.safetensors",
+                "405db6a1d060075d176c3578063b6fa2feb07b58bb61ddb403ddba0669a35a6d",
+            ),
+            "krea2_moody_cutie_v4_fp8": (
+                "moodyCutieMixKrea2_v40.safetensors",
+                "6c54d783aaaab1a6924fafcfa3afa9f36abe72a59723d424e932484a8c98316a",
+            ),
+        }
+        for model_type, (filename, digest) in expected.items():
+            with self.subTest(model_type=model_type):
+                model_def = json.loads(
+                    (ROOT / "app" / "defaults" / f"{model_type}.json").read_text()
+                )["model"]
+                manifest = self.ns["_public_manual_installation_manifest"](
+                    model_def,
+                )
+                self.assertEqual(manifest["filename"], filename)
+                self.assertEqual(manifest["sha256"], digest)
+                self.assertEqual(manifest["size_bytes"], 14125457032)
+                self.assertEqual(manifest["destination_hint"], "app/ckpts")
+                self.assertIs(manifest["local_verification_required"], True)
+                self.assertTrue(manifest["source_url"].startswith("https://"))
+                self.assertTrue(manifest["download_url"].startswith("https://"))
+                self.assertNotRegex(json.dumps(manifest), r"(?i)(token|api[_-]?key)=")
+                for unsafe_url in (
+                    "https://user:password@example.invalid/model",
+                    "https://example.invalid/model?token=private",
+                    "https://example.invalid/model?api%5Fkey=private",
+                    "https://example.invalid/model?X-Amz-Signature=private",
+                    "https://example.invalid/model?download=1",
+                    "https://civitai.com/api/download/models/3209007?type=Diffusion%20Model&format=SECRETCREDENTIAL1234567890&fp=fp8",
+                    "https://example.invalid/model#token=private",
+                ):
+                    unsafe = copy.deepcopy(model_def)
+                    unsafe["artifact_provenance"]["checkpoint"][
+                        "download_url"
+                    ] = unsafe_url
+                    self.assertIsNone(
+                        self.ns["_public_manual_installation_manifest"](unsafe),
+                    )
 
     def test_v2_deferred_lora_freeze_keeps_returned_plan_seal_stable(self):
         lora = self.root / "deferred.safetensors"
