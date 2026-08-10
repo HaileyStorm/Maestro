@@ -20,12 +20,16 @@ function VideoThumbnail({ src, name, cacheKey }: { src: string; name: string; ca
 
   useEffect(() => {
     let cancelled = false
+    const controller = new AbortController()
 
-    requestThumbnail(src, cacheKey).then((dataUrl) => {
+    requestThumbnail(src, cacheKey, controller.signal).then((dataUrl) => {
       if (!cancelled && dataUrl) setThumbUrl(dataUrl)
     })
 
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
   }, [src, cacheKey])
 
   if (thumbUrl) {
@@ -123,19 +127,22 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
           const idx = startIdx + i
           const privateIdentity = privatePreviewIdentity(file.workspace, file.name, file.revision)
           const privateRevealed = file.private && privatePreviewWasRevealed(privateIdentity)
+          const privateBlurred = file.private && !privateRevealed
           return (
             <button
               type="button"
-              key={`${file.workspace}:${file.name}:${file.revision}`}
+              key={privateIdentity}
               data-thumb-index={idx}
               aria-label={file.private && !privateRevealed
-                ? `Reveal private preview and select ${file.name}`
-                : `Select ${file.name}`}
+                ? `Reveal blurred preview and select ${file.name}`
+                : file.private
+                  ? `Select ${file.name}; preview is revealed`
+                  : `Select ${file.name}`}
               title={file.private && !privateRevealed
-                ? 'Click, tap, or press Enter to reveal this private preview'
+                ? 'Click, tap, or press Enter to Reveal this blurred preview'
                 : file.name}
               onClick={() => {
-                if (file.private) {
+                if (file.private && !privateRevealed) {
                   revealPrivatePreview(privateIdentity)
                   refreshPrivateReveal(value => value + 1)
                 }
@@ -157,25 +164,33 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
               }}
             >
               <div className={`h-full w-full transition-[filter] ${
-                file.private && !privateRevealed ? 'blur-md' : ''
+                privateBlurred ? 'blur-md' : ''
               }`}>
-              {file.type === 'video' ? (
-                <VideoThumbnail
-                  src={file.url}
-                  name={file.name}
-                  cacheKey={`${file.workspace}:${file.name}:${file.revision}`}
-                />
-              ) : file.type === 'audio' ? (
-                <div className="w-full h-full bg-bg-active flex items-center justify-center">
-                  <Music size={14} className="text-text-muted" />
-                </div>
-              ) : (
-                <img src={file.url} alt={file.name} className="w-full h-full object-cover" />
-              )}
+                {privateBlurred ? (
+                  <div className="w-full h-full bg-bg-active flex items-center justify-center">
+                    {file.type === 'audio'
+                      ? <Music size={14} className="text-text-muted" />
+                      : file.type === 'video'
+                        ? <Film size={14} className="text-text-muted" />
+                        : <EyeOff size={14} className="text-text-muted" />}
+                  </div>
+                ) : file.type === 'video' ? (
+                  <VideoThumbnail
+                    src={file.url}
+                    name={file.name}
+                    cacheKey={privateIdentity}
+                  />
+                ) : file.type === 'audio' ? (
+                  <div className="w-full h-full bg-bg-active flex items-center justify-center">
+                    <Music size={14} className="text-text-muted" />
+                  </div>
+                ) : (
+                  <img src={file.url} alt={file.name} className="w-full h-full object-cover" />
+                )}
               </div>
-              {file.private && !privateRevealed && (
+              {privateBlurred && (
                 <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25 text-white">
-                  <EyeOff size={13} aria-label="Private preview" />
+                  <EyeOff size={13} aria-label="Blurred preview" />
                 </span>
               )}
             </button>

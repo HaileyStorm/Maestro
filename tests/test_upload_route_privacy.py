@@ -409,7 +409,11 @@ class UploadRouteSourceContractTests(unittest.TestCase):
         self.assertIn("update_requested_outputs(", count)
         self.assertIn("min(250, limit)", log)
         self.assertIn("job_events(", log)
-        self.assertIn('"events": job_events(_jobs[job_id], 100)', _function_source("get_status"))
+        status = _function_source("get_status")
+        self.assertIn("if not _job_owned_by_request(job, request)", status)
+        self.assertIn("j = snapshot_job(job)", status)
+        self.assertIn('"events": job_events(job, 100)', status)
+        self.assertNotIn("job_events(_jobs[job_id]", status)
         self.assertIn('"events": job_events(job, 100)', _function_source("list_jobs"))
 
     def test_high_risk_consumers_use_central_authorizer(self):
@@ -444,7 +448,16 @@ class UploadRouteSourceContractTests(unittest.TestCase):
         self.assertIn('"source_path": path', imported)
         self.assertIn('"metadata": inherited', imported)
         self.assertIn('"source_path": str(artifact.path)', generated)
-        self.assertIn('ordered = [sheets[0], *panels]', generated)
+        self.assertIn(
+            "tuple(item.role for item in artifacts) != expected_output_roles",
+            generated,
+        )
+        self.assertIn(
+            "[item.index for item in artifacts] != list(range(len(artifacts)))",
+            generated,
+        )
+        self.assertIn("for artifact in artifacts:", generated)
+        self.assertIn("result.plan.sheets[artifact.index].label", generated)
 
 
 if __name__ == "__main__":

@@ -94,10 +94,25 @@ class TestDirectorH3Invariants(unittest.TestCase):
     @staticmethod
     def _scene(duration: float) -> tuple[list[dict], list[dict]]:
         prompt = (
-            "subject_definitions:\n<Subject 1>: a runner in a red coat\n"
-            "[Shot 1] The runner crosses the station without a cut.\n"
-            "[Shot 2] At 00:15.000, cut to a close-up as the train arrives."
+            "subject_definitions:\n<Subject 1> is the runner: adult runner in a red coat\n"
+            "[Shot 1] <Subject 1> (the runner) crosses the station without a cut.\n"
+            "[Shot 2] At 00:15.000, cut to a close-up as the train arrives "
+            "beside <Subject 1>."
         )
+        return (
+            [{"video_prompt": prompt, "window_prompts": [], "window_count": 1}],
+            [{"start": 0, "end": duration, "duration_sec": duration}],
+        )
+
+    @staticmethod
+    def _ref_scene(duration: float) -> tuple[list[dict], list[dict]]:
+        prompt = f"""subject_definitions: <Subject 1> is Mara from <Picture 1>.
+summary: Preserve the authored reference scene.
+retention_analysis: Fully preserve <Subject 1> from <Picture 1>.
+detailed_description:
+[Shot 1] [0.00s-{duration:.2f}s] shot_name: Reference action | audiovisual_description: <Subject 1> waits beside the door. | dialogue_and_vocalizations: none
+overall_soundscape: Quiet room tone.
+non_diegetic_music: N/A"""
         return (
             [{"video_prompt": prompt, "window_prompts": [], "window_count": 1}],
             [{"start": 0, "end": duration, "duration_sec": duration}],
@@ -135,27 +150,30 @@ class TestDirectorH3Invariants(unittest.TestCase):
                 self.assertTrue(all(124 <= value <= 345 for value in plan["clip_frames"]))
                 self.assertTrue(all(value % 17 == 5 for value in plan["clip_frames"]))
                 self.assertIn("[15.000s-", plan["global_prompt"])
-                self.assertTrue(all(
-                    not validate_h3_context_ir_records(
-                        prompt,
+                semantic = plan["shot_plan"]["semantic_shots"]
+                self.assertEqual(len(semantic), 1)
+                self.assertEqual(
+                    body["per_clip_prompts"],
+                    [semantic[0]["semantic_prompt"]] * plan["clip_count"],
+                )
+                self.assertEqual(
+                    validate_h3_context_ir_records(
+                        semantic[0]["semantic_prompt"],
                         mode="t2va",
-                        duration_seconds=(
-                            published / plan["shot_plan"]["fps"]
-                        ),
-                    )
-                    for prompt, published in zip(
-                        body["per_clip_prompts"],
-                        plan["clip_published_frames"],
-                    )
-                ))
+                        duration_seconds=duration,
+                    ),
+                    [],
+                )
                 self.assertTrue(any(
                     boundary["type"] in {"precut", "cut"}
                     for boundary in plan["clip_boundaries"]
                 ))
 
     def test_ref2va_effective_segment_requires_and_carries_terms(self):
-        clips, planned = self._scene(20.0)
+        clips, planned = self._ref_scene(20.0)
         body = self._base_generation_params()
+        body.pop("image_start")
+        body["image_prompt_type"] = ""
         with self.assertRaisesRegex(ValueError, "Ref2VA.*terms"):
             pipeline._prepare_director_h3_longform(
                 body,
@@ -166,6 +184,8 @@ class TestDirectorH3Invariants(unittest.TestCase):
             )
 
         accepted = self._base_generation_params()
+        accepted.pop("image_start")
+        accepted["image_prompt_type"] = ""
         plan = pipeline._prepare_director_h3_longform(
             accepted,
             params={"h3_ref2va_terms_accepted": True},
@@ -178,9 +198,29 @@ class TestDirectorH3Invariants(unittest.TestCase):
             pipeline._H3_REF2VA_MODEL,
             {item["model_type"] for item in plan["segment_models"]},
         )
+        self.assertTrue(all(
+            item["model_type"] == pipeline._H3_REF2VA_MODEL
+            for item in plan["segment_models"]
+        ))
+        self.assertTrue(all(
+            "detailed_description:" in prompt
+            for prompt in plan["shot_plan"]["clip_prompts"]
+        ))
+
+        anchored = self._base_generation_params()
+        with self.assertRaisesRegex(
+            ValueError, "Ref2VA prompt schema cannot be paired",
+        ):
+            pipeline._prepare_director_h3_longform(
+                anchored,
+                params={"h3_ref2va_terms_accepted": True},
+                clip_plans=clips,
+                planned_clips=planned,
+                fps=24,
+            )
 
     def test_video_phase_fails_terms_gate_before_child_submission(self):
-        clips, planned = self._scene(20.0)
+        clips, planned = self._ref_scene(20.0)
         params = {
             "video_model": pipeline._H3_BASE_FL2VA_MODEL,
             "video_params": {"resolution": "768x768"},
@@ -280,7 +320,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
                         "supplied final-frame anchor",
                     )
 
-    def test_native_scenes_keep_scene_cut_adaptive_routing(self):
+    def test_base_scenes_keep_schema_compatible_fl2va_routing(self):
         clips = [
             {"video_prompt": "A wide shot in the station."},
             {"video_prompt": "A close-up inside the train."},
@@ -304,7 +344,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
         self.assertEqual(plan["clip_boundaries"][0]["type"], "cut")
         self.assertEqual(
             plan["segment_models"][1]["model_type"],
-            pipeline._H3_REF2VA_MODEL,
+            pipeline._H3_BASE_FL2VA_MODEL,
         )
 
     def test_explicit_metadata_does_not_select_pinkcherry_for_director(self):
@@ -395,6 +435,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
 
     def test_structured_h3_shot_contract_keeps_dialogue_and_visual_context(self):
         shot = SimpleNamespace(
+            shot_id="shot-1",
             continuity_strategy="extend_previous",
             environment="an amber-lit workshop",
             visual_style="restrained 35mm realism",
@@ -419,6 +460,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
             clip_plans, planned, [shot],
         )
         contract = clip_plans[0]["_h3_shot"]
+        self.assertEqual(contract["shot_id"], "shot-1")
         self.assertEqual(contract["continuity_strategy"], "extend_previous")
         self.assertEqual(
             contract["dialogue_beats"][0]["spoken_text"],
@@ -464,15 +506,200 @@ class TestDirectorH3Invariants(unittest.TestCase):
         )
         self.assertTrue(restored["manual_segment_ceiling"])
         self.assertTrue(fresh_body["h3_ref2va_terms_accepted"])
-        for prompt, frames in zip(
-            fresh_body["per_clip_prompts"], restored["clip_published_frames"],
-        ):
+        for semantic in restored["shot_plan"]["semantic_shots"]:
+            frames = sum(
+                restored["clip_published_frames"][index]
+                for index in semantic["segment_indices"]
+            )
             self.assertEqual(
                 validate_h3_context_ir_records(
-                    prompt, mode="t2va", duration_seconds=frames / 24,
+                    semantic["semantic_prompt"],
+                    mode="t2va",
+                    duration_seconds=frames / 24,
                 ),
                 [],
             )
+
+    def test_committed_semantic_shot_rejects_physical_prompt_drift(self):
+        import copy
+
+        clips, planned = self._scene(20.0)
+        body = self._base_generation_params()
+        params = {
+            "h3_ref2va_terms_accepted": True,
+            "director_max_shot_frames": 243,
+        }
+        pipeline._prepare_director_h3_longform(
+            body,
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        saved = copy.deepcopy(params["_h3_longform"])
+        self.assertGreater(len(saved["shot_plan"]["clip_prompts"]), 1)
+        saved["shot_plan"]["clip_prompts"][1] += " changed"
+        saved["shot_plan"]["shots"][1]["prompt"] += " changed"
+
+        replay_body = self._base_generation_params()
+        with self.assertRaisesRegex(ValueError, "prompt bytes disagree"):
+            pipeline._prepare_director_h3_longform(
+                replay_body,
+                params={
+                    "h3_ref2va_terms_accepted": True,
+                    "_h3_longform": saved,
+                },
+                clip_plans=[],
+                planned_clips=[],
+                fps=24,
+            )
+
+    def test_committed_semantic_contract_rejects_corrupt_replay_metadata(self):
+        clips, planned = self._scene(20.0)
+        params = {
+            "h3_ref2va_terms_accepted": True,
+            "director_max_shot_frames": 243,
+        }
+        pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        original = params["_h3_longform"]["shot_plan"]
+
+        future = copy.deepcopy(original)
+        future["semantic_physical_contract_version"] = 99
+        with self.assertRaisesRegex(ValueError, "version is unsupported"):
+            pipeline._canonicalize_director_h3_shot_plan(future)
+
+        missing_shot = copy.deepcopy(original)
+        missing_shot["shots"].pop()
+        with self.assertRaisesRegex(ValueError, "shot records are incomplete"):
+            pipeline._canonicalize_director_h3_shot_plan(missing_shot)
+
+        missing_semantic = copy.deepcopy(original)
+        missing_semantic["semantic_shots"] = []
+        with self.assertRaisesRegex(ValueError, "semantic shot copies disagree"):
+            pipeline._canonicalize_director_h3_shot_plan(missing_semantic)
+
+        corruptions = (
+            (
+                "execution slice geometry disagrees",
+                lambda plan: plan["source_contracts"][0]["execution_slices"][0].update(
+                    {"start_frame": 777}
+                ),
+            ),
+            (
+                "semantic shot is incomplete",
+                lambda plan: plan["source_contracts"][0].update(
+                    {"source_index": 1, "semantic_shot_index": 1}
+                ),
+            ),
+            (
+                "physical segment metadata disagrees",
+                lambda plan: plan["shots"][0].update(
+                    {"authored_shot_id": "wrong-authored-id"}
+                ),
+            ),
+            (
+                "physical segment metadata disagrees",
+                lambda plan: plan["shots"][1].update(
+                    {"execution_cursor_frame": -999}
+                ),
+            ),
+            (
+                "physical segment metadata disagrees",
+                lambda plan: plan["shots"][1].update(
+                    {"predecessor_physical_segment_id": "wrong-segment"}
+                ),
+            ),
+        )
+        for message, mutate in corruptions:
+            with self.subTest(message=message):
+                saved = copy.deepcopy(original)
+                mutate(saved)
+                # The persisted semantic_shots copy must match exactly too.
+                if saved["semantic_shots"] != saved["source_contracts"]:
+                    saved["semantic_shots"] = copy.deepcopy(
+                        saved["source_contracts"]
+                    )
+                with self.assertRaisesRegex(ValueError, message):
+                    pipeline._canonicalize_director_h3_shot_plan(saved)
+
+    def test_committed_dialogue_manifest_requires_complete_ordered_coverage(self):
+        dialogue = "<d>[English] Ready.</d>"
+        prompt = (
+            "subject_definitions: <Subject 1> is Mara: adult medic in a blue coat.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0.00s-20.00s] shot_name: Ready | "
+            "audiovisual_description: <Subject 1> (Mara) waits by the door. | "
+            f"dialogue_and_vocalizations: <Subject 1> (S1) says: {dialogue}\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        params = {
+            "h3_ref2va_terms_accepted": True,
+            "director_max_shot_frames": 243,
+        }
+        pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=params,
+            clip_plans=[{"video_prompt": prompt}],
+            planned_clips=[{"start": 0, "end": 20, "duration_sec": 20}],
+            fps=24,
+        )
+        original = params["_h3_longform"]["shot_plan"]
+        self.assertEqual(len(original["dialogue_manifest"]), 1)
+
+        missing = copy.deepcopy(original)
+        missing["dialogue_manifest"] = []
+        with self.assertRaisesRegex(ValueError, "manifest coverage disagrees"):
+            pipeline._canonicalize_director_h3_shot_plan(missing)
+
+        bad_indices = copy.deepcopy(original)
+        bad_indices["shots"][0]["dialogue_manifest_indices"] = []
+        with self.assertRaisesRegex(ValueError, "physical segment metadata disagrees"):
+            pipeline._canonicalize_director_h3_shot_plan(bad_indices)
+
+    def test_mixed_authored_and_structured_dialogue_round_trips_in_text_order(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        authored = "<d>[English] Authored first.</d>"
+        structured = "<d>[English] Structured second.</d>"
+        prompt = (
+            "subject_definitions: <Subject 1> is Mara.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0.00s-20.00s] shot_name: Two lines | "
+            "audiovisual_description: <Subject 1> waits by the door. | "
+            f"dialogue_and_vocalizations: <Subject 1> says: {authored}\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        shot_plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            source_prompts=[prompt],
+            source_indices=[0, 0],
+            structured_shots=[{
+                "authored_shot_id": "authored-dialogue",
+                "dialogue_beats": [{
+                    "speaker_id": "mara",
+                    "spoken_text": "Structured second.",
+                }],
+            }],
+            clip_frame_counts=[243, 243],
+            clip_requested_frames=[240, 240],
+            fps=24,
+        )
+        self.assertEqual(
+            [item["exact_block"] for item in shot_plan["dialogue_manifest"]],
+            [authored, structured],
+        )
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
+        )
 
     def test_legacy_bare_saved_child_prompts_recompile_to_canonical(self):
         import copy
@@ -489,11 +716,13 @@ class TestDirectorH3Invariants(unittest.TestCase):
             fps=24,
         )
         saved = copy.deepcopy(params["_h3_longform"])
+        saved["shot_plan"].pop("semantic_physical_contract_version", None)
+        saved["shot_plan"].pop("semantic_shots", None)
         legacy = []
         for index, frames in enumerate(saved["clip_published_frames"], start=1):
             prompt = (
-                f"[0-{frames / 24:g}s] Saved child {index} keeps "
-                f"<Subject {index}> (S{index}) in place."
+                f"[0-{frames / 24:g}s] Saved child {index} keeps the "
+                "described adult in place."
             )
             legacy.append(prompt)
             saved["shot_plan"]["shots"][index - 1]["prompt"] = prompt
@@ -548,8 +777,8 @@ class TestDirectorH3Invariants(unittest.TestCase):
         import copy
 
         clips = [
-            {"video_prompt": "Legacy scene A keeps <Subject 1>."},
-            {"video_prompt": "Legacy scene B keeps <Subject 2>."},
+            {"video_prompt": "Legacy scene A keeps the runner in place."},
+            {"video_prompt": "Legacy scene B keeps the pilot in place."},
         ]
         planned = [
             {"start": 0, "end": 10, "duration_sec": 10},
@@ -582,12 +811,12 @@ class TestDirectorH3Invariants(unittest.TestCase):
         self.assertEqual(
             restored["shot_plan"]["global_prompt"], canonical_global,
         )
-        self.assertIn("<Subject 1>", canonical_global)
-        self.assertIn("<Subject 2>", canonical_global)
+        self.assertIn("runner in place", canonical_global)
+        self.assertIn("pilot in place", canonical_global)
 
     def test_empty_scene_uses_canonical_fallback_and_never_invents_dialogue(self):
         body = self._base_generation_params()
-        body["per_clip_prompts"] = ["Fallback keeps <Subject 1> at the door."]
+        body["per_clip_prompts"] = ["Fallback keeps the adult at the door."]
         result = pipeline._prepare_director_h3_longform(
             body,
             params={},
@@ -596,7 +825,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
             fps=24,
         )
         self.assertIsNone(result)
-        self.assertIn("Fallback keeps <Subject 1> at the door.", body["prompt"])
+        self.assertIn("Fallback keeps the adult at the door.", body["prompt"])
         self.assertNotIn("audiovisual_description: Dialogue", body["prompt"])
         self.assertEqual(
             validate_h3_context_ir_records(
@@ -616,7 +845,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
                 fps=24,
             )
 
-    def test_invalid_saved_version_and_unaccepted_ref2va_fail_closed(self):
+    def test_invalid_saved_version_and_schema_model_drift_fail_closed(self):
         body = self._base_generation_params()
         with (
             patch(
@@ -644,7 +873,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
         )
         saved = copy.deepcopy(params["_h3_longform"])
         saved["segment_models"][0]["model_type"] = pipeline._H3_REF2VA_MODEL
-        with self.assertRaisesRegex(ValueError, "saved Director generation.*Ref2VA"):
+        with self.assertRaisesRegex(ValueError, "prompt schema and checkpoint disagree"):
             pipeline._prepare_director_h3_longform(
                 self._base_generation_params(),
                 params={"_h3_longform": saved},
@@ -698,7 +927,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
             {
                 "video_prompt": "",
                 "window_prompts": [
-                    "Mara waits beside <Subject 1> (S1).",
+                    "Mara waits beside the door.",
                     "Theo replies <d>[English] Keep this exact.</d>",
                 ],
             },
@@ -713,9 +942,35 @@ class TestDirectorH3Invariants(unittest.TestCase):
         )
         self.assertIn("[Shot 1] [0.000s-10.000s]", prompt)
         self.assertIn("[Shot 2] [10.000s-20.000s]", prompt)
-        self.assertIn("<Subject 1> (S1)", prompt)
+        self.assertIn("Mara waits beside the door", prompt)
         self.assertIn("<d>[English] Keep this exact.</d>", prompt)
         self.assertNotRegex(prompt, r"(?m)^\[\d+(?:\.\d+)?-")
+
+    def test_ref2va_scene_prompt_preserves_the_six_field_contract_exactly(self):
+        prompt = """subject_definitions: <Subject 1> is Mara from <Picture 1>.
+summary: Preserve the authored reference scene.
+retention_analysis: Fully preserve <Subject 1> from <Picture 1>.
+detailed_description:
+[Shot 1] [0.00s-30.00s] shot_name: Reference hold | audiovisual_description: <Subject 1> waits by the door. | dialogue_and_vocalizations: none
+overall_soundscape: Quiet room tone.
+non_diegetic_music: N/A"""
+        self.assertEqual(
+            pipeline._director_h3_scene_prompt(
+                {"video_prompt": prompt, "window_prompts": []},
+                frame_count=720,
+                fps=24,
+                mode="ref2va",
+            ),
+            prompt,
+        )
+        self.assertEqual(
+            pipeline._director_h3_scene_prompt(
+                {"video_prompt": prompt, "window_prompts": []},
+                frame_count=720,
+                fps=24,
+            ),
+            prompt,
+        )
 
     def test_director_h3_rejects_wrapper_around_canonical_context_ir(self):
         canonical = pipeline._director_h3_scene_prompt(
@@ -774,7 +1029,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
                 fps=24,
             )
 
-    def test_committed_plan_rehydrate_normalizes_h3_keyframes_again(self):
+    def test_base_schema_rejects_semantic_keyframes_before_commit(self):
         clips = [{"video_prompt": "Beat one. Beat two. Beat three."}]
         planned = [{"start": 0, "end": 20, "duration_sec": 20}]
         original_body = self._base_generation_params()
@@ -783,39 +1038,16 @@ class TestDirectorH3Invariants(unittest.TestCase):
             "frames_positions": "200 400",
             "video_prompt_type": "KFI",
         })
-        params = {"h3_ref2va_terms_accepted": True}
-        pipeline._prepare_director_h3_longform(
-            original_body,
-            params=params,
-            clip_plans=clips,
-            planned_clips=planned,
-            fps=24,
-        )
-
-        recovered_body = self._base_generation_params()
-        recovered_body.update({
-            "image_refs": ["keyframe-a.png", "keyframe-b.png"],
-            "frames_positions": "200 400",
-            "video_prompt_type": "KFI",
-        })
-        pipeline._prepare_director_h3_longform(
-            recovered_body,
-            params=params,
-            clip_plans=[],
-            planned_clips=[],
-            fps=24,
-        )
-
-        self.assertNotIn("frames_positions", recovered_body)
-        self.assertNotIn("KFI", recovered_body["video_prompt_type"])
-        self.assertEqual(
-            recovered_body["custom_settings"]["h3_director_keyframes"],
-            "semantic_references",
-        )
-        self.assertEqual(
-            recovered_body["image_refs"],
-            ["keyframe-a.png", "keyframe-b.png"],
-        )
+        with self.assertRaisesRegex(
+            ValueError, "Base prompt schema cannot carry Ref2VA semantic references",
+        ):
+            pipeline._prepare_director_h3_longform(
+                original_body,
+                params={"h3_ref2va_terms_accepted": True},
+                clip_plans=clips,
+                planned_clips=planned,
+                fps=24,
+            )
 
     def test_registered_restart_preserves_structured_h3_shot_contract(self):
         pid = "director-h3-restore"
@@ -1028,19 +1260,22 @@ class TestDirectorH3Invariants(unittest.TestCase):
         self.assertEqual(
             director["clip_boundaries"], studio["clip_boundaries"],
         )
-        for child_prompt, frames in zip(
-            director["shot_plan"]["clip_prompts"],
-            director["clip_published_frames"],
-        ):
+        for semantic in director["shot_plan"]["semantic_shots"]:
+            frames = sum(
+                director["clip_published_frames"][index]
+                for index in semantic["segment_indices"]
+            )
             self.assertEqual(
                 validate_h3_context_ir_records(
-                    child_prompt,
+                    semantic["semantic_prompt"],
                     mode="t2va",
                     duration_seconds=frames / 24,
                 ),
                 [],
             )
-            self.assertNotRegex(child_prompt, r"(?m)^\[\d+(?:\.\d+)?-")
+            self.assertNotRegex(
+                semantic["semantic_prompt"], r"(?m)^\[\d+(?:\.\d+)?-",
+            )
 
     def test_unequal_timed_studio_director_and_recovery_are_exact(self):
         from tests.test_studio_prompt_windows import H3LongStudioPlanningTests
@@ -1081,23 +1316,23 @@ class TestDirectorH3Invariants(unittest.TestCase):
             self.assertEqual(plan["clip_published_frames"], [144, 336])
             self.assertEqual(plan["clip_trim_tail_frames"], [14, 9])
             self.assertEqual(plan["clip_boundaries"][0]["at_seconds"], 6.0)
-            self.assertEqual(sum(
-                item.count(dialogue)
+            self.assertEqual(
+                plan["shot_plan"]["clip_prompts"][0],
+                plan["shot_plan"]["clip_prompts"][1],
+            )
+            self.assertTrue(all(
+                item.count(dialogue) == 1
+                and "guest faces camera" in item
                 for item in plan["shot_plan"]["clip_prompts"]
-            ), 1)
-            self.assertNotIn(
-                "guest faces camera", plan["shot_plan"]["clip_prompts"][0],
+            ))
+        for semantic in director["shot_plan"]["semantic_shots"]:
+            frames = sum(
+                director["clip_published_frames"][index]
+                for index in semantic["segment_indices"]
             )
-            self.assertIn(
-                "guest faces camera", plan["shot_plan"]["clip_prompts"][1],
-            )
-        for child_prompt, frames in zip(
-            director["shot_plan"]["clip_prompts"],
-            director["clip_published_frames"],
-        ):
             self.assertEqual(
                 validate_h3_context_ir_records(
-                    child_prompt,
+                    semantic["semantic_prompt"],
                     mode="t2va",
                     duration_seconds=frames / 24,
                 ),
@@ -1128,7 +1363,7 @@ class TestDirectorH3Invariants(unittest.TestCase):
             director["shot_plan"]["clip_prompts"],
         )
 
-    def test_seamless_keyframes_use_supported_ref2va_semantic_conditioning(self):
+    def test_seamless_keyframes_require_ref2va_prompt_schema(self):
         clips = [{"video_prompt": "One continuous tracking shot."}]
         planned = [{"start": 0, "end": 20, "duration_sec": 20}]
         body = self._base_generation_params()
@@ -1137,30 +1372,16 @@ class TestDirectorH3Invariants(unittest.TestCase):
             "frames_positions": "200 400",
             "video_prompt_type": "KFI",
         })
-        plan = pipeline._prepare_director_h3_longform(
-            body,
-            params={"h3_ref2va_terms_accepted": True},
-            clip_plans=clips,
-            planned_clips=planned,
-            fps=24,
-        )
-
-        self.assertEqual(
-            body["image_refs"], ["keyframe-a.png", "keyframe-b.png"],
-        )
-        self.assertNotIn("frames_positions", body)
-        self.assertEqual(
-            body["custom_settings"]["h3_director_keyframes"],
-            "semantic_references",
-        )
-        self.assertNotIn("per_clip_keyframes", body)
-        self.assertIn(
-            pipeline._H3_REF2VA_MODEL,
-            {item["model_type"] for item in plan["segment_models"]},
-        )
-        self.assertEqual(
-            plan["director_keyframe_conditioning"], "semantic_references",
-        )
+        with self.assertRaisesRegex(
+            ValueError, "Base prompt schema cannot carry Ref2VA semantic references",
+        ):
+            pipeline._prepare_director_h3_longform(
+                body,
+                params={"h3_ref2va_terms_accepted": True},
+                clip_plans=clips,
+                planned_clips=planned,
+                fps=24,
+            )
 
     def test_manual_fl2va_rejects_semantic_references_consistently(self):
         for duration in (10.0, 20.0):

@@ -52,11 +52,6 @@ _H3_SPEECHLIKE_AMBIENCE_REPLACEMENTS = (
     ),
 )
 
-_H3_BASE_FIELDS = (
-    "integrated_multimodal_description",
-    "overall_soundscape",
-    "non_diegetic_music",
-)
 _H3_REF2VA_FIELDS = (
     "subject_definitions",
     "summary",
@@ -65,7 +60,26 @@ _H3_REF2VA_FIELDS = (
     "overall_soundscape",
     "non_diegetic_music",
 )
+# Base H3 now carries the same stable subject namespace used by Ref2VA, but
+# keeps its three native audiovisual fields. The definitions are global
+# metadata; shot records reference the labels and add only local state.
+_H3_BASE_FIELDS = (
+    "subject_definitions",
+    "integrated_multimodal_description",
+    "overall_soundscape",
+    "non_diegetic_music",
+)
 _H3_ALL_FIELDS = tuple(dict.fromkeys((*_H3_REF2VA_FIELDS, *_H3_BASE_FIELDS)))
+_H3_SUBJECT_LABEL_RE = re.compile(
+    r"<Subject\s+(?P<number>[1-9]\d*)>", re.IGNORECASE,
+)
+_H3_REFERENCE_LABEL_RE = re.compile(
+    r"<(?:Subject|Picture|Video|Audio)\s+[1-9]\d*>", re.IGNORECASE,
+)
+_H3_NO_SUBJECT_DEFINITIONS = (
+    "No separately named subjects were authored; shot records carry only "
+    "the request's explicitly described visible action and setting."
+)
 _H3_CANONICAL_TIME = r"(?:(?:\d{1,2}:){1,2})?\d+(?:\.\d+)?"
 _H3_CANONICAL_RECORD_RE = re.compile(
     rf"^\[Shot (?P<number>[1-9]\d*)\] "
@@ -565,6 +579,179 @@ def _extract_h3_fields(text: str) -> dict[str, str]:
     return fields
 
 
+def _parse_h3_subject_definitions(value: str) -> list[dict[str, str]]:
+    """Parse the Base global entity namespace without interpreting shot prose."""
+
+    text = normalize_h3_text(value).strip()
+    if not text or text.casefold() == _H3_NO_SUBJECT_DEFINITIONS.casefold():
+        return []
+    chunks = re.split(r"(?=<Subject\s+[1-9]\d*>\s*)", text, flags=re.IGNORECASE)
+    entries: list[dict[str, str]] = []
+    for chunk in chunks:
+        chunk = chunk.strip().strip(";,")
+        if not chunk:
+            continue
+        label = _H3_SUBJECT_LABEL_RE.match(chunk)
+        if label is None:
+            continue
+        number = int(label.group("number"))
+        rest = chunk[label.end():].strip().strip(";,")
+        if rest.casefold().startswith("is "):
+            rest = rest[3:].strip()
+        identity, separator, description = rest.partition(":")
+        # Base examples in the wild often use ``Name, description`` instead
+        # of the preferred ``Name: description`` form. Treat only a
+        # substantial comma suffix as a description so a plain multi-word
+        # identity remains an identity rather than becoming repetition bait.
+        if not separator and "," in rest:
+            comma_identity, comma_description = rest.split(",", 1)
+            if len(comma_description.split()) >= 2:
+                identity = comma_identity
+                description = comma_description
+                separator = ","
+        identity = identity.strip().strip(" .;,")
+        description = (
+            description.strip().strip(" .;,")
+            if separator else ""
+        )
+        entries.append({
+            "label": f"<Subject {number}>",
+            "number": str(number),
+            "identity": identity,
+            "description": description,
+            "has_description": bool(separator and description),
+        })
+    return entries
+
+
+def _h3_subject_identity_aliases(entry: Mapping[str, str]) -> list[str]:
+    """Return only authored identity aliases, never inferred descriptions."""
+
+    identity = " ".join(str(entry.get("identity") or "").split()).strip()
+    if not identity:
+        return []
+    aliases: list[str] = []
+    # Stable speaker IDs and reference provenance are metadata, not part of
+    # the visible name a shot needs to repeat.
+    without_speaker = re.sub(
+        r"\s*\((?:S\d+|speaker\s+\d+)\)\s*$",
+        "",
+        identity,
+        flags=re.IGNORECASE,
+    ).strip()
+    without_reference = re.sub(
+        r"\s+from\s+<Picture\s+\d+>\s*$",
+        "",
+        without_speaker or identity,
+        flags=re.IGNORECASE,
+    ).strip()
+    if without_reference:
+        aliases.append(without_reference)
+    if without_speaker and without_speaker not in aliases:
+        aliases.append(without_speaker)
+    if identity not in aliases:
+        aliases.append(identity)
+    return aliases
+
+
+def _h3_entity_contract_errors(prompt: str, *, mode: str) -> list[str]:
+    """Enforce Base's global entity namespace and non-repetition rule."""
+
+    if str(mode or "").strip().casefold() == "ref2va":
+        return []
+    fields = _extract_h3_fields(prompt)
+    definitions = fields.get("subject_definitions", "").strip()
+    if not definitions:
+        return ["Base H3 prompt is missing subject_definitions"]
+    visual = fields.get("integrated_multimodal_description", "")
+    visual_labels = {
+        f"<Subject {number}>".casefold()
+        for number in re.findall(r"<Subject\s+([1-9]\d*)>", visual, re.IGNORECASE)
+    }
+    if definitions.casefold() == _H3_NO_SUBJECT_DEFINITIONS.casefold():
+        return [
+            "subject_definitions sentinel is orphaned by shot-record Subject labels"
+        ] if visual_labels else []
+    entries = _parse_h3_subject_definitions(definitions)
+    if not entries:
+        return ["subject_definitions contains no parseable stable Subject labels"]
+    errors: list[str] = []
+    numbers = [int(entry["number"]) for entry in entries]
+    if len(numbers) != len(set(numbers)):
+        errors.append("subject_definitions labels are not unique")
+    visual_compact = " ".join(visual.split()).casefold()
+    record_compacts = [
+        " ".join(line.split()).casefold()
+        for line in str(visual or "").splitlines()
+        if _H3_CANONICAL_RECORD_RE.fullmatch(line.strip())
+    ]
+    defined_labels = {entry["label"].casefold() for entry in entries}
+    for label in sorted(visual_labels - defined_labels):
+        errors.append(f"shot record references undefined {label}")
+    for entry in entries:
+        label = entry["label"]
+        aliases = _h3_subject_identity_aliases(entry)
+        referenced = label.casefold() in visual_labels or any(
+            re.search(
+                rf"(?<![\w>]){re.escape(alias.casefold())}(?![\w<])",
+                visual_compact,
+            )
+            for alias in aliases
+            if alias
+        )
+        if not referenced:
+            errors.append(f"{label} is never referenced by a shot record")
+        description = " ".join(entry["description"].split()).strip()
+        # Only an explicitly delimited description can be repeated, so a
+        # multi-word identity (for example, "The Very Red Fox") remains
+        # exempt. Long exact descriptions are rejected anywhere in a record
+        # that also names the entity; short phrases require syntactic adjacency
+        # so "Mara walks past a tall tree" does not describe Mara as "tall".
+        if description and entry.get("has_description"):
+            normalized_description = " ".join(description.split()).casefold()
+            anchors = [label, *aliases]
+            for record in record_compacts:
+                matching_anchors = [
+                    anchor for anchor in anchors
+                    if re.search(
+                        rf"(?<![\w>]){re.escape(anchor.casefold())}(?![\w<])",
+                        record,
+                    )
+                ]
+                if not matching_anchors:
+                    continue
+                repeated = (
+                    len(description.split()) >= 4
+                    and re.search(
+                        rf"(?<![\w]){re.escape(normalized_description)}(?![\w])",
+                        record,
+                    )
+                )
+                if not repeated:
+                    for anchor in matching_anchors:
+                        for match in re.finditer(
+                            re.escape(anchor.casefold()), record,
+                        ):
+                            window = record[match.end():match.end() + 220]
+                            if re.match(
+                                r"\s*(?:\([^)]{1,96}\)\s*)?"
+                                r"(?:[,;:–—-]\s*|(?:is|appears as)\s+)?"
+                                + re.escape(normalized_description)
+                                + r"(?![\w])",
+                                window,
+                            ):
+                                repeated = True
+                                break
+                        if repeated:
+                            break
+                if repeated:
+                    errors.append(
+                        f"{label} full entity description is repeated in a shot record"
+                    )
+                    break
+    return list(dict.fromkeys(errors))
+
+
 def _canonical_h3_record_lines(body: str) -> list[str]:
     """Return exact non-empty physical record lines, or an empty list."""
 
@@ -693,6 +880,7 @@ def validate_h3_context_ir_records(
         value = fields.get(field, "").strip()
         if value and len(value.splitlines()) != 1:
             errors.append(f"{field} must be exactly one physical line")
+    errors.extend(_h3_entity_contract_errors(text, mode=mode))
 
     visual_name = (
         "detailed_description" if mode == "ref2va"
@@ -1341,10 +1529,13 @@ def _ref2va_subject_definitions(
     subjects: Sequence[Any],
     registry: Mapping[str, Any],
     source_bindings: Mapping[int, Sequence[str]] | None = None,
+    included_indices: set[int] | None = None,
 ) -> list[str]:
     definitions: list[str] = []
     source_bindings = source_bindings or {}
     for index, subject in enumerate(subjects or [], start=1):
+        if included_indices is not None and index not in included_indices:
+            continue
         character_id = _normalized_space(_field(subject, "character_id", ""))
         name = _normalized_space(
             _field(subject, "speaker_name", "") or character_id or f"subject {index}"
@@ -1366,34 +1557,96 @@ def _ref2va_subject_definitions(
     return definitions
 
 
+def _base_subject_definitions(
+    subjects: Sequence[Any],
+    registry: Mapping[str, Any],
+    authored: str = "",
+    body: str = "",
+) -> list[str]:
+    """Build Base's global entity declarations from Director metadata."""
+
+    authored = normalize_h3_text(authored).strip()
+    if authored:
+        # The saved prompt is authoritative. In particular, do not replace an
+        # authored namespace with stale Director metadata or manufacture a
+        # sentinel after the namespace has been parsed out of the body.
+        return [authored]
+    body_compact = " ".join(str(body or "").split()).casefold()
+    included_indices: set[int] = set()
+    for index, subject in enumerate(subjects or [], start=1):
+        character_id = _normalized_space(_field(subject, "character_id", ""))
+        name = _normalized_space(
+            _field(subject, "speaker_name", "") or character_id
+        )
+        registry_entry = _speaker_registry_entry(
+            registry, character_id or name,
+        )
+        candidates = [
+            name,
+            character_id,
+            registry_entry[0] if registry_entry else "",
+            f"<Subject {index}>",
+        ]
+        if any(
+            candidate
+            and re.search(
+                rf"(?<![\w>]){re.escape(candidate.casefold())}(?![\w<])",
+                body_compact,
+            )
+            for candidate in candidates
+        ):
+            included_indices.add(index)
+    definitions = _ref2va_subject_definitions(
+        subjects, registry, included_indices=included_indices,
+    )
+    return definitions or [_H3_NO_SUBJECT_DEFINITIONS]
+
+
 def _label_ref2va_subjects_in_body(
     body: str,
     subjects: Sequence[Any],
+    definitions: str = "",
 ) -> str:
-    """Insert each official subject label at its first named appearance."""
+    """Label exact authored identities without inventing visible entities."""
 
     result = body
-    missing: list[str] = []
-    for index, subject in enumerate(subjects or [], start=1):
-        label = f"<Subject {index}>"
+    definition_entries = _parse_h3_subject_definitions(definitions) if definitions else []
+    if definition_entries:
+        references = [
+            (entry["label"], _h3_subject_identity_aliases(entry))
+            for entry in definition_entries
+        ]
+    elif definitions:
+        # Preserve malformed authored definitions for the validator to reject;
+        # falling back to metadata here could silently orphan the source.
+        references = []
+    else:
+        references = []
+        for index, subject in enumerate(subjects or [], start=1):
+            name = _normalized_space(
+                _field(subject, "speaker_name", "")
+                or _field(subject, "character_id", "")
+            )
+            if name:
+                references.append((f"<Subject {index}>", [name]))
+
+    for label, aliases in references:
         if label in result:
             continue
-        name = _normalized_space(
-            _field(subject, "speaker_name", "")
-            or _field(subject, "character_id", "")
-        )
-        if not name:
-            continue
-        pattern = re.compile(rf"(?<![\w>]){re.escape(name)}(?![\w<])", re.IGNORECASE)
-        result, count = pattern.subn(f"{label} ({name})", result, count=1)
-        if not count:
-            missing.append(f"{label} ({name}) is visible in the described blocking.")
-    if missing:
-        addition = " ".join(missing)
-        if _canonical_h3_record_lines(result):
-            result = _augment_h3_record_description(result, addition)
-        else:
-            result = f"{addition} {result}".strip()
+        for alias in aliases:
+            if not alias:
+                continue
+            pattern = re.compile(
+                rf"(?<![\w>]){re.escape(alias)}(?![\w<])",
+                re.IGNORECASE,
+            )
+            result, count = pattern.subn(
+                lambda match: f"{label} ({match.group(0)})",
+                result,
+                count=1,
+            )
+            if count:
+                break
     return result
 
 
@@ -1479,18 +1732,47 @@ def compile_h3_official_prompt(
         body = f"[Shot 1] {body}".strip()
 
     if mode == "ref2va":
-        subject_definitions = _ref2va_subject_definitions(
-            subjects or [],
-            registry,
-            subject_sources,
-        )
-        definitions = "\n".join([*subject_definitions, *reference_definitions])
+        authored_fields = _extract_h3_fields(prompt)
+        authored_definitions = str(
+            authored_fields.get("subject_definitions") or ""
+        ).strip()
+        if authored_definitions:
+            definition_parts = [authored_definitions]
+            authored_labels = {
+                match.group(0).casefold()
+                for match in _H3_REFERENCE_LABEL_RE.finditer(
+                    authored_definitions
+                )
+            }
+            for definition in reference_definitions:
+                leading = _H3_REFERENCE_LABEL_RE.match(definition.strip())
+                if leading and leading.group(0).casefold() in authored_labels:
+                    continue
+                definition_parts.append(definition)
+            definitions = "\n".join(definition_parts)
+        else:
+            subject_definitions = _ref2va_subject_definitions(
+                subjects or [],
+                registry,
+                subject_sources,
+            )
+            definitions = "\n".join([
+                *subject_definitions, *reference_definitions,
+            ])
         if not definitions:
             definitions = "Use the explicitly described subjects and target scene."
-        retention_text = "\n".join(retention) or (
-            "Preserve the explicitly described identities, wardrobe, setting, action, and audio roles."
+        authored_retention = str(
+            authored_fields.get("retention_analysis") or ""
+        ).strip()
+        retention_text = "\n".join(
+            item for item in [authored_retention, *retention] if item
+        ) or (
+            "Preserve the explicitly described identities, wardrobe, setting, "
+            "action, and audio roles."
         )
-        body = _label_ref2va_subjects_in_body(body, subjects or [])
+        body = _label_ref2va_subjects_in_body(
+            body, subjects or [], definitions,
+        )
         summary_body = re.sub(r"^\[Shot\s+1\]\s*", "", body, flags=re.IGNORECASE)
         summary_body = _H3_STRICT_DIALOGUE_RE.sub(
             "scripted dialogue",
@@ -1499,7 +1781,8 @@ def compile_h3_official_prompt(
         summary = _trim_sentence(re.split(r"(?<=[.!?])\s+", summary_body, maxsplit=1)[0])
         if len(summary) > 320:
             summary = summary[:320].rsplit(" ", 1)[0].rstrip(" ,;:-") + "..."
-        summary = (
+        authored_summary = str(authored_fields.get("summary") or "").strip()
+        summary = authored_summary or (
             f"[{' + '.join(task_types)}] "
             f"{summary or 'A complete audiovisual shot matching the mapped subjects and requested action.'}"
         )
@@ -1522,6 +1805,16 @@ def compile_h3_official_prompt(
             f"non_diegetic_music: {music}"
         )
     else:
+        authored_definitions = _extract_h3_fields(prompt).get(
+            "subject_definitions", "",
+        )
+        subject_definitions = _base_subject_definitions(
+            subjects or [], registry, authored_definitions, body,
+        )
+        definitions_text = "\n".join(subject_definitions)
+        body = _label_ref2va_subjects_in_body(
+            body, subjects or [], definitions_text,
+        )
         shot_numbers = [
             int(value)
             for value in re.findall(r"\[Shot\s+(\d+)\]", body, flags=re.IGNORECASE)
@@ -1532,6 +1825,7 @@ def compile_h3_official_prompt(
             max(shot_numbers) if shot_numbers else 1,
         )
         compiled = (
+            f"subject_definitions: {definitions_text}\n\n"
             f"integrated_multimodal_description: {body}\n\n"
             f"overall_soundscape: {soundscape}.\n\n"
             f"non_diegetic_music: {music}"
@@ -1582,6 +1876,7 @@ def validate_h3_prompt_contract(
         if re.search(rf"(?mi)^\s*{re.escape(field)}\s*:", text):
             errors.append(f"unexpected {field} field for {mode}")
     extracted_fields = _extract_h3_fields(text)
+    errors.extend(_h3_entity_contract_errors(text, mode=mode))
     visual_field = "detailed_description" if mode == "ref2va" else "integrated_multimodal_description"
     visual = extracted_fields.get(visual_field, "")
     if not re.match(r"^\s*\[Shot\s+1\]", visual, flags=re.IGNORECASE):

@@ -502,13 +502,21 @@ class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
             "local_gguf_path": "",
             "gguf_file_override": "",
         }
+
+        class HTTPException(RuntimeError):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
         namespace = {
             "Request": object,
             "asyncio": asyncio,
-            "HTTPException": RuntimeError,
+            "HTTPException": HTTPException,
+            "_gen_lock": threading.RLock(),
             "wgp": types.SimpleNamespace(server_config={"services": {
                 "director_prompt_polish": "off",
-            }}),
+            }}, transformer_type="", wan_model=None, offloadobj=None),
             "_authorize_director_media_inputs": lambda *_args: None,
             "_llm_chat_request_is_external": lambda _request: False,
             "_resolve_direct_llm_selection": lambda _request: dict(selection),
@@ -544,6 +552,7 @@ class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(
             sys.modules["services"], "llm_service", fake_service,
+            create=True,
         ), mock.patch.dict(sys.modules, {
             "services.director.nsfw_guidance": guidance_module,
             "services.director.orchestrator": orchestrator_module,

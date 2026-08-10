@@ -157,7 +157,6 @@ class family_handler:
                 "h3_source_audio_mode",
                 "h3_primary_audio_ordinal",
                 "h3_audio_remix_strength",
-                "h3_multirate_profile",
             ],
             "h3_native_boundary_conditioning": native_boundary_enabled,
             "minimax_h3_native_boundary_image_prompt_types_allowed": (

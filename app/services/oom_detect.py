@@ -32,10 +32,12 @@ _GPU_OOM_SIGNATURES = (
 )
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 _FAILURE_STAGES = {
-    "denoise", "vae_decode", "segment_checkpoint", "concat", "audio_mux",
-    "postprocess", "flashvsr", "delivery", "publication", "generation",
+    "model_load", "denoise", "vae_decode", "segment_checkpoint", "concat",
+    "audio_mux", "postprocess", "flashvsr", "delivery", "publication",
+    "generation",
 }
 _STAGE_DETAILS = {
+    "model_load": "The generation model could not be loaded with the available host memory.",
     "denoise": "Generation failed during denoising.",
     "vae_decode": "Generation failed while decoding the rendered segment.",
     "segment_checkpoint": "The rendered segment could not be sealed for recovery.",

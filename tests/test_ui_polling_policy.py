@@ -216,7 +216,7 @@ class UiPollingStateTests(unittest.TestCase):
             STORE.index("reconnectJobs: async"):
             STORE.index("// LoRA state", STORE.index("reconnectJobs: async"))
         ]
-        self.assertIn("_queueJobDetails(queueJob)", reconcile)
+        self.assertIn("_queueJobDetails(queueJob, job)", reconcile)
         self.assertIn("becameFast", reconcile)
         self.assertIn("_jobNeedsFastStatusPoll", reconcile)
         self.assertIn("get()._pollRecoveredJob(job_id)", standard)
@@ -232,9 +232,27 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertIn("job.recoveryState === 'retrying'", fast_gate)
 
     def test_all_job_submit_paths_use_the_one_queue_aware_poller(self):
-        # Two one-shot recovery refreshes plus the one central recurring fetch
-        # are the only job-status callsites in the UI store.
-        self.assertEqual(STORE.count("api.fetchJobStatus("), 3)
+        # Plan-review hydration plus two recovery refreshes are bounded
+        # one-shots; _pollRecoveredJob remains the sole recurring fetch.
+        self.assertEqual(STORE.count("api.fetchJobStatus("), 4)
+        review_start = STORE.index("openH3PlanReview: async")
+        review = STORE[
+            review_start:STORE.index("closeH3PlanReview: () =>", review_start)
+        ]
+        recurring_start = STORE.index("_pollRecoveredJob: (jobId) => {")
+        recurring = STORE[
+            recurring_start:STORE.index("reconnectJobs: async", recurring_start)
+        ]
+        self.assertEqual(review.count("api.fetchJobStatus(jobId)"), 1)
+        self.assertNotIn("setInterval", review)
+        self.assertNotIn("setTimeout", review)
+        self.assertEqual(recurring.count("api.fetchJobStatus(jobId)"), 1)
+        self.assertIn("scheduleNext()", recurring)
+        self.assertIn("_recoveryJobPolls.set(jobId, poll)", recurring)
+        self.assertEqual(
+            recurring.count("stopped || _recoveryJobPolls.get(jobId) !== poll"),
+            2,
+        )
         self.assertNotIn("const pollInterval = setInterval(async", STORE)
         self.assertNotIn("status.status === 'running') get().refreshOutputs()", STORE)
         self.assertEqual(
@@ -262,7 +280,7 @@ class UiPollingStateTests(unittest.TestCase):
             callsites,
             {
                 "ui/src/api/client.ts": 1,
-                "ui/src/stores/useStore.ts": 3,
+                "ui/src/stores/useStore.ts": 4,
             },
         )
         references = UI_SOURCES[

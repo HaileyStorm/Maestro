@@ -81,6 +81,7 @@ def _launch_subset(*names: str, include_remote_constants: bool = False) -> dict:
         "HTTPException": HTTPException,
         "quote": quote,
         "_request_is_cloudflare_remote": lambda _request: True,
+        "_STATE_CHANGING_METHODS": frozenset({"POST", "PUT", "PATCH", "DELETE"}),
     }
     exec(compile(module, str(LAUNCH), "exec"), namespace)
     return namespace

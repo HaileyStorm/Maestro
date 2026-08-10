@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
 import statistics
+import stat
 import tempfile
 import threading
 import time
@@ -15,8 +17,12 @@ import subprocess
 from typing import Any, Callable, Mapping
 
 
-SCHEMA_VERSION = 4
-LEGACY_SCHEMA_VERSIONS = {1, 2, 3, SCHEMA_VERSION}
+SCHEMA_VERSION = 5
+LEGACY_SCHEMA_VERSIONS = {1, 2, 3, 4, SCHEMA_VERSION}
+ALLOCATION_LEDGER_SCHEMA_VERSION = 1
+ALLOCATION_HEURISTIC_REVISION = 1
+ALLOCATION_OOM_THRESHOLD = 3
+ALLOCATION_SUCCESS_HYSTERESIS = 5
 CASE_IDS = ("text_only", "first_frame", "first_last", "ref2va")
 QUICK_TASK = {
     "width": 608,
@@ -131,6 +137,7 @@ def build_benchmark_spec(
             "lora_count", "cache_enabled", "warmup_runs", "measured_runs",
             "source_audio_mode", "audio_algorithm_version",
             "video_evaluations", "audio_evaluations", "multirate_profile",
+            "offload_profile", "recovery_policy_version",
         )
         if key in raw_task and isinstance(raw_task[key], (str, int, float, bool))
     }
@@ -143,6 +150,22 @@ def build_benchmark_spec(
         raise H3BenchmarkError("Quick benchmark is fixed at 124 H3-grid frames")
     if profile != "quick" and frames < 1:
         raise H3BenchmarkError("Observed H3 jobs must contain at least one frame")
+    if "offload_profile" in resolved_task:
+        try:
+            offload_profile = int(resolved_task["offload_profile"])
+        except (TypeError, ValueError):
+            raise H3BenchmarkError("H3 offload profile is invalid") from None
+        if offload_profile not in {1, 2, 3, 4, 5}:
+            raise H3BenchmarkError("H3 offload profile is invalid")
+        resolved_task["offload_profile"] = offload_profile
+    if "recovery_policy_version" in resolved_task:
+        try:
+            recovery_policy = int(resolved_task["recovery_policy_version"])
+        except (TypeError, ValueError):
+            raise H3BenchmarkError("H3 recovery policy version is invalid") from None
+        if recovery_policy < 1:
+            raise H3BenchmarkError("H3 recovery policy version is invalid")
+        resolved_task["recovery_policy_version"] = recovery_policy
     signature = _safe_input_shape(input_signature)
     if case_id != "text_only" and not signature:
         raise H3BenchmarkError(f"{case_id} requires a content-free reference shape")
@@ -311,6 +334,7 @@ def _sanitize_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
             "lora_count", "cache_enabled", "warmup_runs", "measured_runs",
             "source_audio_mode", "audio_algorithm_version",
             "video_evaluations", "audio_evaluations", "multirate_profile",
+            "offload_profile", "recovery_policy_version",
         )
         if key in raw_task and isinstance(raw_task[key], (str, int, float, bool))
     }
@@ -332,6 +356,22 @@ def _sanitize_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
         and safe_task.get("audio_evaluations") == 8
     ):
         return None
+    if "offload_profile" in safe_task:
+        try:
+            safe_task["offload_profile"] = int(safe_task["offload_profile"])
+        except (TypeError, ValueError):
+            return None
+        if safe_task["offload_profile"] not in {1, 2, 3, 4, 5}:
+            return None
+    if "recovery_policy_version" in safe_task:
+        try:
+            safe_task["recovery_policy_version"] = int(
+                safe_task["recovery_policy_version"]
+            )
+        except (TypeError, ValueError):
+            return None
+        if safe_task["recovery_policy_version"] < 1:
+            return None
     safe_spec = {
         "schema_version": SCHEMA_VERSION,
         "case_id": str(raw_spec.get("case_id") or "text_only"),
@@ -1023,6 +1063,266 @@ def build_benchmark_report(records: list[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+_ALLOCATION_SCENARIO_FIELDS = (
+    "model_type", "width", "height", "frame_count", "authored_steps",
+    "effective_steps", "attention_engine", "attention_signature",
+    "schedule_id", "resource_kind", "offload_profile",
+    "policy_version", "host_ram_band_gib", "free_vram_band_gib",
+    "residency_epoch_band",
+)
+_ALLOCATION_OUTCOMES = {
+    "clean_oom", "contaminated_oom", "production_success",
+    "confirmation_success", "probe_success",
+}
+
+
+def _allocation_scenario(value: Mapping[str, Any]) -> dict[str, Any]:
+    source = dict(value or {})
+    result = {}
+    for field in _ALLOCATION_SCENARIO_FIELDS:
+        item = source.get(field)
+        if field in {
+            "model_type", "attention_engine", "attention_signature",
+            "schedule_id", "resource_kind",
+        }:
+            token = str(item or "")
+            if re.fullmatch(r"[A-Za-z0-9_.+-]{1,96}", token) is None:
+                raise H3BenchmarkError("Invalid H3 allocation scenario")
+            result[field] = token
+        else:
+            if isinstance(item, bool):
+                raise H3BenchmarkError("Invalid H3 allocation scenario")
+            try:
+                number = int(item)
+            except (TypeError, ValueError):
+                raise H3BenchmarkError("Invalid H3 allocation scenario") from None
+            if number < 0:
+                raise H3BenchmarkError("Invalid H3 allocation scenario")
+            result[field] = number
+    return result
+
+
+def _allocation_key(scenario: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(scenario), sort_keys=True, separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class H3AllocationLedger:
+    """Bounded content-free allocation evidence with episode deduplication."""
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = Path(path)
+        self._lock = threading.RLock()
+        from services.generation_names import GenerationNameRegistry
+        # Reuse its reviewed no-follow directory anchoring, cross-process
+        # locking, Windows write-through replacement, and parent fsync seam.
+        self._storage_guard = GenerationNameRegistry(self.path)
+
+    def _read(self, directory_descriptor: int | None) -> dict[str, Any]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = (
+                os.open(self.path, flags)
+                if directory_descriptor is None else os.open(
+                    self.path.name, flags, dir_fd=directory_descriptor,
+                )
+            )
+        except FileNotFoundError:
+            return {"schema_version": ALLOCATION_LEDGER_SCHEMA_VERSION,
+                    "heuristic_revision": ALLOCATION_HEURISTIC_REVISION,
+                    "scenarios": {}}
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size > 2 * 1024 * 1024
+                or (os.name != "nt" and stat.S_IMODE(opened.st_mode) != 0o600)
+            ):
+                raise H3BenchmarkError("H3 allocation ledger is unsafe")
+            chunks = []
+            remaining = 2 * 1024 * 1024 + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = json.loads(b"".join(chunks).decode("ascii"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise H3BenchmarkError("H3 allocation ledger is unavailable") from None
+        finally:
+            os.close(descriptor)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != ALLOCATION_LEDGER_SCHEMA_VERSION
+            or payload.get("heuristic_revision") != ALLOCATION_HEURISTIC_REVISION
+            or not isinstance(payload.get("scenarios"), dict)
+        ):
+            raise H3BenchmarkError("H3 allocation ledger is invalid")
+        clean = {}
+        for key, item in list(payload["scenarios"].items())[-512:]:
+            if not isinstance(key, str) or not isinstance(item, dict):
+                continue
+            try:
+                scenario = _allocation_scenario(item.get("scenario") or {})
+            except H3BenchmarkError:
+                continue
+            if _allocation_key(scenario) != key:
+                continue
+            counts = item.get("counts")
+            counts = counts if isinstance(counts, dict) else {}
+            clean[key] = {
+                "scenario": scenario,
+                "counts": {
+                    outcome: max(0, min(1_000_000, int(counts.get(outcome) or 0)))
+                    for outcome in _ALLOCATION_OUTCOMES
+                },
+                "last_episode_bucket": max(
+                    0, int(item.get("last_episode_bucket") or 0),
+                ),
+                "last_outcome": str(item.get("last_outcome") or ""),
+                "contamination_reason": str(
+                    item.get("contamination_reason") or ""
+                )[:64],
+            }
+        return {"schema_version": ALLOCATION_LEDGER_SCHEMA_VERSION,
+                "heuristic_revision": ALLOCATION_HEURISTIC_REVISION,
+                "scenarios": clean}
+
+    def _write(
+        self,
+        payload: Mapping[str, Any],
+        directory_descriptor: int | None,
+    ) -> None:
+        from services.generation_names import _windows_replace_write_through
+        encoded = json.dumps(
+            dict(payload), sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
+        if len(encoded) > 2 * 1024 * 1024:
+            raise H3BenchmarkError("H3 allocation ledger is too large")
+        temporary_name = f".{self.path.name}.{os.urandom(16).hex()}.tmp"
+        temporary = self.path.parent / temporary_name
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = None
+        try:
+            descriptor = (
+                os.open(temporary, flags, 0o600)
+                if directory_descriptor is None else os.open(
+                    temporary_name, flags, 0o600,
+                    dir_fd=directory_descriptor,
+                )
+            )
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise H3BenchmarkError(
+                        "H3 allocation ledger write made no progress"
+                    )
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            if directory_descriptor is None:
+                _windows_replace_write_through(temporary, self.path)
+            else:
+                os.replace(
+                    temporary_name, self.path.name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+                os.fsync(directory_descriptor)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                if directory_descriptor is None:
+                    os.unlink(temporary)
+                else:
+                    os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+
+    def record(
+        self,
+        scenario: Mapping[str, Any],
+        outcome: str,
+        *,
+        contamination_reason: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        if outcome not in _ALLOCATION_OUTCOMES:
+            raise H3BenchmarkError("Invalid H3 allocation outcome")
+        clean_scenario = _allocation_scenario(scenario)
+        key = _allocation_key(clean_scenario)
+        episode = int((time.time() if now is None else now) // (15 * 60))
+        with self._lock, self._storage_guard._cross_process_lock_locked() as directory_descriptor:
+            payload = self._read(directory_descriptor)
+            item = payload["scenarios"].get(key) or {
+                "scenario": clean_scenario,
+                "counts": {name: 0 for name in _ALLOCATION_OUTCOMES},
+                "last_episode_bucket": 0,
+                "last_outcome": "",
+                "contamination_reason": "",
+            }
+            # Bursts in one short incident window/shared residency vote once.
+            if not (
+                item.get("last_episode_bucket") == episode
+                and item.get("last_outcome") == outcome
+            ):
+                item["counts"][outcome] = int(item["counts"].get(outcome) or 0) + 1
+            item["last_episode_bucket"] = episode
+            item["last_outcome"] = outcome
+            item["contamination_reason"] = (
+                str(contamination_reason)[:64]
+                if outcome == "contaminated_oom" else ""
+            )
+            payload["scenarios"][key] = item
+            if len(payload["scenarios"]) > 512:
+                payload["scenarios"] = dict(
+                    list(payload["scenarios"].items())[-512:]
+                )
+            self._write(payload, directory_descriptor)
+            return json.loads(json.dumps(item))
+
+    def snapshot(self, scenario: Mapping[str, Any]) -> dict[str, Any]:
+        clean_scenario = _allocation_scenario(scenario)
+        key = _allocation_key(clean_scenario)
+        with self._lock, self._storage_guard._cross_process_lock_locked() as directory_descriptor:
+            payload = self._read(directory_descriptor)
+        item = payload["scenarios"].get(key) or {
+            "scenario": clean_scenario,
+            "counts": {name: 0 for name in _ALLOCATION_OUTCOMES},
+        }
+        counts = item["counts"]
+        voting_successes = int(counts.get("production_success") or 0) + int(
+            counts.get("confirmation_success") or 0
+        )
+        clean_ooms = int(counts.get("clean_oom") or 0)
+        snapshot = {
+            "revision": ALLOCATION_HEURISTIC_REVISION,
+            "clean_oom_episodes": clean_ooms,
+            "contaminated_oom_episodes": int(
+                counts.get("contaminated_oom") or 0
+            ),
+            "strong_success_episodes": voting_successes,
+            "probe_success_episodes": int(counts.get("probe_success") or 0),
+            "globally_suppressed": clean_ooms >= ALLOCATION_OOM_THRESHOLD,
+            "upward_confirmed": voting_successes >= ALLOCATION_SUCCESS_HYSTERESIS,
+        }
+        snapshot["digest"] = hashlib.sha256(json.dumps(
+            snapshot, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")).hexdigest()
+        return snapshot
+
+
 class H3BenchmarkCache:
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
@@ -1119,6 +1419,8 @@ class H3BenchmarkCache:
 
 __all__ = [
     "CASE_IDS", "QUICK_TASK", "PUBLISHED_EXTERNAL", "H3BenchmarkCache",
+    "H3AllocationLedger", "ALLOCATION_HEURISTIC_REVISION",
+    "ALLOCATION_OOM_THRESHOLD", "ALLOCATION_SUCCESS_HYSTERESIS",
     "H3BenchmarkError", "build_benchmark_spec", "measure_benchmark",
     "record_observation", "build_benchmark_report", "estimate_h3_output",
     "normalize_estimate_context", "validate_output_artifacts",

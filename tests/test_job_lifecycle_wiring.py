@@ -834,6 +834,8 @@ class TestJobLifecycleWiring(unittest.TestCase):
                 "_queue_recovery_is_blocked": lambda _job: False,
                 "_public_queue_residency_metadata": lambda *_args, **_kwargs: {},
                 "_public_queue_recovery_metadata": lambda *_args, **_kwargs: {},
+                "_public_resource_metadata": lambda *_args, **_kwargs: {},
+                "_public_parent_job_id": lambda _job: None,
                 "_set_recovery_no_store": lambda response: (
                     response.headers.update({
                         "Cache-Control": "private, no-store",
@@ -851,7 +853,11 @@ class TestJobLifecycleWiring(unittest.TestCase):
 
         self.assertEqual(call_order, ["gate", "snapshot"])
         require_remote_project.assert_called_once()
-        self.assertEqual(response["summary"], summary)
+        self.assertEqual(response["summary"], {
+            **summary,
+            "cpu_text_running": 0,
+            "cpu_text_waiting": 0,
+        })
         self.assertEqual(response["summary"]["active_total"], sum(
             response["summary"][name]
             for name in ("running", "waiting", "held", "registering")

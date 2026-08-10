@@ -66,6 +66,7 @@ const MODE_LABELS: { mode: GenerationMode; label: string }[] = [
 const COLLAPSED_FAMILIES_KEY = 'maestro-collapsed-model-families'
 
 function ModelVisibilitySection() {
+  const activeWorkspace = useStore(s => s.activeWorkspace)
   const models = useStore(s => s.models)
   const families = useStore(s => s.families)
   const enabledModels = useStore(s => s.enabledModels)
@@ -126,14 +127,15 @@ function ModelVisibilitySection() {
     setDownloadErrors(prev => { const next = { ...prev }; delete next[modelType]; return next })
     setDownloading(prev => new Set(prev).add(modelType))
     try {
-      await api.downloadModel(modelType)
+      if (!activeWorkspace) throw new Error('Select and unlock a project before downloading models')
+      await api.downloadModel(modelType, activeWorkspace)
       window.dispatchEvent(new CustomEvent(DOWNLOAD_REFRESH_EVENT))
     } catch (e) {
       console.error('Download start failed:', e)
       setDownloading(prev => { const next = new Set(prev); next.delete(modelType); return next })
       setDownloadErrors(prev => ({ ...prev, [modelType]: String(e) }))
     }
-  }, [])
+  }, [activeWorkspace])
 
   // When the ModelSelector "+N more" hint fires, open this section, expand
   // the requested mode, and scroll it into view — then clear the request.
@@ -192,17 +194,17 @@ function ModelVisibilitySection() {
 
   // Group every installed/registered model by generation mode.
   const visibleModels = models
-  const modelsByMode = new Map<GenerationMode, { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string }[] }[]>()
+  const modelsByMode = new Map<GenerationMode, { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string; downloadable?: boolean; manual_checkpoint_verified?: boolean }[] }[]>()
   for (const { mode } of MODE_LABELS) {
     const modeFamilies = getFamiliesForMode(mode, families)
-    const groups: { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string }[] }[] = []
+    const groups: { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string; downloadable?: boolean; manual_checkpoint_verified?: boolean }[] }[] = []
     for (const fam of modeFamilies) {
       const familyModels = getModelsForFamily(fam.id, visibleModels, mode)
       if (familyModels.length > 0) {
         groups.push({
           familyId: fam.id,
           familyLabel: fam.label,
-          models: familyModels.map(m => ({ model_type: m.model_type, name: m.name, is_downloaded: m.is_downloaded, architecture: m.architecture })),
+          models: familyModels.map(m => ({ model_type: m.model_type, name: m.name, is_downloaded: m.is_downloaded, architecture: m.architecture, downloadable: m.downloadable, manual_checkpoint_verified: m.manual_checkpoint_verified })),
         })
       }
     }
@@ -339,6 +341,16 @@ function ModelVisibilitySection() {
                             <Loader2 size={10} className="text-accent-blue shrink-0 animate-spin" />
                           ) : m.architecture === 'mmaudio' ? (
                             <Download size={10} className="text-text-muted shrink-0" />
+                          ) : m.downloadable === false ? (
+                            <span
+                              aria-label={m.manual_checkpoint_verified ? 'Manual checkpoint verified; supporting files pending' : 'Manual install and verification required'}
+                              title={m.manual_checkpoint_verified ? 'The exact manual checkpoint is verified; supporting model files are not ready yet' : 'Manual install and verification required; use the model selector to review terms and verify the exact local checkpoint'}
+                            >
+                              <FolderOpen
+                                size={10}
+                                className="text-amber-300 shrink-0"
+                              />
+                            </span>
                           ) : (
                             <button
                               onClick={e => { e.preventDefault(); e.stopPropagation(); handleDownload(m.model_type) }}

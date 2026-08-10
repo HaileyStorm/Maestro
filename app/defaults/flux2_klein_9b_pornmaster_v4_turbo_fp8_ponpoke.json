@@ -1,0 +1,156 @@
+{
+    "model": {
+        "name": "FLUX.2 Klein 9B — PornMaster V4 Turbo FP8 + Ponpoke Encoder (Experimental)",
+        "architecture": "flux2_klein_9b",
+        "description": "Experimental manual-only layered FLUX.2 Klein 9B generation and editing recipe. It combines the PornMaster V4 Turbo FP8 transformer tune with the pinned ponpoke Qwen3 8B conditioning encoder while preserving the external FLUX.2 VAE and canonical Qwen3 8B tokenizer/config assets. It is source-registered for manual evaluation only and has no verified quality or automatic-routing status.",
+        "selector_help": "Experimental/manual: exact Klein 9B PornMaster V4 Turbo FP8 transformer plus pinned ponpoke Qwen3 8B encoder. Install the checkpoint manually only after verifying the published SHA-256; Maestro's generic model URL loader is intentionally not used for this artifact. Creator iamddtla requires credit, permits derivatives, and lists commercial use as RentCivit only; the underlying FLUX base remains non-commercial.",
+        "URLs": [
+            "pornmasterFlux2Klein_v4TurboFp8.safetensors"
+        ],
+        "text_encoder_URLs": [
+            "https://huggingface.co/ponpoke/flux2-klein-9b-uncensored-text-encoder/resolve/fba36e796aac081246708dd30392a401ba44922e/model.safetensors"
+        ],
+        "text_encoder_folder": "flux2_klein_9b_uncensored_text_encoder",
+        "text_encoder_tokenizer_folder": "qwen3_8b",
+        "text_encoder_quantization": "bf16",
+        "content_capability": "uncensored_layered_recipe",
+        "visible": true,
+        "availability_status": "experimental_manual_installation",
+        "manual_installation_ready": true,
+        "downloadable": false,
+        "selection_policy": "manual_only",
+        "automatic_routing": false,
+        "verified": false,
+        "default_for_operations": [],
+        "source_gated": true,
+        "manual_review_required": true,
+        "required_host_terms": [
+            "civitai_2382648_2973304_creator_terms",
+            "bfl_flux2_self_review",
+            "ponpoke_flux2_klein_9b_self_review"
+        ],
+        "capability_recipe": {
+            "kind": "layered_checkpoint_and_conditioning_encoder",
+            "base_model": "flux2_klein_9b",
+            "operations": [
+                "generation",
+                "editing"
+            ],
+            "changed_components": [
+                "transformer",
+                "text_encoder"
+            ],
+            "preserved_components": [
+                "vae",
+                "tokenizer_config"
+            ],
+            "quality_status": "experimental_requires_benchmark",
+            "component_graph": [
+                {
+                    "component": "transformer",
+                    "role": "exact_family_tune",
+                    "artifact": "checkpoint"
+                },
+                {
+                    "component": "vae",
+                    "role": "preserved_external_base",
+                    "source_model": "flux2_klein_9b",
+                    "filename": "flux2_vae.safetensors"
+                },
+                {
+                    "component": "text_encoder",
+                    "role": "conditioning_override",
+                    "artifact": "text_encoder",
+                    "family": "qwen3_8b",
+                    "precision": "bf16"
+                },
+                {
+                    "component": "tokenizer_config",
+                    "role": "preserved_external_base",
+                    "source_model": "flux2_klein_9b",
+                    "folder": "qwen3_8b"
+                }
+            ]
+        },
+        "artifact_provenance": {
+            "scope": "changed_artifacts_only",
+            "preserved_asset_sources": "capability_recipe.component_graph",
+            "checkpoint": {
+                "provider": "civitai",
+                "artifact_kind": "exact_family_tune",
+                "creator": "iamddtla",
+                "model_id": 2382648,
+                "version_id": 2973304,
+                "filename": "pornmasterFlux2Klein_v4TurboFp8.safetensors",
+                "precision": "fp8",
+                "size_kb": 9212016.476,
+                "size_bytes": 9433104872,
+                "sha256": "E90EEB50140A10806341B7521C340214C6F76CEC2F8F8DAE7A443C5806072DF7",
+                "source_url": "https://civitai.com/models/2382648?modelVersionId=2973304",
+                "download_url": "https://civitai.com/api/download/models/2973304",
+                "download_policy": "manual_hash_verified_only",
+                "loader_auto_download": false,
+                "exact_family": "FLUX.2 Klein 9B",
+                "operations": [
+                    "generation",
+                    "editing"
+                ],
+                "creator_terms": {
+                    "allowNoCredit": false,
+                    "allowDerivatives": true,
+                    "allowCommercialUse": [
+                        "RentCivit"
+                    ],
+                    "underlying_base_license": "FLUX non-commercial"
+                }
+            },
+            "text_encoder": {
+                "provider": "huggingface",
+                "artifact_kind": "conditioning_encoder",
+                "repo_id": "ponpoke/flux2-klein-9b-uncensored-text-encoder",
+                "revision": "fba36e796aac081246708dd30392a401ba44922e",
+                "path": "model.safetensors",
+                "size_bytes": 16381516808,
+                "access": "gated-auto",
+                "license": "FLUX non-commercial v2.1 plus repository access conditions",
+                "content_sha256": null,
+                "content_sha256_status": "unavailable_until_authorized_download"
+            },
+            "vae": {
+                "provider": "huggingface",
+                "artifact_kind": "preserved_external_base_vae",
+                "source_model": "flux2_klein_9b",
+                "repo_id": "DeepBeepMeep/Flux2",
+                "revision": null,
+                "path": "flux2_vae.safetensors",
+                "content_sha256": null,
+                "content_sha256_status": "inherited_base_asset_not_pinned_in_current_manifest"
+            },
+            "tokenizer_config": {
+                "provider": "huggingface",
+                "artifact_kind": "canonical_tokenizer_and_config",
+                "source_model": "flux2_klein_9b",
+                "repo_id": "DeepBeepMeep/Flux2",
+                "revision": null,
+                "folder": "qwen3_8b",
+                "paths": [
+                    "config.json",
+                    "generation_config.json",
+                    "added_tokens.json",
+                    "chat_template.jinja",
+                    "merges.txt",
+                    "special_tokens_map.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "vocab.json"
+                ],
+                "content_sha256": null,
+                "content_sha256_status": "inherited_base_assets_not_pinned_in_current_manifest"
+            }
+        }
+    },
+    "prompt": "a cinematic portrait with natural skin texture, dimensional lighting, and precise fine detail",
+    "resolution": "1024x1024",
+    "num_inference_steps": 4,
+    "guidance_scale": 1
+}

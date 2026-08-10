@@ -20,6 +20,7 @@ if _APP_DIR not in sys.path:
 
 from services import llm_service  # noqa: E402
 from services.director.h3_dialogue import (  # noqa: E402
+    H3DialogueContractError,
     compile_h3_clip_plans,
     compile_h3_official_prompt,
     validate_h3_context_ir_records,
@@ -48,13 +49,26 @@ _FORBIDDEN_EXECUTION_TERMS = (
     "native", "overlap", "model limit",
 )
 
-_BASE_60S = """integrated_multimodal_description:
+_BASE_ENTITY_FALLBACK = (
+    "subject_definitions: No separately named subjects were authored; shot "
+    "records carry only the request's explicitly described visible action and setting."
+)
+
+
+def _base_prompt(value: str) -> str:
+    """Keep legacy synthetic Base responses explicit under the new contract."""
+
+    if "subject_definitions:" in value:
+        return value
+    return f"{_BASE_ENTITY_FALLBACK}\n\n{value}"
+
+_BASE_60S = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-00:30.000s] shot_name: Opening address | audiovisual_description: A singer in a red coat faces camera. | dialogue_and_vocalizations: The singer (S1) says: <d>[English] Keep every word exactly.</d>
 [Shot 2] [00:30.000s-60.00s] shot_name: Stage crossing | audiovisual_description: Cut to the same singer crossing the stage; she stops at the end. | dialogue_and_vocalizations: none
 
 overall_soundscape: Audience room tone and footsteps.
 
-non_diegetic_music: A restrained piano theme continues throughout."""
+non_diegetic_music: A restrained piano theme continues throughout.""")
 
 _REF_30S = """subject_definitions: <Subject 1> is the singer from <Picture 1>.
 summary: [reference generation] Preserve <Subject 1>.
@@ -65,11 +79,11 @@ detailed_description:
 overall_soundscape: Quiet room tone and piano-key sounds.
 non_diegetic_music: N/A"""
 
-_BASE_IRREGULAR = """integrated_multimodal_description:
+_BASE_IRREGULAR = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-7.35s] shot_name: Mara's doorway pause | audiovisual_description: Mara waits at the doorway while Theo turns from the desk. | dialogue_and_vocalizations: Mara gives one soft gasp.
 [Shot 2] [7.35s-18.20s] shot_name: Theo's exact reply | audiovisual_description: Theo crosses to screen-left and Mara holds position. | dialogue_and_vocalizations: Theo (S1) says: <d>[English] Keep this exact.</d>
 overall_soundscape: Quiet room tone and one synchronized footstep.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
 
 _REF_IRREGULAR = """subject_definitions: <Subject 1> is Mara from <Picture 1>; <Subject 2> is Theo from <Picture 2>.
 summary: [reference generation] Mara hears Theo's answer.
@@ -135,6 +149,367 @@ class TestH3LongDurationGuides(unittest.TestCase):
         self.assertIn("chipped blue cup", combined)
         self.assertNotIn("automatic long-video segment", compact)
         self._assert_no_execution_terms(combined)
+
+    def test_base_entity_namespace_and_multi_beat_records_are_deterministic(self):
+        multi_beat = """subject_definitions: <Subject 1> is Mara (S1): adult woman in a red coat with a silver key.
+
+integrated_multimodal_description:
+[Shot 1] [0.00s-8.25s] shot_name: Doorway wait | audiovisual_description: <Subject 1> (Mara) waits beside the door as the camera settles. | dialogue_and_vocalizations: none
+[Shot 2] [8.25s-27.40s] shot_name: Key turn | audiovisual_description: <Subject 1> (Mara) raises the silver key and unlocks the door. | dialogue_and_vocalizations: none
+[Shot 3] [27.40s-42.00s] shot_name: Opening reveal | audiovisual_description: <Subject 1> (Mara) opens the door and holds the changed position. | dialogue_and_vocalizations: none
+
+overall_soundscape: Quiet room tone and one synchronized key turn.
+
+non_diegetic_music: N/A"""
+        one_take = """subject_definitions: <Subject 1> is the singer (S1): adult singer in a blue jacket.
+
+integrated_multimodal_description:
+[Shot 1] [0.00s-42.00s] shot_name: Sustained one-take | audiovisual_description: <Subject 1> (the singer) remains in the single authored composition while the camera slowly pushes in. | dialogue_and_vocalizations: none
+
+overall_soundscape: Quiet room tone.
+
+non_diegetic_music: N/A"""
+        self.assertEqual(
+            validate_h3_context_ir_records(
+                multi_beat, mode="t2va", duration_seconds=42,
+            ),
+            [],
+        )
+        self.assertEqual(
+            validate_h3_context_ir_records(
+                one_take, mode="t2va", duration_seconds=42,
+            ),
+            [],
+        )
+        repeated = multi_beat.replace(
+            "<Subject 1> (Mara) raises the silver key",
+            "<Subject 1> (Mara) adult woman in a red coat with a silver key raises the silver key",
+        )
+        self.assertTrue(any(
+            "full entity description is repeated" in error
+            for error in validate_h3_context_ir_records(
+                repeated, mode="t2va", duration_seconds=42,
+            )
+        ))
+        short_non_subject_use = multi_beat.replace(
+            "Mara (S1): adult woman in a red coat with a silver key",
+            "Mara: tall",
+        ).replace(
+            "waits beside the door as the camera settles",
+            "walks past a tall tree as the camera settles",
+        )
+        self.assertFalse(any(
+            "full entity description is repeated" in error
+            for error in validate_h3_context_ir_records(
+                short_non_subject_use, mode="t2va", duration_seconds=42,
+            )
+        ))
+        short_description = multi_beat.replace(
+            "Mara (S1): adult woman in a red coat with a silver key",
+            "Mara: tall blue-coated medic",
+        ).replace(
+            "<Subject 1> (Mara) raises the silver key",
+            "<Subject 1> (Mara) tall blue-coated medic raises the silver key",
+        )
+        self.assertTrue(any(
+            "full entity description is repeated" in error
+            for error in validate_h3_context_ir_records(
+                short_description, mode="t2va", duration_seconds=42,
+            )
+        ))
+        comma_form = multi_beat.replace(
+            "Mara (S1): adult woman in a red coat with a silver key",
+            "Mara, adult woman in a red coat with a silver key",
+        )
+        comma_repeated = comma_form.replace(
+            "<Subject 1> (Mara) raises the silver key",
+            "<Subject 1> (Mara) adult woman in a red coat with a silver key raises the silver key",
+        )
+        self.assertTrue(any(
+            "full entity description is repeated" in error
+            for error in validate_h3_context_ir_records(
+                comma_repeated, mode="t2va", duration_seconds=42,
+            )
+        ))
+        comma_repeated_before = comma_form.replace(
+            "<Subject 1> (Mara) raises the silver key",
+            "adult woman in a red coat with a silver key <Subject 1> (Mara) raises the silver key",
+        )
+        self.assertTrue(any(
+            "full entity description is repeated" in error
+            for error in validate_h3_context_ir_records(
+                comma_repeated_before, mode="t2va", duration_seconds=42,
+            )
+        ))
+        missing = multi_beat.replace("subject_definitions: <Subject 1>", "")
+        self.assertTrue(any(
+            "subject_definitions" in error
+            for error in validate_h3_context_ir_records(
+                missing, mode="t2va", duration_seconds=42,
+            )
+        ))
+
+    def test_base_compiler_preserves_authored_namespace_over_stale_metadata(self):
+        source = """subject_definitions: <Subject 1> is The Very Red Fox: adult animal with a silver collar.
+
+integrated_multimodal_description:
+[Shot 1] [0.00s-12.00s] shot_name: Fox crosses | audiovisual_description: <Subject 1> (The Very Red Fox) crosses the described garden. | dialogue_and_vocalizations: none
+
+overall_soundscape: Garden room tone.
+non_diegetic_music: N/A"""
+        compiled, _ = compile_h3_official_prompt(
+            source,
+            [{"character_id": "stale", "speaker_name": "Stale Metadata"}],
+            [],
+            duration_seconds=12,
+        )
+        self.assertIn(
+            "<Subject 1> is The Very Red Fox: adult animal with a silver collar",
+            compiled,
+        )
+        self.assertNotIn("Stale Metadata", compiled)
+        self.assertNotIn("No separately named subjects were authored", compiled)
+        self.assertEqual(
+            validate_h3_context_ir_records(
+                compiled, mode="t2va", duration_seconds=12,
+            ),
+            [],
+        )
+
+    def test_ref2va_compiler_preserves_authored_namespace_over_stale_metadata(self):
+        source = """subject_definitions: <Subject 1> is The Very Red Fox: adult fox with a silver collar.
+summary: Preserve the authored fox scene.
+retention_analysis: <Subject 1> identity and silver collar are fully preserved from <Picture 1>.
+detailed_description:
+[Shot 1] [0.00s-12.00s] shot_name: Fox crosses | audiovisual_description: <Subject 1> (The Very Red Fox) crosses the garden. | dialogue_and_vocalizations: none
+overall_soundscape: Garden room tone.
+non_diegetic_music: N/A"""
+        compiled, _ = compile_h3_official_prompt(
+            source,
+            [{
+                "character_id": "stale",
+                "speaker_name": "Stale Metadata",
+                "visual_description": "invented details",
+            }],
+            [],
+            mode="ref2va",
+            duration_seconds=12,
+        )
+        self.assertIn(
+            "<Subject 1> is The Very Red Fox: adult fox with a silver collar",
+            compiled,
+        )
+        self.assertIn(
+            "<Subject 1> identity and silver collar are fully preserved from <Picture 1>",
+            compiled,
+        )
+        self.assertNotIn("Stale Metadata", compiled)
+        self.assertNotIn("invented details", compiled)
+        self.assertEqual(
+            validate_h3_context_ir_records(
+                compiled, mode="ref2va", duration_seconds=12,
+            ),
+            [],
+        )
+
+    def test_base_entity_references_are_closed_and_repetition_is_contextual(self):
+        def prompt(definitions: str, visual: str) -> str:
+            return (
+                f"subject_definitions: {definitions}\n\n"
+                "integrated_multimodal_description:\n"
+                f"[Shot 1] [0.00s-10.00s] shot_name: Test | "
+                f"audiovisual_description: {visual} | "
+                "dialogue_and_vocalizations: none\n"
+                "overall_soundscape: Room tone\nnon_diegetic_music: N/A"
+            )
+
+        sentinel_orphan = prompt(
+            _BASE_ENTITY_FALLBACK.removeprefix("subject_definitions: "),
+            "<Subject 1> moves through the room.",
+        )
+        self.assertTrue(any(
+            "sentinel" in error
+            for error in validate_h3_context_ir_records(sentinel_orphan)
+        ))
+        undefined = prompt(
+            "<Subject 1> is Mara.",
+            "<Subject 2> moves through the room.",
+        )
+        self.assertTrue(any(
+            "undefined" in error
+            for error in validate_h3_context_ir_records(undefined)
+        ))
+        unreferenced = prompt(
+            "<Subject 1> is Mara.\n<Subject 2> is Theo.",
+            "<Subject 1> remains beside the door.",
+        )
+        self.assertTrue(any(
+            "never referenced" in error
+            for error in validate_h3_context_ir_records(unreferenced)
+        ))
+        valid_name = prompt(
+            "<Subject 1> is The Very Red Fox: adult animal with a silver collar.",
+            "<Subject 1> (The Very Red Fox) crosses the garden.",
+        )
+        self.assertEqual(validate_h3_context_ir_records(valid_name), [])
+        repeated = valid_name.replace(
+            "crosses the garden.",
+            "adult animal with a silver collar crosses the garden.",
+        )
+        self.assertTrue(any(
+            "full entity description is repeated" in error
+            for error in validate_h3_context_ir_records(repeated)
+        ))
+
+    def test_base_compiler_rejects_orphan_labels_without_inventing_entities(self):
+        source = """subject_definitions: No separately named subjects were authored; shot records carry only the request's explicitly described visible action and setting.
+
+integrated_multimodal_description:
+[Shot 1] [0.00s-10.00s] shot_name: Walk | audiovisual_description: <Subject 1> crosses the room. | dialogue_and_vocalizations: none
+overall_soundscape: Room tone.
+non_diegetic_music: N/A"""
+        with self.assertRaisesRegex(
+            H3DialogueContractError, "sentinel is orphaned",
+        ):
+            compile_h3_official_prompt(source, [], [])
+
+        unreferenced = source.replace(
+            "No separately named subjects were authored; shot records carry only "
+            "the request's explicitly described visible action and setting.",
+            "<Subject 1> is Mara.\n<Subject 2> is Theo.",
+        )
+        with self.assertRaisesRegex(
+            H3DialogueContractError, "<Subject 2> is never referenced",
+        ) as raised:
+            compile_h3_official_prompt(unreferenced, [], [])
+        self.assertNotIn("remains outside", str(raised.exception))
+
+    def test_base_source_structure_contract_rejects_collapse_and_equal_pacing(self):
+        source = (
+            "A 42-second request has distinct authored beats: first the subject "
+            "waits, then the subject turns the key, finally the door opens."
+        )
+        one_record = _base_prompt("""integrated_multimodal_description:
+[Shot 1] [0.00s-42.00s] shot_name: All beats | audiovisual_description: The subject waits, turns the key, and opens the door. | dialogue_and_vocalizations: none
+overall_soundscape: Room tone.
+non_diegetic_music: N/A""")
+        equal_records = _base_prompt("""integrated_multimodal_description:
+[Shot 1] [0.00s-14.00s] shot_name: Wait | audiovisual_description: The subject waits. | dialogue_and_vocalizations: none
+[Shot 2] [14.00s-28.00s] shot_name: Turn | audiovisual_description: The subject turns the key. | dialogue_and_vocalizations: none
+[Shot 3] [28.00s-42.00s] shot_name: Open | audiovisual_description: The door opens. | dialogue_and_vocalizations: none
+overall_soundscape: Room tone.
+non_diegetic_music: N/A""")
+        self.assertTrue(any(
+            "collapsed explicit multi-beat" in error
+            for error in llm_service._h3_source_structure_errors(
+                source, one_record, duration_seconds=42,
+            )
+        ))
+        self.assertTrue(any(
+            "equal-duration" in error
+            for error in llm_service._h3_source_structure_errors(
+                source, equal_records, duration_seconds=42,
+            )
+        ))
+        one_take_source = "An explicitly sustained one unbroken take holds a singer for 42 seconds."
+        two_records = equal_records.replace(
+            "[Shot 3] [28.00s-42.00s]", "[Shot 3] [28.00s-42.00s]",
+        )
+        self.assertTrue(any(
+            "one-take" in error
+            for error in llm_service._h3_source_structure_errors(
+                one_take_source, two_records, duration_seconds=42,
+            )
+        ))
+        one_take_with_internal_beats = (
+            "One sustained unbroken take: first Mara enters, then she sits, "
+            "and finally she sleeps."
+        )
+        self.assertEqual(
+            llm_service._h3_source_structure_errors(
+                one_take_with_internal_beats,
+                one_record,
+                duration_seconds=42,
+            ),
+            [],
+        )
+        for noun_source in (
+            "A bartender pours a single shot of espresso, then Mara drinks it over 42 seconds.",
+            "A nurse prepares a single shot of medicine, then Mara receives it over 42 seconds.",
+            "A single composition by Mozart plays, then Mara leaves over 42 seconds.",
+            "A continuous composition by Mozart plays, then Mara leaves over 42 seconds.",
+        ):
+            errors = llm_service._h3_source_structure_errors(
+                noun_source, equal_records, duration_seconds=42,
+            )
+            self.assertFalse(any("one-take" in error for error in errors))
+
+    def test_base_enhance_contract_rejects_added_entities_events_and_cuts(self):
+        source = "Mara waits in the room."
+        invented = """subject_definitions: <Subject 1> is Mara.
+<Subject 2> is Theo.
+
+integrated_multimodal_description:
+[Shot 1] [0.00s-6.00s] shot_name: Mara waits | audiovisual_description: <Subject 1> waits in the room. | dialogue_and_vocalizations: none
+[Shot 2] [6.00s-12.00s] shot_name: Theo enters | audiovisual_description: Cut to <Subject 2> entering with a silver case. | dialogue_and_vocalizations: none
+overall_soundscape: Quiet room tone.
+non_diegetic_music: N/A"""
+        errors = llm_service._h3_enhance_contract_errors(
+            invented,
+            source,
+            ref2va=False,
+            duration_seconds=12,
+        )
+        self.assertTrue(any("unauthored entity" in error for error in errors))
+        self.assertTrue(any("added shot records" in error for error in errors))
+        self.assertTrue(any("unauthored cut" in error for error in errors))
+
+    def test_base_user_guidance_and_guide_do_not_invent_ref2va_clauses(self):
+        base_prompt = llm_service._build_enhance_user_prompt(
+            "A 42-second multi-beat request.", "video", 42, None, None,
+            h3_context_ir=True,
+        )
+        ref_prompt = llm_service._build_enhance_user_prompt(
+            "A 42-second reference request.", "video", 42, None, None,
+            h3_context_ir=True, h3_ref2va=True,
+        )
+        self.assertIn("multiple naturally unequal records", base_prompt)
+        self.assertNotIn("multiple naturally unequal records", ref_prompt)
+        guide = Path(_H3_GUIDE_PATHS[0]).read_text(encoding="utf-8")
+        self.assertIn("preserve only the requested observable result", guide)
+        self.assertIn("do not invent garments", guide)
+        self.assertNotIn("choose a restrained, established on-screen ability", guide)
+        self.assertNotIn("choose one restrained canonical everyday outfit", guide)
+        director_guide = Path(_H3_GUIDE_PATHS[3]).read_text(encoding="utf-8")
+        self.assertNotIn("Ref2VA", director_guide)
+        self.assertIn("separate model-specific guide", director_guide)
+
+    def test_base_guide_examples_close_subject_and_speaker_namespaces(self):
+        for path in (_H3_GUIDE_PATHS[0], _H3_GUIDE_PATHS[2], _H3_GUIDE_PATHS[3]):
+            with self.subTest(path=path):
+                guide = Path(path).read_text(encoding="utf-8")
+                self.assertIn("<Subject 1> is Mara (S1)", guide)
+                self.assertIn("<Subject 2> is Theo (S2)", guide)
+                self.assertIn("Theo (S2) says", guide)
+                self.assertNotIn("Theo (S1) says", guide)
+
+    def test_base_shot_guidance_preserves_one_take_and_requires_multi_beat_records(self):
+        guide = Path(_H3_GUIDE_PATHS[0]).read_text(encoding="utf-8")
+        compact = " ".join(guide.split())
+        self.assertIn("distinct authored beats, cuts, reactions, locations", compact)
+        self.assertIn("one sustained unbroken take", compact)
+        self.assertIn("define every authored visible entity once", compact.lower())
+        self.assertIn("never repeat the full definition", compact.lower())
+        user_prompt = llm_service._build_enhance_user_prompt(
+            "A 42-second multi-beat request.",
+            "video",
+            42,
+            None,
+            None,
+            h3_context_ir=True,
+        )
+        self.assertIn("multiple naturally unequal records", user_prompt)
+        self.assertIn("explicitly sustained one-take", user_prompt)
 
     def test_all_h3_guides_require_discrete_parseable_shot_records(self):
         required_shape = (
@@ -446,7 +821,7 @@ class TestH3LongDurationGuides(unittest.TestCase):
                     llm_service, "generate", side_effect=fake_generate,
                 ):
                     result = llm_service.enhance_prompt(
-                        "synthetic authorized request",
+                        response,
                         mode="video",
                         model_type=model_type,
                         duration_seconds=duration,
@@ -521,10 +896,10 @@ class TestH3LongDurationGuides(unittest.TestCase):
                 "window_prompts": window_prompts,
             }
 
-        canonical = """integrated_multimodal_description:
+        canonical = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-18.20s] shot_name: Exact reply | audiovisual_description: Mara stands screen-right as the camera pushes in. | dialogue_and_vocalizations: Mara (S1) says: <d>[English] Keep this exact.</d>
 overall_soundscape: Quiet office room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
         cases = (
             ("minimax_h3_fl2va", row(canonical, [])),
             (
@@ -596,12 +971,46 @@ non_diegetic_music: N/A"""
             ["First twenty-second passage."],
         )
 
+    def test_short_film_ref2va_guide_does_not_receive_base_layout_clauses(self):
+        ref_prompt = """subject_definitions: <Subject 1> is Mara from <Picture 1>.
+summary: [reference generation] Mara waits at the door.
+retention_analysis: <Subject 1>: fully_preserved - identity from <Picture 1>.
+detailed_description:
+[Shot 1] [0.00s-18.20s] shot_name: Door wait | audiovisual_description: <Subject 1> waits beside the door. No one speaks; mouths remain closed. | dialogue_and_vocalizations: none
+overall_soundscape: Quiet room tone.
+non_diegetic_music: N/A"""
+        row = {
+            "video_prompt": ref_prompt,
+            "dialogue_beats": [],
+            "window_prompts": [],
+        }
+        planner = ShortFilmPlanner()
+        planner._video_model = "minimax_h3_ref2va"
+        planner._image_model = "flux"
+        planner._uses_generated_shot_images = False
+        planner._build_all_image_paths = lambda *_args, **_kwargs: []
+        calls = []
+        planner._call_llm_json = lambda **kwargs: calls.append(kwargs) or [row]
+        planner._plan_audio_driven(
+            [{"start": 0.0, "end": 18.2, "label": "door wait"}],
+            "Mara waits at the door.",
+            lyrics=None,
+            speaker_mappings=None,
+            reference_image_path=None,
+            char_profiles=[],
+            has_reference=False,
+        )
+        system = calls[0]["system_prompt"]
+        self.assertIn("REFERENCE — MiniMax H3 Ref2VA guide", system)
+        self.assertIn("detailed_description", system)
+        self.assertNotIn("integrated_multimodal_description", system)
+
     def test_audio_driven_h3_retries_invalid_record_shape_once(self):
         clip = {"start": 0.0, "end": 18.2, "label": "reply"}
-        canonical = """integrated_multimodal_description:
+        canonical = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-18.20s] shot_name: Mara stands screen-right | audiovisual_description: Mara stands screen-right as the camera pushes in while (S1) says <d>[English] Keep this exact.</d> | dialogue_and_vocalizations: none
 overall_soundscape: Quiet office room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
 
         def row(video_prompt):
             return {
@@ -637,10 +1046,10 @@ non_diegetic_music: N/A"""
         planner._image_model = "flux"
         planner._uses_generated_shot_images = False
         planner._build_all_image_paths = lambda *_args, **_kwargs: []
-        authoritative = row("""integrated_multimodal_description:
+        authoritative = row(_base_prompt("""integrated_multimodal_description:
 0.00-18.20: Mara stands screen-right as the camera pushes in while (S1) says <d>[English] Keep this exact.</d>
 overall_soundscape: Quiet office room tone.
-non_diegetic_music: N/A""")
+non_diegetic_music: N/A"""))
         mutated_repair = row(canonical)
         mutated_repair["scene_goal"] = "MUTATED GOAL"
         mutated_repair["action_beats"] = ["MUTATED ACTION"]
@@ -693,16 +1102,16 @@ non_diegetic_music: N/A""")
         self.assertEqual(shots[0].window_prompts, [])
 
     def test_audio_h3_repair_lock_rejects_mutation_swap_wrapper_and_no_range(self):
-        source = """integrated_multimodal_description:
+        source = _base_prompt("""integrated_multimodal_description:
 0.00-7.350: Mara (S1) waits beside <Subject 1> and gives one soft gasp.
 7.350-18.20: Theo (S2) opens the scarlet door and says <d>[English] Keep this exact.</d>
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
-        exact = """integrated_multimodal_description:
+non_diegetic_music: N/A""")
+        exact = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-7.350s] shot_name: Mara waits | audiovisual_description: Mara (S1) waits beside <Subject 1> and gives one soft gasp. | dialogue_and_vocalizations: none
 [Shot 2] [7.350s-18.20s] shot_name: Theo opens scarlet door | audiovisual_description: Theo (S2) opens the scarlet door and says <d>[English] Keep this exact.</d> | dialogue_and_vocalizations: none
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
         self.assertEqual(_h3_audio_repair_lock_errors(source, exact), [])
 
         mutations = {
@@ -725,10 +1134,10 @@ non_diegetic_music: N/A"""
                 ]
                 self.assertTrue(errors)
 
-        no_range = """integrated_multimodal_description:
+        no_range = _base_prompt("""integrated_multimodal_description:
 Mara waits beside the scarlet door.
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
         self.assertTrue(_h3_audio_repair_lock_errors(no_range, exact))
 
         canonical_source = exact
@@ -781,10 +1190,10 @@ non_diegetic_music: N/A"""
             )
 
     def test_audio_h3_format_repair_requires_the_selected_local_provider(self):
-        invalid = """integrated_multimodal_description:
+        invalid = _base_prompt("""integrated_multimodal_description:
 0.00-10.00: Mara waits beside the scarlet door.
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
         row = {
             "scene_goal": "Mara waits.",
             "scene_type": "dialogue",
@@ -1030,7 +1439,7 @@ non_diegetic_music: N/A"""
 
         with patch.object(llm_service, "generate", side_effect=fake_generate):
             result = llm_service.enhance_prompt(
-                "First authored line.\nSecond authored line.",
+                _BASE_60S,
                 mode="video",
                 model_type="minimax_h3_fl2va",
                 duration_seconds=60,
@@ -1055,7 +1464,7 @@ non_diegetic_music: N/A"""
 
         with patch.object(llm_service, "generate", side_effect=fake_generate):
             llm_service.enhance_prompt(
-                "One complete authored request.",
+                _BASE_60S,
                 mode="video",
                 model_type="minimax_h3_fl2va",
                 duration_seconds=60,
@@ -1076,7 +1485,7 @@ non_diegetic_music: N/A"""
 
         with patch.object(llm_service, "generate", side_effect=fake_generate):
             llm_service.enhance_prompt(
-                "One complete authored request.",
+                _REF_30S,
                 mode="video",
                 model_type="minimax_h3_ref2va",
                 duration_seconds=30,
@@ -1193,14 +1602,14 @@ non_diegetic_music: N/A"""
         self.assertIn("the exact identity reference", result)
 
     def test_h3_bare_range_gets_one_format_only_repair(self):
-        invalid = """integrated_multimodal_description:
+        invalid = _base_prompt("""integrated_multimodal_description:
 0.00-40.00: Mara (S1) pulls the scarlet cord and says <d>[English] Keep this exact.</d>
 overall_soundscape: Rope strain and quiet room tone.
-non_diegetic_music: N/A"""
-        repaired = """integrated_multimodal_description:
+non_diegetic_music: N/A""")
+        repaired = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-40.00s] shot_name: Scarlet cord | audiovisual_description: Mara (S1) pulls the scarlet cord and says <d>[English] Keep this exact.</d> | dialogue_and_vocalizations: none
 overall_soundscape: Rope strain and quiet room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
         calls = []
 
         def fake_generate(**kwargs):
@@ -1222,11 +1631,35 @@ non_diegetic_music: N/A"""
         self.assertEqual(calls[1]["temperature"], 0.2)
         self.assertNotIn("image_paths", calls[1])
 
-    def test_h3_invalid_repair_fails_closed_after_exactly_one_pass(self):
-        invalid = """integrated_multimodal_description:
-15.00-40.00: Mara crosses the room.
+    def test_h3_format_repair_cannot_add_base_entity_definitions(self):
+        before = """integrated_multimodal_description:
+[Shot 1] [0.00s-10.00s] shot_name: Hold | audiovisual_description: Mara waits. | dialogue_and_vocalizations: none
 overall_soundscape: Quiet room tone.
 non_diegetic_music: N/A"""
+        after = before.replace(
+            "integrated_multimodal_description:",
+            "subject_definitions: <Subject 1> is Mara: adult woman in a red coat.\n\nintegrated_multimodal_description:",
+        )
+        errors = llm_service._h3_format_repair_lock_errors(before, after)
+        self.assertIn("format repair added or removed subject definitions", errors)
+        changed = before.replace(
+            "integrated_multimodal_description:",
+            "subject_definitions: <Subject 1> is Mara: adult woman in a red coat.\n\n"
+            "integrated_multimodal_description:",
+        )
+        changed = changed.replace(
+            "subject_definitions: <Subject 1> is Mara: adult woman in a red coat.",
+            "subject_definitions: <Subject 2> is Theo: adult man in a gray coat.",
+            1,
+        )
+        changed_errors = llm_service._h3_format_repair_lock_errors(after, changed)
+        self.assertIn("format repair changed subject_definitions", changed_errors)
+
+    def test_h3_invalid_repair_fails_closed_after_exactly_one_pass(self):
+        invalid = _base_prompt("""integrated_multimodal_description:
+15.00-40.00: Mara crosses the room.
+overall_soundscape: Quiet room tone.
+non_diegetic_music: N/A""")
         calls = []
 
         def fake_generate(**kwargs):
@@ -1247,14 +1680,14 @@ non_diegetic_music: N/A"""
         self.assertEqual(len(calls), 2)
 
     def test_h3_unparseable_repair_cannot_replace_visual_semantics(self):
-        invalid = """integrated_multimodal_description:
+        invalid = _base_prompt("""integrated_multimodal_description:
 Shot 1 0.00-10.00 Scarlet cord; Mara waits under amber light.
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
-        mutated = """integrated_multimodal_description:
+non_diegetic_music: N/A""")
+        mutated = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-10.00s] shot_name: Blue door | audiovisual_description: Theo runs beneath green light. | dialogue_and_vocalizations: none
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
         calls = []
 
         def fake_generate(**kwargs):
@@ -1275,14 +1708,14 @@ non_diegetic_music: N/A"""
         self.assertEqual(len(calls), 2)
 
     def test_h3_format_repair_cannot_expand_while_retaining_source_text(self):
-        invalid = """integrated_multimodal_description:
+        invalid = _base_prompt("""integrated_multimodal_description:
 Shot 1 0.00-10.00 Scarlet cord; Mara waits under amber light.
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
-        expanded = """integrated_multimodal_description:
+non_diegetic_music: N/A""")
+        expanded = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-10.00s] shot_name: Theo under green light | audiovisual_description: Scarlet cord; Mara waits under amber light. Theo runs through a blue door. | dialogue_and_vocalizations: (S9) says <d>[English] Invented words.</d>
 overall_soundscape: Quiet room tone plus thunder.
-non_diegetic_music: N/A with drums"""
+non_diegetic_music: N/A with drums""")
         calls = []
         def fake_generate(**kwargs):
             calls.append(kwargs)
@@ -1298,14 +1731,14 @@ non_diegetic_music: N/A with drums"""
         self.assertEqual(len(calls), 2)
 
     def test_h3_format_repair_fails_closed_without_recoverable_source_range(self):
-        invalid = """integrated_multimodal_description:
+        invalid = _base_prompt("""integrated_multimodal_description:
 Shot 1 Scarlet cord; Mara waits under amber light.
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
-        expanded = """integrated_multimodal_description:
+non_diegetic_music: N/A""")
+        expanded = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-10.00s] shot_name: Theo green door | audiovisual_description: Shot 1 Scarlet cord; Mara waits under amber light. Theo runs through a blue door. | dialogue_and_vocalizations: none
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
         calls = []
 
         def fake_generate(**kwargs):
@@ -1326,16 +1759,16 @@ non_diegetic_music: N/A"""
         self.assertEqual(len(calls), 2)
 
     def test_h3_repair_cannot_swap_subject_speaker_time_associations(self):
-        invalid = """integrated_multimodal_description:
+        invalid = _base_prompt("""integrated_multimodal_description:
 0.00-5.00: <Subject 1> (S1) waits under amber light.
 5.00-10.00: <Subject 2> (S2) opens the scarlet door.
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
-        swapped = """integrated_multimodal_description:
+non_diegetic_music: N/A""")
+        swapped = _base_prompt("""integrated_multimodal_description:
 [Shot 1] [0.00s-5.00s] shot_name: Scarlet door | audiovisual_description: <Subject 2> (S2) opens the scarlet door. | dialogue_and_vocalizations: none
 [Shot 2] [5.00s-10.00s] shot_name: Amber wait | audiovisual_description: <Subject 1> (S1) waits under amber light. | dialogue_and_vocalizations: none
 overall_soundscape: Quiet room tone.
-non_diegetic_music: N/A"""
+non_diegetic_music: N/A""")
         calls = []
 
         def fake_generate(**kwargs):

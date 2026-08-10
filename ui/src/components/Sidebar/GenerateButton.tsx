@@ -9,6 +9,19 @@ export function GenerateButton() {
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const modelOptionsLoading = useStore(s => s.modelOptionsLoading)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const needsModelTerms = useStore(s => {
+    const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
+    return (model?.required_host_terms || []).some(
+      requirement => s.hostTerms?.[requirement.term]?.accepted !== true,
+    )
+  })
+  const needsManualCheckpointVerification = useStore(s => {
+    const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
+    return Boolean(
+      model?.downloadable === false
+      && !model.manual_checkpoint_verified
+    )
+  })
   const isH3 = useStore(s => (
     s.generationMode === 'video'
     && (
@@ -49,7 +62,7 @@ export function GenerateButton() {
   )
   const needsOutpaintArea = isOutpaint && !!editVideoPath && !hasOutpaintArea
   const needsProject = !activeWorkspace
-  const blocked = modelOptionsLoading || needsProject || needsImage || needsOutpaintSource || needsOutpaintArea
+  const blocked = modelOptionsLoading || needsProject || needsModelTerms || needsManualCheckpointVerification || needsImage || needsOutpaintSource || needsOutpaintArea
 
   // Brief gray flash after clicking
   useEffect(() => {
@@ -74,6 +87,10 @@ export function GenerateButton() {
       ? 'Loading model'
       : needsProject
       ? 'Select project'
+      : needsModelTerms
+      ? 'Review terms'
+      : needsManualCheckpointVerification
+      ? 'Manual install'
       : needsImage
       ? 'Need image'
       : needsOutpaintSource
@@ -85,6 +102,10 @@ export function GenerateButton() {
       ? 'Choose a larger output aspect or resize the source to create an area for Outpaint to generate.'
       : needsProject
       ? 'Select or create a password-protected project from the project picker first.'
+      : needsModelTerms
+      ? 'Review and accept the selected model recipe terms for this host.'
+      : needsManualCheckpointVerification
+      ? 'Install the exact checkpoint locally, then verify its byte size and SHA-256 in the model selector. Maestro will not download this checkpoint.'
       : undefined
     return (
       <div className="flex flex-col items-end gap-0.5">

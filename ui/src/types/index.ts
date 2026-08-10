@@ -49,11 +49,217 @@ export interface ModelDef {
   supports_audio_input?: boolean
   generates_audio?: boolean
   supports_ref_images?: boolean
+  /** Server catalog capability used by image-only workflows. */
+  image_outputs?: boolean
   director?: DirectorModelCompatibility
   is_downloaded?: boolean
+  /** Whether Maestro may fetch this recipe through the generic downloader. */
+  downloadable?: boolean
+  /** The source contract is complete enough for owner-managed installation. */
+  manual_installation_ready?: boolean
+  availability_status?: string
+  manual_checkpoint_verification_required?: boolean
+  manual_checkpoint_verified?: boolean
+  supported_operations?: string[]
+  automatic_routing?: boolean
+  verified?: boolean
+  default_for_operations?: string[]
+  revenue_eligible?: boolean | null
+  fine_tuning_eligible?: boolean | null
+  derivative_tooling?: boolean | null
   // Upstream catalog metadata; Maestro does not gate model visibility with it.
   nsfw_only?: boolean
   update_status?: string
+  required_host_terms?: ModelHostTermRequirement[]
+}
+
+export interface ModelHostTermRequirement {
+  term: HostTermId
+  version: number
+  title: string
+  license_url: string
+  review_mode: 'manual_self_review'
+  notice: string
+}
+
+// Reference Studio v2 uses canonical asset names on the wire. Older project
+// manifests may still contain setting/item/style aliases and remain readable.
+export type ProjectReferenceAssetType =
+  | 'character'
+  | 'location'
+  | 'prop'
+  | 'vehicle'
+  | 'creature'
+  | 'wardrobe'
+  | 'world'
+
+export type ProjectReferenceLegacyAssetType = 'setting' | 'item' | 'machine' | 'accessory' | 'style'
+export type ProjectReferenceIntent = 'exact_spec' | 'generic' | 'brainstorming'
+export type ProjectReferenceDepth = 'compact' | 'standard' | 'comprehensive' | 'custom'
+export type ProjectReferenceManagedLayoutAssistMode = 'off'
+export type ProjectReferenceAnchorBasis = 'anatomy' | 'primary_outfit' | 'least_occluded'
+export type ProjectReferenceAnchorPrivacy =
+  | 'private_blurred' | 'private_visible' | 'project_blurred' | 'project_visible'
+export type ProjectReferenceLegacyAnchorPrivacy = ProjectReferenceAnchorPrivacy | 'standard'
+export type ProjectReferencePreset =
+  | 'identity' | 'performance' | 'wardrobe' | 'underlayers'
+  | 'spatial' | 'lighting'
+  | 'materials' | 'product' | 'functional'
+  | 'construction' | 'exterior' | 'interior' | 'mechanical'
+  | 'anatomy' | 'behavior' | 'look' | 'accessories'
+  | 'visual_language' | 'environment' | 'cinematography'
+export type ProjectReferenceDetailOperation = 'auto' | 'crop' | 'enhance' | 'reconstruct'
+export type ProjectReferenceDetailKind =
+  | 'custom'
+  | 'face' | 'hands' | 'marking' | 'markings' | 'garment' | 'accessory'
+  | 'material' | 'fixture' | 'prop' | 'signage'
+  | 'mechanism' | 'control' | 'interior'
+  | 'limb' | 'surface' | 'closure' | 'seam'
+  | 'lighting' | 'composition' | 'motion'
+
+export interface ProjectReferenceDetailCallout {
+  custom_id: string
+  label: string
+  kind: ProjectReferenceDetailKind
+  operation: ProjectReferenceDetailOperation
+  source_role: string
+}
+
+export interface ProjectReferenceTypeFieldItem {
+  id: string
+  label: string
+  custom: boolean
+  group: string
+}
+
+export type ProjectReferenceLoraScope = 'auto' | 'generation' | 'editing'
+
+export interface ProjectReferenceAdditionalLora {
+  id: string
+  multiplier: number
+  scope: ProjectReferenceLoraScope
+}
+
+export interface ProjectReferenceAdditionalLoraSummary {
+  applied: Array<{
+    id: string
+    weight: number
+    requested_scope: ProjectReferenceLoraScope
+    resolved_scope: ProjectReferenceLoraScope[]
+    roles: string[]
+  }>
+  skipped: Array<{
+    id: string
+    weight: number
+    requested_scope: ProjectReferenceLoraScope
+    reason: string
+  }>
+}
+
+export interface ProjectReferencePlannedDetailCallout {
+  custom_id: string
+  kind: ProjectReferenceDetailKind
+  requested_operation: ProjectReferenceDetailOperation
+  source_role: string
+  target_role: string
+  label_digest: string
+}
+
+export interface ProjectReferenceResolvedModel {
+  requested_model: string
+  resolved_model: string | null
+  resolved_provider: string | null
+}
+
+export interface ProjectReferenceTypeFieldMap {
+  character: { poses?: ProjectReferenceTypeFieldItem[]; outfits?: ProjectReferenceTypeFieldItem[] }
+  location: { zones?: ProjectReferenceTypeFieldItem[]; lighting?: ProjectReferenceTypeFieldItem[] }
+  prop: { functions?: ProjectReferenceTypeFieldItem[]; scale?: ProjectReferenceTypeFieldItem[] }
+  vehicle: { views?: ProjectReferenceTypeFieldItem[]; mechanisms?: ProjectReferenceTypeFieldItem[] }
+  creature: { poses?: ProjectReferenceTypeFieldItem[]; anatomy?: ProjectReferenceTypeFieldItem[] }
+  wardrobe: { views?: ProjectReferenceTypeFieldItem[]; materials?: ProjectReferenceTypeFieldItem[] }
+  world: { composition?: ProjectReferenceTypeFieldItem[]; lighting?: ProjectReferenceTypeFieldItem[] }
+}
+
+export type ProjectReferenceTypeFields<
+  T extends ProjectReferenceAssetType = ProjectReferenceAssetType,
+> = Partial<ProjectReferenceTypeFieldMap[T]>
+
+export interface ProjectReferenceManagedLayoutAssist {
+  schema_version: 1
+  mode: ProjectReferenceManagedLayoutAssistMode
+  id: null
+  provenance: {
+    kind: 'server_allowlist'
+    version: 'managed-layout-v1'
+  }
+}
+
+export type ProjectReferenceOperation = 'generation' | 'edit' | 'repair' | 'callout'
+export type ProjectReferenceOperationStatus = 'standard' | 'applied' | 'skipped'
+
+export interface ProjectReferenceModelSchedule {
+  model: string
+  steps: number
+  guidance: number
+  guidance_key: 'guidance_scale' | 'embedded_guidance_scale'
+  source: 'model_default' | 'explicit'
+}
+
+export interface ProjectReferenceOperationRoute {
+  status: ProjectReferenceOperationStatus
+  requested_model: string | null
+  resolved_model: string | null
+  schedule: ProjectReferenceModelSchedule | null
+  recipe_id?: string
+  verification_status?: string
+  reason?: string
+}
+
+export interface ProjectReferenceOperationRouting {
+  requested_capability: 'standard' | 'unrestricted_local'
+  operations: Record<ProjectReferenceOperation, ProjectReferenceOperationRoute>
+}
+
+export interface ProjectReferencePackPlan {
+  schema_version: 2
+  planner_version: 'reference-pack-v2' | string
+  intent: ProjectReferenceIntent
+  reference_type: ProjectReferenceAssetType
+  depth: ProjectReferenceDepth
+  preset: ProjectReferencePreset
+  anchor_basis: ProjectReferenceAnchorBasis
+  anchor_privacy: ProjectReferenceAnchorPrivacy
+  private_output: boolean
+  sheet_count: number
+  detail_callout_count: number
+  ordered_sheet_roles: string[]
+  ordered_output_roles: string[]
+  mode: 'production' | 'hybrid' | 'draft'
+  candidate_count: number
+  anchor_strategy: 'canonical_anchor' | 'draft_one_shot'
+  generation_model?: string
+  editor_model?: string | null
+  user_loras?: { count: number; preserved: boolean }
+  additional_loras?: ProjectReferenceAdditionalLoraSummary
+  explicit_output?: boolean
+  content_capability?: 'standard' | 'unrestricted_local'
+  initial_blur?: boolean
+  intelligence_policy?: 'standard_auto' | 'uncensored_auto'
+  operation_routing: ProjectReferenceOperationRouting
+  detail_callouts?: ProjectReferencePlannedDetailCallout[]
+  authored_settings?: {
+    seal: string
+    type_fields: Array<{
+      field: string
+      items: Array<Pick<ProjectReferenceTypeFieldItem, 'id' | 'custom' | 'group'>>
+    }>
+    detail_callouts: ProjectReferencePlannedDetailCallout[]
+  }
+  planning?: ProjectReferenceResolvedModel
+  review?: ProjectReferenceResolvedModel & { status?: string }
+  managed_layout_assist: ProjectReferenceManagedLayoutAssist
+  plan_seal: string
 }
 
 export interface Resolution {
@@ -187,6 +393,8 @@ export interface GenerateParams {
   /** Explicit acknowledgement required whenever the effective plan loads the
    * separately licensed Ref2VA checkpoint. Filled from the local terms UI. */
   h3_ref2va_terms_accepted?: boolean
+  /** One-shot durable server-side preparation before this generation. */
+  enhance_before_generate?: boolean
   h3_segment_overrides?: Array<{
     model_type: 'minimax_h3' | 'minimax_h3_pinkcherry_fl2va' | 'minimax_h3_w4a8_fl2va' | 'minimax_h3_ref2va'
     drop_semantic_refs?: boolean
@@ -303,7 +511,7 @@ export interface GenerationJob {
   id: string
   /** Server creation time in epoch seconds when known. */
   createdAt?: number
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  status: 'preparing' | 'waiting_for_plan_approval' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   progress: number
   step: number
   totalSteps: number
@@ -327,7 +535,16 @@ export interface GenerationJob {
   /** True when the active named phase has no truthful numeric denominator. */
   progressIndeterminate?: boolean
   queueWaitReason?: import('../api/client').QueueWaitReason | null
+  /** Owner-scoped, closed execution facts. A higher attempt means earlier
+   *  CPU progress/ETA was discarded and must not be presented as reusable. */
+  resourceDescriptor?: import('../api/client').ResourceDescriptor | null
+  /** Owner-scoped live relation for an internal child generation. */
+  parentJobId?: string | null
   h3SegmentPlan?: H3SegmentPlan | null
+  planReviewRequired?: boolean
+  planReviewTermsRequired?: boolean
+  /** Server-authored absolute Unix epoch seconds; null outside plan review. */
+  planReviewDeadline?: number | null
   currentSegmentModel?: string
   currentSegmentReason?: string
   currentSegmentBoundary?: H3SegmentBoundary | null
@@ -570,8 +787,8 @@ export interface ModelOptions {
 }
 
 export interface SystemConfig {
-  // Maestro release version (repo-root VERSION file), shown next to the
-  // app title. Optional: older backends don't send it.
+  // Optional Maestro-base compatibility version from older/current backends.
+  // Product identity comes from the UI-bundled Continuum branding constants.
   app_version?: string
   attention_mode: string
   transformer_quantization: string
@@ -624,18 +841,64 @@ export interface MultiClip {
 
 export type SettingsTab = 'performance' | 'integrations'
 
-export type HostTermId = 'lawful_use' | 'minimax_h3_ref2va'
+export type HostTermId =
+  | 'lawful_use'
+  | 'minimax_h3_ref2va'
+  | 'bfl_flux1_self_review'
+  | 'bfl_flux2_self_review'
+  | 'krea2_self_review'
+  | 'civitai_2731187_3209007_creator_terms'
+  | 'civitai_2764429_3211049_creator_terms'
+  | 'ponpoke_flux2_klein_4b_self_review'
+  | 'ponpoke_flux2_klein_9b_self_review'
+  | 'civitai_2382648_2973304_creator_terms'
+
+export interface HostTermBinding {
+  license_id: string
+  repository: string
+  revision: string
+  license_repository?: string
+  license_revision?: string
+  covered_repositories?: Array<{
+    repository: string
+    revision: string
+  }>
+  source_url?: string
+  creator?: string
+  model_id?: number
+  model_version_id?: number
+  file_id?: number
+  filename?: string
+  file_size_bytes?: number
+  file_sha256?: string
+  recipe_graph?: Record<string, unknown>
+  creator_restrictions?: {
+    allowNoCredit: boolean
+    allowDerivatives: boolean
+    allowCommercialUse: string[]
+  }
+  underlying_base_license?: string
+}
 
 export interface HostTermStatus {
   current_version: number
   accepted_version: number | null
   accepted_at: string | null
   accepted: boolean
+  binding?: HostTermBinding
 }
 
 export interface HostTermsStatus {
   lawful_use: HostTermStatus
   minimax_h3_ref2va: HostTermStatus
+  bfl_flux1_self_review: HostTermStatus
+  bfl_flux2_self_review: HostTermStatus
+  krea2_self_review: HostTermStatus
+  civitai_2731187_3209007_creator_terms: HostTermStatus
+  civitai_2764429_3211049_creator_terms: HostTermStatus
+  ponpoke_flux2_klein_4b_self_review: HostTermStatus
+  ponpoke_flux2_klein_9b_self_review: HostTermStatus
+  civitai_2382648_2973304_creator_terms: HostTermStatus
 }
 
 export interface ServicesConfig {

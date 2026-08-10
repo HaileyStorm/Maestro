@@ -197,14 +197,16 @@ class TestH3DirectorDialogueCompiler(unittest.TestCase):
         compile_h3_clip_plans(plans)
         prompt = plans[0]["video_prompt"]
 
-        self.assertTrue(prompt.startswith("integrated_multimodal_description: [Shot 1]"))
+        self.assertTrue(prompt.startswith("subject_definitions: "))
+        self.assertIn("integrated_multimodal_description: [Shot 1]", prompt)
+        self.assertEqual(prompt.count("subject_definitions:"), 1)
         self.assertEqual(prompt.count("integrated_multimodal_description:"), 1)
         self.assertEqual(prompt.count("overall_soundscape:"), 1)
         self.assertEqual(prompt.count("non_diegetic_music:"), 1)
         self.assertNotIn("PROJECT CONTINUITY", prompt)
         self.assertNotIn("OPENING CONTINUITY", prompt)
         self.assertNotIn("FINAL BLOCKING", prompt)
-        self.assertIn("Monica (S1) speaks", prompt)
+        self.assertIn("<Subject 1> (Monica) (S1) speaks", prompt)
         self.assertIn("<d>[English] You\u2019re late.</d>", prompt)
         self.assertNotIn("cafe chatter", prompt.lower())
         self.assertFalse(any(0x80 <= ord(character) <= 0x9F for character in prompt))

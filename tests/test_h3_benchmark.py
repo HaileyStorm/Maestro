@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 import tempfile
 import unittest
 import json
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
@@ -13,6 +15,7 @@ if str(APP) not in sys.path:
 
 from services.h3_benchmark import (  # noqa: E402
     H3BenchmarkCache,
+    H3AllocationLedger,
     H3BenchmarkError,
     aggregate_h3_estimates,
     build_benchmark_report,
@@ -38,6 +41,119 @@ def spec(case="text_only", engine="sdpa", signature=None):
 
 
 class H3BenchmarkTests(unittest.TestCase):
+    def _allocation_scenario(self):
+        return {
+            "model_type": "minimax_h3_ref2va",
+            "width": 1344,
+            "height": 768,
+            "frame_count": 243,
+            "authored_steps": 20,
+            "effective_steps": 20,
+            "attention_engine": "sol_attn",
+            "attention_signature": "sol10-2",
+            "schedule_id": "native",
+            "resource_kind": "cuda_allocation",
+            "offload_profile": 4,
+            "policy_version": 1,
+            "host_ram_band_gib": 64,
+            "free_vram_band_gib": 20,
+            "residency_epoch_band": 0,
+        }
+
+    def test_allocation_ledger_dedupes_bursts_and_contamination_never_votes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = H3AllocationLedger(Path(directory, "ledger.json"))
+            scenario = self._allocation_scenario()
+            ledger.record(scenario, "clean_oom", now=900)
+            ledger.record(scenario, "clean_oom", now=901)
+            ledger.record(
+                scenario, "contaminated_oom",
+                contamination_reason="foreign_gpu_allocation", now=902,
+            )
+            snapshot = ledger.snapshot(scenario)
+            self.assertEqual(snapshot["clean_oom_episodes"], 1)
+            self.assertEqual(snapshot["contaminated_oom_episodes"], 1)
+            self.assertFalse(snapshot["globally_suppressed"])
+            ledger.record(scenario, "clean_oom", now=1800)
+            ledger.record(scenario, "clean_oom", now=2700)
+            self.assertTrue(ledger.snapshot(scenario)["globally_suppressed"])
+
+    def test_allocation_ledger_probes_do_not_relax_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "ledger.json")
+            ledger = H3AllocationLedger(path)
+            scenario = self._allocation_scenario()
+            for index in range(8):
+                ledger.record(
+                    scenario, "probe_success", now=(index + 1) * 900,
+                )
+            self.assertFalse(ledger.snapshot(scenario)["upward_confirmed"])
+            path.write_text('{"schema_version":999}', encoding="utf-8")
+            with self.assertRaises(H3BenchmarkError):
+                ledger.snapshot(scenario)
+
+    def test_allocation_ledger_cross_process_updates_are_not_lost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "ledger.json")
+            scenario = self._allocation_scenario()
+            program = (
+                "import json,sys; "
+                "from services.h3_benchmark import H3AllocationLedger; "
+                "ledger=H3AllocationLedger(sys.argv[1]); "
+                "scenario=json.loads(sys.argv[2]); base=int(sys.argv[3]); "
+                "[ledger.record(scenario,'clean_oom',now=(base+i)*900) "
+                "for i in range(5)]"
+            )
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(APP)
+            processes = [
+                subprocess.Popen([
+                    sys.executable, "-c", program, str(path),
+                    json.dumps(scenario), str(base),
+                ], env=env)
+                for base in (1, 20)
+            ]
+            self.assertEqual([process.wait() for process in processes], [0, 0])
+            snapshot = H3AllocationLedger(path).snapshot(scenario)
+            self.assertEqual(snapshot["clean_oom_episodes"], 10)
+
+    def test_peak_recovery_identity_separates_offload_profile_and_policy(self):
+        base = spec()
+        common = {
+            "profile": "observed_job",
+            "width": 1344,
+            "height": 768,
+            "frame_count": 243,
+            "sampling_steps": 20,
+            "recovery_policy_version": 1,
+        }
+        profile4 = build_benchmark_spec(
+            case_id="ref2va", hardware=base["hardware"],
+            runtime=base["runtime"], model=base["model"],
+            engine=base["engine"], encoder=base["encoder"],
+            input_signature={"image_count": 1},
+            task={**common, "offload_profile": 4},
+        )
+        profile5 = build_benchmark_spec(
+            case_id="ref2va", hardware=base["hardware"],
+            runtime=base["runtime"], model=base["model"],
+            engine=base["engine"], encoder=base["encoder"],
+            input_signature={"image_count": 1},
+            task={**common, "offload_profile": 5},
+        )
+        next_policy = build_benchmark_spec(
+            case_id="ref2va", hardware=base["hardware"],
+            runtime=base["runtime"], model=base["model"],
+            engine=base["engine"], encoder=base["encoder"],
+            input_signature={"image_count": 1},
+            task={
+                **common, "offload_profile": 4,
+                "recovery_policy_version": 2,
+            },
+        )
+        self.assertNotEqual(profile4["cache_key"], profile5["cache_key"])
+        self.assertNotEqual(profile4["cache_key"], next_policy["cache_key"])
+
     def test_cache_key_changes_with_reference_and_engine(self):
         base = spec()
         frame = spec("first_frame", signature={"has_start": True})

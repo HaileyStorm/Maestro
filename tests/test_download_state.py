@@ -5,6 +5,7 @@ import ast
 import json
 import os
 from pathlib import PureWindowsPath
+import re
 import struct
 import tempfile
 import threading
@@ -114,6 +115,141 @@ class TestDownloadState(unittest.TestCase):
         self.assertEqual(public["model_type"], "civitai_example_checkpoint")
         self.assertNotIn("_internal", public)
         json.dumps(public)
+
+    def test_civitai_http_failure_redacts_query_and_header_credentials(self):
+        constant_names = {
+            "_CIVITAI_DIAGNOSTIC_LIMIT",
+            "_CIVITAI_HEADER_LIMIT",
+            "_CIVITAI_HEADER_VALUE_LIMIT",
+            "_CIVITAI_REDACTED",
+            "_CIVITAI_CREDENTIAL_QUERY_NAMES",
+            "_CIVITAI_QUERY_VALUE_RE",
+            "_CIVITAI_AUTH_VALUE_RE",
+            "_CIVITAI_SENSITIVE_FIELD_RE",
+        }
+        function_names = {
+            "_redact_civitai_diagnostic",
+            "_redact_civitai_headers",
+            "_update_download_record",
+            "_fail_download_record",
+            "_run_civitai_download",
+        }
+        nodes = []
+        for node in self.tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in constant_names
+                for target in node.targets
+            ):
+                nodes.append(node)
+            elif isinstance(node, ast.FunctionDef) and node.name in function_names:
+                nodes.append(node)
+        module = ast.Module(body=nodes, type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        configured_secret = "configured-token-secret"
+        response_auth_secret = "response-auth-secret"
+        response_cookie_secret = "response-cookie-secret"
+        response_location_secret = "response-location-secret"
+        body_token_secret = "body-token-secret"
+        body_bearer_secret = "body-bearer-secret"
+        requested = {}
+        printed = []
+
+        class FakeResponse:
+            status_code = 403
+            headers = {
+                "Authorization": f"Bearer {response_auth_secret}",
+                "Set-Cookie": f"session={response_cookie_secret}",
+                "Location": (
+                    "https://civitai.com/denied?token="
+                    f"{response_location_secret}&modelVersionId=7"
+                ),
+                "Server": "synthetic-edge",
+            }
+            text = (
+                "denied callback=https://civitai.com/error?token="
+                f"{body_token_secret} Authorization: Bearer "
+                f"{body_bearer_secret}"
+            )
+
+            def raise_for_status(self):
+                raise RuntimeError(
+                    "403 for https://civitai.com/api/download/models/7?token="
+                    f"{configured_secret}; Authorization: Bearer "
+                    f"{response_auth_secret}"
+                )
+
+        class FakeRequests:
+            @staticmethod
+            def get(url, **kwargs):
+                requested.update({"url": url, "headers": kwargs["headers"]})
+                return FakeResponse()
+
+        registry = {
+            "synthetic": {
+                "id": "synthetic",
+                "filename": "synthetic.safetensors",
+                "status": "downloading",
+                "error": None,
+                "_url": "https://civitai.com/api/download/models/7",
+                "target_dir": "/synthetic/not-used",
+            },
+        }
+        namespace = {
+            "os": os,
+            "re": re,
+            "time": time,
+            "uuid": uuid,
+            "threading": threading,
+            "requests": FakeRequests,
+            "wgp": type("FakeWgp", (), {
+                "server_config": {
+                    "services": {"civitai_api_key": configured_secret},
+                },
+            })(),
+            "_civitai_downloads": registry,
+            "_civitai_download_lock": threading.Lock(),
+            "print": lambda *values, **_kwargs: printed.append(
+                " ".join(str(value) for value in values)
+            ),
+        }
+        exec(compile(module, "civitai-redaction", "exec"), namespace)
+
+        namespace["_run_civitai_download"]("synthetic")
+        self.assertIn(f"token={configured_secret}", requested["url"])
+        self.assertEqual(
+            requested["headers"]["Authorization"],
+            f"Bearer {configured_secret}",
+        )
+        public_diagnostics = "\n".join(
+            printed + [str(registry["synthetic"]["error"])]
+        )
+        for secret in (
+            configured_secret,
+            response_auth_secret,
+            response_cookie_secret,
+            response_location_secret,
+            body_token_secret,
+            body_bearer_secret,
+        ):
+            self.assertNotIn(secret, public_diagnostics)
+        self.assertIn("[REDACTED]", public_diagnostics)
+        self.assertIn("synthetic-edge", public_diagnostics)
+        self.assertEqual(registry["synthetic"]["status"], "failed")
+
+        redact = namespace["_redact_civitai_diagnostic"]
+        self.assertEqual(
+            redact(
+                "https://civitai.com/model?modelVersionId=7&api%5Fkey=secret"
+            ),
+            "https://civitai.com/model?modelVersionId=7&api%5Fkey=[REDACTED]",
+        )
+        worker_source = _source_segment(
+            self.tree, self.source, "_run_civitai_download",
+        )
+        self.assertNotIn("dict(resp.headers)", worker_source)
+        self.assertIn("_redact_civitai_headers(resp.headers)", worker_source)
+        self.assertIn("_redact_civitai_diagnostic(e)", worker_source)
 
     def test_checkpoint_completion_refresh_is_global_and_filename_independent(self):
         with open(_UI_STORE_PATH, "r", encoding="utf-8") as handle:

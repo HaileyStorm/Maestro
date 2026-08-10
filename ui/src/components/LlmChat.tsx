@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Bot, Flag, ImagePlus, Loader2, Pencil, RotateCcw, Send, Trash2, UserRound, X } from 'lucide-react'
+import { Bot, Check, Copy, Flag, ImagePlus, Loader2, Pencil, RotateCcw, Send, Trash2, UserRound, X } from 'lucide-react'
 import * as api from '../api/client'
+import { copyTextToClipboard, isAssistantCopyScopeCurrent } from '../lib/clipboard'
 import { useStore } from '../stores/useStore'
 import type { LlmChatMessage, LlmModelOption, LlmPromptGuideOption } from '../types'
 
@@ -19,6 +20,13 @@ interface RefusalCapture {
 interface RefusalCaptureError {
   messageIndex: number
   message: string
+}
+
+interface AssistantCopyNotice {
+  workspace: string
+  projectInstance: string
+  messageIndex: number
+  outcome: 'copied' | 'failed'
 }
 
 interface RefusalSelectionResult {
@@ -417,6 +425,7 @@ export function LlmChat() {
   const [refusalCaptureError, setRefusalCaptureError] = useState<RefusalCaptureError | null>(null)
   const [refusalCaptureNotice, setRefusalCaptureNotice] = useState<string | null>(null)
   const [savingRefusalLiteral, setSavingRefusalLiteral] = useState(false)
+  const [assistantCopyNotice, setAssistantCopyNotice] = useState<AssistantCopyNotice | null>(null)
   const [error, setError] = useState<string | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -428,6 +437,8 @@ export function LlmChat() {
   const refusalSelectionSnapshotRef = useRef<RefusalSelectionSnapshot | null>(null)
   const refusalLiteralSaveRef = useRef<RefusalLiteralSaveRequest | null>(null)
   const refusalLiteralSaveTokenRef = useRef(0)
+  const assistantCopyTokenRef = useRef(0)
+  const assistantCopyTimerRef = useRef<number | null>(null)
   const requestRef = useRef<PendingChatRequest | null>(null)
   const projectInstanceRef = useRef('')
   const guidesRef = useRef<LlmPromptGuideOption[]>([])
@@ -435,6 +446,15 @@ export function LlmChat() {
   const guideTargetOverridden = useRef(false)
   const canUseCustomModel = accessContext?.custom_model_sources === true
   const canManageRefusalLiterals = accessContext?.machine_controls === true
+
+  const clearAssistantCopyNotice = useCallback(() => {
+    assistantCopyTokenRef.current += 1
+    if (assistantCopyTimerRef.current !== null) {
+      window.clearTimeout(assistantCopyTimerRef.current)
+      assistantCopyTimerRef.current = null
+    }
+    setAssistantCopyNotice(null)
+  }, [])
 
   const cancelActiveRefusalLiteralSave = useCallback(() => {
     refusalLiteralSaveTokenRef.current += 1
@@ -484,6 +504,7 @@ export function LlmChat() {
     setRefusalCapture(null)
     setRefusalCaptureError(null)
     setRefusalCaptureNotice(null)
+    clearAssistantCopyNotice()
     setSavingRefusalLiteral(false)
     setUseGuide(false)
     setSelectedImages([])
@@ -502,7 +523,7 @@ export function LlmChat() {
     // deleted and recreated. Never import it into this project instance.
     try { localStorage.removeItem(`${STORAGE_PREFIX}${encodeURIComponent(activeWorkspace)}`) } catch { /* private mode */ }
     return true
-  }, [activeWorkspace, cancelActiveRefusalLiteralSave])
+  }, [activeWorkspace, cancelActiveRefusalLiteralSave, clearAssistantCopyNotice])
 
   useEffect(() => {
     cancelActiveRefusalLiteralSave()
@@ -519,6 +540,7 @@ export function LlmChat() {
     setRefusalCapture(null)
     setRefusalCaptureError(null)
     setRefusalCaptureNotice(null)
+    clearAssistantCopyNotice()
     setSavingRefusalLiteral(false)
     setUseGuide(false)
     guideTargetOverridden.current = false
@@ -559,7 +581,7 @@ export function LlmChat() {
       }
       requestRef.current = null
     }
-  }, [activeWorkspace, cancelActiveRefusalLiteralSave])
+  }, [activeWorkspace, cancelActiveRefusalLiteralSave, clearAssistantCopyNotice])
 
   useEffect(() => {
     let cancelled = false
@@ -678,6 +700,18 @@ export function LlmChat() {
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages, sending])
+
+  useEffect(() => {
+    clearAssistantCopyNotice()
+  }, [clearAssistantCopyNotice, messages])
+
+  useEffect(() => () => {
+    assistantCopyTokenRef.current += 1
+    if (assistantCopyTimerRef.current !== null) {
+      window.clearTimeout(assistantCopyTimerRef.current)
+      assistantCopyTimerRef.current = null
+    }
+  }, [])
 
   useEffect(() => {
     if (!activeWorkspace || !projectInstance) return
@@ -1153,6 +1187,39 @@ export function LlmChat() {
     window.requestAnimationFrame(() => textareaRef.current?.focus())
   }
 
+  const copyAssistantTurn = async (messageIndex: number) => {
+    const message = messages[messageIndex]
+    if (message?.role !== 'assistant') return
+    const workspace = activeWorkspace
+    const instance = projectInstance
+    const token = assistantCopyTokenRef.current + 1
+    assistantCopyTokenRef.current = token
+    if (assistantCopyTimerRef.current !== null) {
+      window.clearTimeout(assistantCopyTimerRef.current)
+      assistantCopyTimerRef.current = null
+    }
+    const copied = await copyTextToClipboard(message.content)
+    if (!isAssistantCopyScopeCurrent(
+      { token, workspace, projectInstance: instance },
+      {
+        token: assistantCopyTokenRef.current,
+        workspace: useStore.getState().activeWorkspace,
+        projectInstance: projectInstanceRef.current,
+      },
+    )) return
+    setAssistantCopyNotice({
+      workspace,
+      projectInstance: instance,
+      messageIndex,
+      outcome: copied ? 'copied' : 'failed',
+    })
+    assistantCopyTimerRef.current = window.setTimeout(() => {
+      if (assistantCopyTokenRef.current !== token) return
+      assistantCopyTimerRef.current = null
+      setAssistantCopyNotice(null)
+    }, 2000)
+  }
+
   const readRefusalSelection = (messageIndex: number): RefusalSelectionResult => {
     const content = assistantContentRefs.current.get(messageIndex)
     const selection = window.getSelection()
@@ -1359,6 +1426,11 @@ export function LlmChat() {
               .some(item => item.attachments?.length)
             const retryUnavailable = message.role === 'assistant' && precedingHasImages
             const editUnavailable = message.role === 'user' && precedingHasImages
+            const copyNoticeForTurn = assistantCopyNotice?.workspace === activeWorkspace
+              && assistantCopyNotice.projectInstance === projectInstance
+              && assistantCopyNotice.messageIndex === index
+              ? assistantCopyNotice
+              : null
             return (
               <article key={`${message.role}-${index}`} className={`flex gap-3 rounded-xl border p-3 ${message.role === 'user' ? 'border-accent-blue/30 bg-accent-blue/5' : 'border-border bg-bg-secondary'}`}>
                 <div className="mt-0.5 shrink-0 text-text-muted">{message.role === 'user' ? <UserRound size={16} /> : <Bot size={16} />}</div>
@@ -1503,6 +1575,28 @@ export function LlmChat() {
                     </button>
                   ) : (
                     <>
+                      <button
+                        type="button"
+                        aria-label={`Copy assistant turn ${index + 1}`}
+                        title={copyNoticeForTurn?.outcome === 'copied'
+                          ? 'Copied response'
+                          : copyNoticeForTurn?.outcome === 'failed'
+                            ? 'Copy failed'
+                            : 'Copy response'}
+                        onClick={() => void copyAssistantTurn(index)}
+                        className="flex h-9 w-9 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary"
+                      >
+                        {copyNoticeForTurn?.outcome === 'copied'
+                          ? <Check size={13} className="text-accent-green" />
+                          : <Copy size={13} />}
+                      </button>
+                      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+                        {copyNoticeForTurn
+                          ? copyNoticeForTurn.outcome === 'copied'
+                            ? `Assistant turn ${index + 1} copied.`
+                            : `Assistant turn ${index + 1} could not be copied.`
+                          : ''}
+                      </span>
                       <button
                         type="button"
                         aria-label={`Retry assistant turn ${index + 1}`}

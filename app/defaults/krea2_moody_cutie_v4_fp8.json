@@ -1,0 +1,117 @@
+{
+    "model": {
+        "name": "Moody Cutie V4 Krea 2 FP8 — Broad-capability (Experimental)",
+        "architecture": "krea2_raw",
+        "description": "Experimental generation-only broad-capability Krea 2 RAW family checkpoint for manual research and quality evaluation. The creator describes it as uncensored; effectiveness has not yet been benchmarked. It is never selected automatically and does not enable direct revenue, fine-tuning, or derivative tooling.",
+        "selector_help": "Broad-capability experimental/manual candidate, creator-described as uncensored; effectiveness not yet benchmarked. Install and verify the exact Moody Cutie V4 Krea 2 FP8 checkpoint locally. Creator catlover1937 requires credit, forbids derivatives, and permits commercial use only through RentCivit. Evaluation may inform separate Krea-base work but does not permit Moody derivatives.",
+        "URLs": [
+            "moodyCutieMixKrea2_v40.safetensors"
+        ],
+        "visible": true,
+        "availability_status": "experimental_manual_installation",
+        "manual_installation_ready": true,
+        "downloadable": false,
+        "selection_policy": "manual_only",
+        "automatic_routing": false,
+        "verified": false,
+        "default_for_operations": [],
+        "revenue_eligible": false,
+        "fine_tuning_eligible": false,
+        "derivative_tooling": false,
+        "source_gated": true,
+        "manual_review_required": true,
+        "required_host_terms": [
+            "civitai_2764429_3211049_creator_terms",
+            "krea2_self_review"
+        ],
+        "capability_recipe": {
+            "kind": "exact_family_checkpoint",
+            "base_model": "krea2_raw",
+            "operations": [
+                "generation"
+            ],
+            "changed_components": [
+                "transformer"
+            ],
+            "preserved_components": [
+                "vae",
+                "text_encoder",
+                "tokenizer_config"
+            ],
+            "quality_status": "experimental_requires_benchmark",
+            "component_graph": [
+                {
+                    "component": "transformer",
+                    "role": "exact_family_tune",
+                    "artifact": "checkpoint"
+                },
+                {
+                    "component": "vae",
+                    "role": "preserved_architecture_asset",
+                    "source_model": "krea2_raw"
+                },
+                {
+                    "component": "text_encoder",
+                    "role": "preserved_architecture_asset",
+                    "source_model": "krea2_raw"
+                },
+                {
+                    "component": "tokenizer_config",
+                    "role": "preserved_architecture_asset",
+                    "source_model": "krea2_raw"
+                }
+            ]
+        },
+        "artifact_provenance": {
+            "scope": "changed_artifacts_only",
+            "preserved_asset_sources": "capability_recipe.component_graph",
+            "checkpoint": {
+                "provider": "civitai",
+                "artifact_kind": "exact_family_tune",
+                "title": "Moody Cutie V4",
+                "creator": "catlover1937",
+                "model_id": 2764429,
+                "version_id": 3211049,
+                "file_id": 3092831,
+                "filename": "moodyCutieMixKrea2_v40.safetensors",
+                "precision": "fp8",
+                "size_kb": 13794391.633,
+                "size_bytes": 14125457032,
+                "sha256": "6C54D783AAAAB1A6924FAFCFA3AFA9F36ABE72A59723D424E932484A8C98316A",
+                "source_url": "https://civitai.com/models/2764429?modelVersionId=3211049",
+                "download_url": "https://civitai.com/api/download/models/3211049?type=Diffusion%20Model&format=SafeTensor&fp=fp8",
+                "download_policy": "manual_hash_verified_only",
+                "loader_auto_download": false,
+                "exact_family": "Krea 2 RAW",
+                "operations": [
+                    "generation"
+                ],
+                "creator_terms": {
+                    "allowNoCredit": false,
+                    "allowDerivatives": false,
+                    "allowCommercialUse": [
+                        "RentCivit"
+                    ],
+                    "underlying_base_license": "Krea 2 Community License and Acceptable Use Policy"
+                }
+            },
+            "base": {
+                "provider": "huggingface",
+                "artifact_kind": "preserved_krea2_base_contract",
+                "model_type": "krea2_raw",
+                "license_id": "krea-2-community-license-v1",
+                "repository": "krea/Krea-2-Turbo",
+                "revision": "98e0fe1",
+                "license_repository": "krea-ai/krea-2",
+                "license_revision": "db3984fbc6e13b34c0064990fc2d95ac64d00058"
+            }
+        }
+    },
+    "prompt": "a softly lit character portrait with polished detail and a warm expressive mood",
+    "negative_prompt": "",
+    "batch_size": 1,
+    "denoising_strength": 1.0,
+    "masking_strength": 1.0,
+    "num_inference_steps": 52,
+    "guidance_scale": 3.5
+}

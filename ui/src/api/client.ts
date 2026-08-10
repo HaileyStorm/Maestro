@@ -1,4 +1,51 @@
-import type { ArtifactClass, DirectorRecoveryMetadata, OutputArtifactScope, OutputSearchFilters, ScailResolutionProfile } from '../types'
+import type {
+  ArtifactClass,
+  DirectorRecoveryMetadata,
+  OutputArtifactScope,
+  OutputSearchFilters,
+  ProjectReferenceAnchorBasis,
+  ProjectReferenceAnchorPrivacy,
+  ProjectReferenceAdditionalLora,
+  ProjectReferenceAdditionalLoraSummary,
+  ProjectReferenceAssetType,
+  ProjectReferenceDepth,
+  ProjectReferenceDetailCallout,
+  ProjectReferenceDetailKind,
+  ProjectReferenceDetailOperation,
+  ProjectReferenceIntent,
+  ProjectReferenceLegacyAssetType,
+  ProjectReferenceLegacyAnchorPrivacy,
+  ProjectReferenceLoraScope,
+  ProjectReferenceManagedLayoutAssistMode,
+  ProjectReferencePackPlan,
+  ProjectReferencePreset,
+  ProjectReferenceOperationRouting,
+  ProjectReferenceTypeFields,
+  ProjectReferenceTypeFieldItem,
+  ScailResolutionProfile,
+} from '../types'
+
+export type {
+  ProjectReferenceAssetType,
+  ProjectReferenceAnchorBasis,
+  ProjectReferenceAnchorPrivacy,
+  ProjectReferenceAdditionalLora,
+  ProjectReferenceAdditionalLoraSummary,
+  ProjectReferenceDepth,
+  ProjectReferenceDetailCallout,
+  ProjectReferenceDetailKind,
+  ProjectReferenceDetailOperation,
+  ProjectReferenceIntent,
+  ProjectReferenceLegacyAssetType,
+  ProjectReferenceLegacyAnchorPrivacy,
+  ProjectReferenceLoraScope,
+  ProjectReferenceManagedLayoutAssistMode,
+  ProjectReferencePackPlan,
+  ProjectReferencePreset,
+  ProjectReferenceOperationRouting,
+  ProjectReferenceTypeFields,
+  ProjectReferenceTypeFieldItem,
+} from '../types'
 
 const BASE = ''  // same origin in production; Vite proxy handles /api in dev
 
@@ -20,11 +67,25 @@ export interface ApiModel {
   supports_audio_input?: boolean
   generates_audio?: boolean
   supports_ref_images?: boolean
+  image_outputs?: boolean
   director?: import('../types').DirectorModelCompatibility
   is_downloaded?: boolean
+  downloadable?: boolean
+  manual_installation_ready?: boolean
+  availability_status?: string
+  manual_checkpoint_verification_required?: boolean
+  manual_checkpoint_verified?: boolean
+  supported_operations?: string[]
+  automatic_routing?: boolean
+  verified?: boolean
+  default_for_operations?: string[]
+  revenue_eligible?: boolean | null
+  fine_tuning_eligible?: boolean | null
+  derivative_tooling?: boolean | null
   // Upstream catalog metadata; it does not control Maestro visibility.
   nsfw_only?: boolean
   update_status?: string
+  required_host_terms?: import('../types').ModelHostTermRequirement[]
 }
 
 export interface ApiFamily {
@@ -77,6 +138,28 @@ export type QueueRecoveryReason =
 
 export type QueueRecoveryAction = 'resume' | 'retry'
 
+export type ResourceIntent = 'generation' | 'text'
+export type ResourceExecution = 'standard' | 'cpu'
+export type ResourcePreemptionMode = 'none' | 'discard_restart'
+export type ResourceExecutionState =
+  | 'queued'
+  | 'admitted'
+  | 'running'
+  | 'preemption_requested'
+  | 'resources_releasing'
+  | 'restarting_on_accelerator'
+  | 'blocked'
+  | 'released'
+
+export interface ResourceDescriptor {
+  intent: ResourceIntent
+  execution: ResourceExecution
+  preemptible: boolean
+  preemption_mode: ResourcePreemptionMode
+  state: ResourceExecutionState
+  execution_attempt: number
+}
+
 export interface QueueRecoveryMetadata {
   recovery_state?: QueueRecoveryState | null
   recovery_interrupted?: boolean
@@ -93,8 +176,8 @@ export interface QueueRecoveryMetadata {
 
 export interface ApiJobStatus extends QueueRecoveryMetadata {
   job_id: string
-  created_at?: number
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  created_at: number
+  status: 'preparing' | 'waiting_for_plan_approval' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   progress: number
   step: number
   total_steps: number
@@ -124,6 +207,8 @@ export interface ApiJobStatus extends QueueRecoveryMetadata {
   hold_after_output: boolean
   queue_position: number | null
   queue_wait_reason: QueueWaitReason | null
+  resource_descriptor?: ResourceDescriptor | null
+  parent_job_id?: string | null
   queue_reorder_reason: QueueReorderReason | null
   queue_residency_bypass_count: number
   queue_residency_bypassed_waiters: number
@@ -134,6 +219,11 @@ export interface ApiJobStatus extends QueueRecoveryMetadata {
   h3_estimate?: import('../types').H3PerformanceEstimate | null
   queue: { paused: boolean; pause_after_current: boolean }
   h3_segment_plan?: import('../types').H3SegmentPlan | null
+  plan_review_required?: boolean
+  /** True when the frozen plan cannot auto-accept until Ref2VA terms are accepted. */
+  plan_review_terms_required?: boolean
+  /** Server-authored absolute Unix epoch seconds; null outside plan review. */
+  plan_review_deadline?: number | null
   current_segment_model?: string
   current_segment_reason?: string
   current_segment_boundary?: import('../types').H3SegmentBoundary | null
@@ -142,12 +232,17 @@ export interface ApiJobStatus extends QueueRecoveryMetadata {
 
 export interface QueueJobState extends QueueRecoveryMetadata {
   job_id: string
-  status: 'queued' | 'running'
+  status: 'preparing' | 'waiting_for_plan_approval' | 'queued' | 'running'
   priority: number
   held: boolean
   hold_after_output: boolean
   position: number | null
   wait_reason: QueueWaitReason | null
+  resource_descriptor?: ResourceDescriptor | null
+  parent_job_id?: string | null
+  plan_review_terms_required?: boolean
+  /** Server-authored absolute Unix epoch seconds; null outside plan review. */
+  plan_review_deadline?: number | null
   queue_reorder_reason: QueueReorderReason | null
   queue_residency_bypass_count: number
   queue_residency_bypassed_waiters: number
@@ -165,6 +260,8 @@ export interface QueueState {
     waiting: number
     held: number
     registering: number
+    preparing: number
+    approval_waiting: number
     active_total: number
   }
   jobs: QueueJobState[]
@@ -175,9 +272,13 @@ export type QueueWaitReason =
   | 'held'
   | 'queue_paused'
   | 'registering'
+  | 'preparing'
+  | 'waiting_for_plan_approval'
+  | 'waiting_for_plan_terms'
   | 'waiting_for_turn'
   | 'waiting_for_active_generation'
   | 'waiting_for_other_user'
+  | 'resource_wait'
   | 'ready'
 
 export type QueueReorderReason =
@@ -351,9 +452,42 @@ export async function deleteModel(modelType: string): Promise<{ deleted: string[
 
 export type ModelDownloadStatus = 'downloading' | 'completed' | 'failed'
 
-export async function downloadModel(modelType: string): Promise<{ status: ModelDownloadStatus; model_type: string }> {
-  const res = await fetch(`${BASE}/api/v1/models/${encodeURIComponent(modelType)}/download`, { method: 'POST' })
-  if (!res.ok) throw new Error('Failed to start model download')
+export async function downloadModel(modelType: string, workspace: string): Promise<{ status: ModelDownloadStatus; model_type: string }> {
+  const query = new URLSearchParams({ workspace })
+  const res = await fetch(`${BASE}/api/v1/models/${encodeURIComponent(modelType)}/download?${query}`, { method: 'POST' })
+  if (!res.ok) {
+    const message = res.status === 409
+      ? 'Review this model recipe\'s terms and supported installation method.'
+      : res.status === 423
+        ? 'Unlock the selected project before downloading models.'
+        : res.status === 403
+          ? 'This project is not authorized to download models.'
+          : res.status === 404
+            ? 'This model is unavailable.'
+            : 'Failed to start model download.'
+    throw new Error(message)
+  }
+  return res.json()
+}
+
+export async function verifyManualCheckpoint(modelType: string): Promise<{
+  status: 'verified'
+  model_type: string
+  manual_checkpoint_verified: true
+  is_downloaded: boolean
+}> {
+  const res = await fetch(
+    `${BASE}/api/v1/models/${encodeURIComponent(modelType)}/verify-manual-checkpoint`,
+    { method: 'POST' },
+  )
+  if (!res.ok) {
+    const message = res.status === 403
+      ? 'Manual checkpoint verification is available only on the local host.'
+      : res.status === 404
+        ? 'This model is unavailable.'
+        : 'Verification failed. Confirm the exact local filename, byte size, and SHA-256.'
+    throw new Error(message)
+  }
   return res.json()
 }
 
@@ -384,6 +518,7 @@ export async function fetchDefaults(modelType: string): Promise<Record<string, u
 
 export async function submitGeneration(params: Record<string, unknown>): Promise<{
   job_id: string
+  status?: 'preparing' | 'queued'
   h3_estimate?: import('../types').H3PerformanceEstimate | null
 }> {
   const res = await fetch(`${BASE}/api/v1/generate`, {
@@ -394,6 +529,36 @@ export async function submitGeneration(params: Record<string, unknown>): Promise
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Generation failed' }))
     throw new Error(err.detail || 'Generation failed')
+  }
+  return res.json()
+}
+
+export interface GenerationPlanApprovalRequest {
+  workspace: string
+  segment_overrides: NonNullable<import('../types').GenerateParams['h3_segment_overrides']>
+  boundary_overrides: NonNullable<import('../types').GenerateParams['h3_boundary_overrides']>
+  h3_ref2va_terms_accepted?: boolean
+}
+
+export async function approveGenerationPlan(
+  jobId: string,
+  params: GenerationPlanApprovalRequest,
+): Promise<{
+  job_id: string
+  status: 'queued'
+  h3_segment_plan: import('../types').H3SegmentPlan
+  h3_estimate: import('../types').H3PerformanceEstimate | null
+}> {
+  const res = await fetch(`${BASE}/api/v1/generate/${encodeURIComponent(jobId)}/plan/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    if (res.status === 404) throw new Error('That plan review is no longer available.')
+    if (res.status === 409) throw new Error('The plan review state changed. Refresh and try again.')
+    if (res.status === 423) throw new Error('Unlock the plan\'s project and try again.')
+    throw new Error('The generation plan could not be approved.')
   }
   return res.json()
 }
@@ -804,11 +969,31 @@ export interface Workspace {
   file_count?: number
   password_protected?: boolean
   unlocked?: boolean
+  remember_policy?: WorkspaceRememberPolicy | null
+  unlock_expires_at?: number | null
+  unlock_idle_expires_at?: number | null
+}
+
+export type WorkspaceRememberPolicy = 'session' | 'device'
+
+export interface WorkspaceUnlockResult {
+  unlocked: boolean
+  remember_policy: WorkspaceRememberPolicy
+  unlock_expires_at: number
+  unlock_idle_expires_at: number
+}
+
+export interface WorkspaceLockResult {
+  unlocked: false
+  locked_count: number
 }
 
 export interface WorkspacePasswordResult {
   password_protected: boolean
   unlocked: boolean
+  remember_policy: WorkspaceRememberPolicy | null
+  unlock_expires_at: number | null
+  unlock_idle_expires_at: number | null
 }
 
 export async function fetchWorkspaces(): Promise<{ workspaces: Workspace[]; active: string }> {
@@ -826,11 +1011,15 @@ export async function setActiveWorkspace(name: string): Promise<void> {
   if (!res.ok) throw new Error('Failed to switch workspace')
 }
 
-export async function createWorkspace(name: string, password?: string): Promise<void> {
+export async function createWorkspace(
+  name: string,
+  password?: string,
+  remember: WorkspaceRememberPolicy = 'device',
+): Promise<void> {
   const res = await fetch(`${BASE}/api/v1/workspaces`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, password: password || undefined }),
+    body: JSON.stringify({ name, password: password || undefined, remember }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Failed to create workspace' }))
@@ -838,28 +1027,56 @@ export async function createWorkspace(name: string, password?: string): Promise<
   }
 }
 
-export async function unlockWorkspace(name: string, password: string): Promise<void> {
+export async function unlockWorkspace(
+  name: string,
+  password: string,
+  remember: WorkspaceRememberPolicy,
+): Promise<WorkspaceUnlockResult> {
   const res = await fetch(`${BASE}/api/v1/workspaces/${encodeURIComponent(name)}/unlock`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password }),
+    body: JSON.stringify({ password, remember }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Unlock failed' }))
     throw new Error(err.detail || 'Unlock failed')
   }
+  return res.json()
 }
 
-export async function setWorkspacePassword(name: string, password: string): Promise<WorkspacePasswordResult> {
+export async function lockWorkspace(name: string): Promise<WorkspaceLockResult> {
+  const res = await fetch(`${BASE}/api/v1/workspaces/${encodeURIComponent(name)}/lock`, {
+    method: 'POST',
+  })
+  if (!res.ok) throw new Error('Project could not be locked')
+  return res.json()
+}
+
+export async function lockAllWorkspaces(): Promise<WorkspaceLockResult> {
+  const res = await fetch(`${BASE}/api/v1/workspaces/lock-all`, {
+    method: 'POST',
+  })
+  if (!res.ok) throw new Error('Projects could not be locked')
+  return res.json()
+}
+
+export async function setWorkspacePassword(
+  name: string,
+  password: string,
+  remember: WorkspaceRememberPolicy = 'device',
+): Promise<WorkspacePasswordResult> {
   const res = await fetch(`${BASE}/api/v1/workspaces/${encodeURIComponent(name)}/password`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password }),
+    body: JSON.stringify({ password, remember }),
   })
   const payload = await res.json().catch(() => null) as ({
     detail?: unknown
     password_protected?: unknown
     unlocked?: unknown
+    remember_policy?: unknown
+    unlock_expires_at?: unknown
+    unlock_idle_expires_at?: unknown
   } | null)
   if (!res.ok) {
     throw new Error(typeof payload?.detail === 'string' ? payload.detail : 'Password update failed')
@@ -867,6 +1084,11 @@ export async function setWorkspacePassword(name: string, password: string): Prom
   return {
     password_protected: payload?.password_protected === true,
     unlocked: payload?.unlocked === true,
+    remember_policy: payload?.remember_policy === 'device' || payload?.remember_policy === 'session'
+      ? payload.remember_policy
+      : null,
+    unlock_expires_at: typeof payload?.unlock_expires_at === 'number' ? payload.unlock_expires_at : null,
+    unlock_idle_expires_at: typeof payload?.unlock_idle_expires_at === 'number' ? payload.unlock_idle_expires_at : null,
   }
 }
 
@@ -882,8 +1104,41 @@ export interface ProjectAssetOutput {
 }
 
 export type ProjectReferenceSheetMode = 'production' | 'hybrid' | 'draft'
-export type ProjectReferenceAssetType = 'character' | 'setting' | 'item' | 'style'
 export type ProjectReferenceReviewStatus = 'pass' | 'fail' | 'review_unavailable'
+
+const PROJECT_REFERENCE_ASSET_TYPE_ALIASES: Record<string, ProjectReferenceAssetType> = {
+  character: 'character',
+  location: 'location',
+  setting: 'location',
+  prop: 'prop',
+  item: 'prop',
+  vehicle: 'vehicle',
+  machine: 'vehicle',
+  creature: 'creature',
+  wardrobe: 'wardrobe',
+  accessory: 'wardrobe',
+  world: 'world',
+  style: 'world',
+}
+
+export function normalizeProjectReferenceAssetType(value: unknown): ProjectReferenceAssetType | null {
+  return typeof value === 'string' ? PROJECT_REFERENCE_ASSET_TYPE_ALIASES[value] ?? null : null
+}
+
+const PROJECT_REFERENCE_ANCHOR_PRIVACY_VALUES: readonly ProjectReferenceAnchorPrivacy[] = [
+  'private_blurred', 'private_visible', 'project_blurred', 'project_visible',
+]
+
+export function normalizeProjectReferenceAnchorPrivacy(
+  value: unknown,
+  schemaVersion?: number,
+): ProjectReferenceAnchorPrivacy | null {
+  if (typeof value === 'string' && PROJECT_REFERENCE_ANCHOR_PRIVACY_VALUES.includes(
+    value as ProjectReferenceAnchorPrivacy,
+  )) return value as ProjectReferenceAnchorPrivacy
+  if (schemaVersion !== 2 && value === 'standard') return 'project_visible'
+  return null
+}
 
 export interface ProjectReferenceSheetArtifactMetadata {
   role?: string
@@ -892,10 +1147,40 @@ export interface ProjectReferenceSheetArtifactMetadata {
   reason_codes?: string[]
 }
 
+export interface ProjectReferencePackArtifactMetadata {
+  schema_version: 2
+  planner_version: string
+  role: string
+  index: number
+  model?: string
+  provenance?: {
+    strategy?: string
+    version?: string
+    anchor_role?: string | null
+  }
+  reason_codes?: string[]
+  private_output?: boolean
+  anchor_privacy?: ProjectReferenceAnchorPrivacy
+  detail?: {
+    custom_id: string
+    kind: ProjectReferenceDetailKind
+    source_role: string
+    source_digest: string
+    normalized_crop: [number, number, number, number]
+    requested_operation: ProjectReferenceDetailOperation
+    resolved_operation: ProjectReferenceDetailOperation
+    editor_model: string | null
+    label_digest: string
+    seal: string
+  }
+}
+
 export interface ProjectAssetOutputMetadata extends Record<string, unknown> {
   private?: boolean
   explicit?: boolean
+  initial_blur?: boolean
   reference_sheet?: ProjectReferenceSheetArtifactMetadata
+  reference_pack?: ProjectReferencePackArtifactMetadata
   lineage?: {
     parent_job_id?: string
     candidate_index?: number
@@ -905,12 +1190,18 @@ export interface ProjectAssetOutputMetadata extends Record<string, unknown> {
   }
 }
 
+export function projectAssetOutputNeedsInitialBlur(output: ProjectAssetOutput): boolean {
+  return output.metadata?.private === true || output.metadata?.initial_blur === true
+}
+
 export interface ProjectReferenceSheetVariantMetadata {
   schema_version?: number
   planner_version?: string
   mode?: ProjectReferenceSheetMode
-  asset_type?: ProjectReferenceAssetType
+  asset_type?: ProjectReferenceAssetType | ProjectReferenceLegacyAssetType
   model?: string
+  generation_model?: string
+  editor_model?: string
   roles?: {
     sheet?: string
     panels?: string[]
@@ -918,6 +1209,30 @@ export interface ProjectReferenceSheetVariantMetadata {
   }
   reason_codes?: string[]
   review_status?: ProjectReferenceReviewStatus
+  max_repair_attempts?: number
+  repair_attempts_used?: number
+  anchor_privacy?: ProjectReferenceLegacyAnchorPrivacy
+}
+
+export interface ProjectReferencePackVariantMetadata extends Partial<ProjectReferencePackPlan> {
+  schema_version: 2
+  planner_version: string
+  plan_seal?: string
+  reference_type?: ProjectReferenceAssetType
+  anchor_role?: string | null
+  generation_model?: string
+  editor_model?: string | null
+  user_loras?: { count: number; preserved: boolean }
+  additional_loras?: ProjectReferenceAdditionalLoraSummary
+  private_output?: boolean
+  operation_routing?: ProjectReferenceOperationRouting
+  review_status?: ProjectReferenceReviewStatus
+  max_repair_attempts?: number
+  repair_attempts_used?: number
+  roles?: {
+    sheets?: string[]
+    repaired?: string[]
+  }
 }
 
 export interface ProjectAssetVariant {
@@ -928,11 +1243,21 @@ export interface ProjectAssetVariant {
   outputs: ProjectAssetOutput[]
   metadata: Record<string, unknown> & {
     reference_sheet?: ProjectReferenceSheetVariantMetadata
+    reference_pack?: ProjectReferencePackVariantMetadata
     job?: {
       id?: string
       model?: string
+      generation_model?: string
+      editor_model?: string | null
       candidate_index?: number
       candidate_count?: number
+      max_repair_attempts_per_candidate?: number
+      repair_attempts_used_per_candidate?: number
+      retry?: {
+        parent_variant_id?: string | null
+        instruction_present?: boolean
+        plan_seal?: string
+      }
     }
     parent?: {
       asset_id?: string
@@ -943,7 +1268,7 @@ export interface ProjectAssetVariant {
 
 export interface ProjectAsset {
   id: string
-  asset_type: string
+  asset_type: ProjectReferenceAssetType | ProjectReferenceLegacyAssetType | string
   name: string
   description: string
   tags: string[]
@@ -952,7 +1277,21 @@ export interface ProjectAsset {
 }
 
 export interface ProjectReferenceGenerationSettings {
+  schema_version?: 2
   mode?: ProjectReferenceSheetMode
+  intent?: ProjectReferenceIntent
+  depth?: ProjectReferenceDepth
+  /** Accepted only with Custom depth; all presets resolve their own sheet count. */
+  sheet_count?: number
+  type_fields?: ProjectReferenceTypeFields
+  managed_layout_assist?: ProjectReferenceManagedLayoutAssistMode
+  preset?: ProjectReferencePreset
+  anchor_basis?: ProjectReferenceAnchorBasis
+  detail_callouts?: ProjectReferenceDetailCallout[]
+  planning_model?: string
+  planning_provider?: string
+  review_model?: string
+  review_provider?: string
   model_type?: string
   editor_model_type?: string
   candidate_count?: number
@@ -962,14 +1301,19 @@ export interface ProjectReferenceGenerationSettings {
   columns?: number
   palette_swatches?: number
   review?: boolean
+  max_repair_attempts?: number
   num_inference_steps?: number
   guidance_scale?: number
   seed?: number
   negative_prompt?: string
   activated_loras?: string[]
   loras_multipliers?: string
+  additional_loras?: ProjectReferenceAdditionalLora[]
   private_output?: boolean
   explicit_output?: boolean
+  content_capability?: 'standard' | 'unrestricted_local'
+  initial_blur?: boolean
+  intelligence_policy?: 'standard_auto' | 'uncensored_auto'
 }
 
 export interface FreshProjectReferenceGenerationRequest extends ProjectReferenceGenerationSettings {
@@ -997,20 +1341,234 @@ export type ProjectReferenceGenerationRequest =
   | FreshProjectReferenceGenerationRequest
   | ExistingProjectReferenceGenerationRequest
 
+export interface ProjectReferenceGenerationResponse {
+  job_id: string
+  asset: ProjectAsset
+  /** Present for v2 requests; absent on v1-compatible hosts/responses. */
+  plan?: ProjectReferencePackPlan
+}
+
+export interface ProjectReferenceCapabilities {
+  schema_version: 2
+  planner_version: string
+  intents: ProjectReferenceIntent[]
+  depths: Record<ProjectReferenceDepth, {
+    sheet_count?: number
+    minimum?: number
+    maximum?: number
+    default?: number
+  }>
+  reference_types: Array<{
+    id: ProjectReferenceAssetType
+    presets: Array<{
+      id: ProjectReferencePreset
+      label: string
+      ordered_roles: string[]
+      valid_source_roles: string[]
+      detail_operations: ProjectReferenceDetailOperation[]
+    }>
+    type_fields: Array<{
+      id: string
+      groups: Array<{
+        id: string
+        label: string
+        options: Array<{ id: string; label: string }>
+      }>
+    }>
+    detail_kinds: Array<{ id: Exclude<ProjectReferenceDetailKind, 'custom'>; label: string }>
+    supports_custom_details: boolean
+  }>
+  detail_operations: ProjectReferenceDetailOperation[]
+  lora_scopes: ProjectReferenceLoraScope[]
+  content_capabilities: Array<'standard' | 'unrestricted_local'>
+  intelligence_policies: Array<'standard_auto' | 'uncensored_auto'>
+  uncensored_auto_review: {
+    requested_model: 'auto_local'
+    resolved_model: string
+    resolved_provider: 'local'
+    vision_required: true
+  }
+  review_policy: {
+    mandatory_for_content_capabilities: Array<'unrestricted_local'>
+    mandatory_when_explicit_output: true
+    off_allowed_for_content_capabilities: Array<'standard'>
+    mandatory_contract: 'explicit_unrestricted_fidelity_v1'
+  }
+  max_candidate_count: number
+  max_repair_attempts: number
+  default_models: {
+    generation_model: string
+    editor_model: string
+  }
+}
+
+export interface ProjectReferenceAuthoringSnapshot {
+  schema_version: 2
+  asset_id: string
+  variant_id: string
+  authored_settings: {
+    seal: string
+    type_fields: ProjectReferenceTypeFields
+    detail_callouts: ProjectReferenceDetailCallout[]
+  }
+}
+
+export interface ProjectReferenceModelCatalogEntry {
+  model_type: string
+  name: string
+  image_outputs?: boolean
+  supports_ref_images?: boolean
+  is_downloaded?: boolean
+  downloadable?: boolean
+  manual_checkpoint_verification_required?: boolean
+  manual_checkpoint_verified?: boolean
+}
+
+export function getProjectReferenceModelAvailabilityCopy(
+  model: ProjectReferenceModelCatalogEntry,
+): string {
+  if (model.downloadable === false) {
+    return model.manual_checkpoint_verified
+      ? ' (manual checkpoint verified)'
+      : ' (manual install and verification required)'
+  }
+  return model.is_downloaded === false ? ' (download required)' : ''
+}
+
+export function getProjectReferenceGenerationModels<T extends ProjectReferenceModelCatalogEntry>(
+  models: readonly T[],
+): T[] {
+  return models.filter(model => model.image_outputs === true)
+}
+
+export function getProjectReferenceEditorModels<T extends ProjectReferenceModelCatalogEntry>(
+  models: readonly T[],
+): T[] {
+  return models.filter(model => (
+    model.image_outputs === true && model.supports_ref_images === true
+  ))
+}
+
+export function selectProjectReferenceModel(
+  models: readonly ProjectReferenceModelCatalogEntry[],
+  current: string,
+  preferred = '',
+): string {
+  if (models.some(model => model.model_type === current)) return current
+  if (preferred && models.some(model => model.model_type === preferred)) return preferred
+  return models[0]?.model_type ?? ''
+}
+
+export function getEffectiveProjectReferenceRepairAttempts(
+  mode: ProjectReferenceSheetMode,
+  review: boolean,
+  requested: number,
+): number {
+  if (!review || mode === 'draft') return 0
+  if (!Number.isInteger(requested)) return 1
+  return Math.max(1, Math.min(5, requested))
+}
+
+export function getProjectReferenceRepairCopy(
+  metadata?: {
+    repair_attempts_used?: number
+    roles?: { repaired?: string[] }
+  },
+): string {
+  const repaired = Array.isArray(metadata?.roles?.repaired)
+    ? metadata.roles.repaired.filter(role => typeof role === 'string')
+    : []
+  const recordedAttempts = metadata?.repair_attempts_used
+  const attempts = Number.isInteger(recordedAttempts) && Number(recordedAttempts) >= 0
+    ? Number(recordedAttempts)
+    : repaired.length
+  if (attempts === 0) return 'No repair was needed.'
+  const targets = repaired.length > 0
+    ? repaired.map(role => (
+      role.replaceAll('_', ' ').replace(/\b\w/g, letter => letter.toUpperCase())
+    )).join(', ')
+    : 'the requested panels'
+  return `${attempts} bounded repair ${attempts === 1 ? 'attempt' : 'attempts'} regenerated ${targets}.`
+}
+
+const PROJECT_ASSET_STATUS_MESSAGES: Partial<Record<number, string>> = {
+  401: 'Project reference access was denied',
+  403: 'Project reference access was denied',
+  404: 'Project references are unavailable for this project',
+  409: 'Project reference request conflicts with the current state',
+  423: 'Project reference access is locked',
+  500: 'Project reference service failed',
+  503: 'Project reference storage is unavailable',
+}
+
+export class ProjectAssetRequestError extends Error {
+  readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ProjectAssetRequestError'
+    this.status = status
+  }
+}
+
+/** Build a fixed, status-aware error without reflecting response content. */
+export function projectAssetRequestError(
+  status: number,
+  fallback: string,
+): ProjectAssetRequestError {
+  const safeStatus = Number.isInteger(status) && status >= 100 && status <= 599
+    ? status
+    : 0
+  const message = PROJECT_ASSET_STATUS_MESSAGES[safeStatus] ?? fallback
+  return new ProjectAssetRequestError(
+    safeStatus,
+    safeStatus > 0 ? `${message} (HTTP ${safeStatus})` : message,
+  )
+}
+
+/** Render only fixed client copy; arbitrary exceptions may contain private details. */
+export function projectReferenceSafeErrorMessage(reason: unknown, fallback: string): string {
+  return reason instanceof ProjectAssetRequestError ? reason.message : fallback
+}
+
 /** Select the sole semantic reference represented by a reference-sheet variant. */
 export function selectProjectAssetApplyOutput(
   variant: ProjectAssetVariant,
 ): ProjectAssetOutput | undefined {
+  if (variant.variant_type === 'reference_pack') {
+    return getProjectAssetApplyOutputs(variant)[0]
+  }
   if (variant.variant_type !== 'reference_sheet') return variant.outputs[0]
   return variant.outputs.find(output => output.metadata?.reference_sheet?.role === 'sheet')
     // Compatibility with reference-sheet records written before artifact roles.
     ?? variant.outputs[0]
 }
 
+/** Whole-pack application order is authored by public, prompt-free indices. */
+export function getProjectAssetApplyOutputs(
+  variant: ProjectAssetVariant,
+): ProjectAssetOutput[] {
+  if (variant.variant_type !== 'reference_pack') {
+    const output = selectProjectAssetApplyOutput(variant)
+    return output ? [output] : []
+  }
+  return variant.outputs
+    .map((output, originalIndex) => ({ output, originalIndex }))
+    .sort((left, right) => {
+      const leftIndex = left.output.metadata.reference_pack?.index
+      const rightIndex = right.output.metadata.reference_pack?.index
+      const safeLeft = Number.isInteger(leftIndex) ? Number(leftIndex) : left.originalIndex
+      const safeRight = Number.isInteger(rightIndex) ? Number(rightIndex) : right.originalIndex
+      return safeLeft - safeRight || left.originalIndex - right.originalIndex
+    })
+    .map(({ output }) => output)
+}
+
 /** Return display-only components; these must never be applied separately. */
 export function getProjectAssetComponentOutputs(
   variant: ProjectAssetVariant,
 ): ProjectAssetOutput[] {
+  if (variant.variant_type === 'reference_pack') return []
   if (variant.variant_type !== 'reference_sheet') return []
   const sheet = selectProjectAssetApplyOutput(variant)
   return variant.outputs.filter(output => (
@@ -1048,67 +1606,342 @@ export function isProjectAssetOperationCurrent(
   return submittedProject === currentProject && submittedEpoch === currentEpoch
 }
 
+export interface ProjectReferenceRetrySettings {
+  mode: ProjectReferenceSheetMode
+  model_type: string
+  editor_model_type?: string
+  private_output: boolean
+  explicit_output: boolean
+  content_capability?: 'standard' | 'unrestricted_local'
+  initial_blur?: boolean
+  intelligence_policy?: 'standard_auto' | 'uncensored_auto'
+  additional_loras?: ProjectReferenceAdditionalLora[]
+  review: boolean
+  max_repair_attempts: number
+  schema_version?: 2
+  asset_type?: ProjectReferenceAssetType
+  intent?: ProjectReferenceIntent
+  depth?: ProjectReferenceDepth
+  sheet_count?: number
+  type_fields?: ProjectReferenceTypeFields
+  managed_layout_assist?: ProjectReferenceManagedLayoutAssistMode
+  preset?: ProjectReferencePreset
+  anchor_basis?: ProjectReferenceAnchorBasis
+  detail_callouts?: ProjectReferenceDetailCallout[]
+  planning_model?: string
+  planning_provider?: string
+  review_model?: string
+  review_provider?: string
+  /** Session-only proof that private labels came from this exact public summary. */
+  authored_settings_seal?: string
+}
+
+export function isProjectReferenceReviewMandatory(
+  contentCapability: 'standard' | 'unrestricted_local' | undefined,
+  explicitOutput: boolean,
+  policy: ProjectReferenceCapabilities['review_policy'] | undefined,
+): boolean {
+  return (policy
+    ? policy.mandatory_for_content_capabilities.some(capability => capability === contentCapability)
+    : contentCapability === 'unrestricted_local')
+    || (explicitOutput && (policy?.mandatory_when_explicit_output ?? true))
+}
+
+export function isProjectReferenceReviewerEligible(
+  intelligencePolicy: 'standard_auto' | 'uncensored_auto',
+  modelId: string | undefined,
+  provider: string | undefined,
+  reviewModels: ReadonlyArray<{ id: string; provider?: string }>,
+  capabilities: ProjectReferenceCapabilities | null,
+): boolean {
+  if (!modelId || modelId === 'off') return false
+  if (intelligencePolicy === 'uncensored_auto') {
+    const contract = capabilities?.uncensored_auto_review
+    if (!contract) return false
+    const exactModel = reviewModels.find(model => (
+      model.id === contract.resolved_model
+      && (model.provider ?? 'local') === contract.resolved_provider
+    ))
+    return Boolean(exactModel) && (modelId === 'auto_local'
+      || (modelId === contract.resolved_model
+        && (!provider || provider === contract.resolved_provider)))
+  }
+  if (modelId === 'auto_local') {
+    return reviewModels.some(model => (model.provider ?? 'local') === 'local')
+  }
+  return reviewModels.some(model => (
+    model.id === modelId && (!provider || (model.provider ?? 'local') === provider)
+  ))
+}
+
+export interface ProjectReferenceRetryReviewDecision {
+  ready: boolean
+  use_current_reviewer: boolean
+  intelligence_policy: 'standard_auto' | 'uncensored_auto'
+}
+
+export function resolveProjectReferenceRetryReview(
+  source: Pick<ProjectReferenceRetrySettings,
+    'content_capability' | 'explicit_output' | 'intelligence_policy'
+    | 'review' | 'review_model' | 'review_provider'>,
+  current: { review_model: string; review_provider?: string },
+  reviewModels: ReadonlyArray<{ id: string; provider?: string }>,
+  capabilities: ProjectReferenceCapabilities | null,
+): ProjectReferenceRetryReviewDecision {
+  const mandatory = isProjectReferenceReviewMandatory(
+    source.content_capability, source.explicit_output, capabilities?.review_policy,
+  )
+  const intelligencePolicy = source.intelligence_policy
+    ?? (mandatory ? 'uncensored_auto' : 'standard_auto')
+  if (!mandatory) {
+    return { ready: true, use_current_reviewer: false, intelligence_policy: intelligencePolicy }
+  }
+  if (source.review && isProjectReferenceReviewerEligible(
+    intelligencePolicy, source.review_model, source.review_provider,
+    reviewModels, capabilities,
+  )) {
+    return { ready: true, use_current_reviewer: false, intelligence_policy: intelligencePolicy }
+  }
+  const currentEligible = isProjectReferenceReviewerEligible(
+    intelligencePolicy, current.review_model, current.review_provider,
+    reviewModels, capabilities,
+  )
+  return {
+    ready: currentEligible,
+    use_current_reviewer: currentEligible,
+    intelligence_policy: intelligencePolicy,
+  }
+}
+
+/** Private labels are required to replay any custom public authored identity. */
+export function projectReferenceRetryNeedsPrivateAuthoring(
+  variant: ProjectAssetVariant,
+): boolean {
+  const authored = variant.metadata.reference_pack?.authored_settings
+  return authored?.type_fields.some(field => field.items.some(item => item.custom)) === true
+    || authored?.detail_callouts.some(callout => callout.kind === 'custom') === true
+}
+
+function resolveProjectReferenceRetryAuthoredSettings(
+  packMetadata: ProjectReferencePackVariantMetadata,
+  fallback: ProjectReferenceRetrySettings,
+  capabilities?: ProjectReferenceCapabilities,
+): Pick<ProjectReferenceRetrySettings, 'type_fields' | 'detail_callouts'> {
+  const summary = packMetadata.authored_settings
+  if (!summary) return {}
+  const referenceType = packMetadata.reference_type ?? fallback.asset_type
+  const hasExactPrivateSnapshot = fallback.authored_settings_seal === summary.seal
+  const typeCapability = capabilities?.reference_types.find(item => item.id === referenceType)
+  const fallbackFields = (fallback.type_fields ?? {}) as Record<string, ProjectReferenceTypeFieldItem[] | undefined>
+  const resolvedFields: Record<string, ProjectReferenceTypeFieldItem[]> = {}
+  for (const field of summary.type_fields) {
+    const resolvedItems: ProjectReferenceTypeFieldItem[] = []
+    for (const publicItem of field.items) {
+      const localItem = hasExactPrivateSnapshot && publicItem.custom
+        ? fallbackFields[field.field]?.find(item => (
+        item.id === publicItem.id
+        && item.custom === publicItem.custom
+        && item.group === publicItem.group
+        ))
+        : undefined
+      if (localItem) {
+        resolvedItems.push(localItem)
+        continue
+      }
+      if (publicItem.custom) return {}
+      const group = typeCapability?.type_fields.find(item => item.id === field.field)
+        ?.groups.find(item => item.id === publicItem.group)
+      const option = group?.options.find(item => item.id === publicItem.id)
+      if (!option) return {}
+      resolvedItems.push({ ...publicItem, label: option.label })
+    }
+    resolvedFields[field.field] = resolvedItems
+  }
+
+  const fallbackCallouts = fallback.detail_callouts ?? []
+  const resolvedCallouts: ProjectReferenceDetailCallout[] = []
+  for (const publicCallout of summary.detail_callouts) {
+    const localCallout = hasExactPrivateSnapshot && publicCallout.kind === 'custom'
+      ? fallbackCallouts.find(item => item.custom_id === publicCallout.custom_id)
+      : undefined
+    if (localCallout) {
+      resolvedCallouts.push({
+        ...localCallout,
+        kind: publicCallout.kind,
+        operation: publicCallout.requested_operation,
+        source_role: publicCallout.source_role,
+      })
+      continue
+    }
+    if (publicCallout.kind === 'custom') return {}
+    const kind = typeCapability?.detail_kinds.find(item => item.id === publicCallout.kind)
+    if (!kind) return {}
+    resolvedCallouts.push({
+      custom_id: publicCallout.custom_id,
+      label: kind.label,
+      kind: publicCallout.kind,
+      operation: publicCallout.requested_operation,
+      source_role: publicCallout.source_role,
+    })
+  }
+  return {
+    type_fields: resolvedFields as ProjectReferenceTypeFields,
+    detail_callouts: resolvedCallouts,
+  }
+}
+
 /** Preserve available source settings; layout controls are deliberately current. */
 export function getProjectReferenceRetrySettings(
   variant: ProjectAssetVariant,
-  fallback: {
-    mode: ProjectReferenceSheetMode
-    model_type: string
-    private_output: boolean
-    explicit_output: boolean
-    review: boolean
-  },
-): typeof fallback {
+  fallback: ProjectReferenceRetrySettings,
+  capabilities?: ProjectReferenceCapabilities,
+): ProjectReferenceRetrySettings {
   const metadata = variant.metadata.reference_sheet
+  const packMetadata = variant.metadata.reference_pack
   const output = selectProjectAssetApplyOutput(variant)
-  const mode = metadata?.mode
-  const model = metadata?.model
-  return {
-    mode: mode === 'production' || mode === 'hybrid' || mode === 'draft'
-      ? mode
-      : fallback.mode,
+  const mode = packMetadata?.mode ?? metadata?.mode
+  const selectedMode = mode === 'production' || mode === 'hybrid' || mode === 'draft'
+    ? mode
+    : fallback.mode
+  const model = packMetadata?.generation_model ?? metadata?.generation_model ?? metadata?.model
+  const editorModel = packMetadata?.editor_model ?? metadata?.editor_model
+  const fallbackEditorModel = fallback.editor_model_type?.trim()
+  const requestedRepairs = typeof packMetadata?.max_repair_attempts === 'number'
+    ? packMetadata.max_repair_attempts
+    : typeof metadata?.max_repair_attempts === 'number'
+      ? metadata.max_repair_attempts
+    : fallback.max_repair_attempts
+  const settings: ProjectReferenceRetrySettings = {
+    mode: selectedMode,
     model_type: typeof model === 'string' && model.length > 0 ? model : fallback.model_type,
-    private_output: typeof output?.metadata.private === 'boolean'
+    editor_model_type: typeof editorModel === 'string' && editorModel.length > 0
+      ? editorModel
+      : fallbackEditorModel || undefined,
+    private_output: typeof packMetadata?.private_output === 'boolean'
+      ? packMetadata.private_output
+      : typeof output?.metadata.private === 'boolean'
       ? output.metadata.private
       : fallback.private_output,
-    explicit_output: typeof output?.metadata.explicit === 'boolean'
+    explicit_output: typeof packMetadata?.explicit_output === 'boolean'
+      ? packMetadata.explicit_output
+      : typeof output?.metadata.explicit === 'boolean'
       ? output.metadata.explicit
       : fallback.explicit_output,
     // `review_unavailable` is also the no-review representation in v1
     // metadata, so current user intent is the only unambiguous source here.
     review: fallback.review,
+    max_repair_attempts: getEffectiveProjectReferenceRepairAttempts(
+      selectedMode,
+      fallback.review,
+      requestedRepairs,
+    ),
   }
+  if (fallback.asset_type) settings.asset_type = fallback.asset_type
+  if (fallback.preset) settings.preset = fallback.preset
+  if (fallback.anchor_basis) settings.anchor_basis = fallback.anchor_basis
+  if (packMetadata?.schema_version === 2) {
+    settings.schema_version = 2
+    settings.asset_type = packMetadata.reference_type ?? fallback.asset_type
+    settings.intent = packMetadata.intent ?? fallback.intent ?? 'generic'
+    settings.depth = packMetadata.depth ?? fallback.depth ?? 'standard'
+    settings.sheet_count = settings.depth === 'custom'
+      ? packMetadata.sheet_count ?? fallback.sheet_count
+      : undefined
+    const authoredSettings = resolveProjectReferenceRetryAuthoredSettings(
+      packMetadata,
+      fallback,
+      capabilities,
+    )
+    if (authoredSettings.type_fields !== undefined) {
+      settings.type_fields = authoredSettings.type_fields
+    }
+    settings.managed_layout_assist = 'off'
+    settings.preset = packMetadata.preset ?? fallback.preset
+    settings.anchor_basis = packMetadata.anchor_basis ?? fallback.anchor_basis
+    if (authoredSettings.detail_callouts !== undefined) {
+      settings.detail_callouts = authoredSettings.detail_callouts
+    }
+    settings.content_capability = packMetadata.content_capability ?? fallback.content_capability
+    settings.initial_blur = packMetadata.initial_blur ?? fallback.initial_blur
+    settings.intelligence_policy = packMetadata.intelligence_policy ?? fallback.intelligence_policy
+    const summarizedLoras = [
+      ...(packMetadata.additional_loras?.applied ?? []),
+      ...(packMetadata.additional_loras?.skipped ?? []),
+    ]
+    settings.additional_loras = packMetadata.additional_loras
+      ? [...new Map(summarizedLoras.map(lora => [lora.id, {
+          id: lora.id,
+          multiplier: lora.weight,
+          scope: lora.requested_scope,
+        }])).values()]
+      : fallback.additional_loras
+    settings.planning_model = packMetadata.planning?.resolved_model
+      ?? packMetadata.planning?.requested_model
+      ?? fallback.planning_model
+    settings.planning_provider = settings.planning_model === 'auto' || settings.planning_model === 'deterministic'
+      ? undefined
+      : packMetadata.planning?.resolved_provider ?? fallback.planning_provider
+    settings.review_model = packMetadata.review?.resolved_model
+      ?? packMetadata.review?.requested_model
+      ?? fallback.review_model
+    settings.review_provider = settings.review_model === 'auto_local' || settings.review_model === 'off'
+      ? undefined
+      : packMetadata.review?.resolved_provider ?? fallback.review_provider
+    settings.review = settings.review_model !== 'off'
+    settings.max_repair_attempts = getEffectiveProjectReferenceRepairAttempts(
+      selectedMode,
+      settings.review,
+      requestedRepairs,
+    )
+  }
+  return settings
 }
 
 export async function fetchProjectAssets(project: string): Promise<ProjectAsset[]> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets`)
-  if (!res.ok) throw new Error('Failed to load project references')
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to load project references')
   const data = await res.json()
   return data.assets || []
+}
+
+export async function fetchProjectReferenceCapabilities(
+  project: string,
+): Promise<ProjectReferenceCapabilities> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/reference-capabilities`)
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to load Reference Studio capabilities')
+  return res.json()
+}
+
+export async function fetchProjectReferenceAuthoring(
+  project: string,
+  assetId: string,
+  variantId: string,
+  signal?: AbortSignal,
+): Promise<ProjectReferenceAuthoringSnapshot> {
+  const res = await fetch(
+    `${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/${encodeURIComponent(assetId)}/variants/${encodeURIComponent(variantId)}/reference-authoring`,
+    { signal, cache: 'no-store' },
+  )
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Exact reference authoring is unavailable')
+  return res.json()
 }
 
 export async function createProjectAsset(project: string, body: Record<string, unknown>): Promise<ProjectAsset> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Failed to create reference card' }))
-    throw new Error(err.detail || 'Failed to create reference card')
-  }
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to create reference card')
   return res.json()
 }
 
 export async function generateProjectAssetReferences(
   project: string,
   body: ProjectReferenceGenerationRequest,
-): Promise<{ job_id: string; asset: ProjectAsset }> {
+): Promise<ProjectReferenceGenerationResponse> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/generate`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Failed to start reference generation' }))
-    throw new Error(err.detail || 'Failed to start reference generation')
-  }
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to start reference generation')
   return res.json()
 }
 
@@ -1118,10 +1951,7 @@ export async function addProjectAssetVariant(
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/${encodeURIComponent(assetId)}/variants`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Failed to import reference media' }))
-    throw new Error(err.detail || 'Failed to import reference media')
-  }
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to import reference media')
   return res.json()
 }
 
@@ -1131,7 +1961,7 @@ export async function setProjectAssetVariantStatus(
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/${encodeURIComponent(assetId)}/variants/${encodeURIComponent(variantId)}`, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }),
   })
-  if (!res.ok) throw new Error('Failed to update reference candidate')
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to update reference candidate')
   return res.json()
 }
 
@@ -1141,10 +1971,7 @@ export async function deleteProjectAssetVariant(
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/${encodeURIComponent(assetId)}/variants/${encodeURIComponent(variantId)}`, {
     method: 'DELETE',
   })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Failed to delete reference candidate' }))
-    throw new Error(err.detail || 'Failed to delete reference candidate')
-  }
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to delete reference candidate')
 }
 
 export function getProjectAssetMediaUrl(project: string, relativePath: string): string {
@@ -2657,8 +3484,12 @@ export async function fetchHostTerms(
   const query = new URLSearchParams({ workspace })
   const res = await fetch(`${BASE}/api/v1/host-terms?${query}`)
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Failed to load host notice status' }))
-    throw new Error(err.detail || 'Failed to load host notice status')
+    const message = res.status === 423
+      ? 'Unlock the selected project to review host notices.'
+      : res.status === 403
+        ? 'This project is not authorized to review host notices.'
+        : 'Failed to load host notice status.'
+    throw new Error(message)
   }
   return res.json()
 }
@@ -2674,8 +3505,14 @@ export async function acceptHostTerm(
     body: JSON.stringify({ term, version, workspace }),
   })
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Host notice acceptance failed' }))
-    throw new Error(err.detail || 'Host notice acceptance failed')
+    const message = res.status === 409
+      ? 'The notice changed. Reload Maestro and review the current version.'
+      : res.status === 423
+        ? 'Unlock the selected project before accepting this notice.'
+        : res.status === 403
+          ? 'This project is not authorized to accept host notices.'
+          : 'Host notice acceptance failed.'
+    throw new Error(message)
   }
   return res.json()
 }

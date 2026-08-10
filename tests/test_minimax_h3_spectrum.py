@@ -543,6 +543,10 @@ class SpectrumCompatibilityTests(unittest.TestCase):
             "_H3_LONG_STUDIO_MODELS": {"minimax_h3"},
             "_H3_REF2VA_MODEL": "minimax_h3_ref2va",
             "_H3_W4A8_FL2VA_MODEL": "minimax_h3_w4a8_fl2va",
+            "_H3_PEAK_RECOVERY_POLICY_VERSION": 1,
+            "_h3_effective_offload_profile": (
+                lambda params: int(params.get("override_profile") or 4)
+            ),
             "_h3_benchmark_input_signature": lambda _params, _case: {},
             "_get_h3_benchmark_cache": lambda: Cache(),
         }

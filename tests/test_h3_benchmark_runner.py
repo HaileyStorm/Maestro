@@ -122,6 +122,10 @@ class TestH3BenchmarkMatrix(unittest.TestCase):
              delivery_4k.delivery_fit),
             ("flashvsr3", "3840x2160", "center_crop"),
         )
+        delivery_config = delivery_4k.public_config()
+        self.assertEqual(delivery_config["native_resolution"], "1344x768")
+        self.assertEqual(delivery_config["delivery_kind"], "learned_upscale")
+        self.assertFalse(delivery_config["native_delivery_resolution"])
         for case in (hd, ultra, delivery_4k):
             payload = runner.build_generation_payload(
                 case, project="synthetic-project", seed=7, reference_path=None,
@@ -129,6 +133,116 @@ class TestH3BenchmarkMatrix(unittest.TestCase):
             self.assertEqual(payload["spatial_upsampling"], case.spatial_upsampling)
             self.assertEqual(payload["delivery_resolution"], case.delivery_resolution)
             self.assertEqual(payload["delivery_fit"], case.delivery_fit)
+
+    def test_high_allocation_probes_cross_likely_models_and_profiles(self):
+        defaults = [case.case_id for case in runner.build_matrix()]
+        self.assertTrue(all(
+            case_id not in defaults for case_id in runner.ALLOCATION_PROBE_CASES
+        ))
+        cases = runner.build_matrix(runner.ALLOCATION_PROBE_CASES)
+        self.assertEqual(len(cases), 9)
+        self.assertEqual({case.offload_profile for case in cases}, {3, 4, 5})
+        self.assertEqual(
+            {case.model_type for case in cases},
+            {
+                "minimax_h3", "minimax_h3_w4a8_fl2va",
+                "minimax_h3_pinkcherry_fl2va", "minimax_h3_ref2va",
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case.case_id):
+                self.assertTrue(case.allocation_probe)
+                self.assertEqual(
+                    (case.resolution, case.steps, case.expected_frames),
+                    ("1344x768", 2, 243),
+                )
+                payload = runner.build_generation_payload(
+                    case,
+                    project="synthetic-project",
+                    seed=7,
+                    reference_path="private-procedural-reference.png",
+                )
+                self.assertEqual(payload["video_length"], 243)
+                self.assertEqual(payload["sliding_window_size"], 243)
+                self.assertEqual(payload["num_inference_steps"], 2)
+                self.assertEqual(payload["override_profile"], case.offload_profile)
+                self.assertEqual(
+                    payload["custom_settings"]["h3_attention_engine"], "sol_attn",
+                )
+                self.assertEqual(payload["custom_settings"]["h3_sol_dense_steps"], 10)
+                self.assertEqual(payload["custom_settings"]["h3_sol_dense_blocks"], 2)
+                self.assertTrue(payload["custom_settings"]["h3_benchmark_capture"])
+                self.assertTrue(payload["private_output"])
+                self.assertFalse(payload["h3_adaptive_conditioning"])
+                if case.semantic_reference:
+                    self.assertEqual(
+                        payload["image_refs"], ["private-procedural-reference.png"],
+                    )
+                    self.assertNotIn("image_start", payload)
+                else:
+                    self.assertEqual(
+                        payload["image_start"], "private-procedural-reference.png",
+                    )
+        ref_case = "ref2va_high_allocation_p4"
+        for invalid in (106, 108, 244, 346):
+            with self.subTest(invalid_frames=invalid), self.assertRaises(ValueError):
+                runner.build_matrix(
+                    [ref_case], {ref_case: {"expected_frames": invalid}},
+                )
+        base_case = "base_high_allocation_p4"
+        with self.assertRaises(ValueError):
+            runner.build_matrix(
+                [base_case], {base_case: {"expected_frames": 107}},
+            )
+        for case_id in (base_case, ref_case):
+            for frames in (226, 243, 260):
+                with self.subTest(case=case_id, frames=frames):
+                    probe = runner.build_matrix(
+                        [case_id], {case_id: {"expected_frames": frames}},
+                    )[0]
+                    probe_payload = runner.build_generation_payload(
+                        probe,
+                        project="synthetic-project",
+                        seed=7,
+                        reference_path="private-procedural-reference.png",
+                    )
+                    self.assertEqual(probe_payload["video_length"], frames)
+                    self.assertEqual(
+                        probe_payload["sliding_window_size"], frames,
+                    )
+        full = runner.build_matrix(
+            [ref_case], {ref_case: {"expected_frames": 260, "steps": 20}},
+        )[0]
+        self.assertEqual((full.expected_frames, full.steps), (260, 20))
+        ordinary = runner.build_matrix(["base_native_sdpa"])[0]
+        delivery = runner.build_matrix([runner.LIVE_4K_ACCEPTANCE_CASE])[0]
+        boundary = runner.build_matrix([
+            "boundary_off_continuous_edge_only",
+        ])[0]
+        for case, expected in (
+            (ordinary, (124, 124)),
+            (delivery, (124, 124)),
+            (boundary, (350, 175)),
+        ):
+            with self.subTest(unchanged_case=case.case_id):
+                unchanged = runner.build_generation_payload(
+                    case,
+                    project="synthetic-project",
+                    seed=7,
+                    reference_path=(
+                        "private-procedural-reference.png"
+                        if case.procedural_edge else None
+                    ),
+                )
+                self.assertEqual(
+                    (unchanged["video_length"], unchanged["sliding_window_size"]),
+                    expected,
+                )
+        for override in (
+            {"sol_dense_steps": 9}, {"sol_dense_blocks": 1},
+        ):
+            with self.subTest(sol_override=override), self.assertRaises(ValueError):
+                runner.build_matrix([ref_case], {ref_case: override})
 
     def test_t8_multirate_evidence_is_disabled_and_dry_run_only(self):
         case_id = "base_t8_multirate_4v8a_evidence"
@@ -172,7 +286,10 @@ class TestH3BenchmarkMatrix(unittest.TestCase):
     def test_matrix_config_rejects_prompts_paths_and_model_replacement(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "matrix.json"
-            for unsafe in ("prompt", "image_refs", "model_type", "output_path"):
+            for unsafe in (
+                "prompt", "image_refs", "model_type", "output_path",
+                "override_profile", "offload_profile", "allocation_probe",
+            ):
                 with self.subTest(field=unsafe):
                     config.write_text(json.dumps({
                         "base_native_sdpa": {unsafe: "private-value"},
@@ -239,6 +356,133 @@ class TestH3BenchmarkSafety(unittest.TestCase):
         self.assertIn(b"IHDR", first)
         self.assertTrue(first.endswith(b"IEND\xaeB`\x82"))
 
+    def test_allocation_evidence_requires_exact_fresh_profile_identity(self):
+        case = runner.build_matrix(["ref2va_high_allocation_p4"])[0]
+
+        def record(*, profile=4, frames=243, samples=2, dense_steps=10):
+            return {
+                "cache_key": "exact" if profile == 4 else "other",
+                "sample_count": samples,
+                "peak_gpu_memory_bytes": 31_000_000_000,
+                "generation_wall_time_seconds": 12.5,
+                "spec": {
+                    "model": {"id": "minimax_h3_ref2va"},
+                    "engine": {
+                        "id": "sol_attn", "dense_steps": dense_steps,
+                        "dense_blocks": 2,
+                    },
+                    "task": {
+                        "width": 1344, "height": 768,
+                        "frame_count": frames, "sampling_steps": 2,
+                        "offload_profile": profile,
+                    },
+                },
+            }
+
+        report = {"records": [
+            record(),
+            record(profile=5),
+            record(frames=260),
+            record(dense_steps=9),
+        ]}
+        evidence = runner.allocation_vram_evidence(
+            report, case, prior_sample_counts={"exact": 1},
+        )
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["offload_profile"], 4)
+        self.assertEqual(evidence[0]["frame_count"], 243)
+        self.assertEqual(evidence[0]["sample_count_delta"], 1)
+        self.assertEqual(
+            runner.allocation_vram_evidence(
+                report, case, prior_sample_counts={"exact": 2},
+            ),
+            [],
+        )
+
+        self.assertEqual(
+            runner.allocation_vram_evidence(
+                report, case, prior_sample_counts=None,
+            ),
+            [],
+        )
+
+        for unsafe_peak, unsafe_wall in (
+            ("/private/user/output.mp4", 12.5),
+            (31_000_000_000, {"prompt": "secret"}),
+            (True, 12.5),
+            (31_000_000_000, float("nan")),
+            (float("inf"), 12.5),
+            (10**1000, 12.5),
+            (-1, 12.5),
+        ):
+            unsafe = record()
+            unsafe["peak_gpu_memory_bytes"] = unsafe_peak
+            unsafe["generation_wall_time_seconds"] = unsafe_wall
+            with self.subTest(
+                unsafe_peak=unsafe_peak, unsafe_wall=unsafe_wall,
+            ):
+                self.assertEqual(
+                    runner.allocation_vram_evidence(
+                        {"records": [unsafe]}, case,
+                        prior_sample_counts={"exact": 1},
+                    ),
+                    [],
+                )
+
+    def test_allocation_run_suppresses_evidence_when_before_snapshot_is_unusable(self):
+        case = runner.build_matrix(["ref2va_high_allocation_p4"])[0]
+
+        class SnapshotFailureClient(_FakeClient):
+            def __init__(self, before_kind):
+                super().__init__({
+                    "status": "completed",
+                    "output_files": ["synthetic-output.mp4"],
+                })
+                self.before_kind = before_kind
+                self.report_calls = 0
+
+            def h3_benchmark_report(self):
+                self.report_calls += 1
+                if self.report_calls == 1:
+                    if self.before_kind == "failure":
+                        raise runner.BenchmarkError("server_runtime")
+                    return {}
+                return {"records": [{
+                    "cache_key": "stale",
+                    "sample_count": 9,
+                    "peak_gpu_memory_bytes": 31_000_000_000,
+                    "generation_wall_time_seconds": 12.5,
+                    "spec": {
+                        "model": {"id": "minimax_h3_ref2va"},
+                        "engine": {
+                            "id": "sol_attn", "dense_steps": 10,
+                            "dense_blocks": 2,
+                        },
+                        "task": {
+                            "width": 1344, "height": 768,
+                            "frame_count": 243, "sampling_steps": 2,
+                            "offload_profile": 4,
+                        },
+                    },
+                }]}
+
+        for before_kind in ("failure", "malformed"):
+            with self.subTest(before_kind=before_kind), tempfile.TemporaryDirectory(
+            ) as temporary, mock.patch.object(
+                runner, "probe_video", return_value={"validation": "valid"},
+            ):
+                record = runner.run_case(
+                    SnapshotFailureClient(before_kind), case,
+                    project="synthetic-project", seed=9,
+                    reference_path="synthetic-reference.png",
+                    output_dir=Path(temporary), poll_interval=0.01,
+                    case_timeout=5,
+                )
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["allocation_evidence"], [])
+
+        self.assertEqual(runner.benchmark_sample_counts({"records": []}), {})
+        self.assertIsNone(runner.benchmark_sample_counts({}))
     def test_payload_is_single_output_and_ref_uses_image_reference_mode(self):
         cases = {case.case_id: case for case in runner.build_matrix()}
         base = runner.build_generation_payload(
@@ -374,6 +618,40 @@ class TestH3BenchmarkSafety(unittest.TestCase):
         self.assertNotIn(runner.SYNTHETIC_REF_PROMPT, output)
         self.assertNotIn("password", output.lower())
 
+    def test_live_4k_acceptance_selects_only_exact_unmodified_delivery_case(self):
+        stdout = io.StringIO()
+        with mock.patch.object(
+            runner, "MaestroClient",
+        ) as client, contextlib.redirect_stdout(stdout):
+            result = runner.main([
+                "--base-url", "http://127.0.0.1:42016",
+                "--project", "synthetic-project",
+                "--live-4k-acceptance",
+                "--dry-run",
+            ])
+        self.assertEqual(result, 0)
+        client.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            [case["case_id"] for case in payload["cases"]],
+            ["base_4k_delivery"],
+        )
+        self.assertEqual(payload["cases"][0]["native_resolution"], "1344x768")
+        self.assertEqual(payload["cases"][0]["delivery_resolution"], "3840x2160")
+        self.assertFalse(payload["cases"][0]["native_delivery_resolution"])
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rejected = runner.main([
+                "--base-url", "http://127.0.0.1:42016",
+                "--project", "synthetic-project",
+                "--case", "base_native_sdpa",
+                "--live-4k-acceptance",
+                "--dry-run",
+            ])
+        self.assertEqual(rejected, 2)
+        self.assertIn("runs only base_4k_delivery", stderr.getvalue())
+
 
 class _FakeClient:
     def __init__(self, status):
@@ -397,6 +675,25 @@ class _FakeClient:
 
 
 class TestH3BenchmarkRecords(unittest.TestCase):
+    def test_delivery_publication_requires_one_safe_final_and_no_native_exposure(self):
+        accepted = runner.assess_delivery_publication(
+            {"status": "completed", "output_files": ["final.mp4"]},
+            ["final.mp4"],
+        )
+        self.assertEqual(accepted["validation"], "valid")
+        self.assertTrue(accepted["checks"]["protected_native_not_exposed"])
+
+        rejected = (
+            ({"status": "completed"}, [".maestro-delivery-native.mp4"]),
+            ({"status": "completed", "delivery_recovery": {"available": True}},
+             ["final.mp4"]),
+            ({"status": "running"}, ["final.mp4"]),
+        )
+        for status, outputs in rejected:
+            with self.subTest(status=status, outputs=outputs):
+                evidence = runner.assess_delivery_publication(status, outputs)
+            self.assertEqual(evidence["validation"], "invalid")
+
     def test_probe_requires_exact_video_and_audio_contract(self):
         def completed(
             width=608,
@@ -600,6 +897,66 @@ class TestH3BenchmarkRecords(unittest.TestCase):
             )
         self.assertEqual(record["status"], "invalid")
         self.assertEqual(record["failure_category"], "unexpected_output_count")
+        download.assert_not_called()
+
+    def test_4k_delivery_record_is_upscaled_finality_evidence_not_native_claim(self):
+        client = _FakeClient({
+            "status": "completed",
+            "output_files": ["synthetic-4k-final.mp4"],
+        })
+        case = runner.build_matrix(["base_4k_delivery"])[0]
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            runner, "probe_video", return_value={
+                "validation": "valid",
+                "probe_available": True,
+                "width": 3840,
+                "height": 2160,
+                "frame_count": 124,
+                "has_audio": True,
+                "audio_sample_rate": 32000,
+                "audio_channels": 2,
+                "checks": {
+                    "dimensions": True,
+                    "duration": True,
+                    "frame_count": True,
+                    "audio_preserved": True,
+                    "audio_32khz_stereo": True,
+                },
+            },
+        ):
+            record = runner.run_case(
+                client, case, project="synthetic-project", seed=9,
+                reference_path=None, output_dir=Path(temporary),
+                poll_interval=0.01, case_timeout=5,
+            )
+        self.assertEqual(record["status"], "completed")
+        acceptance = record["delivery_acceptance"]
+        self.assertEqual(acceptance["validation"], "valid")
+        self.assertEqual(acceptance["native_resolution"], "1344x768")
+        self.assertEqual(acceptance["delivery_resolution"], "3840x2160")
+        self.assertFalse(acceptance["native_4k"])
+        self.assertEqual(
+            acceptance["private_recovery_live_evidence"],
+            "not_exercised_success_path",
+        )
+        self.assertEqual(
+            acceptance["public_finality"]["validation"], "valid",
+        )
+
+    def test_delivery_native_reference_is_rejected_before_download(self):
+        client = _FakeClient({
+            "status": "completed",
+            "output_files": [".maestro-delivery-native.mp4"],
+        })
+        case = runner.build_matrix(["base_4k_delivery"])[0]
+        with mock.patch.object(client, "download_output") as download:
+            record = runner.run_case(
+                client, case, project="synthetic-project", seed=9,
+                reference_path=None, output_dir=Path("unused"),
+                poll_interval=0.01, case_timeout=5,
+            )
+        self.assertEqual(record["status"], "invalid")
+        self.assertEqual(record["failure_category"], "delivery_publication")
         download.assert_not_called()
 
     def test_failed_record_keeps_only_safe_structured_failure_facts(self):

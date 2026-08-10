@@ -1,11 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, Check, Pause, X } from 'lucide-react'
+import { AlertTriangle, Check, X } from 'lucide-react'
 import { useStore } from '../stores/useStore'
 import type { H3SegmentBoundary, H3SegmentPlan, H3SegmentPlanItem } from '../types'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
-
-const REQUIRE_REVIEW_KEY = 'maestro:h3-plan-require-review'
-const COUNTDOWN_SECONDS = 8
 
 function compactTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return 'calculating…'
@@ -56,16 +53,28 @@ const BOUNDARY_LABELS: Record<BoundaryType, string> = {
 export function H3GenerationPlanDialog() {
   const plan = useStore(s => s.pendingH3Plan)
   const planEstimate = useStore(s => s.pendingH3PlanEstimate)
+  const planJobId = useStore(s => s.pendingH3PlanJobId)
+  const planWorkspace = useStore(s => s.pendingH3PlanWorkspace)
+  const planJobStatus = useStore(s => (
+    s.pendingH3PlanJobId
+      ? s.jobs.find(job => job.id === s.pendingH3PlanJobId)?.status ?? null
+      : null
+  ))
+  const planReviewDeadline = useStore(s => (
+    s.pendingH3PlanJobId
+      ? s.jobs.find(job => job.id === s.pendingH3PlanJobId)?.planReviewDeadline ?? null
+      : null
+  ))
+  const planReviewTermsRequired = useStore(s => (
+    s.pendingH3PlanJobId
+      ? s.jobs.find(job => job.id === s.pendingH3PlanJobId)?.planReviewTermsRequired === true
+      : false
+  ))
+  const reviewLoading = useStore(s => s.h3PlanReviewLoading)
+  const reviewError = useStore(s => s.h3PlanReviewError)
   const approve = useStore(s => s.approveH3Plan)
   const cancel = useStore(s => s.cancelH3Plan)
-  const selectModel = useStore(s => s.selectModel)
-  const h3SelectedProfile = useStore(s => s.h3SelectedProfile)
-  const h3ProfileApplying = useStore(s => s.h3ProfileApplying)
-  const h3Profiles = useStore(s => s.h3PerformanceProfiles)
-  const pinkCompatibility = useStore(
-    s => s.h3ModelProfileCompatibility.minimax_h3_pinkcherry_fl2va,
-  )
-  const refreshH3Compatibility = useStore(s => s.refreshH3ModelProfileCompatibility)
+  const close = useStore(s => s.closeH3PlanReview)
   const availableModels = useStore(s => s.models)
   const activeWorkspace = useStore(s => s.activeWorkspace)
   const hostTerms = useStore(s => s.hostTerms)
@@ -75,47 +84,59 @@ export function H3GenerationPlanDialog() {
   const acceptHostTerm = useStore(s => s.acceptHostTerm)
   const [models, setModels] = useState<H3Model[]>([])
   const [boundaries, setBoundaries] = useState<BoundaryType[]>([])
-  const [seconds, setSeconds] = useState(COUNTDOWN_SECONDS)
-  const [paused, setPaused] = useState(false)
+  const [editorJobId, setEditorJobId] = useState<string | null>(null)
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const ref2vaTermsAccepted = hostTerms?.minimax_h3_ref2va.accepted === true
-  const [requireReview, setRequireReview] = useState(() => {
-    try { return localStorage.getItem(REQUIRE_REVIEW_KEY) === 'true' } catch { return false }
-  })
 
   useEffect(() => {
     if (activeWorkspace && !hostTerms && !hostTermsLoading) void loadHostTerms()
   }, [activeWorkspace, hostTerms, hostTermsLoading, loadHostTerms])
 
   useEffect(() => {
-    if (!plan) return
+    if (!plan || !planJobId) {
+      const reset = window.setTimeout(() => {
+        setModels([])
+        setBoundaries([])
+        setEditorJobId(null)
+      }, 0)
+      return () => window.clearTimeout(reset)
+    }
     const timer = window.setTimeout(() => {
       setModels(plan.segments.map(segment => segment.model_type))
       setBoundaries(plan.segments.slice(1).map(segment => segment.boundary_from_previous?.type || 'continuous'))
-      setSeconds(COUNTDOWN_SECONDS)
-      try {
-        const accepted = useStore.getState().hostTerms?.minimax_h3_ref2va.accepted === true
-        setPaused(
-          localStorage.getItem(REQUIRE_REVIEW_KEY) === 'true'
-          || (plan.segments.some(segment => segment.model_type === 'minimax_h3_ref2va') && !accepted)
-        )
-      } catch {
-        setPaused(false)
-      }
+      setEditorJobId(planJobId)
     }, 0)
     return () => window.clearTimeout(timer)
-  }, [plan])
+  }, [plan, planJobId])
 
   useEffect(() => {
-    if (!plan || h3SelectedProfile === 'custom') return
-    void refreshH3Compatibility('minimax_h3_pinkcherry_fl2va')
-  }, [plan, h3SelectedProfile, refreshH3Compatibility])
+    const timer = window.setInterval(() => setNowMs(Date.now()), 250)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (planWorkspace && activeWorkspace !== planWorkspace) close()
+  }, [activeWorkspace, close, planWorkspace])
+
+  useEffect(() => {
+    if (plan && planJobStatus !== 'waiting_for_plan_approval') close()
+  }, [close, plan, planJobStatus])
 
   const switchCount = useMemo(
     () => models.slice(1).filter((model, index) => model !== models[index]).length,
     [models],
   )
+  const editsReady = Boolean(
+    plan
+    && editorJobId === planJobId
+    && models.length === plan.segments.length
+    && boundaries.length === Math.max(0, plan.segments.length - 1),
+  )
+  const reviewSecondsRemaining = planReviewDeadline == null
+    ? null
+    : Math.max(0, planReviewDeadline - nowMs / 1000)
   const serverOptions = (plan as H3PlanWithCheckpointOptions | null)?.checkpoint_options
-  const checkpointOptions: H3CheckpointOption[] = serverOptions?.length
+  const checkpointOptions: H3CheckpointOption[] = serverOptions !== undefined
     ? serverOptions
     : availableModels
       .filter(model => H3_MODEL_IDS.has(model.model_type as H3Model))
@@ -147,19 +168,17 @@ export function H3GenerationPlanDialog() {
   }
 
   const submit = () => {
-    if (!plan) return
+    if (!plan || !editsReady || reviewSecondsRemaining === 0) return
     const blockedIndex = models.findIndex((model, index) => getModelBlockedReason(index, model))
     if (blockedIndex >= 0) {
       window.alert(getModelBlockedReason(blockedIndex, models[blockedIndex]) || 'This checkpoint is unavailable for the selected segment.')
-      setPaused(true)
       return
     }
     if (models.includes('minimax_h3_ref2va') && !ref2vaTermsAccepted) {
       window.alert('Accept the MiniMax H3 Ref2VA model terms before submitting this plan.')
-      setPaused(true)
       return
     }
-    approve({
+    void approve({
       segmentOverrides: models.map((model, index) => ({
         model_type: model,
         drop_semantic_refs: model !== 'minimax_h3_ref2va',
@@ -171,23 +190,13 @@ export function H3GenerationPlanDialog() {
     })
   }
 
-  useEffect(() => {
-    if (!plan || paused || requireReview || (models.includes('minimax_h3_ref2va') && !ref2vaTermsAccepted)) return
-    const timer = window.setTimeout(() => {
-      if (seconds <= 0) submit()
-      else setSeconds(value => value - 1)
-    }, seconds <= 0 ? 0 : 1000)
-    return () => window.clearTimeout(timer)
-    // submit intentionally uses the latest render's editable plan.
-  }, [plan, paused, requireReview, seconds, models, ref2vaTermsAccepted]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  if (!plan) return null
+  if (!plan || !planJobId || !planWorkspace) return null
   const planFps = plan.fps || 24
   const planPublishedFrames = plan.published_frames || plan.requested_frames
   const planLoadSeconds = planEstimate?.model_load_state === 'resident'
     ? 0
     : Number(planEstimate?.model_load_seconds || 0)
-  const needsRef2VA = models.includes('minimax_h3_ref2va')
+  const needsRef2VA = editsReady && models.includes('minimax_h3_ref2va')
   const modelStatus = (option: H3CheckpointOption) => (
     option.is_downloaded
       ? 'installed'
@@ -195,49 +204,24 @@ export function H3GenerationPlanDialog() {
         ? 'will auto-download'
         : 'not installed'
   )
-  const requestedProfileLabel = h3Profiles.find(
-    profile => profile.id === pinkCompatibility?.requestedProfileId,
-  )?.label || pinkCompatibility?.requestedProfileId
-  const pinkReconciliationLabel = (
-    pinkCompatibility?.requestedProfileId === h3SelectedProfile
-    && pinkCompatibility.loading === false
-    && !pinkCompatibility.compatible
-  )
-    ? `${requestedProfileLabel || 'Current profile'} incompatible; selecting PinkCherry also selects ${pinkCompatibility.fallbackProfileLabel || pinkCompatibility.fallbackProfileId || 'the server fallback'}`
-    : ''
   const optionLabel = (index: number, option: H3CheckpointOption) => {
     const reason = getModelBlockedReason(index, option.model_type)
-    const profileWarning = option.model_type === 'minimax_h3_pinkcherry_fl2va'
-      ? pinkReconciliationLabel
-      : ''
-    return `${MODEL_LABELS[option.model_type] || option.name} · ${modelStatus(option)}${profileWarning ? ` · ${profileWarning}` : ''}${reason ? ` · unavailable: ${reason}` : ''}`
+    return `${MODEL_LABELS[option.model_type] || option.name} · ${modelStatus(option)}${reason ? ` · unavailable: ${reason}` : ''}`
   }
-  const invalidSelections = models
-    .map((model, index) => getModelBlockedReason(index, model))
-    .filter(Boolean)
+  const invalidSelections = editsReady
+    ? models.map((model, index) => getModelBlockedReason(index, model)).filter(Boolean)
+    : ['Loading plan editor']
   const missingModels = Array.from(new Set(models))
     .map(model => optionByModel.get(model))
     .filter((option): option is H3CheckpointOption => Boolean(
       option && !option.is_downloaded && option.auto_download,
     ))
 
-  const changeModel = async (index: number, model: H3Model) => {
-    setPaused(true)
-    const reconciled = await selectModel(model)
-    if (!reconciled) {
-      window.alert('This checkpoint could not be reconciled with the active H3 performance profile.')
-      return
-    }
+  const changeModel = (index: number, model: H3Model) => {
     setModels(values => values.map((value, i) => i === index ? model : value))
   }
   const changeBoundary = (index: number, type: BoundaryType) => {
-    setPaused(true)
     setBoundaries(values => values.map((value, i) => i === index ? type : value))
-  }
-  const setReviewPreference = (enabled: boolean) => {
-    setRequireReview(enabled)
-    setPaused(enabled)
-    try { localStorage.setItem(REQUIRE_REVIEW_KEY, String(enabled)) } catch { /* local preference only */ }
   }
 
   return (
@@ -267,7 +251,7 @@ export function H3GenerationPlanDialog() {
               </p>
             )}
           </div>
-          <button onClick={cancel} className="rounded p-1 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label="Cancel generation"><X size={16} /></button>
+          <button onClick={close} className="rounded p-1 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label="Close plan review"><X size={16} /></button>
         </div>
 
         <div className="min-h-0 overflow-y-auto overscroll-contain p-4 [-webkit-overflow-scrolling:touch]">
@@ -286,7 +270,7 @@ export function H3GenerationPlanDialog() {
                   <button
                     type="button"
                     disabled={hostTermsLoading}
-                    onClick={() => { setPaused(true); void acceptHostTerm('minimax_h3_ref2va') }}
+                    onClick={() => { void acceptHostTerm('minimax_h3_ref2va') }}
                     className="w-full shrink-0 rounded border border-violet-400/50 px-2 py-1 text-violet-200 hover:bg-violet-500/10 disabled:opacity-50 sm:w-auto sm:px-1.5 sm:py-0.5"
                   >
                     Accept for this host
@@ -321,13 +305,13 @@ export function H3GenerationPlanDialog() {
                       {generatedFrames !== publishedFrames && ` · ${generatedSeconds.toFixed(2)}s generated · ${generatedFrames}f`}
                     </span>
                     {index > 0 && (
-                      <select value={boundaries[index - 1]} onChange={event => changeBoundary(index - 1, event.target.value as BoundaryType)} className="ml-auto rounded border border-border bg-bg-primary px-2 py-1 text-[10px] text-text-secondary">
+                      <select disabled={!editsReady} value={boundaries[index - 1]} onChange={event => changeBoundary(index - 1, event.target.value as BoundaryType)} className="ml-auto rounded border border-border bg-bg-primary px-2 py-1 text-[10px] text-text-secondary disabled:opacity-50">
                         {Object.entries(BOUNDARY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                       </select>
                     )}
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <select disabled={h3ProfileApplying !== null} value={models[index]} onChange={event => { void changeModel(index, event.target.value as H3Model) }} className="rounded border border-border bg-bg-primary px-2 py-1 text-[11px] text-text-primary disabled:cursor-wait disabled:opacity-60">
+                    <select disabled={!editsReady} value={models[index]} onChange={event => changeModel(index, event.target.value as H3Model)} className="rounded border border-border bg-bg-primary px-2 py-1 text-[11px] text-text-primary disabled:opacity-50">
                       {checkpointOptions.map(option => (
                         <option
                           key={option.model_type}
@@ -342,9 +326,6 @@ export function H3GenerationPlanDialog() {
                       <span className={`rounded px-1.5 py-0.5 text-[9px] ${selectedOption.is_downloaded ? 'bg-emerald-500/15 text-emerald-200' : selectedOption.auto_download ? 'bg-blue-500/15 text-blue-200' : 'bg-amber-500/15 text-amber-200'}`}>
                         {modelStatus(selectedOption)}
                       </span>
-                    )}
-                    {h3ProfileApplying !== null && (
-                      <span className="text-[9px] text-blue-200">Reconciling performance profile…</span>
                     )}
                     <span className="text-[10px] text-text-muted">{segment.model_reason}</span>
                     {segment.edge_anchor_locked && (
@@ -371,21 +352,21 @@ export function H3GenerationPlanDialog() {
         </div>
 
         <div className="shrink-0 flex flex-wrap items-center gap-2 border-t border-border px-4 py-3">
-          <label className="mr-auto flex items-center gap-2 text-[10px] text-text-muted">
-            <input type="checkbox" checked={requireReview} onChange={event => setReviewPreference(event.target.checked)} />
-            Always require explicit approval
-          </label>
-          {!requireReview && (
-            <button
-              onClick={() => setPaused(true)}
-              disabled={paused}
-              className="flex items-center gap-1 rounded border border-border px-2.5 py-1.5 text-[10px] text-text-secondary hover:bg-bg-hover disabled:cursor-default disabled:opacity-60"
-            >
-              <Pause size={12} />{paused ? 'Countdown dismissed' : `Dismiss countdown · ${seconds}s`}
-            </button>
-          )}
-          <button onClick={cancel} className="rounded border border-border px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-hover">Cancel</button>
-          <button disabled={h3ProfileApplying !== null || invalidSelections.length > 0} onClick={submit} className="flex items-center gap-1.5 rounded bg-accent-blue px-3 py-1.5 text-xs font-medium text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"><Check size={13} />Generate now</button>
+          <div className="mr-auto min-w-0 text-[10px] text-text-muted">
+            <p className="truncate">Job {planJobId} · Project {planWorkspace}</p>
+            <p className="mt-1 text-amber-200">
+              {reviewSecondsRemaining == null
+                ? !ref2vaTermsAccepted && (planReviewTermsRequired || needsRef2VA)
+                  ? 'Approval required to accept Ref2VA terms'
+                  : 'Explicit plan approval required'
+                : reviewSecondsRemaining > 0
+                  ? `Server auto-accepts this frozen plan in ${Math.ceil(reviewSecondsRemaining)}s`
+                  : 'Server is auto-accepting this frozen plan…'}
+            </p>
+            {reviewError && <p className="mt-1 text-red-300">{reviewError}</p>}
+          </div>
+          <button disabled={reviewLoading} onClick={() => void cancel()} className="rounded border border-red-400/40 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/10 disabled:opacity-50">Cancel generation</button>
+          <button disabled={reviewLoading || reviewSecondsRemaining === 0 || invalidSelections.length > 0} onClick={submit} className="flex items-center gap-1.5 rounded bg-accent-blue px-3 py-1.5 text-xs font-medium text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"><Check size={13} />{reviewLoading ? 'Applying…' : 'Approve & resume'}</button>
         </div>
       </div>
     </div>

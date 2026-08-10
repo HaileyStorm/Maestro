@@ -2,6 +2,8 @@ import { useEffect, useRef } from 'react'
 import { Settings, X, Globe, BookMarked } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { useIsMobile } from '../../lib/useIsMobile'
+import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from '../../lib/branding'
+import { WhatsNewButton } from '../WhatsNewDialog'
 import { GenerationModeSelector } from './GenerationModeSelector'
 import { InputsPanel } from './InputsPanel'
 import { PromptInput } from './PromptInput'
@@ -42,7 +44,6 @@ export function Sidebar() {
   const imageMode = useStore(s => s.params.image_mode)
   const modelOptions = useStore(s => s.modelOptions)
   const sidebarOpen = useStore(s => s.sidebarOpen)
-  const appVersion = useStore(s => s.systemConfig?.app_version)
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const sidebarMode = useStore(s => s.sidebarMode)
   const setSidebarMode = useStore(s => s.setSidebarMode)
@@ -116,6 +117,20 @@ export function Sidebar() {
     setSidebarOpen(false)
     useStore.getState().setRecipesOpen(true)
   }
+
+  const productIdentity = (
+    <div className="flex min-w-0 items-center gap-2">
+      <div aria-hidden="true" className="w-7 h-7 shrink-0 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
+        M
+      </div>
+      <div className="min-w-0">
+        <span className="sr-only">{PRODUCT_NAME}. {PRODUCT_PROVENANCE}</span>
+        <span aria-hidden="true" className="block truncate text-[11px] font-semibold leading-tight">{PRODUCT_NAME_VISUAL}</span>
+        <span aria-hidden="true" className="block truncate text-[8px] font-normal leading-tight text-text-muted">{PRODUCT_PROVENANCE}</span>
+      </div>
+      {!isMobile && <WhatsNewButton />}
+    </div>
+  )
 
   const modeToggle = (size: 'sm' | 'md') => (
     <div className="flex bg-bg-tertiary rounded-lg p-0.5 border border-border">
@@ -343,13 +358,7 @@ export function Sidebar() {
         }`}>
           {/* Header */}
           <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
-                M
-              </div>
-              <span className="font-semibold text-sm">Maestro</span>
-              {appVersion && <span className="text-[10px] text-text-muted font-normal mt-0.5">v{appVersion}</span>}
-            </div>
+            {productIdentity}
             <div className="flex items-center gap-1.5">
               {modeToggle('sm')}
               <button
@@ -381,13 +390,7 @@ export function Sidebar() {
     <aside className="w-[420px] h-full bg-bg-secondary border-r border-border flex flex-col shrink-0">
       {/* Header */}
       <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <div className="w-7 h-7 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
-            M
-          </div>
-          <span className="font-semibold text-sm">Maestro</span>
-              {appVersion && <span className="text-[10px] text-text-muted font-normal mt-0.5">v{appVersion}</span>}
-        </div>
+        {productIdentity}
         <div className="flex items-center gap-2">
           {modeToggle('md')}
           {machineControls && <button

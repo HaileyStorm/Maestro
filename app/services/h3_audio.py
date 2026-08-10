@@ -15,7 +15,6 @@ from typing import Any, Mapping, Sequence
 
 
 H3_SOURCE_AUDIO_ALGORITHM_VERSION = "maestro_h3_source_audio_v1"
-H3_MULTIRATE_EVIDENCE_PROFILE = "t8_4v8a_evidence_v1"
 H3_SOURCE_AUDIO_MODES = frozenset({
     "native", "lock_source", "remix_source", "reference_only",
 })
@@ -86,43 +85,6 @@ def source_audio_mode(custom_settings: Mapping[str, Any] | None) -> str:
 
 def source_audio_requested(custom_settings: Mapping[str, Any] | None) -> bool:
     return source_audio_mode(custom_settings) in H3_EXPERIMENTAL_SOURCE_AUDIO_MODES
-
-
-def multirate_profile(custom_settings: Mapping[str, Any] | None) -> str:
-    custom = _custom_settings(custom_settings)
-    raw = custom.get("h3_multirate_profile")
-    profile = "" if raw in (None, "") else str(raw).strip()
-    if profile and profile != H3_MULTIRATE_EVIDENCE_PROFILE:
-        raise H3AudioCompatibilityError("Unknown MiniMax H3 multirate profile")
-    return profile
-
-
-def validate_multirate_evidence_request(
-    custom_settings: Mapping[str, Any] | None,
-    *,
-    benchmark_dry_run: bool = False,
-) -> dict[str, Any] | None:
-    """Return the disabled 4-video/8-audio evidence identity.
-
-    The runtime deliberately has no enabling branch.  Only the local synthetic
-    benchmark's sanitized dry-run may materialize this descriptor.
-    """
-
-    profile = multirate_profile(custom_settings)
-    if not profile:
-        return None
-    if not benchmark_dry_run:
-        raise H3AudioCompatibilityError(
-            "MiniMax H3 4-video/8-audio multirate is benchmark-dry-run only "
-            "until live synchronized visual/audio acceptance passes"
-        )
-    return {
-        "profile": H3_MULTIRATE_EVIDENCE_PROFILE,
-        "algorithm_version": "maestro_h3_dual_clock_evidence_v1",
-        "video_evaluations": 4,
-        "audio_evaluations": 8,
-        "enabled_for_generation": False,
-    }
 
 
 def _primary_ordinal(custom: Mapping[str, Any], count: int) -> int:
@@ -269,7 +231,6 @@ def resolve_h3_audio_roles(
     """Resolve and validate Base-FL2VA audio roles identically at every layer."""
 
     custom = _custom_settings(custom_settings)
-    validate_multirate_evidence_request(custom, benchmark_dry_run=False)
     mode = source_audio_mode(custom)
     guides = tuple(item for item in audio_guides if _present(item))
 
@@ -408,10 +369,9 @@ def resolve_h3_audio_roles(
 
 __all__ = [
     "H3AudioCompatibilityError", "H3AudioRoles", "H3MediaMapError",
-    "H3_EXPERIMENTAL_SOURCE_AUDIO_MODES", "H3_MULTIRATE_EVIDENCE_PROFILE",
+    "H3_EXPERIMENTAL_SOURCE_AUDIO_MODES",
     "H3_SOURCE_AUDIO_ALGORITHM_VERSION", "H3_SOURCE_AUDIO_MODES",
-    "canonical_media_map", "multirate_profile", "remap_primary_audio",
+    "canonical_media_map", "remap_primary_audio",
     "remap_prompt_audio_ordinals", "resolve_h3_audio_roles",
-    "source_audio_mode", "source_audio_requested",
-    "validate_multirate_evidence_request", "validate_prompt_media_ordinals",
+    "source_audio_mode", "source_audio_requested", "validate_prompt_media_ordinals",
 ]

@@ -221,7 +221,7 @@ export function InputsPanel() {
     if (!h3TermsAccepted || !h3StudioWorkflow) return
     setH3DownloadStatus('downloading')
     try {
-      await api.downloadModel('minimax_h3_ref2va')
+      await api.downloadModel('minimax_h3_ref2va', activeWorkspace || '')
       window.dispatchEvent(new CustomEvent(DOWNLOAD_REFRESH_EVENT))
     } catch {
       setH3DownloadStatus('failed')

@@ -5570,6 +5570,7 @@ def _attach_director_h3_shot_contracts(
         metadata = getattr(shot, "metadata", None) or {}
         audio_plan = getattr(shot, "audio_plan", None)
         contract = {
+            "shot_id": str(getattr(shot, "shot_id", "") or ""),
             "continuity_strategy": str(
                 getattr(shot, "continuity_strategy", "independent")
                 or "independent"
@@ -5639,12 +5640,31 @@ def _director_h3_canonical_prompt(
     *,
     duration_seconds: float,
     events: list[dict] | None = None,
+    mode: str | None = None,
 ) -> str:
     """Map one Director source/segment to strict physical Context-IR records."""
-    from services.director.h3_dialogue import validate_h3_context_ir_records
+    from services.director.h3_dialogue import (
+        _H3_NO_SUBJECT_DEFINITIONS,
+        _h3_subject_identity_aliases,
+        _parse_h3_subject_definitions,
+        _extract_h3_fields,
+        validate_h3_context_ir_records,
+    )
     from shared.utils.prompt_parser import parse_global_timeline_prompt
 
     source = str(prompt or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    requested_mode = str(mode or "").strip().casefold()
+    if requested_mode not in {"", "t2va", "ref2va"}:
+        raise ValueError("Director H3 Context-IR mode is unsupported")
+    if not requested_mode:
+        requested_mode = (
+            "ref2va"
+            if re.search(
+                r"(?mi)^\s*(?:summary|retention_analysis|detailed_description)\s*:",
+                source,
+            )
+            else "t2va"
+        )
     # The shared splitter may carry FINAL BLOCKING onto its own line between
     # a record's visual and vocal fields. Rejoin only that known deterministic
     # shape before parsing; both literal payloads remain unchanged.
@@ -5664,21 +5684,74 @@ def _director_h3_canonical_prompt(
     if duration <= 0:
         raise ValueError("Director H3 prompt duration must be positive")
     existing_errors = validate_h3_context_ir_records(
-        source, mode="t2va", duration_seconds=duration,
+        source, mode=requested_mode, duration_seconds=duration,
     )
     if not existing_errors:
         return source
+    if requested_mode == "ref2va":
+        # Ref2VA has its own six-field schema. Mapping an invalid reference
+        # prompt through the Base compiler would erase retention/provenance
+        # semantics, so fail closed instead of manufacturing Base fields.
+        raise ValueError(
+            "Director H3 Ref2VA prompt validation failed: "
+            + "; ".join(existing_errors)
+        )
 
+    source_fields = _extract_h3_fields(source)
+    raw_subject_definitions = str(
+        source_fields.get("subject_definitions") or ""
+    ).strip()
+    # Legacy Director sources sometimes put bare timeline records between the
+    # subject namespace and the first Context-IR field. They are not entity
+    # definitions even though the generic field extractor includes them.
+    subject_definition_lines: list[str] = []
+    for raw_line in raw_subject_definitions.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^\[\s*(?:Shot|Scene)\s+\d+", line, re.IGNORECASE):
+            break
+        if parse_global_timeline_prompt(line)[1]:
+            break
+        subject_definition_lines.append(line)
+    subject_definitions = "\n".join(subject_definition_lines).strip()
     first_field = re.search(
         r"(?mi)^\s*integrated_multimodal_description\s*:", source,
     )
     if first_field and source[:first_field.start()].strip():
-        raise ValueError(
-            "Director H3 prompt contains wrapper text; exact mapping is unavailable"
+        prefix = source[:first_field.start()].strip()
+        subject_prefix = re.fullmatch(
+            r"(?is)subject_definitions\s*:(?P<body>.*)", prefix,
         )
+        prefix_body = (
+            " ".join(subject_prefix.group("body").split())
+            if subject_prefix is not None else ""
+        )
+        definitions_compact = " ".join(subject_definitions.split())
+        prefix_suffix = (
+            prefix_body[len(definitions_compact):].strip()
+            if definitions_compact
+            and prefix_body.startswith(definitions_compact)
+            else prefix_body
+        )
+        prefix_suffix_is_timeline = not prefix_suffix or bool(
+            re.match(r"^(?:\[?\s*(?:Shot|Scene)\s+\d+|\d+(?:\.\d+)?\s*s?)\b", prefix_suffix, re.IGNORECASE)
+        )
+        if subject_prefix is None or (
+            prefix_body != definitions_compact
+            and not (definitions_compact and prefix_suffix_is_timeline)
+        ):
+            raise ValueError(
+                "Director H3 prompt contains wrapper text; exact mapping is unavailable"
+            )
 
     soundscape = "N/A"
     music = "N/A"
+    definition_lines = {
+        " ".join(line.split()).casefold()
+        for line in subject_definitions.splitlines()
+        if line.strip()
+    }
     context_lines: list[str] = []
     for raw_line in source.splitlines():
         line = raw_line.strip()
@@ -5695,6 +5768,10 @@ def _director_h3_canonical_prompt(
             continue
         if music_match:
             music = music_match.group(1).strip()
+            continue
+        if re.match(r"subject_definitions\s*:", line, re.IGNORECASE):
+            continue
+        if " ".join(line.split()).casefold() in definition_lines:
             continue
         if re.fullmatch(
             r"integrated_multimodal_description\s*:\s*", line,
@@ -5727,6 +5804,19 @@ def _director_h3_canonical_prompt(
 
     parsed_globals, parsed_events = parse_global_timeline_prompt(source)
     mapped_events = list(events if events is not None else parsed_events)
+    # Native-shot partitioning can retain both the source timeline line and
+    # the already structured Context-IR record for the same range. Prefer the
+    # structured form when present so rehydration does not duplicate records.
+    structured_events = [
+        item for item in mapped_events
+        if re.search(
+            r"\bshot_name\s*:|\baudiovisual_description\s*:",
+            str(item.get("text") or ""),
+            re.IGNORECASE,
+        )
+    ]
+    if structured_events:
+        mapped_events = structured_events
     if not mapped_events:
         body = " ".join(context_lines).strip() or source
         mapped_events = [{
@@ -5753,6 +5843,7 @@ def _director_h3_canonical_prompt(
         ] + [
             str(line).strip() for line in parsed_globals
             if str(line).strip()
+            and " ".join(str(line).split()).casefold() not in definition_lines
             and not re.match(
                 r"^(?:integrated_multimodal_description|overall_soundscape|"
                 r"non_diegetic_music|subject_definitions|cast|setting|"
@@ -5797,10 +5888,29 @@ def _director_h3_canonical_prompt(
         line for line in context_lines
         if re.match(r"^FINAL BLOCKING\s*:", line, re.IGNORECASE)
     ).strip()
+    entity_definitions = _parse_h3_subject_definitions(subject_definitions)
+
+    def strip_repeated_entity_definition(value: str) -> str:
+        result = str(value or "")
+        for entry in entity_definitions:
+            description = " ".join(str(entry.get("description") or "").split())
+            if len(description.split()) < 4:
+                continue
+            label = re.escape(str(entry.get("label") or ""))
+            result = re.sub(
+                rf"({label})\s*[:\-–—]?\s*{re.escape(description)}",
+                r"\1",
+                result,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        return result.strip()
+
     for index, (event, (start, end)) in enumerate(zip(ordered, ranges), start=1):
         name, description, vocals = _director_h3_record_payload(
             str(event.get("text") or ""), index,
         )
+        description = strip_repeated_entity_definition(description)
         if index == 1 and opening:
             description = f"{opening} {description}".strip()
         if index == len(ordered) and closing:
@@ -5817,7 +5927,8 @@ def _director_h3_canonical_prompt(
         )
 
     result = (
-        "integrated_multimodal_description:\n"
+        f"subject_definitions: {subject_definitions or _H3_NO_SUBJECT_DEFINITIONS}\n"
+        "\nintegrated_multimodal_description:\n"
         + "\n".join(records)
         + f"\noverall_soundscape: {soundscape}"
         + f"\nnon_diegetic_music: {music}"
@@ -5833,7 +5944,7 @@ def _director_h3_canonical_prompt(
 
 
 def _director_h3_scene_prompt(
-    plan: dict, *, frame_count: int, fps: float,
+    plan: dict, *, frame_count: int, fps: float, mode: str | None = None,
 ) -> str:
     """Preserve one scene as canonical physical H3 records."""
     fps_value = float(fps)
@@ -5852,6 +5963,13 @@ def _director_h3_scene_prompt(
         return _director_h3_canonical_prompt(
             raw_prompt,
             duration_seconds=duration,
+            mode=mode,
+        )
+
+    if str(mode or "").strip().casefold() == "ref2va":
+        raise ValueError(
+            "Director H3 Ref2VA window prompts cannot be merged without "
+            "rewriting their six-field reference contract"
         )
 
     events: list[dict] = []
@@ -5869,7 +5987,7 @@ def _director_h3_scene_prompt(
         })
         cursor = end
     return _director_h3_canonical_prompt(
-        "", duration_seconds=duration, events=events,
+        "", duration_seconds=duration, events=events, mode=mode,
     )
 
 
@@ -5879,6 +5997,19 @@ def _director_h3_preferred_fl2va(params: dict, selected: str) -> str:
     if requested in _H3_FL2VA_MODELS:
         return requested
     return _H3_BASE_FL2VA_MODEL
+
+
+def _director_h3_prompt_schema(prompt: str) -> str:
+    """Return the authored H3 Context-IR schema without model inference."""
+
+    return (
+        "ref2va"
+        if re.search(
+            r"(?mi)^\s*(?:summary|retention_analysis|detailed_description)\s*:",
+            str(prompt or ""),
+        )
+        else "base"
+    )
 
 
 def _director_h3_segment_models(
@@ -6109,21 +6240,264 @@ def _canonicalize_director_h3_shot_plan(
         raise ValueError("Saved Director H3 shot-plan FPS is invalid") from exc
     if not prompts or fps <= 0 or len(prompts) != len(published):
         raise ValueError("Saved Director H3 child prompts are incomplete")
-
-    canonical = [
-        _director_h3_canonical_prompt(
-            prompt,
-            duration_seconds=int(frames) / fps,
-        )
-        for prompt, frames in zip(prompts, published)
-    ]
-    shot_plan["clip_prompts"] = canonical
     shots = shot_plan.get("shots")
-    if not isinstance(shots, list) or len(shots) != len(canonical):
+    if not isinstance(shots, list) or len(shots) != len(prompts):
         raise ValueError("Saved Director H3 shot records are incomplete")
+    if not all(isinstance(shot, dict) for shot in shots):
+        raise ValueError("Saved Director H3 shot record is invalid")
+
+    raw_contract_version = shot_plan.get("semantic_physical_contract_version")
+    if raw_contract_version is not None and (
+        isinstance(raw_contract_version, bool)
+        or not isinstance(raw_contract_version, int)
+        or raw_contract_version not in {0, 1}
+    ):
+        raise ValueError(
+            "Saved Director H3 semantic/physical contract version is unsupported"
+        )
+    semantic_contract = int(raw_contract_version or 0)
+    if semantic_contract == 1:
+        contracts = shot_plan.get("source_contracts")
+        if not isinstance(contracts, list) or not contracts:
+            raise ValueError("Saved Director H3 semantic shots are incomplete")
+        semantic_shots = shot_plan.get("semantic_shots")
+        if not isinstance(semantic_shots, list) or semantic_shots != contracts:
+            raise ValueError("Saved Director H3 semantic shot copies disagree")
+        boundaries = shot_plan.get("clip_boundaries")
+        if not isinstance(boundaries, list) or len(boundaries) != len(prompts) - 1:
+            raise ValueError("Saved Director H3 continuity metadata is incomplete")
+        clip_frames = shot_plan.get("clip_frames")
+        clip_published = shot_plan.get("clip_published_frames")
+        clip_trims = shot_plan.get("clip_trim_tail_frames")
+        if not all(isinstance(value, list) for value in (
+            clip_frames, clip_published, clip_trims,
+        )) or not (
+            len(clip_frames) == len(clip_published) == len(clip_trims) == len(prompts)
+            and [int(value) for value in clip_published] == [
+                int(value) for value in published
+            ]
+        ):
+            raise ValueError("Saved Director H3 physical geometry is incomplete")
+
+        canonical = [""] * len(prompts)
+        covered: set[int] = set()
+        mapping: dict[int, tuple[dict, int, dict, str, str]] = {}
+        authored_ids: set[str] = set()
+        for expected_source_index, contract in enumerate(contracts):
+            if not isinstance(contract, dict):
+                raise ValueError("Saved Director H3 semantic shot is invalid")
+            positions = contract.get("segment_indices")
+            semantic_prompt = contract.get("semantic_prompt")
+            source_index = contract.get("source_index")
+            semantic_index = contract.get("semantic_shot_index")
+            authored_shot_id = contract.get("authored_shot_id")
+            if (
+                not isinstance(positions, list)
+                or not positions
+                or not isinstance(semantic_prompt, str)
+                or not semantic_prompt.strip()
+                or isinstance(source_index, bool)
+                or not isinstance(source_index, int)
+                or source_index != expected_source_index
+                or semantic_index != expected_source_index
+                or not isinstance(authored_shot_id, str)
+                or not authored_shot_id.strip()
+                or authored_shot_id in authored_ids
+                or contract.get("prompt_rewrite_for_physical_split") is not False
+            ):
+                raise ValueError("Saved Director H3 semantic shot is incomplete")
+            authored_ids.add(authored_shot_id)
+            normalized_positions: list[int] = []
+            for value in positions:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError("Saved Director H3 segment mapping is invalid")
+                position = value
+                if (
+                    position < 0
+                    or position >= len(prompts)
+                    or position in covered
+                ):
+                    raise ValueError(
+                        "Saved Director H3 segment mapping is incomplete"
+                    )
+                normalized_positions.append(position)
+                covered.add(position)
+            if normalized_positions != list(range(
+                normalized_positions[0], normalized_positions[-1] + 1,
+            )):
+                raise ValueError(
+                    "Saved Director H3 semantic segments are not contiguous"
+                )
+            if any(
+                prompts[position] != semantic_prompt
+                for position in normalized_positions
+            ):
+                raise ValueError(
+                    "Saved Director H3 physical prompt bytes disagree with "
+                    "their semantic shot"
+                )
+            reference_labels = list(dict.fromkeys(re.findall(
+                r"<(?:Subject|Picture|Video|Audio)\s+[1-9]\d*>",
+                semantic_prompt,
+                flags=re.IGNORECASE,
+            )))
+            if contract.get("reference_labels") != reference_labels:
+                raise ValueError(
+                    "Saved Director H3 semantic reference mapping disagrees"
+                )
+            slices = contract.get("execution_slices")
+            if not isinstance(slices, list) or len(slices) != len(normalized_positions):
+                raise ValueError("Saved Director H3 execution slices are incomplete")
+            local_cursor = 0
+            for local_index, position in enumerate(normalized_positions):
+                end_cursor = local_cursor + int(published[position])
+                expected_slice = {
+                    "segment_index": position,
+                    "physical_segment_index": local_index,
+                    "start_frame": local_cursor,
+                    "end_frame_exclusive": end_cursor,
+                    "start_seconds": local_cursor / fps,
+                    "end_seconds": end_cursor / fps,
+                }
+                if slices[local_index] != expected_slice:
+                    raise ValueError(
+                        "Saved Director H3 execution slice geometry disagrees"
+                    )
+                physical_id = f"{authored_shot_id}:segment-{local_index + 1}"
+                mapping[position] = (
+                    contract, local_index, expected_slice, physical_id,
+                    semantic_prompt,
+                )
+                local_cursor = end_cursor
+            contract["execution_slices"] = [
+                dict(mapping[position][2]) for position in normalized_positions
+            ]
+            semantic_duration = sum(
+                int(published[position]) for position in normalized_positions
+            ) / fps
+            compiled = _director_h3_canonical_prompt(
+                semantic_prompt,
+                duration_seconds=semantic_duration,
+            )
+            contract["semantic_prompt"] = compiled
+            contract["prompt_rewrite_for_physical_split"] = False
+            for position in normalized_positions:
+                canonical[position] = compiled
+        if covered != set(range(len(prompts))) or any(not item for item in canonical):
+            raise ValueError("Saved Director H3 segment mapping is incomplete")
+
+        manifest = shot_plan.get("dialogue_manifest")
+        if not isinstance(manifest, list):
+            raise ValueError("Saved Director H3 dialogue manifest is incomplete")
+        expected_dialogue: list[tuple[dict, str]] = []
+        for contract in contracts:
+            expected_dialogue.extend(
+                (contract, match.group(0))
+                for match in re.finditer(
+                    r"<d>.*?</d>",
+                    contract["semantic_prompt"],
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+            )
+        if len(manifest) != len(expected_dialogue):
+            raise ValueError(
+                "Saved Director H3 dialogue manifest coverage disagrees"
+            )
+        for item, expected in zip(manifest, expected_dialogue):
+            contract, block = expected
+            if (
+                not isinstance(item, dict)
+                or item.get("exact_block") != block
+                or item.get("source_index") != contract["source_index"]
+                or item.get("authored_shot_id") != contract["authored_shot_id"]
+                or item.get("semantic_shot_index") != contract["semantic_shot_index"]
+                or item.get("segment_index") != contract["segment_indices"][0]
+            ):
+                raise ValueError(
+                    "Saved Director H3 dialogue association disagrees"
+                )
+        for contract in contracts:
+            nested_manifest = contract.get("dialogue_manifest")
+            expected_nested = [
+                dict(item) for item in manifest
+                if item["source_index"] == contract["source_index"]
+            ]
+            if nested_manifest != expected_nested:
+                raise ValueError(
+                    "Saved Director H3 semantic dialogue association disagrees"
+                )
+
+        generated_cursor = 0
+        published_cursor = 0
+        for index, shot in enumerate(shots):
+            contract, local_index, expected_slice, physical_id, original_prompt = (
+                mapping[index]
+            )
+            expected_predecessor = index - 1 if index else None
+            expected_previous_physical = (
+                mapping[index - 1][3] if index else None
+            )
+            expected_previous_authored = (
+                mapping[index - 1][0]["authored_shot_id"] if index else None
+            )
+            expected_boundary = boundaries[index - 1] if index else None
+            expected_continuity = (
+                str(expected_boundary.get("continuity_mode") or "")
+                if isinstance(expected_boundary, dict) else "independent"
+            )
+            expected_values = {
+                "index": index,
+                "source_index": contract["source_index"],
+                "authored_shot_id": contract["authored_shot_id"],
+                "semantic_shot_index": contract["semantic_shot_index"],
+                "physical_segment_id": physical_id,
+                "physical_segment_index": local_index,
+                "physical_segment_count": len(contract["segment_indices"]),
+                "predecessor_segment_index": expected_predecessor,
+                "predecessor_physical_segment_id": expected_previous_physical,
+                "predecessor_authored_shot_id": expected_previous_authored,
+                "execution_cursor_frame": expected_slice["start_frame"],
+                "execution_slice": expected_slice,
+                "frames": int(clip_frames[index]),
+                "start_frame": generated_cursor,
+                "end_frame": generated_cursor + int(clip_frames[index]) - 1,
+                "published_frames": int(clip_published[index]),
+                "published_start_frame": published_cursor,
+                "published_end_frame": (
+                    published_cursor + int(clip_published[index]) - 1
+                ),
+                "trim_tail_frames": int(clip_trims[index]),
+                "continuity_mode": expected_continuity,
+                "boundary_before": expected_boundary,
+                "prompt": original_prompt,
+                "dialogue_manifest_indices": [
+                    manifest_index
+                    for manifest_index, item in enumerate(manifest)
+                    if item["segment_index"] == index
+                ],
+            }
+            if any(shot.get(key) != value for key, value in expected_values.items()):
+                raise ValueError(
+                    "Saved Director H3 physical segment metadata disagrees"
+                )
+            for key, value in expected_values.items():
+                shot[key] = dict(value) if key == "execution_slice" else value
+            generated_cursor += int(clip_frames[index])
+            published_cursor += int(clip_published[index])
+
+        shot_plan["semantic_shots"] = contracts
+    else:
+        # Compatibility for committed v1 plans whose child prompts were
+        # physically rebased before the semantic/physical contract existed.
+        canonical = [
+            _director_h3_canonical_prompt(
+                prompt,
+                duration_seconds=int(frames) / fps,
+            )
+            for prompt, frames in zip(prompts, published)
+        ]
+    shot_plan["clip_prompts"] = canonical
     for index, prompt in enumerate(canonical):
-        if not isinstance(shots[index], dict):
-            raise ValueError("Saved Director H3 shot record is invalid")
         shots[index]["prompt"] = prompt
     return canonical
 
@@ -6211,6 +6585,20 @@ def _rehydrate_director_h3_longform(gen_params: dict, plan: dict) -> bool:
     )
     if len(prompts) != len(frames):
         raise ValueError("Saved Director H3 shot plan is incomplete")
+    if shot_plan.get("semantic_physical_contract_version") == 1:
+        saved_models = plan.get("segment_models")
+        if not isinstance(saved_models, list) or len(saved_models) != len(prompts):
+            raise ValueError("Saved Director H3 segment models are incomplete")
+        for index, (prompt, model) in enumerate(zip(prompts, saved_models)):
+            if not isinstance(model, dict):
+                raise ValueError("Saved Director H3 segment model is invalid")
+            ref_schema = _director_h3_prompt_schema(prompt) == "ref2va"
+            ref_model = str(model.get("model_type") or "") == _H3_REF2VA_MODEL
+            if ref_schema != ref_model:
+                raise ValueError(
+                    f"Saved Director H3 segment {index + 1} prompt schema and "
+                    "checkpoint disagree"
+                )
     # Legacy committed plans may duplicate a pre-Context-IR source in either
     # global prompt field. Preserve already-canonical multi-scene provenance;
     # migrate only fields whose parsed events include bare range records.
@@ -6423,6 +6811,10 @@ def _prepare_director_h3_longform(
     scene_prompts: list[str] = []
     scene_geometry_prompts: list[str] = []
     fallback_prompts = list(gen_params.get("per_clip_prompts") or [])
+    # Schema follows the authored Context-IR fields, not the eventual adaptive
+    # checkpoint. A Base scene may route to Ref2VA for conditioning, while a
+    # six-field reference scene must remain Ref2VA even under adaptive routing.
+    selected_prompt_mode = None
     for index, plan in enumerate(clip_plans):
         planned = planned_clips[index] if index < len(planned_clips) else {}
         try:
@@ -6437,19 +6829,23 @@ def _prepare_director_h3_longform(
         frame_count = max(1, round(duration * float(fps)))
         requested_scene_frames.append(frame_count)
         scene_prompt = _director_h3_scene_prompt(
-            plan, frame_count=frame_count, fps=fps,
+            plan, frame_count=frame_count, fps=fps, mode=selected_prompt_mode,
         )
         if not scene_prompt and index < len(fallback_prompts):
             fallback = str(fallback_prompts[index] or "").strip()
             if fallback:
                 scene_prompt = _director_h3_canonical_prompt(
-                    fallback, duration_seconds=frame_count / float(fps),
+                    fallback,
+                    duration_seconds=frame_count / float(fps),
+                    mode=selected_prompt_mode,
                 )
         if not scene_prompt:
             fallback = str(gen_params.get("prompt") or "").strip()
             if fallback:
                 scene_prompt = _director_h3_canonical_prompt(
-                    fallback, duration_seconds=frame_count / float(fps),
+                    fallback,
+                    duration_seconds=frame_count / float(fps),
+                    mode=selected_prompt_mode,
                 )
         if not scene_prompt:
             raise ValueError("Director H3 scene prompt is empty")
@@ -6482,6 +6878,7 @@ def _prepare_director_h3_longform(
         scene_prompts = [_director_h3_canonical_prompt(
             raw_prompt,
             duration_seconds=requested_scene_frames[0] / float(fps),
+            mode=selected_prompt_mode,
         )]
 
     # H3 FL2VA cannot consume arbitrary KFI timing. The normalization above
@@ -6601,6 +6998,28 @@ def _prepare_director_h3_longform(
                 _H3_REF2VA_MODEL if semantic_references
                 else _director_h3_preferred_fl2va(params, selected)
             )
+        prompt_schema = _director_h3_prompt_schema(segment_prompts[0])
+        if prompt_schema == "ref2va":
+            if params.get("h3_ref2va_terms_accepted") is not True:
+                raise ValueError(
+                    "This Director generation uses the separately licensed "
+                    "MiniMax H3 Ref2VA checkpoint. Review and accept its model "
+                    "terms before submitting."
+                )
+            if (
+                (first_anchor or last_anchor)
+                and params.get("h3_native_boundary_conditioning") is not True
+            ):
+                raise ValueError(
+                    "Director Ref2VA prompt schema cannot be paired with "
+                    "native first/end-frame anchors"
+                )
+            effective = _H3_REF2VA_MODEL
+        elif effective == _H3_REF2VA_MODEL:
+            raise ValueError(
+                "Director Base prompt schema cannot be paired with a Ref2VA "
+                "checkpoint; supply the six-field Ref2VA Context-IR"
+            )
         effective_models = [effective]
         if (
             _H3_REF2VA_MODEL in effective_models
@@ -6636,6 +7055,61 @@ def _prepare_director_h3_longform(
         last_anchor=last_anchor,
         semantic_references=semantic_references,
     )
+    prompt_schemas = [
+        _director_h3_prompt_schema(prompt) for prompt in segment_prompts
+    ]
+    if (
+        any(schema == "ref2va" for schema in prompt_schemas)
+        and params.get("h3_ref2va_terms_accepted") is not True
+    ):
+        raise ValueError(
+            "This Director H3 plan requires the separately licensed Ref2VA "
+            "checkpoint for its six-field prompt schema. Review and accept "
+            "its model terms before submitting."
+        )
+    if any(schema == "ref2va" for schema in prompt_schemas) and (
+        (first_anchor or last_anchor)
+        and params.get("h3_native_boundary_conditioning") is not True
+    ):
+        raise ValueError(
+            "Director Ref2VA prompt schema cannot be paired with native "
+            "first/end-frame anchors"
+        )
+    fl2va_model = _director_h3_preferred_fl2va(params, selected)
+    for index, (schema, model) in enumerate(zip(
+        prompt_schemas, segment_models,
+    )):
+        if schema == "ref2va":
+            if model.get("user_override") and model["model_type"] != _H3_REF2VA_MODEL:
+                raise ValueError(
+                    f"Director segment {index + 1} Ref2VA prompt schema conflicts "
+                    "with its Base checkpoint override"
+                )
+            model.update({
+                "model_type": _H3_REF2VA_MODEL,
+                "reason": "six-field Ref2VA prompt schema",
+            })
+        elif model["model_type"] == _H3_REF2VA_MODEL:
+            if semantic_references and not model.get("drop_semantic_refs"):
+                raise ValueError(
+                    f"Director segment {index + 1} Base prompt schema cannot "
+                    "carry Ref2VA semantic references; supply the six-field "
+                    "Ref2VA Context-IR"
+                )
+            if model.get("user_override"):
+                raise ValueError(
+                    f"Director segment {index + 1} Base prompt schema conflicts "
+                    "with its Ref2VA checkpoint override"
+                )
+            model.update({
+                "model_type": fl2va_model,
+                "reason": "Base Context-IR prompt schema",
+            })
+    for index, model in enumerate(segment_models):
+        model["switch_from_previous"] = bool(
+            index
+            and segment_models[index - 1]["model_type"] != model["model_type"]
+        )
     if (
         any(item["model_type"] == _H3_REF2VA_MODEL for item in segment_models)
         and params.get("h3_ref2va_terms_accepted") is not True

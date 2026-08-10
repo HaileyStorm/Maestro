@@ -6,11 +6,11 @@ import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type Th
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
 import { applyH3SegmentCeilingPolicy, hasManualH3SegmentCeiling } from '../lib/h3Submission'
 import { alignStudioTotalFrames, alignTotalFrames, controlFpsTotalFrames, effectiveSlidingWindowGeometry, hasGlobalTimeline, usesStudioSegments } from '../lib/timelinePrompt'
+import { hidePrivatePreviewsForWorkspace } from '../lib/privatePreview'
 
 const CIVIT_DOWNLOAD_POLL_MS = 2000
 const CIVIT_DOWNLOAD_COMPLETED_VISIBLE_MS = 30_000
 const H3_REF2VA_TERMS_ACK_KEY = 'maestro:minimax-h3-ref2va-terms-v1'
-const H3_REF2VA_LEGACY_TERM_VERSION = HOST_TERM_NOTICES.minimax_h3_ref2va.version
 const H3_ATTENTION_ENGINE_KEY = 'maestro:h3-attention-engine'
 const H3_STUDIO_MODELS = new Set([
   'minimax_h3',
@@ -47,14 +47,6 @@ let _h3Ref2VATermsHostAccepted = false
 
 export function h3Ref2VATermsAccepted(): boolean {
   return _h3Ref2VATermsHostAccepted
-}
-
-function _legacyH3Ref2VATermsAccepted(): boolean {
-  try {
-    return localStorage.getItem(H3_REF2VA_TERMS_ACK_KEY) === 'accepted'
-  } catch {
-    return false
-  }
 }
 
 function _clearLegacyH3Ref2VATermsAcceptance(): void {
@@ -207,7 +199,18 @@ function _beginDirectorPipelineLifecycle(workspace: string) {
 function _isBrowserAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
 }
-let _h3PlanDecisionResolver: ((decision: H3PlanDecision | null) => void) | null = null
+const ACTIVE_GENERATION_JOB_STATUSES = new Set<GenerationJob['status']>([
+  'preparing',
+  'waiting_for_plan_approval',
+  'queued',
+  'running',
+])
+let _h3PlanReviewSequence = 0
+let _workspaceLoadSequence = 0
+
+function _isActiveGenerationJob(job: Pick<GenerationJob, 'status'>): boolean {
+  return ACTIVE_GENERATION_JOB_STATUSES.has(job.status)
+}
 
 type StoredDirectorPreparation = { requestId: string; workspace: string }
 
@@ -426,16 +429,104 @@ function _h3EstimateTotalSeconds(
   return Number.isFinite(total) && total > 0 ? total : null
 }
 
+const RESOURCE_EXECUTION_STATES = new Set<api.ResourceExecutionState>([
+  'queued',
+  'admitted',
+  'running',
+  'preemption_requested',
+  'resources_releasing',
+  'restarting_on_accelerator',
+  'blocked',
+  'released',
+])
+
+function _normalizeResourceDescriptor(
+  value: api.ResourceDescriptor | null | undefined,
+  jobStatus: string,
+): api.ResourceDescriptor | null | undefined {
+  if (value === undefined || value === null) return value
+  const raw = value as Partial<api.ResourceDescriptor>
+  const intent: api.ResourceIntent = raw.intent === 'text' ? 'text' : 'generation'
+  const execution: api.ResourceExecution = intent === 'text' && raw.execution === 'cpu'
+    ? 'cpu'
+    : 'standard'
+  const preemptionMode: api.ResourcePreemptionMode = intent === 'text'
+    && raw.preemption_mode === 'discard_restart'
+    ? 'discard_restart'
+    : 'none'
+  const inferredState: api.ResourceExecutionState = jobStatus === 'running'
+    ? 'running'
+    : jobStatus === 'completed' || jobStatus === 'failed' || jobStatus === 'cancelled'
+      ? 'released'
+      : 'queued'
+  const state = RESOURCE_EXECUTION_STATES.has(raw.state as api.ResourceExecutionState)
+    ? raw.state as api.ResourceExecutionState
+    : inferredState
+  const executionAttempt = Number.isInteger(raw.execution_attempt)
+    && Number(raw.execution_attempt) >= 1
+    && Number(raw.execution_attempt) <= 1_000_000
+    ? Number(raw.execution_attempt)
+    : 1
+  const liveCpuAttempt = intent === 'text'
+    && execution === 'cpu'
+    && preemptionMode === 'discard_restart'
+    && (
+      state === 'admitted'
+      || state === 'running'
+      || state === 'preemption_requested'
+      || state === 'resources_releasing'
+    )
+  return {
+    intent,
+    execution,
+    preemptible: liveCpuAttempt && raw.preemptible === true,
+    preemption_mode: preemptionMode,
+    state,
+    execution_attempt: executionAttempt,
+  }
+}
+
+function _isStaleResourceAttempt(
+  descriptor: api.ResourceDescriptor | null | undefined,
+  previous?: GenerationJob,
+): boolean {
+  if (!descriptor || !previous?.resourceDescriptor) return false
+  return descriptor.execution_attempt < previous.resourceDescriptor.execution_attempt
+}
+
+function _resourceProgressMustReset(
+  descriptor: api.ResourceDescriptor | null | undefined,
+  previous?: GenerationJob,
+): boolean {
+  if (!descriptor) return false
+  if (descriptor.state === 'resources_releasing' || descriptor.state === 'restarting_on_accelerator') {
+    return true
+  }
+  const previousDescriptor = previous?.resourceDescriptor
+  const previousAttempt = previous?.resourceDescriptor?.execution_attempt ?? 1
+  return descriptor.execution_attempt > previousAttempt && (
+    descriptor.preemption_mode === 'discard_restart'
+    || previousDescriptor?.preemption_mode === 'discard_restart'
+  )
+}
+
 function _jobStatusDetails(
   status: api.ApiJobStatus,
   previous?: GenerationJob,
 ): Partial<GenerationJob> {
   const submittedEstimate = status.h3_estimate || previous?.h3Estimate || null
   const estimatedTotal = _h3EstimateTotalSeconds(submittedEstimate)
+  const resourceDescriptor = _normalizeResourceDescriptor(status.resource_descriptor, status.status)
+  const resetDiscardedProgress = _resourceProgressMustReset(resourceDescriptor, previous)
+  const exactTextEta = resourceDescriptor?.intent === 'text'
   return {
-    ...(status.created_at != null ? { createdAt: status.created_at } : {}),
-    promptPreview: status.prompt_preview,
-    activeWindowPrompt: status.active_window_prompt,
+    createdAt: status.created_at,
+    promptPreview: status.status === 'preparing' || status.status === 'waiting_for_plan_approval'
+      ? ''
+      : status.prompt_preview,
+    activeWindowPrompt: status.status === 'preparing' || status.status === 'waiting_for_plan_approval'
+      ? ''
+      : status.active_window_prompt,
     modelType: status.model_type,
     generationMode: status.generation_mode,
     workspace: status.workspace,
@@ -447,17 +538,30 @@ function _jobStatusDetails(
     overallProgress: status.overall_progress,
     progressIndeterminate: status.status === 'running' && status.progress_indeterminate === true,
     queueWaitReason: status.queue_wait_reason,
+    ...(resourceDescriptor !== undefined
+      ? { resourceDescriptor }
+      : {}),
+    ...(status.parent_job_id !== undefined
+      ? { parentJobId: status.parent_job_id }
+      : {}),
     h3SegmentPlan: status.h3_segment_plan,
+    planReviewRequired: status.plan_review_required === true,
+    ...(status.plan_review_terms_required != null
+      ? { planReviewTermsRequired: status.plan_review_terms_required === true }
+      : {}),
+    planReviewDeadline: status.plan_review_deadline ?? null,
     currentSegmentModel: status.current_segment_model,
     currentSegmentReason: status.current_segment_reason,
     currentSegmentBoundary: status.current_segment_boundary,
     ...(submittedEstimate ? { h3Estimate: submittedEstimate } : {}),
-    etaSeconds: status.status === 'running'
-      ? (status.eta_seconds ?? previous?.etaSeconds ?? estimatedTotal)
+    etaSeconds: resetDiscardedProgress
+      ? null
+      : status.status === 'running'
+        ? (exactTextEta ? status.eta_seconds ?? null : status.eta_seconds ?? previous?.etaSeconds ?? estimatedTotal)
       : status.status === 'queued'
-        ? (previous?.etaSeconds ?? estimatedTotal)
+        ? (exactTextEta ? status.eta_seconds ?? null : previous?.etaSeconds ?? estimatedTotal)
         : null,
-    subtaskEtaSeconds: status.status === 'running'
+    subtaskEtaSeconds: status.status === 'running' && !resetDiscardedProgress
       ? (status.subtask_eta_seconds ?? null)
       : null,
     recoveryState: status.recovery_state ?? null,
@@ -476,19 +580,43 @@ function _jobStatusDetails(
 }
 
 function _mergeJobStatus(job: GenerationJob, status: api.ApiJobStatus): GenerationJob {
+  const resourceDescriptor = _normalizeResourceDescriptor(status.resource_descriptor, status.status)
+  if (_isStaleResourceAttempt(resourceDescriptor, job)) return job
+  const resetDiscardedProgress = _resourceProgressMustReset(resourceDescriptor, job)
   return {
     ...job,
     status: status.status,
-    progress: status.progress / 100,
-    step: status.step,
-    totalSteps: status.total_steps,
-    phase: status.phase,
+    progress: resetDiscardedProgress ? 0 : status.progress / 100,
+    step: resetDiscardedProgress ? 0 : status.step,
+    totalSteps: resetDiscardedProgress ? 0 : status.total_steps,
+    phase: resetDiscardedProgress ? '' : status.phase,
     message: status.message,
     outputFiles: status.output_files,
     error: status.error,
     oomInfo: status.oom_info ?? null,
     ..._jobStatusDetails(status, job),
+    ...(resetDiscardedProgress ? {
+      windowStep: 0,
+      windowTotalSteps: 0,
+      windowProgress: 0,
+      overallProgress: 0,
+      progressIndeterminate: true,
+    } : {}),
   }
+}
+
+function _newGenerationJobFromStatus(status: api.ApiJobStatus): GenerationJob {
+  return _mergeJobStatus({
+    id: status.job_id,
+    status: status.status,
+    progress: 0,
+    step: 0,
+    totalSteps: 0,
+    phase: '',
+    message: '',
+    outputFiles: [],
+    error: null,
+  }, status)
 }
 
 const ACTIVE_JOB_STATUS_POLL_MS = 2_000
@@ -533,17 +661,46 @@ function _rejectTerminalJobWaiter(jobId: string, message: string): void {
 }
 
 function _jobNeedsFastStatusPoll(job: GenerationJob): boolean {
-  return job.status === 'running' || job.recoveryState === 'retrying'
+  return job.status === 'preparing'
+    || job.status === 'waiting_for_plan_approval'
+    || job.status === 'running'
+    || job.recoveryState === 'retrying'
 }
 
-function _queueJobDetails(status: api.QueueJobState): Partial<GenerationJob> {
+function _queueJobDetails(
+  status: api.QueueJobState,
+  previous?: GenerationJob,
+): Partial<GenerationJob> {
+  const resourceDescriptor = _normalizeResourceDescriptor(status.resource_descriptor, status.status)
+  if (_isStaleResourceAttempt(resourceDescriptor, previous)) return {}
+  const resetDiscardedProgress = _resourceProgressMustReset(resourceDescriptor, previous)
   return {
     status: status.status,
     queueWaitReason: status.wait_reason,
-    etaSeconds: status.eta_seconds ?? null,
-    subtaskEtaSeconds: status.status === 'running'
+    ...(resourceDescriptor !== undefined
+      ? { resourceDescriptor }
+      : {}),
+    ...(status.parent_job_id !== undefined
+      ? { parentJobId: status.parent_job_id }
+      : {}),
+    planReviewRequired: status.status === 'waiting_for_plan_approval',
+    planReviewTermsRequired: status.plan_review_terms_required === true,
+    planReviewDeadline: status.plan_review_deadline ?? null,
+    etaSeconds: resetDiscardedProgress ? null : status.eta_seconds ?? null,
+    subtaskEtaSeconds: status.status === 'running' && !resetDiscardedProgress
       ? (status.subtask_eta_seconds ?? null)
       : null,
+    ...(resetDiscardedProgress ? {
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: '',
+      windowStep: 0,
+      windowTotalSteps: 0,
+      windowProgress: 0,
+      overallProgress: 0,
+      progressIndeterminate: true,
+    } : {}),
     recoveryState: status.recovery_state ?? null,
     recoveryInterrupted: status.recovery_interrupted === true,
     recoveryBlocked: status.recovery_blocked === true,
@@ -1038,27 +1195,6 @@ const H3_PROFILE_PARAM_KEYS = new Set<keyof GenerateParams>([
   'delivery_fit',
 ])
 
-function _copyH3ProfileParamsIntoSubmission(
-  target: Record<string, unknown>,
-  source: GenerateParams,
-  spatialUpsampling: string,
-): void {
-  for (const key of H3_PROFILE_PARAM_KEYS) {
-    const value = source[key]
-    if (value === undefined) {
-      delete target[key]
-    } else if (Array.isArray(value)) {
-      target[key] = [...value]
-    } else if (value && typeof value === 'object') {
-      target[key] = { ...(value as Record<string, unknown>) }
-    } else {
-      target[key] = value
-    }
-  }
-  if (spatialUpsampling) target.spatial_upsampling = spatialUpsampling
-  else delete target.spatial_upsampling
-}
-
 function _applyModelDefaults(
   storeGet: () => {
     selectedModelPerMode: Partial<Record<GenerationMode, string>>
@@ -1210,14 +1346,21 @@ const SFX_VIRTUAL_MODELS: ModelDef[] = [
 // Default enabled models (shown by default in selectors)
 const DEFAULT_ENABLED_MODELS = new Set([
   // Image
-  // Keep the general-purpose Flux default plus the complete Krea 2 family:
-  // base RAW/Turbo generation and their identity-preserving Edit variants.
-  // Other image models remain opt-in through Model Visibility.
+  // Curated local image generation/edit families. Experimental uncensored
+  // encoders remain normal visible choices; capability policy is independent.
+  'flux2_dev',
+  'flux2_klein_4b_uncensored',
+  'flux2_klein_9b_uncensored',
+  'flux2_klein_9b_pornmaster_v4_turbo_fp8_ponpoke',
   'flux2_klein_9b',
+  'flux_krea',
+  'flux_dev_kontext',
   'krea2_raw',
   'krea2_turbo',
   'krea2_raw_edit',
   'krea2_turbo_edit',
+  'qwen_image_edit_2511_20B_fp8_lightning_8step',
+  'qwen_image_edit_2511_nsfw',
   // Video
   // Keep LTX-2.3 Distilled available as a fast alternative. MiniMax H3
   // Base is the curated first-launch video default below.
@@ -1258,7 +1401,7 @@ const DEFAULT_ENABLED_MODELS = new Set([
  * a user who then disables them stays disabled forever. (This is
  * deliberately narrower than auto-enabling every unknown model — only
  * the curated list's own additions are pushed.) */
-const DEFAULTS_VERSION = 7
+const DEFAULTS_VERSION = 9
 const DEFAULTS_ADDED_IN: Record<number, string[]> = {
   // v1.2.0: the ACE-Step XL SFT pair; LM_4B becomes the music default.
   2: ['ace_step_v1_5_xl_sft', 'ace_step_v1_5_xl_sft_lm_4b'],
@@ -1272,6 +1415,24 @@ const DEFAULTS_ADDED_IN: Record<number, string[]> = {
   6: ['minimax_h3'],
   // MiniMax H3 semantic-reference checkpoint (separate from FL2VA).
   7: ['minimax_h3_ref2va'],
+  // One bounded discovery migration for the expanded local image lineup.
+  // Legacy server visibility stores have no disabled-model tombstones, so a
+  // pre-v8 hide of an existing id cannot be distinguished from "never
+  // curated" and may resurface once. A hide after v8 remains authoritative:
+  // this version is never replayed. Durable historical tombstones require a
+  // future visibility-API schema addition rather than origin-bound storage.
+  8: [
+    'flux2_dev',
+    'flux2_klein_4b_uncensored',
+    'flux2_klein_9b_uncensored',
+    'flux_krea',
+    'flux_dev_kontext',
+    'qwen_image_edit_2511_20B_fp8_lightning_8step',
+    'qwen_image_edit_2511_nsfw',
+  ],
+  // Manual experimental Klein 9B layered recipe. The backend omits it from
+  // the catalog unless the creator/base/encoder term graph and source match.
+  9: ['flux2_klein_9b_pornmaster_v4_turbo_fp8_ponpoke'],
 }
 const DEFAULTS_VERSION_KEY = 'maestro_defaults_version'
 
@@ -1919,8 +2080,14 @@ interface AppState {
   isGenerating: boolean
   pendingH3Plan: H3SegmentPlan | null
   pendingH3PlanEstimate: H3PerformanceEstimate | null
-  approveH3Plan: (decision: H3PlanDecision) => void
-  cancelH3Plan: () => void
+  pendingH3PlanJobId: string | null
+  pendingH3PlanWorkspace: string | null
+  h3PlanReviewLoading: boolean
+  h3PlanReviewError: string | null
+  openH3PlanReview: (jobId: string) => Promise<void>
+  closeH3PlanReview: () => void
+  approveH3Plan: (decision: H3PlanDecision) => Promise<void>
+  cancelH3Plan: () => Promise<void>
   startGeneration: () => Promise<void>
   stopGeneration: (jobId?: string) => void
   dismissJob: (jobId: string) => void
@@ -2017,10 +2184,12 @@ interface AppState {
    *  server-side active workspace, and where generations save, is
    *  untouched). Entered via switchWorkspace('__uploads__'). */
   browsingUploads: boolean
-  loadWorkspaces: () => Promise<void>
+  loadWorkspaces: () => Promise<boolean>
   switchWorkspace: (name: string) => Promise<boolean>
   createWorkspace: (name: string, password?: string) => Promise<void>
-  unlockWorkspace: (name: string, password: string) => Promise<void>
+  unlockWorkspace: (name: string, password: string, remember: api.WorkspaceRememberPolicy) => Promise<api.WorkspaceUnlockResult>
+  lockWorkspace: (name: string) => Promise<api.WorkspaceLockResult>
+  lockAllWorkspaces: () => Promise<api.WorkspaceLockResult>
   deleteWorkspace: (name: string) => Promise<void>
 
   // Storage Manager overlay
@@ -4129,8 +4298,21 @@ export const useStore = create<AppState>((set, get) => ({
         supports_ref_images: m.supports_ref_images ?? false,
         director: m.director,
         is_downloaded: m.is_downloaded ?? false,
+        downloadable: m.downloadable ?? true,
+        manual_installation_ready: m.manual_installation_ready ?? false,
+        availability_status: m.availability_status,
+        manual_checkpoint_verification_required: m.manual_checkpoint_verification_required ?? false,
+        manual_checkpoint_verified: m.manual_checkpoint_verified ?? false,
+        supported_operations: m.supported_operations ?? [],
+        automatic_routing: m.automatic_routing ?? false,
+        verified: m.verified ?? false,
+        default_for_operations: m.default_for_operations ?? [],
+        revenue_eligible: m.revenue_eligible,
+        fine_tuning_eligible: m.fine_tuning_eligible,
+        derivative_tooling: m.derivative_tooling,
         nsfw_only: m.nsfw_only ?? false,
         update_status: m.update_status,
+        required_host_terms: m.required_host_terms ?? [],
       }))
       // Inject virtual SFX (MMAudio) models alongside backend models
       const models = [...backendModels, ...SFX_VIRTUAL_MODELS]
@@ -4167,35 +4349,40 @@ export const useStore = create<AppState>((set, get) => ({
       // DEFAULT_ENABLED_MODELS list; for them this only stamps the
       // version key.
       let migrateMusicDefault = false
-      try {
-        const storedVer = _modelVisibilityHydrated
-          ? _modelVisibilityDefaultsVersion
-          : (
+      // A failed durable read is not evidence that visibility is
+      // unconfigured. Defer every migration/write and retry on the next load,
+      // so a new Pinokio origin cannot resurrect or overwrite server hides.
+      if (!shouldHydrateVisibility || visibility !== null) {
+        try {
+          const storedVer = _modelVisibilityHydrated
+            ? _modelVisibilityDefaultsVersion
+            : (
               parseInt(
                 localStorage.getItem(DEFAULTS_VERSION_KEY) || '1',
                 10,
               ) || 1
             )
-        if (storedVer < DEFAULTS_VERSION) {
-          const additions: string[] = []
-          for (let v = storedVer + 1; v <= DEFAULTS_VERSION; v++) {
-            additions.push(...(DEFAULTS_ADDED_IN[v] || []))
+          if (storedVer < DEFAULTS_VERSION) {
+            const additions: string[] = []
+            for (let v = storedVer + 1; v <= DEFAULTS_VERSION; v++) {
+              additions.push(...(DEFAULTS_ADDED_IN[v] || []))
+            }
+            const present = additions.filter(id => models.some(m => m.model_type === id))
+            if (present.length > 0) {
+              set(s => {
+                const next = new Set(s.enabledModels)
+                present.forEach(id => next.add(id))
+                _saveEnabledModels(next)
+                return { enabledModels: next }
+              })
+            }
+            migrateMusicDefault = storedVer < 2
+            _modelVisibilityDefaultsVersion = DEFAULTS_VERSION
+            localStorage.setItem(DEFAULTS_VERSION_KEY, String(DEFAULTS_VERSION))
+            _saveEnabledModels(get().enabledModels)
           }
-          const present = additions.filter(id => models.some(m => m.model_type === id))
-          if (present.length > 0) {
-            set(s => {
-              const next = new Set(s.enabledModels)
-              present.forEach(id => next.add(id))
-              _saveEnabledModels(next)
-              return { enabledModels: next }
-            })
-          }
-          migrateMusicDefault = storedVer < 2
-          _modelVisibilityDefaultsVersion = DEFAULTS_VERSION
-          localStorage.setItem(DEFAULTS_VERSION_KEY, String(DEFAULTS_VERSION))
-          _saveEnabledModels(get().enabledModels)
-        }
-      } catch { /* localStorage blocked — defaults only apply this session */ }
+        } catch { /* localStorage blocked — defaults only apply this session */ }
+      }
 
       // Hydrate persisted per-mode settings from localStorage.
       //
@@ -4535,7 +4722,7 @@ export const useStore = create<AppState>((set, get) => ({
       const msg = e instanceof Error ? e.message : (tool === 'upscale' ? 'Upscale failed' : 'Revoice failed')
       set(st => ({
         jobs: st.jobs.map(j => j === newJob ? { ...j, id: j.id || `tool-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
-        isGenerating: st.jobs.some(j => j !== newJob && (j.status === 'running' || j.status === 'queued')),
+        isGenerating: st.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
       }))
       console.error(`Tool ${tool} failed:`, msg)
     }
@@ -4808,21 +4995,174 @@ export const useStore = create<AppState>((set, get) => ({
   isGenerating: false,
   pendingH3Plan: null,
   pendingH3PlanEstimate: null,
-  approveH3Plan: (decision) => {
-    const resolve = _h3PlanDecisionResolver
-    _h3PlanDecisionResolver = null
-    set({ pendingH3Plan: null, pendingH3PlanEstimate: null })
-    resolve?.(decision)
+  pendingH3PlanJobId: null,
+  pendingH3PlanWorkspace: null,
+  h3PlanReviewLoading: false,
+  h3PlanReviewError: null,
+  openH3PlanReview: async (jobId) => {
+    const initial = get().jobs.find(job => job.id === jobId)
+    if (!initial || initial.status !== 'waiting_for_plan_approval' || !initial.workspace) return
+    const workspace = initial.workspace
+    if (get().activeWorkspace !== workspace) {
+      window.alert(`Switch to project ${workspace} to review this plan.`)
+      return
+    }
+    const sequence = ++_h3PlanReviewSequence
+    set({
+      pendingH3Plan: null,
+      pendingH3PlanEstimate: null,
+      pendingH3PlanJobId: jobId,
+      pendingH3PlanWorkspace: workspace,
+      h3PlanReviewLoading: true,
+      h3PlanReviewError: null,
+    })
+    try {
+      const status = initial.h3SegmentPlan ? null : await api.fetchJobStatus(jobId)
+      const current = get().jobs.find(job => job.id === jobId)
+      if (
+        sequence !== _h3PlanReviewSequence
+      ) return
+      if (
+        get().pendingH3PlanJobId !== jobId
+        || get().pendingH3PlanWorkspace !== workspace
+      ) return
+      if (
+        get().activeWorkspace !== workspace
+        || !current
+        || current.workspace !== workspace
+        || current.status !== 'waiting_for_plan_approval'
+        || (status != null && (
+          status.job_id !== jobId
+          || status.workspace !== workspace
+          || (
+            status.created_at != null
+            && current.createdAt != null
+            && current.createdAt !== initial.createdAt
+            && status.created_at !== current.createdAt
+          )
+        ))
+      ) {
+        get().closeH3PlanReview()
+        return
+      }
+      const plan = status?.h3_segment_plan || current.h3SegmentPlan || null
+      if (!plan || (status && status.status !== 'waiting_for_plan_approval')) {
+        throw new Error('The queued plan is not ready for review.')
+      }
+      set(s => ({
+        pendingH3Plan: plan,
+        pendingH3PlanEstimate: status?.h3_estimate || current.h3Estimate || null,
+        pendingH3PlanJobId: jobId,
+        pendingH3PlanWorkspace: workspace,
+        h3PlanReviewLoading: false,
+        jobs: status
+          ? s.jobs.map(job => job.id === jobId ? _mergeJobStatus(job, status) : job)
+          : s.jobs,
+      }))
+    } catch (error) {
+      if (
+        sequence !== _h3PlanReviewSequence
+        || get().activeWorkspace !== workspace
+        || get().pendingH3PlanJobId !== jobId
+        || get().pendingH3PlanWorkspace !== workspace
+      ) return
+      set({
+        h3PlanReviewLoading: false,
+        h3PlanReviewError: error instanceof Error ? error.message : 'The queued plan could not be loaded.',
+      })
+    }
   },
-  cancelH3Plan: () => {
-    const resolve = _h3PlanDecisionResolver
-    _h3PlanDecisionResolver = null
-    set({ pendingH3Plan: null, pendingH3PlanEstimate: null })
-    resolve?.(null)
+  closeH3PlanReview: () => {
+    _h3PlanReviewSequence += 1
+    set({
+      pendingH3Plan: null,
+      pendingH3PlanEstimate: null,
+      pendingH3PlanJobId: null,
+      pendingH3PlanWorkspace: null,
+      h3PlanReviewLoading: false,
+      h3PlanReviewError: null,
+    })
+  },
+  approveH3Plan: async (decision) => {
+    const sequence = ++_h3PlanReviewSequence
+    const { pendingH3PlanJobId: jobId, pendingH3PlanWorkspace: workspace } = get()
+    if (!jobId || !workspace || get().activeWorkspace !== workspace) return
+    set({ h3PlanReviewLoading: true, h3PlanReviewError: null })
+    try {
+      const result = await api.approveGenerationPlan(jobId, {
+        workspace,
+        segment_overrides: decision.segmentOverrides,
+        boundary_overrides: decision.boundaryOverrides,
+        h3_ref2va_terms_accepted: h3Ref2VATermsAccepted(),
+      })
+      if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      set(s => ({
+        pendingH3Plan: null,
+        pendingH3PlanEstimate: null,
+        pendingH3PlanJobId: null,
+        pendingH3PlanWorkspace: null,
+        h3PlanReviewLoading: false,
+        jobs: s.jobs.map(job => job.id === jobId ? {
+          ...job,
+          status: result.status,
+          phase: 'registered',
+          message: 'Queued...',
+          planReviewRequired: false,
+          planReviewTermsRequired: false,
+          planReviewDeadline: null,
+          h3SegmentPlan: result.h3_segment_plan,
+          h3Estimate: result.h3_estimate,
+          etaSeconds: _h3EstimateTotalSeconds(result.h3_estimate),
+        } : job),
+      }))
+      get()._pollRecoveredJob(jobId)
+      window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+    } catch (error) {
+      if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      set({
+        h3PlanReviewLoading: false,
+        h3PlanReviewError: error instanceof Error ? error.message : 'The generation plan could not be approved.',
+      })
+    }
+  },
+  cancelH3Plan: async () => {
+    const sequence = ++_h3PlanReviewSequence
+    const { pendingH3PlanJobId: jobId, pendingH3PlanWorkspace: workspace } = get()
+    if (!jobId || !workspace || get().activeWorkspace !== workspace) return
+    set({ h3PlanReviewLoading: true, h3PlanReviewError: null })
+    try {
+      await api.cancelJob(jobId)
+      if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      _recoveryJobPolls.get(jobId)?.stop()
+      set(s => ({
+        pendingH3Plan: null,
+        pendingH3PlanEstimate: null,
+        pendingH3PlanJobId: null,
+        pendingH3PlanWorkspace: null,
+        h3PlanReviewLoading: false,
+        jobs: s.jobs.map(job => job.id === jobId ? {
+          ...job,
+          status: 'cancelled',
+          message: 'Cancelled',
+          planReviewRequired: false,
+          planReviewTermsRequired: false,
+          planReviewDeadline: null,
+        } : job),
+        isGenerating: s.jobs.some(job => job.id !== jobId && _isActiveGenerationJob(job)),
+      }))
+      window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+    } catch (error) {
+      if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      set({
+        h3PlanReviewLoading: false,
+        h3PlanReviewError: error instanceof Error ? error.message : 'The generation could not be cancelled.',
+      })
+    }
   },
 
   startGeneration: async () => {
-    let state = get()
+    const state = get()
+    const submissionWorkspace = state.activeWorkspace
     // Model changes update params.model_type immediately and load capabilities
     // asynchronously. Never submit against the previous model's limits or
     // conditioning contract during that short hand-off window.
@@ -4860,7 +5200,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       // Under Auto, the selected checkpoint is only a starting preference;
       // semantic inputs make Ref2VA certain here, while cut-driven Ref2VA is
-      // discovered by previewGenerationPlan and gated in the plan dialog.
+      // discovered by durable server planning and gated on the exact job card.
       const h3WillUseRef2VA = (
         (!h3AdaptiveConditioning && h3FixedRef2VA)
         || (h3AdaptiveConditioning && h3HasSemanticReferences)
@@ -4895,33 +5235,23 @@ export const useStore = create<AppState>((set, get) => ({
         return
       }
     }
-    let enhancedForSubmission = false
-    if (state.studioPromptEnhance) {
-      if (state.params.prompt.trim()) {
-        const enhanced = await get().enhancePrompt()
-        if (!enhanced) {
-          // The checkbox means enhancement is required for this submission.
-          // Keep it checked and abort rather than silently generating the
-          // original prompt after a service failure.
-          return
-        }
-        enhancedForSubmission = true
-        // One-shot by design: avoid recursively enhancing the enhanced result
-        // when the user queues another output from the same prompt.
-        set({ studioPromptEnhance: false })
-      }
-      state = get()
+    // Enhancement is durable job preparation. Submit the intent with the
+    // original frozen request so the browser gets a job ID immediately and
+    // never repeats the LLM work after a disconnect or refresh.
+    const enhanceRequested = state.studioPromptEnhance
+    if (enhanceRequested && !state.params.prompt.trim()) {
+      window.alert('Enter a prompt before using Enhance before Generate.')
+      return
     }
-
-    // Auto-unload LLM before GPU-heavy generation to free VRAM
-    if (state.llmStatus?.loaded || enhancedForSubmission) {
-      try {
-        await api.unloadLlm()
-        set({ llmStatus: { loaded: false, model_id: null, device: null, provider: '' } })
-      } catch { /* best-effort */ }
+    const enhanceBeforeGenerate = enhanceRequested
+    const usesDedicatedGenerationEndpoint = (
+      (state.generationMode === 'video' && (state.params.image_mode as number) === 4)
+      || (state.generationMode === 'avatar' && Boolean(state.editSubMode))
+    )
+    if (enhanceBeforeGenerate && usesDedicatedGenerationEndpoint) {
+      window.alert('Enhance before Generate is available for standard Studio generations. Use the standalone Enhance action first for this Blend or Edit workflow.')
+      return
     }
-
-    state = get()
 
     // Validate: i2v-only models require a start image — Video mode only.
     // Edit sub-modes supply their own source media and validate in their
@@ -4985,7 +5315,7 @@ export const useStore = create<AppState>((set, get) => ({
         // the tile silently disappearing.
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: j.id || `submit-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
-          isGenerating: s.jobs.some(j => j !== newJob && (j.status === 'running' || j.status === 'queued')),
+          isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
         }))
         console.error('Blend failed:', msg)
       }
@@ -5114,7 +5444,7 @@ export const useStore = create<AppState>((set, get) => ({
         // the tile silently disappearing.
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: j.id || `submit-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
-          isGenerating: s.jobs.some(j => j !== newJob && (j.status === 'running' || j.status === 'queued')),
+          isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
         }))
         console.error('Outpaint failed:', msg)
       }
@@ -5183,7 +5513,7 @@ export const useStore = create<AppState>((set, get) => ({
           jobs: s.jobs.map(j => j === newJob
             ? { ...j, id: j.id || `submit-fail-${Date.now()}`, status: 'failed', message: msg, error: msg }
             : j),
-          isGenerating: s.jobs.some(j => j !== newJob && (j.status === 'running' || j.status === 'queued')),
+          isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
         }))
         console.error('Repaint failed:', msg)
       }
@@ -5268,7 +5598,7 @@ export const useStore = create<AppState>((set, get) => ({
         const msg = e instanceof Error ? e.message : 'Recast failed'
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: j.id || `submit-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
-          isGenerating: s.jobs.some(j => j !== newJob && (j.status === 'running' || j.status === 'queued')),
+          isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
         }))
         console.error('Recast failed:', msg)
       }
@@ -5382,7 +5712,7 @@ export const useStore = create<AppState>((set, get) => ({
         // the tile silently disappearing.
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: j.id || `submit-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
-          isGenerating: s.jobs.some(j => j !== newJob && (j.status === 'running' || j.status === 'queued')),
+          isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
         }))
         console.error('Edit generation failed:', msg)
       }
@@ -5392,7 +5722,7 @@ export const useStore = create<AppState>((set, get) => ({
     const params: Record<string, unknown> = {
       ...state.params,
       generation_mode: state.generationMode,
-      workspace: state.activeWorkspace,
+      workspace: submissionWorkspace,
       private_output: state.privateOutput,
       explicit_output: state.explicitOutput,
       h3_ref2va_terms_accepted: h3Ref2VATermsAccepted(),
@@ -5901,87 +6231,38 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
 
-    // Long H3 jobs are expensive and may change checkpoints at authored
-    // cuts. Build the exact server plan before queuing, show it for a short
-    // countdown, and let the user override every segment/boundary. The same
-    // payload is planned again at submission, so UI and runtime cannot drift.
-    let plannedH3Estimate: H3PerformanceEstimate | null = null
-    let plannedH3SegmentPlan: H3SegmentPlan | null = null
-    if (
-      state.generationMode === 'video'
-      && ['minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_w4a8_fl2va', 'minimax_h3_ref2va'].includes(String(params.model_type || ''))
-    ) {
-      try {
-        // Field presence is the server's manual-ceiling contract. Automatic
-        // Studio planning must omit it so Draft/Fast profile pressure can
-        // choose segment geometry; locked values remain byte-for-byte exact.
-        applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
-        const preview = await api.previewGenerationPlan(params)
-        plannedH3Estimate = preview.h3_estimate
-        plannedH3SegmentPlan = preview.plan
-        let effectiveNeedsRef2VA = preview.requirements.ref2va_terms_required
-        if (preview.requires_review && preview.plan) {
-          if (_h3PlanDecisionResolver) return
-          const decision = await new Promise<H3PlanDecision | null>(resolve => {
-            _h3PlanDecisionResolver = resolve
-            set({
-              pendingH3Plan: preview.plan,
-              pendingH3PlanEstimate: preview.h3_estimate,
-            })
-          })
-          if (!decision) return
-          // The plan dialog can reconcile a manually selected checkpoint to
-          // a different server-authored profile while this generation is
-          // suspended. Refresh only the profile-owned fields in the pending
-          // payload so the submission cannot combine an old Turbo snapshot
-          // with a newly selected incompatible checkpoint.
-          const reconciledState = get()
-          _copyH3ProfileParamsIntoSubmission(
-            params,
-            reconciledState.params,
-            reconciledState.spatialUpsampling,
-          )
-          params.h3_segment_overrides = decision.segmentOverrides
-          params.h3_boundary_overrides = decision.boundaryOverrides
-          effectiveNeedsRef2VA = decision.segmentOverrides.some(
-            segment => segment.model_type === 'minimax_h3_ref2va',
-          )
-        }
-        params.h3_ref2va_terms_accepted = h3Ref2VATermsAccepted()
-        if (effectiveNeedsRef2VA && params.h3_ref2va_terms_accepted !== true) {
-          window.alert('This plan uses the separately licensed MiniMax H3 Ref2VA checkpoint. Accept its model terms in the plan or Inputs before generating.')
-          return
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Could not build the long-video plan'
-        window.alert(message)
-        return
-      }
-    }
-
     const initialH3Estimate = String(params.model_type || '').startsWith('minimax_h3')
-      ? (plannedH3Estimate || state.h3CurrentEstimate)
+      ? state.h3CurrentEstimate
       : null
+    // Uploads above can outlive a project switch. Never admit the frozen
+    // request under a project that is no longer active in this browser.
+    if (get().activeWorkspace !== submissionWorkspace) return
+    params.enhance_before_generate = enhanceBeforeGenerate
+    params.h3_ref2va_terms_accepted = h3Ref2VATermsAccepted()
+    const durablePreparationExpected = enhanceBeforeGenerate
+      || String(params.model_type || '').startsWith('minimax_h3')
     const newJob: GenerationJob = {
       id: '',
       createdAt: Date.now() / 1000,
-      status: 'queued',
+      status: durablePreparationExpected ? 'preparing' : 'queued',
       progress: 0,
       step: 0,
       totalSteps: 0,
-      phase: '',
-      message: 'Submitting...',
+      phase: durablePreparationExpected
+        ? enhanceBeforeGenerate ? 'enhancing_prompt' : 'planning_generation'
+        : '',
+      message: durablePreparationExpected
+        ? enhanceBeforeGenerate ? 'Enhancing prompt' : 'Planning generation'
+        : 'Submitting...',
       outputFiles: [],
       error: null,
       oomInfo: null,
-      promptPreview: String(params.model_type || '').startsWith('minimax_h3')
-        ? ''
-        : String(params.prompt || ''),
+      promptPreview: durablePreparationExpected ? '' : String(params.prompt || ''),
       modelType: String(params.model_type || ''),
       generationMode: state.generationMode,
-      workspace: state.activeWorkspace,
+      workspace: submissionWorkspace,
       h3Estimate: initialH3Estimate,
-      h3SegmentPlan: plannedH3SegmentPlan,
+      h3SegmentPlan: null,
     }
 
     set(s => ({
@@ -5991,20 +6272,33 @@ export const useStore = create<AppState>((set, get) => ({
 
     try {
       applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
-      const { job_id, h3_estimate } = await api.submitGeneration(params)
+      const { job_id, status, h3_estimate } = await api.submitGeneration(params)
       const submittedEstimate = h3_estimate || newJob.h3Estimate || null
 
       // Update the job with its server-assigned ID
-      set(s => ({
-        jobs: s.jobs.map(j => j === newJob ? {
-          ...j,
-          id: job_id,
-          status: 'queued',
-          message: 'Queued...',
-          h3Estimate: submittedEstimate,
-          etaSeconds: _h3EstimateTotalSeconds(submittedEstimate),
-        } : j),
-      }))
+      set(s => {
+        const reconnectedJobExists = s.jobs.some(job => job !== newJob && job.id === job_id)
+        return {
+          jobs: reconnectedJobExists
+            ? s.jobs.filter(job => job !== newJob)
+            : s.jobs.map(job => job === newJob ? {
+              ...job,
+              id: job_id,
+              status: status || 'queued',
+              phase: status === 'preparing'
+                ? enhanceBeforeGenerate ? 'enhancing_prompt' : 'planning_generation'
+                : job.phase,
+              message: status === 'preparing'
+                ? enhanceBeforeGenerate ? 'Enhancing prompt' : 'Planning generation'
+                : 'Queued...',
+              h3Estimate: submittedEstimate,
+              etaSeconds: _h3EstimateTotalSeconds(submittedEstimate),
+            } : job),
+          ...(enhanceBeforeGenerate && s.activeWorkspace === submissionWorkspace
+            ? { studioPromptEnhance: false }
+            : {}),
+        }
+      })
 
       // Queued cards use the shared queue snapshot for start transitions. A
       // slow per-card fallback check remains for missed events; the same poller
@@ -6020,7 +6314,7 @@ export const useStore = create<AppState>((set, get) => ({
       // tile disappear and leaving them to wonder.
       set(s => ({
         jobs: s.jobs.map(j => j === newJob ? { ...j, id: j.id || `submit-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
-        isGenerating: s.jobs.some(j => j !== newJob && (j.status === 'running' || j.status === 'queued')),
+        isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
       }))
     }
   },
@@ -6033,7 +6327,7 @@ export const useStore = create<AppState>((set, get) => ({
       api.cancelJob(jobId).catch(e => console.error('Cancel failed:', e))
       set(s => {
         const remaining = s.jobs.filter(j => j.id !== jobId)
-        return { jobs: remaining, isGenerating: remaining.length > 0 }
+        return { jobs: remaining, isGenerating: remaining.some(_isActiveGenerationJob) }
       })
     } else {
       // Cancel all jobs
@@ -6056,7 +6350,7 @@ export const useStore = create<AppState>((set, get) => ({
       const remaining = s.jobs.filter(j => j.id !== jobId)
       return {
         jobs: remaining,
-        isGenerating: remaining.some(j => j.status === 'running' || j.status === 'queued'),
+        isGenerating: remaining.some(_isActiveGenerationJob),
       }
     })
   },
@@ -6067,7 +6361,7 @@ export const useStore = create<AppState>((set, get) => ({
     set(s => ({
       jobs: s.jobs.map(job => {
         const queueJob = queueJobs.get(job.id)
-        return queueJob ? { ...job, ..._queueJobDetails(queueJob) } : job
+        return queueJob ? { ...job, ..._queueJobDetails(queueJob, job) } : job
       }),
     }))
 
@@ -6085,9 +6379,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   resumeJobRecovery: async (jobId) => {
-    const needsRecoveryPoll = !['queued', 'running'].includes(
-      get().jobs.find(job => job.id === jobId)?.status || '',
-    )
+    const needsRecoveryPoll = !get().jobs.some(job => job.id === jobId && _isActiveGenerationJob(job))
     let recoveryError: unknown = null
     try {
       await api.resumeQueueRecovery(jobId)
@@ -6098,8 +6390,8 @@ export const useStore = create<AppState>((set, get) => ({
       const status = await api.fetchJobStatus(jobId)
       set(s => ({
         jobs: s.jobs.map(job => job.id !== jobId ? job : _mergeJobStatus(job, status)),
-        isGenerating: status.status === 'queued' || status.status === 'running'
-          || s.jobs.some(job => job.id !== jobId && (job.status === 'queued' || job.status === 'running')),
+        isGenerating: ACTIVE_GENERATION_JOB_STATUSES.has(status.status)
+          || s.jobs.some(job => job.id !== jobId && _isActiveGenerationJob(job)),
       }))
     } catch {
       // Preserve the bounded recovery endpoint error below.
@@ -6110,9 +6402,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   retryJobRecovery: async (jobId) => {
-    const needsRecoveryPoll = !['queued', 'running'].includes(
-      get().jobs.find(job => job.id === jobId)?.status || '',
-    )
+    const needsRecoveryPoll = !get().jobs.some(job => job.id === jobId && _isActiveGenerationJob(job))
     let recoveryError: unknown = null
     try {
       await api.retryQueueRecovery(jobId)
@@ -6123,8 +6413,8 @@ export const useStore = create<AppState>((set, get) => ({
       const status = await api.fetchJobStatus(jobId)
       set(s => ({
         jobs: s.jobs.map(job => job.id !== jobId ? job : _mergeJobStatus(job, status)),
-        isGenerating: status.status === 'queued' || status.status === 'running'
-          || s.jobs.some(job => job.id !== jobId && (job.status === 'queued' || job.status === 'running')),
+        isGenerating: ACTIVE_GENERATION_JOB_STATUSES.has(status.status)
+          || s.jobs.some(job => job.id !== jobId && _isActiveGenerationJob(job)),
       }))
     } catch {
       // Preserve the bounded recovery endpoint error below.
@@ -6201,6 +6491,10 @@ export const useStore = create<AppState>((set, get) => ({
       running = true
       try {
         const status = await api.fetchJobStatus(jobId)
+        if (stopped || _recoveryJobPolls.get(jobId) !== poll) {
+          stop()
+          return
+        }
         consecutivePollFailures = 0
         set(s => ({
           jobs: s.jobs.map(job => job.id !== jobId ? job : _mergeJobStatus(job, status)),
@@ -6215,7 +6509,7 @@ export const useStore = create<AppState>((set, get) => ({
             const remaining = s.jobs.filter(job => job.id !== jobId)
             return {
               jobs: remaining,
-              isGenerating: remaining.some(job => job.status === 'queued' || job.status === 'running'),
+              isGenerating: remaining.some(_isActiveGenerationJob),
             }
           })
           get().loadOutputs()
@@ -6225,12 +6519,16 @@ export const useStore = create<AppState>((set, get) => ({
           stop()
           set(s => ({
             isGenerating: s.jobs.some(job => (
-              job.id !== jobId && (job.status === 'queued' || job.status === 'running')
+              job.id !== jobId && _isActiveGenerationJob(job)
             )),
           }))
           get().loadOutputs()
         }
       } catch {
+        if (stopped || _recoveryJobPolls.get(jobId) !== poll) {
+          stop()
+          return
+        }
         // A transient disconnect must not strand the only poller for an
         // existing recovered card. Keep retrying; periodically reconcile the
         // owner list as an independent authoritative path.
@@ -6301,56 +6599,19 @@ export const useStore = create<AppState>((set, get) => ({
         const existingIds = new Set(get().jobs.map(j => j.id))
         const newJobs: GenerationJob[] = data.jobs
           .filter(j => !existingIds.has(j.job_id))
-          .map(j => ({
-            id: j.job_id,
-            createdAt: j.created_at,
-            status: j.status as GenerationJob['status'],
-            progress: j.progress / 100,
-            step: j.step,
-            totalSteps: j.total_steps,
-            phase: j.phase,
-            message: j.message,
-            outputFiles: j.output_files,
-            error: j.error,
-            oomInfo: (j as { oom_info?: import('../types').OomInfo | null }).oom_info ?? null,
-            promptPreview: j.prompt_preview,
-            activeWindowPrompt: j.active_window_prompt,
-            modelType: j.model_type,
-            generationMode: j.generation_mode,
-            workspace: j.workspace,
-            windowCurrent: j.window_current,
-            windowTotal: j.window_total,
-            windowStep: j.window_step,
-            windowTotalSteps: j.window_total_steps,
-            windowProgress: j.window_progress,
-            overallProgress: j.overall_progress,
-            progressIndeterminate: j.status === 'running' && j.progress_indeterminate === true,
-            queueWaitReason: j.queue_wait_reason,
-            h3SegmentPlan: j.h3_segment_plan,
-            currentSegmentModel: j.current_segment_model,
-            currentSegmentReason: j.current_segment_reason,
-            currentSegmentBoundary: j.current_segment_boundary,
-            h3Estimate: j.h3_estimate ?? null,
-            etaSeconds: j.status === 'running' ? (j.eta_seconds ?? null) : null,
-            subtaskEtaSeconds: j.status === 'running' ? (j.subtask_eta_seconds ?? null) : null,
-            logEvents: j.events,
-            ..._jobStatusDetails(j),
-          }))
+          .map(_newGenerationJobFromStatus)
         if (newJobs.length > 0) {
           set(s => ({
             jobs: [...s.jobs, ...newJobs],
-            isGenerating: newJobs.some(job =>
-              job.status === 'queued' || job.status === 'running'
-            ) || s.jobs.some(job =>
-              job.status === 'queued' || job.status === 'running'
-            ),
+            isGenerating: newJobs.some(_isActiveGenerationJob)
+              || s.jobs.some(_isActiveGenerationJob),
           }))
           console.log(`[Queue] Reconnected to ${newJobs.length} active job(s)`)
         }
-        // Queue snapshots keep queued cards current; only running/retrying
-        // jobs switch the shared per-card poller to its 2s execution cadence.
+        // Queue snapshots keep ordinary queued cards current; preparation,
+        // review, execution, and retry states use the fast per-card poller.
         for (const status of data.jobs) {
-          if (status.status === 'queued' || status.status === 'running') {
+          if (ACTIVE_GENERATION_JOB_STATUSES.has(status.status)) {
             get()._pollRecoveredJob(status.job_id)
           }
         }
@@ -7208,19 +7469,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       set({ hostTermsLoading: true, hostTermsError: null })
       try {
-        let result = await api.fetchHostTerms(workspace)
-        const ref2va = result.terms.minimax_h3_ref2va
-        if (
-          !ref2va.accepted
-          && ref2va.current_version === H3_REF2VA_LEGACY_TERM_VERSION
-          && _legacyH3Ref2VATermsAccepted()
-        ) {
-          result = await api.acceptHostTerm(
-            'minimax_h3_ref2va',
-            H3_REF2VA_LEGACY_TERM_VERSION,
-            workspace,
-          )
-        }
+        const result = await api.fetchHostTerms(workspace)
         if (result.terms.minimax_h3_ref2va.accepted) {
           _clearLegacyH3Ref2VATermsAcceptance()
         }
@@ -9118,35 +9367,85 @@ export const useStore = create<AppState>((set, get) => ({
   activeWorkspace: 'default',
   browsingUploads: false,
   loadWorkspaces: async () => {
+    const requestSequence = ++_workspaceLoadSequence
     try {
       const data = await api.fetchWorkspaces()
-      const projectChanged = data.active !== get().activeWorkspace
+      if (requestSequence !== _workspaceLoadSequence) return false
+      const before = get()
+      const previousActive = before.activeWorkspace
+      const projectChanged = data.active !== previousActive
+      const nextWorkspaces = new Map(data.workspaces.map(workspace => [workspace.name, workspace]))
+      const revokedWorkspaces = before.workspaces
+        .filter(workspace => (
+          workspace.password_protected
+          && workspace.unlocked === true
+          && nextWorkspaces.get(workspace.name)?.unlocked !== true
+        ))
+        .map(workspace => workspace.name)
+      const previousAccessRevoked = Boolean(previousActive) && !data.workspaces.some(workspace => (
+        workspace.name === previousActive && workspace.unlocked !== false
+      ))
+      const clearPendingPlan = before.pendingH3PlanWorkspace != null && (
+        projectChanged || (
+          previousAccessRevoked && before.pendingH3PlanWorkspace === previousActive
+        )
+      )
       if (projectChanged) {
         _directorPipelineLifecycleToken = null
         _dashboardPipelineLoadToken += 1
         _dashboardPipelineListLoadToken += 1
       }
-      set({
-        workspaces: data.workspaces,
-        activeWorkspace: data.active,
-        selectedOutputKeys: [],
-        gallerySelectionMode: false,
-        ...(projectChanged ? {
-          pipelineId: null,
-          pipelineStatus: null,
-          pipelinePolling: false,
-          directorLoading: false,
-          dashboardOpen: false,
-          dashboardPipelineList: [],
-          dashboardSelectedPipeline: null,
-          dashboardLoading: false,
-        } : {}),
+      if (clearPendingPlan) _h3PlanReviewSequence += 1
+      set(state => {
+        const remainingJobs = previousAccessRevoked
+          ? state.jobs.filter(job => job.workspace && job.workspace !== previousActive)
+          : state.jobs
+        return {
+          workspaces: data.workspaces,
+          activeWorkspace: data.active,
+          selectedOutputKeys: [],
+          gallerySelectionMode: false,
+          ...(projectChanged || previousAccessRevoked ? {
+            browsingUploads: false,
+            outputs: [],
+            outputsTotal: 0,
+            selectedOutput: 0,
+            selectedOutputMeta: null,
+            pipelineId: null,
+            pipelineStatus: null,
+            pipelinePolling: false,
+            directorLoading: false,
+            dashboardOpen: false,
+            dashboardPipelineList: [],
+            dashboardSelectedPipeline: null,
+            dashboardLoading: false,
+          } : {}),
+          ...(previousAccessRevoked ? {
+            jobs: remainingJobs,
+            isGenerating: remainingJobs.some(_isActiveGenerationJob),
+          } : {}),
+          ...(clearPendingPlan ? {
+            pendingH3Plan: null,
+            pendingH3PlanEstimate: null,
+            pendingH3PlanJobId: null,
+            pendingH3PlanWorkspace: null,
+            h3PlanReviewLoading: false,
+            h3PlanReviewError: null,
+          } : {}),
+        }
       })
+      for (const workspace of new Set([
+        ...revokedWorkspaces,
+        ...(projectChanged && previousActive ? [previousActive] : []),
+        ...(previousAccessRevoked ? [previousActive] : []),
+      ])) hidePrivatePreviewsForWorkspace(workspace)
       if (get().accessContext?.remote && data.active) {
         void get().loadOutputs()
       }
+      return true
     } catch (e) {
       console.error('Failed to load workspaces:', e)
+      return false
     }
   },
   switchWorkspace: async (name) => {
@@ -9154,6 +9453,8 @@ export const useStore = create<AppState>((set, get) => ({
     // the server-side active workspace — generations keep saving to the
     // real workspace; uploads are read-only in the gallery.
     if (name === '__uploads__') {
+      const activeWorkspace = get().activeWorkspace
+      if (activeWorkspace) hidePrivatePreviewsForWorkspace(activeWorkspace)
       set({ browsingUploads: true, outputs: [], outputsTotal: 0, selectedOutput: 0, selectedOutputMeta: null, selectedOutputKeys: [] })
       return get().loadOutputs()
     }
@@ -9161,7 +9462,11 @@ export const useStore = create<AppState>((set, get) => ({
     _dashboardPipelineLoadToken += 1
     _dashboardPipelineListLoadToken += 1
     try {
+      const previousWorkspace = get().activeWorkspace
       await api.setActiveWorkspace(name)
+      if (previousWorkspace && previousWorkspace !== name) {
+        hidePrivatePreviewsForWorkspace(previousWorkspace)
+      }
       set({
         browsingUploads: false,
         activeWorkspace: name,
@@ -9192,8 +9497,12 @@ export const useStore = create<AppState>((set, get) => ({
     _dashboardPipelineLoadToken += 1
     _dashboardPipelineListLoadToken += 1
     try {
-      await api.createWorkspace(name, password)
+      const previousWorkspace = get().activeWorkspace
+      await api.createWorkspace(name, password, 'device')
       await api.setActiveWorkspace(name)
+      if (previousWorkspace && previousWorkspace !== name) {
+        hidePrivatePreviewsForWorkspace(previousWorkspace)
+      }
       set({
         browsingUploads: false,
         activeWorkspace: name,
@@ -9218,9 +9527,138 @@ export const useStore = create<AppState>((set, get) => ({
       throw e
     }
   },
-  unlockWorkspace: async (name, password) => {
-    await api.unlockWorkspace(name, password)
-    await get().loadWorkspaces()
+  unlockWorkspace: async (name, password, remember) => {
+    const result = await api.unlockWorkspace(name, password, remember)
+    // Re-authentication always starts from a blurred preview session.
+    hidePrivatePreviewsForWorkspace(name)
+    if (!await get().loadWorkspaces()) {
+      throw new Error('Project unlocked, but its current access state could not be refreshed')
+    }
+    return result
+  },
+  lockWorkspace: async (name) => {
+    const result = await api.lockWorkspace(name)
+    hidePrivatePreviewsForWorkspace(name)
+    const before = get()
+    const lockedActiveWorkspace = name === before.activeWorkspace
+    const clearPendingPlan = before.pendingH3PlanWorkspace === name
+    if (clearPendingPlan) _h3PlanReviewSequence += 1
+    set(state => {
+      const remainingJobs = state.jobs.filter(job => (
+        job.workspace ? job.workspace !== name : !lockedActiveWorkspace
+      ))
+      return {
+        workspaces: state.workspaces.map(workspace => workspace.name === name ? {
+          ...workspace,
+          unlocked: false,
+          remember_policy: null,
+          unlock_expires_at: null,
+          unlock_idle_expires_at: null,
+        } : workspace),
+        ...(lockedActiveWorkspace && state.accessContext?.remote ? { activeWorkspace: '' } : {}),
+        jobs: remainingJobs,
+        isGenerating: remainingJobs.some(_isActiveGenerationJob),
+        ...(clearPendingPlan ? {
+          pendingH3Plan: null,
+          pendingH3PlanEstimate: null,
+          pendingH3PlanJobId: null,
+          pendingH3PlanWorkspace: null,
+          h3PlanReviewLoading: false,
+          h3PlanReviewError: null,
+        } : {}),
+      }
+    })
+    if (lockedActiveWorkspace) {
+      _directorPipelineLifecycleToken = null
+      _dashboardPipelineLoadToken += 1
+      _dashboardPipelineListLoadToken += 1
+      set({
+        browsingUploads: false,
+        outputs: [],
+        outputsTotal: 0,
+        selectedOutput: 0,
+        selectedOutputMeta: null,
+        selectedOutputKeys: [],
+        gallerySelectionMode: false,
+        pipelineId: null,
+        pipelineStatus: null,
+        pipelinePolling: false,
+        directorLoading: false,
+        dashboardOpen: false,
+        dashboardPipelineList: [],
+        dashboardSelectedPipeline: null,
+        dashboardLoading: false,
+      })
+    }
+    if (!await get().loadWorkspaces()) {
+      throw new Error('Project locked, but its current access state could not be refreshed')
+    }
+    return result
+  },
+  lockAllWorkspaces: async () => {
+    const before = get()
+    const lockedWorkspaces = new Set(before.workspaces
+      .filter(workspace => workspace.password_protected && workspace.unlocked)
+      .map(workspace => workspace.name))
+    const lockedActiveWorkspace = lockedWorkspaces.has(before.activeWorkspace)
+    const clearPendingPlan = before.pendingH3PlanWorkspace != null
+      && lockedWorkspaces.has(before.pendingH3PlanWorkspace)
+    const result = await api.lockAllWorkspaces()
+    for (const workspace of lockedWorkspaces) hidePrivatePreviewsForWorkspace(workspace)
+    if (lockedActiveWorkspace) {
+      _directorPipelineLifecycleToken = null
+      _dashboardPipelineLoadToken += 1
+      _dashboardPipelineListLoadToken += 1
+    }
+    if (clearPendingPlan) _h3PlanReviewSequence += 1
+    set(state => {
+      const remainingJobs = state.jobs.filter(job => (
+        job.workspace
+          ? !lockedWorkspaces.has(job.workspace)
+          : !lockedActiveWorkspace
+      ))
+      return {
+        workspaces: state.workspaces.map(workspace => lockedWorkspaces.has(workspace.name) ? {
+          ...workspace,
+          unlocked: false,
+          remember_policy: null,
+          unlock_expires_at: null,
+          unlock_idle_expires_at: null,
+        } : workspace),
+        ...(lockedActiveWorkspace && state.accessContext?.remote ? { activeWorkspace: '' } : {}),
+        ...(lockedActiveWorkspace ? {
+          browsingUploads: false,
+          outputs: [],
+          outputsTotal: 0,
+          selectedOutput: 0,
+          selectedOutputMeta: null,
+          selectedOutputKeys: [],
+          gallerySelectionMode: false,
+          pipelineId: null,
+          pipelineStatus: null,
+          pipelinePolling: false,
+          directorLoading: false,
+          dashboardOpen: false,
+          dashboardPipelineList: [],
+          dashboardSelectedPipeline: null,
+          dashboardLoading: false,
+        } : {}),
+        jobs: remainingJobs,
+        isGenerating: remainingJobs.some(_isActiveGenerationJob),
+        ...(clearPendingPlan ? {
+          pendingH3Plan: null,
+          pendingH3PlanEstimate: null,
+          pendingH3PlanJobId: null,
+          pendingH3PlanWorkspace: null,
+          h3PlanReviewLoading: false,
+          h3PlanReviewError: null,
+        } : {}),
+      }
+    })
+    if (!await get().loadWorkspaces()) {
+      throw new Error('Projects locked, but their current access state could not be refreshed')
+    }
+    return result
   },
   deleteWorkspace: async (name) => {
     // The server refuses 'default', refuses while anything generates, and
@@ -9234,6 +9672,7 @@ export const useStore = create<AppState>((set, get) => ({
       _dashboardPipelineListLoadToken += 1
     }
     const result = await api.deleteWorkspace(name)
+    hidePrivatePreviewsForWorkspace(name)
     if (result.switched_to_default) {
       set({
         browsingUploads: false,

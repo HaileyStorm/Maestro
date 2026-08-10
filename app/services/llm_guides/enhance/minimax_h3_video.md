@@ -6,14 +6,15 @@ visual style, exact dialogue, and requested silence or music.
 OUTPUT CONTRACT
 - Output only the finished H3 prompt. Do not add markdown, commentary, or an
   "enhanced prompt" heading.
-- With no attached image, begin exactly with these three fields:
+- With no attached image, begin exactly with these four fields:
 
+  subject_definitions: ...
   integrated_multimodal_description: ...
   overall_soundscape: ...
   non_diegetic_music: ...
 
 - With an attached start image, put this exact alignment instruction first,
-  followed by one blank line and the same three fields:
+  followed by one blank line and the same four fields:
 
   For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
 
@@ -23,9 +24,13 @@ OUTPUT CONTRACT
 
   [Shot N] [STARTs-ENDs] shot_name: SHORT NAME | audiovisual_description: VISIBLE ACTION, CAMERA, LIGHT, AND SYNCHRONIZED SOUND | dialogue_and_vocalizations: EXACT <d> BLOCKS AND REQUESTED VOCALIZATIONS, OR none
 
-- Begin with [Shot 1]. Use a single continuous shot by default. Preserve
-  requested cuts and number later shot records sequentially. Never bury a shot
-  boundary in prose such as "At 30 seconds, [Shot 2] begins."
+- Begin with [Shot 1]. Do not use a single continuous shot merely because the
+  request is long: for distinct authored beats, cuts, reactions, locations,
+  actions, or timestamp boundaries, write multiple canonical records with
+  naturally unequal durations. Use one record only when the user explicitly
+  requests one sustained unbroken take or the entire request is one beat.
+  Preserve requested cuts and number later shot records sequentially. Never
+  bury a shot boundary in prose such as "At 30 seconds, [Shot 2] begins."
 - START and END are explicit global seconds. The first START is 0.00 and the
   final END is the supplied Duration. Every record has END greater than START;
   records are strictly ordered, contiguous, disjoint, and have no gaps.
@@ -38,6 +43,26 @@ OUTPUT CONTRACT
   Every timeline record must begin with `[Shot N] [`.
 - Keep every described event inside the supplied Duration. Use present tense
   and develop the audiovisual timeline in chronological order.
+
+GLOBAL ENTITY DEFINITIONS (BASE H3)
+- Define every authored visible entity once in `subject_definitions`, with one
+  stable declaration per entity
+  (person, object, creature, or other reusable entity). Use labels such as
+  `<Subject 1>`, `<Subject 2>`, and so on, one declaration per line. Include the
+  full identity, appearance, wardrobe, and other user-provided qualifiers once
+  in this global section; never invent an entity or qualifier.
+- In shot records, reference the stable `<Subject N>` label or its authored
+  name. Add only shot-specific visibility, pose, position, action, camera,
+  lighting, sound, and a clearly authored appearance change. Never repeat the
+  full definition in every shot. Every defined entity must be referenced by at
+  least one record. If no separately named entity was authored, use the exact
+  declaration `No separately named subjects were authored; shot records carry
+  only the request's explicitly described visible action and setting.`
+- A long duration is not a reason to merge distinct beats into one record. Use
+  one record for an explicit sustained one-take; otherwise give each authored
+  beat or boundary its own record, using unequal inferred durations where the
+  action or dialogue calls for them. Do not invent cuts, events, entities, or
+  timestamps.
 
 HIGHEST PRIORITY REQUEST-FACT LEDGER
 - Before writing, silently make a private request-fact ledger containing every
@@ -71,13 +96,15 @@ LONG-DURATION CONTRACT
   A record boundary does not imply a visual cut; preserve visual continuity
   unless the user authored a cut. Never omit or round the timestamp, and never
   invent a cut, event, or timestamp.
-- Authored-event boundary example — user: `Mara waits by the door with a yellow
+- Authored-event boundary example — user: `Mara (S1) waits by the door with a yellow
   leaf on the floor. At 3.125 seconds, Mara opens the door, revealing a chipped
-  blue cup on the sill. At 9.50 seconds, Theo says "Ready." Duration 12.75
-  seconds.` Canonical records:
+  blue cup on the sill. At 9.50 seconds, Theo (S2) says "Ready." Duration
+  12.75 seconds.` Canonical definitions and records:
+  `subject_definitions: <Subject 1> is Mara (S1).`
+  `<Subject 2> is Theo (S2).`
   `[Shot 1] [0.00s-3.125s] shot_name: Mara waits | audiovisual_description: Mara waits by the door; a yellow leaf lies on the floor. | dialogue_and_vocalizations: none`
   `[Shot 2] [3.125s-9.50s] shot_name: Door opens | audiovisual_description: Mara opens the door, revealing a chipped blue cup on the sill; the yellow leaf remains on the floor. | dialogue_and_vocalizations: none`
-  `[Shot 3] [9.50s-12.75s] shot_name: Theo says Ready | audiovisual_description: The yellow leaf remains on the floor and the chipped blue cup remains on the sill as Theo speaks. | dialogue_and_vocalizations: Theo (S1) says: <d>[English] Ready.</d>`
+  `[Shot 3] [9.50s-12.75s] shot_name: Theo says Ready | audiovisual_description: The yellow leaf remains on the floor and the chipped blue cup remains on the sill as Theo speaks. | dialogue_and_vocalizations: Theo (S2) says: <d>[English] Ready.</d>`
 - For times the user has not authored, treat timestamps as chronological
   narrative anchors, not a metronome. Vary shot and event lengths according
   to action, dialogue, reactions, and visual rhythm. Approximate, irregular
@@ -104,15 +131,15 @@ SOURCE AND CANON FIDELITY - HIGHEST PRIORITY
   film as one exact portrayal. Do not blend adaptations or invent abilities,
   lore, props, costumes, spectacle, or visual effects that the user omitted.
 - If the user says a known character "uses their powers" without naming an
-  ability, choose a restrained, established on-screen ability of that exact
-  portrayal. If uncertain, describe the physical result conservatively.
+  ability, preserve only the requested observable result; do not choose a
+  named ability, effect, or lore detail that the user did not supply.
 - Never turn speed, strength, reflexes, durability, or another physical power
   into a glowing aura, colored energy, energy wave/pulse/blast, telekinesis,
   force field, magic, beam, transformation, or costume change unless the user
   explicitly requested that effect.
-- "Classic attire" is not a usable continuity description. When wardrobe is
-  unspecified, choose one restrained canonical everyday outfit appropriate to
-  the exact portrayal and describe its garments and colors concretely.
+- If wardrobe is unspecified, do not invent garments, colors, accessories, or
+  continuity details. Preserve the supplied appearance and describe the
+  unspecified wardrobe neutrally.
 
 VISUAL TIMELINE
 - Establish the visible subjects, setting, composition, lighting, action, and
@@ -121,8 +148,11 @@ VISUAL TIMELINE
 - When a start image is attached, treat it as the exact 0.00-second frame.
   Preserve its identity, wardrobe, objects, composition, setting, and light,
   then describe how motion develops forward from it.
-- Keep each person's visual descriptor and spatial role stable. Reuse the same
-  descriptor and speaker ID whenever that person appears again.
+- Keep each person's stable Subject label/name, speaker ID, and spatial role
+  consistent. Refer back to the global definition; repeat only shot-specific
+  visibility, pose, action, or an authored appearance change.
+- After the final spoken line, remain silent with their mouths closed unless
+  the user explicitly requests another vocalization.
 - Synchronize physical sounds with their visible causes.
 
 SPEAKERS AND DIALOGUE
@@ -130,8 +160,9 @@ SPEAKERS AND DIALOGUE
   immutable dialogue list. The output is invalid if even one literal line is
   missing from a <d> block.
 - Give every person who speaks a stable ID such as (S1), (S2), or (S3). Put
-  the person's identifying description, speaker ID, action, vocal character,
-  and delivery outside the dialogue tag.
+  the stable Subject label/name, speaker ID, shot-specific action, vocal
+  character, and delivery outside the dialogue tag; do not repeat the full
+  global entity definition.
 - Put only the language tag and literal spoken words inside the dialogue tag:
   <d>[English] Exact words spoken.</d>
 - If the user supplies dialogue, preserve every word and punctuation mark
@@ -206,19 +237,26 @@ For a 10-second request that two coworkers discuss a local creative
 application, write the actual short exchange rather than the words "they
 discuss it":
 
+subject_definitions: <Subject 1> is the younger coworker (S1): relaxed posture, warm conversational voice, blue shirt, seated at the left desk.
+<Subject 2> is the older coworker (S2): rigid posture, clipped intense voice, gray jacket, seated at the right desk.
+
 integrated_multimodal_description:
-[Shot 1] [0.00s-10.00s] shot_name: Desk conversation | audiovisual_description: Live-action workplace comedy; a medium two-shot holds on two coworkers at adjacent desks as the camera slowly pushes in, then they exchange a deadpan look and remain silent with their mouths closed through the final beat. | dialogue_and_vocalizations: The relaxed younger coworker with a warm, conversational voice (S1) turns from his monitor and says: <d>[English] It makes videos and music right on your computer.</d> The rigid older coworker with a clipped, intense voice (S2) leans closer and replies: <d>[English] Good. The cloud is a security weakness.</d>
+[Shot 1] [0.00s-4.50s] shot_name: Desk conversation | audiovisual_description: <Subject 1> (S1) and <Subject 2> (S2) sit at adjacent desks as the camera slowly pushes in. | dialogue_and_vocalizations: <Subject 1> (S1) turns from the monitor and says: <d>[English] It makes videos and music right on your computer.</d>
+[Shot 2] [4.50s-10.00s] shot_name: Deadpan reply | audiovisual_description: <Subject 2> (S2) leans closer, replies, and then both coworkers exchange a deadpan look with closed mouths through the final beat. | dialogue_and_vocalizations: <Subject 2> (S2) says: <d>[English] Good. The cloud is a security weakness.</d>
 
 overall_soundscape: Low office room tone, distant keyboard taps, and a quiet ventilation hum continue beneath the exchange.
 
 non_diegetic_music: N/A
 
-For an 18.20-second quiet action with one requested gasp, an irregular
-two-record timeline can be:
+For an 18.20-second request where Mara pauses at a doorway, gives one soft
+gasp, crosses the room, and closes the door, an irregular two-record timeline
+can be:
+
+subject_definitions: <Subject 1> is Mara.
 
 integrated_multimodal_description:
-[Shot 1] [0.00s-6.125s] shot_name: Doorway pause | audiovisual_description: Mara waits at the doorway while the camera eases closer. | dialogue_and_vocalizations: Mara gives one soft gasp.
-[Shot 2] [6.125s-18.20s] shot_name: Silent crossing | audiovisual_description: Mara crosses the room, closes the door, and remains silent with her mouth closed. | dialogue_and_vocalizations: none
+[Shot 1] [0.00s-6.125s] shot_name: Doorway pause | audiovisual_description: <Subject 1> (Mara) waits at the doorway while the camera eases closer. | dialogue_and_vocalizations: Mara gives one soft gasp while <Subject 1> remains in frame.
+[Shot 2] [6.125s-18.20s] shot_name: Silent crossing | audiovisual_description: <Subject 1> (Mara) crosses the room, closes the door, and remains silent with her mouth closed. | dialogue_and_vocalizations: none
 
 overall_soundscape: Quiet room tone, one synchronized footstep sequence, and the requested gasp.
 

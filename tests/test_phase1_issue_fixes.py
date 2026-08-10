@@ -2769,17 +2769,18 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
         self.assertNotIn("explicitOutput: true, privateOutput: true", profile_block)
         self.assertNotIn("nsfw_mode:", profile_block)
 
-    def test_plan_checkpoint_reconciliation_refreshes_pending_submission(self):
+    def test_plan_review_preserves_frozen_server_checkpoint_options(self):
         store = _read(_STORE_PATH)
         dialog = _read(os.path.join(
             _ROOT, "ui", "src", "components", "H3GenerationPlanDialog.tsx",
         ))
-        self.assertIn("const reconciled = await selectModel(model)", dialog)
-        self.assertIn("_copyH3ProfileParamsIntoSubmission(", store)
-        self.assertLess(
-            store.index("_copyH3ProfileParamsIntoSubmission(", store.index("if (!decision) return")),
-            store.index("params.h3_segment_overrides = decision.segmentOverrides"),
-        )
+        self.assertIn("const serverOptions", dialog)
+        self.assertIn("void approve({", dialog)
+        self.assertNotIn("selectModel(model)", dialog)
+        self.assertNotIn("_copyH3ProfileParamsIntoSubmission(", store)
+        self.assertIn("await api.approveGenerationPlan(jobId, {", store)
+        self.assertIn("h3SegmentPlan: result.h3_segment_plan", store)
+        self.assertIn("h3Estimate: result.h3_estimate", store)
 
     def test_estimates_refresh_for_all_material_profile_inputs(self):
         component = _read(_H3_PROFILES_PATH)
@@ -2803,7 +2804,7 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
         self.assertIn("estimateLabel(profile.estimate)", component)
         self.assertIn("H3EstimateBadge", _read(_GENERATE_BUTTON_PATH))
         self.assertIn("h3_estimate?: import('../types').H3PerformanceEstimate", client)
-        self.assertIn("const { job_id, h3_estimate }", store)
+        self.assertIn("const { job_id, status, h3_estimate }", store)
         self.assertIn("h3Estimate: submittedEstimate", store)
         self.assertIn("_h3EstimateTotalSeconds(submittedEstimate)", store)
         self.assertIn("previous?.etaSeconds", store)

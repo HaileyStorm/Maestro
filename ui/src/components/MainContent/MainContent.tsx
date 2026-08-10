@@ -1,5 +1,5 @@
-import { useRef, useCallback, useState, useEffect, useId, useMemo, type JSX } from 'react'
-import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Upload, Trash2, ListChecks, Eye, EyeOff, FolderInput, Lock, KeyRound, Pause, ArrowUp, ArrowDown } from 'lucide-react'
+import { useRef, useCallback, useState, useEffect, useId, useLayoutEffect, useMemo, type JSX } from 'react'
+import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Upload, Trash2, ListChecks, Eye, EyeOff, FolderInput, Lock, LockOpen, KeyRound, Pause, ArrowUp, ArrowDown } from 'lucide-react'
 import { TabFilter } from './TabFilter'
 import { ThumbnailGallery } from './ThumbnailGallery'
 import { MediaFeedItem } from './MediaFeedItem'
@@ -8,13 +8,121 @@ import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecov
 import { useStore } from '../../stores/useStore'
 import type { GenerationJob } from '../../types'
 import * as api from '../../api/client'
+import {
+  privatePreviewIdentity,
+  privatePreviewWorkspaceHasRevealed,
+  setPrivatePreviewsForWorkspaceRevealed,
+  subscribePrivatePreviewChanges,
+} from '../../lib/privatePreview'
 import { boundedBackoffDelay, POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
 
 const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
+const RESOURCE_WAIT_TITLE = 'This job is durably queued and will start when the generation lane is available.'
+const CPU_RESTART_WARNING = 'CPU text is slower and may be discarded and restarted with acceleration only when that is predicted to deliver sooner.'
+
+type ResourcePresentation = {
+  label: string
+  title: string
+  warning?: string
+  tone: 'accelerated' | 'cpu' | 'transition' | 'neutral'
+}
+
+function describeResourceExecution(
+  descriptor: api.ResourceDescriptor | null | undefined,
+): ResourcePresentation | null {
+  if (!descriptor) return null
+
+  if (descriptor.intent === 'generation') {
+    const label = descriptor.state === 'queued'
+      ? 'GPU generation queued'
+      : descriptor.state === 'admitted'
+        ? 'Starting GPU generation'
+        : descriptor.state === 'blocked'
+          ? 'GPU generation waiting'
+          : descriptor.state === 'released'
+            ? 'Generation resources released'
+            : 'GPU generation'
+    return {
+      label,
+      title: descriptor.state === 'blocked'
+        ? 'Standard GPU generation is waiting for compatible generation resources.'
+        : 'Standard generation uses the GPU generation lane.',
+      tone: descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'accelerated',
+    }
+  }
+
+  if (descriptor.state === 'preemption_requested') {
+    return {
+      label: 'Acceleration restart requested',
+      title: 'Acceleration is predicted to deliver sooner. CPU text will be discarded and restarted from zero; its progress will not carry over.',
+      warning: 'Acceleration is predicted to deliver sooner; CPU progress will be discarded before restart.',
+      tone: 'transition',
+    }
+  }
+  if (descriptor.state === 'resources_releasing') {
+    return {
+      label: 'Releasing CPU resources',
+      title: 'CPU text has stopped and its progress is discarded. Maestro is confirming the resources are released before restarting.',
+      warning: 'CPU progress is discarded; waiting for resources to be fully released.',
+      tone: 'transition',
+    }
+  }
+  if (descriptor.state === 'restarting_on_accelerator') {
+    return {
+      label: 'Restarting with acceleration',
+      title: 'CPU progress was discarded. This text step is restarting from zero with acceleration; ETA remains unknown until measured.',
+      warning: 'Restarting from zero with acceleration; ETA remains unknown until measured.',
+      tone: 'transition',
+    }
+  }
+
+  if (descriptor.execution === 'cpu') {
+    const label = descriptor.state === 'queued'
+      ? 'CPU-only text queued'
+      : descriptor.state === 'admitted'
+        ? 'Starting CPU-only text'
+        : descriptor.state === 'blocked'
+          ? 'CPU text waiting'
+          : descriptor.state === 'released'
+            ? 'CPU resources released'
+            : 'CPU-only text · slower'
+    return {
+      label,
+      title: descriptor.preemptible
+        ? CPU_RESTART_WARNING
+        : 'This text step is using CPU-only execution, which is slower than acceleration.',
+      ...(descriptor.preemptible ? {
+        warning: 'Slower CPU work may be discarded and restarted only when acceleration is predicted to deliver sooner.',
+      } : {}),
+      tone: descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'cpu',
+    }
+  }
+
+  return {
+    label: descriptor.state === 'queued'
+      ? 'Accelerated text queued'
+      : descriptor.state === 'admitted'
+        ? 'Starting accelerated text'
+        : descriptor.state === 'blocked'
+          ? 'Accelerated text waiting'
+          : descriptor.state === 'released'
+            ? 'Text resources released'
+            : 'Accelerated text',
+    title: 'This text step is using accelerated execution.',
+    tone: descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'accelerated',
+  }
+}
+
+function resourcePresentationClass(tone: ResourcePresentation['tone']): string {
+  if (tone === 'cpu') return 'border-amber-300/35 bg-amber-300/10 text-amber-200'
+  if (tone === 'transition') return 'border-violet-300/35 bg-violet-300/10 text-violet-200'
+  if (tone === 'accelerated') return 'border-accent-green/30 bg-accent-green/10 text-accent-green'
+  return 'border-border bg-bg-secondary text-text-secondary'
+}
 
 function compactEta(seconds: number | null | undefined): string {
-  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return 'estimating'
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return 'unknown'
   if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s`
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`
   return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`
@@ -50,6 +158,8 @@ function WorkspaceSelector() {
   const switchWorkspace = useStore(s => s.switchWorkspace)
   const createWorkspace = useStore(s => s.createWorkspace)
   const unlockWorkspace = useStore(s => s.unlockWorkspace)
+  const lockWorkspace = useStore(s => s.lockWorkspace)
+  const lockAllWorkspaces = useStore(s => s.lockAllWorkspaces)
   const deleteWorkspace = useStore(s => s.deleteWorkspace)
   const loadWorkspaces = useStore(s => s.loadWorkspaces)
   const reconnectJobs = useStore(s => s.reconnectJobs)
@@ -62,7 +172,12 @@ function WorkspaceSelector() {
   const [newPassword, setNewPassword] = useState('')
   const [unlockTarget, setUnlockTarget] = useState<string | null>(null)
   const [unlockPassword, setUnlockPassword] = useState('')
+  const [unlockRemember, setUnlockRemember] = useState<api.WorkspaceRememberPolicy>('device')
   const [unlockRecoveryJobId, setUnlockRecoveryJobId] = useState<string | null>(null)
+  const [unlockSelectAfter, setUnlockSelectAfter] = useState(false)
+  const [unlockingTarget, setUnlockingTarget] = useState<string | null>(null)
+  const [lockingTarget, setLockingTarget] = useState<string | null>(null)
+  const [lockingAll, setLockingAll] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
@@ -90,6 +205,9 @@ function WorkspaceSelector() {
     : activeWorkspace
       ? `Current project: ${activeWorkspace}. Open project selector`
       : 'Select or create a project'
+  const unlockedProtectedCount = workspaces.filter(workspace => (
+    workspace.password_protected && workspace.unlocked
+  )).length
 
   const resetPasswordEditor = useCallback(() => {
     setPasswordTarget(null)
@@ -99,6 +217,28 @@ function WorkspaceSelector() {
     setPasswordNotice(null)
     setConfirmRemovePassword(false)
   }, [])
+
+  const resetUnlockEditor = useCallback(() => {
+    setUnlockTarget(null)
+    setUnlockPassword('')
+    setUnlockRemember('device')
+    setUnlockRecoveryJobId(null)
+    setUnlockSelectAfter(false)
+  }, [])
+
+  const beginUnlock = useCallback((
+    workspace: string,
+    recoveryJobId: string | null = null,
+    selectAfter = false,
+  ) => {
+    resetPasswordEditor()
+    setCreating(false)
+    setUnlockTarget(workspace)
+    setUnlockPassword('')
+    setUnlockRemember('device')
+    setUnlockRecoveryJobId(recoveryJobId)
+    setUnlockSelectAfter(selectAfter)
+  }, [resetPasswordEditor])
 
   const handleDelete = async (name: string, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -129,11 +269,12 @@ function WorkspaceSelector() {
         setOpen(false)
         setCreating(false)
         resetPasswordEditor()
+        resetUnlockEditor()
       }
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
-  }, [open, requiredProject, resetPasswordEditor])
+  }, [open, requiredProject, resetPasswordEditor, resetUnlockEditor])
 
   // A new Cloudflare browser has no active project by design.  Put the
   // project gate in front of them immediately instead of leaving Generate
@@ -145,20 +286,45 @@ function WorkspaceSelector() {
   }, [open, requiredProject, workspaces.length])
 
   useEffect(() => {
+    const nowSeconds = Date.now() / 1000
+    const expiries = workspaces.flatMap(workspace => {
+      if (!workspace.password_protected || !workspace.unlocked) return []
+      return [workspace.unlock_expires_at, workspace.unlock_idle_expires_at]
+        .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0)
+    })
+    if (expiries.length === 0) return
+    const nextExpiry = Math.min(...expiries)
+    let cancelled = false
+    let timer = 0
+    const refreshAtExpiry = async () => {
+      const refreshed = await loadWorkspaces()
+      if (!refreshed && !cancelled) {
+        timer = window.setTimeout(() => void refreshAtExpiry(), 5000)
+      }
+    }
+    timer = window.setTimeout(
+      () => void refreshAtExpiry(),
+      nextExpiry <= nowSeconds
+        ? 5000
+        : Math.min(2_147_000_000, Math.max(250, (nextExpiry - nowSeconds) * 1000 + 250)),
+    )
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [loadWorkspaces, workspaces])
+
+  useEffect(() => {
     const requestUnlock = (event: Event) => {
       const detail = (event as CustomEvent<{ workspace?: string; jobId?: string }>).detail
       const workspace = detail?.workspace || ''
       if (!workspace) return
       setOpen(true)
-      setCreating(false)
-      resetPasswordEditor()
-      setUnlockTarget(workspace)
-      setUnlockPassword('')
-      setUnlockRecoveryJobId(detail?.jobId || null)
+      beginUnlock(workspace, detail?.jobId || null, true)
     }
     window.addEventListener(REQUEST_WORKSPACE_UNLOCK_EVENT, requestUnlock)
     return () => window.removeEventListener(REQUEST_WORKSPACE_UNLOCK_EVENT, requestUnlock)
-  }, [resetPasswordEditor])
+  }, [beginUnlock])
 
   useEffect(() => {
     if (!open || !requiredProject) return
@@ -217,22 +383,65 @@ function WorkspaceSelector() {
   }
 
   const handleUnlock = async () => {
-    if (!unlockTarget) return
+    if (!unlockTarget || unlockingTarget || lockingTarget || lockingAll) return
+    const target = unlockTarget
     const password = unlockPassword
+    const remember = unlockRemember
+    const recoveryJobId = unlockRecoveryJobId
+    const selectAfter = unlockSelectAfter || recoveryJobId !== null
     setUnlockPassword('')
     setDeleteError(null)
+    setUnlockingTarget(target)
     try {
-      await unlockWorkspace(unlockTarget, password)
-      const switched = await switchWorkspace(unlockTarget)
-      if (!switched) throw new Error('Could not open this project. Try again.')
+      await unlockWorkspace(target, password, remember)
       await reconnectJobs()
-      if (unlockRecoveryJobId) await resumeJobRecovery(unlockRecoveryJobId)
+      if (selectAfter) {
+        const switched = await switchWorkspace(target)
+        if (!switched) throw new Error('Could not open this project. Try again.')
+      }
+      if (recoveryJobId) {
+        await resumeJobRecovery(recoveryJobId)
+      }
       window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
-      setUnlockTarget(null)
-      setUnlockRecoveryJobId(null)
-      setOpen(false)
+      resetUnlockEditor()
+      if (selectAfter && useStore.getState().activeWorkspace === target) {
+        setOpen(false)
+      }
     } catch (error) {
       setDeleteError(error instanceof Error ? error.message : 'Unlock failed')
+    } finally {
+      setUnlockingTarget(null)
+    }
+  }
+
+  const handleLock = async (name: string, event: React.MouseEvent) => {
+    event.stopPropagation()
+    if (unlockingTarget || lockingTarget || lockingAll) return
+    setLockingTarget(name)
+    setDeleteError(null)
+    try {
+      await lockWorkspace(name)
+      if (unlockTarget === name) resetUnlockEditor()
+      window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : 'Project could not be locked')
+    } finally {
+      setLockingTarget(null)
+    }
+  }
+
+  const handleLockAll = async () => {
+    if (unlockingTarget || lockingAll || lockingTarget) return
+    setLockingAll(true)
+    setDeleteError(null)
+    try {
+      await lockAllWorkspaces()
+      resetUnlockEditor()
+      window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : 'Projects could not be locked')
+    } finally {
+      setLockingAll(false)
     }
   }
 
@@ -245,7 +454,7 @@ function WorkspaceSelector() {
     setPasswordNotice(null)
     setConfirmRemovePassword(false)
     setCreating(false)
-    setUnlockTarget(null)
+    resetUnlockEditor()
   }
 
   const handlePasswordUpdate = async (remove = false) => {
@@ -285,7 +494,18 @@ function WorkspaceSelector() {
   return (
     <div className="relative" ref={dropdownRef}>
       <button
-        onClick={() => setOpen(requiredProject ? true : !open)}
+        onClick={() => {
+          if (requiredProject) {
+            setOpen(true)
+            return
+          }
+          if (open) {
+            setCreating(false)
+            resetPasswordEditor()
+            resetUnlockEditor()
+          }
+          setOpen(!open)
+        }}
         className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors border border-border"
         title={projectTriggerAccessibleLabel}
         aria-label={projectTriggerAccessibleLabel}
@@ -310,9 +530,24 @@ function WorkspaceSelector() {
             : 'fixed left-2 right-2 top-14 z-[70] max-h-[calc(100vh-4rem)] overflow-y-auto rounded-lg border border-border bg-bg-secondary shadow-2xl sm:absolute sm:left-auto sm:right-0 sm:top-full sm:mt-1 sm:w-64 sm:max-h-[min(78vh,620px)]'}
         >
           <div className="px-2 py-1.5 border-b border-border">
-            <span id={projectDialogTitleId} className="text-[10px] text-text-muted uppercase tracking-wider">
-              {requiredProject ? 'Choose a project to enter Maestro' : remote ? 'Projects — unlock with password' : 'Workspaces'}
-            </span>
+            <div className="flex items-center justify-between gap-2">
+              <span id={projectDialogTitleId} className="text-[10px] text-text-muted uppercase tracking-wider">
+                {requiredProject ? 'Choose a project to enter Maestro' : remote ? 'Projects — unlock with password' : 'Workspaces'}
+              </span>
+              {unlockedProtectedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void handleLockAll()}
+                  disabled={unlockingTarget !== null || lockingAll || lockingTarget !== null}
+                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[9px] text-text-muted transition-colors hover:bg-bg-hover hover:text-amber-300 focus-visible:text-amber-300 disabled:cursor-wait disabled:opacity-50"
+                  title={`Lock all ${unlockedProtectedCount} unlocked projects in this browser`}
+                  aria-label={`Lock all ${unlockedProtectedCount} unlocked projects`}
+                >
+                  {lockingAll ? <Loader2 size={10} className="animate-spin" /> : <Lock size={10} />}
+                  Lock all
+                </button>
+              )}
+            </div>
             {requiredProject && (
               <p className="mt-1 text-[10px] leading-relaxed text-text-secondary">
                 Unlock an available project, or create a password-protected project for this browser.
@@ -320,13 +555,21 @@ function WorkspaceSelector() {
             )}
           </div>
           <div className="max-h-[200px] overflow-y-auto">
-            {workspaces.map(ws => (
+            {workspaces.map(ws => {
+              const absoluteExpiry = Number(ws.unlock_expires_at)
+              const idleExpiry = Number(ws.unlock_idle_expires_at)
+              const validExpiries = [absoluteExpiry, idleExpiry].filter(value => Number.isFinite(value) && value > 0)
+              const effectiveExpiry = validExpiries.length > 0 ? Math.min(...validExpiries) : null
+              const unlockedTitle = ws.remember_policy === 'device'
+                ? `Lock ${ws.name}. Remembered on this device${effectiveExpiry ? ` until ${new Date(effectiveExpiry * 1000).toLocaleString()}` : ''}.`
+                : `Lock ${ws.name}. Unlocked for this session${effectiveExpiry ? ` until ${new Date(effectiveExpiry * 1000).toLocaleString()}` : ''}.`
+              return (
               <div key={ws.name} className="flex items-center group hover:bg-bg-hover transition-colors">
                 <button
                   onClick={async () => {
+                    if (lockingAll || lockingTarget) return
                     if (ws.password_protected && !ws.unlocked) {
-                      setUnlockTarget(ws.name)
-                      setUnlockPassword('')
+                      beginUnlock(ws.name, null, true)
                     } else {
                       await switchWorkspace(ws.name)
                       if (useStore.getState().activeWorkspace === ws.name) {
@@ -341,11 +584,40 @@ function WorkspaceSelector() {
                   }`}
                 >
                   <span className="flex min-w-0 items-center gap-1.5 truncate">
-                    {ws.password_protected && <Lock size={10} className={ws.unlocked ? 'text-accent-green' : 'text-amber-400'} />}
                     <span className="truncate">{ws.name}</span>
+                    {ws.password_protected && ws.unlocked && (
+                      <span className="shrink-0 text-[8px] uppercase tracking-wide text-accent-green">
+                        {ws.remember_policy === 'device' ? 'remembered' : 'session'}
+                      </span>
+                    )}
                   </span>
                   {ws.name === activeWorkspace && !browsingUploads && <Check size={12} className="shrink-0" />}
                 </button>
+                {ws.password_protected && (
+                  <button
+                    type="button"
+                    onClick={event => {
+                      event.stopPropagation()
+                      if (ws.unlocked) {
+                        void handleLock(ws.name, event)
+                      } else {
+                        beginUnlock(ws.name)
+                      }
+                    }}
+                    disabled={lockingAll || lockingTarget !== null || unlockingTarget !== null}
+                    className={`shrink-0 rounded px-2 py-2 transition-colors focus-visible:bg-bg-hover ${
+                      ws.unlocked
+                        ? 'text-accent-green hover:text-amber-300 focus-visible:text-amber-300'
+                        : 'text-amber-400 hover:text-accent-blue focus-visible:text-accent-blue'
+                    } disabled:cursor-wait disabled:opacity-50`}
+                    title={ws.unlocked ? unlockedTitle : `Unlock ${ws.name}`}
+                    aria-label={ws.unlocked ? `Lock ${ws.name}` : `Unlock ${ws.name}`}
+                  >
+                    {lockingTarget === ws.name || unlockingTarget === ws.name
+                      ? <Loader2 size={12} className="animate-spin" />
+                      : ws.unlocked ? <LockOpen size={12} /> : <Lock size={12} />}
+                  </button>
+                )}
                 {!remote && (!ws.password_protected || ws.unlocked) && (
                   <button
                     onClick={event => openPasswordEditor(ws, event)}
@@ -381,7 +653,8 @@ function WorkspaceSelector() {
                   </button>
                 )}
               </div>
-            ))}
+              )
+            })}
           </div>
           {!remote && passwordTarget && (
             <div className="border-t border-border p-2 space-y-2">
@@ -487,8 +760,8 @@ function WorkspaceSelector() {
             </div>
           )}
           {unlockTarget && (
-            <div className="border-t border-border p-2">
-              <p className="mb-1.5 text-[10px] text-text-muted">Enter the project password to continue.</p>
+            <div className="border-t border-border p-2 space-y-1.5">
+              <p className="text-[10px] text-text-muted">Enter the project password to unlock <span className="font-medium text-text-secondary">{unlockTarget}</span>.</p>
               <div className="flex gap-1.5">
                 <input
                   type="password"
@@ -496,11 +769,32 @@ function WorkspaceSelector() {
                   onChange={event => setUnlockPassword(event.target.value)}
                   onKeyDown={event => event.key === 'Enter' && void handleUnlock()}
                   placeholder="Project password"
+                  aria-label={`Password for ${unlockTarget}`}
+                  autoComplete="current-password"
                   className="min-w-0 flex-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-primary"
                   autoFocus
                 />
-                <button onClick={() => void handleUnlock()} className="rounded bg-accent-blue px-2 py-1 text-xs text-white">Unlock</button>
+                <button
+                  onClick={() => void handleUnlock()}
+                  disabled={unlockingTarget !== null || lockingTarget !== null || lockingAll}
+                  className="flex items-center gap-1 rounded bg-accent-blue px-2 py-1 text-xs text-white disabled:cursor-wait disabled:opacity-50"
+                >
+                  {unlockingTarget && <Loader2 size={11} className="animate-spin" />}
+                  Unlock
+                </button>
               </div>
+              <label className="flex cursor-pointer items-start gap-1.5 rounded px-1 py-0.5 text-[9px] leading-relaxed text-text-muted hover:bg-bg-hover">
+                <input
+                  type="checkbox"
+                  checked={unlockRemember === 'device'}
+                  onChange={event => setUnlockRemember(event.target.checked ? 'device' : 'session')}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="text-text-secondary">Remember this device</span>
+                  {' '}— uncheck for a shorter session unlock. You can relock this project at any time.
+                </span>
+              </label>
             </div>
           )}
           {deleteError && (
@@ -593,6 +887,7 @@ function JobPlaceholder({
   onDismiss,
   onToggleLog,
   onRecoveryAction,
+  onReviewPlan,
   logOpen = false,
   logEvents = [],
   logError = null,
@@ -602,11 +897,32 @@ function JobPlaceholder({
   onDismiss: () => void
   onToggleLog?: () => void
   onRecoveryAction?: (action: api.QueueRecoveryAction) => void
+  onReviewPlan?: () => void
   logOpen?: boolean
   logEvents?: api.JobLogEvent[]
   logError?: string | null
 }) {
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
+  const ref2vaTermsAccepted = useStore(s => s.hostTerms?.minimax_h3_ref2va.accepted === true)
+  const [reviewNowMs, setReviewNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    if (job.status !== 'waiting_for_plan_approval' || job.planReviewDeadline == null) return
+    const immediate = window.setTimeout(() => setReviewNowMs(Date.now()), 0)
+    const timer = window.setInterval(() => setReviewNowMs(Date.now()), 250)
+    return () => {
+      window.clearTimeout(immediate)
+      window.clearInterval(timer)
+    }
+  }, [job.planReviewDeadline, job.status])
+  const planReviewSeconds = job.planReviewDeadline == null
+    ? null
+    : Math.max(0, job.planReviewDeadline - reviewNowMs / 1000)
+  const planNeedsRef2VATerms = !ref2vaTermsAccepted && (
+    job.h3SegmentPlan?.segments.some(
+      segment => segment.model_type === 'minimax_h3_ref2va',
+    ) === true
+  )
+  const planNeedsModelTerms = job.planReviewTermsRequired === true || planNeedsRef2VATerms
   const hasSteps = job.totalSteps > 0
   const progressPct = hasSteps ? (job.step / job.totalSteps) * 100 : job.progress * 100
   const hasWindows = (job.windowTotal ?? 0) > 1
@@ -623,7 +939,7 @@ function JobPlaceholder({
         : (job.windowProgress ?? progressPct)))
     : progressPct
   const currentProgressIndeterminate = job.progressIndeterminate === true || !hasExactCurrentSteps
-  const queuedH3Runtime = job.status === 'queued' && job.modelType?.startsWith('minimax_h3')
+  const queuedH3Runtime = (job.status === 'queued' || job.status === 'waiting_for_plan_approval') && job.modelType?.startsWith('minimax_h3')
     ? h3QueuedRuntime(job)
     : null
   const phase = stripTimeSuffix(job.phase || job.message)
@@ -647,13 +963,19 @@ function JobPlaceholder({
   const hasLocalEvents = (job.logEvents?.length || 0) > 0
   const canOpenLog = (!job.oomInfo || machineControls) && (hasLocalEvents || api.isBackendJobId(job.id))
   const errorText = job.error || job.message || (job.status === 'cancelled' ? 'Cancelled' : 'Generation failed')
-  const queueWaitLabel = job.status === 'queued' && !recoveryBlocked ? ({
+  const resourcePresentation = describeResourceExecution(job.resourceDescriptor)
+  const resourceWaitTitle = job.queueWaitReason === 'resource_wait' ? RESOURCE_WAIT_TITLE : undefined
+  const queueWaitLabel = job.status !== 'running' && !isFailed && !recoveryBlocked ? ({
     held: 'Held — use Start next or Resume when ready',
     queue_paused: 'Queue paused — use Start next or Resume queue',
     registering: 'Registering with the scheduler',
+    preparing: 'Preparing the generation',
+    waiting_for_plan_approval: 'Generation plan ready for review',
+    waiting_for_plan_terms: 'Waiting for required model terms',
     waiting_for_turn: 'Waiting for earlier queued work',
     waiting_for_active_generation: 'Waiting for another generation on this host',
     waiting_for_other_user: 'Waiting for another generation on this host',
+    resource_wait: 'Waiting for generation resources',
     ready: 'Ready to start',
     running: 'Starting',
   } as const)[job.queueWaitReason || 'registering'] : null
@@ -700,10 +1022,53 @@ function JobPlaceholder({
                       ? 'Generation Interrupted — Recovery Preserved'
                       : recoveryState === 'retrying'
                         ? 'Recovery Queued'
-                        : job.status === 'queued' ? 'Queued...' : 'Generating...'}
+                        : job.status === 'preparing'
+                          ? job.phase === 'planning_generation' ? 'Planning generation' : 'Enhancing prompt'
+                          : job.status === 'waiting_for_plan_approval'
+                            ? 'Plan ready for review'
+                            : job.status === 'queued' ? 'Queued...' : 'Generating...'}
             </p>
             {!isFailed && (queueWaitLabel || phase) && (
-              <p className="text-xs mt-1 truncate">{queueWaitLabel || phase}</p>
+              <p className="text-xs mt-1 truncate" title={resourceWaitTitle}>{queueWaitLabel || phase}</p>
+            )}
+            {!isFailed && resourcePresentation && (
+              <div className="mt-1.5 flex flex-col items-center gap-1" data-resource-state={job.resourceDescriptor?.state}>
+                <span
+                  className={`rounded-full border px-2 py-0.5 text-[9px] font-medium ${resourcePresentationClass(resourcePresentation.tone)}`}
+                  title={resourcePresentation.title}
+                >
+                  {resourcePresentation.label}
+                </span>
+                {resourcePresentation.warning && (
+                  <p className="max-w-sm text-[9px] leading-relaxed text-text-muted">
+                    {resourcePresentation.warning}
+                  </p>
+                )}
+              </div>
+            )}
+            {job.status === 'waiting_for_plan_approval' && (
+              <>
+                {job.h3SegmentPlan && (
+                  <button
+                    type="button"
+                    onClick={onReviewPlan}
+                    className="mt-2 inline-flex items-center gap-1.5 rounded bg-accent-blue px-3 py-1.5 text-xs font-medium text-white hover:brightness-110"
+                  >
+                    <ListChecks size={13} /> Review plan
+                  </button>
+                )}
+                <p className="mt-1 text-[10px] text-amber-200">
+                  {planReviewSeconds == null
+                    ? planNeedsRef2VATerms
+                      ? 'Approval required to accept Ref2VA terms'
+                      : planNeedsModelTerms
+                        ? 'Approval required to accept model terms'
+                        : 'Explicit plan approval required'
+                    : planReviewSeconds > 0
+                      ? `Server auto-accepts its frozen plan in ${Math.ceil(planReviewSeconds)}s`
+                      : 'Server is auto-accepting its frozen plan…'}
+                </p>
+              </>
             )}
             {!isFailed && !recoveryBlocked && (
               <p className="mt-1 text-[10px] text-text-secondary">
@@ -933,7 +1298,7 @@ function JobPlaceholder({
 }
 
 function queueSummaryLabel(summary: api.QueueState['summary']): string {
-  return `${summary.running} running · ${summary.waiting} waiting · ${summary.held} held · ${summary.registering} registering`
+  return `${summary.running} running · ${summary.preparing ?? 0} preparing · ${summary.approval_waiting ?? 0} awaiting review · ${summary.waiting} waiting · ${summary.held} held · ${summary.registering} registering`
 }
 
 function queuePositionLabel(position: number | null, waiting: number): string {
@@ -961,6 +1326,8 @@ function QueuePanel({
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
   const resumeJobRecovery = useStore(s => s.resumeJobRecovery)
   const retryJobRecovery = useStore(s => s.retryJobRecovery)
+  const openH3PlanReview = useStore(s => s.openH3PlanReview)
+  const planReviewError = useStore(s => s.h3PlanReviewError)
   const [error, setError] = useState<string | null>(null)
   const [countDrafts, setCountDrafts] = useState<Record<string, number>>({})
   const [logJobId, setLogJobId] = useState<string | null>(null)
@@ -971,6 +1338,35 @@ function QueuePanel({
     () => new Map((queue?.jobs || []).map(item => [item.job_id, item])),
     [queue],
   )
+  const projectedChildByParent = useMemo(() => {
+    const jobsById = new Map(jobs.map(job => [job.id, job]))
+    const projected = new Map<string, GenerationJob>()
+    const liveStatuses = new Set<GenerationJob['status']>([
+      'preparing', 'waiting_for_plan_approval', 'queued', 'running',
+    ])
+    for (const child of jobs) {
+      if (!child.parentJobId || child.parentJobId === child.id) continue
+      const parent = jobsById.get(child.parentJobId)
+      const childInfo = queueInfo.get(child.id)
+      const descriptor = childInfo?.resource_descriptor ?? child.resourceDescriptor
+      if (!parent || !childInfo || !liveStatuses.has(parent.status) || !liveStatuses.has(child.status)) continue
+      if (childInfo.held || childInfo.hold_after_output || descriptor?.state === 'blocked') continue
+      const recoveryStates = [child.recoveryState, childInfo.recovery_state]
+      if (child.recoveryBlocked || child.recoveryActionable || child.recoveryInterrupted
+        || childInfo.recovery_blocked || childInfo.recovery_actionable || childInfo.recovery_interrupted
+        || recoveryStates.some(state => state === 'interrupted' || state?.startsWith('blocked'))
+        || (child.recoveryActions?.length ?? 0) > 0
+        || (childInfo.recovery_actions?.length ?? 0) > 0) continue
+      projected.set(parent.id, child)
+    }
+    return projected
+  }, [jobs, queueInfo])
+  const visibleJobs = useMemo(() => {
+    const projectedChildIds = new Set(
+      [...projectedChildByParent.values()].map(child => child.id),
+    )
+    return jobs.filter(job => !projectedChildIds.has(job.id))
+  }, [jobs, projectedChildByParent])
 
   const act = async (action: () => Promise<unknown>) => {
     try {
@@ -1039,6 +1435,17 @@ function QueuePanel({
             {queue?.summary && (
               <p className="mt-0.5 text-[10px] text-text-secondary">{queueSummaryLabel(queue.summary)}</p>
             )}
+            <details className="group mt-1.5 max-w-2xl text-[10px] text-text-muted">
+              <summary className="cursor-pointer text-text-secondary hover:text-text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent-blue">
+                How queue priority works
+              </summary>
+              <div className="mt-1.5 space-y-1 rounded-md border border-border bg-bg-primary/40 px-2.5 py-2 leading-relaxed">
+                <p>User-set priority is applied before queue-order and residency choices; work waits until compatible resources are available.</p>
+                <p>Reusing the exact loaded model can reorder otherwise eligible work.</p>
+                <p>A starvation guard can preserve queue order to prevent excessive delay. Recent-service fair share is planned but is not active in this build; each row's live reason is authoritative.</p>
+                <p>Only CPU work explicitly marked preemptible may be discarded and restarted from zero, and only when acceleration is predicted to deliver sooner.</p>
+              </div>
+            </details>
           </div>
           {machineControls && <div className="flex items-center gap-2">
             {queue?.paused ? (
@@ -1052,27 +1459,43 @@ function QueuePanel({
             )}
           </div>}
         </div>
-        {(error || queueError) && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error || queueError}</div>}
+        {(error || queueError || planReviewError) && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error || queueError || planReviewError}</div>}
         <PipelinePlaceholder />
-        {jobs.length === 0 ? (
+        {visibleJobs.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-text-muted">
             {queue?.summary.active_total
               ? `No jobs from this session. ${queue.summary.active_total} active globally.`
               : 'No queued, running, or failed generations.'}
           </div>
-        ) : jobs.map((job, index) => {
-          const info = queueInfo.get(job.id)
+        ) : visibleJobs.map((job, index) => {
+          const projectedChild = projectedChildByParent.get(job.id)
+          const effectiveJob = projectedChild ?? job
+          const schedulerJobId = effectiveJob.id
+          const info = queueInfo.get(schedulerJobId)
+          const effectiveResourceDescriptor = projectedChild
+            ? info?.resource_descriptor ?? effectiveJob.resourceDescriptor
+            : effectiveJob.resourceDescriptor ?? info?.resource_descriptor
           const queueRowLabel = info?.status === 'running'
             ? (info.hold_after_output ? 'Holding after this output' : 'Running')
+            : info?.status === 'preparing'
+              ? 'Preparing generation'
+              : info?.status === 'waiting_for_plan_approval'
+                ? 'Awaiting plan review'
             : info?.held
               ? 'Held'
               : queuePositionLabel(info?.position ?? null, queue?.summary.waiting ?? 0)
           const waitDetail = info?.wait_reason === 'queue_paused'
             ? 'Queue paused'
+            : info?.wait_reason === 'waiting_for_plan_terms'
+              ? 'Waiting for required model terms'
+            : info?.wait_reason === 'resource_wait'
+              ? 'Waiting for generation resources'
             : info?.wait_reason === 'waiting_for_active_generation'
               || info?.wait_reason === 'waiting_for_other_user'
               ? 'Waiting for another generation on this host'
               : null
+          const resourceWaitTitle = info?.wait_reason === 'resource_wait' ? RESOURCE_WAIT_TITLE : undefined
+          const resourcePresentation = describeResourceExecution(effectiveResourceDescriptor)
           const residencyMessage = info?.status === 'running' && (
             info?.queue_reorder_reason === 'resident_base'
             || info?.queue_reorder_reason === 'resident_affinity'
@@ -1083,7 +1506,7 @@ function QueuePanel({
               : null
           return (
             <div key={job.id || `pending-${index}`} className="space-y-1.5">
-              {info && (job.status === 'queued' || job.status === 'running') && (
+              {info && (job.status === 'preparing' || job.status === 'waiting_for_plan_approval' || job.status === 'queued' || job.status === 'running') && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-bg-secondary px-2.5 py-1.5 text-[10px] text-text-muted">
                   {info.recovery_blocked ? (
                     <>
@@ -1094,7 +1517,11 @@ function QueuePanel({
                     </>
                   ) : (
                     <>
-                      <span>{queueRowLabel}{waitDetail ? ` · ${waitDetail}` : ''} · Priority {info.priority} · Outputs {info.produced_outputs}/{info.requested_outputs}</span>
+                      <span title={resourceWaitTitle}>{queueRowLabel}{waitDetail ? ` · ${waitDetail}` : ''} · Priority {info.priority} · Outputs {info.produced_outputs}/{info.requested_outputs}</span>
+                      <span className="text-[9px] text-text-secondary">
+                        ETA {compactEta(info.eta_seconds)}
+                        {info.subtask_eta_seconds != null ? ` · current task ${compactEta(info.subtask_eta_seconds)}` : ''}
+                      </span>
                       {residencyMessage && (
                         <span
                           className="rounded-full border border-accent-green/30 bg-accent-green/10 px-2 py-0.5 text-[9px] text-accent-green"
@@ -1103,35 +1530,44 @@ function QueuePanel({
                           {residencyMessage}
                         </span>
                       )}
+                      {resourcePresentation && (
+                        <span
+                          className={`rounded-full border px-2 py-0.5 text-[9px] ${resourcePresentationClass(resourcePresentation.tone)}`}
+                          title={resourcePresentation.title}
+                          data-resource-state={effectiveResourceDescriptor?.state}
+                        >
+                          {resourcePresentation.label}
+                        </span>
+                      )}
                       <div className="flex flex-wrap items-center gap-1">
                         <span className="text-[9px]">Total</span>
                         <input
                           type="number"
                           min={Math.max(1, info.produced_outputs)}
                           max={25}
-                          value={countDrafts[job.id] ?? info.requested_outputs}
-                          onChange={event => setCountDrafts(values => ({ ...values, [job.id]: Number(event.target.value) }))}
+                          value={countDrafts[schedulerJobId] ?? info.requested_outputs}
+                          onChange={event => setCountDrafts(values => ({ ...values, [schedulerJobId]: Number(event.target.value) }))}
                           className="w-12 rounded border border-border bg-bg-primary px-1 py-0.5 text-center text-[10px] text-text-primary"
                           aria-label="Requested output count"
                         />
-                        <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void act(() => api.setQueueOutputCount(job.id, countDrafts[job.id] ?? info.requested_outputs))}>Set</button>
-                        <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void toggleLog(job)}>Log</button>
-                        {job.status === 'queued' && <>
+                        <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void act(() => api.setQueueOutputCount(schedulerJobId, countDrafts[schedulerJobId] ?? info.requested_outputs))}>Set</button>
+                        <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void toggleLog(effectiveJob)}>Log</button>
+                        {info.status === 'queued' && <>
                           {machineControls && <>
-                            <button className="rounded bg-accent-green/15 px-2 py-0.5 text-accent-green hover:bg-accent-green/25" onClick={() => void act(() => api.startQueueJobNext(job.id))}>
+                            <button className="rounded bg-accent-green/15 px-2 py-0.5 text-accent-green hover:bg-accent-green/25" onClick={() => void act(() => api.startQueueJobNext(schedulerJobId))}>
                               Start next
                             </button>
-                            <button title="Lower priority" className="rounded p-1 hover:bg-bg-hover" onClick={() => void act(() => api.setQueuePriority(job.id, info.priority - 1))}><ArrowDown size={12} /></button>
-                            <button title="Raise priority" className="rounded p-1 hover:bg-bg-hover" onClick={() => void act(() => api.setQueuePriority(job.id, info.priority + 1))}><ArrowUp size={12} /></button>
+                            <button title="Lower priority" className="rounded p-1 hover:bg-bg-hover" onClick={() => void act(() => api.setQueuePriority(schedulerJobId, info.priority - 1))}><ArrowDown size={12} /></button>
+                            <button title="Raise priority" className="rounded p-1 hover:bg-bg-hover" onClick={() => void act(() => api.setQueuePriority(schedulerJobId, info.priority + 1))}><ArrowUp size={12} /></button>
                           </>}
-                          <button className="rounded border border-border px-2 py-0.5 text-text-secondary hover:text-text-primary" onClick={() => void act(() => info.held ? api.resumeQueueJob(job.id) : api.holdQueueJob(job.id))}>
+                          <button className="rounded border border-border px-2 py-0.5 text-text-secondary hover:text-text-primary" onClick={() => void act(() => info.held ? api.resumeQueueJob(schedulerJobId) : api.holdQueueJob(schedulerJobId))}>
                             {info.held ? 'Resume' : 'Hold'}
                           </button>
                         </>}
-                        {job.status === 'running' && (
+                        {info.status === 'running' && (
                           <button
                             className="rounded border border-border px-2 py-0.5 text-text-secondary hover:text-text-primary"
-                            onClick={() => void act(() => info.hold_after_output ? api.resumeQueueJob(job.id) : api.holdQueueJob(job.id))}
+                            onClick={() => void act(() => info.hold_after_output ? api.resumeQueueJob(schedulerJobId) : api.holdQueueJob(schedulerJobId))}
                           >
                             {info.hold_after_output ? 'Cancel hold' : 'Hold after output'}
                           </button>
@@ -1145,11 +1581,12 @@ function QueuePanel({
                 job={job}
                 onStop={() => onStop(job.id)}
                 onDismiss={() => onDismiss(job.id)}
-                onToggleLog={() => void toggleLog(job)}
+                onToggleLog={() => void toggleLog(effectiveJob)}
                 onRecoveryAction={action => recover(job, action)}
-                logOpen={logJobId === job.id}
-                logEvents={logJobId === job.id && job.logEvents?.length ? job.logEvents : logEvents}
-                logError={logJobId === job.id ? logError : null}
+                onReviewPlan={() => void openH3PlanReview(job.id)}
+                logOpen={logJobId === effectiveJob.id}
+                logEvents={logJobId === effectiveJob.id && effectiveJob.logEvents?.length ? effectiveJob.logEvents : logEvents}
+                logError={logJobId === effectiveJob.id ? logError : null}
               />
               {job.status !== 'failed' && job.status !== 'cancelled' && !info && api.isBackendJobId(job.id) && (
                 <button className="ml-2 text-[10px] text-text-muted hover:text-text-primary" onClick={() => void toggleLog(job)}>View job log</button>
@@ -1357,6 +1794,11 @@ export function MainContent() {
   const dismissJob = useStore(s => s.dismissJob)
   const setSelectedOutput = useStore(s => s.setSelectedOutput)
   const activeIndex = useStore(s => s.selectedOutput)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const browsingUploads = useStore(s => s.browsingUploads)
+  const mediaFilter = useStore(s => s.mediaFilter)
+  const outputArtifactScope = useStore(s => s.outputArtifactScope)
+  const outputSearchQuery = useStore(s => s.outputSearchQuery)
   const gallerySelectionMode = useStore(s => s.gallerySelectionMode)
   const setGallerySelectionMode = useStore(s => s.setGallerySelectionMode)
   const openQueueAfterSubmit = useStore(s => s.openQueueAfterSubmit)
@@ -1368,9 +1810,19 @@ export function MainContent() {
   const [queueTabState, setQueueTabState] = useState<api.QueueState | null>(null)
   const [queueTabError, setQueueTabError] = useState<string | null>(null)
   const [accessPollAttempt, setAccessPollAttempt] = useState(0)
+  const [privatePreviewVersion, setPrivatePreviewVersion] = useState(0)
   const queuePollSequence = useRef(0)
   const queuePollAbort = useRef<AbortController | null>(null)
   const seenJobIds = useRef(new Set(jobs.map(job => job.id).filter(Boolean)))
+
+  useEffect(() => subscribePrivatePreviewChanges(() => {
+    setPrivatePreviewVersion(version => version + 1)
+  }), [])
+
+  const anyProjectPrivatePreviewRevealed = useMemo(() => {
+    void privatePreviewVersion
+    return Boolean(activeWorkspace) && privatePreviewWorkspaceHasRevealed(activeWorkspace)
+  }, [activeWorkspace, privatePreviewVersion])
 
   useEffect(() => {
     const openGallery = () => setMainView('gallery')
@@ -1382,7 +1834,7 @@ export function MainContent() {
     const newActiveJob = jobs.some(job => (
       !!job.id
       && !seenJobIds.current.has(job.id)
-      && (job.status === 'queued' || job.status === 'running')
+      && (job.status === 'preparing' || job.status === 'waiting_for_plan_approval' || job.status === 'queued' || job.status === 'running')
     ))
     for (const job of jobs) if (job.id) seenJobIds.current.add(job.id)
     if (newActiveJob && openQueueAfterSubmit) setMainView('queue')
@@ -1422,7 +1874,12 @@ export function MainContent() {
     return () => window.removeEventListener(QUEUE_REFRESH_EVENT, refresh)
   }, [refreshQueue])
 
-  const activeQueueJobs = jobs.filter(job => job.status === 'queued' || job.status === 'running')
+  const activeQueueJobs = jobs.filter(job => (
+    job.status === 'preparing'
+    || job.status === 'waiting_for_plan_approval'
+    || job.status === 'queued'
+    || job.status === 'running'
+  ))
   const queueActiveTotal = queueTabState?.summary.active_total ?? 0
   const queueActivity = activeQueueJobs.length > 0 || queueActiveTotal > 0
 
@@ -1463,6 +1920,10 @@ export function MainContent() {
   const currentJob = activeQueueJobs.find(job => job.status === 'running')
   const queueStateLabel = (queueTabState?.summary.running ?? (currentJob ? 1 : 0)) > 0
     ? (queueTabState?.pause_after_current ? 'running · pause next' : 'running')
+    : (queueTabState?.summary.approval_waiting ?? 0) > 0
+      ? 'review needed'
+      : (queueTabState?.summary.preparing ?? 0) > 0
+        ? 'preparing'
     : queueTabState?.paused
       ? 'paused'
       : (queueTabState?.summary.held ?? 0) > 0
@@ -1476,7 +1937,7 @@ export function MainContent() {
             : 'idle'
   const queueStateColor = (queueTabState?.summary.running ?? (currentJob ? 1 : 0)) > 0
     ? 'bg-accent-green'
-    : queueTabState?.paused || (queueTabState?.summary.held ?? 0) > 0
+    : (queueTabState?.summary.approval_waiting ?? 0) > 0 || queueTabState?.paused || (queueTabState?.summary.held ?? 0) > 0
       ? 'bg-amber-400'
       : jobs.some(job => job.status === 'failed')
         ? 'bg-red-400'
@@ -1490,13 +1951,50 @@ export function MainContent() {
 
   const feedRef = useRef<HTMLDivElement>(null)
   const isUserScrolling = useRef(false)
-  const scrollTargetIndex = useRef<number | null>(null)
+  const scrollTarget = useRef<{ identity: string; listGeneration: number; scopeGeneration: number } | null>(null)
+  const viewportAnchor = useRef<{ identity: string; intraItemOffset: number } | null>(null)
+  const selectedOutputIdentity = useRef<string | null>(null)
+  const galleryScopeKey = JSON.stringify([
+    browsingUploads ? '__uploads__' : activeWorkspace,
+    mediaFilter,
+    outputArtifactScope,
+    outputSearchQuery,
+  ])
+  const outputIdentities = useMemo(() => outputs.map(file => (
+    privatePreviewIdentity(file.workspace, file.name, file.revision)
+  )), [outputs])
+  const outputIdentitySignature = JSON.stringify(outputIdentities)
+  const listFence = useRef({ signature: '', generation: 0 })
+  if (listFence.current.signature !== outputIdentitySignature) {
+    listFence.current = {
+      signature: outputIdentitySignature,
+      generation: listFence.current.generation + 1,
+    }
+  }
+  const listGeneration = listFence.current.generation
+  const scopeFence = useRef({ key: galleryScopeKey, generation: 0 })
+  if (scopeFence.current.key !== galleryScopeKey) {
+    scopeFence.current = { key: galleryScopeKey, generation: scopeFence.current.generation + 1 }
+  }
+  const scopeGeneration = scopeFence.current.generation
+  const currentOutputIdentities = useRef(new Set(outputIdentities))
+  currentOutputIdentities.current = new Set(outputIdentities)
 
   // Virtualization state
   const [scrollTop, setScrollTop] = useState(0)
   const [containerHeight, setContainerHeight] = useState(800)
   const [containerWidth, setContainerWidth] = useState(800)
-  const measuredHeights = useRef<Map<number, number>>(new Map())
+  const lastMeasuredContainerWidth = useRef(0)
+  const measuredHeights = useRef<Map<string, { height: number; epoch: number }>>(new Map())
+  const [measurementEpoch, setMeasurementEpoch] = useState(0)
+  const [measurementVersion, setMeasurementVersion] = useState(0)
+
+  // The feed DOM unmounts for Queue/Chat. Restore its controlled virtual
+  // viewport before paint when returning so the old index window cannot be
+  // rendered against a new element still sitting at scrollTop 0.
+  useLayoutEffect(() => {
+    if (mainView === 'gallery' && feedRef.current) feedRef.current.scrollTop = scrollTop
+  }, [mainView, scrollTop])
 
   // Dynamic estimated item height based on actual container width
   const estimatedItemHeight = Math.round(containerWidth * ASPECT_RATIO) + INFO_BAR_HEIGHT
@@ -1508,26 +2006,36 @@ export function MainContent() {
   useEffect(() => {
     const el = feedRef.current
     if (!el) return
-    let prevWidth = 0
     const ro = new ResizeObserver((entries) => {
       const rect = entries[0].contentRect
       setContainerHeight(rect.height)
       const newWidth = rect.width
       setContainerWidth(newWidth)
-      if (prevWidth && Math.abs(newWidth - prevWidth) > 2) {
+      if (
+        lastMeasuredContainerWidth.current
+        && Math.abs(newWidth - lastMeasuredContainerWidth.current) > 2
+      ) {
         measuredHeights.current.clear()
+        setMeasurementEpoch(epoch => epoch + 1)
       }
-      prevWidth = newWidth
+      lastMeasuredContainerWidth.current = newWidth
     })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [mainView])
 
   const getItemHeight = useCallback((index: number) => {
-    return measuredHeights.current.get(index) ?? estimatedItemHeight
-  }, [estimatedItemHeight])
+    const file = outputs[index]
+    if (!file) return estimatedItemHeight
+    const identity = privatePreviewIdentity(file.workspace, file.name, file.revision)
+    const measurement = measuredHeights.current.get(identity)
+    return measurement?.epoch === measurementEpoch ? measurement.height : estimatedItemHeight
+  }, [estimatedItemHeight, measurementEpoch, outputs])
 
   const { startIndex, endIndex, totalHeight, itemOffsets } = useMemo(() => {
+    // ResizeObserver writes into a ref; reading this version makes each new
+    // measurement participate in the memoized offset calculation.
+    void measurementVersion
     const count = outputs.length
     const offsets: number[] = new Array(count)
     let cumulative = placeholderTotalHeight
@@ -1557,30 +2065,96 @@ export function MainContent() {
       totalHeight: Math.max(total, placeholderTotalHeight),
       itemOffsets: offsets,
     }
-  }, [outputs.length, scrollTop, containerHeight, getItemHeight, placeholderTotalHeight, estimatedItemHeight])
+  }, [outputs.length, scrollTop, containerHeight, getItemHeight, placeholderTotalHeight, estimatedItemHeight, measurementVersion])
 
-  const [, setMeasureEpoch] = useState(0)
-  const handleItemMeasured = useCallback((index: number, height: number) => {
-    const prev = measuredHeights.current.get(index)
-    if (prev !== height) {
-      measuredHeights.current.set(index, height)
-      setMeasureEpoch(e => e + 1)
+  const handleItemMeasured = useCallback((identity: string, epoch: number, height: number) => {
+    if (epoch !== measurementEpoch) return
+    if (!currentOutputIdentities.current.has(identity)) return
+    const previous = measuredHeights.current.get(identity)
+    if (previous?.height !== height || previous.epoch !== epoch) {
+      measuredHeights.current.set(identity, { height, epoch })
+      setMeasurementVersion(version => version + 1)
     }
-  }, [])
+  }, [measurementEpoch])
+
+  const anchoredScope = useRef(galleryScopeKey)
+  useLayoutEffect(() => {
+    const feedEl = feedRef.current
+    if (anchoredScope.current !== galleryScopeKey) {
+      anchoredScope.current = galleryScopeKey
+      scrollTarget.current = null
+      viewportAnchor.current = null
+      selectedOutputIdentity.current = outputIdentities[0] ?? null
+      measuredHeights.current.clear()
+      setMeasurementEpoch(epoch => epoch + 1)
+      setMeasurementVersion(version => version + 1)
+      if (feedEl) {
+        feedEl.scrollTo({ top: 0, behavior: 'auto' })
+        setScrollTop(0)
+      }
+      return
+    }
+
+    const selectedIdentity = selectedOutputIdentity.current
+    if (selectedIdentity) {
+      const selectedIndex = outputIdentities.indexOf(selectedIdentity)
+      if (selectedIndex >= 0 && selectedIndex !== activeIndex) setSelectedOutput(selectedIndex)
+      else if (selectedIndex < 0) {
+        selectedOutputIdentity.current = outputIdentities[Math.min(activeIndex, outputIdentities.length - 1)] ?? null
+      }
+    } else if (outputIdentities.length > 0) {
+      selectedOutputIdentity.current = outputIdentities[Math.min(activeIndex, outputIdentities.length - 1)]
+    }
+
+    const anchor = viewportAnchor.current
+    if (!feedEl || !anchor) return
+    const anchorIndex = outputIdentities.indexOf(anchor.identity)
+    if (anchorIndex < 0) return
+    const anchoredTop = Math.max(0, (itemOffsets[anchorIndex] ?? 0) + anchor.intraItemOffset)
+    if (Math.abs(feedEl.scrollTop - anchoredTop) > 0.5) {
+      feedEl.scrollTop = anchoredTop
+      setScrollTop(anchoredTop)
+    }
+  }, [activeIndex, galleryScopeKey, itemOffsets, measurementVersion, outputIdentities, outputIdentitySignature, setSelectedOutput])
+
+  const captureViewportAnchor = useCallback((nextScrollTop: number) => {
+    if (outputIdentities.length === 0) {
+      viewportAnchor.current = null
+      return
+    }
+    let anchorIndex = 0
+    while (
+      anchorIndex + 1 < outputIdentities.length
+      && (itemOffsets[anchorIndex] + getItemHeight(anchorIndex)) <= nextScrollTop
+    ) anchorIndex++
+    viewportAnchor.current = {
+      identity: outputIdentities[anchorIndex],
+      intraItemOffset: nextScrollTop - itemOffsets[anchorIndex],
+    }
+  }, [getItemHeight, itemOffsets, outputIdentities])
 
   const handleItemVisible = useCallback((index: number) => {
-    if (scrollTargetIndex.current !== null) return
+    if (scrollTarget.current !== null) return
     if (isUserScrolling.current) {
+      selectedOutputIdentity.current = outputIdentities[index] ?? null
       setSelectedOutput(index)
     }
-  }, [setSelectedOutput])
+  }, [outputIdentities, setSelectedOutput])
 
   const handleThumbnailClick = useCallback((index: number) => {
+    const identity = outputIdentities[index]
+    if (!identity) return
+    selectedOutputIdentity.current = identity
+    viewportAnchor.current = { identity, intraItemOffset: 0 }
     setSelectedOutput(index)
-    scrollTargetIndex.current = index
+    const targetAtStart = { identity, listGeneration, scopeGeneration }
+    scrollTarget.current = targetAtStart
     isUserScrolling.current = false
     const feedEl = feedRef.current
-    if (!feedEl) return
+    if (!feedEl) {
+      scrollTarget.current = null
+      return
+    }
 
     // ── Why this is two phases ──
     // The virtualizer only renders items inside [startIndex, endIndex].
@@ -1603,37 +2177,44 @@ export function MainContent() {
     //            target item into the virtualizer's render window so
     //            it actually mounts in the DOM.
     //   Phase 2: requestAnimationFrame wait until the DOM contains an
-    //            element with `data-feed-index="${index}"`, then call
+    //            element with the target's full output identity, then call
     //            scrollIntoView on it for pixel-precise alignment.
     //            By the time the element exists, its height has been
     //            measured, so this final align is accurate.
-    //   Guard:   scrollTargetIndex.current is held until phase 2
+    //   Guard:   scrollTarget.current is held until phase 2
     //            finishes (not a fixed timeout). handleItemVisible
     //            ignores intersection events while this is non-null,
     //            so no wrong-active leak through.
-    //   Re-entrancy: a stale align loop checks scrollTargetIndex
+    //   Re-entrancy: a stale align loop checks scrollTarget
     //            against its captured target on every frame and bails
     //            if a newer click overrode it.
 
-    const estimatedOffset = placeholderTotalHeight +
-      Array.from({ length: index }, (_, i) => getItemHeight(i) + GAP).reduce((a, b) => a + b, 0)
+    const estimatedOffset = itemOffsets[index] ?? placeholderTotalHeight
     feedEl.scrollTo({ top: estimatedOffset, behavior: 'auto' })
 
-    const targetIndexAtStart = index
     let attempts = 0
     const MAX_ATTEMPTS = 30 // ~500ms at 60fps
     const align = () => {
-      // Newer click overrode our target — bail.
-      if (scrollTargetIndex.current !== targetIndexAtStart) return
+      // Newer selection, scope, or list generation overrode this target.
+      if (scrollTarget.current !== targetAtStart) return
+      if (
+        scopeFence.current.generation !== targetAtStart.scopeGeneration
+        || listFence.current.generation !== targetAtStart.listGeneration
+      ) {
+        scrollTarget.current = null
+        return
+      }
       attempts++
-      const targetEl = feedEl.querySelector(`[data-feed-index="${index}"]`) as HTMLElement | null
+      const targetEl = feedEl.querySelector(
+        `[data-feed-identity="${encodeURIComponent(targetAtStart.identity)}"]`,
+      ) as HTMLElement | null
       if (targetEl) {
         targetEl.scrollIntoView({ behavior: 'auto', block: 'start' })
         // One more frame so any post-mount measurement settles
         // before we release the guard.
         requestAnimationFrame(() => {
-          if (scrollTargetIndex.current === targetIndexAtStart) {
-            scrollTargetIndex.current = null
+          if (scrollTarget.current === targetAtStart) {
+            scrollTarget.current = null
           }
         })
       } else if (attempts < MAX_ATTEMPTS) {
@@ -1642,13 +2223,15 @@ export function MainContent() {
         // Item didn't mount within the budget — release the guard so
         // the user isn't stuck. Rare; happens if outputs.length changed
         // mid-flight or the index is out of range.
-        if (scrollTargetIndex.current === targetIndexAtStart) {
-          scrollTargetIndex.current = null
+        if (scrollTarget.current === targetAtStart) {
+          scrollTarget.current = null
         }
       }
     }
-    requestAnimationFrame(align)
-  }, [setSelectedOutput, getItemHeight, placeholderTotalHeight])
+    // The first frame mounts the estimated window; the second aligns only if
+    // the exact list and scope generations are still current.
+    requestAnimationFrame(() => requestAnimationFrame(align))
+  }, [itemOffsets, listGeneration, outputIdentities, placeholderTotalHeight, scopeGeneration, setSelectedOutput])
 
   // Infinite scroll: load more when near the bottom
   const loadingMore = useRef(false)
@@ -1656,7 +2239,8 @@ export function MainContent() {
     const el = feedRef.current
     if (!el) return
     setScrollTop(el.scrollTop)
-    if (scrollTargetIndex.current === null) {
+    captureViewportAnchor(el.scrollTop)
+    if (scrollTarget.current === null) {
       isUserScrolling.current = true
     }
     // Trigger load-more when within 2 screens of the bottom
@@ -1668,24 +2252,35 @@ export function MainContent() {
         store.loadMoreOutputs().finally(() => { loadingMore.current = false })
       }
     }
-  }, [])
+  }, [captureViewportAnchor])
 
   useEffect(() => {
-    measuredHeights.current.clear()
-  }, [outputs.length])
+    const visibleIdentities = new Set(outputs.map(file => (
+      privatePreviewIdentity(file.workspace, file.name, file.revision)
+    )))
+    let pruned = false
+    for (const identity of measuredHeights.current.keys()) {
+      if (visibleIdentities.has(identity)) continue
+      measuredHeights.current.delete(identity)
+      pruned = true
+    }
+    if (pruned) setMeasurementVersion(version => version + 1)
+  }, [outputs])
 
   const visibleItems = useMemo(() => {
     const items: JSX.Element[] = []
     for (let i = startIndex; i < endIndex; i++) {
       const file = outputs[i]
       if (!file) continue
+      const identity = privatePreviewIdentity(file.workspace, file.name, file.revision)
       items.push(
         <MediaFeedItem
-          key={`${file.workspace}:${file.name}:${file.revision}`}
+          key={identity}
           file={file}
           index={i}
           isActive={activeIndex === i}
           onVisible={handleItemVisible}
+          measurementEpoch={measurementEpoch}
           onMeasured={handleItemMeasured}
           style={{
             position: 'absolute',
@@ -1697,7 +2292,7 @@ export function MainContent() {
       )
     }
     return items
-  }, [startIndex, endIndex, outputs, activeIndex, handleItemVisible, handleItemMeasured, itemOffsets])
+  }, [startIndex, endIndex, outputs, activeIndex, handleItemVisible, measurementEpoch, handleItemMeasured, itemOffsets])
 
   return (
     <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden">
@@ -1746,6 +2341,26 @@ export function MainContent() {
               {accessContext.share_url ? (shareCopied ? '✓ Cloudflare link copied' : 'Cloudflare · Copy link') : 'Cloudflare · starting…'}
             </button>
           )}
+          {mainView === 'gallery' && activeWorkspace && !browsingUploads && <>
+            <span id="private-preview-session-note" className="hidden text-[9px] text-text-muted xl:inline">
+              Browser-session preview only; project access unchanged.
+            </span>
+            <button
+              type="button"
+              aria-pressed={anyProjectPrivatePreviewRevealed}
+              aria-describedby="private-preview-session-note"
+              aria-label={`${anyProjectPrivatePreviewRevealed ? 'Blur' : 'Reveal'} all private previews for project ${activeWorkspace}`}
+              onClick={() => setPrivatePreviewsForWorkspaceRevealed(
+                activeWorkspace,
+                !anyProjectPrivatePreviewRevealed,
+              )}
+              title={`${anyProjectPrivatePreviewRevealed ? 'Blur' : 'Reveal'} all private previews for this project in this browser session; project access is unchanged`}
+              className="flex items-center gap-1 rounded-md border border-violet-500/40 px-2 py-1 text-[10px] text-violet-200 transition-colors hover:bg-violet-500/10"
+            >
+              {anyProjectPrivatePreviewRevealed ? <EyeOff size={12} /> : <Eye size={12} />}
+              {anyProjectPrivatePreviewRevealed ? 'Blur all' : 'Reveal all'}
+            </button>
+          </>}
           {mainView === 'gallery' && <button
             type="button"
             onClick={() => setGallerySelectionMode(!gallerySelectionMode)}

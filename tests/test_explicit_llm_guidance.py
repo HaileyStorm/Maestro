@@ -376,6 +376,10 @@ class EnhancerPropagationTests(unittest.TestCase):
                 self.detail = detail
 
         class FakeRequest:
+            state = types.SimpleNamespace(
+                maestro_generation_preparation=False,
+            )
+
             async def json(self):
                 return {
                     "prompt": "synthetic explicit request",

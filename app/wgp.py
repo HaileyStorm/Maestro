@@ -1,4 +1,5 @@
 import os, sys
+import hashlib
 os.environ["GRADIO_LANG"] = "en"
 # # os.environ.pop("TORCH_LOGS", None)  # make sure no env var is suppressing/overriding
 # os.environ["TORCH_LOGS"]= "recompiles"
@@ -90,6 +91,10 @@ from services.job_lifecycle import (
     invalidate_residency_state,
     make_residency_key,
     note_residency_state,
+)
+from services.model_terms import (
+    PORNMASTER_V4_PONPOKE_RECIPE,
+    require_model_terms,
 )
 
 # import torch._dynamo as dynamo
@@ -264,6 +269,263 @@ def clear_gen_cache():
         del offload.shared_state["_cache"]
 
 
+_GIB = 1024 ** 3
+# A live Base FL2VA cold/profile load peaked at approximately 56 GiB RSS on
+# this host while its registered checkpoint stack is 39.54 GiB.  Round that
+# observed non-checkpoint cost up to 17 GiB, then retain a separate transient
+# reserve.  Additive headroom tracks the actual files being loaded; the former
+# profile multiplier exaggerated PinkCherry's 61.67 GiB stack to 107.8 GiB
+# even though its larger transformer does not multiply runtime overhead.
+_H3_CALIBRATED_RUNTIME_OVERHEAD_BYTES = 17 * _GIB
+_H3_LOAD_TRANSIENT_RESERVE_BYTES = 6 * _GIB
+_H3_MEMORY_RECLAIM_WAIT_SECONDS = 8.0
+_H3_MEMORY_RECLAIM_POLL_INITIAL_SECONDS = 0.10
+_H3_MEMORY_RECLAIM_POLL_MAX_SECONDS = 0.50
+
+
+class HostMemoryAdmissionError(RuntimeError):
+    """Content-free failure raised before a model can exhaust host RAM."""
+
+    stage = "model_load"
+    code = "insufficient_host_memory"
+
+
+def _host_memory_snapshot():
+    """Return MemAvailable/total bytes without retaining process content."""
+    if sys.platform.startswith("linux"):
+        values = {}
+        try:
+            with open("/proc/meminfo", "r", encoding="ascii") as handle:
+                for line in handle:
+                    key, _, raw = line.partition(":")
+                    if key not in {"MemAvailable", "MemTotal"}:
+                        continue
+                    values[key] = int(raw.strip().split()[0]) * 1024
+                    if len(values) == 2:
+                        break
+            if "MemAvailable" in values and "MemTotal" in values:
+                return values["MemAvailable"], values["MemTotal"]
+        except (OSError, ValueError, IndexError):
+            pass
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        return int(memory.available), int(memory.total)
+    except Exception:
+        return None, None
+
+
+def _load_resource_status(stage, started_at):
+    """Build one bounded, content-free model-load heartbeat payload."""
+    elapsed = max(0, int(time.monotonic() - started_at))
+    available, total = _host_memory_snapshot()
+    payload = {
+        "message": str(stage),
+        "phase": str(stage),
+        "elapsed_seconds": elapsed,
+    }
+    details = [f"{elapsed}s"]
+    if available is not None and total is not None:
+        payload.update({
+            "host_ram_available_bytes": available,
+            "host_ram_total_bytes": total,
+        })
+        details.append(f"host RAM {available / _GIB:.1f} GiB available")
+    try:
+        if torch.cuda.is_available():
+            free_vram, total_vram = torch.cuda.mem_get_info()
+            payload.update({
+                "vram_available_bytes": int(free_vram),
+                "vram_total_bytes": int(total_vram),
+            })
+            details.append(f"VRAM {free_vram / _GIB:.1f} GiB available")
+    except Exception:
+        pass
+    payload["message"] = f"{stage} · " + " · ".join(details)
+    return payload
+
+
+class _ModelLoadStatusReporter:
+    """Token-scoped heartbeat for blocking checkpoint/profile operations."""
+
+    def __init__(
+        self,
+        callback,
+        *,
+        cancel_callback=None,
+        interval_seconds=2.0,
+    ):
+        self._callback = callback if callable(callback) else None
+        self._cancel_callback = (
+            cancel_callback if callable(cancel_callback) else lambda: False
+        )
+        self._interval_seconds = max(0.05, float(interval_seconds))
+        self._stop = threading.Event()
+        self._token = object()
+        self._active_token = self._token
+        self._stage = "Preparing model runtime"
+        self._stage_started_at = time.monotonic()
+        self._thread = None
+        self._cancelled = False
+
+    def _is_cancelled(self):
+        try:
+            return bool(self._cancel_callback())
+        except Exception:
+            return False
+
+    def _emit(self, token):
+        if (
+            self._callback is None
+            or self._stop.is_set()
+            or self._active_token is not token
+        ):
+            return
+        if self._is_cancelled():
+            self._cancelled = True
+            self._stop.set()
+            return
+        try:
+            self._callback(
+                _load_resource_status(self._stage, self._stage_started_at)
+            )
+        except Exception:
+            # Status reporting must never turn a viable model load into a
+            # failure. The generation error path remains authoritative.
+            pass
+
+    def start(self, stage):
+        if self._callback is None:
+            return
+        self.transition(stage)
+        token = self._token
+
+        def heartbeat():
+            while not self._stop.wait(self._interval_seconds):
+                self._emit(token)
+
+        self._thread = threading.Thread(
+            target=heartbeat,
+            name="maestro-model-load-status",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def transition(self, stage):
+        self.check_cancelled()
+        self._stage = str(stage)
+        self._stage_started_at = time.monotonic()
+        self._emit(self._token)
+
+    def check_cancelled(self):
+        if self._cancelled or self._is_cancelled():
+            self._cancelled = True
+            raise InterruptedError("Model preparation was cancelled")
+
+    def close(self):
+        self._active_token = None
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.25, self._interval_seconds * 2))
+        self._thread = None
+
+
+def _h3_checkpoint_bytes(paths):
+    total = 0
+    seen = set()
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            continue
+        try:
+            resolved = os.path.realpath(path)
+            if resolved in seen or not os.path.isfile(resolved):
+                continue
+            seen.add(resolved)
+            total += os.path.getsize(resolved)
+        except OSError:
+            continue
+    return total
+
+
+def _h3_required_host_memory_bytes(checkpoint_bytes):
+    return int(
+        checkpoint_bytes
+        + _H3_CALIBRATED_RUNTIME_OVERHEAD_BYTES
+        + _H3_LOAD_TRANSIENT_RESERVE_BYTES
+    )
+
+
+def _require_h3_host_memory(
+    paths,
+    profile,
+    *,
+    status_callback=None,
+    cancel_callback=None,
+):
+    """Admit an H3 cold load after bounded post-eviction RAM reclamation."""
+    available, _ = _host_memory_snapshot()
+    if available is None:
+        return None
+    checkpoint_bytes = _h3_checkpoint_bytes(paths)
+    if checkpoint_bytes <= 0:
+        # Missing files are reported by the loader itself. Do not invent an
+        # inaccurate memory result when there is no local evidence to size.
+        return None
+    required = _h3_required_host_memory_bytes(checkpoint_bytes)
+    started_at = time.monotonic()
+    deadline = started_at + _H3_MEMORY_RECLAIM_WAIT_SECONDS
+    poll_seconds = _H3_MEMORY_RECLAIM_POLL_INITIAL_SECONDS
+    waited_for_reclamation = False
+
+    def check_cancelled():
+        if not callable(cancel_callback):
+            return
+        try:
+            cancelled = bool(cancel_callback())
+        except Exception:
+            cancelled = False
+        if cancelled:
+            raise InterruptedError("Model preparation was cancelled")
+
+    while available < required and time.monotonic() < deadline:
+        waited_for_reclamation = True
+        check_cancelled()
+        if callable(status_callback):
+            try:
+                status_callback(
+                    _load_resource_status(
+                        "Waiting for host memory reclamation", started_at,
+                    )
+                )
+            except Exception:
+                pass
+        remaining = max(0.0, deadline - time.monotonic())
+        time.sleep(min(poll_seconds, remaining))
+        check_cancelled()
+        available, _ = _host_memory_snapshot()
+        if available is None:
+            return None
+        poll_seconds = min(
+            _H3_MEMORY_RECLAIM_POLL_MAX_SECONDS,
+            poll_seconds * 1.5,
+        )
+
+    if available < required:
+        raise HostMemoryAdmissionError(
+            "MiniMax H3 was not loaded because host memory is too low "
+            f"({available / _GIB:.1f} GiB available; "
+            f"{required / _GIB:.1f} GiB required). "
+            "Close other memory-heavy local work, then retry."
+        )
+    return {
+        "available_bytes": available,
+        "required_bytes": required,
+        "checkpoint_bytes": checkpoint_bytes,
+        "profile": int(profile),
+        "waited_for_reclamation": waited_for_reclamation,
+    }
+
+
 def _invalidate_loaded_model_state():
     """Invalidate WGP and scheduler identity before fallible load/release work."""
     global reload_needed, _loaded_model_configuration
@@ -273,7 +535,6 @@ def _invalidate_loaded_model_state():
     _loaded_residency_base_key = None
     _loaded_residency_affinity_key = None
     invalidate_residency_state()
-
 
 
 def release_model():
@@ -301,6 +562,19 @@ def release_model():
     except Exception as error:
         release_error = error
     finally:
+        # MMGP owns hooks and transfer streams, while the wrapper owns the
+        # component graph. Drop them in that order. H3's explicit release
+        # severs every heavyweight component before the host allocator is
+        # flushed; previously the sole flush ran while the wrapper still held
+        # tens of GiB of shared/pinned tensors.
+        if owned_wan_model is not None and hasattr(owned_wan_model, "release"):
+            try:
+                owned_wan_model.release()
+            except Exception as error:
+                if release_error is None:
+                    release_error = error
+        owned_wan_model = None
+        owned_offloadobj = None
         # Delivery postprocessing depends on allocator cleanup even when a
         # backend-specific release hook fails. Identity and ownership were
         # already invalidated above, so no stale H3 object remains reusable.
@@ -3723,6 +3997,346 @@ def get_local_model_filename(model_filename, use_locator = True, extra_paths = N
                 if filename is not None: return filename
         local_model_filename = fl.locate_file(local_model_filename, error_if_none= False )
     return local_model_filename
+
+
+_MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS = {
+    PORNMASTER_V4_PONPOKE_RECIPE: {
+        "filename": "pornmasterFlux2Klein_v4TurboFp8.safetensors",
+        "size_bytes": 9433104872,
+        "sha256": (
+            "e90eeb50140a10806341b7521c340214c6f76cec2f8f8dae7a443c5806072df7"
+        ),
+    },
+    "krea2_moody_mix_v7_fp8": {
+        "architecture": "krea2_raw",
+        "provider": "civitai",
+        "model_id": 2731187,
+        "version_id": 3209007,
+        "file_id": 3090691,
+        "filename": "moodyKrea2Mix_v70.safetensors",
+        "download_url": (
+            "https://civitai.com/api/download/models/3209007"
+            "?type=Diffusion%20Model&format=SafeTensor&fp=fp8"
+        ),
+        "size_bytes": 14125457032,
+        "sha256": (
+            "405db6a1d060075d176c3578063b6fa2feb07b58bb61ddb403ddba0669a35a6d"
+        ),
+    },
+    "krea2_moody_cutie_v4_fp8": {
+        "architecture": "krea2_raw",
+        "provider": "civitai",
+        "model_id": 2764429,
+        "version_id": 3211049,
+        "file_id": 3092831,
+        "filename": "moodyCutieMixKrea2_v40.safetensors",
+        "download_url": (
+            "https://civitai.com/api/download/models/3211049"
+            "?type=Diffusion%20Model&format=SafeTensor&fp=fp8"
+        ),
+        "size_bytes": 14125457032,
+        "sha256": (
+            "6c54d783aaaab1a6924fafcfa3afa9f36abe72a59723d424e932484a8c98316a"
+        ),
+    },
+}
+_MANUAL_CHECKPOINT_VERIFICATION_CACHE = {}
+_MANUAL_CHECKPOINT_VERIFICATION_LOCK = threading.RLock()
+
+
+def _manual_checkpoint_cache_key(spec):
+    return (
+        spec["filename"],
+        spec["size_bytes"],
+        spec["sha256"],
+    )
+
+
+def _checkpoint_stat_identity(stat_result):
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+    )
+
+
+def _manual_checkpoint_integrity_spec(model_type, model_def, model_defs=None):
+    """Return one server-bound manual-checkpoint contract or fail closed."""
+    definitions = model_defs if isinstance(model_defs, dict) else {}
+    selected_model_type = model_type
+    candidate_model_type = model_type
+    candidate_def = model_def
+    seen = set()
+    while True:
+        if candidate_model_type in seen or len(seen) > 10:
+            raise RuntimeError(
+                f"Manual checkpoint integrity contract is invalid for '{selected_model_type}'."
+            )
+        seen.add(candidate_model_type)
+        contract = _MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS.get(
+            candidate_model_type,
+        )
+        if not isinstance(candidate_def, dict):
+            if contract is not None:
+                raise RuntimeError(
+                    f"Manual checkpoint integrity contract is invalid for '{selected_model_type}'."
+                )
+            return None
+        provenance = candidate_def.get("artifact_provenance")
+        checkpoint = (
+            provenance.get("checkpoint")
+            if isinstance(provenance, dict) else None
+        )
+        if contract is not None:
+            break
+        if (
+            isinstance(checkpoint, dict)
+            and checkpoint.get("download_policy") == "manual_hash_verified_only"
+        ):
+            raise RuntimeError(
+                f"Manual checkpoint integrity contract is not registered for '{selected_model_type}'."
+            )
+        related = candidate_def.get("URLs")
+        if isinstance(related, str) and related in definitions:
+            candidate_model_type = related
+            candidate_def = definitions[related]
+            continue
+        if (
+            isinstance(related, str)
+            and related in _MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS
+        ):
+            raise RuntimeError(
+                f"Manual checkpoint integrity contract is invalid for '{selected_model_type}'."
+            )
+        return None
+
+    provenance = candidate_def.get("artifact_provenance")
+    checkpoint = (
+        provenance.get("checkpoint")
+        if isinstance(provenance, dict) else None
+    )
+    urls = candidate_def.get("URLs")
+    filename = checkpoint.get("filename") if isinstance(checkpoint, dict) else None
+    expected_size = checkpoint.get("size_bytes") if isinstance(checkpoint, dict) else None
+    expected_sha256 = checkpoint.get("sha256") if isinstance(checkpoint, dict) else None
+    bound_metadata_matches = isinstance(checkpoint, dict) and all(
+        field not in contract
+        or (
+            type(checkpoint.get(field)) is type(contract[field])
+            and checkpoint.get(field) == contract[field]
+        )
+        for field in (
+            "provider",
+            "model_id",
+            "version_id",
+            "file_id",
+            "download_url",
+        )
+    )
+    valid = (
+        isinstance(candidate_def, dict)
+        and isinstance(checkpoint, dict)
+        and (
+            "architecture" not in contract
+            or candidate_def.get("architecture") == contract["architecture"]
+        )
+        and bound_metadata_matches
+        and checkpoint.get("download_policy") == "manual_hash_verified_only"
+        and isinstance(urls, list)
+        and len(urls) == 1
+        and isinstance(urls[0], str)
+        and urls[0] == filename
+        and filename == contract["filename"]
+        and expected_size == contract["size_bytes"]
+        and isinstance(expected_sha256, str)
+        and expected_sha256.lower() == contract["sha256"]
+        and checkpoint.get("loader_auto_download") is False
+    )
+    if not valid:
+        raise RuntimeError(
+            f"Manual checkpoint integrity contract is invalid for '{selected_model_type}'."
+        )
+    return dict(contract)
+
+
+def _verified_local_checkpoint_record(
+    local_path,
+    *,
+    model_type,
+    expected_size,
+    expected_sha256,
+):
+    """Stream-check one already-resolved local checkpoint without side effects."""
+    digest = hashlib.sha256()
+    try:
+        with open(local_path, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if before.st_size != expected_size:
+                raise RuntimeError(
+                    f"Manual checkpoint integrity check failed for '{model_type}'."
+                )
+            while True:
+                chunk = handle.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(
+            f"Manual checkpoint integrity check failed for '{model_type}'."
+        ) from exc
+
+    before_identity = _checkpoint_stat_identity(before)
+    after_identity = _checkpoint_stat_identity(after)
+    stable_identity = before_identity == after_identity
+    if (
+        not stable_identity
+        or after.st_size != expected_size
+        or digest.hexdigest() != expected_sha256
+    ):
+        raise RuntimeError(
+            f"Manual checkpoint integrity check failed for '{model_type}'."
+        )
+    return {
+        "path": local_path,
+        "identity": after_identity,
+    }
+
+
+def _verify_local_checkpoint_integrity(
+    local_path,
+    *,
+    model_type,
+    expected_size,
+    expected_sha256,
+):
+    """Compatibility projection returning the verified local path."""
+    return _verified_local_checkpoint_record(
+        local_path,
+        model_type=model_type,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+    )["path"]
+
+
+def _require_manual_checkpoint_integrity(model_type, model_def, model_defs=None):
+    """Stream-check an exact manual artifact before downloads or model work."""
+    spec = _manual_checkpoint_integrity_spec(
+        model_type,
+        model_def,
+        model_defs,
+    )
+    if spec is None:
+        return None
+    cache_key = _manual_checkpoint_cache_key(spec)
+    with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
+        _MANUAL_CHECKPOINT_VERIFICATION_CACHE.pop(cache_key, None)
+    local_path = get_local_model_filename(spec["filename"])
+    if not isinstance(local_path, str) or not os.path.isfile(local_path):
+        raise RuntimeError(
+            f"Manual checkpoint for '{model_type}' is missing or unavailable."
+        )
+
+    record = _verified_local_checkpoint_record(
+        local_path,
+        model_type=model_type,
+        expected_size=spec["size_bytes"],
+        expected_sha256=spec["sha256"],
+    )
+    with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
+        _MANUAL_CHECKPOINT_VERIFICATION_CACHE[cache_key] = record
+    return record["path"]
+
+
+def verify_manual_checkpoint_integrity(model_type, model_def, model_defs=None):
+    """Explicitly hash one registered local artifact and cache readiness."""
+    spec = _manual_checkpoint_integrity_spec(
+        model_type,
+        model_def,
+        model_defs,
+    )
+    if spec is None:
+        raise RuntimeError(
+            f"Manual checkpoint integrity verification is not registered for '{model_type}'."
+        )
+    _require_manual_checkpoint_integrity(
+        model_type,
+        model_def,
+        model_defs,
+    )
+    return True
+
+
+def manual_checkpoint_integrity_required(model_type, model_def, model_defs=None):
+    """Classify hard-bound/manual URL graphs without trusting mutable policy."""
+    definitions = model_defs if isinstance(model_defs, dict) else {}
+    candidate_model_type = model_type
+    candidate_def = model_def
+    seen = set()
+    while True:
+        if candidate_model_type in _MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS:
+            return True
+        if candidate_model_type in seen or len(seen) > 10:
+            return True
+        seen.add(candidate_model_type)
+        if not isinstance(candidate_def, dict):
+            return False
+        provenance = candidate_def.get("artifact_provenance")
+        checkpoint = (
+            provenance.get("checkpoint")
+            if isinstance(provenance, dict) else None
+        )
+        if (
+            isinstance(checkpoint, dict)
+            and checkpoint.get("download_policy") == "manual_hash_verified_only"
+        ):
+            return True
+        related = candidate_def.get("URLs")
+        if not isinstance(related, str):
+            return False
+        if related in _MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS:
+            return True
+        if related not in definitions:
+            return False
+        candidate_model_type = related
+        candidate_def = definitions[related]
+
+
+def manual_checkpoint_integrity_ready(model_type, model_def, model_defs=None):
+    """Return cached exact-artifact readiness without hashing or side effects."""
+    try:
+        spec = _manual_checkpoint_integrity_spec(
+            model_type,
+            model_def,
+            model_defs,
+        )
+    except RuntimeError:
+        return False
+    if spec is None:
+        return False
+    cache_key = _manual_checkpoint_cache_key(spec)
+    with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
+        record = _MANUAL_CHECKPOINT_VERIFICATION_CACHE.get(cache_key)
+    if not isinstance(record, dict):
+        return False
+    path = record.get("path")
+    identity = record.get("identity")
+    if not isinstance(path, str) or not isinstance(identity, tuple):
+        return False
+    try:
+        current_identity = _checkpoint_stat_identity(os.stat(path))
+    except OSError:
+        current_identity = None
+    if current_identity != identity:
+        with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
+            if _MANUAL_CHECKPOINT_VERIFICATION_CACHE.get(cache_key) is record:
+                _MANUAL_CHECKPOINT_VERIFICATION_CACHE.pop(cache_key, None)
+        return False
+    with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
+        return _MANUAL_CHECKPOINT_VERIFICATION_CACHE.get(cache_key) is record
     
 
 
@@ -4432,16 +5046,28 @@ def load_models(
     override_profile=-1,
     output_type="video",
     load_status_callback=None,
+    load_cancel_callback=None,
     **model_kwargs,
 ):
     global transformer_type, loaded_profile, reload_needed
     global _loaded_model_configuration, _loaded_residency_base_key
     global _loaded_residency_affinity_key
+    # Shared fail-closed boundary for Studio, Classic, CLI, internal callers,
+    # recovery, already-downloaded checkpoints, and first-use auto-downloads.
+    # This check is recipe metadata only; it never inspects generation data.
+    require_model_terms(
+        server_config.get("services", {}), model_type, models_def,
+    )
+    model_def = get_model_def(model_type)
+    verified_manual_checkpoint = _require_manual_checkpoint_integrity(
+        model_type,
+        model_def,
+        models_def,
+    )
     # A replacement load is not resident until MMGP profiling completes. If
     # any download/load/profile step raises, the invalid state remains durable.
     _invalidate_loaded_model_state()
     base_model_type = get_base_model_type(model_type)
-    model_def = get_model_def(model_type)
     save_quantized = args.save_quantized and model_def != None
     model_filename = get_model_filename(model_type=model_type, quantization= "" if save_quantized else transformer_quantization, dtype_policy = transformer_dtype_policy) 
     if "URLs2" in model_def:
@@ -4498,6 +5124,13 @@ def load_models(
         if len(filename) == 0: continue 
         download_models(filename, file_model_type, file_source_type, submodel_no)
         local_file_name = get_local_model_filename(filename )
+        if (
+            verified_manual_checkpoint is not None
+            and file_model_type == model_type
+            and file_source_type == 0
+            and submodel_no == 1
+        ):
+            local_file_name = verified_manual_checkpoint
         local_model_file_list.append( os.path.basename(filename) if local_file_name is None else local_file_name )
     if len(local_model_file_list) == 0:
         download_models("", model_type, 0, -1)
@@ -4514,6 +5147,7 @@ def load_models(
 
 
     model_type_handler = model_types_handlers[base_model_type]
+    text_encoder_filename = None
     text_encoder_URLs= get_model_recursive_prop(model_type, "text_encoder_URLs", return_list= True)
     if text_encoder_URLs is not None:
         # Per-model override: a model_def can force a specific text encoder
@@ -4555,55 +5189,161 @@ def load_models(
     ):
         print(f"Unable to use LM Engine '{requested_lm_decoder_engine}' as it requires a Memory Profile such as 1,3 or 3+ that loads entirely the Main Models in VRAM. Switching to Legacy LM Engine...")
         lm_decoder_engine_obtained = "legacy"
-    torch.set_default_device('cpu')    
-    if callable(load_status_callback) and base_model_type != "minimax_h3":
-        load_status_callback("Loading model checkpoint")
-    handler_model_kwargs = dict(model_kwargs)
-    if base_model_type == "minimax_h3":
-        handler_model_kwargs["load_status_callback"] = load_status_callback
-    wan_model, pipe = model_type_handler.load_model(
-                local_model_file_list, model_type, base_model_type, model_def, quantizeTransformer = quantizeTransformer, text_encoder_quantization = text_encoder_quantization,
-                dtype = transformer_dtype, VAE_dtype = VAE_dtype, mixed_precision_transformer = mixed_precision_transformer, save_quantized = save_quantized, submodel_no_list   = model_submodel_no_list, text_encoder_filename = text_encoder_filename, profile=profile, lm_decoder_engine=lm_decoder_engine_obtained, **handler_model_kwargs )
-
-    if callable(load_status_callback):
-        load_status_callback("Preparing model pipeline")
-    kwargs = {}
-    if "pipe" in pipe:
-        kwargs = pipe
-        pipe = kwargs.pop("pipe")
-    if "coTenantsMap" not in kwargs: kwargs["coTenantsMap"] = {}
-    mmgp_profile = init_pipe(pipe, kwargs, profile)
-    if server_config.get("enhancer_mode", 1) == 0:
-        setup_prompt_enhancer(pipe, kwargs)
-    loras_transformer = kwargs.pop("loras", [])
-    if "transformer" in pipe:
-        loras_transformer += ["transformer"]        
-    if "transformer2" in pipe:
-        loras_transformer += ["transformer2"]
-    if len(compile) > 0 and hasattr(wan_model, "custom_compile"):
+    is_h3_load = str(base_model_type or "").startswith("minimax_h3")
+    if is_h3_load:
+        h3_checkpoint_paths = list(local_model_file_list)
+        h3_checkpoint_paths.append(text_encoder_filename)
+        assets_root = model_def.get("minimax_h3_assets_root", "minimax_h3")
+        for relative_path in (
+            os.path.join("vae", "minimax_h3_video_vae_fp16.safetensors"),
+            os.path.join("vae", "minimax_h3_audio_vae_fp32.safetensors"),
+        ):
+            h3_checkpoint_paths.append(
+                fl.locate_file(
+                    os.path.join(assets_root, relative_path),
+                    error_if_none=False,
+                )
+            )
         if callable(load_status_callback):
-            load_status_callback("Compiling model runtime")
-        wan_model.custom_compile(backend= "inductor", mode ="default")
-    # model_def can declare compile policy with three modes:
-    #   not present       → use user's global compile setting (default)
-    #   "transformer" etc → REQUIRE compile, even if user has it off
-    #                       (e.g. HiDream needs compile for quanto int8)
-    #   False             → OPT OUT of compile, even if user has it on
-    #                       (e.g. LTX-2 distilled hits a torch._dynamo
-    #                        proxy-tracking bug during inductor compile
-    #                        in our env — runs fine in eager mode)
-    # Use `None` as the "no override" sentinel so we can distinguish from
-    # an explicit `False` opt-out. The original upstream logic only knew
-    # truthy/falsy, which conflated "no override" with "opt out".
-    compile_modules = load_environment["compile_modules"]
-    if compile_modules == False:
-        print("Pytorch compilation is not supported for this Model")
-    # kwargs["pinnedMemory"] = "text_encoder"
-    if callable(load_status_callback):
-        load_status_callback("Profiling model offload")
-    offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, **kwargs)  
-    if callable(load_status_callback):
-        load_status_callback("Model runtime ready")
+            try:
+                load_status_callback(
+                    _load_resource_status(
+                        "Checking H3 host-memory headroom", time.monotonic(),
+                    )
+                )
+            except Exception:
+                pass
+        _require_h3_host_memory(
+            h3_checkpoint_paths,
+            profile,
+            status_callback=load_status_callback,
+            cancel_callback=load_cancel_callback,
+        )
+
+    status_reporter = _ModelLoadStatusReporter(
+        load_status_callback,
+        cancel_callback=load_cancel_callback,
+    )
+    handler_model_kwargs = dict(model_kwargs)
+    if is_h3_load:
+        handler_model_kwargs["load_status_callback"] = (
+            status_reporter.transition
+        )
+    wan_model = None
+    pipe = None
+    kwargs = None
+    loras_transformer = None
+    offloadobj = None
+    profile_started = False
+    model_load_succeeded = False
+    try:
+        previous_default_device = torch.get_default_device()
+    except (AttributeError, RuntimeError):
+        previous_default_device = args.gpu if len(args.gpu) > 0 else "cpu"
+    torch.set_default_device('cpu')
+    try:
+        status_reporter.start(
+            "Preparing H3 checkpoint loaders"
+            if is_h3_load else "Loading model checkpoint"
+        )
+        wan_model, pipe = model_type_handler.load_model(
+                    local_model_file_list, model_type, base_model_type, model_def, quantizeTransformer = quantizeTransformer, text_encoder_quantization = text_encoder_quantization,
+                    dtype = transformer_dtype, VAE_dtype = VAE_dtype, mixed_precision_transformer = mixed_precision_transformer, save_quantized = save_quantized, submodel_no_list   = model_submodel_no_list, text_encoder_filename = text_encoder_filename, profile=profile, lm_decoder_engine=lm_decoder_engine_obtained, **handler_model_kwargs )
+        status_reporter.check_cancelled()
+        status_reporter.transition("Preparing model pipeline")
+        kwargs = {}
+        if "pipe" in pipe:
+            kwargs = pipe
+            pipe = kwargs.pop("pipe")
+        if "coTenantsMap" not in kwargs: kwargs["coTenantsMap"] = {}
+        mmgp_profile = init_pipe(pipe, kwargs, profile)
+        if server_config.get("enhancer_mode", 1) == 0:
+            setup_prompt_enhancer(pipe, kwargs)
+        loras_transformer = kwargs.pop("loras", [])
+        if "transformer" in pipe:
+            loras_transformer += ["transformer"]
+        if "transformer2" in pipe:
+            loras_transformer += ["transformer2"]
+        if len(compile) > 0 and hasattr(wan_model, "custom_compile"):
+            status_reporter.transition("Compiling model runtime")
+            wan_model.custom_compile(backend= "inductor", mode ="default")
+            status_reporter.check_cancelled()
+        # model_def can declare compile policy with three modes:
+        #   not present       → use user's global compile setting (default)
+        #   "transformer" etc → REQUIRE compile, even if user has it off
+        #                       (e.g. HiDream needs compile for quanto int8)
+        #   False             → OPT OUT of compile, even if user has it on
+        #                       (e.g. LTX-2 distilled hits a torch._dynamo
+        #                        proxy-tracking bug during inductor compile
+        #                        in our env — runs fine in eager mode)
+        # Use `None` as the "no override" sentinel so we can distinguish from
+        # an explicit `False` opt-out. The original upstream logic only knew
+        # truthy/falsy, which conflated "no override" with "opt out".
+        compile_modules = load_environment["compile_modules"]
+        if compile_modules == False:
+            print("Pytorch compilation is not supported for this Model")
+        # kwargs["pinnedMemory"] = "text_encoder"
+        status_reporter.transition("Profiling model offload")
+        profile_started = True
+        offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, **kwargs)
+        status_reporter.check_cancelled()
+        status_reporter.transition("Model runtime ready")
+        model_load_succeeded = True
+    except Exception:
+        partial_offloader = offloadobj
+        if partial_offloader is None and profile_started:
+            partial_offloader = getattr(offload, "last_offload_obj", None)
+        cleanup_error = None
+        try:
+            if partial_offloader is not None:
+                partial_offloader.release()
+        except Exception as error:
+            cleanup_error = error
+        finally:
+            # MMGP publishes the in-progress owner before `all()` finishes.
+            # If its own partial release faults, detach that module-level
+            # owner explicitly so it cannot pin the failed graph forever.
+            if getattr(offload, "last_offload_obj", None) is partial_offloader:
+                offload.last_offload_obj = None
+        try:
+            if wan_model is not None and hasattr(wan_model, "release"):
+                wan_model.release()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        wan_model = None
+        offloadobj = None
+        partial_offloader = None
+        # The handler returns a separate component dictionary in addition to
+        # the wrapper. It aliases the same tensors and must be dropped before
+        # the host allocator flush, especially after profile-time failures.
+        pipe = None
+        kwargs = None
+        loras_transformer = None
+        handler_model_kwargs = None
+        try:
+            clear_gen_cache()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        finally:
+            gc.collect()
+        try:
+            offload.flush_torch_caches()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        finally:
+            gc.collect()
+        if cleanup_error is not None:
+            print(f"Model-load cleanup warning: {type(cleanup_error).__name__}")
+        raise
+    finally:
+        try:
+            status_reporter.close()
+        finally:
+            if not model_load_succeeded:
+                torch.set_default_device(previous_default_device)
     if len(args.gpu) > 0:
         torch.set_default_device(args.gpu)
     transformer_type = model_type
@@ -8294,6 +9034,7 @@ def generate_video(
             override_profile,
             output_type=output_type,
             load_status_callback=lambda stage: send_cmd("status", stage),
+            load_cancel_callback=lambda: bool(gen.get("abort", False)),
             **model_kwargs,
         )
         send_cmd("status", "Model loaded")

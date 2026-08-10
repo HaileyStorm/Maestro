@@ -23,6 +23,10 @@ from typing import Any
 import uuid
 
 from services.queue_recovery import QueueRecoveryJournal, RecoverySnapshot
+from services.h3_offload_plan import (
+    H3OffloadPlanError,
+    validate_h3_offload_plan,
+)
 
 
 _OWNER_PREFIX = "owner:v1:"
@@ -44,15 +48,20 @@ _JOB_FIELDS = frozenset({
     "total_steps", "window_current", "window_total", "window_step",
     "window_total_steps", "window_progress", "overall_progress",
     "clip_current", "clip_total", "clip_progress", "h3_segment_plan",
+    "h3_offload_plan",
     "current_segment_model", "current_segment_reason",
     "current_segment_boundary", "h3_estimate", "window_index",
     "window_count", "segment_index", "segment_count", "repeat_index",
     "repeat_count", "output_files", "artifact_files", "clip_output_files",
     "join_output_file", "queue_reorder_reason",
+    "plan_review_required", "plan_review_deadline",
+    "plan_review_terms_required",
+    "resource_intent", "resource_execution", "preemption_mode",
+    "resource_state", "execution_attempt", "parent_job_id",
     "queue_residency_bypass_count", "queue_residency_bypassed_waiters",
     "residency_base_key", "residency_affinity_key", "_queue_manual_order",
     "recovery_attempt", "recovery_state", "reruns_denoise",
-    "recovery_unit", "recovery_cursor",
+    "recovery_unit", "recovery_cursor", "_recovery_reason_code",
 })
 _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
@@ -68,6 +77,15 @@ _PATH_REDACTABLE_JOB_FIELDS = frozenset({
     "message", "phase", "current_segment_reason", "recovery_state",
 })
 _MAX_MANUAL_ORDER_SEQUENCE = (1 << 63) - 1
+_RESOURCE_INTENTS = frozenset({"generation", "text"})
+_RESOURCE_EXECUTIONS = frozenset({"standard", "cpu"})
+_PREEMPTION_MODES = frozenset({"none", "discard_restart"})
+_RESOURCE_STATES = frozenset({
+    "queued", "admitted", "running", "preemption_requested",
+    "resources_releasing", "restarting_on_accelerator", "blocked",
+    "released",
+})
+_MAX_EXECUTION_ATTEMPT = 1_000_000
 
 
 class QueueRecoveryAdapterError(RuntimeError):
@@ -373,6 +391,55 @@ def _redact_runtime_paths(value: Any, *, path: str) -> Any:
     return _safe_json(value, path=path)
 
 
+def _safe_h3_boundary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, Any] = {}
+    boundary_type = str(value.get("type") or "")
+    if boundary_type in {"continuous", "precut", "cut", "transition"}:
+        result["type"] = boundary_type
+    source = str(value.get("source") or "")
+    if source in {
+        "model_grid", "explicit_continuity", "explicit_transition",
+        "explicit_cut", "precut_lead_in", "user_override",
+        "shared_h3_shot_plan",
+    }:
+        result["source"] = source
+    continuity = str(value.get("continuity_mode") or "")
+    if continuity in {"continuous", "extend_previous", "independent"}:
+        result["continuity_mode"] = continuity
+    at_seconds = value.get("at_seconds")
+    if (
+        type(at_seconds) in {int, float}
+        and math.isfinite(at_seconds)
+        and at_seconds >= 0
+    ):
+        result["at_seconds"] = float(at_seconds)
+    return result or None
+
+
+def _safe_h3_checkpoint_options(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    allowed = {
+        "model_type", "name", "conditioning_mode", "is_downloaded",
+        "managed_download", "auto_download", "terms_required", "available",
+        "unavailable_reason",
+    }
+    result = []
+    for index, option in enumerate(value[:32]):
+        if not isinstance(option, Mapping):
+            continue
+        clean = {
+            key: _safe_json(child, path=f"job.h3_segment_plan.checkpoint_options[{index}].{key}")
+            for key, child in option.items()
+            if key in allowed
+        }
+        if isinstance(clean.get("model_type"), str):
+            result.append(clean)
+    return result
+
+
 def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
     """Retain restart/UI structure without implicitly persisting prompt previews."""
     if not isinstance(value, Mapping):
@@ -382,6 +449,7 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
         "published_frames",
         "adaptive_conditioning", "checkpoint_switches",
         "effective_model_count", "effective_models", "segments",
+        "checkpoint_options",
     }
     allowed_segment = {
         "index", "frames", "duration_seconds",
@@ -406,7 +474,9 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
         if key not in allowed_top or key == "segments":
             continue
         path = f"job.h3_segment_plan.{key}"
-        if key in {"fps"}:
+        if key == "checkpoint_options":
+            result[key] = _safe_h3_checkpoint_options(child)
+        elif key in {"fps"}:
             result[key] = positive_number(child, path=path)
         elif key in {"published_frames"}:
             result[key] = positive_integer(child, path=path)
@@ -425,6 +495,8 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
                 path = f"job.h3_segment_plan.segments[{segment_index}].{key}"
                 if key in {"generated_frames", "published_frames"}:
                     safe_segment[key] = positive_integer(child, path=path)
+                elif key == "boundary_from_previous":
+                    safe_segment[key] = _safe_h3_boundary(child)
                 elif key in {
                     "generated_duration_seconds", "published_duration_seconds",
                 }:
@@ -502,6 +574,54 @@ def serialize_job(
             clean_plan = _safe_h3_segment_plan(value)
             if clean_plan is not None:
                 result[key] = clean_plan
+        elif key == "h3_offload_plan":
+            try:
+                result[key] = validate_h3_offload_plan(value)
+            except H3OffloadPlanError as error:
+                raise QueueRecoveryAdapterError(
+                    "job.h3_offload_plan is invalid."
+                ) from error
+        elif key == "resource_intent":
+            if value not in _RESOURCE_INTENTS:
+                raise QueueRecoveryAdapterError(
+                    "job.resource_intent is invalid."
+                )
+            result[key] = value
+        elif key == "resource_execution":
+            if value not in _RESOURCE_EXECUTIONS:
+                raise QueueRecoveryAdapterError(
+                    "job.resource_execution is invalid."
+                )
+            result[key] = value
+        elif key == "preemption_mode":
+            if value not in _PREEMPTION_MODES:
+                raise QueueRecoveryAdapterError(
+                    "job.preemption_mode is invalid."
+                )
+            result[key] = value
+        elif key == "resource_state":
+            if value not in _RESOURCE_STATES:
+                raise QueueRecoveryAdapterError(
+                    "job.resource_state is invalid."
+                )
+            result[key] = value
+        elif key == "execution_attempt":
+            if (
+                type(value) is not int
+                or not 1 <= value <= _MAX_EXECUTION_ATTEMPT
+            ):
+                raise QueueRecoveryAdapterError(
+                    "job.execution_attempt is invalid."
+                )
+            result[key] = value
+        elif key == "parent_job_id":
+            if not _valid_job_id(value):
+                raise QueueRecoveryAdapterError(
+                    "job.parent_job_id is invalid."
+                )
+            result[key] = value
+        elif key == "current_segment_boundary":
+            result[key] = _safe_h3_boundary(value)
         elif key in _PATH_REDACTABLE_JOB_FIELDS:
             try:
                 result[key] = _safe_json(value, path=f"job.{key}")
@@ -573,6 +693,20 @@ def _validated_recovered_state(
         )
         if clean.get("id") != job_id:
             raise QueueRecoveryAdapterError("Recovered queue identity is invalid.")
+        if clean.get("status") not in _TERMINAL:
+            # Process-local leases never survive restart. Pre-contract and
+            # explicit CPU snapshots both reacquire from the standard queued
+            # lane; the attempt counter remains the stale-result fence.
+            clean.setdefault("resource_intent", "generation")
+            clean["resource_execution"] = "standard"
+            clean["preemption_mode"] = "none"
+            clean["resource_state"] = "queued"
+            clean.setdefault("execution_attempt", 1)
+        elif "resource_intent" in clean:
+            clean["resource_execution"] = "standard"
+            clean["preemption_mode"] = "none"
+            clean["resource_state"] = "released"
+            clean.setdefault("execution_attempt", 1)
         jobs[job_id] = clean
     global_state = serialize_global_state(recovered.global_state or {})
     queued = {
@@ -756,22 +890,37 @@ class QueueRecoveryCoordinator:
         jobs = tuple(getattr(proposal, "jobs", ()) or ())
         tombstones = tuple(getattr(proposal, "tombstones", ()) or ())
         global_state = getattr(proposal, "global_state", None)
+        manifest_updates = dict(
+            getattr(proposal, "request_manifests", None) or {}
+        )
         serialized: dict[str, dict[str, Any]] = {}
+        accepted_manifests: dict[str, dict[str, Any]] = {}
         with self._lock:
+            job_ids = {str(job.get("id") or "") for job in jobs}
+            if set(manifest_updates).difference(job_ids):
+                raise QueueRecoveryAdapterError(
+                    "Queue recovery manifest update has no matching job transition."
+                )
             for job in jobs:
                 job_id = str(job.get("id") or "")
                 identity = self._identities.get(job_id)
-                manifest = self._manifests.get(job_id)
+                manifest = manifest_updates.get(
+                    job_id, self._manifests.get(job_id),
+                )
                 if identity is None or manifest is None:
                     raise QueueRecoveryAdapterError(
                         "Queue recovery job must be registered before transition."
                     )
+                clean_manifest = _safe_json(
+                    dict(manifest), path="request_manifest",
+                )
                 serialized[job_id] = serialize_job(
                     job,
                     owner_digest=identity[0],
                     project_digest=identity[1],
-                    request_manifest=manifest,
+                    request_manifest=clean_manifest,
                 )
+                accepted_manifests[job_id] = clean_manifest
             clean_global = (
                 None
                 if global_state is None
@@ -795,6 +944,7 @@ class QueueRecoveryCoordinator:
             )
             self._accept_receipt(receipt)
             self._snapshots.update(deepcopy(serialized))
+            self._manifests.update(deepcopy(accepted_manifests))
             if clean_global is not None:
                 self._global_state = deepcopy(clean_global)
             for job_id in tombstones:

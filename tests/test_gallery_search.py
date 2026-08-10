@@ -574,7 +574,10 @@ class GalleryApiUiContractTests(unittest.TestCase):
         self.assertIn("_metadataRequestGeneration", store)
         self.assertGreaterEqual(store.count("++_outputsRequestGeneration"), 3)
         self.assertIn("await get().loadOutputs()", store)
-        self.assertIn('key={`${file.workspace}:${file.name}:${file.revision}`}', (
+        self.assertIn("const identity = privatePreviewIdentity(file.workspace, file.name, file.revision)", (
+            Path(_ROOT) / "ui" / "src" / "components" / "MainContent" / "MainContent.tsx"
+        ).read_text(encoding="utf-8"))
+        self.assertIn("key={identity}", (
             Path(_ROOT) / "ui" / "src" / "components" / "MainContent" / "MainContent.tsx"
         ).read_text(encoding="utf-8"))
         self.assertIn("clearTimeout(debounceRef.current)", tabs)
@@ -650,6 +653,10 @@ class GalleryApiUiContractTests(unittest.TestCase):
 
         main = (Path(_ROOT) / "ui" / "src" / "components" / "MainContent" / "MainContent.tsx").read_text(encoding="utf-8")
         self.assertNotIn("clearOutputSelection = useStore", main)
+        self.assertIn("galleryScopeKey", main)
+        self.assertIn("feedEl.scrollTo({ top: 0, behavior: 'auto' })", main)
+        self.assertIn("viewportAnchor", main)
+        self.assertIn("intraItemOffset", main)
 
 
 if __name__ == "__main__":

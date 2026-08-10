@@ -1138,8 +1138,9 @@ def _h3_planner_token_budget(target_duration: float) -> int:
 
     # Keep enough headroom for the 32K-context Director models' system prompt
     # and (when enabled) their separate reasoning budget. H3's native plan is
-    # unusually verbose because each independently generated shot must repeat
-    # its complete world, cast, blocking, audio, and prompt context. The prior
+    # unusually verbose because each independently generated clip carries a
+    # global entity namespace plus its local shot, action, audio, and prompt
+    # context. The prior
     # 200-token/second allowance hit its exact ceiling on a valid 90-second
     # plan and left the final object half-written.
     return min(23000, max(12288, int(math.ceil(target_duration * 240))))
@@ -2826,8 +2827,18 @@ FULL SCREENPLAY FOR ACTION AND RELATIONSHIP CONTEXT:
         # _route_video_pass2_guide / get_image_prompt_rules for routing.
         video_model = getattr(self, '_video_model', '') or ''
         is_h3_video = video_model.lower().startswith("minimax_h3")
+        is_h3_ref2va = video_model.lower().startswith("minimax_h3_ref2va")
+        is_h3_base_video = is_h3_video and not is_h3_ref2va
         image_model = getattr(self, '_image_model', '') or ''
         video_guide = _route_video_pass2_guide(video_model)
+        if is_h3_ref2va:
+            # The Director shot-breakdown guide is Base-only. Ref2VA keeps its
+            # dedicated six-field guide so Base integrated-description clauses
+            # cannot leak into the reference-conditioned layout.
+            from services.guide_loader import load_guide as _load_enhance_guide
+            video_guide = _load_enhance_guide(
+                "enhance", "minimax_h3_ref2va_video",
+            )
         video_name_rules = _video_character_name_rules(
             preserve_names,
         )
@@ -2895,12 +2906,25 @@ FULL SCREENPLAY FOR ACTION AND RELATIONSHIP CONTEXT:
         video_prompt_rules = (
             """VIDEO PROMPT (video_prompt) — follow the MiniMax H3 Context-IR guide below exactly:
 - Put integrated_multimodal_description on its own line.
+- Put subject_definitions first and define each authored visible entity once
+  with stable <Subject N> labels; records reference those labels or names and
+  never repeat a full entity definition.
 - Write each internal shot as one canonical [Shot N] [STARTs-ENDs] record.
 - Put literal speech only in <d>[Language] exact words</d> blocks and preserve every supplied vocalization.
 - Keep overall_soundscape and non_diegetic_music as the final two fields.
 - Do not replace the record structure with prose timing or quote-mark dialogue.
 """ + video_name_rules
-            if is_h3_video else
+            if is_h3_base_video else
+            """VIDEO PROMPT (video_prompt) — follow the MiniMax H3 Ref2VA guide below exactly:
+- Put subject_definitions, summary, retention_analysis, detailed_description,
+  overall_soundscape, and non_diegetic_music in that order.
+- Put canonical [Shot N] [STARTs-ENDs] records on one physical line inside
+  detailed_description. Preserve reference labels and authored entities once;
+  records add only shot-local visibility, pose, action, camera, dialogue,
+  ambience, effects, music, or an explicitly changed appearance.
+- Put literal speech only in <d>[Language] exact words</d> blocks.
+""" + video_name_rules
+            if is_h3_ref2va else
             f"""VIDEO PROMPT (video_prompt) — follow the LTX-2 style guide below closely:
 - One single flowing paragraph, present tense, 4-8 sentences.
 - Start with shot type and visual style early.
@@ -2915,14 +2939,21 @@ FULL SCREENPLAY FOR ACTION AND RELATIONSHIP CONTEXT:
         )
         video_guide_reference = (
             "REFERENCE — MiniMax H3 Context-IR guide:\n"
-            if is_h3_video else
+            if is_h3_base_video else
+            "REFERENCE — MiniMax H3 Ref2VA guide:\n"
+            if is_h3_ref2va else
             "REFERENCE — LTX-2 video style guide:\n"
         ) + (video_guide if video_guide else "(no guide loaded)")
         video_prompt_example = (
-            "MiniMax H3 Context-IR with integrated_multimodal_description on "
-            "its own line, canonical [Shot N] [STARTs-ENDs] records, then "
+            "MiniMax H3 Context-IR with subject_definitions followed by "
+            "integrated_multimodal_description on its own line, canonical "
+            "[Shot N] [STARTs-ENDs] records, then "
             "overall_soundscape and non_diegetic_music"
-            if is_h3_video else
+            if is_h3_base_video else
+            "MiniMax H3 Ref2VA with subject_definitions, summary, retention_analysis, "
+            "detailed_description, overall_soundscape, and non_diegetic_music; "
+            "detailed_description contains canonical [Shot N] [STARTs-ENDs] records"
+            if is_h3_ref2va else
             "Full flowing paragraph for video generation — describes the action..."
         )
         window_prompts_example = (
@@ -2934,9 +2965,16 @@ FULL SCREENPLAY FOR ACTION AND RELATIONSHIP CONTEXT:
             """MINIMAX H3 VIDEO PROMPT:
 - Always populate video_prompt with the complete Context-IR for that audio clip.
 - Always emit window_prompts as []. Do not move any H3 prompt content there.
+- Establish authored entities once in subject_definitions and reference stable
+  Subject IDs or names in records; never repeat full entity descriptions.
 - The first shot record starts at 0.00 and the final record ends at the exact audio-clip duration.
 - Follow the routed MiniMax H3 guide for canonical records, dialogue tags, sound fields, and natural inferred timing."""
-            if is_h3_video else
+            if is_h3_base_video else
+            """MINIMAX H3 REF2VA VIDEO PROMPT:
+- Always populate video_prompt with the complete six-field Ref2VA Context-IR.
+- Always emit window_prompts as []. Keep the six fields in order; detailed_description
+  carries canonical records and supplied reference associations."""
+            if is_h3_ref2va else
             '''WINDOW PROMPTS vs VIDEO PROMPT — use ONE or the OTHER, never both:
 - Scenes 20s or under: write video_prompt, leave window_prompts as [].
 - Scenes over 20s: write window_prompts, leave video_prompt as "".
@@ -3140,21 +3178,38 @@ Shots to plan:
                         float(clip.get("end", 0))
                         - float(clip.get("start", 0))
                     )
+                    # A Ref2VA model has its six-field layout, while older
+                    # saved audio plans may still contain a Base prompt. Read
+                    # the actual payload mode for compatibility; never put
+                    # Base clauses into the Ref2VA system guide.
+                    prompt_mode = (
+                        "ref2va"
+                        if re.search(
+                            r"(?mi)^(?:\s*summary\s*:|\s*detailed_description\s*:)",
+                            prompt_text,
+                        )
+                        else "t2va"
+                    )
                     for error in validate_h3_prompt_contract(
                         prompt_text,
                         dialogue,
-                        mode="t2va",
+                        mode=prompt_mode,
                         duration_seconds=duration,
                     ):
                         issues.append(f"shot {index + 1}: {error}")
                     for error in validate_h3_context_ir_records(
                         prompt_text,
-                        mode="t2va",
+                        mode=prompt_mode,
                         duration_seconds=duration,
                     ):
                         issues.append(f"shot {index + 1}: {error}")
+                    visual_field = (
+                        "detailed_description"
+                        if prompt_mode == "ref2va"
+                        else "integrated_multimodal_description"
+                    )
                     section = re.search(
-                        r"(?ms)^integrated_multimodal_description:[ \t]*\n"
+                        rf"(?ms)^{visual_field}:[ \t]*\n"
                         r"(?P<body>.*?)^overall_soundscape:",
                         prompt_text,
                     )
@@ -5166,6 +5221,34 @@ SCREENPLAY:
             getattr(self, "_video_model", "") or "minimax_h3"
         )
         video_name_rules = _video_character_name_rules(preserve_names)
+        native_h3_ref2va = str(
+            getattr(self, "_video_model", "") or ""
+        ).lower().startswith("minimax_h3_ref2va")
+        if native_h3_ref2va:
+            from services.guide_loader import load_guide as _load_enhance_guide
+            video_rules = _load_enhance_guide(
+                "enhance", "minimax_h3_ref2va_video",
+            )
+        native_h3_prompt_contract = (
+            "- Ref2VA video_prompt uses subject_definitions, summary, "
+            "retention_analysis, detailed_description, overall_soundscape, "
+            "and non_diegetic_music in that order. Put canonical records "
+            "inside detailed_description and preserve supplied reference "
+            "labels; records add only shot-local state."
+            if native_h3_ref2va else
+            "- Base video_prompt uses one global subject_definitions section "
+            "followed by integrated_multimodal_description, overall_soundscape, "
+            "and non_diegetic_music. Records reference stable entities and add "
+            "only shot-local state; never repeat a full entity definition."
+        )
+        native_h3_prompt_example = (
+            "MiniMax H3 Ref2VA Context-IR with the six fields and canonical "
+            "records inside detailed_description"
+            if native_h3_ref2va else
+            "MiniMax H3 Context-IR with subject_definitions, "
+            "integrated_multimodal_description, overall_soundscape, and "
+            "non_diegetic_music"
+        )
 
         image_rules = ""
         image_fields = ""
@@ -5224,7 +5307,7 @@ SCREENPLAY:
 H3 NATIVE SHOT CONTRACT — NON-NEGOTIABLE:
 - Every array item is ONE bounded H3 generation lasting {minimum_seconds:.2f}-{maximum_seconds:.2f} seconds.
 - Use video_prompt for every item and set window_prompts to []. Never write 20-second windows, timeline ranges, or prompt instructions referring to a previous/preceding shot. The structured continuity_strategy and continuity_group fields are required planning metadata, while every video_prompt must remain self-contained.
-- Every video_prompt must stand alone. Restate the exact physical setting, all visible people, their appearance/wardrobe, action, camera, lighting, dialogue, ambience, effects, and music needed in that clip.
+- Every video_prompt must stand alone. {native_h3_prompt_contract}
 - WARDROBE IS STATE: on every appearance, subjects_on_screen must give each person a complete head-to-toe wardrobe (colors, materials, layers, accessories, and visible footwear). Repeat the same wardrobe wording in every shot within a continuity_group unless the screenplay explicitly changes it, and show that change visibly before using the new wardrobe.
 - BLOCKING IS STATE: spatial_setup and each subject's position_or_relation describe the FIRST FRAME precisely: screen-left/center/right, foreground/midground/background, standing/seated/leaning, facing direction, and nearby furniture or props. Repeat that opening blocking in video_prompt.
 - closing_blocking describes the final positions at the end of the shot. When the next shot in the same continuity_group opens with different blocking, the current shot must visibly show the person walking, sitting, standing, turning, or otherwise moving into that next arrangement before the cut.
@@ -5272,7 +5355,7 @@ OUTPUT — one closed object per native shot:
     "audio_plan": {{"mode": "dialogue_driven", "ambience": "Location ambience", "effects": ["Synchronized practical effects"], "vocal_style": "Natural voices", "timing_anchor": "audio", "lip_sync_critical": true}},
     "ending_beat": "Visible end state",
     "closing_blocking": "Exact final screen positions and poses after all movement",
-{image_fields}    "video_prompt": "MiniMax H3 Context-IR prompt with integrated_multimodal_description, overall_soundscape, and non_diegetic_music",
+{image_fields}    "video_prompt": "{native_h3_prompt_example}",
     "multishot": false,
     "window_prompts": []
   }}

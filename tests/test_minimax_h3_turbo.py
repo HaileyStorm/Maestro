@@ -266,15 +266,129 @@ class TestH3TurboMathAndLifecycle(unittest.TestCase):
 
 
 class TestH3TurboSchedulingAndPolicy(unittest.TestCase):
-    def test_four_and_eight_authored_evaluations_become_five_and_nine_grid_points(self):
-        self.assertEqual(h3_turbo.scheduler_grid_points(4), 5)
-        self.assertEqual(h3_turbo.scheduler_grid_points(8), 9)
+    def test_four_uses_dual_clock_and_eight_remains_paired(self):
+        four = h3_turbo.resolve_h3_turbo_schedule(4)
+        self.assertEqual(
+            (
+                four.video_grid_points,
+                four.audio_grid_points,
+                four.video_scheduler_steps,
+                four.audio_scheduler_steps,
+                four.master_evaluations,
+            ),
+            (5, 9, 4, 8, 8),
+        )
+        self.assertEqual(four.video_timestep_indices, (0, 0, 1, 1, 2, 2, 3, 3))
+        self.assertEqual(four.audio_timestep_indices, tuple(range(8)))
+        self.assertEqual(four.video_advance_ticks, (1, 3, 5, 7))
+
+        eight = h3_turbo.resolve_h3_turbo_schedule(8)
+        self.assertEqual(
+            (
+                eight.video_grid_points,
+                eight.audio_grid_points,
+                eight.video_scheduler_steps,
+                eight.audio_scheduler_steps,
+                eight.master_evaluations,
+            ),
+            (9, 9, 8, 8, 8),
+        )
+        self.assertEqual(eight.video_timestep_indices, tuple(range(8)))
+        self.assertEqual(eight.video_advance_ticks, tuple(range(8)))
+
         scheduler_source = _source(_SCHEDULER)
         self.assertIn("num_inference_steps - 1", scheduler_source)
         self.assertIn("self.timesteps = (1.0 - sigmas[:-1])", scheduler_source)
         main_source = _source(_MAIN)
-        self.assertIn("scheduler_grid_points(sampling_steps)", main_source)
+        self.assertIn("resolve_h3_turbo_schedule(sampling_steps)", main_source)
+        self.assertIn("video_scheduler_points = int(sampling_steps) + 1", main_source)
+        self.assertIn("audio_scheduler_points = video_scheduler_points", main_source)
+        self.assertIn("advance_video=index in video_advance_ticks", main_source)
         self.assertIn("len(timesteps) != len(audio_timesteps)", main_source)
+
+    def test_schedule_identity_is_canonical_json_safe_and_validated(self):
+        four = h3_turbo.turbo_schedule_identity(4)
+        eight = h3_turbo.turbo_schedule_identity(8)
+        self.assertEqual(json.loads(json.dumps(four, sort_keys=True)), four)
+        self.assertEqual(
+            four,
+            {
+                "profile_id": h3_turbo.H3_TURBO_PROFILE_ID,
+                "algorithm_version": h3_turbo.H3_TURBO_SCHEDULE_ALGORITHM_VERSION,
+                "authored_video_steps": 4,
+                "video_evaluations": 4,
+                "audio_evaluations": 8,
+                "evaluation_alias_semantics": "scheduler_steps",
+                "master_evaluations": 8,
+                "transformer_evaluations": 8,
+                "video_scheduler_steps": 4,
+                "audio_scheduler_steps": 8,
+            },
+        )
+        self.assertNotEqual(four, eight)
+        self.assertEqual(h3_turbo.validate_turbo_schedule_identity(four), four)
+        with self.assertRaises(h3_turbo.H3TurboCompatibilityError):
+            h3_turbo.validate_turbo_schedule_identity({
+                **four, "audio_evaluations": 4,
+            })
+
+    def test_base_and_ref2va_resolve_the_same_schedule(self):
+        for base_model_type, model_def, authorized in (
+            ("minimax_h3", _base_model_def(), False),
+            (
+                "minimax_h3_ref2va",
+                {
+                    "URLs": [h3_turbo.H3_TURBO_REF2VA_CHECKPOINT],
+                    "minimax_h3_reference_mode": True,
+                },
+                True,
+            ),
+        ):
+            with self.subTest(base_model_type=base_model_type):
+                self.assertTrue(h3_turbo.validate_turbo_request(
+                    base_model_type=base_model_type,
+                    model_def=model_def,
+                    custom_settings=_turbo_settings(),
+                    authored_steps=4,
+                    _h3_turbo_validation_authorized=authorized,
+                ))
+                self.assertEqual(
+                    h3_turbo.resolve_h3_turbo_schedule(4).public_identity(),
+                    h3_turbo.turbo_schedule_identity(4),
+                )
+
+    def test_incomplete_master_loop_resets_both_schedule_clocks(self):
+        source = _source(_MAIN)
+        loop = source[source.index("def _run_h3_master_schedule"):]
+        loop = loop[:loop.index("AUDIO_LATENTS_MEAN =")]
+        self.assertIn("finally:", loop)
+        self.assertIn("if not completed:", loop)
+        self.assertIn("reset()", loop)
+        self.assertIn("self._ref2va_handoff_cache = None", source)
+
+    def test_sol_dense_gate_counts_all_turbo_four_transformer_ticks(self):
+        request = {
+            "base_model_type": "minimax_h3",
+            "model_def": _base_model_def(),
+            "authored_steps": 4,
+        }
+        with self.assertRaisesRegex(
+            h3_turbo.H3TurboCompatibilityError, "every effective transformer",
+        ):
+            h3_turbo.validate_turbo_request(
+                **request,
+                custom_settings={
+                    **_turbo_settings("sol_attn"),
+                    "h3_sol_dense_steps": 4,
+                },
+            )
+        self.assertTrue(h3_turbo.validate_turbo_request(
+            **request,
+            custom_settings={
+                **_turbo_settings("sol_attn"),
+                "h3_sol_dense_steps": 8,
+            },
+        ))
 
     def test_structural_matrix_accepts_validated_variants_attention_and_stacking(self):
         self.assertTrue(

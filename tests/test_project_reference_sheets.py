@@ -21,14 +21,23 @@ if str(_APP_DIR) not in sys.path:
 
 from services import reference_sheets
 from services.reference_sheets import (
+    ArtifactProvenance,
+    PACK_ROLE_RECIPES,
+    PackIntelligenceSelection,
+    PackModelSchedule,
+    PackOperationRoute,
+    ReferencePackArtifact,
     ROLE_RECIPES,
     PanelFile,
     ReferenceSheetReviewError,
     ReferenceSheetStructureError,
     build_failed_panel_repair_plan,
+    build_reference_pack_plan,
+    build_reference_pack_review_request,
     build_reference_sheet_plan,
     build_semantic_review_request,
     compose_reference_sheet,
+    create_reference_pack,
     create_reference_sheet,
     parse_semantic_review_result,
     review_reference_sheet,
@@ -87,6 +96,22 @@ class ReferenceSheetTests(unittest.TestCase):
                 ),
             ))
         return result
+
+    def _pack_plan(self, **updates):
+        values = {
+            "reference_type": "character",
+            "mode": "production",
+            "intent": "generic",
+            "depth": "standard",
+            "creative_request": "A precise adaptive continuity pack.",
+            "generation_model": "flux2_dev",
+            "editor_model": "qwen_image_edit_2511_20B_fp8_lightning_8step",
+            "sheet_size": (96, 80),
+            "planning": PackIntelligenceSelection("auto", "deterministic", "local"),
+            "review_selection": PackIntelligenceSelection("off", None, "off"),
+        }
+        values.update(updates)
+        return build_reference_pack_plan(**values)
 
     @staticmethod
     def _pass_review():
@@ -294,34 +319,646 @@ class ReferenceSheetTests(unittest.TestCase):
             compose_reference_sheet(plan, panels, destination)
         self.assertFalse(destination.exists())
 
-    def test_production_generates_every_panel_independently_and_returns_lineage(self):
-        plan = self._plan()
+    def test_v2_production_generates_one_immutable_anchor_then_reference_derivatives(self):
+        plan = self._pack_plan()
         calls = []
+        anchor = self._image("pack-anchor.png", (40, 50, 60))
+        anchor_digest = self._digest(anchor)
 
         def generate(request):
-            calls.append((request.role, request.strategy, request.index))
+            calls.append(("generate", request.role, request.strategy, None, None))
+            return anchor
+
+        def edit(primary, canonical, request):
+            calls.append((
+                "edit", request.role, request.strategy,
+                primary.resolve(), canonical.resolve(),
+            ))
             return self._image(
-                f"generated-{request.index}.png",
+                f"pack-{request.index}.png",
                 (request.index * 31, request.index * 29, request.index * 23),
             )
 
-        result = create_reference_sheet(
+        result = create_reference_pack(
             plan,
-            self.outputs / "production.png",
-            generate_panel=generate,
+            generate_sheet=generate,
+            edit_sheet=edit,
             reviewer=lambda _request: self._pass_review(),
         )
+        self.assertEqual(len([call for call in calls if call[0] == "generate"]), 1)
+        self.assertEqual(calls[0][2], "canonical_anchor")
         self.assertEqual(
-            calls,
-            [(role, "independent", index) for index, role in enumerate(plan.panel_roles)],
+            [call[2] for call in calls[1:]],
+            ["reference_guided_derivative"] * (len(plan.sheets) - 1),
         )
-        roles = [artifact.role for artifact in result.artifacts]
-        self.assertEqual(roles.count("sheet"), 1)
-        self.assertEqual(tuple(roles[:-1]), plan.panel_roles)
-        self.assertNotIn("palette", roles)
-        self.assertEqual(result.review.status, "pass")
-        self.assertEqual(result.public_metadata()["roles"]["panels"], list(plan.panel_roles))
-        self.assertEqual(list(self.outputs.glob("*.review-*.png")), [])
+        self.assertTrue(all(call[4] == anchor.resolve() for call in calls[1:]))
+        self.assertEqual(self._digest(anchor), anchor_digest)
+        self.assertEqual(result.artifacts[0].provenance.strategy, "canonical_anchor")
+        self.assertTrue(all(
+            item.provenance.strategy == "reference_guided_derivative"
+            for item in result.artifacts[1:]
+        ))
+        self.assertEqual(tuple(item.role for item in result.artifacts), plan.sheet_roles)
+
+    def test_v2_reviewer_cannot_mutate_or_replace_any_reviewed_artifact(self):
+        for replacement_kind in ("mutate", "regular", "symlink"):
+            if replacement_kind == "symlink" and not hasattr(os, "symlink"):
+                continue
+            with self.subTest(replacement_kind=replacement_kind):
+                plan = self._pack_plan(depth="compact")
+                anchor = self._image(
+                    f"review-{replacement_kind}.png", (40, 50, 60),
+                )
+                external = self._image(
+                    f"review-{replacement_kind}-external.png", (5, 6, 7),
+                )
+
+                def review(request):
+                    # The reviewer receives a descriptor-backed path on POSIX;
+                    # resolving it simulates an attempted mutation of the
+                    # private review stage rather than the authored source.
+                    reviewed = request.sheet_paths[0].resolve()
+                    if replacement_kind == "mutate":
+                        with Image.new("RGB", plan.sheet_size, (200, 10, 20)) as image:
+                            image.save(reviewed, format="PNG")
+                    else:
+                        reviewed.unlink()
+                        if replacement_kind == "regular":
+                            reviewed.write_bytes(b"unowned-regular-replacement")
+                        else:
+                            reviewed.symlink_to(external)
+                    return self._pass_review()
+
+                with self.assertRaisesRegex(
+                    ReferenceSheetStructureError, "sheet_stage_modified",
+                ):
+                    create_reference_pack(
+                        plan,
+                        generate_sheet=lambda _request: anchor,
+                        edit_sheet=lambda *_args: self.fail("compact cannot edit"),
+                        reviewer=review,
+                    )
+                if replacement_kind == "mutate":
+                    self.assertFalse(anchor.exists())
+                elif replacement_kind == "regular":
+                    self.assertEqual(
+                        anchor.read_bytes(), b"unowned-regular-replacement",
+                    )
+                    anchor.unlink()
+                else:
+                    self.assertTrue(anchor.is_symlink())
+                    self.assertEqual(anchor.resolve(), external.resolve())
+                    anchor.unlink()
+                self.assertTrue(external.is_file())
+
+    def test_v2_reviewer_consumes_sealed_copy_during_source_swap_and_restore(self):
+        plan = self._pack_plan(depth="compact")
+        anchor = self._image("review-swap-anchor.png", (40, 50, 60))
+        alternate = self._image("review-swap-alternate.png", (200, 10, 20))
+        original_digest = self._digest(anchor)
+        alternate_digest = self._digest(alternate)
+        reviewed = []
+
+        def review(request):
+            held_original = anchor.with_name("review-swap-held.png")
+            os.replace(anchor, held_original)
+            os.replace(alternate, anchor)
+            try:
+                reviewed.append(self._digest(request.sheet_paths[0]))
+            finally:
+                os.replace(anchor, alternate)
+                os.replace(held_original, anchor)
+            return self._pass_review()
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=lambda _request: anchor,
+            edit_sheet=lambda *_args: self.fail("compact cannot edit"),
+            reviewer=review,
+        )
+        self.assertEqual(reviewed, [original_digest])
+        self.assertNotEqual(reviewed[0], alternate_digest)
+        self.assertEqual(result.review.artifact_seals[0].sha256, reviewed[0])
+        self.assertEqual(self._digest(anchor), original_digest)
+
+    def test_v2_review_returns_private_exact_artifact_seals(self):
+        plan = self._pack_plan(depth="compact")
+        anchor = self._image("review-sealed.png", (41, 51, 61))
+        result = create_reference_pack(
+            plan,
+            generate_sheet=lambda _request: anchor,
+            edit_sheet=lambda *_args: self.fail("compact cannot edit"),
+            reviewer=lambda _request: self._pass_review(),
+        )
+        self.assertEqual(len(result.review.artifact_seals), 1)
+        seal = result.review.artifact_seals[0]
+        current = anchor.stat()
+        self.assertEqual((seal.role, seal.index), (plan.output_roles[0], 0))
+        self.assertEqual((seal.device, seal.inode), (current.st_dev, current.st_ino))
+        self.assertEqual(seal.size, current.st_size)
+        self.assertEqual(seal.sha256, self._digest(anchor))
+        public = json.dumps(result.public_metadata())
+        self.assertNotIn(seal.sha256, public)
+        self.assertNotIn(str(anchor), public)
+
+    def test_v2_review_fails_closed_without_stable_descriptor_path(self):
+        plan = self._pack_plan(depth="compact")
+        anchor = self._image("review-no-descriptor.png", (42, 52, 62))
+        reviewer = mock.Mock(side_effect=self._pass_review)
+        with mock.patch.object(
+            reference_sheets, "_review_descriptor_path", return_value=None,
+        ):
+            result = create_reference_pack(
+                plan,
+                generate_sheet=lambda _request: anchor,
+                edit_sheet=lambda *_args: self.fail("compact cannot edit"),
+                reviewer=reviewer,
+            )
+        reviewer.assert_not_called()
+        self.assertEqual(result.review.status, "review_unavailable")
+
+    def test_v2_failed_anchor_regenerates_all_outputs_into_new_files(self):
+        plan = self._pack_plan(depth="standard")
+        generated = []
+        edited = []
+        review_count = 0
+
+        def generate(request):
+            path = self._image(
+                f"anchor-generation-{len(generated)}.png",
+                (30 + len(generated), 40, 50),
+            )
+            generated.append((request, path, self._digest(path)))
+            return path
+
+        def edit(_primary, _anchor, request):
+            path = self._image(
+                f"anchor-derivative-{len(edited)}.png",
+                (60 + len(edited), 70, 80),
+            )
+            edited.append((request, path, self._digest(path)))
+            return path
+
+        def review(_request):
+            nonlocal review_count
+            review_count += 1
+            if review_count == 1:
+                return self._fail_review(plan.anchor_role)
+            return self._pass_review()
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=generate,
+            edit_sheet=edit,
+            repair_sheet=lambda *_args: self.fail(
+                "anchor rejection regenerates instead of mutating"
+            ),
+            reviewer=review,
+            max_repair_attempts=1,
+        )
+        self.assertEqual(result.repaired_roles, (plan.anchor_role,))
+        self.assertEqual(len(generated), 2)
+        self.assertEqual(len(edited), 2 * (len(plan.sheets) - 1))
+        self.assertEqual(
+            [item.provenance.strategy for item in result.artifacts],
+            ["canonical_anchor_regeneration"]
+            + ["reference_guided_regeneration"] * (len(plan.sheets) - 1),
+        )
+        for _request, path, digest in (*generated[:1], *edited[:len(plan.sheets) - 1]):
+            self.assertTrue(path.exists())
+            self.assertEqual(self._digest(path), digest)
+
+    def test_v2_failed_callout_repairs_only_that_authored_output(self):
+        plan = self._pack_plan(
+            depth="compact",
+            detail_callouts=[{"kind": "face", "operation": "reconstruct"}],
+        )
+        anchor = self._image("callout-repair-anchor.png", (81, 91, 101))
+        original_callout = self._image("callout-original.png", (111, 121, 131))
+        repaired_callout = self._image("callout-repaired.png", (141, 151, 161))
+        anchor_digest = self._digest(anchor)
+        original_digest = self._digest(original_callout)
+        review_count = 0
+        repairs = []
+
+        def review(_request):
+            nonlocal review_count
+            review_count += 1
+            if review_count == 1:
+                return self._fail_review(plan.detail_callouts[0].target_role)
+            return self._pass_review()
+
+        def repair(primary, canonical, request):
+            repairs.append((primary, canonical, request))
+            return repaired_callout
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=lambda _request: anchor,
+            edit_sheet=lambda *_args: original_callout,
+            repair_sheet=repair,
+            reviewer=review,
+            max_repair_attempts=1,
+        )
+        self.assertEqual(result.repaired_roles, (plan.detail_callouts[0].target_role,))
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0][0], original_callout.resolve())
+        self.assertEqual(repairs[0][1], anchor.resolve())
+        repaired = result.artifacts[-1]
+        self.assertEqual(repaired.path, repaired_callout.resolve())
+        self.assertEqual(repaired.provenance.strategy, "detail_callout_repair")
+        self.assertEqual(repaired.detail_provenance["source_role"], plan.anchor_role)
+        self.assertEqual(self._digest(anchor), anchor_digest)
+        self.assertEqual(self._digest(original_callout), original_digest)
+
+    def test_v2_depth_types_presets_and_anchor_basis_are_sealed(self):
+        expected_counts = {"compact": 1, "standard": 3, "comprehensive": 5}
+        aliases = {
+            "character": "character", "setting": "location", "item": "prop",
+            "machine": "vehicle", "creature": "creature",
+            "accessory": "wardrobe", "style": "world",
+        }
+        for source_type, canonical in aliases.items():
+            for depth, count in expected_counts.items():
+                with self.subTest(source_type=source_type, depth=depth):
+                    plan = self._pack_plan(
+                        reference_type=source_type,
+                        depth=depth,
+                        editor_model="editor/model",
+                    )
+                    self.assertEqual(plan.reference_type, canonical)
+                    self.assertEqual(len(plan.sheets), count)
+                    self.assertEqual(plan.sheets[0], PACK_ROLE_RECIPES[canonical][0])
+                    self.assertEqual(len(plan.plan_seal), 64)
+        custom = self._pack_plan(depth="custom", sheet_count=2)
+        self.assertEqual(len(custom.sheets), 2)
+        with self.assertRaises(ValueError):
+            self._pack_plan(depth="standard", sheet_count=2)
+        with self.assertRaises(ValueError):
+            self._pack_plan(depth="custom", sheet_count=6)
+
+        anatomy = self._pack_plan(preset="anatomy")
+        self.assertEqual(anatomy.anchor_basis, "anatomy")
+        self.assertEqual(anatomy.anchor_privacy, "private_blurred")
+        clothed = self._pack_plan(anchor_basis="primary_outfit")
+        self.assertEqual(clothed.anchor_basis, "primary_outfit")
+        self.assertNotEqual(anatomy.plan_seal, clothed.plan_seal)
+        with self.assertRaises(ValueError):
+            self._pack_plan(preset="anatomy", anchor_basis="primary_outfit")
+        with self.assertRaises(ValueError):
+            self._pack_plan(reference_type="prop", anchor_basis="anatomy")
+
+    def test_v2_private_output_and_blur_define_truthful_sealed_anchor_privacy(self):
+        seals = set()
+        for private, blurred, expected in (
+            (False, False, "project_visible"),
+            (False, True, "project_blurred"),
+            (True, False, "private_visible"),
+            (True, True, "private_blurred"),
+        ):
+            with self.subTest(private=private, blurred=blurred):
+                plan = self._pack_plan(
+                    private_output=private,
+                    initial_blur=blurred,
+                )
+                preview = plan.public_preview()
+                self.assertEqual(plan.anchor_privacy, expected)
+                self.assertEqual(preview["anchor_privacy"], expected)
+                self.assertEqual(preview["private_output"], private)
+                self.assertEqual(preview["initial_blur"], blurred)
+                seals.add(plan.plan_seal)
+        self.assertEqual(len(seals), 4)
+
+        anatomy = self._pack_plan(preset="anatomy")
+        self.assertTrue(anatomy.private_output)
+        self.assertTrue(anatomy.initial_blur)
+        self.assertEqual(anatomy.anchor_privacy, "private_blurred")
+        forged = replace(anatomy, private_output=False)
+        with self.assertRaisesRegex(ValueError, "unsupported reference-pack plan"):
+            create_reference_pack(
+                forged,
+                generate_sheet=lambda _request: self.fail("must not execute"),
+                edit_sheet=lambda *_args: self.fail("must not execute"),
+            )
+
+    def test_v2_operation_routes_are_complete_bounded_and_part_of_plan_seal(self):
+        standard = self._pack_plan()
+        standard_routes = standard.public_preview()["operation_routing"]
+        self.assertEqual(standard_routes["requested_capability"], "standard")
+        self.assertTrue(all(
+            route["status"] == "standard"
+            for route in standard_routes["operations"].values()
+        ))
+
+        skipped = self._pack_plan(content_capability="unrestricted_local")
+        self.assertTrue(all(
+            route["status"] == "skipped"
+            and route["reason"] == "no_verified_compatible_recipe"
+            and route["requested_model"] == route["resolved_model"]
+            for route in skipped.public_preview()["operation_routing"]["operations"].values()
+        ))
+        self.assertNotEqual(standard.plan_seal, skipped.plan_seal)
+
+        applied_routes = tuple(PackOperationRoute(
+            operation=operation,
+            requested_capability="unrestricted_local",
+            requested_model=(
+                "flux2_dev" if operation == "generation"
+                else "qwen_image_edit_2511_20B_fp8_lightning_8step"
+            ),
+            resolved_model=f"verified_{operation}",
+            status="applied",
+            schedule=PackModelSchedule(
+                model=f"verified_{operation}",
+                steps=10,
+                guidance=1.0,
+                guidance_key="guidance_scale",
+                source="model_default",
+            ),
+            recipe_id=f"verified-{operation}-v1",
+            verification_status="verified",
+        ) for operation in ("generation", "edit", "repair", "callout"))
+        applied = self._pack_plan(
+            content_capability="unrestricted_local",
+            operation_routing=applied_routes,
+        )
+        self.assertNotEqual(applied.plan_seal, skipped.plan_seal)
+        self.assertEqual(
+            applied.public_preview()["operation_routing"]["operations"]["repair"]["resolved_model"],
+            "verified_repair",
+        )
+        forged = replace(applied, operation_routing=tuple(reversed(applied.operation_routing)))
+        with self.assertRaisesRegex(ValueError, "unsupported reference-pack plan"):
+            create_reference_pack(
+                forged,
+                generate_sheet=lambda _request: self.fail("must not execute"),
+                edit_sheet=lambda *_args: self.fail("must not execute"),
+            )
+
+    def test_v2_draft_is_truthfully_unanchored_and_never_edits_or_repairs(self):
+        plan = self._pack_plan(
+            mode="draft",
+            editor_model=None,
+            depth="custom",
+            sheet_count=2,
+        )
+        requests = []
+
+        def generate(request):
+            requests.append(request)
+            return self._image(
+                f"draft-pack-{request.index}.png",
+                (20 + request.index, 30, 40),
+            )
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=generate,
+            edit_sheet=lambda *_args: self.fail("draft cannot edit"),
+            repair_sheet=lambda *_args: self.fail("draft cannot repair"),
+            reviewer=lambda request: self._fail_review(request.sheet_roles[-1]),
+            max_repair_attempts=5,
+        )
+        self.assertEqual([item.strategy for item in requests], ["draft_one_shot"] * 2)
+        self.assertIsNone(plan.anchor_role)
+        self.assertEqual(plan.anchor_strategy, "draft_one_shot")
+        self.assertEqual(result.repair_attempts_used, 0)
+        self.assertEqual(result.review.status, "fail")
+
+    def test_v2_detail_callouts_are_type_discriminated_and_exact_never_reconstructs(self):
+        plan = self._pack_plan(detail_callouts=[{
+            "kind": "garment", "operation": "auto",
+        }])
+        callout = plan.public_preview()["detail_callouts"][0]
+        self.assertEqual(callout["kind"], "garment")
+        self.assertIn(callout["source_role"], plan.sheet_roles)
+        with self.assertRaises(ValueError):
+            self._pack_plan(detail_callouts=[{
+                "kind": "mechanism", "operation": "enhance",
+            }])
+        with self.assertRaises(ValueError):
+            self._pack_plan(
+                intent="exact_spec",
+                detail_callouts=[{"kind": "face", "operation": "reconstruct"}],
+            )
+
+    def test_v2_sufficient_detail_source_uses_deterministic_crop_without_editor(self):
+        plan = self._pack_plan(
+            depth="comprehensive",
+            detail_callouts=[{"kind": "face", "operation": "auto"}],
+        )
+        anchor = self._image("detail-anchor.png", (90, 100, 110))
+        edited_roles = []
+
+        def edit(_primary, _anchor, request):
+            edited_roles.append(request.role)
+            return self._image(
+                f"detail-edit-{request.index}.png",
+                (request.index * 10, 20, 30),
+            )
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=lambda _request: anchor,
+            edit_sheet=edit,
+            reviewer=lambda _request: self._pass_review(),
+        )
+        detail = next(item for item in result.artifacts if item.role.startswith(
+            "detail_callout:builtin:face"
+        ))
+        self.assertIn("identity_details", edited_roles)
+        self.assertEqual(detail.provenance.strategy, "deterministic_crop")
+        self.assertEqual(detail.detail_provenance["resolved_operation"], "crop")
+        self.assertIsNone(detail.detail_provenance["editor_model"])
+        self.assertEqual(len(detail.detail_provenance["source_digest"]), 64)
+
+    def test_v2_ordered_authored_fields_are_sealed_and_public_preview_is_label_free(self):
+        private_label = "PRIVATE_CUSTOM_EXPRESSION"
+        fields = {
+            "poses": [
+                {
+                    "id": "views:front", "label": "front",
+                    "custom": False, "group": "views",
+                },
+                {
+                    "id": "custom:0123456789abcdef",
+                    "label": private_label,
+                    "custom": True, "group": "expressions",
+                },
+            ],
+        }
+        plan = self._pack_plan(type_fields=fields)
+        preview = plan.public_preview()
+        self.assertNotIn(private_label, json.dumps(preview))
+        self.assertEqual(
+            preview["authored_settings"]["type_fields"][0]["items"],
+            [
+                {"id": "views:front", "custom": False, "group": "views"},
+                {
+                    "id": "custom:0123456789abcdef",
+                    "custom": True,
+                    "group": "expressions",
+                },
+            ],
+        )
+        private = plan.private_authored_settings()
+        self.assertEqual(private["type_fields"]["poses"][1]["label"], private_label)
+        self.assertEqual(
+            reference_sheets.reference_pack_authored_settings_seal(private),
+            plan.authored_settings_seal,
+        )
+        with self.assertRaises(ValueError):
+            reference_sheets.reference_pack_authored_settings_seal({
+                "type_fields": {},
+            })
+        reversed_plan = self._pack_plan(type_fields={
+            "poses": list(reversed(fields["poses"])),
+        })
+        self.assertNotEqual(plan.authored_settings_seal, reversed_plan.authored_settings_seal)
+        self.assertNotEqual(plan.plan_seal, reversed_plan.plan_seal)
+        relabeled = self._pack_plan(type_fields={
+            "poses": [fields["poses"][0], {
+                **fields["poses"][1], "label": "PRIVATE_OTHER_EXPRESSION",
+            }],
+        })
+        self.assertNotEqual(plan.plan_seal, relabeled.plan_seal)
+
+    def test_v2_legacy_type_field_is_one_lossless_item(self):
+        authored = "Views: front, profile; Expressions: calm, tense"
+        plan = self._pack_plan(
+            depth="compact",
+            type_fields={"poses": authored},
+        )
+        item = plan.private_authored_settings()["type_fields"]["poses"][0]
+        self.assertEqual(item, {
+            "id": "legacy:poses",
+            "label": authored,
+            "custom": True,
+            "group": "legacy",
+        })
+        result = create_reference_pack(
+            plan,
+            generate_sheet=lambda _request: self._image(
+                "legacy-pack.png", (1, 2, 3), size=plan.sheet_size,
+            ),
+            edit_sheet=lambda *_args: self.fail("compact pack must not edit"),
+            reviewer=lambda _request: self._pass_review(),
+        )
+        self.assertEqual(result.plan.private_authored_settings()["type_fields"], {
+            "poses": [item],
+        })
+        self.assertEqual(result.plan.authored_settings_seal, plan.authored_settings_seal)
+
+    def test_v2_multiple_callouts_execute_as_independent_ordered_targets(self):
+        callouts = [
+            {
+                "custom_id": "builtin:face",
+                "label": "Face",
+                "kind": "face",
+                "operation": "enhance",
+                "source_role": "turnaround",
+            },
+            {
+                "custom_id": "custom:abcdef0123456789",
+                "label": "PRIVATE_CUSTOM_DETAIL",
+                "kind": "custom",
+                "operation": "reconstruct",
+                "source_role": "expressions",
+            },
+        ]
+        plan = self._pack_plan(detail_callouts=callouts)
+        anchor = self._image("multi-callout-anchor.png", (2, 3, 4))
+        produced = {}
+        edit_calls = []
+
+        def edit(primary, canonical, request):
+            edit_calls.append((request, primary, canonical))
+            path = self._image(
+                f"multi-callout-{request.index}.png",
+                (request.index + 20, 30, 40),
+            )
+            produced[request.role] = path
+            return path
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=lambda _request: anchor,
+            edit_sheet=edit,
+            reviewer=lambda _request: self._pass_review(),
+        )
+        self.assertEqual(tuple(item.role for item in result.artifacts), plan.output_roles)
+        detail_calls = [call for call in edit_calls if call[0].detail_custom_id]
+        self.assertEqual(
+            [call[0].detail_custom_id for call in detail_calls],
+            ["builtin:face", "custom:abcdef0123456789"],
+        )
+        self.assertEqual(detail_calls[0][1], produced["turnaround"].resolve())
+        self.assertEqual(detail_calls[1][1], produced["expressions"].resolve())
+        self.assertTrue(all(call[2] == anchor.resolve() for call in detail_calls))
+        public = json.dumps(result.public_metadata())
+        self.assertNotIn("PRIVATE_CUSTOM_DETAIL", public)
+        self.assertIn("custom:abcdef0123456789", public)
+
+        forged_callout = replace(
+            plan.detail_callouts[1], label="TAMPERED_PRIVATE_LABEL",
+        )
+        forged = replace(
+            plan,
+            detail_callouts=(plan.detail_callouts[0], forged_callout),
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported reference-pack plan"):
+            create_reference_pack(
+                forged,
+                generate_sheet=lambda _request: self.fail("must not execute"),
+                edit_sheet=lambda *_args: self.fail("must not execute"),
+            )
+
+    def test_v2_explicit_callout_source_and_mode_constraints_fail_closed(self):
+        forged_source = {
+            "custom_id": "builtin:face", "label": "Face", "kind": "face",
+            "operation": "auto", "source_role": "identity_details",
+        }
+        with self.assertRaisesRegex(ValueError, "source"):
+            self._pack_plan(detail_callouts=[forged_source])
+        with self.assertRaisesRegex(ValueError, "draft packs"):
+            self._pack_plan(
+                mode="draft",
+                editor_model=None,
+                detail_callouts=[{"kind": "face", "operation": "auto"}],
+            )
+        with self.assertRaisesRegex(ValueError, "exact_spec"):
+            self._pack_plan(
+                intent="exact_spec",
+                detail_callouts=[{
+                    **forged_source,
+                    "source_role": "canonical_identity",
+                    "operation": "reconstruct",
+                }],
+            )
+
+    def test_v2_public_metadata_is_prompt_path_and_review_text_free(self):
+        secret = "PRIVATE PACK REQUEST"
+        plan = self._pack_plan(creative_request=secret)
+        anchor = self._image("private-pack-anchor.png", (1, 2, 3))
+
+        def edit(_primary, _anchor, request):
+            return self._image(
+                f"private-pack-{request.index}.png", (request.index, 4, 5),
+            )
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=lambda _request: anchor,
+            edit_sheet=edit,
+            reviewer=lambda _request: self._pass_review(),
+        )
+        public = json.dumps({
+            "pack": result.public_metadata(),
+            "artifacts": [item.public_metadata() for item in result.artifacts],
+        })
+        self.assertNotIn(secret, public)
+        self.assertNotIn(str(self.root), public)
+        self.assertNotIn("creative_request", public)
 
     def test_hybrid_generates_anchor_then_targeted_edits_in_order(self):
         plan = self._plan(mode="hybrid")
@@ -346,6 +983,7 @@ class ReferenceSheetTests(unittest.TestCase):
             generate_panel=generate,
             edit_panel=edit,
             reviewer=lambda _request: self._pass_review(),
+            editor_model="local/editor-model",
         )
         self.assertEqual(calls[0], ("generate", plan.panel_roles[0], "identity_anchor", None))
         self.assertEqual(
@@ -355,6 +993,11 @@ class ReferenceSheetTests(unittest.TestCase):
         self.assertTrue(all(call[3] == anchor.resolve() for call in calls[1:]))
         self.assertEqual(self._digest(anchor), anchor_digest)
         self.assertEqual(result.artifacts[0].provenance.strategy, "anchor_edit")
+        self.assertEqual(result.artifacts[0].model, plan.model)
+        self.assertTrue(all(
+            artifact.model == "local/editor-model"
+            for artifact in result.artifacts[1:-1]
+        ))
 
     def test_hybrid_rejects_edit_reusing_anchor_output(self):
         plan = self._plan(mode="hybrid")
@@ -441,6 +1084,62 @@ class ReferenceSheetTests(unittest.TestCase):
         with self.assertRaises(ReferenceSheetReviewError):
             parse_semantic_review_result(invalid, allowed_roles=plan.panel_roles)
 
+    def test_unrestricted_pack_review_is_bounded_authored_register_fidelity_qa(self):
+        with self.assertRaises(ValueError):
+            self._pack_plan(
+                content_capability="unrestricted_local",
+                review_contract="standard_fidelity_v1",
+            )
+        plan = self._pack_plan(
+            depth="compact",
+            content_capability="unrestricted_local",
+            review_selection=PackIntelligenceSelection(
+                "chosen-vlm", "chosen-vlm", "local", "a" * 64,
+            ),
+        )
+        artifact = ReferencePackArtifact(
+            path=self._image("unrestricted-review.png", (20, 40, 60), plan.sheet_size),
+            role=plan.output_roles[0],
+            index=0,
+            model=plan.generation_model,
+            provenance=ArtifactProvenance("local_generation", plan.planner_version),
+            anchor_role=plan.anchor_role,
+        )
+        request = build_reference_pack_review_request(plan, (artifact,))
+        checks = request.response_schema["properties"]["checks"]["required"]
+        self.assertEqual(checks[-4:], [
+            "overall_fidelity",
+            "mature_register_fidelity",
+            "violent_register_fidelity",
+            "detail_register_fidelity",
+        ])
+        self.assertIn("explicitly requested by the author", request.instruction)
+        self.assertIn("without inference", request.instruction)
+        for prohibited in (
+            "content moderation", "permissibility decisions",
+            "maturity classification", "refusal analysis",
+        ):
+            self.assertIn(prohibited, request.instruction)
+        payload = {
+            "status": "fail",
+            "checks": {name: name != "detail_register_fidelity" for name in checks},
+            "failed_roles": [artifact.role],
+            "reason_codes": ["detail_register_mismatch"],
+        }
+        parsed = parse_semantic_review_result(
+            payload,
+            allowed_roles=plan.output_roles,
+            check_names=checks,
+        )
+        self.assertEqual(parsed.failed_roles, (artifact.role,))
+        self.assertEqual(parsed.reason_codes, ("detail_register_mismatch",))
+        payload["critique"] = "must never cross the strict contract"
+        with self.assertRaises(ReferenceSheetReviewError):
+            parse_semantic_review_result(
+                payload,
+                allowed_roles=plan.output_roles,
+                check_names=checks,
+            )
     def test_malformed_missing_or_throwing_review_is_review_unavailable(self):
         plan = self._plan()
         sheet = self._image("review.png", (2, 3, 4))
@@ -535,6 +1234,106 @@ class ReferenceSheetTests(unittest.TestCase):
             (plan.panel_roles[0],),
         )
 
+    def test_semantic_repair_loop_stops_exactly_at_five_attempts(self):
+        plan = self._plan()
+        repairs = []
+        reviews = []
+
+        def generate(request):
+            return self._image(
+                f"bounded-{request.index}.png",
+                (request.index * 13, request.index * 17, request.index * 19),
+            )
+
+        def review(request):
+            reviews.append(request.sheet_path)
+            return self._fail_review(plan.panel_roles[0])
+
+        def repair(path, request):
+            repairs.append((path, request.role))
+            return self._image(
+                f"bounded-repair-{len(repairs)}.png",
+                (200, 150 + len(repairs), 100),
+            )
+
+        result = create_reference_sheet(
+            plan,
+            self.outputs / "bounded-five.png",
+            generate_panel=generate,
+            reviewer=review,
+            repair_panel=repair,
+            max_repair_attempts=5,
+        )
+        self.assertEqual(len(repairs), 5)
+        self.assertEqual(len(reviews), 6)
+        self.assertEqual(len(set(reviews)), 6)
+        self.assertEqual(
+            [role for _path, role in repairs],
+            [plan.panel_roles[0]] * 5,
+        )
+        self.assertEqual(result.review.status, "fail")
+        self.assertEqual(result.repair_attempts_used, 5)
+        self.assertEqual(result.max_repair_attempts, 5)
+        self.assertEqual(result.repaired_roles, (plan.panel_roles[0],) * 5)
+        self.assertTrue(result.sheet_path.is_file())
+        metadata = result.public_metadata()
+        self.assertEqual(metadata["max_repair_attempts"], 5)
+        self.assertEqual(metadata["repair_attempts_used"], 5)
+        self.assertEqual(metadata["generation_model"], plan.model)
+
+    def test_zero_budget_and_draft_never_repair_panels(self):
+        production = self._plan()
+
+        def generate(request):
+            return self._image(
+                f"zero-{request.index}.png", (request.index * 11, 80, 90),
+            )
+
+        production_result = create_reference_sheet(
+            production,
+            self.outputs / "zero-budget.png",
+            generate_panel=generate,
+            reviewer=lambda _request: self._fail_review(
+                production.panel_roles[0],
+            ),
+            repair_panel=lambda *_args: self.fail("zero budget must not repair"),
+            max_repair_attempts=0,
+        )
+        self.assertEqual(production_result.review.status, "fail")
+        self.assertEqual(production_result.repair_attempts_used, 0)
+
+        draft = self._plan(mode="draft")
+        draft_source = self._image(
+            "no-repair-draft.png", (1, 2, 3), draft.draft_size,
+        )
+        draft_result = create_reference_sheet(
+            draft,
+            self.outputs / "no-repair-draft-sheet.png",
+            generate_draft=lambda _request: draft_source,
+            reviewer=lambda _request: self._fail_review(draft.panel_roles[0]),
+            repair_panel=lambda *_args: self.fail("draft must not repair"),
+            max_repair_attempts=5,
+        )
+        self.assertEqual(draft_result.review.status, "fail")
+        self.assertEqual(draft_result.max_repair_attempts, 5)
+        self.assertEqual(draft_result.repair_attempts_used, 0)
+
+    def test_service_repair_budget_rejects_values_outside_zero_through_five(self):
+        plan = self._plan()
+        for value in (-1, 6, True, 1.0):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "max_repair_attempts"),
+            ):
+                create_reference_sheet(
+                    plan,
+                    self.outputs / f"invalid-budget-{value}.png",
+                    generate_panel=lambda _request: self.fail(
+                        "invalid budget must fail before generation",
+                    ),
+                    max_repair_attempts=value,
+                )
+
     def test_one_structurally_invalid_panel_can_be_repaired_once(self):
         plan = self._plan()
         last_role = plan.panel_roles[-1]
@@ -586,6 +1385,40 @@ class ReferenceSheetTests(unittest.TestCase):
             )
         self.assertEqual(repairs, [plan.panel_roles[0]])
         self.assertFalse((self.outputs / "multi-invalid.png").exists())
+
+    def test_structural_repair_loop_revalidates_in_recipe_order(self):
+        plan = self._plan()
+        bad_roles = set(plan.panel_roles[:2])
+        repairs = []
+
+        def generate(request):
+            size = (95, 80) if request.role in bad_roles else plan.panel_size
+            return self._image(
+                f"multi-bounded-{request.index}.png",
+                (20 + request.index, 30, 40),
+                size,
+            )
+
+        def repair(_path, request):
+            repairs.append(request.role)
+            return self._image(
+                f"multi-fixed-{len(repairs)}.png",
+                (90, 80, 70),
+                plan.panel_size,
+            )
+
+        result = create_reference_sheet(
+            plan,
+            self.outputs / "multi-fixed-sheet.png",
+            generate_panel=generate,
+            reviewer=lambda _request: self._pass_review(),
+            repair_panel=repair,
+            max_repair_attempts=2,
+        )
+        self.assertEqual(repairs, list(plan.panel_roles[:2]))
+        self.assertEqual(result.repaired_roles, plan.panel_roles[:2])
+        self.assertEqual(result.repair_attempts_used, 2)
+        self.assertEqual(result.review.status, "pass")
 
     def test_forged_or_stale_plans_are_rejected_at_execution_boundary(self):
         plan = self._plan()
@@ -681,6 +1514,59 @@ class ReferenceSheetTests(unittest.TestCase):
             )
         self.assertFalse((self.outputs / "atomic-final.png").exists())
         self.assertEqual(list(self.outputs.iterdir()), [])
+
+    def test_repair_failure_never_deletes_interval_stage_replacement(self):
+        plan = self._plan()
+        for replacement_kind in ("regular", "symlink"):
+            if replacement_kind == "symlink" and not hasattr(os, "symlink"):
+                continue
+            with self.subTest(replacement_kind=replacement_kind):
+                reviewed_paths = []
+
+                def generate(request):
+                    return self._image(
+                        f"interval-{replacement_kind}-{request.index}.png",
+                        (40 + request.index, 50, 60),
+                    )
+
+                def review(request):
+                    reviewed_paths.append(request.sheet_path)
+                    return self._fail_review(plan.panel_roles[0])
+
+                external = self._image(
+                    f"interval-external-{replacement_kind}.png",
+                    (1, 2, 3),
+                )
+
+                def replace_then_fail(_path, _request):
+                    stage = reviewed_paths[-1]
+                    self.assertFalse(stage.exists())
+                    if replacement_kind == "regular":
+                        stage.write_bytes(b"unowned-regular-replacement")
+                    else:
+                        stage.symlink_to(external)
+                    raise RuntimeError("synthetic repair failure")
+
+                final = self.outputs / f"interval-{replacement_kind}.png"
+                with self.assertRaisesRegex(
+                    RuntimeError, "synthetic repair failure",
+                ):
+                    create_reference_sheet(
+                        plan,
+                        final,
+                        generate_panel=generate,
+                        reviewer=review,
+                        repair_panel=replace_then_fail,
+                    )
+                stage = reviewed_paths[-1]
+                self.assertFalse(final.exists())
+                if replacement_kind == "regular":
+                    self.assertEqual(
+                        stage.read_bytes(), b"unowned-regular-replacement",
+                    )
+                else:
+                    self.assertTrue(stage.is_symlink())
+                    self.assertEqual(stage.resolve(), external.resolve())
 
     def test_concurrent_final_creation_is_preserved_and_stage_is_cleaned(self):
         plan = self._plan()

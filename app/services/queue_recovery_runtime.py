@@ -30,6 +30,7 @@ MAX_RECOVERY_ATTEMPTS = 3
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UNIT_ID_RE = re.compile(r"^unit:v1:[0-9a-f]{64}$")
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+_MANIFEST_REVISION_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 class QueueRecoveryRuntimeError(RuntimeError):
@@ -181,6 +182,131 @@ def _read_exact_file(
         os.close(descriptor)
 
 
+def _open_private_directory(path: Path) -> int:
+    """Open one unchanged real private directory without following its leaf."""
+    try:
+        before = os.lstat(path)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        raise QueueRecoveryRuntimeError(
+            "Recovery manifest directory is unsafe."
+        ) from None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or (os.name != "nt" and stat.S_IMODE(opened.st_mode) & 0o077)
+        ):
+            raise QueueRecoveryRuntimeError(
+                "Recovery manifest directory is unsafe."
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _manifest_dir_fd_supported() -> bool:
+    supported = getattr(os, "supports_dir_fd", set())
+    return all(function in supported for function in (os.open, os.stat, os.unlink))
+
+
+def _private_directory_identity(path: Path) -> tuple[int, int]:
+    """Validate a no-link private directory for platforms without openat."""
+    try:
+        info = os.lstat(path)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or os.path.normcase(os.path.realpath(path))
+            != os.path.normcase(os.path.abspath(path))
+            or (os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077)
+        ):
+            raise QueueRecoveryRuntimeError(
+                "Recovery manifest directory is unsafe."
+            )
+        return info.st_dev, info.st_ino
+    except OSError:
+        raise QueueRecoveryRuntimeError(
+            "Recovery manifest directory is unsafe."
+        ) from None
+
+
+def _read_exact_file_at(
+    directory_descriptor: int,
+    filename: str,
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    """Read one unchanged manifest relative to a no-follow directory handle."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(filename, flags, dir_fd=directory_descriptor)
+    except OSError:
+        raise QueueRecoveryRuntimeError(
+            "Recovery evidence could not be opened safely."
+        ) from None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size < 1
+            or opened.st_size > maximum_bytes
+        ):
+            raise QueueRecoveryRuntimeError(
+                "Recovery evidence has an unsafe size or type."
+            )
+        chunks: list[bytes] = []
+        remaining = int(opened.st_size)
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise QueueRecoveryRuntimeError(
+                    "Recovery evidence ended unexpectedly."
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise QueueRecoveryRuntimeError(
+                "Recovery evidence changed while it was read."
+            )
+        refreshed = os.fstat(descriptor)
+        current = os.stat(
+            filename,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            != (refreshed.st_dev, refreshed.st_ino, refreshed.st_size, refreshed.st_mtime_ns)
+            or (current.st_dev, current.st_ino) != (refreshed.st_dev, refreshed.st_ino)
+        ):
+            raise QueueRecoveryRuntimeError(
+                "Recovery evidence changed while it was read."
+            )
+        return b"".join(chunks)
+    except OSError:
+        raise QueueRecoveryRuntimeError(
+            "Recovery evidence could not be read safely."
+        ) from None
+    finally:
+        os.close(descriptor)
+
+
 def _validated_project_root(project_directory: os.PathLike[str] | str) -> Path:
     root = Path(os.path.abspath(os.fspath(project_directory)))
     try:
@@ -233,10 +359,48 @@ def _verify_directory_identity(path: Path, identity: tuple[int, int]) -> None:
         raise QueueRecoveryRuntimeError("Recovery directory changed during access.")
 
 
-def _manifest_relative_path(job_id: str) -> str:
+def _manifest_relative_path(
+    job_id: str,
+    revision: str | None = None,
+) -> str:
     if not isinstance(job_id, str) or _JOB_ID_RE.fullmatch(job_id) is None:
         raise QueueRecoveryRuntimeError("Recovery job identity is invalid.")
-    return f"{MANIFEST_DIRECTORY}/{job_id}.request.json"
+    if revision is None:
+        filename = f"{job_id}.request.json"
+    elif (
+        not isinstance(revision, str)
+        or _MANIFEST_REVISION_RE.fullmatch(revision) is None
+    ):
+        raise QueueRecoveryRuntimeError("Recovery manifest revision is invalid.")
+    else:
+        filename = f"{job_id}.{revision}.request.json"
+    return f"{MANIFEST_DIRECTORY}/{filename}"
+
+
+def _pointer_relative_path(
+    pointer: Mapping[str, Any],
+    *,
+    expected_job_id: str,
+) -> str:
+    """Accept the initial pointer or one immutable versioned successor."""
+    relative = pointer.get("path") if isinstance(pointer, Mapping) else None
+    if not isinstance(relative, str):
+        raise QueueRecoveryRuntimeError("Recovery manifest pointer is invalid.")
+    path = PurePosixPath(relative)
+    if path.parent != PurePosixPath(MANIFEST_DIRECTORY):
+        raise QueueRecoveryRuntimeError("Recovery manifest pointer is invalid.")
+    initial = _manifest_relative_path(expected_job_id)
+    if relative == initial:
+        return relative
+    prefix = f"{expected_job_id}."
+    suffix = ".request.json"
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        raise QueueRecoveryRuntimeError("Recovery manifest pointer is invalid.")
+    revision = name[len(prefix):-len(suffix)]
+    if _MANIFEST_REVISION_RE.fullmatch(revision) is None:
+        raise QueueRecoveryRuntimeError("Recovery manifest pointer is invalid.")
+    return relative
 
 
 def atomic_write_request_manifest(
@@ -247,8 +411,45 @@ def atomic_write_request_manifest(
     inputs: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Write a project-local mode-0600 manifest and return its safe pointer."""
+    return _write_request_manifest(
+        project_directory,
+        job_id=job_id,
+        params=params,
+        inputs=inputs,
+        revision=None,
+        create_only=False,
+    )
+
+
+def write_sealed_request_manifest(
+    project_directory: os.PathLike[str] | str,
+    *,
+    job_id: str,
+    params: Mapping[str, Any],
+    inputs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Create one immutable private manifest version for prepared content."""
+    return _write_request_manifest(
+        project_directory,
+        job_id=job_id,
+        params=params,
+        inputs=inputs,
+        revision=uuid.uuid4().hex,
+        create_only=True,
+    )
+
+
+def _write_request_manifest(
+    project_directory: os.PathLike[str] | str,
+    *,
+    job_id: str,
+    params: Mapping[str, Any],
+    inputs: Sequence[Mapping[str, Any]],
+    revision: str | None,
+    create_only: bool,
+) -> dict[str, Any]:
     root = _validated_project_root(project_directory)
-    relative = _manifest_relative_path(job_id)
+    relative = _manifest_relative_path(job_id, revision)
     recovery_dir = root / MANIFEST_DIRECTORY
     try:
         recovery_dir, recovery_identity = _ensure_private_directory(recovery_dir)
@@ -283,7 +484,16 @@ def atomic_write_request_manifest(
         os.close(descriptor)
         descriptor = -1
         _verify_directory_identity(recovery_dir, recovery_identity)
-        os.replace(temporary, destination)
+        if create_only:
+            # The version name is random and must never replace prior sealed
+            # content. Linking a fully fsynced temporary file publishes it
+            # atomically; an unreferenced crash orphan is cleaned on restart.
+            os.link(temporary, destination)
+            os.unlink(temporary)
+            temporary = ""
+        else:
+            os.replace(temporary, destination)
+            temporary = ""
         replaced = True
         os.chmod(destination, 0o600)
         _fsync_directory(recovery_dir)
@@ -313,10 +523,13 @@ def load_request_manifest(
 ) -> dict[str, Any]:
     """Load one exact manifest after relative path, size, hash, and schema checks."""
     root = _validated_project_root(project_directory)
-    expected_relative = _manifest_relative_path(expected_job_id)
     if not isinstance(pointer, Mapping) or set(pointer) != {"path", "schema", "sha256", "size"}:
         raise QueueRecoveryRuntimeError("Recovery manifest pointer is invalid.")
-    if pointer.get("path") != expected_relative or pointer.get("schema") != MANIFEST_SCHEMA:
+    expected_relative = _pointer_relative_path(
+        pointer,
+        expected_job_id=expected_job_id,
+    )
+    if pointer.get("schema") != MANIFEST_SCHEMA:
         raise QueueRecoveryRuntimeError("Recovery manifest pointer is invalid.")
     digest = pointer.get("sha256")
     size = pointer.get("size")
@@ -328,8 +541,25 @@ def load_request_manifest(
         or size > MAX_MANIFEST_BYTES
     ):
         raise QueueRecoveryRuntimeError("Recovery manifest pointer is invalid.")
-    path = root / PurePosixPath(expected_relative)
-    raw = _read_exact_file(path, maximum_bytes=MAX_MANIFEST_BYTES)
+    filename = PurePosixPath(expected_relative).name
+    recovery_directory = root / MANIFEST_DIRECTORY
+    if _manifest_dir_fd_supported():
+        directory_descriptor = _open_private_directory(recovery_directory)
+        try:
+            raw = _read_exact_file_at(
+                directory_descriptor,
+                filename,
+                maximum_bytes=MAX_MANIFEST_BYTES,
+            )
+        finally:
+            os.close(directory_descriptor)
+    else:
+        identity = _private_directory_identity(recovery_directory)
+        raw = _read_exact_file(
+            recovery_directory / filename,
+            maximum_bytes=MAX_MANIFEST_BYTES,
+        )
+        _verify_directory_identity(recovery_directory, identity)
     actual_size = len(raw)
     actual_digest = hashlib.sha256(raw).hexdigest()
     if actual_size != size or actual_digest != digest:
@@ -350,6 +580,114 @@ def load_request_manifest(
     ):
         raise QueueRecoveryRuntimeError("Recovery manifest schema is invalid.")
     return manifest
+
+
+def discover_request_manifest_pointers(
+    project_directory: os.PathLike[str] | str,
+    *,
+    expected_sha256: str = "",
+    maximum_candidates: int = 128,
+) -> list[dict[str, Any]]:
+    """Return bounded content-free pointers for valid sealed manifests.
+
+    This is a host-local recovery primitive, not a public listing API.  It
+    never returns params or inputs, and every candidate is reloaded through
+    the same no-follow/hash/schema validation as a journal-owned pointer.
+    """
+    root = _validated_project_root(project_directory)
+    recovery_directory = root / MANIFEST_DIRECTORY
+    expected = str(expected_sha256 or "")
+    if expected and _SHA256_RE.fullmatch(expected) is None:
+        raise QueueRecoveryRuntimeError(
+            "Recovery manifest assertion is invalid."
+        )
+    limit = max(1, min(1024, int(maximum_candidates)))
+    if not os.path.lexists(recovery_directory):
+        return []
+    directory_descriptor = None
+    identity = None
+    try:
+        if _manifest_dir_fd_supported():
+            directory_descriptor = _open_private_directory(
+                recovery_directory
+            )
+            names = sorted(os.listdir(directory_descriptor))
+        else:
+            identity = _private_directory_identity(recovery_directory)
+            names = sorted(os.listdir(recovery_directory))
+            _verify_directory_identity(recovery_directory, identity)
+    except OSError:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+            directory_descriptor = None
+        raise QueueRecoveryRuntimeError(
+            "Recovery manifest discovery is unavailable."
+        ) from None
+    manifest_names = [
+        name for name in names
+        if isinstance(name, str)
+        and name.endswith(".request.json")
+        and name == os.path.basename(name)
+    ]
+    if len(manifest_names) > limit:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+            directory_descriptor = None
+        raise QueueRecoveryRuntimeError(
+            "Recovery manifest candidate set is too large."
+        )
+    discovered: list[dict[str, Any]] = []
+    try:
+        for name in manifest_names:
+            raw = (
+                _read_exact_file_at(
+                    directory_descriptor, name,
+                    maximum_bytes=MAX_MANIFEST_BYTES,
+                )
+                if directory_descriptor is not None
+                else _read_exact_file(
+                    recovery_directory / name,
+                    maximum_bytes=MAX_MANIFEST_BYTES,
+                )
+            )
+            if identity is not None:
+                _verify_directory_identity(recovery_directory, identity)
+            size = len(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            if expected and digest != expected:
+                continue
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, ValueError, TypeError):
+                raise QueueRecoveryRuntimeError(
+                    "Recovery manifest discovery found malformed evidence."
+                ) from None
+            job_id = payload.get("job_id") if isinstance(payload, dict) else None
+            pointer = {
+                "path": f"{MANIFEST_DIRECTORY}/{name}",
+                "schema": MANIFEST_SCHEMA,
+                "sha256": digest,
+                "size": size,
+            }
+            if (
+                not isinstance(job_id, str)
+                or type(payload) is not dict
+                or set(payload) != {"inputs", "job_id", "params", "schema"}
+                or payload.get("schema") != MANIFEST_SCHEMA
+                or type(payload.get("params")) is not dict
+                or type(payload.get("inputs")) is not list
+                or any(type(item) is not dict for item in payload["inputs"])
+                or _canonical_json(payload) != raw
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "Recovery manifest discovery found invalid evidence."
+                )
+            _pointer_relative_path(pointer, expected_job_id=job_id)
+            discovered.append({"job_id": job_id, "pointer": pointer})
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+    return discovered
 
 
 def validate_manifest_inputs(
@@ -374,7 +712,9 @@ def cleanup_orphan_request_manifests(
     """Bound cleanup to unreferenced request manifests in one project."""
     root = _validated_project_root(project_directory)
     recovery_dir = root / MANIFEST_DIRECTORY
-    if not recovery_dir.is_dir() or recovery_dir.is_symlink():
+    if not os.path.lexists(recovery_dir):
+        return 0
+    if not _manifest_dir_fd_supported():
         return 0
     live = {
         value
@@ -384,30 +724,36 @@ def cleanup_orphan_request_manifests(
         and PurePosixPath(value).parent == PurePosixPath(MANIFEST_DIRECTORY)
     }
     removed = 0
+    directory_descriptor = None
     try:
-        entries = sorted(os.scandir(recovery_dir), key=lambda item: item.name)
-    except OSError:
+        directory_descriptor = _open_private_directory(recovery_dir)
+        names = sorted(os.listdir(directory_descriptor))
+    except (OSError, QueueRecoveryRuntimeError):
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
         return 0
-    for entry in entries:
-        if removed >= max(0, min(1024, int(maximum_removals))):
-            break
-        relative = f"{MANIFEST_DIRECTORY}/{entry.name}"
-        if (
-            relative in live
-            or not entry.name.endswith(".request.json")
-            or not entry.is_file(follow_symlinks=False)
-        ):
-            continue
-        try:
-            info = os.lstat(entry.path)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+    try:
+        for name in names:
+            if removed >= max(0, min(1024, int(maximum_removals))):
+                break
+            relative = f"{MANIFEST_DIRECTORY}/{name}"
+            if relative in live or not name.endswith(".request.json"):
                 continue
-            os.unlink(entry.path)
-            removed += 1
-        except OSError:
-            continue
-    if removed:
-        _fsync_directory(recovery_dir)
+            try:
+                info = os.stat(
+                    name, dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    continue
+                os.unlink(name, dir_fd=directory_descriptor)
+                removed += 1
+            except OSError:
+                continue
+        if removed:
+            os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
     return removed
 
 
@@ -425,16 +771,32 @@ def remove_request_manifest(
         or not PurePosixPath(relative).name.endswith(".request.json")
     ):
         return False
-    path = root / PurePosixPath(relative)
+    filename = PurePosixPath(relative).name
+    recovery_directory = root / MANIFEST_DIRECTORY
+    if not _manifest_dir_fd_supported():
+        # A path-based unlink can be redirected through a parent junction
+        # between validation and deletion. Leave the immutable orphan for a
+        # platform cleanup path rather than risk deleting outside the project.
+        return False
     try:
-        info = os.lstat(path)
+        directory_descriptor = _open_private_directory(recovery_directory)
+    except QueueRecoveryRuntimeError:
+        return False
+    try:
+        info = os.stat(
+            filename,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             return False
-        os.unlink(path)
-        _fsync_directory(path.parent)
+        os.unlink(filename, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
         return True
     except OSError:
         return False
+    finally:
+        os.close(directory_descriptor)
 
 
 def ensure_recovery_staging_directory(
@@ -515,13 +877,7 @@ def cleanup_orphan_staged_outputs(
     """Bound cleanup of stable native staging files for terminal jobs."""
     root = _validated_project_root(project_directory)
     recovery_dir = root / MANIFEST_DIRECTORY
-    staging_dir = recovery_dir / "staging"
-    if (
-        not recovery_dir.is_dir()
-        or recovery_dir.is_symlink()
-        or not staging_dir.is_dir()
-        or staging_dir.is_symlink()
-    ):
+    if not os.path.lexists(recovery_dir) or not _manifest_dir_fd_supported():
         return 0
     live_prefixes = tuple(
         f"unit-{job_id}-"
@@ -530,29 +886,60 @@ def cleanup_orphan_staged_outputs(
     )
     limit = max(0, min(1024, int(maximum_removals)))
     removed = 0
+    recovery_descriptor = None
+    staging_descriptor = None
     try:
-        entries = sorted(os.scandir(staging_dir), key=lambda item: item.name)
-    except OSError:
-        return 0
-    for entry in entries:
-        if removed >= limit:
-            break
+        recovery_descriptor = _open_private_directory(recovery_dir)
+        staging_descriptor = os.open(
+            "staging",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=recovery_descriptor,
+        )
+        staging_info = os.fstat(staging_descriptor)
         if (
-            not entry.name.startswith("unit-")
-            or any(entry.name.startswith(prefix) for prefix in live_prefixes)
-            or not entry.is_file(follow_symlinks=False)
+            not stat.S_ISDIR(staging_info.st_mode)
+            or (os.name != "nt" and stat.S_IMODE(staging_info.st_mode) & 0o077)
         ):
-            continue
-        try:
-            info = os.lstat(entry.path)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise QueueRecoveryRuntimeError(
+                "Recovery staging directory is unsafe."
+            )
+        names = sorted(os.listdir(staging_descriptor))
+    except (OSError, QueueRecoveryRuntimeError):
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
+            staging_descriptor = None
+        return 0
+    finally:
+        if recovery_descriptor is not None:
+            os.close(recovery_descriptor)
+    try:
+        for name in names:
+            if removed >= limit:
+                break
+            if (
+                not name.startswith("unit-")
+                or any(name.startswith(prefix) for prefix in live_prefixes)
+            ):
                 continue
-            os.unlink(entry.path)
-            removed += 1
-        except OSError:
-            continue
-    if removed:
-        _fsync_directory(staging_dir)
+            try:
+                info = os.stat(
+                    name, dir_fd=staging_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    continue
+                os.unlink(name, dir_fd=staging_descriptor)
+                removed += 1
+            except OSError:
+                continue
+        if removed:
+            os.fsync(staging_descriptor)
+    finally:
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
     return removed
 
 
@@ -893,6 +1280,7 @@ __all__ = [
     "atomic_write_request_manifest",
     "cleanup_orphan_request_manifests",
     "cleanup_orphan_staged_outputs",
+    "discover_request_manifest_pointers",
     "ensure_recovery_staging_directory",
     "load_request_manifest",
     "next_recovery_attempt",

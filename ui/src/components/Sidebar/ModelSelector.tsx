@@ -1,7 +1,7 @@
-import { ChevronDown, Check, Plus } from 'lucide-react'
+import { ChevronDown, Check, HardDrive, Loader2, Plus } from 'lucide-react'
 import { useState, useRef, useEffect } from 'react'
 import { useStore, getFamiliesForMode, getModelsForFamily } from '../../stores/useStore'
-import { fetchH3AccelerationStatus } from '../../api/client'
+import { fetchH3AccelerationStatus, verifyManualCheckpoint } from '../../api/client'
 import { InfoTooltip } from './InfoTooltip'
 
 export function ModelSelector() {
@@ -19,8 +19,18 @@ export function ModelSelector() {
   )
   const refreshH3Compatibility = useStore(s => s.refreshH3ModelProfileCompatibility)
   const openModelVisibility = useStore(s => s.openModelVisibility)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const machineControls = useStore(s => s.accessContext?.machine_controls === true)
+  const hostTerms = useStore(s => s.hostTerms)
+  const hostTermsLoading = useStore(s => s.hostTermsLoading)
+  const hostTermsError = useStore(s => s.hostTermsError)
+  const loadHostTerms = useStore(s => s.loadHostTerms)
+  const acceptHostTerm = useStore(s => s.acceptHostTerm)
+  const loadModels = useStore(s => s.loadModels)
 
   const [open, setOpen] = useState(false)
+  const [verifyingManualCheckpoint, setVerifyingManualCheckpoint] = useState(false)
+  const [manualVerificationError, setManualVerificationError] = useState('')
   const [w4a8Capability, setW4a8Capability] = useState<{ available: boolean; reason: string } | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -78,6 +88,43 @@ export function ModelSelector() {
   const audioSubMode = useStore(s => s.audioSubMode)
 
   const currentModel = models.find(m => m.model_type === currentModelType)
+  const pendingRequirements = (currentModel?.required_host_terms || []).filter(
+    requirement => hostTerms?.[requirement.term]?.accepted !== true,
+  )
+  const manualVerificationPending = Boolean(
+    currentModel?.downloadable === false
+    && currentModel.manual_checkpoint_verification_required
+    && !currentModel.manual_checkpoint_verified,
+  )
+
+  useEffect(() => {
+    setManualVerificationError('')
+  }, [currentModelType])
+
+  const verifyCurrentManualCheckpoint = async () => {
+    if (!currentModel || pendingRequirements.length > 0) return
+    setVerifyingManualCheckpoint(true)
+    setManualVerificationError('')
+    try {
+      await verifyManualCheckpoint(currentModel.model_type)
+      await loadModels()
+    } catch (error) {
+      setManualVerificationError(
+        error instanceof Error ? error.message : 'Manual checkpoint verification failed.',
+      )
+    } finally {
+      setVerifyingManualCheckpoint(false)
+    }
+  }
+
+  useEffect(() => {
+    if (
+      activeWorkspace
+      && (currentModel?.required_host_terms?.length || 0) > 0
+      && !hostTerms
+      && !hostTermsLoading
+    ) void loadHostTerms()
+  }, [activeWorkspace, currentModel, hostTerms, hostTermsLoading, loadHostTerms])
   const effectiveSubMode = generationMode === 'avatar' ? editSubMode : undefined
   const effectiveAudioSubMode = generationMode === 'audio' ? audioSubMode : undefined
   const modeFamilies = getFamiliesForMode(generationMode, families, effectiveSubMode, effectiveAudioSubMode)
@@ -110,6 +157,55 @@ export function ModelSelector() {
         </span>
         <ChevronDown size={14} className={`shrink-0 text-text-muted transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
+
+      {pendingRequirements.map(requirement => (
+        <div key={requirement.term} role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
+          <p>{requirement.notice}</p>
+          <div className="mt-1 flex items-center gap-2">
+            <a href={requirement.license_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Review exact terms</a>
+            <button
+              type="button"
+              disabled={hostTermsLoading || !hostTerms}
+              onClick={() => { void acceptHostTerm(requirement.term) }}
+              className="rounded border border-amber-400/40 px-1.5 py-0.5 text-[9px] font-medium text-amber-100 disabled:opacity-40"
+            >
+              Accept for this host
+            </button>
+          </div>
+        </div>
+      ))}
+      {pendingRequirements.length > 0 && hostTermsError && (
+        <p role="status" className="mt-1 text-[9px] text-red-300">{hostTermsError}</p>
+      )}
+      {currentModel?.downloadable === false && (
+        <div role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
+          {currentModel.manual_checkpoint_verified ? (
+            <p>Exact local checkpoint verified for this host. Routine catalog polling does not re-hash it.</p>
+          ) : (
+            <>
+              <p>Manual install required. Place the exact published checkpoint in a linked or local model folder, then verify its byte size and SHA-256. Maestro will not download this checkpoint.</p>
+              {manualVerificationPending && machineControls && (
+                <button
+                  type="button"
+                  disabled={verifyingManualCheckpoint || pendingRequirements.length > 0}
+                  onClick={() => { void verifyCurrentManualCheckpoint() }}
+                  className="mt-1 inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5 font-medium text-amber-100 disabled:opacity-40"
+                >
+                  {verifyingManualCheckpoint ? <Loader2 size={9} className="animate-spin" /> : <HardDrive size={9} />}
+                  {verifyingManualCheckpoint ? 'Verifying local checkpoint…' : 'Verify local checkpoint'}
+                </button>
+              )}
+              {manualVerificationPending && !machineControls && (
+                <p className="mt-1 text-amber-200">Verify this host-global checkpoint from Maestro on the local machine.</p>
+              )}
+              {!currentModel.manual_checkpoint_verification_required && (
+                <p className="mt-1 text-red-300">No supported exact verification contract is available for this recipe.</p>
+              )}
+            </>
+          )}
+          {manualVerificationError && <p className="mt-1 text-red-300">{manualVerificationError}</p>}
+        </div>
+      )}
 
       {/* Dropdown (opens upward) */}
       {open && (
@@ -198,7 +294,7 @@ export function ModelSelector() {
 }
 
 function ModelBadges({ model }: {
-  model: { model_type: string; is_i2v: boolean; is_t2v: boolean; supports_end_frame?: boolean; supports_audio?: boolean; supports_audio_input?: boolean; generates_audio?: boolean; supports_ref_images?: boolean }
+  model: { model_type: string; is_i2v: boolean; is_t2v: boolean; supports_end_frame?: boolean; supports_audio?: boolean; supports_audio_input?: boolean; generates_audio?: boolean; supports_ref_images?: boolean; downloadable?: boolean; manual_checkpoint_verified?: boolean }
 }) {
   const badges: Array<{ label: string; title?: string }> = []
   if (model.model_type === 'minimax_h3_pinkcherry_fl2va') badges.push({ label: 'Explicit FL2VA' })
@@ -211,6 +307,12 @@ function ModelBadges({ model }: {
   if (model.supports_audio_input) badges.push({ label: 'Audio In', title: 'Accepts audio conditioning' })
   if (model.supports_audio && !model.generates_audio && !model.supports_audio_input) badges.push({ label: 'Audio' })
   if (model.supports_ref_images) badges.push({ label: 'Refs', title: 'Supports reference images' })
+  if (model.downloadable === false) badges.push({
+    label: model.manual_checkpoint_verified ? 'Manual · verified' : 'Manual install',
+    title: model.manual_checkpoint_verified
+      ? 'The exact local checkpoint was verified on this host'
+      : 'Install and verify the exact checkpoint locally; Maestro will not download it',
+  })
   if (badges.length === 0) return null
   return (
     <span className="flex gap-0.5 shrink-0">

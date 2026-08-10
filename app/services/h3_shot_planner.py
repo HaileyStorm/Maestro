@@ -13,6 +13,7 @@ from typing import Any
 
 
 H3_SHOT_PLAN_VERSION = 1
+H3_SEMANTIC_PHYSICAL_CONTRACT_VERSION = 1
 H3_CONTINUITY_MODES = frozenset({
     "independent", "continuous", "extend_previous",
 })
@@ -228,12 +229,6 @@ def _extract_final_blocking(prompt: str) -> tuple[str, str]:
     return without, blocking
 
 
-def _normalize_outside_dialogue(text: str) -> str:
-    protected, blocks = _protect_dialogue(text)
-    protected = re.sub(r"[ \t]{2,}", " ", protected).strip()
-    return _restore_dialogue(protected, blocks)
-
-
 def _untimed_units(prompt: str, required: int) -> tuple[list[str], str, str]:
     if not _dialogue_spans_are_balanced(prompt):
         raise H3ShotPlanError("MiniMax H3 dialogue tags must be balanced before planning")
@@ -272,10 +267,6 @@ def _untimed_units(prompt: str, required: int) -> tuple[list[str], str, str]:
             break
         units[split_index:split_index + 1] = pieces
     return [_restore_dialogue(unit, blocks) for unit in units], context, final_blocking
-
-
-def _without_final_blocking(prompt: str) -> tuple[str, str]:
-    return _extract_final_blocking(prompt)
 
 
 def infer_h3_profile_id(params: Mapping[str, Any] | None) -> str:
@@ -589,41 +580,6 @@ def estimate_h3_segment_count(
     }
 
 
-def _partition_untimed_prompt(prompt: str, frame_counts: Sequence[int]) -> list[str]:
-    count = len(frame_counts)
-    units, context, final_blocking = _untimed_units(prompt, count)
-    buckets: list[list[str]] = [[] for _ in range(count)]
-    if units:
-        total_frames = sum(frame_counts)
-        frame_boundaries: list[float] = []
-        cursor = 0
-        for frames in frame_counts[:-1]:
-            cursor += frames
-            frame_boundaries.append(cursor / total_frames)
-        for index, unit in enumerate(units):
-            midpoint = (index + 0.5) / len(units)
-            bucket = sum(midpoint > boundary for boundary in frame_boundaries)
-            buckets[min(bucket, count - 1)].append(unit)
-    prompts: list[str] = []
-    for index, bucket in enumerate(buckets):
-        parts = []
-        if context:
-            parts.append(context)
-        if bucket:
-            parts.extend(bucket)
-        else:
-            parts.append(
-                "Continue from the preceding segment without repeating earlier "
-                "action or adding dialogue."
-                if index else
-                "Hold the authored opening state without adding dialogue."
-            )
-        if index == count - 1 and final_blocking:
-            parts.append(f"FINAL BLOCKING: {final_blocking}")
-        prompts.append("\n".join(parts).strip())
-    return prompts
-
-
 def _normalize_continuity(value: Any, *, fallback: str) -> str:
     normalized = str(value or fallback).strip().casefold()
     aliases = {
@@ -684,16 +640,30 @@ def _semantic_boundary(
 
 def _source_dialogue_beats(shot: Any | None) -> list[dict[str, Any]]:
     beats: list[dict[str, Any]] = []
-    for beat in _field(shot, "dialogue_beats", []) or []:
+    source_beats = (
+        _field(shot, "dialogue_beats", [])
+        or _field(shot, "dialogue_manifest", [])
+        or []
+    )
+    for beat in source_beats:
+        exact_block = str(_field(beat, "exact_block", "") or "")
         spoken = _field(beat, "spoken_text", "")
         language = _field(beat, "language", "English")
-        block = _canonical_dialogue(spoken, language)
+        block = exact_block or _canonical_dialogue(spoken, language)
         if not block:
             continue
+        if exact_block and not _DIALOGUE_RE.fullmatch(exact_block):
+            raise H3ShotPlanError(
+                "Recovered MiniMax H3 dialogue manifest has an invalid exact block"
+            )
         beats.append({
             "exact_block": block,
             "spoken_text": _DIALOGUE_TOKEN_RE.sub("", block).strip(),
             "speaker_id": str(_field(beat, "speaker_id", "") or ""),
+            "source": str(
+                _field(beat, "source", "structured_dialogue")
+                or "structured_dialogue"
+            ),
         })
     return beats
 
@@ -727,6 +697,28 @@ def _compile_source_dialogue(
             return text, False
         return text[:position] + block + text[position + len(words):], True
 
+    def append_to_canonical_vocals(text: str, block: str) -> str:
+        """Place recovered dialogue inside the final canonical record."""
+
+        lines = text.splitlines()
+        pattern = re.compile(
+            r"^(?P<prefix>\[Shot\s+\d+\].*\|\s*"
+            r"dialogue_and_vocalizations\s*:\s*)(?P<vocals>.*)$",
+            re.IGNORECASE,
+        )
+        for index in range(len(lines) - 1, -1, -1):
+            match = pattern.fullmatch(lines[index].strip())
+            if not match:
+                continue
+            vocals = match.group("vocals").strip()
+            lines[index] = (
+                match.group("prefix")
+                + (block if vocals.casefold() in {"", "none", "n/a"}
+                   else f"{vocals} {block}")
+            )
+            return "\n".join(lines)
+        return f"{text}\n{block}".strip()
+
     for beat_index, beat in enumerate(structured):
         block = beat["exact_block"]
         occurrences = [
@@ -753,12 +745,13 @@ def _compile_source_dialogue(
                     len(prompts) - 1,
                     beat_index * len(prompts) // max(1, len(structured)),
                 )
-                prompts[target] = f"{prompts[target]}\n{block}".strip()
+                prompts[target] = append_to_canonical_vocals(
+                    prompts[target], block,
+                )
         claimed[block] = claim + 1
         manifest.append({
             **beat,
             "source_index": source_index,
-            "source": "structured_dialogue",
             "local_segment_index": target,
         })
 
@@ -782,34 +775,41 @@ def _compile_source_dialogue(
                 "source": "authored_prompt",
                 "local_segment_index": local_index,
             })
-    return manifest
-
-
-def _deduplicate_mapped_dialogue(
-    source: str,
-    prompts: list[str],
-) -> None:
-    """Restore the source dialogue multiset after a spanning timed range."""
-
-    allowed: dict[str, int] = {}
-    for match in _DIALOGUE_RE.finditer(source):
-        block = match.group(0)
-        allowed[block] = allowed.get(block, 0) + 1
-    seen: dict[str, int] = {}
-    for index, prompt in enumerate(prompts):
-        def retain(match: re.Match[str]) -> str:
+    # Persist the semantic prompt's literal dialogue order. Structured beats
+    # keep their speaker/source metadata, but they must not sort ahead of an
+    # earlier authored block or the same fresh plan becomes non-resumable.
+    remaining = list(manifest)
+    ordered: list[dict[str, Any]] = []
+    for prompt in prompts:
+        for match in _DIALOGUE_RE.finditer(prompt):
             block = match.group(0)
-            occurrence = seen.get(block, 0)
-            seen[block] = occurrence + 1
-            return block if occurrence < allowed.get(block, 0) else ""
+            match_index = next((
+                index for index, item in enumerate(remaining)
+                if item["exact_block"] == block
+            ), None)
+            if match_index is not None:
+                ordered.append(remaining.pop(match_index))
+    return [*ordered, *remaining]
 
-        prompts[index] = _normalize_outside_dialogue(
-            _DIALOGUE_RE.sub(retain, prompt)
-        )
-    for block, expected in allowed.items():
-        missing = expected - min(expected, seen.get(block, 0))
-        for _ in range(missing):
-            prompts[-1] = f"{prompts[-1]}\n{block}".strip()
+
+def _authored_shot_id(shot: Any | None, source_index: int) -> str:
+    """Return a stable semantic ID without deriving it from mutable prose."""
+
+    for field in ("authored_shot_id", "shot_id", "id", "stable_id"):
+        value = str(_field(shot, field, "") or "").strip()
+        if value:
+            return value
+    return f"h3-authored-shot-{source_index + 1}"
+
+
+def _semantic_reference_labels(prompt: str) -> list[str]:
+    """Record literal Context-IR labels without interpreting their meaning."""
+
+    return list(dict.fromkeys(re.findall(
+        r"<(?:Subject|Picture|Video|Audio)\s+[1-9]\d*>",
+        str(prompt or ""),
+        flags=re.IGNORECASE,
+    )))
 
 
 def plan_h3_native_shots(
@@ -826,12 +826,13 @@ def plan_h3_native_shots(
     segment_frames_maximum: int | None = None,
     segment_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Reconcile one authored H3 timeline into persistent native shots.
+    """Reconcile semantic H3 shots into persistent native execution segments.
 
     Frame geometry is supplied by the caller after applying the selected
-    profile/model ceiling.  Timestamped prompts still use Maestro's existing
-    exact clip/rebase implementation; only its untimed fallback is replaced
-    with chronological unique partitioning.
+    profile/model ceiling. A semantic prompt is compiled once per authored
+    source and then reused byte-for-byte by every physical segment assigned to
+    that source. Segment-local cursors describe which temporal slice is being
+    executed; a model-grid split never requests another LLM rewrite.
     """
 
     counts = [int(value) for value in clip_frame_counts]
@@ -894,14 +895,10 @@ def plan_h3_native_shots(
         for frames, trim in zip(counts, clip_trim_tail_frames)
     ]
 
-    from shared.utils.prompt_parser import (
-        build_global_timeline_clip_prompts,
-        has_global_timeline,
-    )
-
     prompts = [""] * len(counts)
     dialogue_manifest: list[dict[str, Any]] = []
     source_contracts: list[dict[str, Any]] = []
+    seen_authored_shot_ids: set[str] = set()
     for source_index in sorted(set(indices)):
         positions = [
             index for index, value in enumerate(indices) if value == source_index
@@ -913,69 +910,89 @@ def plan_h3_native_shots(
             raise H3ShotPlanError(
                 "MiniMax H3 dialogue tags must be balanced before planning"
             )
-        local_counts = [counts[index] for index in positions]
         local_published = [clip_published_frames[index] for index in positions]
-        timed = has_global_timeline(source)
-        authored_final_blocking = ""
-        if timed:
-            timed_source, authored_final_blocking = _without_final_blocking(source)
-            local_prompts = build_global_timeline_clip_prompts(
-                timed_source,
-                clip_frame_counts=local_published,
-                fps=fps_value,
-            )
-        else:
-            local_prompts = _partition_untimed_prompt(source, local_counts)
-        if not local_prompts or len(local_prompts) != len(local_counts):
-            raise H3ShotPlanError(
-                f"Unable to map H3 source {source_index + 1} across native shots"
-            )
-        _deduplicate_mapped_dialogue(source, local_prompts)
         shot = shots[source_index] if source_index < len(shots) else None
+        authored_shot_id = _authored_shot_id(shot, source_index)
+        if authored_shot_id in seen_authored_shot_ids:
+            raise H3ShotPlanError(
+                f"Duplicate authored H3 shot ID: {authored_shot_id}"
+            )
+        seen_authored_shot_ids.add(authored_shot_id)
+
+        # All deterministic semantic compilation happens once, before native
+        # geometry fans the shot out into physical execution segments.
+        semantic_prompts = [source]
         visual_context = build_h3_visual_context(shot)
         if visual_context:
-            local_prompts = [
+            semantic_prompts = [
                 prompt if visual_context in prompt
                 else f"{visual_context}\n{prompt}".strip()
-                for prompt in local_prompts
+                for prompt in semantic_prompts
             ]
         opening_blocking = _compact(_field(shot, "spatial_setup", ""), 600)
         if opening_blocking and not re.search(
-            r"\bOPENING\s+BLOCKING\s*:", local_prompts[0], re.I,
+            r"\bOPENING\s+BLOCKING\s*:", semantic_prompts[0], re.I,
         ):
-            local_prompts[0] = (
-                f"OPENING BLOCKING: {opening_blocking}\n{local_prompts[0]}"
+            semantic_prompts[0] = (
+                f"OPENING BLOCKING: {opening_blocking}\n{semantic_prompts[0]}"
             ).strip()
         final_blocking = _compact(
             _field(shot, "closing_blocking", "")
             or _field(shot, "ending_beat", ""),
             1200,
         )
-        blocking_parts = []
-        for value in (authored_final_blocking, final_blocking):
-            if value and value not in blocking_parts:
-                blocking_parts.append(value)
-        if blocking_parts and not re.search(
-            r"\bFINAL\s+BLOCKING\s*:", local_prompts[-1], re.I,
+        if final_blocking and not re.search(
+            r"\bFINAL\s+BLOCKING\s*:", semantic_prompts[0], re.I,
         ):
-            local_prompts[-1] = (
-                f"{local_prompts[-1]}\nFINAL BLOCKING: "
-                + "; ".join(blocking_parts)
+            semantic_prompts[0] = (
+                f"{semantic_prompts[0]}\nFINAL BLOCKING: {final_blocking}"
             ).strip()
         source_dialogue = _compile_source_dialogue(
-            local_prompts,
+            semantic_prompts,
             shot=shot,
             source_index=source_index,
         )
         for item in source_dialogue:
-            item["segment_index"] = positions[item.pop("local_segment_index")]
+            item.pop("local_segment_index", None)
+            item["authored_shot_id"] = authored_shot_id
+            item["semantic_shot_index"] = source_index
+            # Dialogue belongs to the semantic shot. This anchor is for
+            # recovery/order only; repeated physical prompt bytes do not create
+            # duplicate authored dialogue records.
+            item["segment_index"] = positions[0]
         dialogue_manifest.extend(source_dialogue)
-        for position, prompt in zip(positions, local_prompts):
-            prompts[position] = prompt
+        semantic_prompt = semantic_prompts[0]
+        authored_final_blocking = _extract_final_blocking(source)[1]
+        for position in positions:
+            prompts[position] = semantic_prompt
+
+        execution_slices: list[dict[str, Any]] = []
+        local_cursor = 0
+        for local_index, (position, published_frames) in enumerate(
+            zip(positions, local_published)
+        ):
+            end_cursor = local_cursor + published_frames
+            execution_slices.append({
+                "segment_index": position,
+                "physical_segment_index": local_index,
+                "start_frame": local_cursor,
+                "end_frame_exclusive": end_cursor,
+                "start_seconds": local_cursor / fps_value,
+                "end_seconds": end_cursor / fps_value,
+            })
+            local_cursor = end_cursor
         source_contracts.append({
             "source_index": source_index,
+            "authored_shot_id": authored_shot_id,
+            "semantic_shot_index": source_index,
             "segment_indices": positions,
-            "timed": timed,
+            "semantic_prompt": semantic_prompt,
+            "authored_prompt": source,
+            "prompt_changed_before_split": semantic_prompt != source,
+            "prompt_rewrite_for_physical_split": False,
+            "execution_slices": execution_slices,
+            "reference_labels": _semantic_reference_labels(semantic_prompt),
+            "dialogue_manifest": [dict(item) for item in source_dialogue],
             "visual_context": visual_context,
             "opening_blocking": opening_blocking,
             "final_blocking": final_blocking,
@@ -989,9 +1006,25 @@ def plan_h3_native_shots(
     cursor = 0
     published_cursor = 0
     native_shots: list[dict[str, Any]] = []
+    contracts_by_source = {
+        int(contract["source_index"]): contract
+        for contract in source_contracts
+    }
+    local_positions = {
+        (int(contract["source_index"]), int(segment_index)): local_index
+        for contract in source_contracts
+        for local_index, segment_index in enumerate(contract["segment_indices"])
+    }
     for index, (frames, prompt, source_index) in enumerate(
         zip(counts, prompts, indices)
     ):
+        source_contract = contracts_by_source[source_index]
+        authored_shot_id = str(source_contract["authored_shot_id"])
+        physical_segment_index = local_positions[(source_index, index)]
+        execution_slice = source_contract["execution_slices"][physical_segment_index]
+        physical_segment_id = (
+            f"{authored_shot_id}:segment-{physical_segment_index + 1}"
+        )
         if index == 0:
             continuity = "independent"
             boundary_before = None
@@ -1015,6 +1048,20 @@ def plan_h3_native_shots(
         native_shots.append({
             "index": index,
             "source_index": source_index,
+            "authored_shot_id": authored_shot_id,
+            "semantic_shot_index": source_index,
+            "physical_segment_id": physical_segment_id,
+            "physical_segment_index": physical_segment_index,
+            "physical_segment_count": len(source_contract["segment_indices"]),
+            "predecessor_segment_index": index - 1 if index else None,
+            "predecessor_physical_segment_id": (
+                native_shots[-1]["physical_segment_id"] if native_shots else None
+            ),
+            "predecessor_authored_shot_id": (
+                native_shots[-1]["authored_shot_id"] if native_shots else None
+            ),
+            "execution_cursor_frame": execution_slice["start_frame"],
+            "execution_slice": dict(execution_slice),
             "frames": frames,
             "start_frame": cursor,
             "end_frame": cursor + frames - 1,
@@ -1038,6 +1085,9 @@ def plan_h3_native_shots(
 
     return {
         "version": H3_SHOT_PLAN_VERSION,
+        "semantic_physical_contract_version": (
+            H3_SEMANTIC_PHYSICAL_CONTRACT_VERSION
+        ),
         "global_prompt": str(global_prompt or ""),
         "fps": fps_value,
         "segment_frames_maximum": (
@@ -1052,6 +1102,7 @@ def plan_h3_native_shots(
         "clip_prompts": prompts,
         "clip_boundaries": boundaries,
         "source_contracts": source_contracts,
+        "semantic_shots": source_contracts,
         "dialogue_manifest": dialogue_manifest,
         "shots": native_shots,
     }
@@ -1061,6 +1112,7 @@ __all__ = [
     "H3_CONTINUITY_MODES",
     "H3_SHOT_PLAN_VERSION",
     "H3_SEGMENT_POLICY_VERSION",
+    "H3_SEMANTIC_PHYSICAL_CONTRACT_VERSION",
     "H3ShotPlanError",
     "build_h3_visual_context",
     "floor_h3_frame_count",

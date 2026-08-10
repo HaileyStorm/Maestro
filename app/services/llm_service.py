@@ -50,6 +50,26 @@ _runtime_fallback_reason: str = ""
 _runtime_model_size_gb: float = 0.0
 _runtime_timings_multimodal: bool = False
 _runtime_speed_variant_digest: str = ""
+_runtime_generation_counter: int = 0
+_runtime_generation: int = 0
+_runtime_attempt_counter: int = 0
+_runtime_active_attempt_id: int = 0
+_runtime_phase: str = "idle"
+_runtime_execution: str = ""
+_runtime_load_started_at: Optional[float] = None
+_runtime_load_finished_at: Optional[float] = None
+_runtime_request_started_at: Optional[float] = None
+_runtime_request_finished_at: Optional[float] = None
+_runtime_abort_requested_at: Optional[float] = None
+_runtime_last_release: dict = {}
+_runtime_last_aborted_attempt: tuple[int, int, bool] = (0, 0, False)
+_runtime_output_token_limit: Optional[int] = None
+_runtime_observed_output_tokens: Optional[int] = None
+_runtime_request_pass: int = 0
+_runtime_request_multimodal: Optional[bool] = None
+_runtime_remaining_rate_tps: Optional[float] = None
+_runtime_remaining_selection_digest: str = ""
+_runtime_remaining_invalid_reason: str = "no_active_attempt"
 _hardware_cache: Optional[dict] = None
 _nvcc_path_cache: Optional[str] = None
 _speed_observation_lock = threading.Lock()
@@ -87,6 +107,402 @@ _download_state_lock = threading.Lock()
 _download_state: dict = {}
 _loading_model_id: str = ""
 _model_activity = threading.local()
+_runtime_request = threading.local()
+
+
+CPU_COEXISTENCE_MODE = "cooperative_cpu"
+_CPU_COEXISTENCE_MAX_THREADS = 8
+_CPU_COEXISTENCE_MAX_BATCH_THREADS = 8
+_CPU_COEXISTENCE_BATCH_SIZE = 256
+_CPU_COEXISTENCE_UBATCH_SIZE = 64
+_PROCESS_TERMINATE_TIMEOUT_SEC = 10.0
+_PROCESS_KILL_TIMEOUT_SEC = 5.0
+_RUNTIME_OUTPUT_TOKEN_LIMIT_MAX = 1_000_000
+_RUNTIME_REMAINING_MAX_SECONDS = 86_400.0
+
+
+class LocalRuntimeAbortedError(RuntimeError):
+    """An exact local CPU attempt was intentionally stopped by its owner."""
+
+    def __init__(
+        self,
+        runtime_generation: int,
+        attempt_id: int,
+        *,
+        resources_released: bool,
+    ) -> None:
+        super().__init__(
+            "Local CPU LLM attempt was preempted after a faster execution "
+            "path became available"
+        )
+        self.runtime_generation = int(runtime_generation)
+        self.attempt_id = int(attempt_id)
+        self.resources_released = bool(resources_released)
+
+
+def get_cpu_coexistence_defaults() -> dict:
+    """Return the public, content-free caps for opportunistic CPU inference."""
+
+    return {
+        "execution": CPU_COEXISTENCE_MODE,
+        "max_threads": _CPU_COEXISTENCE_MAX_THREADS,
+        "max_batch_threads": _CPU_COEXISTENCE_MAX_BATCH_THREADS,
+        "batch_size": _CPU_COEXISTENCE_BATCH_SIZE,
+        "ubatch_size": _CPU_COEXISTENCE_UBATCH_SIZE,
+        "abort_capable": True,
+        "preemptible": False,
+        "preemption_requires_decision_evidence": True,
+        "slots": 1,
+    }
+
+
+def _clear_runtime_remaining_evidence_locked(reason: str) -> None:
+    """Invalidate request-bound projection evidence without reading content."""
+
+    global _runtime_output_token_limit, _runtime_observed_output_tokens
+    global _runtime_request_pass, _runtime_request_multimodal
+    global _runtime_remaining_rate_tps, _runtime_remaining_selection_digest
+    global _runtime_remaining_invalid_reason
+    _runtime_output_token_limit = None
+    _runtime_observed_output_tokens = None
+    _runtime_request_pass = 0
+    _runtime_request_multimodal = None
+    _runtime_remaining_rate_tps = None
+    _runtime_remaining_selection_digest = ""
+    _runtime_remaining_invalid_reason = str(reason or "unavailable")
+
+
+def _bind_runtime_request_budget(
+    max_output_tokens: int,
+    *,
+    multimodal: bool,
+    request_pass: int,
+) -> bool:
+    """Bind exact request-budget evidence to the current CPU attempt.
+
+    ``max_output_tokens`` is a protocol ceiling, not a predicted terminal
+    length. The resulting projection is therefore diagnostic evidence only
+    and is never decision-eligible for preemption.
+    """
+
+    global _runtime_output_token_limit, _runtime_observed_output_tokens
+    global _runtime_request_pass, _runtime_request_multimodal
+    global _runtime_remaining_rate_tps, _runtime_remaining_selection_digest
+    global _runtime_remaining_invalid_reason
+    token = _current_runtime_attempt_token()
+    if (
+        token is None
+        or isinstance(max_output_tokens, bool)
+        or not isinstance(max_output_tokens, int)
+        or not 1 <= max_output_tokens <= _RUNTIME_OUTPUT_TOKEN_LIMIT_MAX
+        or isinstance(request_pass, bool)
+        or not isinstance(request_pass, int)
+        or request_pass < 1
+    ):
+        return False
+    generation, attempt_id = token
+    with _runtime_status_lock:
+        if (
+            _runtime_generation != generation
+            or _runtime_active_attempt_id != attempt_id
+            or _runtime_execution != CPU_COEXISTENCE_MODE
+            or _runtime_phase != "requesting"
+        ):
+            return False
+        rate = None
+        if _runtime_timings_multimodal == bool(multimodal):
+            rate = _valid_speed_rate(
+                _runtime_timings.get("predicted_per_second")
+            )
+        selection_digest = _runtime_speed_variant_digest if rate else ""
+        if not selection_digest:
+            rate = None
+        _runtime_output_token_limit = max_output_tokens
+        _runtime_observed_output_tokens = 0
+        _runtime_request_pass = request_pass
+        _runtime_request_multimodal = bool(multimodal)
+        _runtime_remaining_rate_tps = rate
+        _runtime_remaining_selection_digest = selection_digest
+        _runtime_remaining_invalid_reason = (
+            "terminal_length_unknown"
+            if rate is not None else "same_selection_rate_unavailable"
+        )
+    return True
+
+
+def _exact_output_tokens(metrics: dict) -> Optional[int]:
+    """Read an exact server token count; never estimate it from response text."""
+
+    if not isinstance(metrics, dict):
+        return None
+    candidates = []
+    usage = metrics.get("usage")
+    if isinstance(usage, dict):
+        candidates.append(usage.get("completion_tokens"))
+    timings = metrics.get("timings")
+    if isinstance(timings, dict):
+        candidates.append(timings.get("predicted_n"))
+    exact = [
+        value for value in candidates
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    ]
+    if not exact:
+        return None
+    if len(set(exact)) > 1:
+        return None
+    return exact[0]
+
+
+def _observe_runtime_output_metrics(metrics: dict, *, request_pass: int) -> bool:
+    """Publish monotonic exact token progress for the current attempt/pass."""
+
+    global _runtime_observed_output_tokens, _runtime_remaining_invalid_reason
+    observed = _exact_output_tokens(metrics)
+    token = _current_runtime_attempt_token()
+    if observed is None or token is None:
+        return False
+    generation, attempt_id = token
+    with _runtime_status_lock:
+        if (
+            _runtime_generation != generation
+            or _runtime_active_attempt_id != attempt_id
+            or _runtime_request_pass != request_pass
+            or _runtime_output_token_limit is None
+            or observed > _runtime_output_token_limit
+        ):
+            return False
+        current = _runtime_observed_output_tokens
+        if current is not None and observed < current:
+            return False
+        _runtime_observed_output_tokens = observed
+        if _runtime_remaining_rate_tps is not None:
+            _runtime_remaining_invalid_reason = "terminal_length_unknown"
+    return True
+
+
+def _runtime_remaining_snapshot_locked() -> dict:
+    """Return a bounded, content-free projection and its evidence grade."""
+
+    base = {
+        "state": "unavailable",
+        "reason": _runtime_remaining_invalid_reason,
+        "decision_eligible": False,
+        "runtime_generation": _runtime_generation or None,
+        "attempt_id": _runtime_active_attempt_id or None,
+        "request_pass": _runtime_request_pass or None,
+        "output_token_limit": _runtime_output_token_limit,
+        "observed_output_tokens": _runtime_observed_output_tokens,
+        "remaining_budget_tokens": None,
+        "measured_tokens_per_second": _runtime_remaining_rate_tps,
+        "budget_projection_seconds": None,
+    }
+    if (
+        _runtime_active_attempt_id <= 0
+        or _runtime_output_token_limit is None
+        or _runtime_observed_output_tokens is None
+    ):
+        return base
+    if (
+        _runtime_remaining_rate_tps is None
+        or not _runtime_remaining_selection_digest
+        or _runtime_remaining_selection_digest != _runtime_speed_variant_digest
+    ):
+        base["reason"] = "same_selection_rate_unavailable"
+        return base
+    remaining = max(
+        0, _runtime_output_token_limit - _runtime_observed_output_tokens,
+    )
+    projection = remaining / _runtime_remaining_rate_tps
+    if not math.isfinite(projection):
+        base["reason"] = "non_finite_projection"
+        return base
+    base.update({
+        "state": "budget_projection",
+        "reason": "terminal_length_unknown",
+        "remaining_budget_tokens": remaining,
+        "budget_projection_seconds": round(
+            min(max(projection, 0.0), _RUNTIME_REMAINING_MAX_SECONDS), 3,
+        ),
+    })
+    return base
+
+
+def _current_runtime_attempt_token() -> Optional[tuple[int, int]]:
+    token = getattr(_runtime_request, "token", None)
+    if (
+        isinstance(token, tuple)
+        and len(token) == 2
+        and all(isinstance(value, int) for value in token)
+    ):
+        return token
+    return None
+
+
+def _begin_runtime_attempt() -> Optional[tuple[int, int]]:
+    """Enter one re-entrant request attempt for the current local runtime."""
+
+    global _runtime_attempt_counter, _runtime_active_attempt_id
+    global _runtime_request_started_at, _runtime_request_finished_at
+    global _runtime_abort_requested_at, _runtime_phase
+    depth = int(getattr(_runtime_request, "depth", 0) or 0)
+    token = _current_runtime_attempt_token()
+    if depth > 0 and token is not None:
+        _runtime_request.depth = depth + 1
+        return token
+    with _runtime_status_lock:
+        process = _process
+        if (
+            _provider != "local"
+            or process is None
+            or process.poll() is not None
+            or _runtime_generation <= 0
+        ):
+            return None
+        _runtime_attempt_counter += 1
+        attempt_id = _runtime_attempt_counter
+        token = (_runtime_generation, attempt_id)
+        _runtime_active_attempt_id = attempt_id
+        _runtime_request_started_at = time.time()
+        _runtime_request_finished_at = None
+        _runtime_abort_requested_at = None
+        _runtime_phase = "requesting"
+        _clear_runtime_remaining_evidence_locked("request_budget_unbound")
+    _runtime_request.depth = 1
+    _runtime_request.token = token
+    return token
+
+
+def _end_runtime_attempt(token: Optional[tuple[int, int]]) -> None:
+    """Finish only the request attempt owned by this worker thread."""
+
+    global _runtime_active_attempt_id, _runtime_request_finished_at
+    global _runtime_phase
+    if token is None:
+        return
+    depth = int(getattr(_runtime_request, "depth", 0) or 0)
+    if depth > 1:
+        _runtime_request.depth = depth - 1
+        return
+    if hasattr(_runtime_request, "depth"):
+        del _runtime_request.depth
+    if hasattr(_runtime_request, "token"):
+        del _runtime_request.token
+    generation, attempt_id = token
+    with _runtime_status_lock:
+        if (
+            _runtime_generation == generation
+            and _runtime_active_attempt_id == attempt_id
+        ):
+            _runtime_active_attempt_id = 0
+            _runtime_request_finished_at = time.time()
+            if _runtime_phase == "requesting":
+                _clear_runtime_remaining_evidence_locked("request_finished")
+                _runtime_phase = "ready" if is_loaded() else "idle"
+
+
+def _activate_request_scope_after_load() -> None:
+    """Bind a decorated cold/switching request to its post-load runtime."""
+
+    if int(getattr(_runtime_request, "scope_depth", 0) or 0) <= 0:
+        return
+    current = _current_runtime_attempt_token()
+    with _runtime_status_lock:
+        generation = _runtime_generation
+        local_ready = (
+            _provider == "local"
+            and generation > 0
+            and _process is not None
+            and _process.poll() is None
+        )
+    if not local_ready or (current is not None and current[0] == generation):
+        return
+    # A generate_chat model switch invalidates the pre-load token. The old
+    # runtime state was already cleared only after its confirmed exit; replace
+    # this thread's token without letting its eventual finalizer touch the new
+    # generation.
+    if hasattr(_runtime_request, "depth"):
+        del _runtime_request.depth
+    if hasattr(_runtime_request, "token"):
+        del _runtime_request.token
+    _begin_runtime_attempt()
+
+
+@contextmanager
+def local_runtime_attempt(expected_generation: int):
+    """Reserve one exact cooperative-CPU request attempt.
+
+    The context holds Maestro's existing re-entrant model lease. An external
+    supervisor can still call :func:`abort_local_cpu_runtime`, which operates
+    on the exact captured process rather than waiting for this lease.
+    """
+
+    with _lock:
+        _begin_model_activity()
+        token: Optional[tuple[int, int]] = None
+        try:
+            with _runtime_status_lock:
+                if (
+                    _runtime_generation != int(expected_generation)
+                    or _provider != "local"
+                    or _runtime_execution != CPU_COEXISTENCE_MODE
+                    or not is_loaded()
+                ):
+                    raise RuntimeError(
+                        "Expected cooperative CPU LLM runtime is not resident"
+                    )
+            token = _begin_runtime_attempt()
+            if token is None or token[0] != int(expected_generation):
+                raise RuntimeError(
+                    "Expected cooperative CPU LLM runtime changed before request"
+                )
+            _cancel_idle_timer()
+            yield token[1]
+        finally:
+            _end_runtime_attempt(token)
+            _end_model_activity(_loaded_model_key)
+
+
+def get_local_runtime_control() -> dict:
+    """Return content-free lifecycle state for the local runtime supervisor."""
+
+    with _runtime_status_lock:
+        request_started_at = _runtime_request_started_at
+        now = time.time()
+        remaining = _runtime_remaining_snapshot_locked()
+        abort_capable = bool(
+            _runtime_execution == CPU_COEXISTENCE_MODE
+            and _runtime_active_attempt_id
+            and _runtime_phase == "requesting"
+        )
+        return {
+            "generation": _runtime_generation or None,
+            "attempt_id": _runtime_active_attempt_id or None,
+            "phase": _runtime_phase,
+            "execution": _runtime_execution or None,
+            "abort_capable": abort_capable,
+            "preemptible": bool(remaining["decision_eligible"]),
+            "load_started_at": _runtime_load_started_at,
+            "load_finished_at": _runtime_load_finished_at,
+            "request_started_at": request_started_at,
+            "request_finished_at": _runtime_request_finished_at,
+            "request_elapsed_seconds": (
+                round(max(0.0, now - request_started_at), 3)
+                if request_started_at is not None
+                and _runtime_active_attempt_id
+                else None
+            ),
+            "remaining_estimate_seconds": (
+                remaining["budget_projection_seconds"]
+                if remaining["decision_eligible"] else None
+            ),
+            "remaining": remaining,
+            "abort_requested_at": _runtime_abort_requested_at,
+            "resources_released": bool(
+                _runtime_generation == 0
+                and _runtime_last_release.get("resources_released", False)
+            ),
+            "last_release": dict(_runtime_last_release) or None,
+        }
 
 
 def _begin_model_activity() -> None:
@@ -112,9 +528,31 @@ def _with_model_lease(function):
         with _lock:
             _begin_model_activity()
             identity = _loaded_model_key
+            prior_scope_depth = int(
+                getattr(_runtime_request, "scope_depth", 0) or 0
+            )
+            _runtime_request.scope_depth = prior_scope_depth + 1
+            # generate_chat owns its load/switch operation, so its exact
+            # attempt must bind to the post-load generation rather than a
+            # previously resident runtime. Other request entry points already
+            # require a resident model and can bind immediately.
+            runtime_attempt = (
+                None if function.__name__ == "generate_chat"
+                else _begin_runtime_attempt()
+            )
             try:
                 return function(*args, **kwargs)
             finally:
+                # A cold/switching generate_chat receives its attempt only
+                # after load_model commits the new runtime generation.
+                terminal_attempt = (
+                    _current_runtime_attempt_token() or runtime_attempt
+                )
+                _end_runtime_attempt(terminal_attempt)
+                if prior_scope_depth:
+                    _runtime_request.scope_depth = prior_scope_depth
+                elif hasattr(_runtime_request, "scope_depth"):
+                    del _runtime_request.scope_depth
                 # generate_chat may cold-load or intentionally switch the
                 # model inside this re-entrant lease. External switches cannot
                 # race the lock, so the terminal resident identity is the
@@ -171,6 +609,7 @@ def loaded_model_lease(
     api_key: str = "",
     local_gguf_path: str = "",
     gguf_file_override: str = "",
+    cpu_coexistence: bool = False,
 ):
     """Hold one exact loaded-model identity across caller-owned inference.
 
@@ -178,6 +617,8 @@ def loaded_model_lease(
     cold load and a subsequent callback on the same singleton model. Calls to
     :func:`generate` are safe inside the lease because the lock is re-entrant.
     The yielded tuple is the exact resident identity used for finalization.
+    ``cpu_coexistence`` forces a bounded, externally abortable local CPU
+    runtime without changing the defaults used by ordinary CPU or GPU loads.
     """
     with _lock:
         _begin_model_activity()
@@ -192,6 +633,7 @@ def loaded_model_lease(
                 api_key=api_key,
                 local_gguf_path=local_gguf_path,
                 gguf_file_override=gguf_file_override,
+                cpu_coexistence=cpu_coexistence,
             )
             identity = _loaded_model_key
             if not identity or not is_loaded():
@@ -1387,6 +1829,7 @@ def get_status() -> dict:
             "fallback_reason": _runtime_fallback_reason or None,
             "loading_model_id": _loading_model_id,
         }
+    runtime_control = get_local_runtime_control()
     return {
         "loaded": status_snapshot["loaded"],
         "model_id": status_snapshot["model_id"],
@@ -1403,6 +1846,7 @@ def get_status() -> dict:
             "timings": status_snapshot["runtime_timings"],
             "speed": _current_runtime_speed(runtime_snapshot),
             "fallback_reason": status_snapshot["fallback_reason"],
+            "control": runtime_control,
         },
         "loading": bool(download or status_snapshot["loading_model_id"]),
         "loading_model_id": (
@@ -3136,6 +3580,7 @@ def _runtime_profile_for(
     registry_entry: dict,
     *,
     probe_hardware: bool = True,
+    cpu_coexistence: bool = False,
 ) -> dict:
     """Choose conservative fast llama.cpp flags for this model and host."""
     hardware = _hardware_profile(probe_gpu=probe_hardware)
@@ -3219,6 +3664,37 @@ def _runtime_profile_for(
     for key in tuple(profile):
         if key in overrides and key not in {"backend", "slots", "prompt_cache"}:
             profile[key] = overrides[key]
+    if cpu_coexistence:
+        # This lane deliberately leaves CPU and memory-bandwidth headroom for
+        # the foreground GPU worker and the rest of Maestro. Model-authored
+        # flags remain authoritative for ordinary CPU/GPU execution; only the
+        # explicitly requested coexistence lane applies these upper bounds.
+        profile["backend"] = "cpu"
+        profile["gpu_layers"] = 0
+        profile["projector_offload"] = False
+        def bounded(value, cap: int) -> int:
+            try:
+                return max(1, min(int(value), cap))
+            except (TypeError, ValueError):
+                return cap
+
+        profile["threads"] = bounded(
+            profile["threads"], _CPU_COEXISTENCE_MAX_THREADS,
+        )
+        profile["threads_batch"] = bounded(
+            profile["threads_batch"], _CPU_COEXISTENCE_MAX_BATCH_THREADS,
+        )
+        profile["batch_size"] = bounded(
+            profile["batch_size"], _CPU_COEXISTENCE_BATCH_SIZE,
+        )
+        profile["ubatch_size"] = min(
+            bounded(profile["ubatch_size"], _CPU_COEXISTENCE_UBATCH_SIZE),
+            profile["batch_size"],
+        )
+        profile["execution"] = CPU_COEXISTENCE_MODE
+        profile["abort_capable"] = True
+        profile["preemptible"] = False
+        profile["preemption_requires_decision_evidence"] = True
     return profile
 
 
@@ -3296,6 +3772,7 @@ def load_model(
     api_key: str = "",
     local_gguf_path: str = "",
     gguf_file_override: str = "",
+    cpu_coexistence: bool = False,
 ) -> None:
     """Load an LLM model. Supports local (llama-server), remote (OpenAI-compatible),
     OpenAI API, and Anthropic API providers.
@@ -3307,6 +3784,7 @@ def load_model(
         provider: "local" | "remote" | "openai" | "anthropic"
         remote_url: Base URL for remote/openai servers (e.g. http://192.168.1.100:1234)
         api_key: API key for openai/anthropic providers
+        cpu_coexistence: Force the bounded, externally abortable CPU profile.
     """
     global _process, _model_id, _device, _server_port, _vision_available
     global _provider, _remote_url, _api_key, _loaded_model_key
@@ -3314,8 +3792,15 @@ def load_model(
     global _runtime_timings, _requested_device, _loading_model_id
     global _runtime_fallback_reason, _runtime_model_size_gb
     global _runtime_timings_multimodal, _runtime_speed_variant_digest
+    global _runtime_generation_counter, _runtime_generation
+    global _runtime_phase, _runtime_execution
+    global _runtime_load_started_at, _runtime_load_finished_at
+    global _runtime_request_started_at, _runtime_request_finished_at
+    global _runtime_abort_requested_at, _runtime_last_release
 
     provider = str(provider or "local").lower()
+    if cpu_coexistence and provider != "local":
+        raise ValueError("CPU coexistence is available only for local LLMs")
     local_path_key = (
         os.path.realpath(os.path.abspath(local_gguf_path))
         if local_gguf_path else ""
@@ -3364,7 +3849,10 @@ def load_model(
     if migrated_repo_id != repo_id:
         print("[LLM] Retired saved model selection migrated to the text default")
         repo_id = migrated_repo_id
-    requested_device = "cuda" if str(device).lower() == "cuda" else "cpu"
+    requested_device = (
+        "cpu" if cpu_coexistence
+        else ("cuda" if str(device).lower() == "cuda" else "cpu")
+    )
 
     with _lock:
         print(f"[LLM] Preparing model: {repo_id} for {requested_device}")
@@ -3447,6 +3935,7 @@ def load_model(
         profile = _runtime_profile_for(
             gguf_path, mmproj_path, requested_device, capabilities, registry_entry,
             probe_hardware=probe_runtime,
+            cpu_coexistence=cpu_coexistence,
         )
         load_key = (
             "local", repo_id, requested_device, "", "", local_path_key,
@@ -3456,6 +3945,7 @@ def load_model(
             _runtime_launch_identity(server_exe, extra_flags, disable_jinja),
         )
         if is_loaded() and _loaded_model_key == load_key and not force_reload:
+            _activate_request_scope_after_load()
             _reset_idle_timer(load_key)
             return
         if is_loaded() or _process is not None:
@@ -3485,6 +3975,17 @@ def load_model(
             _runtime_speed_variant_digest = runtime_speed_variant_digest
             _vision_available = vision_enabled
             _server_port = server_port
+            _runtime_phase = "loading"
+            _runtime_execution = (
+                CPU_COEXISTENCE_MODE if cpu_coexistence else "standard"
+            )
+            _runtime_load_started_at = time.time()
+            _runtime_load_finished_at = None
+            _runtime_request_started_at = None
+            _runtime_request_finished_at = None
+            _runtime_abort_requested_at = None
+            _runtime_last_release = {}
+            _clear_runtime_remaining_evidence_locked("runtime_replaced")
         cmd = _build_llama_server_command(
             server_exe, gguf_path, server_port, profile,
             extra_flags=extra_flags,
@@ -3501,6 +4002,8 @@ def load_model(
             env=runtime_env,
         )
         with _runtime_status_lock:
+            _runtime_generation_counter += 1
+            _runtime_generation = _runtime_generation_counter
             _process = process
         # Start the sole stdout consumer immediately. Cold loads can emit far
         # more than a pipe buffer before /health becomes ready.
@@ -3553,6 +4056,9 @@ def load_model(
             _loading_model_id = ""
             _device = profile["backend"]
             _loaded_model_key = load_key
+            _runtime_load_finished_at = time.time()
+            _runtime_phase = "ready"
+        _activate_request_scope_after_load()
         file_size = os.path.getsize(gguf_path) / 1e6
         print(
             f"[LLM] Model loaded: {repo_id} ({file_size:.0f}MB) on "
@@ -3662,6 +4168,191 @@ def _server_log_tail(n: int = 20) -> str:
     return "\n".join(lines) if lines else "(no diagnostic chunks captured)"
 
 
+def _terminate_process_and_confirm(
+    process: subprocess.Popen,
+    *,
+    terminate_timeout: float,
+    kill_timeout: float,
+) -> tuple[bool, bool]:
+    """Stop one captured process and confirm that its resources were released."""
+
+    if process.poll() is not None:
+        return True, False
+    try:
+        process.terminate()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=max(0.0, float(terminate_timeout)))
+    except Exception:
+        pass
+    if process.poll() is not None:
+        return True, False
+    escalated = True
+    try:
+        process.kill()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=max(0.0, float(kill_timeout)))
+    except Exception:
+        pass
+    return process.poll() is not None, escalated
+
+
+def _clear_runtime_state_locked() -> None:
+    """Clear singleton state after a confirmed process exit.
+
+    The caller must hold ``_runtime_status_lock``. The monotonic generation
+    counters and the last confirmed release record deliberately survive.
+    """
+
+    global _process, _model_id, _device, _server_port, _vision_available
+    global _loaded_model_key, _loading_model_id
+    global _provider, _remote_url, _api_key, _requested_device
+    global _runtime_backend, _runtime_build, _runtime_devices, _runtime_profile
+    global _runtime_timings, _runtime_fallback_reason, _runtime_model_size_gb
+    global _runtime_timings_multimodal, _runtime_speed_variant_digest
+    global _runtime_generation, _runtime_active_attempt_id, _runtime_phase
+    global _runtime_execution, _runtime_load_started_at
+    global _runtime_load_finished_at, _runtime_request_started_at
+    global _runtime_request_finished_at, _runtime_abort_requested_at
+    _process = None
+    _model_id = ""
+    _device = ""
+    _server_port = 0
+    _vision_available = False
+    _loading_model_id = ""
+    _loaded_model_key = ()
+    _provider = "local"
+    _remote_url = ""
+    _api_key = ""
+    _requested_device = ""
+    _runtime_backend = ""
+    _runtime_build = None
+    _runtime_devices = []
+    _runtime_profile = {}
+    _runtime_timings = {}
+    _runtime_fallback_reason = ""
+    _runtime_model_size_gb = 0.0
+    _runtime_timings_multimodal = False
+    _runtime_speed_variant_digest = ""
+    _runtime_generation = 0
+    _runtime_active_attempt_id = 0
+    _runtime_phase = "idle"
+    _runtime_execution = ""
+    _runtime_load_started_at = None
+    _runtime_load_finished_at = None
+    _runtime_request_started_at = None
+    _runtime_request_finished_at = None
+    _runtime_abort_requested_at = None
+    _clear_runtime_remaining_evidence_locked("runtime_released")
+
+
+def _stale_abort_result(
+    expected_generation: int,
+    expected_attempt_id: Optional[int],
+) -> dict:
+    return {
+        "matched": False,
+        "runtime_generation": int(expected_generation),
+        "attempt_id": (
+            int(expected_attempt_id) if expected_attempt_id is not None else None
+        ),
+        "resources_released": False,
+        "released_at": None,
+        "escalated_to_kill": False,
+    }
+
+
+def abort_local_cpu_runtime(
+    expected_generation: int,
+    expected_attempt_id: Optional[int] = None,
+    *,
+    terminate_timeout: float = 5.0,
+    kill_timeout: float = 5.0,
+) -> dict:
+    """Preempt one exact cooperative CPU request without taking ``_lock``.
+
+    The captured ``Popen`` object is the cancellation target. A delayed abort
+    therefore cannot act on a replacement process even if a newer runtime has
+    already become resident by the time the termination waits finish.
+    """
+
+    global _runtime_abort_requested_at, _runtime_phase
+    global _runtime_last_release, _runtime_last_aborted_attempt
+    try:
+        generation = int(expected_generation)
+        attempt = (
+            int(expected_attempt_id)
+            if expected_attempt_id is not None else None
+        )
+    except (TypeError, ValueError):
+        return _stale_abort_result(0, None)
+    with _runtime_status_lock:
+        process = _process
+        active_attempt = _runtime_active_attempt_id
+        if (
+            generation <= 0
+            or attempt is None
+            or attempt <= 0
+            or generation != _runtime_generation
+            or _provider != "local"
+            or _runtime_backend != "cpu"
+            or _runtime_execution != CPU_COEXISTENCE_MODE
+            or _runtime_phase != "requesting"
+            or process is None
+            or process.poll() is not None
+            or active_attempt <= 0
+            or attempt != active_attempt
+        ):
+            return _stale_abort_result(generation, attempt)
+        attempt = active_attempt
+        requested_at = time.time()
+        _runtime_abort_requested_at = requested_at
+        _runtime_phase = "abort_requested"
+        _clear_runtime_remaining_evidence_locked("abort_requested")
+        # Publish exact intent before signalling the process. The request can
+        # observe the dead socket before the termination waiter returns; it
+        # must still distinguish owner preemption from an unplanned crash.
+        _runtime_last_aborted_attempt = (generation, attempt, False)
+
+    released, escalated = _terminate_process_and_confirm(
+        process,
+        terminate_timeout=terminate_timeout,
+        kill_timeout=kill_timeout,
+    )
+    released_at = time.time() if released else None
+    with _runtime_status_lock:
+        if released:
+            if _runtime_last_aborted_attempt[:2] == (generation, attempt):
+                _runtime_last_aborted_attempt = (generation, attempt, True)
+            release = {
+                "generation": generation,
+                "attempt_id": attempt,
+                "request_started_at": _runtime_request_started_at,
+                "abort_requested_at": requested_at,
+                "released_at": released_at,
+                "resources_released": True,
+                "escalated_to_kill": escalated,
+            }
+            # A replacement cannot be cleared by a delayed callback. Only the
+            # exact process and generation captured above are eligible.
+            if _process is process and _runtime_generation == generation:
+                _runtime_last_release = release
+                _clear_runtime_state_locked()
+        elif _process is process and _runtime_generation == generation:
+            _runtime_phase = "release_failed"
+    return {
+        "matched": True,
+        "runtime_generation": generation,
+        "attempt_id": attempt,
+        "resources_released": released,
+        "released_at": released_at,
+        "escalated_to_kill": escalated,
+    }
+
+
 def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
     """Turn a raw request failure into an actionable error.
 
@@ -3669,6 +4360,14 @@ def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
     frozen Director run — bad GGUF quant, VRAM OOM at load, wrong binary)
     from a transient network blip and includes only content-free diagnostics.
     """
+    token = _current_runtime_attempt_token()
+    if token is not None:
+        with _runtime_status_lock:
+            aborted = _runtime_last_aborted_attempt
+        if token[:2] == aborted[:2]:
+            return LocalRuntimeAbortedError(
+                token[0], token[1], resources_released=aborted[2],
+            )
     proc = _process
     if _provider == "local" and proc is not None:
         # A reset socket usually means the subprocess is mid-death; poll()
@@ -3714,44 +4413,42 @@ def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
 
 
 def _unload_inner():
-    global _process, _model_id, _device, _server_port, _vision_available
-    global _loaded_model_key, _loading_model_id
-    global _provider, _remote_url, _api_key, _requested_device
-    global _runtime_backend, _runtime_build, _runtime_devices, _runtime_profile
-    global _runtime_timings, _runtime_fallback_reason, _runtime_model_size_gb
-    global _runtime_timings_multimodal, _runtime_speed_variant_digest
+    global _runtime_phase, _runtime_last_release
     _cancel_idle_timer()
     with _runtime_status_lock:
         process = _process
-        _process = None
-        _model_id = ""
-        _device = ""
-        _server_port = 0
-        _vision_available = False
-        _loading_model_id = ""
-        _loaded_model_key = ()
-        _provider = "local"
-        _remote_url = ""
-        _api_key = ""
-        _requested_device = ""
-        _runtime_backend = ""
-        _runtime_build = None
-        _runtime_devices = []
-        _runtime_profile = {}
-        _runtime_timings = {}
-        _runtime_fallback_reason = ""
-        _runtime_model_size_gb = 0.0
-        _runtime_timings_multimodal = False
-        _runtime_speed_variant_digest = ""
+        generation = _runtime_generation
+        attempt_id = _runtime_active_attempt_id or None
+        if process is not None and process.poll() is None:
+            _runtime_phase = "releasing"
+    released = True
+    escalated = False
     if process is not None:
-        try:
-            process.terminate()
-            process.wait(timeout=10)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
+        released, escalated = _terminate_process_and_confirm(
+            process,
+            terminate_timeout=_PROCESS_TERMINATE_TIMEOUT_SEC,
+            kill_timeout=_PROCESS_KILL_TIMEOUT_SEC,
+        )
+    if not released:
+        with _runtime_status_lock:
+            if _process is process and _runtime_generation == generation:
+                _runtime_phase = "release_failed"
+        raise RuntimeError(
+            "Local LLM process did not exit after terminate and kill waits"
+        )
+    with _runtime_status_lock:
+        if _process is process and _runtime_generation == generation:
+            if process is not None:
+                _runtime_last_release = {
+                    "generation": generation,
+                    "attempt_id": attempt_id,
+                    "released_at": time.time(),
+                    "resources_released": True,
+                    "escalated_to_kill": escalated,
+                }
+            _clear_runtime_state_locked()
+        elif process is None and _process is None:
+            _clear_runtime_state_locked()
     gc.collect()
 
 
@@ -3809,6 +4506,7 @@ def generate_chat(
     api_key: str = "",
     local_gguf_path: str = "",
     gguf_file_override: str = "",
+    cpu_coexistence: bool = False,
     system_prompt: str = "",
     image_paths: Optional[Sequence[str]] = None,
     max_new_tokens: int = 2048,
@@ -3854,6 +4552,7 @@ def generate_chat(
         api_key=api_key,
         local_gguf_path=local_gguf_path,
         gguf_file_override=gguf_file_override,
+        cpu_coexistence=cpu_coexistence,
     )
     if not is_loaded():
         raise RuntimeError("LLM did not finish loading")
@@ -3954,6 +4653,11 @@ def generate_chat(
             response = None
             attempt_payload = dict(payload)
             attempt_payload["stream"] = True
+            _bind_runtime_request_budget(
+                int(attempt_payload["max_tokens"]),
+                multimodal=bool(image_paths),
+                request_pass=attempt,
+            )
             try:
                 response = requests.post(
                     f"{_server_url()}/v1/chat/completions",
@@ -3979,6 +4683,9 @@ def generate_chat(
                                     response_data.setdefault(
                                         section, {},
                                     ).update(values)
+                            _observe_runtime_output_metrics(
+                                chunk, request_pass=attempt,
+                            )
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         reasoning_token = delta.get("reasoning_content", "")
                         token = delta.get("content", "")
@@ -4055,6 +4762,11 @@ def generate_chat(
             average_tps=average_tps,
         )
     else:
+        _bind_runtime_request_budget(
+            int(payload["max_tokens"]),
+            multimodal=bool(image_paths),
+            request_pass=1,
+        )
         try:
             response = requests.post(
                 f"{_server_url()}/v1/chat/completions",
@@ -4067,6 +4779,7 @@ def generate_chat(
             raise _diagnose_llm_request_failure(error) from error
         try:
             response_data = response.json()
+            _observe_runtime_output_metrics(response_data, request_pass=1)
             message = response_data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise RuntimeError("LLM returned an invalid chat response") from error
@@ -4242,6 +4955,11 @@ def generate(
         attempt_payload = dict(payload)
         if attempt > 1 and isinstance(payload.get("seed"), int):
             attempt_payload["seed"] = payload["seed"] + attempt - 1
+        _bind_runtime_request_budget(
+            int(attempt_payload["max_tokens"]),
+            multimodal=multimodal,
+            request_pass=attempt,
+        )
         try:
             resp = requests.post(
                 f"{_server_url()}/v1/chat/completions",
@@ -4257,6 +4975,7 @@ def generate(
             # into an actionable error naming the real cause (see the helper).
             raise _diagnose_llm_request_failure(e) from e
         data = resp.json()
+        _observe_runtime_output_metrics(data, request_pass=attempt)
         raw_content = data["choices"][0]["message"]["content"] or ""
         public_content = _public_response_text(
             raw_content,
@@ -4502,6 +5221,11 @@ def generate_streaming(
         attempt_payload = dict(payload)
         if attempt > 1 and isinstance(payload.get("seed"), int):
             attempt_payload["seed"] = payload["seed"] + attempt - 1
+        _bind_runtime_request_budget(
+            int(attempt_payload["max_tokens"]),
+            multimodal=multimodal,
+            request_pass=attempt,
+        )
         try:
             resp = requests.post(
                 f"{_server_url()}/v1/chat/completions",
@@ -4529,6 +5253,9 @@ def generate_streaming(
                                 completed_stream_metrics.setdefault(
                                     section, {},
                                 ).update(values)
+                        _observe_runtime_output_metrics(
+                            chunk, request_pass=attempt,
+                        )
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
 
                     reasoning_token = delta.get("reasoning_content", "")
@@ -4823,7 +5550,7 @@ def _generate_streaming_anthropic(
 
 def _build_enhance_user_prompt(
     prompt, mode, duration_seconds, window_count, window_size_seconds,
-    preserve_global_timeline=False, h3_context_ir=False,
+    preserve_global_timeline=False, h3_context_ir=False, h3_ref2va=False,
 ):
     """Prefix a prompt with duration and architecture-appropriate structure.
 
@@ -4839,6 +5566,15 @@ def _build_enhance_user_prompt(
                 "keep identities, literal dialogue, speaker IDs, sound, music, "
                 "authored global timestamps, and cuts consistent and in order"
             )
+            if not h3_ref2va:
+                parts.append(
+                    "define every authored visible entity once in global "
+                    "subject_definitions and reference stable Subject IDs or "
+                    "names in shot records; for distinct authored beats, cuts, "
+                    "or timestamp boundaries use multiple naturally unequal "
+                    "records, while an explicitly sustained one-take remains "
+                    "one record"
+                )
             return f"[{', '.join(parts)}]\n\n{prompt}"
         if preserve_global_timeline:
             parts.append(
@@ -4969,7 +5705,220 @@ def _h3_locked_content_errors(source: str, candidate: str) -> list[str]:
     quoted = re.findall(r"[\"“]([^\"”\r\n]+)[\"”]", source or "")
     if any(fragment not in candidate for fragment in quoted):
         errors.append("quoted authored text changed")
+    errors.extend(_h3_added_entity_errors(source, candidate))
+    source_cuts = len(re.findall(
+        r"\b(?:cut\s+to|scene\s+change|location\s+change|time\s+jump)\b",
+        source or "",
+        re.IGNORECASE,
+    ))
+    candidate_cuts = len(re.findall(
+        r"\b(?:cut\s+to|scene\s+change|location\s+change|time\s+jump)\b",
+        candidate or "",
+        re.IGNORECASE,
+    ))
+    if candidate_cuts > source_cuts:
+        errors.append("candidate invented an unauthored cut or scene change")
     errors.extend(_h3_event_association_errors(source, candidate))
+    return errors
+
+
+def _h3_added_entity_errors(source: str, candidate: str) -> list[str]:
+    """Reject candidate subject identities that are absent from the request."""
+
+    from services.director.h3_dialogue import (
+        _extract_h3_fields,
+        _h3_subject_identity_aliases,
+        _parse_h3_subject_definitions,
+    )
+
+    definitions = _extract_h3_fields(candidate).get("subject_definitions", "")
+    entries = _parse_h3_subject_definitions(definitions)
+    source_compact = " ".join(str(source or "").split()).casefold()
+    errors: list[str] = []
+    for entry in entries:
+        aliases: list[str] = []
+        for alias in _h3_subject_identity_aliases(entry):
+            normalized = " ".join(alias.split()).strip().casefold()
+            if normalized:
+                aliases.append(normalized)
+                aliases.append(re.sub(r"^(?:the|a|an)\s+", "", normalized))
+        aliases = list(dict.fromkeys(alias for alias in aliases if alias))
+        if entry["label"].casefold() in source_compact or any(
+            re.search(
+                rf"(?<![\w]){re.escape(alias)}(?![\w])",
+                source_compact,
+            )
+            for alias in aliases
+        ):
+            continue
+        errors.append(
+            f"candidate invented unauthored entity {entry['label']}"
+        )
+    return errors
+
+
+def _h3_source_record_ranges(value: str) -> list[tuple[float, float]]:
+    """Read only explicit source ranges; prose is never treated as a cut."""
+
+    from services.director.h3_dialogue import (
+        _H3_CANONICAL_RECORD_RE,
+        _extract_h3_fields,
+    )
+
+    fields = _extract_h3_fields(value)
+    visual = (
+        fields.get("integrated_multimodal_description")
+        or fields.get("detailed_description")
+        or value
+    )
+    ranges: list[tuple[float, float]] = []
+    for raw_line in str(visual or "").splitlines():
+        line = raw_line.strip()
+        canonical = _H3_CANONICAL_RECORD_RE.fullmatch(line)
+        if canonical:
+            start = _h3_time_value(canonical.group("start"))
+            end = _h3_time_value(canonical.group("end"))
+            if start is not None and end is not None and end > start:
+                ranges.append((start, end))
+            continue
+        loose = _H3_LOOSE_RANGE_RE.fullmatch(line)
+        if loose:
+            start = _h3_time_value(loose.group("start"))
+            end = _h3_time_value(loose.group("end"))
+            if start is not None and end is not None and end > start:
+                ranges.append((start, end))
+    return ranges
+
+
+def _h3_candidate_record_ranges(value: str) -> list[tuple[float, float]]:
+    """Extract the final Base records without repairing or interpreting them."""
+
+    from services.director.h3_dialogue import _H3_CANONICAL_RECORD_RE, _extract_h3_fields
+
+    fields = _extract_h3_fields(value)
+    visual = fields.get("integrated_multimodal_description", "")
+    ranges: list[tuple[float, float]] = []
+    for raw_line in visual.splitlines():
+        match = _H3_CANONICAL_RECORD_RE.fullmatch(raw_line.strip())
+        if not match:
+            continue
+        start = _h3_time_value(match.group("start"))
+        end = _h3_time_value(match.group("end"))
+        if start is not None and end is not None and end > start:
+            ranges.append((start, end))
+    return ranges
+
+
+def _h3_authored_beat_count(source: str) -> int:
+    """Count only explicit, meaningful multi-beat evidence in a request."""
+
+    from services.director.h3_dialogue import _extract_h3_fields
+
+    fields = _extract_h3_fields(source)
+    text = str(
+        fields.get("integrated_multimodal_description")
+        or fields.get("detailed_description")
+        or source
+    )
+    explicit_ranges = _h3_source_record_ranges(source)
+    count = len(explicit_ranges)
+    count = max(count, len(re.findall(r"\[\s*(?:Shot|Scene)\s+\d+", text, re.IGNORECASE)))
+    beat_numbers = [
+        int(number) for number in re.findall(
+            r"\b(?:beat|step|phase)\s+([1-9]\d*)\b", text, re.IGNORECASE,
+        )
+    ]
+    if beat_numbers:
+        count = max(count, max(beat_numbers))
+    if re.search(r"\b(?:first|initially|starts?|begins?)\b", text, re.IGNORECASE):
+        if re.search(r"\b(?:then|next|after that|later|finally|ends?|lastly)\b", text, re.IGNORECASE):
+            count = max(count, 3 if re.search(
+                r"\b(?:finally|lastly|ends?)\b", text, re.IGNORECASE,
+            ) else 2)
+    transitions = re.findall(
+        r"\b(?:then|next|after that|later|finally|lastly)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if transitions and not re.search(r"\bif\b[^.?!]{0,80}\bthen\b", text, re.IGNORECASE):
+        count = max(count, 1 + len(transitions))
+    authored_time_markers = re.findall(
+        r"\bAt\s+(?:(?:\d{1,2}:){1,2})?\d+(?:\.\d+)?\s*seconds?\b|"
+        r"\b(?:\d+(?:\.\d+)?\s*s)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if len(authored_time_markers) >= 2:
+        count = max(count, len(authored_time_markers))
+    if re.search(r"\b(?:cut\s+to|scene\s+change|location\s+change|time\s+jump)\b", text, re.IGNORECASE):
+        count = max(count, 2)
+    named_count = re.search(
+        r"\b(?:two|three|four|five|six|several|multiple)\s+"
+        r"(?:distinct\s+)?(?:beats?|moments?|actions?|events?)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if named_count:
+        count = max(count, {
+            "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "several": 2, "multiple": 2,
+        }[named_count.group(1).casefold()])
+    return count
+
+
+def _h3_source_structure_errors(
+    source: str,
+    candidate: str,
+    *,
+    duration_seconds: Optional[float],
+) -> list[str]:
+    """Reject Base rewrites that erase explicit beats or violate one-takes."""
+
+    source_text = str(source or "")
+    candidate_ranges = _h3_candidate_record_ranges(candidate)
+    one_take = bool(re.search(
+        r"\b(?:one|single|sustained|continuous|unbroken|uninterrupted)\s+"
+        r"(?:(?:sustained|continuous|unbroken|uninterrupted)\s+)?"
+        r"(?:one[- ]?)?take\b|"
+        r"\b(?:one|single)\s+(?:sustained|continuous|unbroken|uninterrupted)\s+"
+        r"(?:(?:camera\s+)?shot|(?:visual|camera)\s+composition)\b|"
+        r"\b(?:sustained|continuous|unbroken|uninterrupted)\s+"
+        r"(?:(?:camera\s+)?shot|(?:visual|camera)\s+composition)\b|"
+        r"\b(?:one|single)\s+(?:visual|camera)\s+composition\b|"
+        r"\bwithout\s+(?:a\s+)?cut\b|\bno\s+cuts?\b",
+        source_text,
+        re.IGNORECASE,
+    ))
+    if one_take:
+        if len(candidate_ranges) != 1:
+            return [
+                "explicit sustained one-take must remain exactly one canonical record"
+            ]
+        # Chronological action words inside an explicitly continuous take are
+        # internal beats, not permission to manufacture record boundaries.
+        return []
+
+    source_ranges = _h3_source_record_ranges(source_text)
+    authored_beats = _h3_authored_beat_count(source_text)
+    if authored_beats < 2:
+        return (
+            ["Base rewrite added shot records without an authored multi-beat request"]
+            if len(candidate_ranges) > 1 else []
+        )
+    errors: list[str] = []
+    if len(candidate_ranges) < 2:
+        errors.append(
+            "Base rewrite collapsed explicit multi-beat source into one shot record"
+        )
+    # Supplied numeric boundaries are authoritative and are checked by the
+    # timestamp lock. Unequal timing is required only when the source asks for
+    # distinct beats without supplying its own ranges.
+    if not source_ranges and len(candidate_ranges) >= 2:
+        durations = [end - start for start, end in candidate_ranges]
+        if durations and max(durations) - min(durations) <= 0.01:
+            errors.append(
+                "Base multi-beat rewrite used equal-duration records; preserve natural unequal pacing"
+            )
     return errors
 
 
@@ -5127,12 +6076,19 @@ def _h3_format_repair_lock_errors(before: str, after: str) -> list[str]:
 
     errors = _h3_locked_content_errors(before, after)
     before_fields = _extract_h3_fields(before)
+    after_fields = _extract_h3_fields(after)
     after_compact = " ".join(str(after or "").split())
+    before_subjects = " ".join(str(before_fields.get("subject_definitions", "")).split())
+    after_subjects = " ".join(str(after_fields.get("subject_definitions", "")).split())
+    if bool(before_subjects) != bool(after_subjects):
+        errors.append("format repair added or removed subject definitions")
+    elif before_subjects and before_subjects != after_subjects:
+        errors.append("format repair changed subject_definitions")
     for field, value in before_fields.items():
         if field in {"detailed_description", "integrated_multimodal_description"}:
             continue
         compact = " ".join(value.split())
-        after_value = " ".join(_extract_h3_fields(after).get(field, "").split())
+        after_value = " ".join(after_fields.get(field, "").split())
         if compact and compact != after_value:
             errors.append(f"format repair changed {field}")
 
@@ -5264,6 +6220,12 @@ def _h3_enhance_contract_errors(
         duration_seconds=duration_seconds,
     ))
     errors.extend(_h3_locked_content_errors(source_prompt, candidate))
+    if not ref2va:
+        errors.extend(_h3_source_structure_errors(
+            source_prompt,
+            candidate,
+            duration_seconds=duration_seconds,
+        ))
     return list(dict.fromkeys(errors))
 
 
@@ -5414,7 +6376,7 @@ def enhance_prompt(
             override_prompt = _build_enhance_user_prompt(
                 prompt, mode, duration_seconds, window_count,
                 window_size_seconds, preserve_global_timeline=True,
-                h3_context_ir=True,
+                h3_context_ir=True, h3_ref2va=is_h3_ref2va,
             )
         prompt_with_marker = (
             f"/no_think\n\n{override_prompt}" if override_prompt else "/no_think"
@@ -5527,6 +6489,7 @@ def enhance_prompt(
         raw_prompt = _build_enhance_user_prompt(
             prompt, mode, duration_seconds, window_count, window_size_seconds,
             preserve_global_timeline, h3_context_ir=is_h3_context_ir,
+            h3_ref2va=is_h3_ref2va,
         )
         print(f"[Enhance] Raw enhancer ({model_type}, images={bool(image_paths)}, windows={window_count})")
         result = generate(prompt=raw_prompt, image_paths=image_paths, **gen_kw)
@@ -5568,11 +6531,14 @@ def enhance_prompt(
         elif is_h3_context_ir:
             system = (
                 "Rewrite the request as one complete MiniMax H3 prompt with "
-                "these exact fields in order: integrated_multimodal_description:, "
+                "these exact fields in order: subject_definitions:, "
+                "integrated_multimodal_description:, "
                 "overall_soundscape:, non_diegetic_music:. Use one coherent "
-                "global timeline through the supplied Duration. Preserve "
-                "identities, literal <d> dialogue, speaker IDs, sound, music, "
-                "authored global timestamps, and cuts."
+                "global timeline through the supplied Duration. Establish each "
+                "authored entity once, reference stable Subject IDs or names, "
+                "and use multiple unequal records for distinct authored beats "
+                "or boundaries; preserve identities, literal <d> dialogue, "
+                "speaker IDs, sound, music, authored global timestamps, and cuts."
             )
         else:
             system_prompts = {
@@ -5699,6 +6665,7 @@ def enhance_prompt(
     user_prompt = _build_enhance_user_prompt(
         prompt, mode, duration_seconds, window_count, window_size_seconds,
         preserve_global_timeline, h3_context_ir=is_h3_context_ir,
+        h3_ref2va=is_h3_ref2va,
     )
 
     # Add image context
@@ -5752,10 +6719,17 @@ def enhance_prompt(
             system += (
                 "\n\nCRITICAL MINIMAX H3 OUTPUT CONTRACT: Output ONLY the structured "
                 "H3 prompt, with the exact field labels "
-                "integrated_multimodal_description:, overall_soundscape:, and "
+                "subject_definitions:, integrated_multimodal_description:, "
+                "overall_soundscape:, and "
                 "non_diegetic_music:. These labels are required model syntax, not "
-                "explanatory headers. Every spoken line must have a stable (S1), "
+                "explanatory headers. Define each authored visible entity once "
+                "in subject_definitions and reference its stable Subject ID or "
+                "name in the records; never repeat its full definition in a "
+                "shot. Every spoken line must have a stable (S1), "
                 "(S2), etc. speaker ID and use <d>[Language] literal words</d>. "
+                "For distinct authored beats, cuts, or timestamp boundaries, "
+                "write multiple naturally unequal records; use one record only "
+                "for an explicitly sustained one-take. "
                 "When the user requests a discussion without supplying lines, write "
                 "short meaningful dialogue that fits the supplied Duration. Once the "
                 "last line ends, describe silent visible action and closed mouths; do "
@@ -5777,7 +6751,7 @@ def enhance_prompt(
     if window_count and window_count > 1:
         effective_max_tokens = max(max_new_tokens, window_count * 300 + 256)
     if is_h3_context_ir:
-        # Leave enough room for the three required fields plus a compact timed
+        # Leave enough room for the Base entity namespace and required fields plus a compact timed
         # dialogue. Most H3 prompts finish well below this ceiling, but 512 can
         # truncate a vision-assisted 15-second rewrite before its sound fields.
         duration_budget = min(

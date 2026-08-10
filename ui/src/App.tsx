@@ -13,9 +13,11 @@ import { PreflightBanner } from './components/PreflightBanner'
 import { WelcomeModal } from './components/WelcomeModal'
 import { H3GenerationPlanDialog } from './components/H3GenerationPlanDialog'
 import { RecipesOverlay } from './components/Recipes/RecipesOverlay'
+import { WhatsNewButton } from './components/WhatsNewDialog'
 import { useStore } from './stores/useStore'
 import { useIsMobile } from './lib/useIsMobile'
 import { POLL_INTERVAL_MS, useVisibilityPolling } from './lib/useVisibilityPolling'
+import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from './lib/branding'
 import * as api from './api/client'
 
 const BOOTSTRAP_TIMEOUT_MS = 15_000
@@ -50,7 +52,6 @@ function App() {
   const sidebarOpen = useStore(s => s.sidebarOpen)
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const toggleSettings = useStore(s => s.toggleSettings)
-  const appVersion = useStore(s => s.systemConfig?.app_version)
   const llmLoading = useStore(s => s.llmLoading)
   const llmEnhancing = useStore(s => s.isEnhancing)
   const llmStatusLoading = useStore(s => s.llmStatus?.loading === true)
@@ -67,11 +68,11 @@ function App() {
     let cancelled = false
     void bootstrapWithin(
       loadAccessContext(),
-      'Maestro did not respond while checking access.',
+      `${PRODUCT_NAME} did not respond while checking access.`,
     ).then(async context => {
       const workspaceState = await bootstrapWithin(
         api.fetchWorkspaces(),
-        'Maestro did not respond while loading projects.',
+        `${PRODUCT_NAME} did not respond while loading projects.`,
       )
       if (cancelled) return
       useStore.setState({
@@ -95,7 +96,7 @@ function App() {
       setBootstrapState('ready')
     }).catch(error => {
       if (cancelled) return
-      setBootstrapError(error instanceof Error ? error.message : 'Maestro did not respond')
+      setBootstrapError(error instanceof Error ? error.message : `${PRODUCT_NAME} did not respond`)
       setBootstrapState('error')
     })
     return () => { cancelled = true }
@@ -123,8 +124,14 @@ function App() {
           <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-accent-blue text-lg font-bold text-white">
             M
           </div>
-          <h1 className="text-base font-semibold">
-            {bootstrapState === 'loading' ? 'Connecting to Maestro…' : 'Maestro is not ready'}
+          <h1 className="text-base font-semibold" aria-label={bootstrapState === 'loading'
+            ? `Connecting to ${PRODUCT_NAME}`
+            : `${PRODUCT_NAME} is not ready`}>
+            <span aria-hidden="true">
+              {bootstrapState === 'loading'
+                ? `Connecting to ${PRODUCT_NAME_VISUAL}…`
+                : `${PRODUCT_NAME_VISUAL} is not ready`}
+            </span>
           </h1>
           {bootstrapState === 'error' && (
             <>
@@ -169,12 +176,16 @@ function App() {
           >
             <Menu size={20} />
           </button> : <span className="w-9" aria-hidden="true" />}
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
+          <div className="mx-1 flex min-w-0 items-center gap-2">
+            <div aria-hidden="true" className="w-7 h-7 shrink-0 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
               M
             </div>
-            <span className="font-semibold text-sm">Maestro</span>
-            {appVersion && <span className="text-[10px] text-text-muted font-normal mt-0.5">v{appVersion}</span>}
+            <div className="min-w-0">
+              <span className="sr-only">{PRODUCT_NAME}. {PRODUCT_PROVENANCE}</span>
+              <span aria-hidden="true" className="block truncate text-[11px] font-semibold leading-tight">{PRODUCT_NAME_VISUAL}</span>
+              <span aria-hidden="true" className="block truncate text-[8px] font-normal leading-tight text-text-muted">{PRODUCT_PROVENANCE}</span>
+            </div>
+            <WhatsNewButton compact />
           </div>
           {machineControls ? (
             <button

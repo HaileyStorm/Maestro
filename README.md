@@ -132,7 +132,7 @@ View all past Director runs with their full state — clip plans, generated imag
 
 ## Updates
 
-The version you are running is shown next to the Maestro title in the UI. To update, use the launcher's Update button in Pinokio.
+Maestro Continuum has its own product release version, separate from the bundled Maestro-base compatibility version. This build is Continuum 0.3.0 on Maestro base 1.6.5; open **What's new** in the product header for Continuum notes and both release archives. The entries below record Maestro-base updates and are not Continuum release history. To update, use the launcher's Update button in Pinokio.
 
 ### v1.6.5 (2026-08-08)
 
@@ -579,15 +579,15 @@ When a verified stable Worker URL is active, Pinokio shows it as the primary Clo
 
 For a reusable address without buying a domain, Maestro includes a minimal Cloudflare Workers Free stable-share Worker in [`cloudflare/stable-share-worker`](cloudflare/stable-share-worker/README.md). It keeps Pinokio's existing Quick Tunnel and updates only a KV-stored target after each launch. Maestro displays the `*.workers.dev` address only after an authenticated update plus health/target verification at the updating edge; if that check fails, the current `*.trycloudflare.com` URL remains available. The default `SHARE_MODE=proxy` streams polling, uploads, downloads, and other HTTP traffic so the stable hostname survives page refreshes across Maestro restarts; `SHARE_MODE=redirect` is the configuration-only rollback. Proxying adds a Cloudflare Worker transit hop: bodies and session headers are not logged or stored, observability is disabled, and responses are `no-store`, but the traffic does pass through Cloudflare's Worker runtime. Cloudflare Free inbound requests are capped at 100 MB; that ceiling applies to the Worker and is also expected at the Quick Tunnel edge, so larger uploads require local/LAN access or a future chunked-upload path. The Workers Free allowance is 100,000 requests/day and 10 ms CPU/invocation. The landed remote idle cadence is 2,880 requests/day per visible tab and zero while hidden, below the 25,000/day enablement gate. Periodic upper bounds are 56,160/day for one continuously active remote job and 59,040/day for one running plus ten queued, before bounded event-driven refreshes. Multiple active tabs can still exhaust the allowance, so the independently surfaced Quick Tunnel remains the quota/extra-hop fallback. The Worker's `/direct` convenience route only works while the Worker is healthy; it is not usable after quota exhaustion. In proxy mode upstream redirects are never auto-followed, only same-target redirects are rewritten to the stable host, and cross-target redirects are rejected. Because Workers KV is eventually consistent across edge locations, another region can briefly retain the prior (normally expired) Quick Tunnel until KV converges. Keep the Worker update secret only in the ignored local `ENVIRONMENT`; the one-time Cloudflare provisioning credential is removed after setup. Do not enable a paid Workers plan for this setup.
 
-Remote access is deliberately not an administration surface. It exposes the app but denies Classic UI, system/storage/model-source settings, arbitrary model links/paths, and service load/unload. New remote projects require a password. LAN binding remains disabled by default.
+Remote access is deliberately not an administration surface. It exposes the app but denies Classic UI, system/storage/model-source settings, arbitrary model links/paths, and service load/unload. New remote projects require a password. A browser may keep several projects unlocked at once. An explicit `device` unlock is cached server-side across ordinary reloads and Maestro restarts for at most 30 days locally (7 days idle) or 7 days remotely (24 hours idle); `session` grants are shorter and process-local. Deliberate project selection and authorized project mutations slide the idle deadline without moving its absolute cap. Read-only listing, media, gallery, queue, job, and status polls validate grants but never extend them, so a tab left polling cannot stay unlocked forever. Relocking, password changes/removal, project deletion/recreation, expiry, or invalid grant data revokes access. The owner-only cache contains HMAC identities and expiry metadata, never passwords, raw session cookies, or bearer credentials. LAN binding remains disabled by default.
 
-Lawful-use and separately licensed Ref2VA notices are versioned once per Maestro host, not per browser, project, or device. Any current local project user or password-unlocked remote project user may record the exact displayed version; doing so grants no project or machine-control capability. A notice version change requires a fresh acceptance. Mature prompt guidance is a separate host setting and is applied only when the current Studio or Director job is explicitly marked **Explicit**. Maestro does not inspect local prompts or outputs to make that choice. External LLM providers remain separately disclosed and subject to their own terms and privacy policies.
+Lawful-use, separately licensed Ref2VA, and applicable BFL/Krea model-license notices are versioned once per Maestro host, not per browser, project, or device. Any current local project user or password-unlocked remote project user may record the exact displayed version; doing so grants no project or machine-control capability. A notice version change requires a fresh acceptance, and any required manual-review commitment is user-confirmed before the selected model or paired recipe can run. Mature prompt guidance is a separate host setting and is applied only when the current Studio or Director job is explicitly marked **Explicit**. Maestro does not inspect local prompts or outputs to make that choice. External LLM providers remain separately disclosed and subject to their own terms and privacy policies.
 
 Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to `false` (in the per-app or global ENVIRONMENT file) to bind the server to loopback only; set to `true` for LAN access. Pinokio's own daemon proxy is a separate concern that may also need to honor the variable depending on your setup.
 
 ## API examples
 
-The React UI uses the same project-scoped API. A browser must first unlock a protected project; the signed `maestro_session` cookie then carries that unlock for later requests.
+The React UI uses the same project-scoped API. A browser must first unlock a protected project; the signed `maestro_session` cookie identifies that browser while the server validates its independently revocable project grant on every later request.
 
 ```bash
 # Resolve whichever surface is active. Default proxy mode remains on the stable
@@ -603,9 +603,15 @@ curl -fsS -b cookies.txt "$BASE/api/v1/access-context"
 # Unlock a known project, then list only its authorized final outputs
 curl -fsS -b cookies.txt -c cookies.txt -H "Origin: $BASE" \
   -H 'Content-Type: application/json' \
-  -d '{"password":"PROJECT_PASSWORD"}' \
+  -d '{"password":"PROJECT_PASSWORD","remember":"device"}' \
   "$BASE/api/v1/workspaces/my-project/unlock"
 curl -fsS -b cookies.txt "$BASE/api/v1/outputs?workspace=my-project&artifact_scope=final"
+
+# Relock one project, or every project unlocked by this browser on this access surface
+curl -fsS -b cookies.txt -H "Origin: $BASE" -X POST \
+  "$BASE/api/v1/workspaces/my-project/lock"
+curl -fsS -b cookies.txt -H "Origin: $BASE" -X POST \
+  "$BASE/api/v1/workspaces/lock-all"
 
 # Create and animate a bounded Blender scene; no Python/code field is accepted
 curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import {
   ArrowRight,
   Clapperboard,
+  Check,
   Cuboid,
   Download,
   FolderLock,
@@ -15,6 +16,8 @@ import {
   X,
 } from 'lucide-react'
 import { useStore } from '../stores/useStore'
+import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from '../lib/branding'
+import { CHANGELOG_MANIFEST, CURRENT_RELEASE } from '../lib/changelog'
 
 const SEEN_KEY = 'maestro_welcome_seen_v1'
 
@@ -90,7 +93,7 @@ export function WelcomeModal() {
     ? 'This browser works only inside projects you explicitly unlock. Machine settings stay on the host.'
     : accessContext?.cloudflare_enabled
       ? 'Your local studio keeps working independently of its Cloudflare share address.'
-      : 'Open Maestro from Pinokio for the most direct, dependable local connection.'
+      : `Open ${PRODUCT_NAME} from Pinokio for the most direct, dependable local connection.`
 
   return (
     <div
@@ -121,14 +124,19 @@ export function WelcomeModal() {
               <div className="mb-1 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-accent-blue">
                 <Sparkles size={12} /> Your creative workspace
               </div>
-              <h2 id={titleId} className="text-xl font-semibold tracking-tight text-text-primary sm:text-2xl">
-                Welcome to Maestro
+              <h2
+                id={titleId}
+                aria-label={`Welcome to ${PRODUCT_NAME}`}
+                className="text-xl font-semibold tracking-tight text-text-primary sm:text-2xl"
+              >
+                <span aria-hidden="true">Welcome to {PRODUCT_NAME_VISUAL}</span>
               </h2>
+              <p className="mt-0.5 text-[9px] font-medium text-text-muted sm:text-[10px]">{PRODUCT_PROVENANCE}</p>
               <p id={descriptionId} className="mt-1 max-w-2xl text-xs leading-relaxed text-text-secondary sm:text-sm">
                 Move from a single idea to finished images, video, audio, and connected stories—without losing sight of the work between.
               </p>
             </div>
-            <button type="button" onClick={dismiss} className="shrink-0 rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label="Close welcome to Maestro">
+            <button type="button" onClick={dismiss} className="shrink-0 rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label={`Close welcome to ${PRODUCT_NAME}`}>
               <X size={17} />
             </button>
           </div>
@@ -142,7 +150,7 @@ export function WelcomeModal() {
           </div>
         </div>
 
-        <div className="grid gap-2.5 px-5 py-5 sm:grid-cols-2 sm:px-7 sm:py-6">
+        <div className="grid gap-2.5 px-5 pt-5 sm:grid-cols-2 sm:px-7 sm:pt-6">
           <ModeCard icon={<WandSparkles size={17} />} title="Studio" eyebrow="Make and refine">
             Generate images, video, and audio, then restyle, extend, retake, and edit without leaving the workspace.
           </ModeCard>
@@ -151,7 +159,7 @@ export function WelcomeModal() {
           </ModeCard>
           <ModeCard icon={<MessageSquare size={17} />} title="Chat" eyebrow="Think with your tools">
             {accessContext?.remote
-              ? 'Develop concepts and production plans with the language-model service configured on the Maestro host.'
+              ? `Develop concepts and production plans with the language-model service configured on the ${PRODUCT_NAME} host.`
               : 'Develop concepts and production plans with the language-model service you choose in Settings.'}
           </ModeCard>
           <ModeCard icon={<FolderLock size={17} />} title="Projects" eyebrow="Keep context together">
@@ -169,6 +177,38 @@ export function WelcomeModal() {
             </FeaturePoint>
           </div>
         </div>
+
+        <div className="px-5 py-5 sm:px-7 sm:py-6">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-xs font-semibold text-text-primary">What's new in Continuum</h3>
+            <span className="rounded-full bg-accent-blue/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-accent-blue">
+              v{CURRENT_RELEASE.version}
+            </span>
+          </div>
+          <p className="mt-1 text-[10px] leading-relaxed text-text-muted">{CURRENT_RELEASE.summary}</p>
+          <ul className="mt-3 grid gap-2 sm:grid-cols-2" aria-label={`Continuum ${CURRENT_RELEASE.version} release highlights`}>
+            {CURRENT_RELEASE.highlights.map(highlight => (
+              <li key={highlight.id} className="flex gap-2 rounded-lg border border-border/80 bg-bg-primary/45 px-3 py-2.5">
+                <Check size={14} aria-hidden="true" className="mt-0.5 shrink-0 text-accent-green" />
+                <div>
+                  <h4 className="text-[10px] font-semibold text-text-primary">{highlight.title}</h4>
+                  <p className="mt-0.5 text-[10px] leading-relaxed text-text-muted">{highlight.summary}</p>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <div className="mt-3 border-t border-border/80 pt-3">
+            <h3 className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-muted">Why Continuum</h3>
+            <ul className="mt-2 flex flex-wrap gap-1.5" aria-label="Why Continuum">
+              {CHANGELOG_MANIFEST.whyContinuum.map(highlight => (
+                <li key={highlight.id} className="rounded-full border border-border bg-bg-tertiary/55 px-2 py-1 text-[9px] font-medium text-text-secondary">
+                  {highlight.title}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <p className="mt-2 text-[9px] leading-relaxed text-text-muted">Reopen these notes and the separate release archive from What's new in the product header.</p>
+        </div>
         </div>
 
         <div className="sticky bottom-0 shrink-0 border-t border-border bg-bg-secondary px-5 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:flex sm:items-center sm:justify-between sm:gap-5 sm:px-7">
@@ -179,7 +219,7 @@ export function WelcomeModal() {
             </div>
             <div className="flex items-start gap-2">
               <Download size={14} className="mt-0.5 shrink-0 text-accent-blue" />
-              <span>If needed, this Maestro host downloads and prepares model files in a shared cache. Allowed local and remote users reuse that host cache; project access and private-preview rules still apply.</span>
+              <span>If needed, this {PRODUCT_NAME} host downloads and prepares model files in a shared cache. Allowed local and remote users reuse that host cache; project access and private-preview rules still apply.</span>
             </div>
           </div>
           <button
@@ -210,7 +250,7 @@ function FeaturePoint({ icon, title, children }: { icon: React.ReactNode; title:
 
 function ModeCard({ icon, title, eyebrow, children }: { icon: React.ReactNode; title: string; eyebrow: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-xl border border-border bg-bg-tertiary/55 p-3.5">
+    <div className="rounded-xl border border-border bg-bg-tertiary/55 p-3.5" title={title}>
       <div className="flex items-center gap-2.5">
         <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent-blue/12 text-accent-blue">
           {icon}

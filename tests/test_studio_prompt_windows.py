@@ -395,6 +395,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             "_h3_preferred_fl2va_model",
             "_prepare_h3_long_studio_request",
             "_public_h3_long_plan",
+            "_public_h3_boundary",
             "_h3_estimate_context",
             "_h3_segment_count_estimate",
             "_plan_h3_adaptive_models",
@@ -443,6 +444,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                 )
 
         namespace = {
+            "math": __import__("math"),
             "wgp": FakeWgp,
             "_H3_LONG_STUDIO_MODELS": {
                 "minimax_h3", "minimax_h3_pinkcherry_fl2va",
@@ -525,7 +527,10 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                 {"model_type": "minimax_h3", "reason": "base"},
                 {"model_type": "minimax_h3_ref2va", "reason": "semantic"},
             ],
-            "clip_boundaries": [{"type": "cut"}],
+            "clip_boundaries": [{
+                "type": "cut", "source": "explicit_cut",
+                "event": "AUTHORED_BOUNDARY_SENTINEL",
+            }],
             "clip_prompt_previews": ["one", "two"],
             "requested_frames": 240,
             "planned_frames": 248,
@@ -538,6 +543,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             [segment["published_frames"] for segment in public["segments"]],
             [124, 116],
         )
+        self.assertNotIn("AUTHORED_BOUNDARY_SENTINEL", repr(public))
         self.assertEqual(
             [segment["published_duration_seconds"] for segment in public["segments"]],
             [124 / 24, 116 / 24],
@@ -1043,12 +1049,21 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                 )
                 self.assertEqual(cut_boundary["at_seconds"], 15.0)
                 self.assertEqual(cut_boundary["source"], "explicit_cut")
-                self.assertIn(
-                    "[0-", body["per_clip_prompts"][cut_index + 1],
+                self.assertEqual(
+                    body["per_clip_prompts"], [prompt] * expected_clips,
                 )
-                self.assertIn(
-                    "[Shot 2] cut to the cockpit.",
-                    body["per_clip_prompts"][cut_index + 1],
+                semantic = plan["shot_plan"]["semantic_shots"]
+                self.assertEqual(len(semantic), 1)
+                self.assertFalse(
+                    semantic[0]["prompt_rewrite_for_physical_split"],
+                )
+                self.assertEqual(
+                    [shot["execution_cursor_frame"]
+                     for shot in plan["shot_plan"]["shots"]],
+                    [0, *[
+                        sum(plan["clip_published_frames"][:index])
+                        for index in range(1, expected_clips)
+                    ]],
                 )
                 if final_frame:
                     self.assertGreaterEqual(plan["final_trim_frames"], 17)
@@ -1164,18 +1179,24 @@ class H3LongStudioPlanningTests(unittest.TestCase):
 
     def test_h3_step_validation_covers_plan_submit_and_worker_ingress(self):
         launch = Path(APP, "launch.py").read_text(encoding="utf-8")
-        self.assertEqual(launch.count("_validate_h3_sampling_steps("), 4)
+        self.assertGreaterEqual(launch.count("_validate_h3_sampling_steps("), 3)
         plan = launch[launch.index("async def preview_generation_plan"):]
         submit = launch[launch.index("async def generate(request: Request)"):]
+        submission_planner = launch[
+            launch.index("def _plan_generation_submission("):
+            launch.index('@api.post("/api/v1/generate/plan")')
+        ]
         worker_at = launch.index("worker_h3_plan =")
         worker = launch[worker_at - 2500:]
+        self.assertIn("_plan_generation_submission(", plan)
         self.assertLess(
-            plan.index("_validate_h3_sampling_steps(body)"),
-            plan.index("_prepare_h3_long_studio_request(body)"),
+            submission_planner.index("_validate_h3_sampling_steps(body)"),
+            submission_planner.index("_prepare_h3_long_studio_request(body)"),
         )
+        self.assertIn("_plan_generation_submission(", submit)
         self.assertLess(
-            submit.index("_validate_h3_sampling_steps(body)"),
-            submit.index("_prepare_h3_long_studio_request(body)"),
+            submission_planner.index("_validate_h3_sampling_steps(body)"),
+            submission_planner.index("_prepare_h3_long_studio_request(body)"),
         )
         self.assertLess(
             worker.index("_validate_h3_sampling_steps(raw_params)"),
@@ -1328,9 +1349,19 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         with open(os.path.join(ROOT, "ui", "src", "components", "Sidebar", "PromptInput.tsx"), encoding="utf-8") as handle:
             prompt_ui = handle.read()
         self.assertIn("studioPromptEnhance: false", store)
-        self.assertIn("enhancedForSubmission", store)
-        self.assertIn("if (!enhanced)", store)
-        self.assertIn("return false", store)
+        generation = store[store.index("startGeneration: async"):store.index("stopGeneration: (jobId)")]
+        self.assertIn("enhance_before_generate", generation)
+        self.assertIn("enhanceBeforeGenerate", generation)
+        self.assertNotIn("get().enhancePrompt()", generation)
+        self.assertLess(generation.index("jobs: [newJob, ...s.jobs]"), generation.index("api.submitGeneration(params)"))
+        self.assertIn("enhanceBeforeGenerate && s.activeWorkspace === submissionWorkspace", generation)
+        self.assertIn("? { studioPromptEnhance: false }", generation)
+        self.assertIn("get().activeWorkspace !== submissionWorkspace", generation)
+        self.assertIn("reconnectedJobExists", generation)
+        self.assertIn("promptPreview: durablePreparationExpected ? ''", generation)
+        self.assertIn("usesDedicatedGenerationEndpoint", generation)
+        self.assertIn("enhanceRequested && !state.params.prompt.trim()", generation)
+        self.assertIn("Enter a prompt before using Enhance before Generate.", generation)
         self.assertIn("Enhance before Generate", prompt_ui)
         self.assertIn("Model: ${enhancerModelLabel}", prompt_ui)
         self.assertIn("global timeline is preserved as authored", prompt_ui)
@@ -1366,14 +1397,15 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         ):
             self.assertIn(field, launch)
         self.assertIn('gen["current_window_prompt"]', wgp)
-        self.assertIn("activeWindowPrompt: j.active_window_prompt", store)
-        self.assertIn("windowCurrent: j.window_current", store)
-        self.assertIn("overallProgress: j.overall_progress", store)
+        self.assertIn("activeWindowPrompt: status.status", store)
+        self.assertIn(": status.active_window_prompt", store)
+        self.assertIn("windowCurrent: status.window_current", store)
+        self.assertIn("overallProgress: status.overall_progress", store)
         self.assertIn("job.modelType?.startsWith('minimax_h3') ? 'Segment' : 'Window'", card)
         self.assertIn("{progressUnit} {job.windowCurrent || 1}/{job.windowTotal}", card)
         self.assertIn("Current {progressUnit.toLowerCase()}", card)
         self.assertIn("job.activeWindowPrompt || job.promptPreview", card)
-        self.assertIn("if (status.status === 'queued' || status.status === 'running')", store)
+        self.assertIn("ACTIVE_GENERATION_JOB_STATUSES.has(status.status)", store)
         self.assertIn("Terminal failures stay", store)
 
     def test_main_studio_window_controls_use_model_effective_values(self):
@@ -1544,7 +1576,7 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
             launch.index('async def generate(request: Request)'):
             launch.index('@api.post("/api/v1/retake")')
         ]
-        self.assertIn("_validate_h3_turbo_estimate_context(", generation)
+        self.assertIn("_plan_generation_submission(", generation)
         eta = launch[
             launch.index("def _job_eta_values"):
             launch.index("def _job_owned_by_request")

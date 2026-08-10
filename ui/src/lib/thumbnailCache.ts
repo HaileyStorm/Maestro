@@ -47,16 +47,22 @@ export async function setCachedThumbnail(key: string, dataUrl: string): Promise<
   }
 }
 
-/** Capture a video frame at the given time and return a data URL */
-function captureVideoFrame(videoUrl: string, timeSeconds = 0.1): Promise<string> {
+/** Capture a video frame at the given time and return a data URL. */
+function captureVideoFrame(videoUrl: string, signal: AbortSignal, timeSeconds = 0.1): Promise<string> {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video')
     video.muted = true
     video.preload = 'auto'
-    video.src = videoUrl
 
     let settled = false
+    const timer: { id?: ReturnType<typeof setTimeout> } = {}
     const cleanup = () => {
+      if (timer.id !== undefined) clearTimeout(timer.id)
+      signal.removeEventListener('abort', abort)
+      video.onloadeddata = null
+      video.onseeked = null
+      video.onerror = null
+      video.pause()
       video.removeAttribute('src')
       video.load()
     }
@@ -66,6 +72,13 @@ function captureVideoFrame(videoUrl: string, timeSeconds = 0.1): Promise<string>
       cleanup()
       reject(e)
     }
+    const abort = () => fail(new DOMException('Thumbnail request aborted', 'AbortError'))
+
+    if (signal.aborted) {
+      abort()
+      return
+    }
+    signal.addEventListener('abort', abort, { once: true })
 
     video.onloadeddata = () => {
       video.currentTime = timeSeconds
@@ -79,7 +92,7 @@ function captureVideoFrame(videoUrl: string, timeSeconds = 0.1): Promise<string>
         canvas.width = video.videoWidth
         canvas.height = video.videoHeight
         const ctx = canvas.getContext('2d')
-        if (!ctx) { cleanup(); reject(new Error('no canvas ctx')); return }
+        if (!ctx) throw new Error('no canvas ctx')
         ctx.drawImage(video, 0, 0)
         const dataUrl = canvas.toDataURL('image/webp', 0.7)
         cleanup()
@@ -92,22 +105,49 @@ function captureVideoFrame(videoUrl: string, timeSeconds = 0.1): Promise<string>
 
     video.onerror = () => fail(new Error('video load failed'))
 
-    setTimeout(() => fail(new Error('timeout')), 10000)
+    timer.id = setTimeout(() => fail(new Error('timeout')), 10000)
+    video.src = videoUrl
   })
 }
 
 // --- Priority queue: most recently requested items are processed first ---
 // This ensures visible thumbnails get captured before off-screen ones.
-type QueueItem = {
-  videoUrl: string
-  key: string
+type ThumbnailConsumer = {
   resolve: (dataUrl: string | null) => void
-  timestamp: number
+  signal?: AbortSignal
+  abort?: () => void
 }
 
-const queue: QueueItem[] = []
-const pending = new Map<string, QueueItem[]>() // identity key -> resolvers waiting
+type ThumbnailJob = {
+  videoUrl: string
+  key: string
+  timestamp: number
+  consumers: Set<ThumbnailConsumer>
+  state: 'queued' | 'active'
+  controller: AbortController
+}
+
+const queue: ThumbnailJob[] = []
+const jobs = new Map<string, ThumbnailJob>()
 let processing = false
+
+function resolveConsumer(consumer: ThumbnailConsumer, dataUrl: string | null): void {
+  if (consumer.abort && consumer.signal) consumer.signal.removeEventListener('abort', consumer.abort)
+  consumer.resolve(dataUrl)
+}
+
+function resolveJob(job: ThumbnailJob, dataUrl: string | null): void {
+  for (const consumer of job.consumers) resolveConsumer(consumer, dataUrl)
+  job.consumers.clear()
+}
+
+function cancelConsumer(job: ThumbnailJob, consumer: ThumbnailConsumer): void {
+  if (!job.consumers.delete(consumer)) return
+  resolveConsumer(consumer, null)
+  if (job.consumers.size > 0) return
+  if (jobs.get(job.key) === job) jobs.delete(job.key)
+  if (job.state === 'active') job.controller.abort()
+}
 
 async function processQueue() {
   if (processing) return
@@ -116,35 +156,27 @@ async function processQueue() {
   while (queue.length > 0) {
     // Process newest request first (priority = most recently visible)
     queue.sort((a, b) => b.timestamp - a.timestamp)
-    const item = queue.shift()!
-    const key = item.key
-
-    // Gather all resolvers waiting for this same thumbnail
-    const waiters = pending.get(key) || []
-    pending.delete(key)
-    // Remove remaining duplicates for this exact workspace/name/revision.
-    for (let i = queue.length - 1; i >= 0; i--) {
-      if (queue[i].key === key) {
-        waiters.push(queue[i])
-        queue.splice(i, 1)
-      }
-    }
-
-    const allResolvers = [item, ...waiters]
+    const job = queue.shift()!
+    if (jobs.get(job.key) !== job || job.consumers.size === 0) continue
+    job.state = 'active'
 
     try {
       // Check cache first
-      const cached = await getCachedThumbnail(key)
+      const cached = await getCachedThumbnail(job.key)
+      if (job.controller.signal.aborted || job.consumers.size === 0) continue
       if (cached) {
-        for (const r of allResolvers) r.resolve(cached)
+        resolveJob(job, cached)
         continue
       }
       // Capture and cache
-      const dataUrl = await captureVideoFrame(item.videoUrl)
-      await setCachedThumbnail(key, dataUrl)
-      for (const r of allResolvers) r.resolve(dataUrl)
+      const dataUrl = await captureVideoFrame(job.videoUrl, job.controller.signal)
+      if (job.controller.signal.aborted || job.consumers.size === 0) continue
+      await setCachedThumbnail(job.key, dataUrl)
+      resolveJob(job, dataUrl)
     } catch {
-      for (const r of allResolvers) r.resolve(null)
+      resolveJob(job, null)
+    } finally {
+      if (jobs.get(job.key) === job) jobs.delete(job.key)
     }
   }
 
@@ -154,12 +186,37 @@ async function processQueue() {
 /**
  * Request a thumbnail for a video. Returns cached version instantly,
  * or queues a sequential capture with priority (newest requests first).
- * Deduplicates requests for the same file.
+ * Deduplicates requests for the same file. Aborting one consumer leaves a
+ * shared job running; the decode is released when its last consumer aborts.
  */
-export function requestThumbnail(videoUrl: string, key: string): Promise<string | null> {
-  // Fast path: check if already in cache synchronously via the queue check
+export function requestThumbnail(
+  videoUrl: string,
+  key: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  if (signal?.aborted) return Promise.resolve(null)
   return new Promise((resolve) => {
-    queue.push({ videoUrl, key, resolve, timestamp: Date.now() })
+    let job = jobs.get(key)
+    if (!job) {
+      job = {
+        videoUrl,
+        key,
+        timestamp: Date.now(),
+        consumers: new Set(),
+        state: 'queued',
+        controller: new AbortController(),
+      }
+      jobs.set(key, job)
+      queue.push(job)
+    } else {
+      job.timestamp = Date.now()
+    }
+    const consumer: ThumbnailConsumer = { resolve, signal }
+    if (signal) {
+      consumer.abort = () => cancelConsumer(job!, consumer)
+      signal.addEventListener('abort', consumer.abort, { once: true })
+    }
+    job.consumers.add(consumer)
     processQueue()
   })
 }

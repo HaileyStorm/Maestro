@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -48,6 +49,35 @@ MAX_RESIDENCY_BYPASSES = 2
 RESIDENCY_AGE_CEILING_SECONDS = 120.0
 MAX_RECORDED_RESIDENCY_BYPASSED_WAITERS = 10_000
 _OPAQUE_RESIDENCY_KEY_PREFIX = "r1:"
+RESOURCE_INTENT_GENERATION = "generation"
+RESOURCE_INTENT_TEXT = "text"
+_RESOURCE_INTENTS = frozenset({
+    RESOURCE_INTENT_GENERATION,
+    RESOURCE_INTENT_TEXT,
+})
+RESOURCE_EXECUTION_STANDARD = "standard"
+RESOURCE_EXECUTION_CPU = "cpu"
+_RESOURCE_EXECUTIONS = frozenset({
+    RESOURCE_EXECUTION_STANDARD,
+    RESOURCE_EXECUTION_CPU,
+})
+PREEMPTION_MODE_NONE = "none"
+PREEMPTION_MODE_DISCARD_RESTART = "discard_restart"
+_PREEMPTION_MODES = frozenset({
+    PREEMPTION_MODE_NONE,
+    PREEMPTION_MODE_DISCARD_RESTART,
+})
+RESOURCE_STATES = frozenset({
+    "queued",
+    "admitted",
+    "running",
+    "preemption_requested",
+    "resources_releasing",
+    "restarting_on_accelerator",
+    "blocked",
+    "released",
+})
+MAX_EXECUTION_ATTEMPT = 1_000_000
 _durability_hook: Callable[["DurableTransition"], None] | None = None
 
 # Any transition that changes both scheduler-visible queue membership and job
@@ -65,6 +95,7 @@ class DurableTransition:
     jobs: tuple[Mapping[str, Any], ...] = ()
     global_state: Mapping[str, Any] | None = None
     tombstones: tuple[str, ...] = ()
+    request_manifests: Mapping[str, Mapping[str, Any]] | None = None
 
 
 def configure_durability_hook(
@@ -177,6 +208,7 @@ def _persist_prospective_unlocked(
     jobs: Iterable[Mapping[str, Any]] = (),
     global_state: Mapping[str, Any] | None = None,
     tombstones: Iterable[str] = (),
+    request_manifests: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     hook = _durability_hook
     if hook is None:
@@ -186,6 +218,9 @@ def _persist_prospective_unlocked(
         jobs=tuple(jobs),
         global_state=(None if global_state is None else dict(global_state)),
         tombstones=tuple(tombstones),
+        request_manifests=(
+            None if request_manifests is None else dict(request_manifests)
+        ),
     ))
 
 
@@ -495,6 +530,162 @@ def _residency_bypass_count(job: Mapping[str, Any]) -> int:
     return max(0, min(MAX_RESIDENCY_BYPASSES, count))
 
 
+def resource_descriptor(job: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return one bounded, content-free execution descriptor.
+
+    The descriptor deliberately exposes no device identifier, lease token,
+    model identity, residency key, hardware measurement, or fairness state.
+    Missing fields retain conservative legacy generation semantics.
+    """
+    intent = job.get("resource_intent")
+    if intent not in _RESOURCE_INTENTS:
+        return None
+    execution = job.get("resource_execution", RESOURCE_EXECUTION_STANDARD)
+    if execution not in _RESOURCE_EXECUTIONS:
+        return None
+    preemption_mode = job.get("preemption_mode", PREEMPTION_MODE_NONE)
+    if preemption_mode not in _PREEMPTION_MODES:
+        return None
+    state = job.get("resource_state")
+    if state not in RESOURCE_STATES:
+        status = str(job.get("status") or "")
+        state = (
+            "running" if status in {"running", "preparing"}
+            else "released" if status in TERMINAL_STATUSES
+            else "queued"
+        )
+    try:
+        execution_attempt = int(job.get("execution_attempt", 1) or 1)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= execution_attempt <= MAX_EXECUTION_ATTEMPT:
+        return None
+    preemptible = bool(
+        intent == RESOURCE_INTENT_TEXT
+        and execution == RESOURCE_EXECUTION_CPU
+        and preemption_mode == PREEMPTION_MODE_DISCARD_RESTART
+        and job.get("_resource_preemption_eligible") is True
+        and state in {
+            "admitted", "running", "preemption_requested",
+            "resources_releasing",
+        }
+        and str(job.get("status") or "") not in TERMINAL_STATUSES
+        and not is_cancel_requested(job)
+    )
+    return {
+        "intent": intent,
+        "execution": execution,
+        "preemptible": preemptible,
+        "preemption_mode": preemption_mode,
+        "state": state,
+        "execution_attempt": execution_attempt,
+    }
+
+
+def _valid_expected_execution_attempt(
+    job: Mapping[str, Any], expected: int | None,
+) -> bool:
+    """Return whether one optional internal attempt fence is current."""
+    if expected is None:
+        return True
+    return (
+        type(expected) is int
+        and 1 <= expected <= MAX_EXECUTION_ATTEMPT
+        and job.get("execution_attempt", 1) == expected
+    )
+
+
+def transition_resource_execution(
+    job: MutableMapping[str, Any],
+    *,
+    expected_execution_attempt: int | None = None,
+    intent: str | None = None,
+    execution: str | None = None,
+    preemption_mode: str | None = None,
+    state: str,
+    increment_attempt: bool = False,
+    reset_progress: bool = False,
+    **updates: Any,
+) -> int | None:
+    """Durably publish one bounded resource/attempt transition.
+
+    The returned positive attempt is the only token allowed to publish later
+    progress or results.  A stale attempt, cancellation, terminal job, invalid
+    enum, or restart-cap overflow returns ``None`` without mutation.
+    """
+    if state not in RESOURCE_STATES:
+        raise ValueError("Invalid resource execution state")
+    if intent is not None and intent not in _RESOURCE_INTENTS:
+        raise ValueError("Invalid resource intent")
+    if execution is not None and execution not in _RESOURCE_EXECUTIONS:
+        raise ValueError("Invalid resource execution")
+    if preemption_mode is not None and preemption_mode not in _PREEMPTION_MODES:
+        raise ValueError("Invalid resource preemption mode")
+    if "status" in updates or "execution_attempt" in updates:
+        raise ValueError("Lifecycle and attempt fields are transition-owned")
+    with _queue_condition, _lifecycle_lock:
+        if (
+            is_cancel_requested(job)
+            or str(job.get("status") or "") in TERMINAL_STATUSES
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
+            return None
+        try:
+            attempt = int(job.get("execution_attempt", 1) or 1)
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= attempt <= MAX_EXECUTION_ATTEMPT:
+            return None
+        if increment_attempt:
+            if attempt >= MAX_EXECUTION_ATTEMPT:
+                return None
+            attempt += 1
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        candidate["resource_intent"] = intent or str(
+            candidate.get("resource_intent") or RESOURCE_INTENT_GENERATION
+        )
+        candidate["resource_execution"] = execution or str(
+            candidate.get("resource_execution") or RESOURCE_EXECUTION_STANDARD
+        )
+        candidate["preemption_mode"] = preemption_mode or str(
+            candidate.get("preemption_mode") or PREEMPTION_MODE_NONE
+        )
+        candidate["resource_state"] = state
+        candidate["execution_attempt"] = attempt
+        if reset_progress:
+            candidate.update({
+                "progress": 0,
+                "step": 0,
+                "overall_progress": 0,
+                "phase_started_at": time.time(),
+            })
+        _append_job_event_unlocked(
+            candidate,
+            resource_state=state,
+            resource_execution=candidate["resource_execution"],
+            execution_attempt=attempt,
+        )
+        _persist_prospective_unlocked(
+            "resource_execution", jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+        )
+        if (
+            is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
+            return None
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return attempt
+
+
 def _select_next_waiter(
     eligible: list[tuple[int, MutableMapping[str, Any]]],
     *,
@@ -688,6 +879,16 @@ def queue_wait_reason(
     with _queue_condition:
         if job.get("status") == "running":
             return "running"
+        if job.get("status") == "preparing":
+            if job.get("resource_state") in {"queued", "blocked"}:
+                return "resource_wait"
+            return "preparing"
+        if job.get("status") == "waiting_for_plan_approval":
+            return (
+                "waiting_for_plan_terms"
+                if job.get("plan_review_terms_required", False)
+                else "waiting_for_plan_approval"
+            )
         if job.get("status") != "queued" or is_cancel_requested(job):
             return None
         if job.get("queue_held", False):
@@ -700,6 +901,11 @@ def queue_wait_reason(
             return "registering"
         if position > 1:
             return "waiting_for_turn"
+        if (
+            generation_busy
+            and job.get("resource_intent") == RESOURCE_INTENT_GENERATION
+        ):
+            return "resource_wait"
         if generation_busy:
             if active_other_user:
                 return "waiting_for_other_user"
@@ -776,6 +982,8 @@ def _queue_positions_unlocked() -> dict[int, int]:
 
 def queue_scheduler_snapshot(
     jobs: Iterable[MutableMapping[str, Any]],
+    *,
+    generation_busy: bool = False,
 ) -> dict[str, Any]:
     """Snapshot global anonymous counts and dynamic positions atomically.
 
@@ -790,6 +998,8 @@ def queue_scheduler_snapshot(
         running = 0
         held = 0
         registering = 0
+        preparing = 0
+        approval_waiting = 0
         seen: set[int] = set()
         states: dict[int, dict[str, Any]] = {}
         for job in candidates:
@@ -802,6 +1012,10 @@ def queue_scheduler_snapshot(
             status = state.get("status")
             if status == "running":
                 running += 1
+            elif status == "preparing":
+                preparing += 1
+            elif status == "waiting_for_plan_approval":
+                approval_waiting += 1
             elif status == "queued" and not state.get("cancel_requested", False):
                 if state.get("queue_held", False):
                     held += 1
@@ -814,7 +1028,12 @@ def queue_scheduler_snapshot(
             "waiting": waiting,
             "held": held,
             "registering": registering,
-            "active_total": running + waiting + held + registering,
+            "preparing": preparing,
+            "approval_waiting": approval_waiting,
+            "active_total": (
+                running + waiting + held + registering
+                + preparing + approval_waiting
+            ),
         }
         running_states = [
             state for state in states.values()
@@ -826,6 +1045,18 @@ def queue_scheduler_snapshot(
             position = positions.get(identity)
             if status == "running":
                 reason = "running"
+            elif status == "preparing":
+                reason = (
+                    "resource_wait"
+                    if state.get("resource_state") in {"queued", "blocked"}
+                    else "preparing"
+                )
+            elif status == "waiting_for_plan_approval":
+                reason = (
+                    "waiting_for_plan_terms"
+                    if state.get("plan_review_terms_required", False)
+                    else "waiting_for_plan_approval"
+                )
             elif status != "queued" or state.get("cancel_requested", False):
                 reason = None
             elif state.get("queue_held", False):
@@ -836,6 +1067,12 @@ def queue_scheduler_snapshot(
                 reason = "registering"
             elif position > 1:
                 reason = "waiting_for_turn"
+            elif (
+                generation_busy
+                and state.get("resource_intent")
+                == RESOURCE_INTENT_GENERATION
+            ):
+                reason = "resource_wait"
             elif running_states:
                 owner = state.get("session_id")
                 active_other_user = owner is not None and any(
@@ -1191,11 +1428,394 @@ def record_job_outputs(
         return list(candidate["output_files"])
 
 
+def update_preparation_job(
+    job: MutableMapping[str, Any],
+    *,
+    expected_execution_attempt: int | None = None,
+    **updates: Any,
+) -> bool:
+    """Durably publish content-free preparation progress before GPU admission."""
+    if "status" in updates:
+        raise ValueError("status must be changed through a lifecycle transition")
+    with _queue_condition, _lifecycle_lock:
+        if (
+            is_cancel_requested(job)
+            or job.get("status") != "preparing"
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        _append_job_event_unlocked(candidate, **updates)
+        _persist_prospective_unlocked("preparation_progress", jobs=(candidate,))
+        if (
+            is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def checkpoint_recovery_job(
+    job: MutableMapping[str, Any],
+    **updates: Any,
+) -> bool:
+    """Durably checkpoint recovery without reviving a terminal winner."""
+    with _queue_condition, _lifecycle_lock:
+        current_status = str(job.get("status") or "")
+        target_status = str(updates.get("status") or current_status)
+        if (
+            current_status in TERMINAL_STATUSES
+            and target_status != current_status
+        ) or (
+            is_cancel_requested(job) and target_status != "cancelled"
+        ):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        _persist_prospective_unlocked("recovery_checkpoint", jobs=(candidate,))
+        # A durability hook may synchronously deliver cancellation (tests and
+        # adapters can re-enter through the RLock). Preserve that later winner
+        # instead of publishing this older recovery candidate in memory.
+        if is_cancel_requested(job) and target_status != "cancelled":
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def block_generation_recovery(
+    job: MutableMapping[str, Any],
+    *,
+    request_manifest: Mapping[str, Any] | None = None,
+    **updates: Any,
+) -> bool:
+    """Durably park incomplete generation without reviving a cancel winner.
+
+    This transition is used only after verified safe-unit reconciliation.  It
+    deliberately leaves the job in scheduler membership but held, so restart
+    and an owner-scoped recovery action can continue the same job without an
+    automatic denoise retry.
+    """
+    if "status" in updates:
+        raise ValueError("status must be changed through a lifecycle transition")
+    with _queue_condition, _lifecycle_lock:
+        if is_cancel_requested(job) or str(job.get("status") or "") not in {
+            "queued", "running", "failed",
+        }:
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        candidate.update({
+            "status": "queued",
+            "queue_held": True,
+            "plan_review_required": False,
+            "plan_review_terms_required": False,
+            "plan_review_deadline": None,
+        })
+        _append_job_event_unlocked(
+            candidate,
+            status="queued",
+            recovery_state=str(candidate.get("recovery_state") or "blocked"),
+        )
+        manifests = None
+        if request_manifest is not None:
+            manifests = {
+                str(candidate.get("id") or ""): dict(request_manifest),
+            }
+        _persist_prospective_unlocked(
+            "generation_recovery_blocked",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+            request_manifests=manifests,
+        )
+        # Durability adapters may synchronously re-enter cancellation.  The
+        # later terminal transition is authoritative in both memory and disk.
+        if is_cancel_requested(job):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def complete_preparation(
+    job: MutableMapping[str, Any],
+    *,
+    request_manifest: Mapping[str, Any],
+    waiting_for_approval: bool,
+    plan_review_deadline: float | None = None,
+    plan_review_terms_required: bool = False,
+    expected_execution_attempt: int | None = None,
+    **updates: Any,
+) -> bool:
+    """Commit sealed parameters and leave preparation without losing cancel."""
+    if "status" in updates:
+        raise ValueError("status must be changed through a lifecycle transition")
+    if waiting_for_approval:
+        if plan_review_terms_required:
+            if plan_review_deadline is not None:
+                raise ValueError("terms-blocked plans cannot have a deadline")
+        elif (
+            type(plan_review_deadline) not in {int, float}
+            or not math.isfinite(plan_review_deadline)
+            or plan_review_deadline <= 0
+        ):
+            raise ValueError("waiting plans require a finite review deadline")
+    with _queue_condition, _lifecycle_lock:
+        if (
+            is_cancel_requested(job)
+            or job.get("status") != "preparing"
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        candidate["status"] = (
+            "waiting_for_plan_approval" if waiting_for_approval else "queued"
+        )
+        candidate["plan_review_required"] = bool(waiting_for_approval)
+        candidate["plan_review_terms_required"] = bool(
+            waiting_for_approval and plan_review_terms_required
+        )
+        candidate["plan_review_deadline"] = (
+            float(plan_review_deadline)
+            if waiting_for_approval and plan_review_deadline is not None
+            else None
+        )
+        _append_job_event_unlocked(candidate, status=candidate["status"])
+        _persist_prospective_unlocked(
+            "preparation_complete",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+            request_manifests={
+                str(candidate.get("id") or ""): dict(request_manifest),
+            },
+        )
+        if (
+            is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def arm_prepared_job_plan_review(
+    job: MutableMapping[str, Any],
+    *,
+    plan_review_deadline: float,
+    **updates: Any,
+) -> bool:
+    """Durably start review after host terms unblock a frozen plan."""
+    if "status" in updates:
+        raise ValueError("status must be changed through a lifecycle transition")
+    if (
+        type(plan_review_deadline) not in {int, float}
+        or not math.isfinite(plan_review_deadline)
+        or plan_review_deadline <= 0
+    ):
+        raise ValueError("plan review requires a finite deadline")
+    with _queue_condition, _lifecycle_lock:
+        if (
+            is_cancel_requested(job)
+            or job.get("status") != "waiting_for_plan_approval"
+            or job.get("plan_review_required") is not True
+            or job.get("plan_review_terms_required") is not True
+            or job.get("plan_review_deadline") is not None
+        ):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        candidate["plan_review_terms_required"] = False
+        candidate["plan_review_deadline"] = float(plan_review_deadline)
+        _append_job_event_unlocked(
+            candidate,
+            phase=str(candidate.get("phase") or "awaiting_plan_approval"),
+            message=str(candidate.get("message") or "Review the generation plan"),
+        )
+        _persist_prospective_unlocked("plan_review_armed", jobs=(candidate,))
+        # Durability hooks may synchronously re-enter cancellation.  Preserve
+        # that later terminal winner rather than publishing this stale wait.
+        if is_cancel_requested(job):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def approve_prepared_job(
+    job: MutableMapping[str, Any],
+    *,
+    request_manifest: Mapping[str, Any],
+    **updates: Any,
+) -> bool:
+    """Atomically promote an approved sealed plan into GPU queue ordering."""
+    if "status" in updates:
+        raise ValueError("status must be changed through a lifecycle transition")
+    with _queue_condition, _lifecycle_lock:
+        if (
+            is_cancel_requested(job)
+            or job.get("status") != "waiting_for_plan_approval"
+        ):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        candidate["status"] = "queued"
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_state"] = "queued"
+        candidate["plan_review_required"] = False
+        candidate["plan_review_terms_required"] = False
+        candidate["plan_review_deadline"] = None
+        _append_job_event_unlocked(candidate, status="queued")
+        _persist_prospective_unlocked(
+            "plan_approved",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+            request_manifests={
+                str(candidate.get("id") or ""): dict(request_manifest),
+            },
+        )
+        if is_cancel_requested(job):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def block_resource_admission_failure(
+    job: MutableMapping[str, Any],
+) -> bool:
+    """Fail closed when durable resource admission cannot start a worker.
+
+    Returns ``True`` when the blocked state was persisted. If persistence is
+    still unavailable, the same bounded state is nevertheless published in
+    memory and removed from admission eligibility so the process cannot spin
+    or strand an ordinary queued job. A later successful checkpoint/startup
+    preserves the held ``blocked_preparation`` state.
+    """
+    with _queue_condition, _lifecycle_lock:
+        if is_cancel_requested(job) or job.get("status") != "queued":
+            return False
+        candidate = _copy_job_for_transition(job)
+        message = "Resource admission failed; resubmit this request"
+        candidate.update({
+            "status": "queued",
+            "queue_held": True,
+            "recovery_state": "blocked_preparation",
+            "reruns_denoise": False,
+            "_recovery_reason_code": "preparation_must_resubmit",
+            "phase": "resource_admission_failed",
+            "message": message,
+            "error": message,
+        })
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_execution"] = RESOURCE_EXECUTION_STANDARD
+            candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+            candidate["resource_state"] = "blocked"
+        _append_job_event_unlocked(
+            candidate,
+            status="queued",
+            phase="resource_admission_failed",
+            message=message,
+        )
+        persisted = True
+        try:
+            _persist_prospective_unlocked(
+                "resource_admission_blocked",
+                jobs=(candidate,),
+                global_state=_global_state_unlocked(
+                    replacements={id(job): candidate},
+                ),
+            )
+        except Exception:
+            # Admission safety is the one transition that must fail closed in
+            # memory even if the durable writer is unavailable. The original
+            # registered snapshot remains the recovery source of truth.
+            persisted = False
+        if is_cancel_requested(job):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_waiters.pop(id(job), None)
+        _queue_condition.notify_all()
+        return persisted
+
+
+def fail_preparation(
+    job: MutableMapping[str, Any],
+    *,
+    expected_execution_attempt: int | None = None,
+    **updates: Any,
+) -> bool:
+    """Terminalize mandatory preparation unless cancellation already won."""
+    if "status" in updates:
+        raise ValueError("status must be changed through a lifecycle transition")
+    with _queue_condition, _lifecycle_lock:
+        if (
+            is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
+            return False
+        if job.get("status") not in {
+            "preparing", "waiting_for_plan_approval",
+        }:
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        candidate["status"] = "failed"
+        candidate["plan_review_required"] = False
+        candidate["plan_review_terms_required"] = False
+        candidate["plan_review_deadline"] = None
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_state"] = "released"
+            candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+        candidate.setdefault("finished_at", time.time())
+        _append_job_event_unlocked(candidate, status="failed", **updates)
+        _persist_prospective_unlocked(
+            "preparation_failed",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+        )
+        if (
+            is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_waiters.pop(id(job), None)
+        _queue_condition.notify_all()
+        return True
+
+
 def try_start(
     job: MutableMapping[str, Any],
     *,
     generation_lock: threading.Lock | None = None,
     poll_interval: float = 0.1,
+    expected_execution_attempt: int | None = None,
+    block_on_persistence_failure: bool = False,
     **updates: Any,
 ) -> bool:
     """Atomically move an admitted queued job to running.
@@ -1213,6 +1833,9 @@ def try_start(
                 candidate = _copy_job_for_transition(job)
                 candidate["status"] = "cancelled"
                 candidate["message"] = "Cancelled"
+                if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+                    candidate["resource_state"] = "released"
+                    candidate["preemption_mode"] = PREEMPTION_MODE_NONE
                 _persist_prospective_unlocked(
                     "start_cancelled",
                     jobs=(candidate,),
@@ -1226,6 +1849,10 @@ def try_start(
                 return False
             if job.get("status") != "queued":
                 return False
+            if not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            ):
+                return False
             admission_blocked = bool(
                 job.get("queue_held", False) or _queue_paused
             )
@@ -1233,16 +1860,24 @@ def try_start(
                 candidate = _copy_job_for_transition(job)
                 candidate.update(updates)
                 candidate["status"] = "running"
+                if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+                    candidate["resource_state"] = "running"
                 candidate.setdefault("started_at", time.time())
                 candidate.setdefault("phase_started_at", candidate["started_at"])
                 _append_job_event_unlocked(candidate, status="running", **updates)
-                _persist_prospective_unlocked(
-                    "start",
-                    jobs=(candidate,),
-                    global_state=_global_state_unlocked(
-                        replacements={id(job): candidate},
-                    ),
-                )
+                try:
+                    _persist_prospective_unlocked(
+                        "start",
+                        jobs=(candidate,),
+                        global_state=_global_state_unlocked(
+                            replacements={id(job): candidate},
+                        ),
+                    )
+                except Exception:
+                    if not block_on_persistence_failure:
+                        raise
+                    block_resource_admission_failure(job)
+                    return False
                 _publish_job_unlocked(job, candidate)
                 _queue_condition.notify_all()
                 return True
@@ -1272,6 +1907,9 @@ def try_requeue(job: MutableMapping[str, Any], **updates: Any) -> bool:
             candidate = _copy_job_for_transition(job)
             candidate["status"] = "cancelled"
             candidate["message"] = "Cancelled"
+            if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+                candidate["resource_state"] = "released"
+                candidate["preemption_mode"] = PREEMPTION_MODE_NONE
             _persist_prospective_unlocked(
                 "requeue_cancelled",
                 jobs=(candidate,),
@@ -1288,6 +1926,8 @@ def try_requeue(job: MutableMapping[str, Any], **updates: Any) -> bool:
         candidate = _copy_job_for_transition(job)
         candidate.update(updates)
         candidate["status"] = "queued"
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_state"] = "queued"
         _append_job_event_unlocked(candidate, status="queued", **updates)
         _persist_prospective_unlocked(
             "requeue",
@@ -1301,12 +1941,23 @@ def try_requeue(job: MutableMapping[str, Any], **updates: Any) -> bool:
         return True
 
 
-def update_job(job: MutableMapping[str, Any], **updates: Any) -> bool:
+def update_job(
+    job: MutableMapping[str, Any],
+    *,
+    expected_execution_attempt: int | None = None,
+    **updates: Any,
+) -> bool:
     """Update a live job without replacing a terminal/cancelled message."""
     if "status" in updates:
         raise ValueError("status must be changed through a lifecycle transition")
     with _lifecycle_lock:
-        if is_cancel_requested(job) or job.get("status") != "running":
+        if (
+            is_cancel_requested(job)
+            or job.get("status") != "running"
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
             return False
         replacement_outputs = updates.pop("output_files", None)
         if replacement_outputs is not None:
@@ -1386,6 +2037,12 @@ def request_cancel(
         candidate["cancel_requested"] = True
         candidate["message"] = "Cancelled"
         candidate["status"] = "cancelled"
+        candidate["plan_review_required"] = False
+        candidate["plan_review_terms_required"] = False
+        candidate["plan_review_deadline"] = None
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_state"] = "released"
+            candidate["preemption_mode"] = PREEMPTION_MODE_NONE
         _append_job_event_unlocked(
             candidate, status="cancelled", message="Cancelled",
         )
@@ -1428,6 +2085,8 @@ def request_cancel(
 def finish_job(
     job: MutableMapping[str, Any],
     status: str,
+    *,
+    expected_execution_attempt: int | None = None,
     **updates: Any,
 ) -> bool:
     """Publish a completed/failed result unless cancellation already won."""
@@ -1440,6 +2099,9 @@ def finish_job(
             candidate = _copy_job_for_transition(job)
             candidate["status"] = "cancelled"
             candidate["message"] = "Cancelled"
+            if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+                candidate["resource_state"] = "released"
+                candidate["preemption_mode"] = PREEMPTION_MODE_NONE
             _persist_prospective_unlocked(
                 "finish_cancelled",
                 jobs=(candidate,),
@@ -1451,7 +2113,12 @@ def finish_job(
             _queue_waiters.pop(id(job), None)
             _queue_condition.notify_all()
             return False
-        if job.get("status") != "running":
+        if (
+            job.get("status") != "running"
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
             return False
         candidate = _copy_job_for_transition(job)
         replacement_outputs = updates.pop("output_files", None)
@@ -1459,6 +2126,9 @@ def finish_job(
         if replacement_outputs is not None:
             _replace_job_outputs_unlocked(candidate, replacement_outputs)
         candidate["status"] = status
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_state"] = "released"
+            candidate["preemption_mode"] = PREEMPTION_MODE_NONE
         _append_job_event_unlocked(candidate, status=status, **updates)
         _persist_prospective_unlocked(
             "finish",
@@ -1561,6 +2231,8 @@ def yield_generation_slot_after_output(
             prospective_paused = True
             prospective_after = False
         candidate["status"] = "queued"
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_state"] = "queued"
         candidate["queue_held"] = per_job_hold
         candidate["hold_after_output"] = False
         candidate["message"] = (
@@ -1606,11 +2278,18 @@ def generation_slot(
     job: MutableMapping[str, Any],
     *,
     poll_interval: float = 0.1,
+    block_on_persistence_failure: bool = False,
 ) -> Iterator[bool]:
     """Context manager form of :func:`acquire_generation_slot`."""
-    acquired = acquire_generation_slot(
-        generation_lock, job, poll_interval=poll_interval,
-    )
+    try:
+        acquired = acquire_generation_slot(
+            generation_lock, job, poll_interval=poll_interval,
+        )
+    except Exception:
+        if not block_on_persistence_failure:
+            raise
+        block_resource_admission_failure(job)
+        acquired = False
     if acquired:
         with _queue_condition, _lifecycle_lock:
             job["_generation_slot_owned"] = True

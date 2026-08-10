@@ -1,0 +1,47 @@
+{
+    "model": {
+        "name": "FLUX.2 Klein 4B — Uncensored Text Encoder (Experimental)",
+        "architecture": "flux2_klein_4b",
+        "description": "Experimental exact-family FLUX.2 Klein 4B variant. It reuses the Apache-2.0 Klein 4B image checkpoint and swaps only the Qwen3 conditioning encoder for the pinned ponpoke uncensored text encoder. That encoder repository is separately gated under FLUX non-commercial v2.1 terms. The artifact size is recorded from repository metadata; its content SHA-256 is unavailable until an authorized download and is not claimed as verified.",
+        "selector_help": "Experimental uncensored conditioning for the exact FLUX.2 Klein 4B family. The base checkpoint is Apache-2.0; the pinned encoder separately requires authorized Hugging Face access and FLUX non-commercial v2.1 terms.",
+        "URLs": "flux2_klein_4b",
+        "text_encoder_URLs": [
+            "https://huggingface.co/ponpoke/flux2-klein-4b-uncensored-text-encoder/resolve/633217e588e4c0bc76619052e05d3ce0e057cd83/flux2-klein-4b-uncensored-text-encoder/model.safetensors"
+        ],
+        "text_encoder_folder": "flux2_klein_4b_uncensored_text_encoder",
+        "text_encoder_tokenizer_folder": "Qwen3",
+        "text_encoder_quantization": "bf16",
+        "content_capability": "uncensored_conditioning",
+        "source_repo_id": "ponpoke/flux2-klein-4b-uncensored-text-encoder",
+        "source_revision": "633217e588e4c0bc76619052e05d3ce0e057cd83",
+        "source_path": "flux2-klein-4b-uncensored-text-encoder/model.safetensors",
+        "source_gated": true,
+        "license_id": "flux-non-commercial-v2.1",
+        "license_url": "https://huggingface.co/ponpoke/flux2-klein-4b-uncensored-text-encoder/blob/633217e588e4c0bc76619052e05d3ce0e057cd83/README.md",
+        "required_host_terms": ["ponpoke_flux2_klein_4b_self_review"],
+        "manual_review_required": true,
+        "capability_recipe": {
+            "kind": "conditioning_encoder_swap",
+            "base_model": "flux2_klein_4b",
+            "changed_components": ["text_encoder"],
+            "preserved_components": ["transformer", "vae", "tokenizer"],
+            "quality_status": "experimental_requires_benchmark"
+        },
+        "artifact_provenance": {
+            "provider": "huggingface",
+            "repo_id": "ponpoke/flux2-klein-4b-uncensored-text-encoder",
+            "revision": "633217e588e4c0bc76619052e05d3ce0e057cd83",
+            "path": "flux2-klein-4b-uncensored-text-encoder/model.safetensors",
+            "size_bytes": 8044981680,
+            "access": "gated-auto",
+            "license": "FLUX non-commercial v2.1 plus repository access conditions",
+            "content_sha256": null,
+            "content_sha256_status": "unavailable_until_authorized_download"
+        }
+    },
+    "prompt": "a cinematic portrait with natural skin texture, dimensional lighting, and precise fine detail",
+    "resolution": "1024x1024",
+    "batch_size": 1,
+    "embedded_guidance_scale": 1,
+    "num_inference_steps": 4
+}

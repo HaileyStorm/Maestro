@@ -22,10 +22,18 @@ from services.job_lifecycle import (  # noqa: E402
     _reset_queue_state_for_tests,
     _select_next_waiter,
     acquire_generation_slot,
+    arm_prepared_job_plan_review,
+    block_generation_recovery,
     call_with_sticky_interrupt,
     clear_job_residency,
+    checkpoint_recovery_job,
     collect_job_outputs,
+    complete_preparation,
+    configure_durability_hook,
+    approve_prepared_job,
+    fail_preparation,
     finish_job,
+    generation_slot,
     invalidate_residency_state,
     job_events,
     make_residency_key,
@@ -36,6 +44,7 @@ from services.job_lifecycle import (  # noqa: E402
     queue_scheduler_snapshot,
     queue_wait_reason,
     record_job_outputs,
+    resource_descriptor,
     register_abort_state,
     residency_configuration_update,
     request_cancel,
@@ -50,6 +59,7 @@ from services.job_lifecycle import (  # noqa: E402
     update_queue_job,
     update_requested_outputs,
     update_job,
+    update_preparation_job,
     yield_generation_slot_after_output,
 )
 
@@ -191,6 +201,222 @@ class TestJobLifecycle(unittest.TestCase):
         self.assertFalse(result.was_running)
         self.assertFalse(try_start(job))
         self.assertEqual(job["status"], "cancelled")
+
+    def test_preparation_waits_outside_gpu_order_and_cancel_wins(self):
+        job = {
+            **_job(),
+            "status": "preparing",
+            "phase": "enhancing_prompt",
+        }
+        self.assertTrue(update_preparation_job(
+            job, phase="planning_generation", message="Planning generation",
+        ))
+        self.assertTrue(complete_preparation(
+            job,
+            request_manifest={"path": "sealed"},
+            waiting_for_approval=True,
+            plan_review_deadline=time.time() + 16,
+            phase="awaiting_plan_approval",
+            message="Review the generation plan",
+        ))
+        self.assertEqual(job["status"], "waiting_for_plan_approval")
+        snapshot = queue_scheduler_snapshot([job])
+        self.assertEqual(snapshot["summary"]["approval_waiting"], 1)
+        self.assertEqual(snapshot["summary"]["waiting"], 0)
+        self.assertIsNone(queue_position(job))
+        self.assertEqual(
+            queue_wait_reason(job), "waiting_for_plan_approval",
+        )
+        self.assertTrue(request_cancel(job).changed)
+        self.assertFalse(approve_prepared_job(
+            job,
+            request_manifest={"path": "approved"},
+            message="Queued",
+        ))
+        self.assertEqual(job["status"], "cancelled")
+
+    def test_single_segment_preparation_and_approval_enter_queue(self):
+        direct = {**_job(), "status": "preparing"}
+        self.assertTrue(complete_preparation(
+            direct,
+            request_manifest={"path": "sealed"},
+            waiting_for_approval=False,
+            message="Queued",
+        ))
+        self.assertEqual(direct["status"], "queued")
+
+        reviewed = {**_job(), "status": "preparing"}
+        self.assertTrue(complete_preparation(
+            reviewed,
+            request_manifest={"path": "sealed"},
+            waiting_for_approval=True,
+            plan_review_deadline=time.time() + 16,
+        ))
+        self.assertTrue(approve_prepared_job(
+            reviewed,
+            request_manifest={"path": "approved"},
+            message="Queued",
+        ))
+        self.assertEqual(reviewed["status"], "queued")
+        self.assertFalse(reviewed["plan_review_required"])
+        self.assertIsNone(reviewed["plan_review_deadline"])
+
+    def test_terms_blocked_plan_has_no_deadline_and_truthful_wait_reason(self):
+        job = {**_job(), "status": "preparing"}
+        self.assertTrue(complete_preparation(
+            job,
+            request_manifest={"path": "sealed"},
+            waiting_for_approval=True,
+            plan_review_deadline=None,
+            plan_review_terms_required=True,
+        ))
+        self.assertIsNone(job["plan_review_deadline"])
+        self.assertTrue(job["plan_review_terms_required"])
+        self.assertEqual(queue_wait_reason(job), "waiting_for_plan_terms")
+
+        deadline = time.time() + 16
+        self.assertTrue(arm_prepared_job_plan_review(
+            job,
+            plan_review_deadline=deadline,
+            phase="awaiting_plan_approval",
+            message="Review the generation plan",
+        ))
+        self.assertFalse(job["plan_review_terms_required"])
+        self.assertEqual(job["plan_review_deadline"], deadline)
+        self.assertEqual(queue_wait_reason(job), "waiting_for_plan_approval")
+        self.assertFalse(arm_prepared_job_plan_review(
+            job,
+            plan_review_deadline=deadline + 16,
+        ))
+        self.assertEqual(job["plan_review_deadline"], deadline)
+
+    def test_cancel_reentrant_from_recovery_durability_hook_wins(self):
+        job = {
+            **_job(),
+            "status": "queued",
+            "queue_held": True,
+            "recovery_state": "blocked",
+        }
+        injected = False
+
+        def durability_hook(proposal):
+            nonlocal injected
+            if proposal.name == "recovery_checkpoint" and not injected:
+                injected = True
+                request_cancel(job)
+
+        configure_durability_hook(durability_hook)
+        try:
+            self.assertFalse(checkpoint_recovery_job(
+                job,
+                status="queued",
+                queue_held=False,
+                recovery_state="retrying",
+            ))
+        finally:
+            configure_durability_hook(None)
+        self.assertEqual(job["status"], "cancelled")
+        self.assertTrue(job["cancel_requested"])
+
+    def test_cancel_reentrant_from_generation_recovery_block_wins(self):
+        job = {**_job(), "status": "running"}
+        injected = False
+
+        def durability_hook(proposal):
+            nonlocal injected
+            if proposal.name == "generation_recovery_blocked" and not injected:
+                injected = True
+                request_cancel(job)
+
+        configure_durability_hook(durability_hook)
+        try:
+            self.assertFalse(block_generation_recovery(
+                job,
+                recovery_state="blocked",
+                reruns_denoise=False,
+            ))
+        finally:
+            configure_durability_hook(None)
+        self.assertEqual(job["status"], "cancelled")
+        self.assertTrue(job["cancel_requested"])
+
+    def test_cancel_reentrant_from_preparation_transitions_wins(self):
+        cases = (
+            (
+                "preparation_progress",
+                {**_job(), "status": "preparing"},
+                lambda job: update_preparation_job(
+                    job, phase="planning_generation",
+                ),
+            ),
+            (
+                "preparation_complete",
+                {**_job(), "status": "preparing"},
+                lambda job: complete_preparation(
+                    job,
+                    request_manifest={"path": "sealed"},
+                    waiting_for_approval=False,
+                ),
+            ),
+            (
+                "plan_review_armed",
+                {
+                    **_job(),
+                    "status": "waiting_for_plan_approval",
+                    "plan_review_required": True,
+                    "plan_review_terms_required": True,
+                    "plan_review_deadline": None,
+                },
+                lambda job: arm_prepared_job_plan_review(
+                    job,
+                    plan_review_deadline=time.time() + 16,
+                ),
+            ),
+            (
+                "plan_approved",
+                {
+                    **_job(),
+                    "status": "waiting_for_plan_approval",
+                    "plan_review_required": True,
+                },
+                lambda job: approve_prepared_job(
+                    job,
+                    request_manifest={"path": "approved"},
+                ),
+            ),
+            (
+                "preparation_failed",
+                {**_job(), "status": "preparing"},
+                lambda job: fail_preparation(job, error="failed"),
+            ),
+        )
+        for transition, job, action in cases:
+            with self.subTest(transition=transition):
+                injected = False
+
+                def durability_hook(proposal):
+                    nonlocal injected
+                    if proposal.name == transition and not injected:
+                        injected = True
+                        request_cancel(job)
+
+                configure_durability_hook(durability_hook)
+                try:
+                    self.assertFalse(action(job))
+                finally:
+                    configure_durability_hook(None)
+                self.assertEqual(job["status"], "cancelled")
+                self.assertTrue(job["cancel_requested"])
+
+    def test_mandatory_preparation_failure_is_terminal(self):
+        job = {**_job(), "status": "preparing"}
+        self.assertTrue(fail_preparation(
+            job,
+            error="Prompt enhancement failed",
+            message="Prompt enhancement failed",
+        ))
+        self.assertEqual(job["status"], "failed")
+        self.assertFalse(try_start(job))
 
     def test_cancel_running_signals_abort_and_model_once(self):
         job = _job()
@@ -561,6 +787,71 @@ class TestJobLifecycle(unittest.TestCase):
         self.assertEqual(result, [False])
         generation_lock.release()
 
+    def test_generation_resource_wait_is_bounded_and_admits_exactly_once(self):
+        generation_lock = threading.Lock()
+        generation_lock.acquire()
+        job = {
+            **_job(),
+            "resource_intent": "generation",
+            "created_at": 1,
+        }
+        calls: list[str] = []
+        entered = threading.Event()
+
+        def run():
+            entered.set()
+            with generation_slot(
+                generation_lock, job, poll_interval=0.005,
+            ) as acquired:
+                if acquired and try_start(
+                    job,
+                    generation_lock=generation_lock,
+                    message="Running",
+                ):
+                    calls.append("admitted")
+                    finish_job(job, "completed", message="Complete")
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=1))
+        deadline = time.time() + 1
+        while queue_position(job) is None and time.time() < deadline:
+            time.sleep(0.005)
+
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            queue_wait_reason(job, generation_busy=True),
+            "resource_wait",
+        )
+        self.assertEqual(
+            queue_wait_reason(
+                job,
+                generation_busy=True,
+                position=2,
+                position_resolved=True,
+            ),
+            "waiting_for_turn",
+        )
+        scheduler = queue_scheduler_snapshot(
+            [job], generation_busy=True,
+        )
+        self.assertEqual(scheduler["wait_reasons"][id(job)], "resource_wait")
+        self.assertEqual(resource_descriptor(job), {
+            "intent": "generation",
+            "execution": "standard",
+            "preemptible": False,
+            "preemption_mode": "none",
+            "state": "queued",
+            "execution_attempt": 1,
+        })
+
+        generation_lock.release()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, ["admitted"])
+        self.assertEqual(job["status"], "completed")
+
     def test_priority_hold_resume_and_pause_after_current_are_cooperative(self):
         generation_lock = threading.Lock()
         generation_lock.acquire()
@@ -894,6 +1185,8 @@ class TestJobLifecycle(unittest.TestCase):
             "waiting": 2,
             "held": 1,
             "registering": 1,
+            "preparing": 0,
+            "approval_waiting": 0,
             "active_total": 5,
         })
         self.assertEqual(snapshot["positions"][id(resident)], 1)

@@ -206,6 +206,106 @@ class ResponseAssistHelperTests(unittest.TestCase):
             inspect.signature(assist.response_matches_refusal).parameters,
         )
 
+    def test_soft_substitution_requires_an_early_three_part_cluster(self):
+        examples = (
+            (
+                "The response focuses on emotional intensity and physical "
+                "closeness rather than explicit anatomical detail or graphic "
+                "sexual acts."
+            ),
+            (
+                "They are engaging in passionate physical intimacy, with the "
+                "description continuing without explicit sexual noises or "
+                "dialogue."
+            ),
+        )
+        for response in examples:
+            with self.subTest(response=response):
+                self.assertFalse(assist.evaluate_response_refusal(
+                    response,
+                ).matched)
+                result = assist.evaluate_response_refusal(
+                    response,
+                    profile="high_confidence",
+                )
+                self.assertTrue(result.matched)
+                self.assertEqual(result.score, 95)
+                self.assertEqual(result.reason, "combined_soft_substitution")
+
+        individual_terms = (
+            "The scene builds emotional intensity.",
+            "They remain in physical closeness.",
+            "The text describes passionate physical intimacy.",
+            "The anatomy remains consistent between shots.",
+            "The dialogue continues without interruption.",
+            "Use explicit anatomical detail throughout.",
+            "Continue without explicit sexual noises or dialogue.",
+            "Use physical closeness rather than a distant composition.",
+        )
+        for response in individual_terms:
+            with self.subTest(response=response):
+                self.assertFalse(assist.evaluate_response_refusal(
+                    response,
+                    profile="high_confidence",
+                ).matched)
+
+        negated_omissions = (
+            (
+                "Preserve emotional intensity and physical closeness. "
+                "Do not avoid explicit sexual dialogue."
+            ),
+            (
+                "Keep the passionate physical intimacy and never omit "
+                "explicit anatomical detail."
+            ),
+            (
+                "Maintain physical closeness; there is no need to exclude "
+                "graphic sexual acts."
+            ),
+            (
+                "Retain emotional connection and don't avoid explicit "
+                "sexual sounds."
+            ),
+        )
+        for response in negated_omissions:
+            with self.subTest(response=response):
+                self.assertFalse(assist.evaluate_response_refusal(
+                    response,
+                    profile="high_confidence",
+                ).matched)
+
+        far_apart = assist.evaluate_response_refusal(
+            "Use emotional intensity and physical closeness. "
+            + ("Unrelated production note. " * 30)
+            + "Continue without explicit anatomical detail.",
+            profile="high_confidence",
+        )
+        self.assertFalse(far_apart.matched)
+
+        late = assist.evaluate_response_refusal(
+            ("Ordinary quoted discussion. " * 24)
+            + "Focus on emotional intensity and physical closeness rather "
+            "than explicit anatomical detail.",
+            profile="high_confidence",
+        )
+        self.assertFalse(late.matched)
+        self.assertEqual(late.score, 70)
+        self.assertEqual(late.reason, "late_soft_substitution_reference")
+
+        late_decisive = assist.evaluate_response_refusal(
+            ("Prelude. " * 12)
+            + "Emotional intensity. "
+            + ("x" * 420)
+            + " without explicit sexual dialogue.",
+            profile="high_confidence",
+        )
+        self.assertFalse(late_decisive.matched)
+        self.assertEqual(late_decisive.score, 70)
+        self.assertEqual(
+            late_decisive.reason,
+            "late_soft_substitution_reference",
+        )
+
     def test_snapshot_builder_keeps_learned_literals_exact_and_bounded(self):
         snapshot = type("Snapshot", (), {
             "literals": ("  Exact refusal copy  ", "x" * 257),

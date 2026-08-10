@@ -215,8 +215,13 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("state.imageRefs.length + (state.params.image_refs?.length ?? 0)", store)
         self.assertIn("restoreGeneration !== _settingsRestoreGeneration", store)
         self.assertIn("_h3Ref2VATermsHostAccepted", store)
-        self.assertIn("ref2va.current_version === H3_REF2VA_LEGACY_TERM_VERSION", store)
         self.assertIn("_clearLegacyH3Ref2VATermsAcceptance", store)
+        load_terms = store.split("loadHostTerms: async () =>", 1)[1].split(
+            "acceptHostTerm: async (term) =>", 1,
+        )[0]
+        self.assertIn("api.fetchHostTerms(workspace)", load_terms)
+        self.assertNotIn("api.acceptHostTerm", load_terms)
+        self.assertNotIn("localStorage.getItem", load_terms)
         self.assertIn("acceptHostTerm('minimax_h3_ref2va')", plan_dialog)
         self.assertIn("HOST_TERM_NOTICES.minimax_h3_ref2va.text", plan_dialog)
 

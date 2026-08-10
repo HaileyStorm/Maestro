@@ -13,16 +13,22 @@ OUTPUT_LAYERS = [9, 18, 27]
 MAX_LENGTH = 512
 
 
+def _resolve_model_config_path(file_path: str, config_path: str | None = None):
+    """Keep legacy beside-weight config lookup unless a variant overrides it."""
+    return config_path or os.path.join(os.path.dirname(file_path), "config.json")
+
+
 class Qwen3Embedder(nn.Module):
     def __init__(
         self,
         model_spec: str | None = None,
         tokenizer_path: str | None = None,
+        config_path: str | None = None,
         torch_dtype: str = "bfloat16",
     ):
         super().__init__()
         file_path = model_spec
-        default_config = os.path.join(os.path.dirname(file_path), "config.json")
+        default_config = _resolve_model_config_path(file_path, config_path)
         self.model = offload.fast_load_transformers_model(
             file_path,
             writable_tensors=False,

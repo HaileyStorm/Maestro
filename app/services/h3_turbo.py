@@ -46,6 +46,7 @@ H3_TURBO_GRID_SHA256 = "30eb3c2cc7fb6b470d9717ff840d359313ac27cd64b705e32da1baa1
 H3_TURBO_AUTHORED_STEPS_MIN = 4
 H3_TURBO_AUTHORED_STEPS_MAX = 8
 H3_TURBO_STRENGTH = 1.0
+H3_TURBO_SCHEDULE_ALGORITHM_VERSION = "maestro_h3_turbo_dual_clock_v1"
 H3_TURBO_BASE_CHECKPOINT = "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"
 H3_TURBO_W4A8_CHECKPOINT = "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
 H3_TURBO_PINKCHERRY_CHECKPOINT = "PinkCherry_h3_fl2va_int8_convrot_v0.2-alpha.safetensors"
@@ -108,6 +109,42 @@ class H3TurboAssets:
     release_dir: Path
     lora_path: Path
     grid_path: Path
+
+
+@dataclass(frozen=True)
+class H3TurboSchedule:
+    """Immutable execution plan for H3 Turbo's video and audio clocks."""
+
+    profile_id: str
+    algorithm_version: str
+    authored_video_steps: int
+    video_scheduler_steps: int
+    audio_scheduler_steps: int
+    master_evaluations: int
+    video_grid_points: int
+    audio_grid_points: int
+    video_timestep_indices: tuple[int, ...]
+    audio_timestep_indices: tuple[int, ...]
+    video_advance_ticks: tuple[int, ...]
+
+    def public_identity(self) -> dict[str, str | int]:
+        """Return the canonical JSON-safe identity used by later durable seams."""
+
+        return {
+            "profile_id": self.profile_id,
+            "algorithm_version": self.algorithm_version,
+            "authored_video_steps": self.authored_video_steps,
+            # These two names are retained as stable compatibility aliases for
+            # launch/benchmark consumers; their values mean scheduler steps,
+            # not joint transformer-head executions.
+            "video_evaluations": self.video_scheduler_steps,
+            "audio_evaluations": self.audio_scheduler_steps,
+            "evaluation_alias_semantics": "scheduler_steps",
+            "master_evaluations": self.master_evaluations,
+            "transformer_evaluations": self.master_evaluations,
+            "video_scheduler_steps": self.video_scheduler_steps,
+            "audio_scheduler_steps": self.audio_scheduler_steps,
+        }
 
 
 def _managed_root(root: str | os.PathLike[str] | None = None) -> Path:
@@ -462,17 +499,86 @@ def turbo_requested(custom_settings: Mapping[str, Any] | None) -> bool:
     return value not in (None, "", False)
 
 
-def scheduler_grid_points(authored_steps: int) -> int:
-    """Translate LarryVRH's model-evaluation count to Maestro grid points."""
+def _validated_authored_steps(authored_steps: Any) -> int:
     if isinstance(authored_steps, bool):
-        raise H3TurboCompatibilityError("H3 Turbo steps must be an integer from 4 through 8")
+        raise H3TurboCompatibilityError(
+            "H3 Turbo steps must be an integer from 4 through 8"
+        )
     try:
         steps = int(authored_steps)
     except (TypeError, ValueError) as error:
-        raise H3TurboCompatibilityError("H3 Turbo steps must be an integer from 4 through 8") from error
-    if steps != authored_steps or not H3_TURBO_AUTHORED_STEPS_MIN <= steps <= H3_TURBO_AUTHORED_STEPS_MAX:
-        raise H3TurboCompatibilityError("H3 Turbo supports exactly 4 through 8 model evaluations")
-    return steps + 1
+        raise H3TurboCompatibilityError(
+            "H3 Turbo steps must be an integer from 4 through 8"
+        ) from error
+    if (
+        steps != authored_steps
+        or not H3_TURBO_AUTHORED_STEPS_MIN
+        <= steps
+        <= H3_TURBO_AUTHORED_STEPS_MAX
+    ):
+        raise H3TurboCompatibilityError(
+            "H3 Turbo supports exactly 4 through 8 model evaluations"
+        )
+    return steps
+
+
+def resolve_h3_turbo_schedule(authored_steps: Any) -> H3TurboSchedule:
+    """Resolve the exact versioned video/audio cadence for one Turbo request.
+
+    Turbo-4 runs two audio/transformer ticks while the video state is frozen,
+    then advances video using the second prediction in the pair. Other managed
+    Turbo operating points retain the historical one-to-one paired cadence.
+    """
+
+    steps = _validated_authored_steps(authored_steps)
+    if steps == 4:
+        audio_evaluations = master_evaluations = 8
+        video_timestep_indices = tuple(index // 2 for index in range(8))
+        video_advance_ticks = (1, 3, 5, 7)
+    else:
+        audio_evaluations = master_evaluations = steps
+        video_timestep_indices = tuple(range(steps))
+        video_advance_ticks = tuple(range(steps))
+    return H3TurboSchedule(
+        profile_id=H3_TURBO_PROFILE_ID,
+        algorithm_version=H3_TURBO_SCHEDULE_ALGORITHM_VERSION,
+        authored_video_steps=steps,
+        video_scheduler_steps=steps,
+        audio_scheduler_steps=audio_evaluations,
+        master_evaluations=master_evaluations,
+        video_grid_points=steps + 1,
+        audio_grid_points=audio_evaluations + 1,
+        video_timestep_indices=video_timestep_indices,
+        audio_timestep_indices=tuple(range(audio_evaluations)),
+        video_advance_ticks=video_advance_ticks,
+    )
+
+
+def turbo_schedule_identity(authored_steps: Any) -> dict[str, str | int]:
+    """Return the canonical public identity for a resolved Turbo schedule."""
+
+    return resolve_h3_turbo_schedule(authored_steps).public_identity()
+
+
+def validate_turbo_schedule_identity(
+    identity: Mapping[str, Any],
+) -> dict[str, str | int]:
+    """Validate an untrusted persisted identity against the current resolver."""
+
+    if not isinstance(identity, Mapping):
+        raise H3TurboCompatibilityError("H3 Turbo schedule identity must be an object")
+    authored_steps = identity.get("authored_video_steps")
+    expected = turbo_schedule_identity(authored_steps)
+    if dict(identity) != expected:
+        raise H3TurboCompatibilityError(
+            "H3 Turbo schedule identity does not match the current runtime"
+        )
+    return expected
+
+
+def scheduler_grid_points(authored_steps: int) -> int:
+    """Translate LarryVRH's model-evaluation count to Maestro grid points."""
+    return resolve_h3_turbo_schedule(authored_steps).video_grid_points
 
 
 def h3_turbo_adaln_delta(lora_a: Any, lora_b: Any, silu_t_emb: Any) -> Any:
@@ -558,7 +664,7 @@ def turbo_compatibility_matrix() -> dict[str, Any]:
             "sol_attn": {
                 "status": "ready_for_live_validation",
                 "reason": (
-                    "Allowed with dense_steps covering every authored evaluation, which makes each Turbo step "
+                    "Allowed with dense_steps covering every effective transformer evaluation, which makes each Turbo step "
                     "take the exact SDPA fallback; sparse Sol still requires a quality gate."
                 ),
             },
@@ -728,7 +834,7 @@ def validate_turbo_request(
         raise H3TurboCompatibilityError(
             "H3 Turbo cache combination is unsupported: MiniMaxH3Transformer has no Tea/Mag cache execution hook"
         )
-    evaluated_steps = scheduler_grid_points(authored_steps) - 1
+    evaluated_steps = resolve_h3_turbo_schedule(authored_steps).master_evaluations
     attention = str((custom_settings or {}).get("h3_attention_engine") or "sdpa")
     if attention not in {"sdpa", "sol_attn", "sage2"}:
         raise H3TurboCompatibilityError(f"Unknown H3 Turbo attention engine: {attention!r}")
@@ -744,7 +850,8 @@ def validate_turbo_request(
             raise H3TurboCompatibilityError("H3 Turbo Sol-Attn dense step count is invalid") from error
         if dense_steps < evaluated_steps:
             raise H3TurboCompatibilityError(
-                "Sparse Sol-Attn is not yet validated with H3 Turbo; h3_sol_dense_steps must cover every authored evaluation"
+                "Sparse Sol-Attn is not yet validated with H3 Turbo; "
+                "h3_sol_dense_steps must cover every effective transformer evaluation"
             )
     return True
 
@@ -828,12 +935,14 @@ __all__ = [
     "H3_TURBO_PINKCHERRY_CHECKPOINT",
     "H3_TURBO_PROFILE_ID",
     "H3_TURBO_REF2VA_CHECKPOINT",
+    "H3_TURBO_SCHEDULE_ALGORITHM_VERSION",
     "H3_TURBO_STRENGTH",
     "H3_TURBO_TENSOR_SHAPES",
     "H3_TURBO_W4A8_CHECKPOINT",
     "H3TurboAssets",
     "H3TurboAssetsUnavailable",
     "H3TurboCompatibilityError",
+    "H3TurboSchedule",
     "activate_h3_turbo_runtime",
     "acquire_turbo_assets",
     "clear_h3_turbo_runtime",
@@ -844,6 +953,7 @@ __all__ = [
     "resolve_turbo_assets",
     "record_ref2va_live_validation",
     "ref2va_live_validation_status",
+    "resolve_h3_turbo_schedule",
     "scheduler_grid_points",
     "strip_and_capture_adaln",
     "turbo_assets_available",
@@ -851,8 +961,10 @@ __all__ = [
     "turbo_compatibility_matrix",
     "turbo_model_variant",
     "turbo_requested",
+    "turbo_schedule_identity",
     "validate_runtime_state_dict",
     "validate_turbo_grid",
     "validate_turbo_lora",
     "validate_turbo_request",
+    "validate_turbo_schedule_identity",
 ]

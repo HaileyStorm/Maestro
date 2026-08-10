@@ -52,7 +52,7 @@ NATIVE_RESOLUTIONS = frozenset({
 })
 CONFIGURABLE_FIELDS = frozenset({
     "enabled", "steps", "resolution", "attention_engine", "sol_dense_steps",
-    "sol_dense_blocks", "export_frames",
+    "sol_dense_blocks", "export_frames", "expected_frames",
 })
 SAFE_FAILURE_STAGES = frozenset({
     "denoise", "vae_decode", "segment_checkpoint", "concat", "audio_mux",
@@ -116,6 +116,18 @@ SYNTHETIC_REF_PROMPT = (
 )
 BENCHMARK_HEADER_NAME = "X-Maestro-H3-Benchmark"
 BENCHMARK_HEADER_VALUE = "synthetic-v1"
+LIVE_4K_ACCEPTANCE_CASE = "base_4k_delivery"
+ALLOCATION_PROBE_CASES = {
+    "base_high_allocation_p4": ("minimax_h3", 4),
+    "base_high_allocation_p5": ("minimax_h3", 5),
+    "w4a8_high_allocation_p4": ("minimax_h3_w4a8_fl2va", 4),
+    "w4a8_high_allocation_p5": ("minimax_h3_w4a8_fl2va", 5),
+    "pinkcherry_high_allocation_p4": ("minimax_h3_pinkcherry_fl2va", 4),
+    "pinkcherry_high_allocation_p5": ("minimax_h3_pinkcherry_fl2va", 5),
+    "ref2va_high_allocation_p3": ("minimax_h3_ref2va", 3),
+    "ref2va_high_allocation_p4": ("minimax_h3_ref2va", 4),
+    "ref2va_high_allocation_p5": ("minimax_h3_ref2va", 5),
+}
 
 
 @dataclass(frozen=True)
@@ -142,6 +154,8 @@ class BenchmarkCase:
     video_evaluations: int = 0
     audio_evaluations: int = 0
     benchmark_dry_run_only: bool = False
+    allocation_probe: bool = False
+    offload_profile: int = -1
     enabled: bool = True
 
     def public_config(self) -> dict[str, Any]:
@@ -176,6 +190,9 @@ class BenchmarkCase:
                 "spatial_upsampling": self.spatial_upsampling,
                 "delivery_resolution": self.delivery_resolution,
                 "delivery_fit": self.delivery_fit,
+                "delivery_kind": "learned_upscale",
+                "native_resolution": self.resolution,
+                "native_delivery_resolution": False,
             })
         if self.multirate_profile:
             result.update({
@@ -183,6 +200,12 @@ class BenchmarkCase:
                 "video_evaluations": self.video_evaluations,
                 "audio_evaluations": self.audio_evaluations,
                 "benchmark_dry_run_only": self.benchmark_dry_run_only,
+            })
+        if self.allocation_probe:
+            result.update({
+                "allocation_probe": True,
+                "expected_frames": self.expected_frames,
+                "offload_profile": self.offload_profile,
             })
         return result
 
@@ -201,6 +224,29 @@ DEFAULT_CASES = (
     BenchmarkCase(
         "ref2va_native_sdpa", "minimax_h3_ref2va", 20,
         semantic_reference=True, export_frames=True,
+    ),
+    # Opt-in local allocation probe for frame-ceiling calibration. Two steps
+    # execute two complete denoising evaluations plus decode, exercising the
+    # frame/resolution/model/profile allocation shape without paying for a
+    # full 20-step sample. A separate full-step confirmation is still required
+    # before promoting a measured ceiling into recovery policy.
+    *tuple(
+        BenchmarkCase(
+            case_id=case_id,
+            model_type=model_type,
+            steps=2,
+            resolution="1344x768",
+            attention_engine="sol_attn",
+            semantic_reference=model_type == "minimax_h3_ref2va",
+            sol_dense_steps=10,
+            sol_dense_blocks=2,
+            expected_frames=243,
+            allocation_probe=True,
+            offload_profile=offload_profile,
+            enabled=False,
+        )
+        for case_id, (model_type, offload_profile)
+        in ALLOCATION_PROBE_CASES.items()
     ),
     BenchmarkCase(
         "ref2va_turbo_4_sdpa", "minimax_h3_ref2va", 4, turbo=True,
@@ -374,12 +420,36 @@ def _validate_case(case: BenchmarkCase) -> BenchmarkCase:
             raise ValueError(
                 f"native-boundary evidence case {case.case_id} changed its fixed geometry"
             )
-    elif (
+    elif not case.allocation_probe and (
         case.native_boundary_conditioning is not None
         or case.procedural_edge
         or case.expected_frames != 124
     ):
         raise ValueError(f"boundary-only settings leaked into {case.case_id}")
+    if case.allocation_probe:
+        expected_probe = ALLOCATION_PROBE_CASES.get(case.case_id)
+        minimum_frames = (
+            107 if case.model_type == "minimax_h3_ref2va" else 124
+        )
+        if (
+            expected_probe != (case.model_type, case.offload_profile)
+            or case.resolution != "1344x768"
+            or case.attention_engine != "sol_attn"
+            or case.sol_dense_steps != 10
+            or case.sol_dense_blocks != 2
+            or case.steps not in {2, 20}
+            or case.expected_frames < minimum_frames
+            or case.expected_frames > 345
+            or (case.expected_frames - 5) % 17 != 0
+            or case.turbo
+            or case.boundary_mode
+            or case.spatial_upsampling
+        ):
+            raise ValueError(
+                f"allocation probe {case.case_id} changed its bounded H3 contract"
+            )
+    elif case.offload_profile != -1:
+        raise ValueError(f"allocation-only offload profile leaked into {case.case_id}")
     if (
         isinstance(case.sol_dense_steps, bool)
         or not isinstance(case.sol_dense_steps, int)
@@ -429,6 +499,7 @@ def _validate_case(case: BenchmarkCase) -> BenchmarkCase:
         raise ValueError(f"multirate-only settings leaked into {case.case_id}")
     for field in (
         "enabled", "export_frames", "procedural_edge", "benchmark_dry_run_only",
+        "allocation_probe",
     ):
         if not isinstance(getattr(case, field), bool):
             raise ValueError(f"{field} for {case.case_id} must be boolean")
@@ -735,10 +806,12 @@ class MaestroClient:
         return self.json("GET", "/api/v1/h3/benchmark")
 
 
-def benchmark_sample_counts(report: Any) -> dict[str, int]:
+def benchmark_sample_counts(report: Any) -> dict[str, int] | None:
     records = report.get("records") if isinstance(report, Mapping) else None
+    if not isinstance(records, list):
+        return None
     result: dict[str, int] = {}
-    for record in records if isinstance(records, list) else ():
+    for record in records:
         if not isinstance(record, Mapping):
             continue
         spec = record.get("spec")
@@ -803,6 +876,84 @@ def boundary_vram_evidence(
     return result
 
 
+def allocation_vram_evidence(
+    report: Any,
+    case: BenchmarkCase,
+    *,
+    prior_sample_counts: Mapping[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Select only fresh content-free evidence for one allocation probe."""
+
+    if not case.allocation_probe or prior_sample_counts is None:
+        return []
+    records = report.get("records") if isinstance(report, Mapping) else None
+    result: list[dict[str, Any]] = []
+    for record in records if isinstance(records, list) else ():
+        if not isinstance(record, Mapping):
+            continue
+        spec = record.get("spec")
+        spec = spec if isinstance(spec, Mapping) else {}
+        task = spec.get("task")
+        task = task if isinstance(task, Mapping) else {}
+        engine = spec.get("engine")
+        engine = engine if isinstance(engine, Mapping) else {}
+        model = spec.get("model")
+        model = model if isinstance(model, Mapping) else {}
+        try:
+            exact = (
+                str(model.get("id") or "") == case.model_type
+                and int(task.get("width") or 0) == 1344
+                and int(task.get("height") or 0) == 768
+                and int(task.get("frame_count") or 0) == case.expected_frames
+                and int(task.get("sampling_steps") or 0) == case.steps
+                and int(task.get("offload_profile") or 0)
+                == case.offload_profile
+                and str(engine.get("id") or "") == "sol_attn"
+                and int(engine.get("dense_steps") or -1) == 10
+                and int(engine.get("dense_blocks") or -1) == 2
+            )
+            sample_count = max(0, int(record.get("sample_count") or 0))
+        except (TypeError, ValueError):
+            continue
+        if not exact:
+            continue
+        cache_key = str(record.get("cache_key") or spec.get("cache_key") or "")
+        prior_count = int((prior_sample_counts or {}).get(cache_key, 0) or 0)
+        if prior_sample_counts is not None and sample_count <= prior_count:
+            continue
+        peak_gpu_memory_bytes = record.get("peak_gpu_memory_bytes")
+        generation_wall_time_seconds = record.get(
+            "generation_wall_time_seconds"
+        )
+        try:
+            peak_value = float(peak_gpu_memory_bytes)
+            wall_value = float(generation_wall_time_seconds)
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if (
+            isinstance(peak_gpu_memory_bytes, bool)
+            or not isinstance(peak_gpu_memory_bytes, (int, float))
+            or not math.isfinite(peak_value)
+            or peak_value < 0
+            or isinstance(generation_wall_time_seconds, bool)
+            or not isinstance(generation_wall_time_seconds, (int, float))
+            or not math.isfinite(wall_value)
+            or wall_value < 0
+        ):
+            continue
+        result.append({
+            "model_type": case.model_type,
+            "offload_profile": case.offload_profile,
+            "frame_count": case.expected_frames,
+            "sampling_steps": case.steps,
+            "peak_gpu_memory_bytes": peak_value,
+            "generation_wall_time_seconds": wall_value,
+            "sample_count_delta": sample_count - prior_count,
+            "source": "local_content_free_h3_allocation_delta",
+        })
+    return result
+
+
 def build_generation_payload(
     case: BenchmarkCase,
     *,
@@ -832,7 +983,16 @@ def build_generation_payload(
         "generation_mode": "video",
         "image_mode": 0,
         "video_length": case.expected_frames,
-        "sliding_window_size": 175 if case.boundary_mode else 124,
+        # H3 Studio treats this as an explicit physical-segment ceiling.  An
+        # allocation probe must stay one exact native clip at the requested
+        # legal frame count; inheriting the ordinary 124-frame benchmark
+        # window silently turns a 226/243-frame probe into two 124-frame
+        # segments and measures the wrong allocation shape.
+        "sliding_window_size": (
+            case.expected_frames
+            if case.allocation_probe
+            else 175 if case.boundary_mode else 124
+        ),
         "sliding_window_overlap": 0,
         "resolution": case.resolution,
         "num_inference_steps": case.steps,
@@ -849,6 +1009,8 @@ def build_generation_payload(
         "explicit_output": case.explicit_output,
         "custom_settings": custom,
     }
+    if case.allocation_probe:
+        payload["override_profile"] = case.offload_profile
     if case.semantic_reference:
         if not reference_path:
             raise ValueError("semantic reference case requires procedural media")
@@ -857,6 +1019,14 @@ def build_generation_payload(
             "image_refs_relative_size": 100,
             "remove_background_images_ref": 0,
             "h3_ref2va_terms_accepted": True,
+            "h3_adaptive_conditioning": False,
+        })
+    elif case.allocation_probe:
+        if not reference_path:
+            raise ValueError("allocation probe requires procedural media")
+        payload.update({
+            "image_start": reference_path,
+            "image_prompt_type": "S",
             "h3_adaptive_conditioning": False,
         })
     if case.boundary_mode:
@@ -979,6 +1149,48 @@ def probe_video(
         "has_audio": audio,
         "audio_sample_rate": audio_sample_rate,
         "audio_channels": audio_channels,
+        "checks": checks,
+    }
+
+
+def assess_delivery_publication(
+    status: Mapping[str, Any], outputs: Any,
+) -> dict[str, Any]:
+    """Validate only content-free public finality facts for one delivery job.
+
+    A successful live run cannot exercise the private recovery path without
+    fault injection.  It can, however, prove that the terminal job exposes one
+    ordinary final basename and no recovery/native capability.  The private
+    artifact validation and recovery mechanics remain covered by the separate
+    model-free delivery-recovery suite.
+    """
+
+    published = outputs if isinstance(outputs, list) else []
+    reference = published[0] if len(published) == 1 else None
+    safe_reference = (
+        isinstance(reference, str)
+        and bool(reference)
+        and Path(reference).name == reference
+        and not reference.startswith(".")
+        and reference.casefold().endswith(".mp4")
+    )
+    recovery_exposed = any(
+        bool(status.get(field))
+        for field in (
+            "delivery_recovery",
+            "delivery_recovery_actions",
+            "delivery_native",
+            "protected_native",
+        )
+    )
+    checks = {
+        "terminal_completed": str(status.get("status") or "") == "completed",
+        "one_public_output": len(published) == 1,
+        "safe_final_reference": safe_reference,
+        "protected_native_not_exposed": not recovery_exposed,
+    }
+    return {
+        "validation": "valid" if all(checks.values()) else "invalid",
         "checks": checks,
     }
 
@@ -1145,6 +1357,8 @@ def run_case(
     if case.boundary_mode:
         record["boundary_evidence"] = {"validation": "not_produced"}
         record["vram_evidence"] = []
+    if case.allocation_probe:
+        record["allocation_evidence"] = []
     prior_benchmark_counts: dict[str, int] | None = None
     def cancel_owned_job() -> bool:
         if not job_id:
@@ -1155,13 +1369,13 @@ def run_case(
             return False
 
     try:
-        if case.boundary_mode:
+        if case.boundary_mode or case.allocation_probe:
             try:
                 prior_benchmark_counts = benchmark_sample_counts(
                     client.h3_benchmark_report()
                 )
             except BenchmarkError:
-                prior_benchmark_counts = {}
+                prior_benchmark_counts = None
         job_id = client.submit(build_generation_payload(
             case, project=project, seed=seed, reference_path=reference_path,
         ))
@@ -1191,6 +1405,23 @@ def run_case(
                 category = "runtime"
             record["failure_category"] = category
             return record
+        if case.spatial_upsampling:
+            record["delivery_acceptance"] = {
+                "validation": "not_produced",
+                "delivery_kind": "learned_upscale",
+                "native_resolution": case.resolution,
+                "delivery_resolution": case.delivery_resolution,
+                "native_4k": False,
+                "public_finality": assess_delivery_publication(status, outputs),
+                "private_recovery_live_evidence": "not_exercised_success_path",
+            }
+            if (
+                record["delivery_acceptance"]["public_finality"]["validation"]
+                != "valid"
+            ):
+                record["status"] = "invalid"
+                record["failure_category"] = "delivery_publication"
+                return record
         if len(outputs) != 1:
             record["status"] = "invalid"
             record["failure_category"] = "unexpected_output_count"
@@ -1230,6 +1461,15 @@ def run_case(
                 )
             except BenchmarkError:
                 record["vram_evidence"] = []
+        if case.allocation_probe:
+            try:
+                record["allocation_evidence"] = allocation_vram_evidence(
+                    client.h3_benchmark_report(),
+                    case,
+                    prior_sample_counts=prior_benchmark_counts,
+                )
+            except BenchmarkError:
+                record["allocation_evidence"] = []
         frames_valid = (
             not case.export_frames
             or set(record["visual_frames"]) == {
@@ -1239,6 +1479,8 @@ def run_case(
         if record["validity"].get("validation") != "valid" or not frames_valid:
             record["status"] = "invalid"
             record["failure_category"] = "output_validation"
+        elif case.spatial_upsampling:
+            record["delivery_acceptance"]["validation"] = "valid"
         return record
     except KeyboardInterrupt:
         record["failure_category"] = "interrupted"
@@ -1298,13 +1540,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="print the sanitized matrix without contacting Maestro",
     )
+    parser.add_argument(
+        "--live-4k-acceptance",
+        action="store_true",
+        help=(
+            "run only the exact minimum-duration 1344x768 -> FlashVSR3 -> "
+            "3840x2160 learned-upscale delivery gate"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        matrix = build_matrix(args.cases, load_matrix_overrides(args.matrix_config))
+        selected_cases = args.cases
+        if args.live_4k_acceptance:
+            if args.matrix_config:
+                raise ValueError("live 4K acceptance does not allow matrix overrides")
+            if selected_cases not in ([], [LIVE_4K_ACCEPTANCE_CASE]):
+                raise ValueError(
+                    f"live 4K acceptance runs only {LIVE_4K_ACCEPTANCE_CASE}"
+                )
+            selected_cases = [LIVE_4K_ACCEPTANCE_CASE]
+        matrix = build_matrix(
+            selected_cases, load_matrix_overrides(args.matrix_config),
+        )
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
         print(f"Benchmark matrix error: {error}", file=sys.stderr)
         return 2
@@ -1321,6 +1582,12 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.live_4k_acceptance and not shutil.which("ffprobe"):
+        print(
+            "Benchmark setup failed: ffprobe_required_for_live_4k_acceptance",
+            file=sys.stderr,
+        )
+        return 1
     password = os.environ.get(args.password_env, "")
     try:
         client = MaestroClient(args.base_url, timeout_seconds=120)
@@ -1328,6 +1595,7 @@ def main(argv: list[str] | None = None) -> int:
         reference_path = None
         if any(
             case.semantic_reference or case.procedural_edge
+            or case.allocation_probe
             for case in matrix
         ):
             reference_path = client.upload_procedural_reference(

@@ -256,7 +256,7 @@ class GenerationTelemetryTests(unittest.TestCase):
             reconnect_start:store.index("// LoRA state", reconnect_start)
         ]
         self.assertNotIn("isGenerating: remaining.length > 0", reconnect)
-        self.assertIn("job.status === 'queued' || job.status === 'running'", reconnect)
+        self.assertIn("ACTIVE_GENERATION_JOB_STATUSES.has(status.status)", reconnect)
 
     def test_requeued_h3_card_prefers_preserved_remaining_eta(self):
         main = _source("ui/src/components/MainContent/MainContent.tsx")
@@ -294,7 +294,7 @@ class GenerationTelemetryTests(unittest.TestCase):
         )
         self.assertIn("? h3QueuedRuntime(job)", placeholder)
         self.assertIn(
-            "job.status === 'queued' && job.modelType?.startsWith('minimax_h3')",
+            "job.status === 'queued' || job.status === 'waiting_for_plan_approval'",
             placeholder,
         )
         self.assertIn(
@@ -310,7 +310,11 @@ class GenerationTelemetryTests(unittest.TestCase):
             eta_render,
         )
         self.assertIn("Overall ETA ${compactEta(job.etaSeconds)}", eta_render)
-        self.assertIn("? (previous?.etaSeconds ?? estimatedTotal)", status_mapper)
+        self.assertIn("const exactTextEta = resourceDescriptor?.intent === 'text'", status_mapper)
+        self.assertIn(
+            "exactTextEta ? status.eta_seconds ?? null : previous?.etaSeconds ?? estimatedTotal",
+            status_mapper,
+        )
 
 
 if __name__ == "__main__":

@@ -62,8 +62,21 @@ module.exports = async (kernel) => {
       // SAM service starts on demand (launched by the backend when inpaint is used)
       // — not started here to avoid holding a CUDA context that wastes VRAM
       {
-        method: "script.start",
-        params: { uri: "blender_runtime_start.js" }
+        when: "{{exists('app/tools/blender/runtime.json')}}",
+        method: "shell.run",
+        params: {
+          env: runtimeSecretEnv,
+          venv: "env",
+          path: "app",
+          message: [
+            "python -m services.blender_mcp_service attest-runtime --marker tools/blender/runtime.json",
+            "python scripts/start_blender_bridge.py"
+          ],
+          on: [{
+            event: "/(MCP server started on 127\\.0\\.0\\.1:9876|Blender bridge already ready at 127\\.0\\.0\\.1:9876)/",
+            done: true
+          }]
+        }
       },
       {
         method: "shell.run",

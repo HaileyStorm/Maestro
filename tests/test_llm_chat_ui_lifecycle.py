@@ -8,6 +8,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 CHAT_UI = ROOT / "ui" / "src" / "components" / "LlmChat.tsx"
 CHAT_CLIENT = ROOT / "ui" / "src" / "api" / "client.ts"
+CLIPBOARD = ROOT / "ui" / "src" / "lib" / "clipboard.ts"
 
 
 class LlmChatUiLifecycleTests(unittest.TestCase):
@@ -15,6 +16,7 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
     def setUpClass(cls):
         cls.source = CHAT_UI.read_text(encoding="utf-8")
         cls.client = CHAT_CLIENT.read_text(encoding="utf-8")
+        cls.clipboard = CLIPBOARD.read_text(encoding="utf-8")
 
     def test_retry_and_edit_build_replacement_branches(self):
         self.assertIn("messages.slice(0, assistantIndex)", self.source)
@@ -94,6 +96,32 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
         self.assertIn("aria-label={`Edit user turn ${index + 1}`}", self.source)
         self.assertIn("aria-label={`Retry assistant turn ${index + 1}`}", self.source)
         self.assertIn("textareaRef.current?.focus()", self.source)
+
+    def test_assistant_copy_uses_exact_content_and_local_http_fallback(self):
+        self.assertIn("await clipboard.writeText(content)", self.clipboard)
+        self.assertIn("return copyTextWithDocumentCommand(content, documentRef)", self.clipboard)
+        self.assertIn("documentRef.createElement('textarea')", self.clipboard)
+        self.assertIn("documentRef.execCommand('copy')", self.clipboard)
+        copy_turn = self.source[
+            self.source.index("const copyAssistantTurn = async"):
+            self.source.index("const readRefusalSelection", self.source.index("const copyAssistantTurn = async"))
+        ]
+        self.assertIn("copyTextToClipboard(message.content)", copy_turn)
+        self.assertNotIn("message.attachments", copy_turn)
+        self.assertNotIn("message.performance", copy_turn)
+
+    def test_assistant_copy_is_per_turn_accessible_and_not_generation_locked(self):
+        self.assertIn("aria-label={`Copy assistant turn ${index + 1}`}", self.source)
+        self.assertIn('role="status" aria-live="polite" aria-atomic="true"', self.source)
+        self.assertIn("assistantCopyNotice?.workspace === activeWorkspace", self.source)
+        self.assertIn("assistantCopyNotice.projectInstance === projectInstance", self.source)
+        self.assertIn("isAssistantCopyScopeCurrent(", self.source)
+        copy_button = self.source[
+            self.source.index('aria-label={`Copy assistant turn ${index + 1}`}'):
+            self.source.index("</button>", self.source.index('aria-label={`Copy assistant turn ${index + 1}`}'))
+        ]
+        self.assertNotIn("disabled=", copy_button)
+        self.assertIn("onClick={() => void copyAssistantTurn(index)}", copy_button)
 
     def test_refusal_capture_is_host_only_assistant_selection_only(self):
         self.assertIn(

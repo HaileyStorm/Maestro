@@ -23,7 +23,6 @@ export function DurationSlider() {
   const h3EstimateLoading = useStore(s => s.h3EstimateLoading)
   const invalidateH3Estimates = useStore(s => s.invalidateH3PerformanceEstimates)
   const refreshH3Estimates = useStore(s => s.refreshH3PerformanceEstimates)
-  const pendingH3Plan = useStore(s => s.pendingH3Plan)
   const h3ReferenceShapeKey = useStore(s => [
     Number(Boolean(s.startImage || s.params.image_start)),
     Number(Boolean(s.endImage || s.params.image_end)),
@@ -108,7 +107,6 @@ export function DurationSlider() {
   const isMultiClip = imageMode === 2
   const promptLineCount = prompt.split('\n').filter((l: string) => l.trim()).length
   const globalTimeline = useStore(s => hasGlobalTimeline(s.params.prompt))
-  const plannedSegmentCount = pendingH3Plan?.clip_count ?? null
   const estimatedSegmentLabel = h3SegmentEstimate
     ? h3SegmentEstimate.minimum === h3SegmentEstimate.maximum
       ? String(h3SegmentEstimate.likely)
@@ -124,9 +122,7 @@ export function DurationSlider() {
           {(usesSegments || showSlidingWindow) && (
             <span className="text-text-muted ml-1">
               ({usesSegments
-                ? plannedSegmentCount != null
-                  ? `Planned segments ${plannedSegmentCount}`
-                  : `Estimated segments ${estimatedSegmentLabel}`
+                ? `Estimated segments ${estimatedSegmentLabel}`
                 : `${windowCount} win`})
             </span>
           )}
@@ -144,9 +140,7 @@ export function DurationSlider() {
         <div className="text-[10px] text-text-muted mt-1">
           {usesSegments ? (
             <span title={h3SegmentEstimate?.reason}>
-              {plannedSegmentCount != null
-                ? `Planned segments ${plannedSegmentCount}`
-                : `Estimated segments ${estimatedSegmentLabel}`}
+              {`Estimated segments ${estimatedSegmentLabel}`}
               {' '}· maximum {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s each
               {globalTimeline ? ' · authored timestamps mapped exactly' : ' · prompt beats can produce shorter unequal shots'}
             </span>
@@ -210,7 +204,7 @@ export function DurationSlider() {
               />
               <span>
                 <span className="font-medium text-text-primary">Automatically choose FL2VA / Ref2VA per segment</span>
-                <span className="mt-0.5 block text-text-muted">On by default. Maestro uses the supplied anchors/references and cut timing, carries temporal context where supported, minimizes checkpoint switches, then shows an editable plan before queueing.</span>
+                <span className="mt-0.5 block text-text-muted">On by default. Maestro queues immediately, then uses the supplied anchors/references and cut timing to plan segments. Multi-segment jobs wait on their card for explicit plan review.</span>
               </span>
             </label>
           )}

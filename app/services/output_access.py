@@ -7,16 +7,24 @@ retains direct access to project storage.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
+import stat
 import threading
 import time
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
-from typing import Any, Mapping, MutableMapping
+from typing import Any
 
+from services.queue_recovery_adapter import (
+    ensure_project_instance_marker,
+    project_instance_digest,
+)
 
 SESSION_COOKIE_NAME = "maestro_session"
 UPLOAD_ACCESS_SIDECAR_SUFFIX = ".access.json"
@@ -25,6 +33,17 @@ _PBKDF2_ITERATIONS = 310_000
 MIN_PROJECT_PASSWORD_LENGTH = 8
 _OUTPUT_SHARE_VERSION = 1
 _OUTPUT_SHARE_TOKEN_DOMAIN = b"maestro-output-share-v1\0"
+_PROJECT_GRANT_VERSION = 1
+_PROJECT_GRANT_PRINCIPAL_DOMAIN = b"maestro-project-principal-v1\0"
+_PROJECT_GRANT_CREDENTIAL_DOMAIN = b"maestro-project-credential-v1\0"
+_PROJECT_GRANT_RECORD_DOMAIN = b"maestro-project-grant-record-v1\0"
+PROJECT_UNLOCK_REMEMBER_POLICIES = frozenset({"session", "device"})
+_PROJECT_UNLOCK_EXPIRY_SECONDS = {
+    ("local", "session"): (24 * 60 * 60, 4 * 60 * 60),
+    ("local", "device"): (30 * 24 * 60 * 60, 7 * 24 * 60 * 60),
+    ("remote", "session"): (8 * 60 * 60, 2 * 60 * 60),
+    ("remote", "device"): (7 * 24 * 60 * 60, 24 * 60 * 60),
+}
 
 
 class OutputShareManager:
@@ -540,18 +559,460 @@ def can_access_upload(upload_path: str, session_id: str) -> bool:
 class ProjectAccessStatus:
     protected: bool
     unlocked: bool
+    remember_policy: str | None = None
+    unlock_expires_at: float | None = None
+    unlock_idle_expires_at: float | None = None
 
 
 class ProjectAccessManager:
-    """Password metadata and per-session project unlocks."""
+    """Password metadata and revocable, principal-scoped project grants.
 
-    def __init__(self) -> None:
+    Device grants survive an application restart, but the durable store never
+    contains a password, raw session identifier, cookie, or bearer token. Each
+    grant is fenced by HMAC identities for the browser principal, project
+    instance, and current password revision, plus the local/remote access class.
+    """
+
+    def __init__(
+        self,
+        grants_path: str | None = None,
+        secret: bytes | None = None,
+        clock=time.time,
+    ) -> None:
+        if secret is None:
+            secret = secrets.token_bytes(32)
+        if not isinstance(secret, bytes) or len(secret) < 32:
+            raise ValueError("project-grant secret must contain at least 32 bytes")
+        self.grants_path = (
+            os.path.abspath(grants_path) if grants_path is not None else None
+        )
+        self._secret = secret
+        self._clock = clock
         self._lock = threading.RLock()
-        self._unlocked: set[tuple[str, str]] = set()
+        self._session_grants: list[dict[str, Any]] = []
 
     @staticmethod
     def metadata_path(workspace_dir: str) -> str:
         return os.path.join(workspace_dir, ".project-access.json")
+
+    @staticmethod
+    def _access_class(remote: bool) -> str:
+        return "remote" if remote else "local"
+
+    def _principal_digest(self, session_id: str) -> str:
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("Project access principal is invalid")
+        return "principal:v1:" + hmac.new(
+            self._secret,
+            _PROJECT_GRANT_PRINCIPAL_DOMAIN + session_id.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _credential_revision(self, metadata: Mapping[str, Any]) -> str | None:
+        try:
+            if (
+                metadata.get("version") != 1
+                or metadata.get("algorithm") != "pbkdf2-sha256"
+            ):
+                return None
+            iterations = int(metadata.get("iterations"))
+            salt = base64.b64decode(metadata["salt"], validate=True)
+            expected = base64.b64decode(metadata["password_hash"], validate=True)
+            if (
+                iterations != _PBKDF2_ITERATIONS
+                or len(salt) != 16
+                or len(expected) != 32
+            ):
+                return None
+        except (KeyError, ValueError, TypeError):
+            return None
+        material = json.dumps(
+            {
+                "version": 1,
+                "algorithm": "pbkdf2-sha256",
+                "iterations": iterations,
+                "salt": metadata["salt"],
+                "password_hash": metadata["password_hash"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "credential:v1:" + hmac.new(
+            self._secret,
+            _PROJECT_GRANT_CREDENTIAL_DOMAIN + material,
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _project_digest(
+        self,
+        workspace_dir: str,
+        *,
+        create: bool = False,
+    ) -> str | None:
+        marker_path = os.path.join(workspace_dir, ".maestro-project-instance")
+        descriptor = None
+        try:
+            if create:
+                marker = ensure_project_instance_marker(workspace_dir)
+            else:
+                descriptor = os.open(
+                    marker_path,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0),
+                )
+                info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or info.st_size > 64
+                ):
+                    return None
+                marker = os.read(descriptor, 65).decode("ascii").strip()
+                current = os.stat(marker_path, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                    or len(marker) != 32
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in marker
+                    )
+                ):
+                    return None
+            return project_instance_digest(self._secret, marker)
+        except (OSError, RuntimeError, TypeError, UnicodeError, ValueError):
+            return None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _hex_digest(value: Any, prefix: str) -> bool:
+        return (
+            isinstance(value, str)
+            and value.startswith(prefix)
+            and len(value) == len(prefix) + 64
+            and all(character in "0123456789abcdef" for character in value[len(prefix):])
+        )
+
+    def _record_hmac(self, record: Mapping[str, Any]) -> str:
+        material = json.dumps(
+            {
+                key: record[key]
+                for key in (
+                    "principal_digest", "workspace", "project_instance_digest",
+                    "credential_revision", "access_class", "remember_policy",
+                    "issued_at", "absolute_expires_at", "idle_expires_at",
+                    "idle_timeout_seconds",
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hmac.new(
+            self._secret,
+            _PROJECT_GRANT_RECORD_DOMAIN + material,
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _valid_grant_record(self, raw: Any) -> dict[str, Any] | None:
+        if not isinstance(raw, Mapping):
+            return None
+        policy = raw.get("remember_policy")
+        access_class = raw.get("access_class")
+        workspace = raw.get("workspace")
+        numeric_fields = (
+            "issued_at", "absolute_expires_at", "idle_expires_at",
+            "idle_timeout_seconds",
+        )
+        if (
+            policy not in PROJECT_UNLOCK_REMEMBER_POLICIES
+            or access_class not in {"local", "remote"}
+            or not isinstance(workspace, str)
+            or not workspace
+            or not self._hex_digest(raw.get("principal_digest"), "principal:v1:")
+            or not self._hex_digest(raw.get("project_instance_digest"), "project:v1:")
+            or not self._hex_digest(raw.get("credential_revision"), "credential:v1:")
+            or not isinstance(raw.get("record_hmac"), str)
+            or len(raw["record_hmac"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in raw["record_hmac"]
+            )
+            or any(
+                not isinstance(raw.get(field), (int, float))
+                or isinstance(raw.get(field), bool)
+                for field in numeric_fields
+            )
+        ):
+            return None
+        record = {
+            "principal_digest": raw["principal_digest"],
+            "workspace": workspace,
+            "project_instance_digest": raw["project_instance_digest"],
+            "credential_revision": raw["credential_revision"],
+            "access_class": access_class,
+            "remember_policy": policy,
+            **{field: float(raw[field]) for field in numeric_fields},
+        }
+        absolute_cap, idle_cap = _PROJECT_UNLOCK_EXPIRY_SECONDS[
+            (access_class, policy)
+        ]
+        if (
+            any(not math.isfinite(record[field]) for field in numeric_fields)
+            or record["issued_at"] < 0
+            or record["idle_timeout_seconds"] <= 0
+            or record["idle_timeout_seconds"] != float(idle_cap)
+            or record["absolute_expires_at"] <= record["issued_at"]
+            or record["idle_expires_at"] <= record["issued_at"]
+            or record["idle_expires_at"] > record["absolute_expires_at"]
+            or record["absolute_expires_at"] > record["issued_at"] + absolute_cap
+            or not hmac.compare_digest(raw["record_hmac"], self._record_hmac(record))
+        ):
+            return None
+        record["record_hmac"] = raw["record_hmac"]
+        return record
+
+    def _load_device_grants(self) -> list[dict[str, Any]] | None:
+        if self.grants_path is None:
+            return []
+        descriptor = None
+        try:
+            descriptor = os.open(
+                self.grants_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size > 8 * 1024 * 1024
+                or (os.name != "nt" and info.st_mode & 0o077)
+            ):
+                os.close(descriptor)
+                descriptor = None
+                return None
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = None
+                payload = json.load(handle)
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError, TypeError):
+            return None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("version") != _PROJECT_GRANT_VERSION
+            or not isinstance(payload.get("grants"), list)
+        ):
+            return None
+        records: list[dict[str, Any]] = []
+        for raw in payload["grants"]:
+            record = self._valid_grant_record(raw)
+            if record is None or record["remember_policy"] != "device":
+                return None
+            records.append(record)
+        return records
+
+    def _save_device_grants(self, grants: list[dict[str, Any]]) -> None:
+        if self.grants_path is None:
+            return
+        directory = os.path.dirname(self.grants_path)
+        os.makedirs(directory, exist_ok=True)
+        temp = f"{self.grants_path}.{secrets.token_hex(8)}.tmp"
+        descriptor = None
+        try:
+            descriptor = os.open(
+                temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = None
+                json.dump(
+                    {"version": _PROJECT_GRANT_VERSION, "grants": grants},
+                    handle,
+                    indent=2,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.grants_path)
+            try:
+                os.chmod(self.grants_path, 0o600)
+            except OSError:
+                pass
+            self._fsync_parent_directory(self.grants_path)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _fsync_parent_directory(path: str) -> None:
+        """Persist a published grant-store directory entry when supported."""
+        if os.name == "nt":
+            return
+        descriptor = None
+        try:
+            descriptor = os.open(
+                os.path.dirname(os.path.abspath(path)),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in {
+                errno.EACCES, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP,
+            }:
+                raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _grant_key(record: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
+        return (
+            str(record.get("principal_digest") or ""),
+            str(record.get("workspace") or ""),
+            str(record.get("project_instance_digest") or ""),
+            str(record.get("credential_revision") or ""),
+            str(record.get("access_class") or ""),
+        )
+
+    def _identity(
+        self,
+        workspace: str,
+        workspace_dir: str,
+        session_id: str,
+        metadata: Mapping[str, Any],
+        remote: bool,
+        *,
+        create_project_marker: bool = False,
+    ) -> tuple[str, str, str, str, str] | None:
+        credential_revision = self._credential_revision(metadata)
+        project_digest = self._project_digest(
+            workspace_dir, create=create_project_marker,
+        )
+        if credential_revision is None or project_digest is None:
+            return None
+        try:
+            principal_digest = self._principal_digest(session_id)
+        except (UnicodeError, ValueError):
+            return None
+        return (
+            principal_digest,
+            workspace,
+            project_digest,
+            credential_revision,
+            self._access_class(remote),
+        )
+
+    def _matching_grant(
+        self,
+        identity: tuple[str, str, str, str, str],
+        *,
+        refresh_idle: bool = False,
+    ) -> dict[str, Any] | None:
+        now = float(self._clock())
+        device_grants = self._load_device_grants()
+        if device_grants is None:
+            # A corrupt/unreadable store must not leave a protected project
+            # authorized through a process-local grant.
+            return None
+        for record in self._session_grants:
+            if self._grant_key(record) != identity:
+                continue
+            if now >= min(
+                record["absolute_expires_at"], record["idle_expires_at"],
+            ):
+                continue
+            if refresh_idle:
+                record["idle_expires_at"] = min(
+                    record["absolute_expires_at"],
+                    max(
+                        record["idle_expires_at"],
+                        now + record["idle_timeout_seconds"],
+                    ),
+                )
+                record["record_hmac"] = self._record_hmac(record)
+            return record
+        for record in device_grants:
+            if self._grant_key(record) != identity:
+                continue
+            if now >= min(
+                record["absolute_expires_at"], record["idle_expires_at"],
+            ):
+                continue
+            if refresh_idle:
+                updated_idle = min(
+                    record["absolute_expires_at"],
+                    max(
+                        record["idle_expires_at"],
+                        now + record["idle_timeout_seconds"],
+                    ),
+                )
+                if updated_idle != record["idle_expires_at"]:
+                    record["idle_expires_at"] = updated_idle
+                    record["record_hmac"] = self._record_hmac(record)
+                    self._save_device_grants(device_grants)
+            return record
+        return None
+
+    def _replace_grant(
+        self,
+        identity: tuple[str, str, str, str, str],
+        remember_policy: str,
+    ) -> ProjectAccessStatus:
+        if remember_policy not in PROJECT_UNLOCK_REMEMBER_POLICIES:
+            raise ValueError("remember must be 'session' or 'device'")
+        access_class = identity[-1]
+        absolute_seconds, idle_seconds = _PROJECT_UNLOCK_EXPIRY_SECONDS[
+            (access_class, remember_policy)
+        ]
+        now = float(self._clock())
+        absolute_expires_at = now + absolute_seconds
+        record = {
+            "principal_digest": identity[0],
+            "workspace": identity[1],
+            "project_instance_digest": identity[2],
+            "credential_revision": identity[3],
+            "access_class": identity[4],
+            "remember_policy": remember_policy,
+            "issued_at": now,
+            "absolute_expires_at": absolute_expires_at,
+            "idle_expires_at": min(absolute_expires_at, now + idle_seconds),
+            "idle_timeout_seconds": float(idle_seconds),
+        }
+        record["record_hmac"] = self._record_hmac(record)
+        self._session_grants = [
+            existing for existing in self._session_grants
+            if self._grant_key(existing) != identity
+        ]
+        device_grants = self._load_device_grants()
+        if device_grants is None:
+            # Successful password proof may safely replace a corrupt grant
+            # cache; the password metadata remains the authorization root.
+            device_grants = []
+        device_grants = [
+            existing for existing in device_grants
+            if self._grant_key(existing) != identity
+        ]
+        if remember_policy == "device":
+            device_grants.append(record)
+        else:
+            self._session_grants.append(record)
+        self._save_device_grants(device_grants)
+        return ProjectAccessStatus(
+            True,
+            True,
+            remember_policy,
+            record["absolute_expires_at"],
+            record["idle_expires_at"],
+        )
 
     def _load(self, workspace_dir: str) -> dict[str, Any]:
         try:
@@ -568,18 +1029,71 @@ class ProjectAccessManager:
             # or deliberately removing the local metadata file.
             return {"_access_metadata_invalid": True}
 
-    def status(self, workspace: str, workspace_dir: str, session_id: str) -> ProjectAccessStatus:
+    def _status(
+        self,
+        workspace: str,
+        workspace_dir: str,
+        session_id: str,
+        remote: bool = False,
+        *,
+        refresh_idle: bool = False,
+    ) -> ProjectAccessStatus:
         metadata = self._load(workspace_dir)
         invalid = bool(metadata.get("_access_metadata_invalid"))
         protected = invalid or bool(metadata.get("password_hash"))
+        if not protected:
+            return ProjectAccessStatus(False, True)
+        if invalid:
+            return ProjectAccessStatus(True, False)
         with self._lock:
-            unlocked = not invalid and (
-                not protected or (workspace, session_id) in self._unlocked
+            identity = self._identity(
+                workspace, workspace_dir, session_id, metadata, remote,
             )
-        return ProjectAccessStatus(protected=protected, unlocked=unlocked)
+            grant = self._matching_grant(
+                identity, refresh_idle=refresh_idle,
+            ) if identity is not None else None
+        if grant is None:
+            return ProjectAccessStatus(True, False)
+        return ProjectAccessStatus(
+            True,
+            True,
+            grant["remember_policy"],
+            grant["absolute_expires_at"],
+            grant["idle_expires_at"],
+        )
 
-    def require(self, workspace: str, workspace_dir: str, session_id: str) -> bool:
-        return self.status(workspace, workspace_dir, session_id).unlocked
+    def status(
+        self,
+        workspace: str,
+        workspace_dir: str,
+        session_id: str,
+        remote: bool = False,
+    ) -> ProjectAccessStatus:
+        """Validate without mutating idle expiry; safe for status polling."""
+        return self._status(workspace, workspace_dir, session_id, remote)
+
+    def authorize(
+        self,
+        workspace: str,
+        workspace_dir: str,
+        session_id: str,
+        remote: bool = False,
+    ) -> ProjectAccessStatus:
+        """Validate real activity and slide idle expiry within the hard cap."""
+        return self._status(
+            workspace, workspace_dir, session_id, remote, refresh_idle=True,
+        )
+
+    def require(
+        self,
+        workspace: str,
+        workspace_dir: str,
+        session_id: str,
+        remote: bool = False,
+    ) -> bool:
+        return self.authorize(
+            workspace, workspace_dir, session_id, remote,
+        ).unlocked
 
     def set_password(
         self,
@@ -587,7 +1101,11 @@ class ProjectAccessManager:
         workspace_dir: str,
         session_id: str,
         password: str | None,
+        remember: str = "session",
+        remote: bool = False,
     ) -> ProjectAccessStatus:
+        if remember not in PROJECT_UNLOCK_REMEMBER_POLICIES:
+            raise ValueError("remember must be 'session' or 'device'")
         value = str(password or "")
         path = self.metadata_path(workspace_dir)
         if not value:
@@ -596,12 +1114,14 @@ class ProjectAccessManager:
             except FileNotFoundError:
                 pass
             with self._lock:
-                self._unlocked = {item for item in self._unlocked if item[0] != workspace}
+                self.revoke_workspace(workspace)
             return ProjectAccessStatus(False, True)
         if len(value) < MIN_PROJECT_PASSWORD_LENGTH:
             raise ValueError(
                 f"Project password must be at least {MIN_PROJECT_PASSWORD_LENGTH} characters"
             )
+        if self._project_digest(workspace_dir, create=True) is None:
+            raise ValueError("Project identity could not be initialized")
         salt = secrets.token_bytes(16)
         digest = hashlib.pbkdf2_hmac(
             "sha256", value.encode("utf-8"), salt, _PBKDF2_ITERATIONS,
@@ -615,21 +1135,48 @@ class ProjectAccessManager:
             "encrypted": False,
         }
         temp = f"{path}.{secrets.token_hex(4)}.tmp"
-        with open(temp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
+        descriptor = None
         try:
-            os.chmod(temp, 0o600)
-        except OSError:
-            pass
-        os.replace(temp, path)
+            descriptor = os.open(
+                temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = None
+                json.dump(payload, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
         with self._lock:
-            self._unlocked = {item for item in self._unlocked if item[0] != workspace}
-            self._unlocked.add((workspace, session_id))
-        return ProjectAccessStatus(True, True)
+            self.revoke_workspace(workspace)
+            identity = self._identity(
+                workspace, workspace_dir, session_id, payload, remote,
+            )
+            if identity is None:
+                return ProjectAccessStatus(True, False)
+            return self._replace_grant(identity, remember)
 
-    def unlock(self, workspace: str, workspace_dir: str, session_id: str, password: str) -> bool:
+    def unlock(
+        self,
+        workspace: str,
+        workspace_dir: str,
+        session_id: str,
+        password: str,
+        remember: str = "session",
+        remote: bool = False,
+    ) -> bool:
+        if remember not in PROJECT_UNLOCK_REMEMBER_POLICIES:
+            raise ValueError("remember must be 'session' or 'device'")
         data = self._load(workspace_dir)
         if data.get("_access_metadata_invalid"):
             return False
@@ -652,9 +1199,80 @@ class ProjectAccessManager:
         if not hmac.compare_digest(actual, expected):
             return False
         with self._lock:
-            self._unlocked.add((workspace, session_id))
+            identity = self._identity(
+                workspace, workspace_dir, session_id, data, remote,
+                create_project_marker=True,
+            )
+            if identity is None:
+                return False
+            self._replace_grant(identity, remember)
         return True
 
-    def lock(self, workspace: str, session_id: str) -> None:
+    def lock(self, workspace: str, session_id: str, remote: bool = False) -> int:
         with self._lock:
-            self._unlocked.discard((workspace, session_id))
+            try:
+                principal = self._principal_digest(session_id)
+            except (UnicodeError, ValueError):
+                return 0
+            access_class = self._access_class(remote)
+            predicate = lambda record: (
+                record["principal_digest"] == principal
+                and record["workspace"] == workspace
+                and record["access_class"] == access_class
+            )
+            removed = sum(1 for record in self._session_grants if predicate(record))
+            self._session_grants = [
+                record for record in self._session_grants if not predicate(record)
+            ]
+            device_grants = self._load_device_grants()
+            if device_grants is None:
+                self._save_device_grants([])
+                return removed
+            removed += sum(1 for record in device_grants if predicate(record))
+            self._save_device_grants([
+                record for record in device_grants if not predicate(record)
+            ])
+            return removed
+
+    def lock_all(self, session_id: str, remote: bool = False) -> int:
+        with self._lock:
+            try:
+                principal = self._principal_digest(session_id)
+            except (UnicodeError, ValueError):
+                return 0
+            access_class = self._access_class(remote)
+            predicate = lambda record: (
+                record["principal_digest"] == principal
+                and record["access_class"] == access_class
+            )
+            removed = sum(1 for record in self._session_grants if predicate(record))
+            self._session_grants = [
+                record for record in self._session_grants if not predicate(record)
+            ]
+            device_grants = self._load_device_grants()
+            if device_grants is None:
+                self._save_device_grants([])
+                return removed
+            removed += sum(1 for record in device_grants if predicate(record))
+            self._save_device_grants([
+                record for record in device_grants if not predicate(record)
+            ])
+            return removed
+
+    def revoke_workspace(self, workspace: str) -> int:
+        """Revoke every principal and access class for one project name."""
+        with self._lock:
+            predicate = lambda record: record["workspace"] == workspace
+            removed = sum(1 for record in self._session_grants if predicate(record))
+            self._session_grants = [
+                record for record in self._session_grants if not predicate(record)
+            ]
+            device_grants = self._load_device_grants()
+            if device_grants is None:
+                self._save_device_grants([])
+                return removed
+            removed += sum(1 for record in device_grants if predicate(record))
+            self._save_device_grants([
+                record for record in device_grants if not predicate(record)
+            ])
+            return removed

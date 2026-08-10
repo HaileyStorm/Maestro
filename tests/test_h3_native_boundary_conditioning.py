@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import contextlib
+import copy
 import importlib.util
 import json
 import os
@@ -42,13 +45,35 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
 
 
+class _HTTPException(Exception):
+    def __init__(self, *, status_code: int, detail):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+class _AdmissionRequest:
+    def __init__(self, body: dict):
+        self._body = body
+        self.state = types.SimpleNamespace(maestro_remote=False)
+
+    async def json(self) -> dict:
+        return copy.deepcopy(self._body)
+
+
 def _load_functions(path: Path, names: set[str], namespace: dict):
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    nodes = [
-        node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
-        and node.name in names
-    ]
+    nodes = []
+    for node in tree.body:
+        if not (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name in names
+        ):
+            continue
+        node = copy.deepcopy(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.decorator_list = []
+        nodes.append(node)
     module = ast.Module(body=nodes, type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, str(path), "exec"), namespace)
@@ -68,6 +93,109 @@ def _load_nested_function(path: Path, name: str, namespace: dict):
     ast.fix_missing_locations(module)
     exec(compile(module, str(path), "exec"), namespace)
     return namespace[name]
+
+
+def _native_admission_namespace():
+    """Load public/preparation/worker guards with later work forbidden."""
+    events: list[str] = []
+    worker_admissions: list[str] = []
+
+    def forbidden(name: str):
+        def reject(*args, **kwargs):
+            events.append(name)
+            raise AssertionError(f"{name} ran after native-boundary rejection")
+
+        return reject
+
+    failed_preparations: list[dict] = []
+    finished_jobs: list[tuple] = []
+    namespace = {
+        "Request": _AdmissionRequest,
+        "_GenerationPreparationRequest": object,
+        "HTTPException": _HTTPException,
+        "copy": copy,
+        "hashlib": __import__("hashlib"),
+        "os": os,
+        "time": types.SimpleNamespace(time=lambda: 1.0),
+        "traceback": __import__("traceback"),
+        "torch": types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+        ),
+        "wgp": types.SimpleNamespace(get_model_def=lambda model_type: {}),
+        "_H3_LONG_STUDIO_MODELS": {
+            "minimax_h3", "minimax_h3_ref2va",
+        },
+        "_H3_TURBO_BENCHMARK_REFERENCE_BYTES": 0,
+        "_H3_TURBO_BENCHMARK_REFERENCE_SHA256": "",
+        "_get_active_workspace": lambda: "default",
+        "_require_project_access": lambda request, workspace: "/tmp/project",
+        "_reject_client_h3_internal_state": lambda body: None,
+        "_reject_client_h3_turbo_validation_controls": lambda body: None,
+        "_authorize_generation_media_inputs": (
+            lambda request, body, workspace: None
+        ),
+        "_require_remote_visible_models": lambda request, models: None,
+        "_apply_h3_adaptive_checkpoint": lambda body: None,
+        "_normalize_video_prompt_type": lambda body: None,
+        "_normalize_image_prompt_type": lambda body: None,
+        "_jobs": {},
+        "is_cancel_requested": lambda job: False,
+        "update_preparation_job": lambda job, **updates: True,
+        "fail_preparation": (
+            lambda job, **updates: failed_preparations.append(dict(updates))
+        ),
+        "generation_slot": (
+            lambda lock, job, **kwargs: contextlib.nullcontext(True)
+        ),
+        "_gen_lock": object(),
+        "_active_gen_states": {"other-worker": {}},
+        "_stamp_requested_generation_residency": lambda job, **kwargs: None,
+        "try_start": lambda job, **kwargs: (
+            worker_admissions.append(str(job.get("id") or "")) or True
+        ),
+        "_queue_recovery_delivery_pending": lambda job: None,
+        "_require_h3_offload_plan_parity": lambda job: None,
+        "_require_job_model_recipe_terms": lambda job: None,
+        "_apply_per_job_coefficient": lambda job: None,
+        "finish_job": (
+            lambda *args, **kwargs: finished_jobs.append((args, kwargs))
+        ),
+        "_restore_base_coefficient": lambda: None,
+    }
+    for name in (
+        "_validate_h3_sampling_steps",
+        "_validate_h3_explicit_multiclip_request",
+        "_prepare_h3_long_studio_request",
+        "_require_h3_acceleration_available",
+        "_h3_estimate_context",
+        "_h3_generation_requirements",
+        "write_sealed_request_manifest",
+        "complete_preparation",
+        "_start_generation_worker",
+        "_ensure_versioned_model_current",
+        "_ensure_h3_effective_models_current",
+        "register_abort_state",
+    ):
+        namespace[name] = forbidden(name)
+    _load_functions(
+        APP / "launch.py",
+        {
+            "_trusted_h3_prepared_plan",
+            "_require_h3_native_boundary_experimental",
+            "_plan_generation_submission",
+            "preview_generation_plan",
+            "_run_generation_preparation",
+            "_run_generation",
+        },
+        namespace,
+    )
+    return (
+        namespace,
+        events,
+        failed_preparations,
+        finished_jobs,
+        worker_admissions,
+    )
 
 
 def _load_handler():
@@ -442,7 +570,7 @@ class NativeBoundaryPlanningTests(unittest.TestCase):
             wgp_source,
         )
 
-    def test_native_boundary_is_rejected_before_http_or_worker_admission(self):
+    def test_native_boundary_rejects_public_planning_before_work_and_worker_before_model(self):
         helpers = _load_functions(
             APP / "launch.py",
             {
@@ -479,14 +607,14 @@ class NativeBoundaryPlanningTests(unittest.TestCase):
         tree = ast.parse(
             (APP / "launch.py").read_text(encoding="utf-8"),
         )
-        required_callers = {
-            "preview_generation_plan", "generate", "_run_generation",
+        required_guard_callers = {
+            "_plan_generation_submission", "_run_generation",
         }
-        seen = set()
+        seen_guard_callers = set()
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if node.name not in required_callers:
+            if node.name not in required_guard_callers:
                 continue
             if any(
                 isinstance(call, ast.Call)
@@ -494,8 +622,79 @@ class NativeBoundaryPlanningTests(unittest.TestCase):
                 and call.func.id == "_require_h3_native_boundary_experimental"
                 for call in ast.walk(node)
             ):
-                seen.add(node.name)
-        self.assertEqual(seen, required_callers)
+                seen_guard_callers.add(node.name)
+        self.assertEqual(seen_guard_callers, required_guard_callers)
+
+        shared_plan_callers = {
+            "preview_generation_plan", "_run_generation_preparation", "generate",
+        }
+        seen_plan_callers = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name not in shared_plan_callers:
+                continue
+            if any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_plan_generation_submission"
+                for call in ast.walk(node)
+            ):
+                seen_plan_callers.add(node.name)
+        self.assertEqual(seen_plan_callers, shared_plan_callers)
+
+        admission, forbidden_events, failed, finished, worker_admissions = (
+            _native_admission_namespace()
+        )
+        rejected_body = {
+            "workspace": "default",
+            "model_type": "minimax_h3",
+            "prompt": "model-free admission probe",
+            "image_mode": 2,
+            "h3_native_boundary_conditioning": True,
+        }
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(_HTTPException) as preview_error:
+                asyncio.run(admission["preview_generation_plan"](
+                    _AdmissionRequest(rejected_body),
+                ))
+        self.assertEqual(preview_error.exception.status_code, 400)
+        self.assertIn("unavailable", str(preview_error.exception.detail))
+        self.assertEqual(forbidden_events, [])
+        self.assertEqual(worker_admissions, [])
+
+        preparation_job = {
+            "id": "native-preparation",
+            "params": copy.deepcopy(rejected_body),
+            "workspace": "default",
+            "out_dir": "/tmp/project",
+        }
+        admission["_jobs"] = {"native-preparation": preparation_job}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            admission["_run_generation_preparation"](
+                "native-preparation",
+                _AdmissionRequest({}),
+                enhance=False,
+            )
+        self.assertEqual(forbidden_events, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["phase"], "preparation_failed")
+        self.assertEqual(worker_admissions, [])
+
+        worker_job = {
+            "id": "native-worker",
+            "params": copy.deepcopy(rejected_body),
+            "status": "queued",
+            "out_dir": "",
+        }
+        admission["_jobs"] = {"native-worker": worker_job}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(admission["_run_generation"]("native-worker"))
+        self.assertEqual(worker_admissions, ["native-worker"])
+        self.assertEqual(forbidden_events, [])
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0][0][1], "failed")
+        self.assertIn("unavailable", finished[0][1]["error"])
 
         succeeded = helpers["_generation_tasks_succeeded"]
         self.assertTrue(succeeded(

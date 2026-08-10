@@ -191,6 +191,7 @@ api = FastAPI(title="Maestro API", version="1.0.0")
 
 from services.output_access import (
     MIN_PROJECT_PASSWORD_LENGTH,
+    PROJECT_UNLOCK_REMEMBER_POLICIES,
     SESSION_COOKIE_NAME,
     ProjectAccessManager,
     ProjectUnlockRateLimiter,
@@ -211,7 +212,6 @@ _session_secret_lock = threading.Lock()
 _session_secret_value = None
 _output_share_manager_lock = threading.Lock()
 _output_share_manager_value = None
-_project_access = ProjectAccessManager()
 _project_unlock_limiter = ProjectUnlockRateLimiter()
 _services_config_lock = threading.RLock()
 _workspace_creation_lock = threading.RLock()
@@ -235,6 +235,12 @@ def _session_secret():
                     os.path.join(os.getcwd(), ".maestro-session-secret")
                 )
     return _session_secret_value
+
+
+_project_access = ProjectAccessManager(
+    os.path.join(os.getcwd(), "storage", "project-unlock-grants.json"),
+    _session_secret(),
+)
 
 
 def _output_share_manager() -> OutputShareManager:
@@ -353,6 +359,7 @@ def _request_is_cloudflare_remote(request: Request) -> bool:
 
 _REMOTE_LOCAL_ONLY_PREFIXES = (
     "/classic",
+    "/api/v1/local-recovery",
     "/api/v1/research",
     "/api/v1/downloads",
     "/api/v1/storage",
@@ -443,6 +450,27 @@ def _research_local_only_denial(request: Request) -> JSONResponse | None:
         {"detail": "Research controls are available locally only"},
         status_code=403,
     )
+
+
+def _local_recovery_control_denial(
+    request: Request,
+) -> JSONResponse | None:
+    """Require direct loopback plus the server's exact advertised origin.
+
+    This is a host-machine recovery capability, not a browser/session API.
+    Exact project, manifest, and cursor assertions provide the second half of
+    the authority check inside each handler.  Cloudflare markers remain
+    remote even when a tunnel rewrites the peer and Host to loopback.
+    """
+    if (
+        _request_is_cloudflare_remote(request)
+        or not _runtime_share_registration_is_local(request)
+    ):
+        return JSONResponse(
+            {"detail": "Local recovery controls require direct loopback"},
+            status_code=403,
+        )
+    return None
 
 
 def _first_forwarded_value(value: str | None) -> str:
@@ -591,9 +619,15 @@ def _recovery_response_requires_no_store(path: str) -> bool:
     return (
         path == "/api/v1/research"
         or path.startswith("/api/v1/research/")
+        or path == "/api/v1/local-recovery"
+        or path.startswith("/api/v1/local-recovery/")
         or path in {"/api/v1/jobs", "/api/v1/queue"}
         or path.startswith("/api/v1/status/")
         or path.startswith("/api/v1/cancel/")
+        or (
+            path.startswith("/api/v1/projects/")
+            and path.endswith("/reference-authoring")
+        )
         or path.startswith("/api/v1/jobs/")
         or path.startswith("/api/v1/queue/")
         or path.startswith("/api/v1/director/pipeline/")
@@ -641,6 +675,12 @@ async def _maestro_session_middleware(request: Request, call_next):
         "/api/v1/research/"
     ):
         remote_denial = _research_local_only_denial(request)
+        if remote_denial is not None:
+            return _stamp_recovery_no_store_response(request, remote_denial)
+    if request.url.path == "/api/v1/local-recovery" or request.url.path.startswith(
+        "/api/v1/local-recovery/"
+    ):
+        remote_denial = _local_recovery_control_denial(request)
         if remote_denial is not None:
             return _stamp_recovery_no_store_response(request, remote_denial)
     rejected = _reject_cross_origin_mutation(request)
@@ -725,13 +765,20 @@ def _safe_join(base: str, *parts: str) -> str | None:
 
 # --- Generation job tracking ---
 from services.job_lifecycle import (
+    arm_prepared_job_plan_review,
+    approve_prepared_job,
+    block_generation_recovery,
+    block_resource_admission_failure,
+    complete_preparation,
     DurableTransition,
     GENERATED_MEDIA_EXTENSIONS,
     clear_job_residency,
+    checkpoint_recovery_job,
     collect_job_outputs,
     configure_durability_hook,
     durable_queue_state,
     finish_job,
+    fail_preparation,
     generation_slot,
     is_cancel_requested,
     job_events,
@@ -740,11 +787,16 @@ from services.job_lifecycle import (
     queue_position,
     queue_scheduler_snapshot,
     queue_wait_reason,
+    resource_descriptor,
     record_job_outputs,
     residency_configuration_update,
     register_abort_state,
     request_cancel,
     restore_scheduler_state,
+    RESOURCE_EXECUTION_CPU,
+    RESOURCE_EXECUTION_STANDARD,
+    RESOURCE_INTENT_GENERATION,
+    RESOURCE_INTENT_TEXT,
     set_job_hold,
     snapshot_job,
     set_queue_pause_after_current,
@@ -752,13 +804,29 @@ from services.job_lifecycle import (
     stamp_job_residency,
     try_requeue,
     try_start,
+    transition_resource_execution,
     unregister_abort_state,
     update_queue_job,
     update_requested_outputs,
     update_job,
+    update_preparation_job,
     yield_generation_slot_after_output,
 )
+from services.cpu_text_lane import (
+    BreakEvenEstimate,
+    CPUTextLane,
+    HostAdmissionSnapshot,
+    PreemptionGate,
+)
 from services.queue_recovery import QueueRecoveryJournal, QueueRecoveryValidationError
+from services.h3_offload_plan import (
+    H3OffloadPlanError,
+    H3_OFFLOAD_PLAN_PARAM_KEY,
+    assert_h3_offload_plan_parity,
+    public_h3_offload_plan,
+    seal_h3_offload_plan,
+    validate_h3_offload_plan,
+)
 from services.queue_recovery_adapter import (
     QueueRecoveryAdapterError,
     QueueRecoveryCoordinator,
@@ -774,6 +842,7 @@ from services.queue_recovery_runtime import (
     atomic_write_request_manifest,
     cleanup_orphan_request_manifests,
     cleanup_orphan_staged_outputs,
+    discover_request_manifest_pointers,
     ensure_recovery_staging_directory,
     load_request_manifest,
     next_recovery_attempt,
@@ -788,6 +857,7 @@ from services.queue_recovery_runtime import (
     validate_artifact_descriptor,
     validate_manifest_inputs,
     validate_protected_artifact_descriptor,
+    write_sealed_request_manifest,
 )
 
 _queue_recovery_journal = QueueRecoveryJournal(
@@ -832,6 +902,36 @@ _director_preparation_lock = threading.RLock()
 
 class _JobRegistry(dict):
     """Attach browser ownership/access defaults to every HTTP-created job."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._registry_lock = threading.RLock()
+
+    def values(self):
+        """Return a stable value snapshot for concurrent public derivation."""
+        with self._registry_lock:
+            return tuple(super().values())
+
+    def items(self):
+        """Return a stable item snapshot for concurrent workspace checks."""
+        with self._registry_lock:
+            return tuple(super().items())
+
+    def __contains__(self, key):
+        with self._registry_lock:
+            return super().__contains__(key)
+
+    def __getitem__(self, key):
+        with self._registry_lock:
+            return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        with self._registry_lock:
+            return super().get(key, default)
+
+    def pop(self, key, default=None):
+        with self._registry_lock:
+            return super().pop(key, default)
 
     def prepare(self, value):
         """Apply publication policy without making the job observable."""
@@ -897,7 +997,8 @@ class _JobRegistry(dict):
             admission = globals().get("_require_job_workspace_available")
             if callable(admission) and isinstance(value, dict):
                 admission(value)
-            super().__setitem__(key, value)
+            with self._registry_lock:
+                super().__setitem__(key, value)
 
     def __setitem__(self, key, value):
         self.publish_prepared(key, self.prepare(value))
@@ -912,6 +1013,16 @@ def _stamp_job_origin(job: dict) -> dict:
     return job
 _gen_lock = threading.Lock()
 _active_gen_states: dict = {}  # job_id -> wgp gen state dict (for abort signaling)
+_cpu_text_lane = CPUTextLane()
+_cpu_text_preemption_gate = PreemptionGate(
+    maximum_restarts=1,
+    cooldown_seconds=60.0,
+)
+_CPU_TEXT_OPERATIONS = frozenset({
+    "prompt_enhancement",
+    "generation_preparation",
+    "reference_planning",
+})
 
 # Opt-in model repositories can publish newer compatible checkpoints. The
 # updater writes only to Maestro's primary checkpoint root, preserves linked
@@ -1517,6 +1628,14 @@ def _queue_recovery_register_and_publish(
     thread_name: str | None = None,
 ) -> threading.Thread:
     """Durably register one Studio job before publication or thread start."""
+    # Internal/direct callers share this pre-publication gate with HTTP
+    # submissions. It runs before registry, manifest, thread, or network work.
+    _require_job_model_recipe_terms(job)
+    if (
+        recovery_kind != "studio_generation_preparation"
+        and job.get("status") == "queued"
+    ):
+        _seal_h3_offload_plan_for_job(job.get("params"), job=job)
     prepared = _jobs.prepare(_stamp_job_origin(job))
     prepared_params = prepared.get("params")
     if isinstance(prepared_params, dict):
@@ -1550,7 +1669,8 @@ def _queue_recovery_register_and_publish(
             params=prepared.get("params") or {},
             inputs=_queue_recovery_input_descriptors(prepared, owner_digest),
         )
-        _stamp_requested_generation_residency(prepared)
+        if prepared.get("status") == "queued":
+            _stamp_requested_generation_residency(prepared)
         try:
             _queue_recovery_with_bounded_compaction(
                 lambda: _queue_recovery_coordinator.register_job(
@@ -1599,27 +1719,175 @@ def _queue_recovery_register_and_publish(
     return thread
 
 
+def _project_reference_publication_recovery_requested(job: dict) -> bool:
+    unit = job.get("recovery_unit")
+    return bool(
+        job.get("kind") == "studio_project_asset_preparation"
+        and isinstance(unit, dict)
+        and unit.get("kind") == "project_reference_publication"
+    )
+
+
+def _project_reference_validate_committed_variant(
+    store,
+    project_id,
+    workspace_id,
+    variant,
+    *,
+    job_id,
+    candidate_index,
+    candidate_count,
+    plan_seal,
+    mandatory_review,
+):
+    """Validate one live/restart replay against the same sealed contract."""
+    metadata = variant.get("metadata") if isinstance(variant, dict) else None
+    reference = (
+        metadata.get("reference_pack") if isinstance(metadata, dict) else None
+    )
+    job_metadata = metadata.get("job") if isinstance(metadata, dict) else None
+    variant_outputs = variant.get("outputs") if isinstance(variant, dict) else None
+    if (
+        not isinstance(variant, dict)
+        or variant.get("variant_type") != "reference_pack"
+        or not isinstance(reference, dict)
+        or reference.get("plan_seal") != plan_seal
+        or (mandatory_review and reference.get("review_status") != "pass")
+        or not isinstance(job_metadata, dict)
+        or job_metadata.get("id") != job_id
+        or job_metadata.get("candidate_index") != candidate_index
+        or job_metadata.get("candidate_count") != candidate_count
+        or not isinstance(variant_outputs, list)
+        or not variant_outputs
+    ):
+        raise ValueError("committed publication metadata changed")
+    try:
+        _project_reference_private_authored_snapshot(variant)
+    except Exception:
+        raise ValueError("committed publication metadata changed") from None
+    outputs = []
+    for output in variant_outputs:
+        relative = output.get("relative_path") if isinstance(output, dict) else None
+        if not isinstance(relative, str):
+            raise ValueError("committed publication output changed")
+        resolved = store.resolve_output_path(
+            project_id, workspace_id, relative,
+        )
+        if os.path.islink(resolved) or not os.path.isfile(resolved):
+            raise ValueError("committed publication output changed")
+        outputs.append(relative)
+    return outputs
+
+
+def _recover_project_reference_publication(job_id: str) -> None:
+    """Finalize one manifest-committed Reference job without generation."""
+    job = _jobs.get(job_id)
+    if not isinstance(job, dict) or not try_start(
+        job,
+        message="Reconciling committed reference packs",
+        phase="publication_recovery",
+    ):
+        return
+    unit = job.get("recovery_unit")
+    failed_message = "Reference-pack publication recovery failed"
+    try:
+        if not isinstance(unit, dict):
+            raise ValueError("invalid publication recovery unit")
+        asset_id = unit.get("asset_id")
+        workspace_id = unit.get("workspace_id")
+        variant_ids = unit.get("variant_ids")
+        candidate_count = unit.get("candidate_count")
+        plan_seal = unit.get("plan_seal")
+        mandatory_review = unit.get("mandatory_review")
+        if (
+            not isinstance(asset_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", asset_id) is None
+            or workspace_id != "main"
+            or not isinstance(variant_ids, list)
+            or isinstance(candidate_count, bool)
+            or not isinstance(candidate_count, int)
+            or not 1 <= candidate_count <= 8
+            or len(variant_ids) != candidate_count
+            or variant_ids != [
+                f"{job_id}_pack_{index}" for index in range(1, candidate_count + 1)
+            ]
+            or not isinstance(plan_seal, str)
+            or re.fullmatch(r"[0-9a-f]{64}", plan_seal) is None
+            or type(mandatory_review) is not bool
+        ):
+            raise ValueError("invalid publication recovery unit")
+        store = _project_asset_store()
+        project_id = str(job.get("workspace") or "")
+        asset = store.get_asset(project_id, workspace_id, asset_id)
+        by_id = {
+            item.get("id"): item for item in asset.get("variants") or []
+            if isinstance(item, dict)
+        }
+        outputs = []
+        for index, variant_id in enumerate(variant_ids, 1):
+            variant = by_id.get(variant_id)
+            outputs.extend(_project_reference_validate_committed_variant(
+                store,
+                project_id,
+                workspace_id,
+                variant,
+                job_id=job_id,
+                candidate_index=index,
+                candidate_count=candidate_count,
+                plan_seal=plan_seal,
+                mandatory_review=mandatory_review,
+            ))
+        finish_job(
+            job,
+            "completed",
+            progress=100,
+            step=int(job.get("total_steps") or 0),
+            total_steps=int(job.get("total_steps") or 0),
+            phase="",
+            message="Reference packs ready",
+            output_files=outputs,
+            error=None,
+            recovery_state="terminal",
+            reruns_denoise=False,
+        )
+    except Exception:
+        finish_job(
+            job,
+            "failed",
+            progress=0,
+            phase="",
+            message=failed_message,
+            error=failed_message,
+            recovery_state="terminal",
+            reruns_denoise=False,
+        )
+
+
 def _queue_recovery_worker(job: dict):
     """Resolve only restart-safe top-level workers; never guess a prep path."""
     kind = str(job.get("kind") or "studio_generation")
+    if kind == "studio_generation_preparation":
+        return None
     if kind == "studio_blend":
         return globals().get("_run_blend_generation")
     if kind == "studio_outpaint_preparation":
         return globals().get("_prepare_and_run_outpaint")
-    if kind in {"studio_project_asset_preparation", "studio_repaint_preparation", "studio_recast_preparation"}:
+    if kind == "studio_project_asset_preparation":
+        publication_recovery = globals().get(
+            "_project_reference_publication_recovery_requested"
+        )
+        if callable(publication_recovery) and publication_recovery(job):
+            return globals().get("_recover_project_reference_publication")
+        return None
+    if kind in {"studio_repaint_preparation", "studio_recast_preparation"}:
         return None
     return _run_generation
 
 
-def _queue_recovery_checkpoint(job: dict, **updates) -> None:
+def _queue_recovery_checkpoint(job: dict, **updates) -> bool:
     """Persist an allowlisted recovery transition before mutating the job."""
     with _queue_recovery_checkpoint_lock:
-        candidate = dict(job)
-        candidate.update(updates)
-        _queue_recovery_durable_transition(DurableTransition(
-            name="recovery_checkpoint", jobs=(candidate,),
-        ))
-        job.update(updates)
+        return checkpoint_recovery_job(job, **updates)
 
 
 def _director_recovery_parent_job_id(pid: str) -> str:
@@ -2041,6 +2309,13 @@ def _director_recovery_submit_child(
                 raise QueueRecoveryRuntimeError(
                     "Director child recovery authorization failed."
                 )
+            if _queue_recovery_delivery_pending(existing) is None:
+                try:
+                    _require_job_model_recipe_terms(existing)
+                except HTTPException as error:
+                    raise QueueRecoveryRuntimeError(
+                        "Director child model terms acceptance is required."
+                    ) from error
             existing["session_id"] = session_id
             existing["access_policy"] = dict(job.get("access_policy") or {})
             _queue_recovery_checkpoint(
@@ -2781,36 +3056,85 @@ def _queue_recovery_materialize_job(
         "_recovery_project_digest": expected_project,
         "_recovery_manifest_pointer": dict(snapshot.get("request_manifest") or {}),
     })
+    snapshot_cursor = snapshot.get("recovery_cursor")
+    snapshot_units = (
+        snapshot_cursor.get("completed_units")
+        if isinstance(snapshot_cursor, dict) else None
+    )
+    had_h3_segment_evidence = any(
+        isinstance(unit, dict) and unit.get("kind") == "h3_segment"
+        for unit in (snapshot_units if isinstance(snapshot_units, list) else [])
+    )
+    publication_recovery = globals().get(
+        "_project_reference_publication_recovery_requested"
+    )
+    project_reference_finalization = bool(
+        callable(publication_recovery) and publication_recovery(snapshot)
+    )
     current = projects.get(workspace)
     blocked_reason = "Recovery project is missing or was recreated"
     blocked_code = "project_missing_or_recreated"
     manifest = None
     if current is not None and hmac.compare_digest(current[1], expected_project):
         runtime["out_dir"] = current[0]
-        try:
-            manifest = load_request_manifest(
-                current[0],
-                snapshot.get("request_manifest") or {},
-                expected_job_id=job_id,
-            )
-            validate_manifest_inputs(
-                manifest,
-                lambda descriptor: _queue_recovery_manifest_validator(
-                    dict(descriptor),
-                    owner_digest=owner_digest,
-                    workspace=workspace,
-                    project_dir=current[0],
-                ),
-            )
-            runtime["params"] = dict(manifest["params"])
-            _queue_recovery_reconcile_cursor(runtime, current[0])
+        if project_reference_finalization:
+            # Completion-only recovery is authorized entirely by the sealed,
+            # content-free recovery unit and committed asset manifest. It must
+            # never reload private request inputs or rerun generation.
             blocked_reason = ""
             blocked_code = ""
-        except QueueRecoveryRuntimeError:
-            blocked_reason = "Recovery request or input validation failed"
-            blocked_code = "input_missing_or_changed"
+        else:
+            try:
+                manifest = load_request_manifest(
+                    current[0],
+                    snapshot.get("request_manifest") or {},
+                    expected_job_id=job_id,
+                )
+                validate_manifest_inputs(
+                    manifest,
+                    lambda descriptor: _queue_recovery_manifest_validator(
+                        dict(descriptor),
+                        owner_digest=owner_digest,
+                        workspace=workspace,
+                        project_dir=current[0],
+                    ),
+                )
+                runtime["params"] = dict(manifest["params"])
+                if (
+                    str(runtime["params"].get("model_type") or "").startswith(
+                        "minimax_h3"
+                    )
+                    and runtime["params"].get(H3_OFFLOAD_PLAN_PARAM_KEY) is None
+                    and runtime.get("h3_offload_plan") is None
+                ):
+                    # Only startup materialization can attest that an otherwise
+                    # valid durable record predates the v1 plan contract. Fresh
+                    # and direct jobs never receive this process-local marker.
+                    runtime["_h3_offload_legacy_recovery"] = True
+                _require_h3_offload_plan_parity(runtime)
+                _queue_recovery_reconcile_cursor(runtime, current[0])
+                blocked_reason = ""
+                blocked_code = ""
+            except QueueRecoveryRuntimeError:
+                blocked_reason = "Recovery request or input validation failed"
+                blocked_code = "input_missing_or_changed"
 
     status = str(snapshot.get("status") or "queued").casefold()
+    if snapshot.get("resource_intent") in {"text", "generation"}:
+        # A process-local CPU lease and runtime tokens never survive restart.
+        # Preserve the attempt counter for stale-result fences, but reacquire
+        # every resource from a conservative standard/released-or-queued state.
+        runtime.update({
+            "resource_execution": "standard",
+            "preemption_mode": "none",
+            "resource_state": (
+                "released"
+                if status in {"completed", "failed", "cancelled", "canceled"}
+                or bool(snapshot.get("cancel_requested"))
+                else "queued"
+            ),
+        })
+    remote = bool(snapshot.get("source_remote", False))
     if status in {"cancelled", "canceled"} or snapshot.get("cancel_requested"):
         runtime.update({
             "status": "cancelled",
@@ -2819,16 +3143,115 @@ def _queue_recovery_materialize_job(
             "message": "Cancelled",
         })
         return runtime, False
+    if status == "failed" and not blocked_reason:
+        # Older journals did not persist safe OOM details.  A fully verified
+        # contiguous H3 prefix plus exactly one missing final segment may be
+        # exposed for explicit owner recovery, but is never auto-started.
+        if _h3_incomplete_recovery_prefix(runtime) is not None:
+            if remote:
+                runtime.update({
+                    "status": "queued",
+                    "queue_held": True,
+                    "recovery_state": "blocked_remote_reauth",
+                    "reruns_denoise": False,
+                    "_recovery_reason_code": (
+                        "owner_reauthentication_required"
+                    ),
+                    "message": (
+                        "Owner reauthentication is required to resume"
+                    ),
+                    "error": None,
+                })
+                return runtime, False
+            runtime.update({
+                "status": "queued",
+                "queue_held": True,
+                "recovery_state": "blocked",
+                "reruns_denoise": False,
+                "_recovery_reason_code": (
+                    "h3_generation_recovery_authorization_required"
+                ),
+                "message": "Calibrated H3 recovery authorization is required",
+                "error": None,
+            })
+            return runtime, False
     if status in {"completed", "failed"}:
         runtime["status"] = status
         runtime["recovery_state"] = "terminal"
         return runtime, False
 
-    attempt, may_retry = next_recovery_attempt(snapshot)
-    runtime["recovery_attempt"] = attempt
+    try:
+        prior_attempt = max(
+            0, int(snapshot.get("recovery_attempt", 0) or 0),
+        )
+    except (TypeError, ValueError):
+        prior_attempt = 0
+    if status == "waiting_for_plan_approval":
+        runtime["recovery_attempt"] = prior_attempt
+        if blocked_reason:
+            runtime.update({
+                "status": "failed",
+                "plan_review_required": False,
+                "plan_review_deadline": None,
+                "recovery_state": "terminal",
+                "message": "Prepared generation state could not be restored",
+                "error": "Prepared generation state could not be restored",
+            })
+        else:
+            deadline = runtime.get("plan_review_deadline")
+            terms_required = bool(
+                runtime.get("plan_review_terms_required", False)
+            )
+            if terms_required:
+                deadline = None
+            elif (
+                type(deadline) not in {int, float}
+                or not math.isfinite(deadline)
+                or deadline <= 0
+            ):
+                deadline = time.time() + _PLAN_REVIEW_TIMEOUT_SECONDS
+            runtime.update({
+                "status": "waiting_for_plan_approval",
+                "plan_review_required": True,
+                "plan_review_terms_required": terms_required,
+                "plan_review_deadline": (
+                    None if terms_required else float(deadline)
+                ),
+                "queue_held": False,
+                "recovery_state": "restored",
+                "reruns_denoise": False,
+                "message": (
+                    "Approval required to accept Ref2VA terms"
+                    if terms_required else "Review the generation plan"
+                ),
+                "phase": (
+                    "awaiting_plan_terms"
+                    if terms_required else "awaiting_plan_approval"
+                ),
+            })
+        return runtime, False
+
+    if status == "preparing":
+        # Content-authoring inference cannot be guessed or bypassed after a
+        # process interruption. Terminalize rather than generate the original
+        # request or increment a denoise recovery attempt.
+        runtime.update({
+            "status": "failed",
+            "plan_review_required": False,
+            "recovery_attempt": prior_attempt,
+            "recovery_state": "terminal",
+            "reruns_denoise": False,
+            "message": "Prompt enhancement was interrupted",
+            "error": "Prompt enhancement was interrupted",
+            "resource_execution": "standard",
+            "preemption_mode": "none",
+            "resource_state": "released",
+        })
+        return runtime, False
+
+    runtime["recovery_attempt"] = prior_attempt
     runtime["status"] = "queued"
     runtime["_recovery_original_held"] = bool(snapshot.get("queue_held", False))
-    remote = bool(snapshot.get("source_remote", False))
     if _queue_recovery_worker(runtime) is None:
         runtime.update({
             "_recovery_reason_code": "preparation_must_resubmit",
@@ -2838,17 +3261,15 @@ def _queue_recovery_materialize_job(
             "message": "This interrupted preparation must be resubmitted",
         })
         return runtime, False
-    if blocked_reason or not may_retry:
+    if blocked_reason:
         runtime.update({
-            "_recovery_reason_code": (
-                blocked_code if blocked_reason else "attempt_limit_reached"
-            ),
+            "_recovery_reason_code": blocked_code,
             "queue_held": True,
             "recovery_state": "blocked",
-            "message": blocked_reason or "Automatic recovery attempt limit reached",
+            "message": blocked_reason,
         })
         return runtime, False
-    if remote:
+    if remote and not project_reference_finalization:
         runtime.update({
             "_recovery_reason_code": "owner_reauthentication_required",
             "queue_held": True,
@@ -2856,9 +3277,97 @@ def _queue_recovery_materialize_job(
             "message": "Owner reauthentication is required to resume",
         })
         return runtime, False
+    if project_reference_finalization:
+        runtime.update({
+            "_recovery_reason_code": "",
+            "queue_held": False,
+            "recovery_state": "publication_prepared",
+            "reruns_denoise": False,
+            "message": "Reconciling committed reference packs",
+        })
+        return runtime, True
+    held_h3_prefix = (
+        _h3_incomplete_recovery_prefix(runtime)
+        if snapshot.get("queue_held", False) else None
+    )
+    if held_h3_prefix is not None:
+        # A held, dependency-closed H3 prefix is a recovery authorization
+        # state, not an ordinary manual queue hold. Generic restoration used
+        # to erase this reason, leaving exact local prepare permanently
+        # unreachable after restart. Preserve only reviewed H3 reasons; an
+        # empty/legacy reason regains explicit owner authorization and never
+        # consumes an automatic attempt or calibration decision.
+        h3_reason = str(runtime.get("_recovery_reason_code") or "")
+        if h3_reason not in {
+            "h3_generation_recovery_authorization_required",
+            "h3_peak_calibration_required",
+            "h3_generation_oom_replanned",
+        }:
+            h3_reason = "h3_generation_recovery_authorization_required"
+        runtime.update({
+            "_recovery_reason_code": h3_reason,
+            "queue_held": True,
+            "recovery_state": "blocked",
+            "reruns_denoise": h3_reason == "h3_generation_oom_replanned",
+            "message": {
+                "h3_generation_recovery_authorization_required": (
+                    "Calibrated H3 recovery authorization is required"
+                ),
+                "h3_peak_calibration_required": (
+                    "Calibrated H3 recovery capacity is required"
+                ),
+                "h3_generation_oom_replanned": (
+                    "Calibrated H3 replacement plan is ready"
+                ),
+            }[h3_reason],
+        })
+        return runtime, False
+    recovery_cursor = runtime.get("recovery_cursor")
+    completed_units = (
+        recovery_cursor.get("completed_units")
+        if isinstance(recovery_cursor, dict) else None
+    )
+    if snapshot.get("queue_held", False) and (
+        had_h3_segment_evidence or any(
+            isinstance(unit, dict) and unit.get("kind") == "h3_segment"
+            for unit in (
+                completed_units if isinstance(completed_units, list) else []
+            )
+        )
+    ):
+        # Segment evidence that is not the exact dependency-closed prefix is
+        # neither an ordinary manual hold nor safe automatic work.
+        runtime.update({
+            "_recovery_reason_code": "input_missing_or_changed",
+            "queue_held": True,
+            "recovery_state": "blocked",
+            "reruns_denoise": False,
+            "message": "H3 recovery prefix validation failed",
+        })
+        return runtime, False
+    if snapshot.get("queue_held", False):
+        runtime.update({
+            "_recovery_reason_code": "",
+            "queue_held": True,
+            "recovery_state": "restored",
+            "reruns_denoise": status == "running",
+            "message": str(snapshot.get("message") or "Queued"),
+        })
+        return runtime, False
+    attempt, may_retry = next_recovery_attempt(snapshot)
+    if not may_retry:
+        runtime.update({
+            "_recovery_reason_code": "attempt_limit_reached",
+            "queue_held": True,
+            "recovery_state": "blocked",
+            "recovery_attempt": prior_attempt,
+            "message": "Automatic recovery attempt limit reached",
+        })
+        return runtime, False
+    runtime["recovery_attempt"] = attempt
     runtime.update({
         "_recovery_reason_code": "",
-        "queue_held": bool(snapshot.get("queue_held", False)),
+        "queue_held": False,
         "recovery_state": "interrupted" if status == "running" else "restored",
         "reruns_denoise": status == "running",
         "message": (
@@ -2866,7 +3375,7 @@ def _queue_recovery_materialize_job(
             if status == "running" else str(snapshot.get("message") or "Queued")
         ),
     })
-    return runtime, not runtime["queue_held"]
+    return runtime, True
 
 
 def _director_recovery_restore_parent(
@@ -3229,7 +3738,12 @@ def _restore_queue_recovery_on_startup() -> None:
             continue
         job, auto_resume = _queue_recovery_materialize_job(snapshot, projects)
         # Persist running->interrupted/blocked conversion before publication.
-        if job.get("status") not in {"completed", "failed", "cancelled"}:
+        if (
+            job.get("status") not in {"completed", "failed", "cancelled"}
+            or str(snapshot.get("status") or "").casefold() in {
+                "preparing", "waiting_for_plan_approval",
+            }
+        ):
             _queue_recovery_checkpoint(
                 job,
                 status=job.get("status"),
@@ -3241,7 +3755,8 @@ def _restore_queue_recovery_on_startup() -> None:
             )
         if job.get("out_dir"):
             try:
-                _stamp_requested_generation_residency(job, replace=True)
+                if job.get("status") == "queued":
+                    _stamp_requested_generation_residency(job, replace=True)
             except Exception:
                 job["queue_held"] = True
                 job["recovery_state"] = "blocked"
@@ -3293,18 +3808,121 @@ def _restore_queue_recovery_on_startup() -> None:
             live_manifests.setdefault(
                 snapshot_workspace, [],
             ).append(path)
+    # Runtime materialization can intentionally promote a failed incomplete
+    # H3 chain into an owner-held recovery job and can swap to a sealed
+    # calibrated plan. Retain the current pointer plus its bounded provenance
+    # chain rather than deriving liveness solely from the stale startup map.
+    for candidate in list(_jobs.values()):
+        if str(candidate.get("status") or "").casefold() in terminal_statuses:
+            continue
+        candidate_workspace = str(candidate.get("workspace") or "default")
+        candidate_id = candidate.get("id")
+        if isinstance(candidate_id, str):
+            live_staging_jobs.setdefault(candidate_workspace, []).append(
+                candidate_id
+            )
+        pointers = [candidate.get("_recovery_manifest_pointer")]
+        cursor = candidate.get("recovery_cursor")
+        if isinstance(cursor, dict):
+            history = cursor.get("request_manifest_history")
+            if isinstance(history, list):
+                pointers.extend(history)
+        for pointer in pointers:
+            path = pointer.get("path") if isinstance(pointer, dict) else None
+            if isinstance(path, str):
+                live_manifests.setdefault(candidate_workspace, []).append(path)
+    # A host-local recovery may outlive an independently retired generic
+    # journal snapshot. Preserve only cryptographically valid manifests whose
+    # project sidecars reconstruct an exact incomplete H3 prefix; they remain
+    # private and held until the offline helper supplies exact digests.
+    preserve_local_candidates = globals().get(
+        "_preserve_local_h3_recovery_evidence"
+    )
+    recovery_cleanup_blocked: set[str] = set()
+    if callable(preserve_local_candidates):
+        for workspace, (project_dir, _project_digest) in projects.items():
+            if not preserve_local_candidates(
+                workspace,
+                project_dir,
+                live_manifests,
+                live_staging_jobs,
+            ):
+                # Discovery uncertainty must never become deletion authority.
+                # Preserve every private artifact and retry on a later start.
+                recovery_cleanup_blocked.add(workspace)
+                continue
     for workspace, (project_dir, _project_digest) in projects.items():
+        if workspace in recovery_cleanup_blocked:
+            continue
         cleanup_orphan_request_manifests(
             project_dir, live_manifests.get(workspace, ()),
         )
         cleanup_orphan_staged_outputs(
             project_dir, live_staging_jobs.get(workspace, ()),
         )
+    asset_store_factory = globals().get("_project_asset_store")
+    if callable(asset_store_factory):
+        try:
+            asset_store_factory().cleanup_unreferenced_media()
+        except Exception:
+            # Uncertain manifests fail closed: preserve media and allow a later
+            # startup to retry without exposing paths in recovery/public state.
+            pass
     _queue_recovery_workers_started = True
+    # Host terms are global. Reconcile all restored, project-fenced frozen
+    # plans before installing timers so a browser need not revisit each
+    # workspace after restart. The common timer loop below installs exactly
+    # one process-local timer per durable deadline.
+    accepted_terms = globals().get("_ref2va_host_terms_accepted")
+    if callable(accepted_terms) and accepted_terms():
+        try:
+            _reconcile_ref2va_waiting_plan_reviews(schedule_timers=False)
+        except Exception:
+            # One failed durable arm must not prevent the common timer loop
+            # from restoring every already-armed plan. The failed candidate
+            # remains terms-blocked and a later idempotent acceptance can heal
+            # it without extending any committed deadline.
+            pass
+    # Arm plan timers only after orphan cleanup has consumed the startup
+    # snapshot. An already-expired timer may atomically replace its manifest.
+    for job in restored_jobs:
+        if (
+            job.get("status") == "waiting_for_plan_approval"
+            and not job.get("plan_review_terms_required", False)
+        ):
+            try:
+                _schedule_plan_review_auto_approval(job)
+            except Exception:
+                fail_preparation(
+                    job,
+                    error="Automatic plan approval could not be restored",
+                    message="Automatic plan approval could not be restored",
+                    phase="preparation_failed",
+                )
     from services.director_pipeline import start_restored_pipeline
     for pid in director_resumable:
         start_restored_pipeline(pid)
     for job in resumable:
+        publication_recovery = globals().get(
+            "_project_reference_publication_recovery_requested"
+        )
+        project_reference_finalization = bool(
+            callable(publication_recovery) and publication_recovery(job)
+        )
+        if _queue_recovery_delivery_pending(job) is None:
+            if not project_reference_finalization:
+                try:
+                    _require_job_model_recipe_terms(job)
+                except HTTPException:
+                    job["_recovery_reason_code"] = "model_terms_required"
+                    _queue_recovery_checkpoint(
+                        job,
+                        queue_held=True,
+                        recovery_state="blocked",
+                        reruns_denoise=True,
+                        message="Model terms acceptance is required",
+                    )
+                    continue
         worker = _queue_recovery_worker(job)
         if worker is None:
             job["_recovery_reason_code"] = "preparation_must_resubmit"
@@ -4252,13 +4870,626 @@ def _h3_segment_recovery_settings(clip_info: dict) -> dict:
         raise QueueRecoveryRuntimeError(
             "H3 segment tail trim does not match its publication geometry."
         )
-    return {
+    result = {
         "discard_prefix_frames": discard,
         "generated_frames": generated,
         "native_boundary_conditioning": native,
         "published_frames": published,
         "trim_tail_frames": tail,
     }
+    peak_identity = clip_info.get("peak_recovery_identity")
+    if isinstance(peak_identity, dict):
+        # This identity is versioned and present only on newly replanned
+        # units. Legacy sealed prefix units retain their original unit IDs.
+        result["peak_recovery_identity"] = copy.deepcopy(peak_identity)
+    if clip_info.get("semantic_physical_contract_version") == 1:
+        execution_slice = clip_info.get("execution_slice")
+        try:
+            execution = {
+                "version": 1,
+                "semantic_shot_index": int(
+                    clip_info.get("semantic_shot_index")
+                ),
+                "physical_segment_index": int(
+                    clip_info.get("physical_segment_index")
+                ),
+                "physical_segment_count": int(
+                    clip_info.get("physical_segment_count")
+                ),
+                "predecessor_segment_index": (
+                    int(clip_info.get("predecessor_segment_index"))
+                    if clip_info.get("predecessor_segment_index") is not None
+                    else None
+                ),
+                "execution_cursor_frame": int(
+                    clip_info.get("execution_cursor_frame")
+                ),
+                "start_frame": int(execution_slice.get("start_frame")),
+                "end_frame_exclusive": int(
+                    execution_slice.get("end_frame_exclusive")
+                ),
+            }
+        except (AttributeError, TypeError, ValueError):
+            raise QueueRecoveryRuntimeError(
+                "H3 semantic execution recovery metadata is invalid."
+            ) from None
+        if (
+            execution["physical_segment_index"] < 0
+            or execution["physical_segment_count"] < 1
+            or execution["physical_segment_index"]
+                >= execution["physical_segment_count"]
+            or execution["execution_cursor_frame"] != execution["start_frame"]
+            or execution["end_frame_exclusive"] - execution["start_frame"]
+                != published
+        ):
+            raise QueueRecoveryRuntimeError(
+                "H3 semantic execution recovery geometry is invalid."
+            )
+        result["semantic_execution"] = execution
+    return result
+
+
+def _h3_execution_shots_for_dispatch(
+    longform: dict,
+    prompt_lines: list[str],
+    clip_count: int,
+) -> list[dict] | None:
+    """Validate and return the semantic-to-physical child contract."""
+    shot_plan = longform.get("shot_plan") if isinstance(longform, dict) else None
+    if not isinstance(shot_plan, dict) or shot_plan.get(
+        "semantic_physical_contract_version"
+    ) != 1:
+        return None
+    shots = shot_plan.get("shots")
+    semantic = shot_plan.get("semantic_shots")
+    if (
+        not isinstance(shots, list) or len(shots) != clip_count
+        or not isinstance(semantic, list) or not semantic
+        or len(prompt_lines) != clip_count
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 semantic execution slice count is invalid."
+        )
+    partition = []
+    for contract in semantic:
+        if not isinstance(contract, dict):
+            raise QueueRecoveryRuntimeError(
+                "H3 semantic execution contract is invalid."
+            )
+        indices = contract.get("segment_indices")
+        slices = contract.get("execution_slices")
+        if (
+            not isinstance(indices, list) or not isinstance(slices, list)
+            or len(indices) != len(slices) or not indices
+            or contract.get("prompt_rewrite_for_physical_split") is not False
+        ):
+            raise QueueRecoveryRuntimeError(
+                "H3 semantic execution contract is invalid."
+            )
+        cursor = 0
+        semantic_prompt = str(contract.get("semantic_prompt"))
+        for physical_index, (segment_index, execution_slice) in enumerate(
+            zip(indices, slices)
+        ):
+            try:
+                segment_index = int(segment_index)
+                valid = (
+                    isinstance(execution_slice, dict)
+                    and int(execution_slice.get("segment_index")) == segment_index
+                    and int(execution_slice.get("physical_segment_index"))
+                        == physical_index
+                    and int(execution_slice.get("start_frame")) == cursor
+                    and int(execution_slice.get("end_frame_exclusive")) > cursor
+                    and prompt_lines[segment_index] == semantic_prompt
+                )
+                cursor = int(execution_slice.get("end_frame_exclusive"))
+            except (IndexError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise QueueRecoveryRuntimeError(
+                    "H3 semantic execution slice is invalid."
+                )
+            partition.append(segment_index)
+    if sorted(partition) != list(range(clip_count)) or len(set(partition)) != clip_count:
+        raise QueueRecoveryRuntimeError(
+            "H3 semantic execution slices do not partition the children."
+        )
+    for index, shot in enumerate(shots):
+        if not isinstance(shot, dict):
+            raise QueueRecoveryRuntimeError(
+                "H3 physical execution child is invalid."
+            )
+        predecessor = shots[index - 1] if index else None
+        try:
+            valid = (
+                int(shot.get("index")) == index
+                and str(shot.get("prompt")) == prompt_lines[index]
+                and int(shot.get("execution_cursor_frame"))
+                    == int((shot.get("execution_slice") or {}).get("start_frame"))
+                and (
+                    shot.get("predecessor_segment_index") is None
+                    if index == 0 else int(shot.get("predecessor_segment_index"))
+                        == index - 1
+                )
+                and (
+                    shot.get("predecessor_physical_segment_id") is None
+                    if predecessor is None else str(
+                        shot.get("predecessor_physical_segment_id")
+                    ) == str(predecessor.get("physical_segment_id"))
+                )
+            )
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise QueueRecoveryRuntimeError(
+                "H3 physical execution predecessor contract is invalid."
+            )
+    return [copy.deepcopy(shot) for shot in shots]
+
+
+def _h3_incomplete_recovery_prefix(job: dict) -> int | None:
+    """Return the exact sealed prefix length for one unfinished H3 chain."""
+    params = job.get("params")
+    params = params if isinstance(params, dict) else {}
+    longform = params.get("_h3_longform")
+    if not isinstance(longform, dict):
+        return None
+    try:
+        clip_count = int(longform.get("clip_count") or 0)
+        requested_outputs = int(job.get("requested_outputs") or 1)
+    except (TypeError, ValueError):
+        return None
+    if clip_count < 2 or requested_outputs != 1:
+        return None
+    units = _queue_recovery_units(job)
+    if any(unit.get("kind") in {"h3_concat", "h3_delivery"} for unit in units):
+        return None
+    indices = set()
+    try:
+        for unit in units:
+            if (
+                unit.get("kind") == "h3_segment"
+                and int(unit.get("variant", 0) or 0) == 0
+            ):
+                indices.add(int(unit.get("index", -1)))
+    except (TypeError, ValueError):
+        return None
+    prefix = 0
+    while prefix in indices:
+        prefix += 1
+    if indices != set(range(prefix)) or prefix != clip_count - 1:
+        return None
+    return prefix
+
+
+def _replan_h3_final_segment_for_peak(
+    params: dict,
+    *,
+    completed_prefix: int,
+    choice: dict,
+) -> dict:
+    """Replace only the missing final semantic segment using the H3 planner."""
+    from services.h3_shot_planner import (
+        infer_h3_profile_id,
+        plan_h3_clip_frames,
+        plan_h3_native_shots,
+    )
+    from shared.utils.prompt_parser import classify_timeline_clip_boundaries
+
+    result = copy.deepcopy(params)
+    longform = result.get("_h3_longform")
+    if not isinstance(longform, dict):
+        raise QueueRecoveryRuntimeError("H3 recovery plan is unavailable.")
+    clip_frames = list(longform.get("clip_frames") or [])
+    published = list(longform.get("clip_published_frames") or [])
+    trims = list(longform.get("clip_trim_tail_frames") or [])
+    prompts = list(result.get("per_clip_prompts") or [])
+    models = list(longform.get("segment_models") or [])
+    boundaries = list(longform.get("clip_boundaries") or [])
+    if not (
+        len(clip_frames) == len(published) == len(trims) == len(prompts)
+        == len(models) == completed_prefix + 1
+    ):
+        raise QueueRecoveryRuntimeError("H3 recovery plan geometry is incomplete.")
+    final_model = str((models[-1] or {}).get("model_type") or "") \
+        if isinstance(models[-1], dict) else ""
+    if final_model != _H3_REF2VA_MODEL:
+        raise QueueRecoveryRuntimeError(
+            "Only a final Ref2VA segment can use calibrated peak recovery."
+        )
+    try:
+        target_published = int(published[-1])
+        ceiling = int(choice["frame_ceiling"])
+        profile = int(choice["offload_profile"])
+        fps = float(longform.get("fps") or 24)
+    except (TypeError, ValueError, KeyError):
+        raise QueueRecoveryRuntimeError("H3 peak calibration is invalid.") from None
+    if ceiling < 1 or target_published < 1:
+        raise QueueRecoveryRuntimeError("H3 peak calibration is invalid.")
+    final_prompt = str(prompts[-1])
+    model_def = wgp.get_model_def(final_model) or {}
+    minimum, _step, _latent = wgp.get_model_min_frames_and_step(final_model)
+    if target_published <= ceiling:
+        replacement_frames = [int(clip_frames[-1])]
+        replacement_published = [target_published]
+        replacement_trims = [int(trims[-1])]
+        replacement_prompts = [final_prompt]
+        replacement_boundaries = []
+        segment_policy = {"calibrated_single_segment": True}
+        shot_plan = {}
+    else:
+        replacement_frames, segment_policy = plan_h3_clip_frames(
+            target_published,
+            prompt=final_prompt,
+            fps=fps,
+            minimum_frames=minimum,
+            maximum_frames=ceiling,
+            align_frame_count=lambda value: wgp.align_model_frame_count(
+                value, model_def,
+            ),
+            profile_id=infer_h3_profile_id(result),
+            manual_segment_ceiling=True,
+            published_total_frames=target_published,
+        )
+        requested = list(
+            segment_policy.get("clip_requested_frames") or replacement_frames
+        )
+        if "clip_requested_frames" not in segment_policy:
+            requested[-1] -= sum(replacement_frames) - target_published
+        replacement_boundaries = classify_timeline_clip_boundaries(
+            final_prompt,
+            clip_frame_counts=requested,
+            fps=fps,
+        )
+        shot_plan = plan_h3_native_shots(
+            global_prompt=final_prompt,
+            clip_frame_counts=replacement_frames,
+            fps=fps,
+            clip_boundaries=replacement_boundaries,
+            clip_requested_frames=requested,
+            segment_frames_maximum=ceiling,
+            segment_policy=segment_policy,
+        )
+        replacement_prompts = list(shot_plan["clip_prompts"])
+        replacement_published = list(shot_plan["clip_published_frames"])
+        replacement_trims = list(shot_plan["clip_trim_tail_frames"])
+    if sum(replacement_published) != target_published:
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery would change the published frame total."
+        )
+    old_boundary = boundaries[completed_prefix - 1] \
+        if completed_prefix > 0 and len(boundaries) >= completed_prefix else None
+    full_boundaries = boundaries[:max(0, completed_prefix - 1)]
+    if old_boundary is not None:
+        full_boundaries.append(old_boundary)
+    full_boundaries.extend(replacement_boundaries)
+    full_frames = clip_frames[:completed_prefix] + list(replacement_frames)
+    full_published = published[:completed_prefix] + list(replacement_published)
+    full_trims = trims[:completed_prefix] + list(replacement_trims)
+    full_prompts = prompts[:completed_prefix] + replacement_prompts
+    full_models = models[:completed_prefix] + [
+        copy.deepcopy(models[-1]) for _ in replacement_frames
+    ]
+    original_shot_plan = longform.get("shot_plan")
+    original_shots = (
+        list(original_shot_plan.get("shots") or [])
+        if isinstance(original_shot_plan, dict) else []
+    )
+    original_semantic = (
+        list(original_shot_plan.get("semantic_shots") or [])
+        if isinstance(original_shot_plan, dict) else []
+    )
+    original_has_semantic_contract = bool(
+        original_shot_plan.get("semantic_physical_contract_version") == 1
+        if isinstance(original_shot_plan, dict) else False
+    )
+    if original_has_semantic_contract:
+        if (
+            len(original_shots) != completed_prefix + 1
+            or not original_semantic
+        ):
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery semantic source contract is incomplete."
+            )
+        source_prompts = [
+            str(contract.get("semantic_prompt"))
+            for contract in original_semantic
+        ]
+        final_source_index = int(original_shots[-1].get("source_index"))
+        source_indices = [
+            int(shot.get("source_index"))
+            for shot in original_shots[:completed_prefix]
+        ] + [final_source_index] * len(replacement_frames)
+        structured_shots = copy.deepcopy(original_semantic)
+        for contract in structured_shots:
+            if isinstance(contract, dict):
+                contract["shot_id"] = str(
+                    contract.get("authored_shot_id") or ""
+                )
+    else:
+        # Legacy plans predate the semantic/physical contract but their
+        # per-clip prompts are already sealed worker inputs. Treat each
+        # completed child as its own immutable source and fan only the final
+        # source across its replacement geometry. Falling back to the global
+        # prompt here rewrites every prefix and makes valid legacy recovery
+        # impossible.
+        source_prompts = [str(prompt) for prompt in prompts]
+        source_indices = list(range(completed_prefix)) + [
+            completed_prefix
+        ] * len(replacement_frames)
+        structured_shots = None
+    full_shot_plan = plan_h3_native_shots(
+        global_prompt=str(longform.get("global_prompt") or ""),
+        clip_frame_counts=full_frames,
+        fps=fps,
+        clip_boundaries=full_boundaries,
+        clip_requested_frames=full_published,
+        segment_frames_maximum=ceiling,
+        segment_policy={
+            "reason": "calibrated final-segment recovery",
+            "clip_requested_frames": full_published,
+        },
+        source_prompts=source_prompts,
+        source_indices=source_indices,
+        structured_shots=structured_shots,
+    )
+    if original_semantic:
+        original_by_source = {
+            int(contract.get("source_index")): contract
+            for contract in original_semantic
+            if isinstance(contract, dict)
+        }
+        rebuilt_contracts = []
+        for rebuilt in list(full_shot_plan.get("semantic_shots") or []):
+            try:
+                source_index = int(rebuilt.get("source_index"))
+                original_contract = original_by_source[source_index]
+            except (AttributeError, KeyError, TypeError, ValueError):
+                raise QueueRecoveryRuntimeError(
+                    "H3 recovery semantic source association changed."
+                ) from None
+            if str(rebuilt.get("semantic_prompt")) != str(
+                original_contract.get("semantic_prompt")
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "H3 recovery changed a sealed semantic prompt."
+                )
+            # Geometry is newly planned; authored metadata remains the exact
+            # sealed semantic contract, including reference associations.
+            preserved = copy.deepcopy(original_contract)
+            for field in (
+                "segment_indices", "execution_slices",
+                "prompt_rewrite_for_physical_split",
+            ):
+                preserved[field] = copy.deepcopy(rebuilt.get(field))
+            rebuilt_contracts.append(preserved)
+        if len(rebuilt_contracts) != len(original_semantic):
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery semantic source count changed."
+            )
+        full_shot_plan["source_contracts"] = copy.deepcopy(rebuilt_contracts)
+        full_shot_plan["semantic_shots"] = copy.deepcopy(rebuilt_contracts)
+
+        original_dialogue = original_shot_plan.get("dialogue_manifest")
+        if not isinstance(original_dialogue, list) or any(
+            not isinstance(item, dict) for item in original_dialogue
+        ):
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery dialogue manifest is invalid."
+            )
+        full_shot_plan["dialogue_manifest"] = copy.deepcopy(original_dialogue)
+        for shot in full_shot_plan.get("shots") or []:
+            shot["dialogue_manifest_indices"] = []
+        for manifest_index, item in enumerate(original_dialogue):
+            try:
+                segment_index = int(item.get("segment_index"))
+                full_shot_plan["shots"][segment_index][
+                    "dialogue_manifest_indices"
+                ].append(manifest_index)
+            except (IndexError, TypeError, ValueError):
+                raise QueueRecoveryRuntimeError(
+                    "H3 recovery dialogue association is invalid."
+                ) from None
+    if (
+        list(full_shot_plan.get("clip_prompts") or []) != full_prompts
+        or list(full_shot_plan.get("clip_published_frames") or [])
+            != full_published
+        or list(full_shot_plan.get("clip_trim_tail_frames") or []) != full_trims
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery changed the sealed semantic shot contract."
+        )
+    if original_has_semantic_contract and original_shots and any(
+        str(full_shot_plan["shots"][index].get("authored_shot_id"))
+            != str(original_shots[index].get("authored_shot_id"))
+        or int(full_shot_plan["shots"][index].get("source_index"))
+            != int(original_shots[index].get("source_index"))
+        for index in range(completed_prefix)
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery changed a sealed authored-shot association."
+        )
+    existing_peak_identities = longform.get("peak_recovery_identities")
+    if existing_peak_identities is None:
+        peak_identities = [None] * completed_prefix
+    elif (
+        isinstance(existing_peak_identities, list)
+        and len(existing_peak_identities) == len(clip_frames)
+        and all(
+            item is None or isinstance(item, dict)
+            for item in existing_peak_identities
+        )
+    ):
+        # Repeated calibrated recovery must retain the exact allocation
+        # snapshot already bound into every newly completed prefix unit.
+        peak_identities = copy.deepcopy(
+            existing_peak_identities[:completed_prefix]
+        )
+    else:
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery peak identity history is invalid."
+        )
+    for frames in replacement_frames:
+        peak_identity = _h3_peak_recovery_identity(
+            {**result, "model_type": final_model, "override_profile": profile},
+            frame_count=frames,
+        )
+        peak_identity.update({
+            "allocation_revision": int(choice["allocation_revision"]),
+            "allocation_snapshot": str(choice["allocation_snapshot"]),
+        })
+        peak_identities.append(peak_identity)
+    result.update({
+        "override_profile": profile,
+        "sliding_window_size": ceiling,
+        "per_clip_frames": full_frames,
+        "per_clip_prompts": full_prompts,
+        "prompt": _MULTI_CLIP_SEPARATOR.join(full_prompts),
+    })
+    longform.update({
+        "clip_count": len(full_frames),
+        "clip_frames": full_frames,
+        "clip_published_frames": full_published,
+        "clip_trim_tail_frames": full_trims,
+        "clip_prompt_previews": [value[:240] for value in full_prompts],
+        "clip_boundaries": full_boundaries,
+        "segment_models": full_models,
+        "planned_frames": sum(full_frames),
+        "final_trim_frames": sum(full_trims),
+        "segment_frames_maximum": ceiling,
+        "manual_segment_ceiling": True,
+        "peak_recovery_identities": peak_identities,
+        "shot_plan": full_shot_plan,
+        "peak_recovery_policy": {
+            "version": _H3_PEAK_RECOVERY_POLICY_VERSION,
+            "frame_ceiling": ceiling,
+            "offload_profile": profile,
+        },
+        "recovery_shot_plan": shot_plan,
+        "recovery_segment_policy": segment_policy,
+    })
+    if sum(full_published) != int(longform.get("published_frames") or 0):
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery changed the job publication contract."
+        )
+    result["_h3_longform"] = longform
+    return result
+
+
+def _prepare_h3_peak_recovery(job: dict) -> bool:
+    """Reseal a calibrated replacement plan; never queue or start work."""
+    prefix = _h3_incomplete_recovery_prefix(job)
+    if prefix is None:
+        raise QueueRecoveryRuntimeError("H3 recovery cursor is incomplete.")
+    source_params = job.get("params") or {}
+    longform = source_params.get("_h3_longform") \
+        if isinstance(source_params, dict) else None
+    try:
+        missing_frames = int((longform.get("clip_frames") or [])[prefix])
+        missing_model = str(
+            ((longform.get("segment_models") or [])[prefix] or {}).get(
+                "model_type"
+            )
+        )
+    except (AttributeError, IndexError, TypeError, ValueError):
+        raise QueueRecoveryRuntimeError("H3 recovery geometry is incomplete.") from None
+    calibration_params = {
+        **source_params,
+        "model_type": missing_model,
+        "video_length": missing_frames,
+    }
+    choice = _h3_calibrated_peak_choice(calibration_params)
+    if choice is None:
+        job["_recovery_reason_code"] = "h3_peak_calibration_required"
+        _queue_recovery_checkpoint(
+            job,
+            status="queued",
+            queue_held=True,
+            recovery_state="blocked",
+            reruns_denoise=False,
+            message="Calibrated H3 recovery capacity is required",
+        )
+        return False
+    project_dir = str(job.get("out_dir") or "")
+    manifest = load_request_manifest(
+        project_dir,
+        job.get("_recovery_manifest_pointer") or {},
+        expected_job_id=str(job.get("id") or ""),
+    )
+    manifest_params = dict(manifest["params"])
+    prior_effective_profile = _h3_effective_offload_profile(manifest_params)
+    prior_offload_plan = manifest_params.get(H3_OFFLOAD_PLAN_PARAM_KEY)
+    if prior_offload_plan is not None:
+        try:
+            prior_offload_plan = validate_h3_offload_plan(
+                prior_offload_plan
+            )
+        except H3OffloadPlanError as error:
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery offload plan is invalid."
+            ) from error
+    replanned = _replan_h3_final_segment_for_peak(
+        manifest_params, completed_prefix=prefix, choice=choice,
+    )
+    replanned_count = len(
+        dict(replanned.get("_h3_longform") or {}).get("clip_frames") or []
+    )
+    recovered_profile = int(choice["offload_profile"])
+    segment_profiles = []
+    for index in range(replanned_count):
+        if (
+            index < prefix
+            and isinstance(prior_offload_plan, dict)
+            and index < len(prior_offload_plan.get("segments") or [])
+        ):
+            segment_profiles.append(int(
+                prior_offload_plan["segments"][index]["profile"]
+            ))
+        elif index < prefix:
+            # A pre-v1 journal has no per-segment plan. Preserve its exact
+            # prior effective/manual profile rather than claiming completed
+            # work ran under the newly selected recovery profile.
+            segment_profiles.append(prior_effective_profile)
+        else:
+            segment_profiles.append(recovered_profile)
+    offload_plan = _seal_h3_offload_plan_for_job(
+        replanned,
+        source="recovery_profile",
+        replace=True,
+        segment_profiles=segment_profiles,
+    )
+    pointer = write_sealed_request_manifest(
+        project_dir,
+        job_id=str(job.get("id") or ""),
+        params=replanned,
+        inputs=list(manifest.get("inputs") or []),
+    )
+    cursor = copy.deepcopy(job.get("recovery_cursor") or {})
+    history = list(cursor.get("request_manifest_history") or [])
+    prior_pointer = dict(job.get("_recovery_manifest_pointer") or {})
+    if prior_pointer and prior_pointer not in history:
+        history.append(prior_pointer)
+    cursor["request_manifest_history"] = history[-8:]
+    try:
+        committed = block_generation_recovery(
+            job,
+            request_manifest=pointer,
+            params=replanned,
+            kind="studio_generation",
+            recovery_cursor=cursor,
+            h3_offload_plan=offload_plan,
+            _recovery_manifest_pointer=dict(pointer),
+            _recovery_reason_code="h3_generation_oom_replanned",
+            recovery_state="blocked",
+            reruns_denoise=True,
+            message="Calibrated H3 replacement plan is ready",
+        )
+    except Exception:
+        remove_request_manifest(project_dir, pointer)
+        raise
+    if not committed:
+        remove_request_manifest(project_dir, pointer)
+    return committed
 
 
 def _h3_source_audio_premux_settings(params: dict) -> dict | None:
@@ -4307,6 +5538,74 @@ def _snapshot_h3_recovery_task_params(
             "H3 task metadata snapshot is invalid."
         )
     return snapshot
+
+
+def _apply_h3_offload_plan_to_manifest(
+    manifest: list[dict], plan: dict | None,
+) -> None:
+    """Bind every H3 child dispatch to its sealed effective profile."""
+    if plan is None:
+        return
+    try:
+        sealed = validate_h3_offload_plan(plan)
+    except H3OffloadPlanError as error:
+        raise QueueRecoveryRuntimeError(
+            "H3 child offload plan is invalid."
+        ) from error
+    segments = sealed["segments"]
+    seen: set[int] = set()
+    for task in manifest:
+        task_params = task.get("params") if isinstance(task, dict) else None
+        if not isinstance(task_params, dict) or not str(
+            task_params.get("model_type") or ""
+        ).startswith("minimax_h3"):
+            continue
+        clip_info = task_params.get("multi_clip_info")
+        if (
+            isinstance(clip_info, dict)
+            and clip_info.get("automatic_h3_longform")
+        ):
+            raw_index = clip_info.get("index")
+        elif len(manifest) == 1 and len(segments) == 1:
+            raw_index = 0
+        else:
+            raise QueueRecoveryRuntimeError(
+                "H3 child offload segment identity is incomplete."
+            )
+        if isinstance(raw_index, bool):
+            raise QueueRecoveryRuntimeError(
+                "H3 child offload segment index is invalid."
+            )
+        try:
+            segment_index = int(raw_index)
+        except (TypeError, ValueError):
+            raise QueueRecoveryRuntimeError(
+                "H3 child offload segment index is invalid."
+            ) from None
+        if not 0 <= segment_index < len(segments):
+            raise QueueRecoveryRuntimeError(
+                "H3 child offload segment index is invalid."
+            )
+        segment = segments[segment_index]
+        try:
+            matches = (
+                str(task_params.get("model_type") or "")
+                    == str(segment["model_type"])
+                and int(task_params.get("video_length") or 0)
+                    == int(segment["generated_frames"])
+            )
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            raise QueueRecoveryRuntimeError(
+                "H3 child dispatch changed after offload planning."
+            )
+        task_params["override_profile"] = int(segment["profile"])
+        seen.add(segment_index)
+    if seen != set(range(len(segments))):
+        raise QueueRecoveryRuntimeError(
+            "H3 child offload plan was not dispatched completely."
+        )
 
 
 def _merge_h3_ref2va_keyframes(
@@ -4514,6 +5813,120 @@ def _queue_recovery_reconcile_orphan_delivery(
     return None
 
 
+def _queue_recovery_reseal_delivery_source(
+    job: dict,
+    project_dir: str,
+    unit: dict,
+    artifact: dict,
+    file_name: str,
+) -> dict | None:
+    """Reseal one sanctioned private-native sidecar without changing media."""
+    unit_id = str(unit.get("unit_id") or "")
+    kind = str(unit.get("kind") or "")
+    variant = unit.get("variant", 0)
+    index = unit.get("index", 0)
+    dependencies = unit.get("dependencies")
+    raw_settings = unit.get("settings")
+    settings = {} if raw_settings is None else raw_settings
+    if (
+        type(variant) is not int
+        or variant < 0
+        or type(index) is not int
+        or index < 0
+        or not isinstance(dependencies, list)
+        or not isinstance(settings, dict)
+    ):
+        return None
+    try:
+        expected_unit_id = recovery_unit_id(
+            str(job.get("id") or ""),
+            kind,
+            variant=variant,
+            index=index,
+            dependencies=dependencies,
+            settings=settings,
+        )
+    except (TypeError, ValueError, QueueRecoveryRuntimeError):
+        return None
+    sidecar_name = artifact.get("sidecar_basename")
+    if (
+        artifact.get("producer_unit_id") != unit_id
+        or not hmac.compare_digest(unit_id, expected_unit_id)
+        or artifact.get("basename") != file_name
+        or not isinstance(sidecar_name, str)
+        or os.path.basename(sidecar_name) != sidecar_name
+        or sidecar_name.startswith(".")
+    ):
+        return None
+    try:
+        refreshed = _recovery_artifact_descriptor(
+            project_dir,
+            basename=file_name,
+            sidecar_basename=sidecar_name,
+            producer_unit_id=unit_id,
+        )
+        if (
+            refreshed.get("size") != artifact.get("size")
+            or refreshed.get("sha256") != artifact.get("sha256")
+        ):
+            return None
+        sidecar_path = os.path.join(project_dir, sidecar_name)
+        with open(sidecar_path, "rb") as handle:
+            sidecar_bytes = handle.read()
+        if (
+            len(sidecar_bytes) != refreshed.get("sidecar_size")
+            or not hmac.compare_digest(
+                hashlib.sha256(sidecar_bytes).hexdigest(),
+                str(refreshed.get("sidecar_sha256") or ""),
+            )
+        ):
+            return None
+        meta = json.loads(sidecar_bytes.decode("utf-8"))
+    except (
+        OSError, UnicodeDecodeError, ValueError, TypeError,
+        QueueRecoveryRuntimeError,
+    ):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    raw_meta_dependencies = meta.get("producer_unit_dependencies")
+    meta_dependencies = (
+        [] if raw_meta_dependencies is None else raw_meta_dependencies
+    )
+    raw_meta_settings = meta.get("producer_unit_settings")
+    meta_settings = {} if raw_meta_settings is None else raw_meta_settings
+    if not isinstance(meta_dependencies, list) or not isinstance(meta_settings, dict):
+        return None
+    expected_role = _queue_recovery_expected_artifact_role(kind, meta)
+    producer_variant = meta.get("producer_unit_variant", 0)
+    producer_index = meta.get("producer_unit_index", 0)
+    if type(producer_variant) is not int or type(producer_index) is not int:
+        return None
+    if (
+        expected_role is None
+        or meta.get("producer_unit_id") != unit_id
+        or str(meta.get("producer_unit_kind") or "") != kind
+        or producer_variant != variant
+        or producer_index != index
+        or meta.get("producer_artifact_class") != expected_role
+        or meta.get("artifact_class") != "temporary"
+        or meta.get("delivery_native_source") is not True
+        or meta.get("private") is not True
+        or str(meta.get("owner_session_id") or "")
+            != str(job.get("session_id") or "")
+        or str(meta.get("workspace") or "")
+            != str(job.get("workspace") or "default")
+        or str(meta.get("job_id") or "") != str(job.get("id") or "")
+        or str(meta.get("output_filename") or "") != file_name
+        or meta.get("producer_media_size") != refreshed.get("size")
+        or meta.get("producer_media_sha256") != refreshed.get("sha256")
+        or meta_dependencies != dependencies
+        or meta_settings != settings
+    ):
+        return None
+    return refreshed
+
+
 def _queue_recovery_delivery_plan(
     job: dict,
     project_dir: str,
@@ -4533,17 +5946,46 @@ def _queue_recovery_delivery_plan(
             if unit.get("state") != "completed":
                 continue
             for artifact in unit.get("artifacts") or []:
-                if (
+                if not (
                     isinstance(artifact, dict)
                     and artifact.get("basename") == file_name
-                    and validate_artifact_descriptor(
-                        project_dir,
-                        artifact,
-                        producer_unit_id=str(unit.get("unit_id") or ""),
-                    )
                 ):
-                    matching = (unit, artifact)
-                    break
+                    continue
+                unit_id = str(unit.get("unit_id") or "")
+                source_unit = unit
+                source_artifact = artifact
+                if not validate_artifact_descriptor(
+                    project_dir,
+                    source_artifact,
+                    producer_unit_id=unit_id,
+                ):
+                    # H3 delivery intentionally restamps the final native as an
+                    # owner-private temporary before this plan is built. That
+                    # sanctioned policy/role change invalidates only the safe
+                    # unit's sidecar digest. Reseal only the exact recognized
+                    # private-native policy evolution; never rewrite evidence or
+                    # accept changed media under the producer's old unit ID.
+                    reseal_source = globals().get(
+                        "_queue_recovery_reseal_delivery_source"
+                    )
+                    refreshed = (
+                        reseal_source(
+                            job, project_dir, unit, artifact, file_name,
+                        )
+                        if callable(reseal_source) else None
+                    )
+                    if (
+                        not isinstance(refreshed, dict)
+                        or not validate_artifact_descriptor(
+                            project_dir,
+                            refreshed,
+                            producer_unit_id=unit_id,
+                        )
+                    ):
+                        continue
+                    source_artifact = refreshed
+                matching = (source_unit, source_artifact)
+                break
             if matching is not None:
                 break
         if matching is None:
@@ -4742,14 +6184,29 @@ def _queue_recovery_checkpoint_delivery_completed(
     return unit
 
 
-def _require_project_access(request: Request, workspace: str) -> str:
+def _require_project_access(
+    request: Request,
+    workspace: str,
+    *,
+    existing_only: bool = False,
+) -> str:
     """Return the contained workspace dir or reject a locked project."""
     remote = bool(getattr(request.state, "maestro_remote", False))
+    if remote and workspace == "default":
+        raise HTTPException(status_code=404, detail="Project not found")
     workspace_dir = (
-        _existing_workspace_dir(workspace) if remote else _workspace_dir(workspace)
+        _existing_workspace_dir(workspace)
+        if remote or existing_only else _workspace_dir(workspace)
     )
-    status = _project_access.status(
+    access_method = (
+        _project_access.authorize
+        if str(getattr(request, "method", "GET") or "GET").upper()
+        in _STATE_CHANGING_METHODS
+        else _project_access.status
+    )
+    status = access_method(
         workspace, workspace_dir, request.state.maestro_session_id,
+        remote,
     )
     if remote and not status.protected:
         raise HTTPException(
@@ -4769,6 +6226,8 @@ def _request_project_workspace(request: Request, workspace: str | None) -> str:
             status_code=400,
             detail="workspace is required for remote project access",
         )
+    if bool(getattr(request.state, "maestro_remote", False)) and selected == "default":
+        raise HTTPException(status_code=404, detail="Project not found")
     return selected or _get_active_workspace()
 
 
@@ -5054,6 +6513,21 @@ def _check_model_downloaded(model_type: str) -> bool:
         model_def = wgp.get_model_def(model_type)
         if model_def is None:
             return False
+        manual_required = getattr(
+            wgp, "manual_checkpoint_integrity_required", None,
+        )
+        manual_ready = getattr(
+            wgp, "manual_checkpoint_integrity_ready", None,
+        )
+        if callable(manual_required) and manual_required(
+            model_type,
+            model_def,
+            wgp.models_def,
+        ) and (
+            not callable(manual_ready)
+            or not manual_ready(model_type, model_def, wgp.models_def)
+        ):
+            return False
         groups = _model_weight_groups(model_type)
         if not groups:
             return False
@@ -5147,10 +6621,115 @@ def _require_remote_visible_job_models(job: dict) -> None:
         raise HTTPException(status_code=404, detail="Model not found")
 
 
+def _job_model_term_ids(job: dict) -> list[str]:
+    """Project registered model IDs only; never inspect request content."""
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    requested = []
+
+    def add(value) -> None:
+        model_type = str(value or "").strip()
+        if model_type and model_type not in requested:
+            requested.append(model_type)
+
+    for value in (
+        job.get("model_type"), params.get("model_type"),
+        params.get("video_model"), params.get("image_model"),
+        params.get("editor_model_type"),
+    ):
+        add(value)
+    reference_pack = params.get("reference_pack")
+    if isinstance(reference_pack, dict):
+        for key in (
+            "generation_model", "editor_model", "model_type",
+            "editor_model_type",
+        ):
+            add(reference_pack.get(key))
+        review = reference_pack.get("review")
+        if isinstance(review, dict):
+            add(review.get("resolved_model"))
+        operation_routing = reference_pack.get("operation_routing")
+        if isinstance(operation_routing, dict):
+            operations = operation_routing.get("operations")
+            if isinstance(operations, dict):
+                for route in operations.values():
+                    if isinstance(route, dict):
+                        add(route.get("resolved_model"))
+        elif isinstance(operation_routing, (list, tuple)):
+            for route in operation_routing:
+                if isinstance(route, dict):
+                    add(route.get("resolved_model"))
+    longform = params.get("_h3_longform")
+    if isinstance(longform, dict):
+        for segment in longform.get("segment_models") or ():
+            add(segment.get("model_type") if isinstance(segment, dict) else segment)
+    return requested
+
+
+def _require_model_recipe_terms(model_types) -> None:
+    """Fail closed on exact server recipe metadata, never generation data."""
+    from services.model_terms import (
+        ModelTermsContractError,
+        ModelTermsRequiredError,
+        require_model_terms,
+    )
+
+    services = wgp.server_config.get("services", {})
+    for model_type in model_types or ():
+        try:
+            require_model_terms(services, model_type, wgp.models_def)
+        except (ModelTermsContractError, ModelTermsRequiredError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _require_job_model_recipe_terms(job: dict) -> None:
+    _require_model_recipe_terms(_job_model_term_ids(job))
+
+
+class ModelDownloadUnavailableError(RuntimeError):
+    """Raised before generic download work for manual-only recipes."""
+
+
+def _public_model_availability(
+    model_type: str,
+    model_def: dict | None,
+    model_defs=None,
+) -> dict:
+    """Project explicit recursive recipe policy into the public catalog."""
+    from services.model_terms import model_availability_policy
+
+    definitions = model_defs if isinstance(model_defs, dict) else {
+        model_type: model_def if isinstance(model_def, dict) else {},
+    }
+    return model_availability_policy(model_type, definitions)
+
+
+def _require_model_download_available(
+    model_type: str,
+    model_def: dict,
+    model_defs=None,
+) -> None:
+    """Reject manual-only recipes without updater, network, or thread work."""
+    if not isinstance(model_def, dict) or (
+        _public_model_availability(
+            model_type,
+            model_def,
+            model_defs,
+        )["downloadable"] is not True
+    ):
+        raise ModelDownloadUnavailableError(
+            f"Model recipe '{model_type}' requires manual installation."
+        )
+
+
 @api.get("/api/v1/models")
 def list_models(request: Request):
     """List available model families and model types."""
     from services.director_model_compat import assess_director_model
+    from services.model_terms import (
+        model_availability_policy,
+        model_terms_manifest_valid,
+        model_terms_statuses,
+    )
 
     remote_visible = _remote_visible_model_ids(request)
 
@@ -5161,6 +6740,10 @@ def list_models(request: Request):
             continue
         md = wgp.get_model_def(mt)
         if md is None:
+            continue
+        # Exact creator-term recipes remain absent from every catalog until
+        # their immutable public source and enforced term graph agree.
+        if not model_terms_manifest_valid(mt, wgp.models_def):
             continue
         _versioned_model_updater.apply_recorded(mt, md)
         _versioned_model_updater.apply_recorded_components(mt, md)
@@ -5182,6 +6765,18 @@ def list_models(request: Request):
                 family=family,
                 architecture=architecture,
             )
+        model_terms = model_terms_statuses({}, mt, wgp.models_def)
+        manual_verification_required = False
+        manual_required = getattr(
+            wgp, "manual_checkpoint_integrity_required", None,
+        )
+        manual_ready = getattr(
+            wgp, "manual_checkpoint_integrity_ready", None,
+        )
+        if callable(manual_required):
+            manual_verification_required = bool(
+                manual_required(mt, md, wgp.models_def)
+            )
         models.append({
             "model_type": mt,
             "name": md.get("name", mt),
@@ -5199,14 +6794,60 @@ def list_models(request: Request):
             "supports_audio_input": bool(md.get("any_audio_prompt", False)),
             "generates_audio": bool(md.get("returns_audio", False)),
             "supports_ref_images": bool(md.get("image_ref_choices")),
+            "image_outputs": bool(md.get("image_outputs", False)),
             "director": director,
             "is_downloaded": _check_model_downloaded(mt),
+            **model_availability_policy(mt, wgp.models_def),
+            "supported_operations": [
+                operation
+                for operation in (
+                    (md.get("capability_recipe") or {}).get("operations", [])
+                    if isinstance(md.get("capability_recipe"), dict) else []
+                )
+                if isinstance(operation, str)
+            ],
+            "automatic_routing": md.get("automatic_routing") is True,
+            "verified": md.get("verified") is True,
+            "default_for_operations": [
+                operation for operation in md.get("default_for_operations", [])
+                if isinstance(operation, str)
+            ] if isinstance(md.get("default_for_operations"), list) else [],
+            "revenue_eligible": (
+                md.get("revenue_eligible")
+                if type(md.get("revenue_eligible")) is bool else None
+            ),
+            "fine_tuning_eligible": (
+                md.get("fine_tuning_eligible")
+                if type(md.get("fine_tuning_eligible")) is bool else None
+            ),
+            "derivative_tooling": (
+                md.get("derivative_tooling")
+                if type(md.get("derivative_tooling")) is bool else None
+            ),
+            "manual_checkpoint_verification_required": manual_verification_required,
+            "manual_checkpoint_verified": (
+                bool(manual_ready(mt, md, wgp.models_def))
+                if manual_verification_required and callable(manual_ready)
+                else False
+            ),
             # Upstream descriptive metadata retained for catalog compatibility.
             # It does not gate visibility, execution, or publication.
             "nsfw_only": bool(md.get("nsfw_only", False)),
             "update_status": str(_versioned_model_update_status.get(mt, {}).get("status") or (
                 "versioned" if isinstance(md.get("model_update"), dict) else "pinned"
             )),
+            # Static server-owned recipe/license metadata. Acceptance remains
+            # available only through the project-authorized host-terms route.
+            "required_host_terms": [
+                {
+                    key: requirement[key]
+                    for key in (
+                        "term", "version", "title", "license_url",
+                        "review_mode", "notice",
+                    )
+                }
+                for requirement in model_terms
+            ],
         })
 
     visible_families = {model["family"] for model in models}
@@ -5408,13 +7049,65 @@ _model_downloads: dict = {}
 _model_downloads_lock = threading.Lock()
 
 
+@api.post("/api/v1/models/{model_type}/verify-manual-checkpoint")
+def verify_manual_checkpoint(model_type: str, request: Request):
+    """Explicitly hash one registered manual artifact on the local host."""
+    if (
+        _request_is_cloudflare_remote(request)
+        or not _runtime_share_registration_is_local(request)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Manual checkpoint verification is available locally only",
+        )
+    model_def = wgp.get_model_def(model_type)
+    if not isinstance(model_def, dict):
+        raise HTTPException(status_code=404, detail="Model not found")
+    _require_model_recipe_terms([model_type])
+    availability = _public_model_availability(
+        model_type, model_def, wgp.models_def,
+    )
+    if (
+        availability["downloadable"] is not False
+        or availability["manual_installation_ready"] is not True
+        or not wgp.manual_checkpoint_integrity_required(
+            model_type, model_def, wgp.models_def,
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This model has no supported manual verification contract",
+        )
+    try:
+        wgp.verify_manual_checkpoint_integrity(
+            model_type, model_def, wgp.models_def,
+        )
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Manual checkpoint verification failed. Confirm the exact "
+                "published filename, byte size, and SHA-256."
+            ),
+        ) from error
+    return {
+        "status": "verified",
+        "model_type": model_type,
+        "manual_checkpoint_verified": True,
+        "is_downloaded": _check_model_downloaded(model_type),
+    }
+
+
 def _download_model_files(model_type: str):
     """Resolve and fetch every file load_models() would download.
 
     Mirrors the file-resolution block at the top of wgp.load_models()
     (wgp.py:4041-4143) — keep the two in sync.
     """
+    # Recheck in the worker before updater metadata or weight network access.
+    _require_model_recipe_terms([model_type])
     model_def = wgp.get_model_def(model_type)
+    _require_model_download_available(model_type, model_def, wgp.models_def)
     update_result = _ensure_versioned_model_current(model_type, force=True)
     quantization = wgp.transformer_quantization
     dtype_policy = wgp.transformer_dtype_policy
@@ -5476,18 +7169,8 @@ def _download_model_files(model_type: str):
 
 
 @api.post("/api/v1/models/{model_type}/download")
-def download_model(model_type: str, request: Request):
+def download_model(model_type: str, request: Request, workspace: str = ""):
     """Start downloading a model's files in the background."""
-    _require_remote_visible_models(request, [model_type])
-    md = wgp.get_model_def(model_type)
-    if not md:
-        return JSONResponse({"error": "Model not found"}, status_code=404)
-    with _model_downloads_lock:
-        entry = _model_downloads.get(model_type)
-        if entry and entry["status"] == "downloading":
-            return {"status": "downloading", "model_type": model_type}
-        _model_downloads[model_type] = {"status": "downloading", "error": None, "started": time.time()}
-
     def _worker():
         try:
             _download_model_files(model_type)
@@ -5498,7 +7181,26 @@ def download_model(model_type: str, request: Request):
             _model_downloads[model_type] = {"status": "failed", "error": str(e), "started": _model_downloads[model_type]["started"]}
             print(f"[Models] Pre-download FAILED for {model_type}: {e}")
 
-    threading.Thread(target=_worker, daemon=True, name=f"model-dl-{model_type}").start()
+    selected = _request_project_workspace(request, workspace)
+    with _workspace_lifecycle_lock:
+        _require_host_terms_project_access(request, selected)
+        _require_remote_visible_models(request, [model_type])
+        md = wgp.get_model_def(model_type)
+        if not md:
+            return JSONResponse({"error": "Model not found"}, status_code=404)
+        # Authority and exact host acceptance precede registry mutation,
+        # thread creation, updater checks, or any weight network activity.
+        _require_model_recipe_terms([model_type])
+        try:
+            _require_model_download_available(model_type, md, wgp.models_def)
+        except ModelDownloadUnavailableError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        with _model_downloads_lock:
+            entry = _model_downloads.get(model_type)
+            if entry and entry["status"] == "downloading":
+                return {"status": "downloading", "model_type": model_type}
+            _model_downloads[model_type] = {"status": "downloading", "error": None, "started": time.time()}
+        threading.Thread(target=_worker, daemon=True, name=f"model-dl-{model_type}").start()
     return {"status": "downloading", "model_type": model_type}
 
 
@@ -6970,6 +8672,34 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
     return body["_h3_longform"]
 
 
+def _public_h3_boundary(boundary: object) -> dict | None:
+    """Project a semantic join into content-free public telemetry."""
+    if not isinstance(boundary, dict):
+        return None
+    result = {}
+    boundary_type = str(boundary.get("type") or "")
+    if boundary_type in {"continuous", "precut", "cut", "transition"}:
+        result["type"] = boundary_type
+    source = str(boundary.get("source") or "")
+    if source in {
+        "model_grid", "explicit_continuity", "explicit_transition",
+        "explicit_cut", "precut_lead_in", "user_override",
+        "shared_h3_shot_plan",
+    }:
+        result["source"] = source
+    continuity = str(boundary.get("continuity_mode") or "")
+    if continuity in {"continuous", "extend_previous", "independent"}:
+        result["continuity_mode"] = continuity
+    at_seconds = boundary.get("at_seconds")
+    if (
+        type(at_seconds) in {int, float}
+        and math.isfinite(at_seconds)
+        and at_seconds >= 0
+    ):
+        result["at_seconds"] = float(at_seconds)
+    return result or None
+
+
 def _public_h3_long_plan(
     plan: dict | None,
     requirements: dict | None = None,
@@ -7031,7 +8761,7 @@ def _public_h3_long_plan(
                 )
             ),
             "switch_from_previous": bool(model.get("switch_from_previous")),
-            "boundary_from_previous": boundary,
+            "boundary_from_previous": _public_h3_boundary(boundary),
         })
     effective_models = []
     for segment in segments:
@@ -7217,7 +8947,7 @@ def _require_h3_generation_terms(body: dict, plan: dict | None = None) -> None:
     requirements = _h3_generation_requirements(body, plan)
     if (
         requirements["ref2va_terms_required"]
-        and body.get("h3_ref2va_terms_accepted") is not True
+        and not _ref2va_host_terms_accepted()
     ):
         raise HTTPException(
             status_code=400,
@@ -8853,6 +10583,95 @@ def _civitai_headers() -> dict:
     return headers
 
 
+_CIVITAI_DIAGNOSTIC_LIMIT = 2000
+_CIVITAI_HEADER_LIMIT = 64
+_CIVITAI_HEADER_VALUE_LIMIT = 512
+_CIVITAI_REDACTED = "[REDACTED]"
+_CIVITAI_CREDENTIAL_QUERY_NAMES = frozenset({
+    "api_key", "apikey", "auth", "auth_token", "key", "signature", "sig",
+    "token", "access_token",
+})
+_CIVITAI_QUERY_VALUE_RE = re.compile(
+    r"(?P<prefix>[?&])(?P<name>[^=&\s]{1,64})=(?P<value>[^&#\s]*)",
+    re.IGNORECASE,
+)
+_CIVITAI_AUTH_VALUE_RE = re.compile(
+    r"(?P<prefix>\b(?:bearer|basic)\s+)(?P<value>[^\s,;'\"}]+)",
+    re.IGNORECASE,
+)
+_CIVITAI_SENSITIVE_FIELD_RE = re.compile(
+    r"(?P<name>\b(?:authorization|proxy-authorization|x-api-key|api-key|"
+    r"cookie|set-cookie|x-auth-token))(?P<separator>\s*[:=]\s*)"
+    r"(?P<value>[^\s,;]+)",
+    re.IGNORECASE,
+)
+
+
+def _redact_civitai_diagnostic(value, *, limit: int = _CIVITAI_DIAGNOSTIC_LIMIT) -> str:
+    """Bound and redact credential-shaped values in CivitAI diagnostics."""
+    try:
+        bounded_limit = max(0, min(int(limit), _CIVITAI_DIAGNOSTIC_LIMIT))
+    except (TypeError, ValueError, OverflowError):
+        bounded_limit = _CIVITAI_DIAGNOSTIC_LIMIT
+    try:
+        text = str(value)
+    except Exception:
+        text = "<unavailable>"
+    text = text[:bounded_limit]
+
+    def redact_query(match):
+        from urllib.parse import unquote_plus
+
+        name = unquote_plus(match.group("name")).casefold().replace("-", "_")
+        sensitive = (
+            name in _CIVITAI_CREDENTIAL_QUERY_NAMES
+            or name.endswith("_token")
+            or name.endswith("_key")
+        )
+        if not sensitive:
+            return match.group(0)
+        return (
+            f"{match.group('prefix')}{match.group('name')}="
+            f"{_CIVITAI_REDACTED}"
+        )
+
+    text = _CIVITAI_QUERY_VALUE_RE.sub(redact_query, text)
+    text = _CIVITAI_AUTH_VALUE_RE.sub(
+        lambda match: f"{match.group('prefix')}{_CIVITAI_REDACTED}",
+        text,
+    )
+    return _CIVITAI_SENSITIVE_FIELD_RE.sub(
+        lambda match: (
+            f"{match.group('name')}{match.group('separator')}"
+            f"{_CIVITAI_REDACTED}"
+        ),
+        text,
+    )
+
+
+def _redact_civitai_headers(headers) -> dict[str, str]:
+    """Return a bounded diagnostic header map with sensitive values removed."""
+    try:
+        items = list(headers.items())[:_CIVITAI_HEADER_LIMIT]
+    except (AttributeError, TypeError, ValueError):
+        return {}
+    redacted: dict[str, str] = {}
+    for raw_name, raw_value in items:
+        name = str(raw_name)[:128]
+        normalized = name.casefold().replace("_", "-")
+        sensitive = any(marker in normalized for marker in (
+            "authorization", "api-key", "apikey", "cookie", "secret", "token",
+        ))
+        redacted[name] = (
+            _CIVITAI_REDACTED
+            if sensitive else _redact_civitai_diagnostic(
+                raw_value,
+                limit=_CIVITAI_HEADER_VALUE_LIMIT,
+            )
+        )
+    return redacted
+
+
 # ── LoRA update manifest ─────────────────────────────────────────────
 # Tracks the latest CivitAI version per LoRA so the UI can surface an
 # "update available" badge in the LoRA browser. The manifest is a
@@ -9466,10 +11285,13 @@ def _run_civitai_download(download_id: str):
                 body_preview = resp.text[:500] if hasattr(resp, "text") else ""
             except Exception:
                 pass
+            safe_url = _redact_civitai_diagnostic(url)
+            safe_headers = _redact_civitai_headers(resp.headers)
+            safe_body_preview = _redact_civitai_diagnostic(body_preview, limit=500)
             print(
-                f"[CivitAI] Download HTTP {resp.status_code} for {url}\n"
-                f"  Response headers: {dict(resp.headers)}\n"
-                f"  Body preview: {body_preview!r}"
+                f"[CivitAI] Download HTTP {resp.status_code} for {safe_url}\n"
+                f"  Response headers: {safe_headers}\n"
+                f"  Body preview: {safe_body_preview!r}"
             )
         resp.raise_for_status()
 
@@ -9523,7 +11345,8 @@ def _run_civitai_download(download_id: str):
                 _validate_safetensors_payload(partial_path)
             except Exception as _validate_exc:
                 raise RuntimeError(
-                    f"CivitAI returned an invalid LoRA payload: {_validate_exc}. "
+                    "CivitAI returned an invalid LoRA payload: "
+                    f"{_redact_civitai_diagnostic(_validate_exc)}. "
                     f"This is usually a missing/expired CivitAI API key, a rate-limit, "
                     f"or a model that requires special access. Check Settings → Services → "
                     f"CivitAI API Key."
@@ -9593,7 +11416,10 @@ def _run_civitai_download(download_id: str):
                 with open(sidecar_path, "w", encoding="utf-8") as f:
                     json.dump(sidecar_data, f, indent=2)
             except Exception as e:
-                print(f"[CivitAI] Failed to write sidecar for {fname}: {e}")
+                print(
+                    f"[CivitAI] Failed to write sidecar for {fname}: "
+                    f"{_redact_civitai_diagnostic(e)}"
+                )
 
         # Post-download registration differs by kind:
         #   - checkpoint: write a finetune JSON so WGP lists it as a selectable
@@ -9618,14 +11444,20 @@ def _run_civitai_download(download_id: str):
                     _ensure_llm_loaded()
                     _generate_and_save_checkpoint_guide(finetune_path, sidecar_data)
                 except Exception as ge:
-                    print(f"[CivitAI] Checkpoint guide auto-generation failed (non-fatal): {ge}")
+                    print(
+                        "[CivitAI] Checkpoint guide auto-generation failed "
+                        f"(non-fatal): {_redact_civitai_diagnostic(ge)}"
+                    )
                 finally:
                     dl["message"] = f"Registered as model '{model_type}'"
             except Exception as e:
                 # The weight file is already on disk; surface a warning instead
                 # of failing the whole download so the user can retry/repair the
                 # registration without re-downloading gigabytes.
-                msg = f"Checkpoint downloaded but registration failed: {e}"
+                msg = (
+                    "Checkpoint downloaded but registration failed: "
+                    f"{_redact_civitai_diagnostic(e)}"
+                )
                 dl.setdefault("warnings", []).append(msg)
                 print(f"[CivitAI] {msg}")
         else:
@@ -9639,15 +11471,19 @@ def _run_civitai_download(download_id: str):
                     _ensure_llm_loaded()
                     _generate_and_save_lora_guide(file_path, sidecar_data, fname)
                 except Exception as e:
-                    print(f"[CivitAI] Guide auto-generation failed for {fname} (non-fatal): {e}")
+                    print(
+                        "[CivitAI] Guide auto-generation failed for "
+                        f"{fname} (non-fatal): {_redact_civitai_diagnostic(e)}"
+                    )
 
         _complete_download_record(download_id)
         print(f"[CivitAI] Download complete: {filename} ({downloaded / 1024 / 1024:.1f}MB)"
               f"{f' — extracted {len(extracted_files)} file(s)' if extracted_files else ''}")
 
     except Exception as e:
-        _fail_download_record(download_id, e)
-        print(f"[CivitAI] Download failed: {e}")
+        safe_error = _redact_civitai_diagnostic(e)
+        _fail_download_record(download_id, safe_error)
+        print(f"[CivitAI] Download failed: {safe_error}")
     finally:
         for cleanup_path in tuple(partial_paths):
             try:
@@ -12109,20 +13945,25 @@ def get_services_config(request: Request):
 
 def _require_host_terms_project_access(request: Request, workspace: str) -> str:
     """Authorize one known project without creating arbitrary local names."""
-    remote = bool(getattr(request.state, "maestro_remote", False))
-    if workspace != "default" or remote:
-        _existing_workspace_dir(workspace)
-    return _require_project_access(request, workspace)
+    # Even the local default project is lookup-only here. A concurrent delete
+    # must fail authorization rather than recreate a directory as a side
+    # effect of reading or accepting host terms.
+    with _workspace_lifecycle_lock:
+        _require_workspace_not_deleting(workspace)
+        return _require_project_access(
+            request, workspace, existing_only=True,
+        )
 
 
 @api.get("/api/v1/host-terms")
 def get_host_terms(request: Request, workspace: str = ""):
     """Return host-wide notice versions after project authorization."""
     selected = _request_project_workspace(request, workspace)
-    _require_host_terms_project_access(request, selected)
     from services.host_terms import host_terms_status
-    with _services_config_lock:
-        terms = host_terms_status(wgp.server_config.get("services", {}))
+    with _workspace_lifecycle_lock:
+        _require_host_terms_project_access(request, selected)
+        with _services_config_lock:
+            terms = host_terms_status(wgp.server_config.get("services", {}))
     return {"terms": terms}
 
 
@@ -12138,31 +13979,39 @@ async def accept_host_terms(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Expected a JSON object")
     workspace = _request_project_workspace(request, body.get("workspace"))
-    _require_host_terms_project_access(request, workspace)
-
     from services.host_terms import (
+        REF2VA_TERM,
         StaleHostTermVersionError,
         UnknownHostTermError,
         accept_host_term,
     )
     try:
-        with _services_config_lock:
-            services = copy.deepcopy(wgp.server_config.get("services", {}))
-            if not isinstance(services, dict):
-                services = {}
-            terms = accept_host_term(
-                services,
-                body.get("term"),
-                body.get("version"),
-            )
-            staged_config = dict(wgp.server_config)
-            staged_config["services"] = services
-            _atomic_write_json(wgp.server_config_filename, staged_config)
-            wgp.server_config["services"] = services
+        with _workspace_lifecycle_lock:
+            _require_host_terms_project_access(request, workspace)
+            with _services_config_lock:
+                services = copy.deepcopy(wgp.server_config.get("services", {}))
+                if not isinstance(services, dict):
+                    services = {}
+                terms = accept_host_term(
+                    services,
+                    body.get("term"),
+                    body.get("version"),
+                )
+                staged_config = dict(wgp.server_config)
+                staged_config["services"] = services
+                _atomic_write_json(wgp.server_config_filename, staged_config)
+                wgp.server_config["services"] = services
     except UnknownHostTermError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except StaleHostTermVersionError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    if (
+        body.get("term") == REF2VA_TERM
+        and bool((terms.get(REF2VA_TERM) or {}).get("accepted"))
+    ):
+        _reconcile_ref2va_waiting_plan_reviews(
+            request=request, workspace=workspace,
+        )
     return {"status": "ok", "terms": terms}
 
 
@@ -12304,19 +14153,43 @@ async def update_services_config(request: Request):
 # API Routes: Workspaces
 # ============================================================================
 
+def _workspace_remember_policy(body: dict) -> str:
+    remember = body.get("remember", "session")
+    if not isinstance(remember, str) or remember not in PROJECT_UNLOCK_REMEMBER_POLICIES:
+        raise HTTPException(
+            status_code=400,
+            detail="remember must be 'session' or 'device'",
+        )
+    return remember
+
+
+def _workspace_access_fields(status) -> dict:
+    return {
+        "remember_policy": getattr(status, "remember_policy", None),
+        "unlock_expires_at": getattr(status, "unlock_expires_at", None),
+        "unlock_idle_expires_at": getattr(
+            status, "unlock_idle_expires_at", None,
+        ),
+    }
+
+
 @api.get("/api/v1/workspaces")
 def list_workspaces_endpoint(request: Request):
     """List all workspaces and the active one."""
     remote = bool(getattr(request.state, "maestro_remote", False))
     workspaces = []
     for item in _list_workspaces():
+        if remote and item["name"] == "default":
+            continue
         status = _project_access.status(
             item["name"], item["path"], request.state.maestro_session_id,
+            remote,
         )
         entry = {
             "name": item["name"],
             "password_protected": status.protected,
             "unlocked": status.unlocked and (status.protected if remote else True),
+            **_workspace_access_fields(status),
         }
         # Project names form the remote sign-in directory. Counts are project
         # content and remain hidden until this browser unlocks that project.
@@ -12377,6 +14250,7 @@ async def create_workspace(request: Request):
     name = body.get("name", "").strip()
     remote = bool(getattr(request.state, "maestro_remote", False))
     password = str(body.get("password") or "")
+    remember = _workspace_remember_policy(body)
 
     if not name:
         raise HTTPException(status_code=400, detail="Workspace name is required")
@@ -12419,6 +14293,7 @@ async def create_workspace(request: Request):
             try:
                 _project_access.set_password(
                     name, ws_dir, request.state.maestro_session_id, password,
+                    remember, remote,
                 )
             except ValueError as error:
                 # Do not leave an unusable empty project behind when password
@@ -12446,8 +14321,9 @@ def _require_remote_project_mutation_access(
     name: str,
     workspace_dir: str,
 ):
-    access = _project_access.status(
+    access = _project_access.authorize(
         name, workspace_dir, request.state.maestro_session_id,
+        bool(getattr(request.state, "maestro_remote", False)),
     )
     if bool(getattr(request.state, "maestro_remote", False)) and (
         not access.protected or not access.unlocked
@@ -12476,6 +14352,7 @@ async def set_workspace_password(name: str, request: Request):
     if current.protected and not current.unlocked:
         raise HTTPException(status_code=423, detail="Unlock the project first")
     body = await request.json()
+    remember = _workspace_remember_policy(body)
     if remote and not str(body.get("password") or ""):
         raise HTTPException(
             status_code=400,
@@ -12485,27 +14362,34 @@ async def set_workspace_password(name: str, request: Request):
         status = _project_access.set_password(
             name, workspace_dir, request.state.maestro_session_id,
             body.get("password"),
+            remember,
+            remote,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return {
         "password_protected": status.protected,
         "unlocked": status.unlocked,
+        **_workspace_access_fields(status),
     }
 
 
 @api.post("/api/v1/workspaces/{name}/unlock")
 async def unlock_workspace(name: str, request: Request):
-    workspace_dir = _existing_workspace_dir(name)
     remote = bool(getattr(request.state, "maestro_remote", False))
+    if remote and name == "default":
+        raise HTTPException(status_code=404, detail="Project not found")
+    workspace_dir = _existing_workspace_dir(name)
     if remote and not _project_access.status(
         name, workspace_dir, request.state.maestro_session_id,
+        remote,
     ).protected:
         raise HTTPException(
             status_code=423,
             detail="This project is not enabled for remote access",
         )
     body = await request.json()
+    remember = _workspace_remember_policy(body)
     remote = bool(getattr(request.state, "maestro_remote", False))
     if remote:
         retry_after = _project_unlock_limiter.retry_after(
@@ -12520,6 +14404,8 @@ async def unlock_workspace(name: str, request: Request):
     if not _project_access.unlock(
         name, workspace_dir, request.state.maestro_session_id,
         str(body.get("password") or ""),
+        remember,
+        remote,
     ):
         if remote:
             retry_after = _project_unlock_limiter.record_failure(
@@ -12535,19 +14421,33 @@ async def unlock_workspace(name: str, request: Request):
         _project_unlock_limiter.record_success(
             name, request.state.maestro_session_id,
         )
-    if remote:
-        with _remote_active_projects_lock:
-            _remote_active_projects[request.state.maestro_session_id] = name
-    return {"unlocked": True}
+    status = _project_access.status(
+        name, workspace_dir, request.state.maestro_session_id, remote,
+    )
+    return {"unlocked": True, **_workspace_access_fields(status)}
 
 
 @api.post("/api/v1/workspaces/{name}/lock")
 def lock_workspace(name: str, request: Request):
-    _project_access.lock(name, request.state.maestro_session_id)
+    remote = bool(getattr(request.state, "maestro_remote", False))
+    locked_count = _project_access.lock(
+        name, request.state.maestro_session_id, remote,
+    )
     with _remote_active_projects_lock:
         if _remote_active_projects.get(request.state.maestro_session_id) == name:
             _remote_active_projects.pop(request.state.maestro_session_id, None)
-    return {"unlocked": False}
+    return {"unlocked": False, "locked_count": locked_count}
+
+
+@api.post("/api/v1/workspaces/lock-all")
+def lock_all_workspaces(request: Request):
+    remote = bool(getattr(request.state, "maestro_remote", False))
+    locked_count = _project_access.lock_all(
+        request.state.maestro_session_id, remote,
+    )
+    with _remote_active_projects_lock:
+        _remote_active_projects.pop(request.state.maestro_session_id, None)
+    return {"unlocked": False, "locked_count": locked_count}
 
 
 def _path_targets_workspace(path_value, workspace_dir: str) -> bool:
@@ -12575,7 +14475,9 @@ def _workspace_has_busy_jobs(name: str, workspace_dir: str) -> bool:
     for job_id, job in list(_jobs.items()):
         if not _job_targets_workspace(job, name, workspace_dir):
             continue
-        if job.get("status") in ("queued", "running") or job_id in _active_gen_states:
+        if job.get("status") in (
+            "preparing", "waiting_for_plan_approval", "queued", "running",
+        ) or job_id in _active_gen_states:
             return True
     return False
 
@@ -12667,9 +14569,10 @@ def delete_workspace(name: str, request: Request):
                 )
 
             # Revoke before the first destructive project mutation.  If the
-            # durable capability store cannot be updated, the project and its
-            # references remain intact; a crash can never leave deleted bytes
-            # paired with a capability that might revive on name reuse.
+            # durable grant/capability stores cannot be updated, the project
+            # and its references remain intact; a crash can never leave
+            # deleted bytes paired with authority that might revive on reuse.
+            _project_access.revoke_workspace(name)
             _output_share_manager().revoke_workspace(name)
 
             # If unrelated work is running, persist the new selection without
@@ -12855,6 +14758,9 @@ def _public_authorized_project_assets(assets: list[dict], session_id: str) -> li
         for variant in asset.get("variants") or []:
             if not _can_access_project_asset_variant(variant, session_id):
                 continue
+            variant_metadata = variant.get("metadata")
+            if isinstance(variant_metadata, dict):
+                variant_metadata.pop("private_authored_settings", None)
             review_private = (
                 variant.get("variant_type") == "blender_video"
                 and variant.get("status") != "kept"
@@ -12912,6 +14818,72 @@ def _require_project_asset_media_access(
     return asset
 
 
+def _project_reference_private_authored_snapshot(variant: dict) -> dict:
+    """Validate one durable private snapshot without exposing it publicly."""
+    if not isinstance(variant, dict) or variant.get("variant_type") != "reference_pack":
+        raise HTTPException(status_code=409, detail="Reference authoring snapshot unavailable")
+    metadata = variant.get("metadata")
+    reference = metadata.get("reference_pack") if isinstance(metadata, dict) else None
+    private = metadata.get("private_authored_settings") if isinstance(metadata, dict) else None
+    public_authored = (
+        reference.get("authored_settings") if isinstance(reference, dict) else None
+    )
+    expected_seal = (
+        public_authored.get("seal") if isinstance(public_authored, dict) else None
+    )
+    try:
+        from services.reference_sheets import reference_pack_authored_settings_seal
+        actual_seal = reference_pack_authored_settings_seal(private)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=409, detail="Reference authoring snapshot unavailable",
+        ) from None
+    if (
+        not isinstance(expected_seal, str)
+        or not hmac.compare_digest(actual_seal, expected_seal)
+    ):
+        raise HTTPException(
+            status_code=409, detail="Reference authoring snapshot unavailable",
+        )
+    return {
+        "seal": actual_seal,
+        "type_fields": copy.deepcopy(private["type_fields"]),
+        "detail_callouts": copy.deepcopy(private["detail_callouts"]),
+    }
+
+
+@api.get(
+    "/api/v1/projects/{project}/assets/{asset_id}/variants/{variant_id}/"
+    "reference-authoring"
+)
+def get_project_reference_authoring(
+    project: str, asset_id: str, variant_id: str, request: Request,
+):
+    project_id, workspace_id = _asset_scope(request, project)
+    try:
+        asset = _require_project_asset_media_access(
+            project_id,
+            workspace_id,
+            asset_id,
+            request.state.maestro_session_id,
+            variant_id=variant_id,
+        )
+        variant = next(
+            item for item in asset.get("variants") or []
+            if item.get("id") == variant_id
+        )
+        return {
+            "schema_version": 2,
+            "asset_id": asset_id,
+            "variant_id": variant_id,
+            "authored_settings": _project_reference_private_authored_snapshot(
+                variant,
+            ),
+        }
+    except Exception as error:
+        raise _project_asset_error(error) from error
+
+
 @api.get("/api/v1/projects/{project}/assets")
 def list_project_assets(
     project: str,
@@ -12966,9 +14938,15 @@ async def update_project_asset(project: str, asset_id: str, request: Request):
         _require_project_asset_media_access(
             project_id, workspace_id, asset_id, request.state.maestro_session_id,
         )
-        return _project_asset_store().update_asset(
+        updated = _project_asset_store().update_asset(
             project_id, workspace_id, asset_id, await request.json(),
         )
+        authorized = _public_authorized_project_assets(
+            [updated], request.state.maestro_session_id,
+        )
+        if not authorized:
+            raise HTTPException(status_code=404, detail="Reference asset not found")
+        return authorized[0]
     except Exception as error:
         raise _project_asset_error(error) from error
     finally:
@@ -13069,10 +15047,16 @@ async def set_project_asset_variant_status(
         )
         if blender_result is not None:
             return blender_result
-        return _project_asset_store().set_variant_status(
+        updated = _project_asset_store().set_variant_status(
             project_id, workspace_id, asset_id, variant_id,
             status,
         )
+        authorized = _public_authorized_project_assets(
+            [{"variants": [updated]}], request.state.maestro_session_id,
+        )
+        if not authorized or not authorized[0].get("variants"):
+            raise HTTPException(status_code=404, detail="Reference variant not found")
+        return authorized[0]["variants"][0]
     except Exception as error:
         raise _project_asset_error(error) from error
     finally:
@@ -13136,14 +15120,40 @@ def serve_project_asset_media(project: str, relative_path: str, request: Request
 
 
 _PROJECT_REFERENCE_BODY_FIELDS = frozenset({
+    "schema_version", "intent", "depth", "sheet_count", "preset",
+    "anchor_basis", "type_fields", "detail_callouts",
     "asset_id", "parent_variant_id", "edit_instruction", "name",
     "asset_type", "description", "tags", "poses", "outfits", "style",
     "genre", "candidate_count", "mode", "model_type", "editor_model_type",
     "panel_size", "draft_size", "resolution", "columns", "palette_swatches",
-    "review", "num_inference_steps", "guidance_scale", "seed",
+    "review", "max_repair_attempts", "num_inference_steps", "guidance_scale", "seed",
     "negative_prompt", "activated_loras", "loras_multipliers",
+    "managed_layout_assist", "planning_model", "planning_provider",
+    "review_model", "review_provider",
+    "content_capability", "initial_blur", "intelligence_policy",
+    "additional_loras",
     "private_output", "explicit_output",
 })
+_PROJECT_REFERENCE_DEFAULT_CREATE_MODEL = "flux2_dev"
+_PROJECT_REFERENCE_DEFAULT_EDITOR_MODEL = (
+    "qwen_image_edit_2511_20B_fp8_lightning_8step"
+)
+_PROJECT_REFERENCE_MANAGED_LAYOUT_LORAS = frozenset()
+_PROJECT_REFERENCE_ABLITERATED_RECIPE = {
+    "id": "local_abliterated_gemma4_v1",
+    "model_id": "paperscarecrow/Gemma-4-31B-it-abliterated-gguf",
+    "projector": "ggml-org/Gemma-4-31B-IT-GGUF:BF16-mmproj",
+    "provider": "local",
+    "version": 1,
+}
+# Populated only after an exact operation/base-family recipe passes the
+# standalone verification gate. Experimental registry and CivitAI entries are
+# intentionally absent and can never become automatic routing candidates.
+_PROJECT_REFERENCE_VERIFIED_OPERATION_RECIPES = {}
+_PROJECT_REFERENCE_OPERATION_ORDER = ("generation", "edit", "repair", "callout")
+_PROJECT_REFERENCE_STANDARD_REVIEW = "standard_fidelity_v1"
+_PROJECT_REFERENCE_UNRESTRICTED_REVIEW = "explicit_unrestricted_fidelity_v1"
+_PROJECT_REFERENCE_QUALITY_FAILURE = "reference_fidelity_quality_failed"
 _PROJECT_REFERENCE_EDITOR_ARCHITECTURES = frozenset({
     "qwen_image_edit_20B", "qwen_image_edit_plus_20B",
     "qwen_image_edit_plus2_20B", "flux2_dev", "pi_flux2",
@@ -13184,22 +15194,646 @@ def _project_reference_dimensions(value, field, default):
     return int(value[0]), int(value[1])
 
 
-def _project_reference_request_config(body, request):
-    """Validate the complete public request before any asset can be created."""
+def _project_reference_seal_intelligence_selection(selection):
+    """Bind one path/credential-free model-provider choice to a stable token."""
+    if not isinstance(selection, dict):
+        raise HTTPException(status_code=409, detail="Studio intelligence selection is invalid")
+    requested = selection.get("requested_model")
+    resolved = selection.get("resolved_model")
+    provider = selection.get("resolved_provider")
+    if (
+        not isinstance(requested, str)
+        or not requested
+        or len(requested) > 256
+        or (
+            resolved is not None
+            and (not isinstance(resolved, str) or not resolved or len(resolved) > 256)
+        )
+        or not isinstance(provider, str)
+        or not provider
+        or len(provider) > 64
+    ):
+        raise HTTPException(status_code=409, detail="Studio intelligence selection is invalid")
+    identity = {
+        "requested_model": requested,
+        "resolved_model": resolved,
+        "resolved_provider": provider,
+    }
+    revision = hashlib.sha256(json.dumps(
+        {"schema_version": 1, **identity},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    supplied = selection.get("selection_revision")
+    if supplied is not None and supplied != revision:
+        raise HTTPException(status_code=409, detail="Studio intelligence selection changed")
+    return {**identity, "selection_revision": revision}
+
+
+def _project_reference_intelligence_selection(
+    request, *, requested_model, requested_provider, purpose, intent,
+):
+    """Resolve Studio-local planning/review without inheriting global intent."""
+    from services import llm_service
+
+    catalog_builder = globals().get("_llm_model_catalog")
+
+    if purpose == "planning" and requested_model in {"auto", "deterministic"}:
+        if requested_model == "deterministic" or intent == "exact_spec":
+            return {
+                "requested_model": requested_model,
+                "resolved_model": "deterministic",
+                "resolved_provider": "local",
+            }
+        status = dict(llm_service.get_status())
+        if (
+            status.get("provider") == "local"
+            and status.get("loaded")
+            and isinstance(status.get("model_id"), str)
+            and status.get("model_id")
+        ):
+            return {
+                "requested_model": requested_model,
+                "resolved_model": status["model_id"],
+                "resolved_provider": "local",
+            }
+        if callable(catalog_builder):
+            local_catalog = catalog_builder(request, "local")
+            selected = next(
+                (
+                    item for item in local_catalog
+                    if item.get("provider", "local") == "local"
+                    and isinstance(item.get("id"), str)
+                    and item.get("id")
+                ),
+                None,
+            )
+            if selected is not None:
+                return {
+                    "requested_model": requested_model,
+                    "resolved_model": selected["id"],
+                    "resolved_provider": "local",
+                }
+        return {
+            "requested_model": requested_model,
+            "resolved_model": "deterministic",
+            "resolved_provider": "local",
+        }
+    if purpose == "review" and requested_model in {"auto_local", "off"}:
+        if requested_model == "off":
+            return {
+                "requested_model": "off",
+                "resolved_model": None,
+                "resolved_provider": "off",
+            }
+        status = dict(llm_service.get_status())
+        if (
+            status.get("provider") == "local"
+            and status.get("loaded")
+            and status.get("vision_available")
+            and llm_service.vision_available()
+            and isinstance(status.get("model_id"), str)
+            and status.get("model_id")
+        ):
+            return {
+                "requested_model": "auto_local",
+                "resolved_model": status["model_id"],
+                "resolved_provider": "local",
+            }
+        if callable(catalog_builder):
+            local_catalog = catalog_builder(request, "local")
+            selected = next(
+                (
+                    item for item in local_catalog
+                    if item.get("provider", "local") == "local"
+                    and item.get("vision_capable") is True
+                    and isinstance(item.get("id"), str)
+                    and item.get("id")
+                ),
+                None,
+            )
+            if selected is not None:
+                return {
+                    "requested_model": "auto_local",
+                    "resolved_model": selected["id"],
+                    "resolved_provider": "local",
+                }
+        return {
+            "requested_model": "auto_local",
+            "resolved_model": None,
+            "resolved_provider": "local",
+        }
+
+    if not callable(catalog_builder):
+        raise HTTPException(status_code=409, detail="Selected Studio intelligence model is unavailable")
+    catalog = catalog_builder(request, requested_provider or "")
+    selected = next(
+        (item for item in catalog if item.get("id") == requested_model),
+        None,
+    )
+    if selected is None:
+        raise HTTPException(status_code=409, detail="Selected Studio intelligence model is unavailable")
+    provider = str(selected.get("provider") or "local")
+    if requested_provider is not None and requested_provider != provider:
+        raise HTTPException(status_code=400, detail="Studio intelligence provider does not match model")
+    if purpose == "review" and selected.get("vision_capable") is not True:
+        raise HTTPException(status_code=409, detail="Reference review requires a vision-capable model")
+    # Residency is intentionally not a prequeue requirement. The exact
+    # authorized selection is loaded during the durable planning/review job
+    # phase and failures are reported on that job rather than freezing Queue.
+    return {
+        "requested_model": requested_model,
+        "resolved_model": requested_model,
+        "resolved_provider": provider,
+    }
+
+
+def _project_reference_model_schedule(body, model_type):
+    """Resolve steps/guidance from the exact model unless explicitly set."""
+    try:
+        defaults = dict(wgp.get_default_settings(model_type) or {})
+    except Exception as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Reference model defaults are unavailable",
+        ) from error
+    explicit_steps = body.get("num_inference_steps")
+    if explicit_steps is None:
+        steps = defaults.get("num_inference_steps", defaults.get("sampling_steps"))
+    else:
+        steps = explicit_steps
+    if (
+        isinstance(steps, bool)
+        or not isinstance(steps, int)
+        or not 1 <= steps <= 200
+    ):
+        raise HTTPException(status_code=400, detail="num_inference_steps must be from 1 through 200")
+    guidance_key = (
+        "guidance_scale"
+        if "guidance_scale" in defaults
+        else "embedded_guidance_scale"
+        if "embedded_guidance_scale" in defaults
+        else "guidance_scale"
+    )
+    explicit_guidance = body.get("guidance_scale")
+    guidance = (
+        defaults.get(guidance_key, 1.0)
+        if explicit_guidance is None else explicit_guidance
+    )
+    if (
+        isinstance(guidance, bool)
+        or not isinstance(guidance, (int, float))
+        or not math.isfinite(float(guidance))
+        or not 0 <= float(guidance) <= 30
+    ):
+        raise HTTPException(status_code=400, detail="guidance_scale must be from 0 through 30")
+    return {
+        "model": model_type,
+        "steps": int(steps),
+        "guidance": float(guidance),
+        "guidance_key": guidance_key,
+        "source": "explicit" if (
+            explicit_steps is not None or explicit_guidance is not None
+        ) else "model_default",
+    }
+
+
+def _project_reference_operation_routing(
+    request, *, content_capability, generation_model, editor_model,
+    editor_reference_mode,
+):
+    """Resolve content-neutral image recipes from an exact verified map only."""
+    requested_models = {
+        "generation": generation_model,
+        "edit": editor_model,
+        "repair": editor_model,
+        "callout": editor_model,
+    }
+    routes = []
+    for operation in _PROJECT_REFERENCE_OPERATION_ORDER:
+        requested_model = requested_models[operation]
+        base = {
+            "operation": operation,
+            "requested_capability": content_capability,
+            "requested_model": requested_model,
+            "resolved_model": requested_model,
+        }
+        if content_capability == "standard":
+            routes.append({**base, "status": "standard"})
+            continue
+        candidates = _PROJECT_REFERENCE_VERIFIED_OPERATION_RECIPES.get(operation)
+        candidate = (
+            candidates.get(requested_model)
+            if isinstance(candidates, dict) and requested_model is not None
+            else None
+        )
+        resolved_model = candidate.get("model_type") if isinstance(candidate, dict) else None
+        verified = bool(
+            isinstance(candidate, dict)
+            and set(candidate) == {
+                "operation", "base_model", "model_type", "recipe_id",
+                "verification_status",
+            }
+            and candidate.get("operation") == operation
+            and candidate.get("base_model") == requested_model
+            and candidate.get("verification_status") == "verified"
+            and isinstance(candidate.get("recipe_id"), str)
+            and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}", candidate["recipe_id"],
+            ) is not None
+            and isinstance(resolved_model, str)
+            and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}", resolved_model,
+            ) is not None
+        )
+        if verified:
+            try:
+                _require_remote_visible_models(request, [resolved_model])
+            except HTTPException:
+                verified = False
+        model_def = wgp.get_model_def(resolved_model) if verified else None
+        if verified and (
+            not isinstance(model_def, dict) or not model_def.get("image_outputs")
+        ):
+            verified = False
+        if verified and operation != "generation":
+            editor_base = str(wgp.get_base_model_type(resolved_model) or "")
+            choices = model_def.get("image_ref_choices", {}).get("choices", [])
+            reference_modes = [
+                str(choice[1]) for choice in choices
+                if isinstance(choice, (list, tuple)) and len(choice) > 1
+                and "I" in str(choice[1])
+            ]
+            if (
+                editor_base not in _PROJECT_REFERENCE_EDITOR_ARCHITECTURES
+                or not reference_modes
+                or editor_reference_mode not in reference_modes
+            ):
+                verified = False
+        if verified:
+            routes.append({
+                **base,
+                "resolved_model": resolved_model,
+                "status": "applied",
+                "recipe_id": candidate["recipe_id"],
+                "verification_status": "verified",
+            })
+        else:
+            routes.append({
+                **base,
+                "status": "skipped",
+                "reason": "no_verified_compatible_recipe",
+            })
+    return routes
+
+
+def _project_reference_sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _project_reference_resolve_additional_loras(
+    value, *, generation_model, editor_model, operation_models=None,
+    freeze=False,
+):
+    """Validate compatibility cheaply, then optionally freeze file identity.
+
+    ``freeze`` is reserved for the durable worker phase: selected weight files
+    can be gigabytes, so request validation must never stream-hash them.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 64:
+        raise HTTPException(status_code=400, detail="Invalid additional LoRA selection")
+    if operation_models is None:
+        operation_models = {
+            "generation": (generation_model,),
+            "editing": (() if editor_model is None else (editor_model,)),
+        }
+    if (
+        not isinstance(operation_models, dict)
+        or set(operation_models) != {"generation", "editing"}
+        or any(
+            not isinstance(models, (list, tuple))
+            or any(not isinstance(model, str) or not model for model in models)
+            for models in operation_models.values()
+        )
+    ):
+        raise HTTPException(status_code=400, detail="Invalid operation model scope")
+    resolved = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"id", "multiplier", "scope"}:
+            raise HTTPException(status_code=400, detail="Invalid additional LoRA selection")
+        lora_id = item.get("id")
+        multiplier = item.get("multiplier")
+        requested_scope = item.get("scope")
+        if (
+            not isinstance(lora_id, str)
+            or not lora_id
+            or len(lora_id) > 512
+            or os.path.basename(lora_id) != lora_id
+            or lora_id in seen
+            or isinstance(multiplier, bool)
+            or not isinstance(multiplier, (int, float))
+            or not math.isfinite(float(multiplier))
+            or not -10 <= float(multiplier) <= 10
+            or requested_scope not in {"auto", "generation", "editing"}
+        ):
+            raise HTTPException(status_code=400, detail="Invalid additional LoRA selection")
+        seen.add(lora_id)
+        compatible = {}
+        for scope, models in operation_models.items():
+            if not models:
+                continue
+            paths = []
+            for model in dict.fromkeys(models):
+                try:
+                    path = wgp.resolve_lora_path(model, lora_id)
+                except Exception:
+                    path = ""
+                if (
+                    not isinstance(path, str)
+                    or not path
+                    or not os.path.isfile(path)
+                    or os.path.islink(path)
+                ):
+                    paths = []
+                    break
+                paths.append((model, os.path.realpath(path)))
+            if paths:
+                compatible[scope] = tuple(paths)
+        required = () if requested_scope == "auto" else (requested_scope,)
+        if any(scope not in compatible for scope in required):
+            raise HTTPException(
+                status_code=409,
+                detail="Additional LoRA is incompatible with its selected scope",
+            )
+        resolved_scopes = (
+            tuple(scope for scope in ("generation", "editing") if scope in compatible)
+            if requested_scope == "auto" else required
+        )
+        if not resolved_scopes:
+            resolved.append({
+                "id": lora_id,
+                "multiplier": float(multiplier),
+                "requested_scope": requested_scope,
+                "resolved_scopes": (),
+                "revision": "unavailable",
+                "source_sha256": hashlib.sha256(lora_id.encode("utf-8")).hexdigest(),
+                "skipped_reason": "incompatible",
+            })
+            continue
+        sources = {}
+        revisions = {}
+        for scope in resolved_scopes:
+            scope_sources = {}
+            scope_revisions = {}
+            for model, path in compatible[scope]:
+                if freeze:
+                    scope_sources[model] = _project_reference_sha256_file(path)
+                sidecar = os.path.splitext(path)[0] + ".civitai.json"
+                revision = "pending"
+                if freeze:
+                    revision = "local"
+                    try:
+                        with open(sidecar, "r", encoding="utf-8") as handle:
+                            metadata = json.load(handle)
+                        revision = str(metadata.get("versionId") or metadata.get("revision") or "local")
+                    except (OSError, TypeError, ValueError):
+                        pass
+                scope_revisions[model] = revision
+            if freeze:
+                sources[scope] = scope_sources
+            revisions[scope] = scope_revisions
+        resolved.append({
+            "id": lora_id,
+            "multiplier": float(multiplier),
+            "requested_scope": requested_scope,
+            "resolved_scopes": resolved_scopes,
+            "revision": json.dumps(revisions, sort_keys=True, separators=(",", ":")),
+            "source_sha256": (
+                hashlib.sha256(
+                    json.dumps(sources, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                if freeze else "pending"
+            ),
+            "skipped_reason": None,
+        })
+    return resolved
+
+
+def _project_reference_capabilities():
+    from services.reference_sheets import (
+        MAX_PACK_SHEETS,
+        PACK_TYPE_PRESETS,
+        reference_pack_detail_kind_capabilities,
+        reference_pack_ordered_roles,
+        reference_pack_type_field_capabilities,
+    )
+
+    return {
+        "schema_version": 2,
+        "planner_version": "reference-pack-v2",
+        "intents": ["exact_spec", "generic", "brainstorming"],
+        "depths": {
+            "compact": {"sheet_count": 1},
+            "standard": {"minimum": 2, "maximum": 3, "default": 3},
+            "comprehensive": {"minimum": 3, "maximum": 5, "default": 5},
+            "custom": {"minimum": 1, "maximum": MAX_PACK_SHEETS},
+        },
+        "reference_types": [
+            {
+                "id": reference_type,
+                "presets": [
+                    {
+                        "id": preset,
+                        "label": {
+                        "underlayers": "Wardrobe & underlayers",
+                        "anatomy": "Anatomy / nude",
+                        }.get(preset, preset.replace("_", " ").title()),
+                        "ordered_roles": list(reference_pack_ordered_roles(
+                            reference_type, preset,
+                        )),
+                        "valid_source_roles": list(reference_pack_ordered_roles(
+                            reference_type, preset,
+                        )),
+                        "detail_operations": [
+                            "auto", "crop", "enhance", "reconstruct",
+                        ],
+                    }
+                    for preset in PACK_TYPE_PRESETS[reference_type]
+                ],
+                "type_fields": reference_pack_type_field_capabilities(
+                    reference_type,
+                ),
+                "detail_kinds": reference_pack_detail_kind_capabilities(
+                    reference_type,
+                ),
+                "supports_custom_details": True,
+            }
+            for reference_type in (
+                "character", "location", "prop", "vehicle", "creature",
+                "wardrobe", "world",
+            )
+        ],
+        "detail_operations": ["auto", "crop", "enhance", "reconstruct"],
+        "lora_scopes": ["auto", "generation", "editing"],
+        "content_capabilities": ["standard", "unrestricted_local"],
+        "intelligence_policies": ["standard_auto", "uncensored_auto"],
+        "uncensored_auto_review": {
+            "requested_model": "auto_local",
+            "resolved_model": _PROJECT_REFERENCE_ABLITERATED_RECIPE["model_id"],
+            "resolved_provider": "local",
+            "vision_required": True,
+        },
+        "review_policy": {
+            "mandatory_for_content_capabilities": ["unrestricted_local"],
+            "mandatory_when_explicit_output": True,
+            "off_allowed_for_content_capabilities": ["standard"],
+            "mandatory_contract": _PROJECT_REFERENCE_UNRESTRICTED_REVIEW,
+        },
+        "max_candidate_count": 8,
+        "max_repair_attempts": 5,
+        "default_models": {
+            "generation_model": _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL,
+            "editor_model": _PROJECT_REFERENCE_DEFAULT_EDITOR_MODEL,
+        },
+        "planning_models": {
+            "built_in": ["auto", "deterministic"],
+            "catalog_endpoint": "/api/v1/llm/models",
+        },
+        "review_models": {
+            "built_in": ["auto_local", "off"],
+            "catalog_endpoint": "/api/v1/llm/models",
+            "required_capability": "vision_capable",
+        },
+        "managed_layout_assist": {
+            "schema_version": 1,
+            "mode": "off",
+            "allowlisted": sorted(_PROJECT_REFERENCE_MANAGED_LAYOUT_LORAS),
+            "provenance": {
+                "kind": "server_allowlist",
+                "version": "managed-layout-v1",
+            },
+        },
+    }
+
+
+@api.get("/api/v1/projects/{project}/assets/reference-capabilities")
+def get_project_reference_capabilities(project: str, request: Request):
+    _asset_scope(request, project)
+    return _project_reference_capabilities()
+
+
+def _project_reference_request_config(
+    body, request, *, existing_asset_type=None,
+):
+    """Validate one v2 pack request before any asset or job can be created."""
+    from services.reference_sheets import (
+        PACK_TYPE_FIELDS,
+        PACK_TYPE_PRESETS,
+        _normalize_pack_callouts,
+        normalize_reference_pack_type,
+        normalize_reference_pack_type_fields,
+        reference_pack_ordered_roles,
+    )
+
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
     unknown = set(body).difference(_PROJECT_REFERENCE_BODY_FIELDS)
     if unknown:
         raise HTTPException(status_code=400, detail="Unsupported reference request fields")
 
+    schema_version = body.get("schema_version", 2)
+    if schema_version != 2 or isinstance(schema_version, bool):
+        raise HTTPException(status_code=400, detail="Reference authoring requires schema_version 2")
+
     mode = body.get("mode", "production")
     if mode not in {"production", "hybrid", "draft"}:
-        raise HTTPException(status_code=400, detail="Unsupported reference-sheet mode")
-    asset_type = body.get("asset_type", "character")
-    if asset_type not in {"character", "setting", "item", "style"}:
-        raise HTTPException(status_code=400, detail="Unsupported reference asset type")
+        raise HTTPException(status_code=400, detail="Unsupported reference-pack mode")
+    intent = body.get("intent", "generic")
+    if intent not in {"exact_spec", "generic", "brainstorming"}:
+        raise HTTPException(status_code=400, detail="Unsupported reference intent")
+    depth = body.get("depth", "standard")
+    if depth not in {"compact", "standard", "comprehensive", "custom"}:
+        raise HTTPException(status_code=400, detail="Unsupported reference depth")
+    requested_asset_type = body.get("asset_type")
+    if requested_asset_type is None:
+        requested_asset_type = existing_asset_type or "character"
+    try:
+        asset_type = normalize_reference_pack_type(requested_asset_type)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Unsupported reference asset type") from error
+    preset = body.get("preset") or {
+        "character": "identity", "location": "spatial", "prop": "product",
+        "vehicle": "exterior", "creature": "identity", "wardrobe": "look",
+        "world": "visual_language",
+    }[asset_type]
+    if preset not in PACK_TYPE_PRESETS[asset_type]:
+        raise HTTPException(status_code=400, detail="Reference preset does not match asset type")
+    anchor_basis = body.get("anchor_basis")
+    if anchor_basis is not None and not isinstance(anchor_basis, str):
+        raise HTTPException(status_code=400, detail="Invalid reference anchor basis")
+    if asset_type in {"character", "creature"}:
+        anchor_basis = anchor_basis or ("anatomy" if preset == "anatomy" else "primary_outfit")
+        if anchor_basis not in {"anatomy", "primary_outfit"}:
+            raise HTTPException(status_code=400, detail="Invalid reference anchor basis")
+        if preset == "anatomy" and anchor_basis != "anatomy":
+            raise HTTPException(status_code=400, detail="Anatomy preset requires anatomy anchor")
+    else:
+        anchor_basis = anchor_basis or "least_occluded"
+        if anchor_basis != "least_occluded":
+            raise HTTPException(status_code=400, detail="Invalid reference anchor basis")
 
-    model_type = body.get("model_type") or "flux2_klein_9b"
+    type_fields = body["type_fields"] if "type_fields" in body else {}
+    if not isinstance(type_fields, dict):
+        raise HTTPException(status_code=400, detail="type_fields must be an object")
+    if set(type_fields).difference(PACK_TYPE_FIELDS[asset_type]):
+        raise HTTPException(status_code=400, detail="type_fields do not match asset type")
+    try:
+        sealed_type_fields = normalize_reference_pack_type_fields(
+            type_fields,
+            reference_type=asset_type,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    normalized_type_fields = {
+        field: [item.private_metadata() for item in items]
+        for field, items in sealed_type_fields
+    }
+    legacy_type_fields = {
+        "poses": {"character", "creature"},
+        "outfits": {"character"},
+        "style": {"world"},
+        "genre": {"world"},
+    }
+    if any(
+        body.get(field) is not None
+        and body.get(field) != ""
+        and asset_type not in allowed_types
+        for field, allowed_types in legacy_type_fields.items()
+    ):
+        raise HTTPException(status_code=400, detail="Legacy type fields do not match asset type")
+
+    raw_detail_callouts = (
+        body["detail_callouts"] if "detail_callouts" in body else []
+    )
+    if not isinstance(raw_detail_callouts, list) or len(raw_detail_callouts) > 8:
+        raise HTTPException(status_code=400, detail="Invalid detail callouts")
+    if mode == "draft" and raw_detail_callouts:
+        raise HTTPException(
+            status_code=400,
+            detail="Draft mode does not support editor-dependent detail callouts",
+        )
+
+    model_type = body.get("model_type") or _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL
     if not isinstance(model_type, str) or not 1 <= len(model_type) <= 128:
         raise HTTPException(status_code=400, detail="Invalid reference image model")
     _require_remote_visible_models(request, [model_type])
@@ -13208,13 +15842,10 @@ def _project_reference_request_config(body, request):
         raise HTTPException(status_code=400, detail="Reference generation requires an image model")
 
     editor_model_type = body.get("editor_model_type")
-    if editor_model_type is None and mode == "hybrid":
-        base_type = str(wgp.get_base_model_type(model_type) or "")
-        editor_model_type = (
-            model_type
-            if base_type in _PROJECT_REFERENCE_EDITOR_ARCHITECTURES
-            else "qwen_image_edit_2511_20B_fp8_lightning_4step"
-        )
+    if editor_model_type is None and mode != "draft":
+        editor_model_type = _PROJECT_REFERENCE_DEFAULT_EDITOR_MODEL
+    if mode == "draft" and editor_model_type is not None:
+        raise HTTPException(status_code=400, detail="Draft mode does not use an editor model")
     if editor_model_type is not None:
         if not isinstance(editor_model_type, str) or not 1 <= len(editor_model_type) <= 128:
             raise HTTPException(status_code=400, detail="Invalid reference editor model")
@@ -13238,7 +15869,7 @@ def _project_reference_request_config(body, request):
         ):
             raise HTTPException(
                 status_code=409,
-                detail="Hybrid mode needs a local image editor with reference-image support",
+                detail="Anchored mode needs an image editor with reference-image support",
             )
         editor_reference_mode = "KI" if any("K" in item for item in reference_modes) else "I"
     else:
@@ -13254,21 +15885,172 @@ def _project_reference_request_config(body, request):
         return value
 
     candidate_count = bounded_integer("candidate_count", 1, 1, 8)
-    steps = bounded_integer("num_inference_steps", 4, 1, 200)
+    if depth == "custom":
+        sheet_count = bounded_integer("sheet_count", None, 1, 5)
+    else:
+        if body.get("sheet_count") is not None:
+            raise HTTPException(status_code=400, detail="sheet_count is allowed only for custom depth")
+        sheet_count = {"compact": 1, "standard": 3, "comprehensive": 5}[depth]
+    try:
+        available_roles = reference_pack_ordered_roles(
+            asset_type, preset, sheet_count,
+        )
+        sealed_callouts = _normalize_pack_callouts(
+            raw_detail_callouts,
+            reference_type=asset_type,
+            intent=intent,
+            sheet_roles=available_roles,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    normalized_callouts = [item.private_metadata() for item in sealed_callouts]
     seed = bounded_integer("seed", -1, -1, (2 ** 63) - 1)
     columns = bounded_integer("columns", 2, 1, 4)
     palette_swatches = bounded_integer("palette_swatches", 8, 3, 12)
-    guidance = body.get("guidance_scale", 1.0)
-    if (
-        isinstance(guidance, bool)
-        or not isinstance(guidance, (int, float))
-        or not math.isfinite(float(guidance))
-        or not 0 <= float(guidance) <= 30
-    ):
-        raise HTTPException(status_code=400, detail="guidance_scale must be from 0 through 30")
+    max_repair_attempts = bounded_integer("max_repair_attempts", 1, 0, 5)
+    model_schedules = {
+        model_type: _project_reference_model_schedule(body, model_type),
+    }
+    if editor_model_type is not None:
+        model_schedules[editor_model_type] = _project_reference_model_schedule(
+            body, editor_model_type,
+        )
     review = body.get("review", True)
     if not isinstance(review, bool):
         raise HTTPException(status_code=400, detail="review must be a boolean")
+
+    explicit_convenience = body.get("explicit_output") is True
+    content_capability = body.get("content_capability")
+    if content_capability is None:
+        content_capability = (
+            "unrestricted_local"
+            if explicit_convenience or anchor_basis == "anatomy" else "standard"
+        )
+    if content_capability not in {"standard", "unrestricted_local"}:
+        raise HTTPException(status_code=400, detail="Invalid content_capability")
+    mandatory_review = bool(
+        content_capability == "unrestricted_local" or explicit_convenience
+    )
+    review_contract = (
+        _PROJECT_REFERENCE_UNRESTRICTED_REVIEW
+        if mandatory_review else _PROJECT_REFERENCE_STANDARD_REVIEW
+    )
+    initial_blur = body.get("initial_blur")
+    if initial_blur is None:
+        initial_blur = explicit_convenience or anchor_basis == "anatomy"
+    if type(initial_blur) is not bool:
+        raise HTTPException(status_code=400, detail="initial_blur must be a boolean")
+    intelligence_policy = body.get("intelligence_policy")
+    if intelligence_policy is None:
+        intelligence_policy = (
+            "uncensored_auto"
+            if explicit_convenience or anchor_basis == "anatomy"
+            else "standard_auto"
+        )
+    if intelligence_policy not in {"standard_auto", "uncensored_auto"}:
+        raise HTTPException(status_code=400, detail="Invalid intelligence_policy")
+
+    planning_model = body.get("planning_model", "auto")
+    review_model = body.get("review_model", "auto_local" if review else "off")
+    planning_provider = body.get("planning_provider")
+    review_provider = body.get("review_provider")
+    for value, field in (
+        (planning_model, "planning_model"), (review_model, "review_model"),
+        (planning_provider, "planning_provider"), (review_provider, "review_provider"),
+    ):
+        if value is not None and (not isinstance(value, str) or not value or len(value) > 256):
+            raise HTTPException(status_code=400, detail=f"Invalid {field}")
+    planning_selection = _project_reference_intelligence_selection(
+        request,
+        requested_model=planning_model,
+        requested_provider=planning_provider,
+        purpose="planning",
+        intent=intent,
+    )
+    review_selection = None
+    if intelligence_policy != "uncensored_auto" or not review:
+        review_selection = _project_reference_intelligence_selection(
+            request,
+            requested_model=review_model,
+            requested_provider=review_provider,
+            purpose="review",
+            intent=intent,
+        )
+    intelligence_recipe = None
+    if intelligence_policy == "uncensored_auto":
+        intelligence_recipe = dict(_PROJECT_REFERENCE_ABLITERATED_RECIPE)
+        if planning_model == "auto":
+            planning_selection = {
+                "requested_model": "auto",
+                "resolved_model": intelligence_recipe["id"],
+                "resolved_provider": "local",
+            }
+        if review:
+            if review_provider not in {None, "local"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Uncensored Auto fidelity review is local-only",
+                )
+            if review_model not in {
+                "auto_local", intelligence_recipe["model_id"],
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Uncensored Auto requires its compatible local vision reviewer",
+                )
+            review_selection = {
+                "requested_model": review_model,
+                "resolved_model": intelligence_recipe["model_id"],
+                "resolved_provider": "local",
+            }
+        intelligence_recipe["status"] = "queued"
+    assert review_selection is not None
+    if mandatory_review:
+        review_selection = _project_reference_seal_intelligence_selection(
+            review_selection,
+        )
+        if not review or review_selection["resolved_model"] is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Explicit/unrestricted output requires a selected vision fidelity reviewer",
+            )
+    if (
+        review_selection["resolved_model"] is not None
+        and review_selection["resolved_provider"] != "local"
+        and review_provider != review_selection["resolved_provider"]
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Remote fidelity review requires an explicit provider selection",
+        )
+
+    operation_routing = _project_reference_operation_routing(
+        request,
+        content_capability=content_capability,
+        generation_model=model_type,
+        editor_model=editor_model_type,
+        editor_reference_mode=editor_reference_mode,
+    )
+    for route in operation_routing:
+        routed_model = route["resolved_model"]
+        if route["status"] == "applied" and routed_model not in model_schedules:
+            model_schedules[routed_model] = _project_reference_model_schedule(
+                body, routed_model,
+            )
+        route["schedule"] = (
+            copy.deepcopy(model_schedules[routed_model])
+            if routed_model is not None else None
+        )
+    operation_models = {
+        "generation": tuple(dict.fromkeys(
+            route["resolved_model"] for route in operation_routing
+            if route["operation"] == "generation" and route["resolved_model"]
+        )),
+        "editing": tuple(dict.fromkeys(
+            route["resolved_model"] for route in operation_routing
+            if route["operation"] != "generation" and route["resolved_model"]
+        )),
+    }
 
     resolution = body.get("resolution")
     resolution_size = (
@@ -13295,6 +16077,18 @@ def _project_reference_request_config(body, request):
         or any(not isinstance(item, str) or not item or len(item) > 512 for item in loras)
     ):
         raise HTTPException(status_code=400, detail="Invalid reference LoRA selection")
+    managed_layout_assist = body.get("managed_layout_assist", "off")
+    if managed_layout_assist != "off":
+        raise HTTPException(
+            status_code=409,
+            detail="No managed Reference Studio layout assist is currently vetted",
+        )
+    additional_loras = _project_reference_resolve_additional_loras(
+        body.get("additional_loras"),
+        generation_model=model_type,
+        editor_model=editor_model_type,
+        operation_models=operation_models,
+    )
 
     asset_id = body.get("asset_id")
     parent_variant_id = body.get("parent_variant_id")
@@ -13310,8 +16104,12 @@ def _project_reference_request_config(body, request):
             detail="Retry and edit requests require asset_id",
         )
 
+    default_private = True if anchor_basis == "anatomy" else body.get("private_output")
     policy_request = {
-        "private_output": body.get("private_output"),
+        "private_output": (
+            default_private if body.get("private_output") is None
+            else body.get("private_output")
+        ),
         "explicit_output": body.get("explicit_output"),
     }
     policy = _http_output_policy_from_request(
@@ -13324,17 +16122,37 @@ def _project_reference_request_config(body, request):
     if not asset_id and not name:
         raise HTTPException(status_code=400, detail="name is required")
     return {
+        "schema_version": 2,
         "mode": mode,
+        "intent": intent,
+        "depth": depth,
+        "sheet_count": sheet_count,
+        "preset": preset,
+        "anchor_basis": anchor_basis,
         "asset_type": asset_type,
         "model_type": model_type,
         "editor_model_type": editor_model_type,
         "editor_reference_mode": editor_reference_mode,
         "candidate_count": candidate_count,
-        "num_inference_steps": steps,
-        "guidance_scale": float(guidance),
+        "type_fields": normalized_type_fields,
+        "detail_callouts": normalized_callouts,
+        "managed_layout_assist": managed_layout_assist,
+        "content_capability": content_capability,
+        "initial_blur": initial_blur,
+        "intelligence_policy": intelligence_policy,
+        "review_contract": review_contract,
+        "mandatory_review": mandatory_review,
+        "intelligence_recipe": intelligence_recipe,
+        "operation_routing": operation_routing,
+        "operation_models": operation_models,
+        "additional_loras": additional_loras,
+        "planning": planning_selection,
+        "review_selection": review_selection,
+        "model_schedules": model_schedules,
         "seed": seed,
         "columns": columns,
         "palette_swatches": palette_swatches,
+        "max_repair_attempts": max_repair_attempts,
         "panel_size": panel_size,
         "draft_size": draft_size,
         "review": review,
@@ -13362,6 +16180,21 @@ def _project_reference_request_config(body, request):
 
 
 def _project_reference_creative_request(asset, config):
+    authored_values = []
+    for items in config["type_fields"].values():
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label", "")
+            group = item.get("group", "")
+            authored_values.append(
+                label if group == "legacy" else f"{group}: {label}"
+            )
+    authored_values.extend(
+        f"detail: {item.get('label', '')}"
+        for item in config["detail_callouts"]
+        if isinstance(item, dict)
+    )
     parts = [
         str(asset.get("name") or "").strip(),
         str(asset.get("description") or "").strip(),
@@ -13370,6 +16203,7 @@ def _project_reference_creative_request(asset, config):
             if config["description"] != str(asset.get("description") or "").strip()
             else ""
         ),
+        *authored_values,
         config["poses"], config["outfits"], config["style"], config["genre"],
         config["edit_instruction"],
     ]
@@ -13378,7 +16212,9 @@ def _project_reference_creative_request(asset, config):
 
 def _project_reference_generation_params(
     config, *, model_type, prompt, size, seed, reference_path=None,
+    operation_scope="generation",
 ):
+    schedule = config["model_schedules"][model_type]
     params = {
         "model_type": model_type,
         "prompt": prompt,
@@ -13387,8 +16223,7 @@ def _project_reference_generation_params(
         "image_prompt_type": "",
         "video_prompt_type": "",
         "resolution": f"{size[0]}x{size[1]}",
-        "num_inference_steps": config["num_inference_steps"],
-        "guidance_scale": config["guidance_scale"],
+        "num_inference_steps": schedule["steps"],
         "seed": seed,
         "settings_version": 2.57,
         "generation_mode": "image",
@@ -13398,17 +16233,36 @@ def _project_reference_generation_params(
         "private_output": config["policy"]["private"],
         "explicit_output": config["policy"]["explicit"],
     }
-    if reference_path is None:
-        params["activated_loras"] = list(config["activated_loras"])
-        params["loras_multipliers"] = config["loras_multipliers"]
-    else:
+    params[schedule["guidance_key"]] = schedule["guidance"]
+    params["activated_loras"] = list(config["activated_loras"])
+    params["loras_multipliers"] = config["loras_multipliers"]
+    scoped = [
+        item for item in config.get("additional_loras") or []
+        if operation_scope in item.get("resolved_scopes", ())
+    ]
+    for item in scoped:
+        params["activated_loras"].append(item["id"])
+    if scoped:
+        additions = " ".join(str(item["multiplier"]) for item in scoped)
+        params["loras_multipliers"] = " ".join(
+            part for part in (params["loras_multipliers"], additions) if part
+        )
+    if reference_path is not None:
+        references = (
+            list(reference_path)
+            if isinstance(reference_path, (list, tuple))
+            else [reference_path]
+        )
+        unique_references = []
+        for item in references:
+            rendered = str(item)
+            if rendered not in unique_references:
+                unique_references.append(rendered)
         params.update({
-            "image_refs": [str(reference_path)],
+            "image_refs": unique_references,
             "video_prompt_type": config["editor_reference_mode"],
             "remove_background_images_ref": 0,
             "image_refs_relative_size": 100,
-            "activated_loras": [],
-            "loras_multipliers": "",
         })
     return params
 
@@ -13416,10 +16270,24 @@ def _project_reference_generation_params(
 def _write_project_reference_sidecar(
     path, *, parent_job, model_type, artifact_metadata,
 ):
-    """Replace generator sidecars with prompt-free public role metadata."""
+    """Write policy-stamped role metadata plus exact private authoring state."""
     sidecar_path = os.path.splitext(path)[0] + ".meta.json"
+    metadata_key = (
+        "reference_pack"
+        if artifact_metadata.get("schema_version") == 2
+        else "reference_sheet"
+    )
+    sidecar_metadata = dict(artifact_metadata)
+    if metadata_key == "reference_pack":
+        authored = (
+            ((parent_job.get("params") or {}).get("reference_pack") or {}).get(
+                "private_authored_settings"
+            )
+        )
+        if isinstance(authored, dict):
+            sidecar_metadata["private_authored_settings"] = copy.deepcopy(authored)
     sidecar = {
-        "params": {"reference_sheet": dict(artifact_metadata)},
+        "params": {metadata_key: sidecar_metadata},
         "generation_mode": "image",
         "model_type": model_type,
         "job_id": str(parent_job.get("id") or ""),
@@ -13444,8 +16312,56 @@ def _write_project_reference_sidecar(
             pass
 
 
+def _cleanup_project_reference_private_source(path, root=None):
+    """Remove one owned generator source and prompt-free sidecar after copying."""
+    lexical = os.path.abspath(str(path))
+    if root is not None:
+        expected_root = os.path.realpath(str(root))
+        if os.path.dirname(lexical) != expected_root:
+            return False
+    removed = False
+    for candidate in (lexical, os.path.splitext(lexical)[0] + ".meta.json"):
+        try:
+            if os.path.islink(candidate) or not os.path.isfile(candidate):
+                continue
+            if root is not None and os.path.dirname(os.path.realpath(candidate)) != expected_root:
+                continue
+            os.remove(candidate)
+            removed = True
+        except OSError:
+            pass
+    return removed
+
+
+def _project_reference_wait_at_output_boundary(parent_job, boundary):
+    """Honor one parent deferred hold between complete Reference outputs."""
+    while (
+        bool(parent_job.get("hold_after_output", False))
+        and not is_cancel_requested(parent_job)
+    ):
+        if not update_job(
+            parent_job,
+            resource_intent="text",
+            resource_execution="standard",
+            resource_state="queued",
+            phase="Reference generation held",
+            message=f"Held after completed {boundary}",
+        ):
+            return False
+        time.sleep(0.1)
+    if is_cancel_requested(parent_job):
+        return False
+    return bool(update_job(
+        parent_job,
+        resource_intent="text",
+        resource_execution="standard",
+        resource_state="released",
+    ))
+
+
 def _run_project_reference_image_job(
     parent_job, params, *, role, phase, step, total_steps,
+    artifact_metadata=None,
 ):
     """Run one recoverable local image child and return only its owned output."""
     child_id = uuid.uuid4().hex[:8]
@@ -13468,7 +16384,18 @@ def _run_project_reference_image_job(
         "prompt_preview": "",
         "model_type": params["model_type"],
         "generation_mode": "image",
+        "resource_intent": "generation",
+        "resource_execution": "standard",
+        "preemption_mode": "none",
+        "resource_state": "queued",
+        "execution_attempt": 1,
+        "parent_job_id": str(parent_job.get("id") or ""),
         "requested_outputs": 1,
+        "queue_priority": int(parent_job.get("queue_priority", 0) or 0),
+        "queue_held": bool(parent_job.get("queue_held", False)),
+        "hold_after_output": bool(
+            parent_job.get("hold_after_output", False)
+        ),
     }
     thread = _queue_recovery_register_and_publish(
         child,
@@ -13478,19 +16405,53 @@ def _run_project_reference_image_job(
     while thread.is_alive():
         thread.join(timeout=0.1)
         snapshot = snapshot_job(child)
+        parent_hold = bool(parent_job.get("hold_after_output", False))
+        child_hold = bool(snapshot.get("hold_after_output", False))
+        # Once registered, the child is the scheduler authority. A deferred
+        # parent hold may still be forwarded, but a child-targeted UI hold or
+        # resume must never be overwritten by stale parent orchestration state.
+        if parent_hold and not child_hold and snapshot.get("status") in {
+            "queued", "running",
+        }:
+            forwarded = set_job_hold(child, True)
+            snapshot = snapshot_job(child)
+            if forwarded is not None:
+                set_job_hold(parent_job, False)
+        if snapshot.get("status") == "queued" and snapshot.get("queue_held"):
+            if parent_job.get("hold_after_output", False):
+                set_job_hold(parent_job, False)
         child_progress = max(0.0, min(100.0, float(snapshot.get("progress") or 0)))
         overall = ((step - 1) + (child_progress / 100.0)) / max(1, total_steps) * 100.0
+        child_resource_state = str(snapshot.get("resource_state") or "queued")
+        if child_resource_state not in {
+            "queued", "admitted", "running", "blocked", "released",
+        }:
+            child_resource_state = "queued"
         if not update_job(
             parent_job,
             progress=min(99.0, overall),
             step=step,
             total_steps=total_steps,
+            resource_intent="text",
+            resource_execution="standard",
+            resource_state=child_resource_state,
             phase=phase,
-            message=f"{phase} · {child_progress:.0f}%",
+            message=(
+                str(snapshot.get("message") or phase)
+                if child_resource_state in {"queued", "blocked"}
+                else f"{phase} · {child_progress:.0f}%"
+            ),
         ):
             request_cancel(child, job_id=child_id, active_states=_active_gen_states)
     snapshot = snapshot_job(child)
     if snapshot.get("status") != "completed":
+        update_job(
+            parent_job,
+            resource_intent="text",
+            resource_execution="standard",
+            resource_state="blocked",
+            message="Reference image child did not complete",
+        )
         raise RuntimeError("reference_image_generation_failed")
     candidates = []
     root = os.path.realpath(str(parent_job["out_dir"]))
@@ -13508,128 +16469,385 @@ def _run_project_reference_image_job(
             candidates.append(path)
     if len(candidates) != 1:
         raise RuntimeError("reference_image_output_invalid")
-    artifact_metadata = {
+    artifact_metadata = dict(artifact_metadata or {
+        "schema_version": 2,
+        "planner_version": "reference-pack-v2",
         "role": role,
+        "index": 0,
         "model": params["model_type"],
         "provenance": {
             "strategy": "local_generation",
-            "version": "reference-sheet-v1",
+            "version": "reference-pack-v2",
+            "anchor_role": None,
         },
         "reason_codes": [],
-    }
+    })
     _write_project_reference_sidecar(
         candidates[0],
         parent_job=parent_job,
         model_type=params["model_type"],
         artifact_metadata=artifact_metadata,
     )
+    if not _project_reference_wait_at_output_boundary(parent_job, "sheet"):
+        raise RuntimeError("reference_job_cancelled")
     return candidates[0]
 
 
-def _project_reference_local_generate(llm_service, parent_job, generate_kwargs):
-    """Atomically enforce local vision residency across one review request."""
-    with llm_service._lock:
-        status = llm_service.get_status()
+def _project_reference_runtime_intelligence_selection(
+    request, config, selection, *, purpose,
+):
+    """Resolve a sealed Studio selection to private load arguments in-worker."""
+    sealed = _project_reference_seal_intelligence_selection(selection)
+    model_id = sealed.get("resolved_model")
+    if model_id in {None, "deterministic"}:
+        return None
+    recipe = config.get("intelligence_recipe")
+    if (
+        purpose == "planning"
+        and isinstance(recipe, dict)
+        and model_id == recipe.get("id")
+        and isinstance(recipe.get("model_id"), str)
+    ):
+        model_id = recipe["model_id"]
+    resolver = globals().get("_resolve_llm_chat_model")
+    if not callable(resolver):
+        raise RuntimeError("reference_intelligence_resolver_unavailable")
+    runtime = resolver(request, model_id)
+    if runtime.get("provider") != sealed.get("resolved_provider"):
+        raise RuntimeError("reference_intelligence_provider_changed")
+    if purpose == "review":
         if (
-            status.get("provider") != "local"
-            or not status.get("loaded")
-            or not status.get("vision_available")
-            or not llm_service.vision_available()
+            runtime.get("vision_capable") is not True
+            or runtime.get("response_model_id") != sealed.get("resolved_model")
         ):
             raise RuntimeError("review_unavailable")
-        if is_cancel_requested(parent_job):
-            raise RuntimeError("reference_job_cancelled")
-        return llm_service.generate(**generate_kwargs)
+    return runtime
 
 
-def _project_reference_local_reviewer(parent_job, review_request):
-    """Use only the already-loaded local vision model for fidelity review."""
+def _project_reference_run_planning(request, parent_job, plan, config):
+    """Run and validate the queued structured planning phase when selected."""
+    from services import llm_service
+    from services.reference_sheets import apply_reference_pack_role_briefs
+
+    selection = config["planning"]
+    reference_params = parent_job["params"]["reference_pack"]
+    try:
+        runtime = _project_reference_runtime_intelligence_selection(
+            request, config, selection, purpose="planning",
+        )
+    except Exception:
+        if selection.get("requested_model") != "auto":
+            raise
+        reference_params["planning_status"] = "deterministic_fallback"
+        recipe = reference_params.get("intelligence_recipe")
+        if isinstance(recipe, dict):
+            recipe["status"] = "deterministic_fallback"
+        return plan
+    if runtime is None:
+        reference_params["planning_status"] = "deterministic"
+        return plan
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "schema_version", "reference_type", "preset",
+            "anchor_basis", "ordered_roles", "role_briefs",
+        ],
+        "properties": {
+            "schema_version": {"const": 2},
+            "reference_type": {"const": plan.reference_type},
+            "preset": {"const": plan.preset},
+            "anchor_basis": {"const": plan.anchor_basis},
+            "ordered_roles": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": list(plan.sheet_roles),
+                },
+                "minItems": len(plan.sheet_roles),
+                "maxItems": len(plan.sheet_roles),
+            },
+            "role_briefs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["role", "brief"],
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "enum": list(plan.sheet_roles),
+                        },
+                        "brief": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500,
+                        },
+                    },
+                },
+                "minItems": len(plan.sheet_roles),
+                "maxItems": len(plan.sheet_roles),
+            },
+        },
+    }
+
+    def progress(_event):
+        if not is_cancel_requested(parent_job):
+            update_job(
+                parent_job,
+                phase="Planning reference pack",
+                message="Planning sealed Reference Studio deliverables",
+            )
+
+    runner = globals().get("_run_llm_with_selection")
+    if not callable(runner):
+        raise RuntimeError("reference_intelligence_runner_unavailable")
+    operation = llm_service.generate
+    if runtime.get("provider") == "local":
+        def operation(*args, **kwargs):
+            try:
+                return llm_service.generate(*args, **kwargs)
+            finally:
+                # This runs inside loaded_model_lease's re-entrant turn lock,
+                # so no new chat can begin between inference and release.
+                llm_service.unload_model()
+    cpu_lane_options = (
+        {
+            "_cpu_text_job": parent_job,
+            "_cpu_text_operation": "reference_planning",
+            "_cpu_text_text_only": True,
+        }
+        if getattr(runner, "_maestro_cpu_text_lane", False)
+        else {}
+    )
+    try:
+        raw = runner(
+            runtime,
+            operation,
+            (
+                "Produce bounded per-sheet execution briefs for this Reference "
+                "Studio request. Do not add, remove, or reorder deliverables; "
+                "do not contradict authored facts or invent identity-bearing "
+                "facts. Generic may clarify constraints and brainstorming may "
+                "suggest non-identity presentation ideas.\n"
+                f"Reference request:\n{plan.creative_request}"
+            ),
+            system_prompt=(
+                "Return only the strict server-provided Reference Pack schema. "
+                "The server owns all bounds and role ordering."
+            ),
+            max_new_tokens=384,
+            temperature=0.2,
+            top_p=0.9,
+            enable_thinking=False,
+            json_schema=schema,
+            progress_callback=progress,
+            **cpu_lane_options,
+        )
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        fixed = {
+            "schema_version": 2,
+            "reference_type": plan.reference_type,
+            "preset": plan.preset,
+            "anchor_basis": plan.anchor_basis,
+            "ordered_roles": list(plan.sheet_roles),
+        }
+        if not isinstance(parsed, dict) or any(
+            parsed.get(key) != value for key, value in fixed.items()
+        ) or set(parsed) != {*fixed, "role_briefs"}:
+            raise RuntimeError("reference_planner_output_invalid")
+        raw_briefs = parsed.get("role_briefs")
+        if (
+            not isinstance(raw_briefs, list)
+            or [item.get("role") for item in raw_briefs if isinstance(item, dict)]
+            != list(plan.sheet_roles)
+        ):
+            raise RuntimeError("reference_planner_output_invalid")
+        planned = apply_reference_pack_role_briefs(
+            plan,
+            {item["role"]: item.get("brief") for item in raw_briefs},
+        )
+        reference_params.update(planned.public_preview(
+            candidate_count=int(reference_params.get("candidate_count") or 1),
+        ))
+        # The bounded briefs remain private; only their content-free immutable
+        # seal enters recovery/retry provenance.
+        reference_params["role_brief_seal"] = planned.role_brief_seal
+        reference_params["planning_status"] = "validated"
+        return planned
+    except Exception:
+        is_auto = selection.get("requested_model") == "auto"
+        if not is_auto:
+            raise
+        reference_params["planning_status"] = "deterministic_fallback"
+        recipe = reference_params.get("intelligence_recipe")
+        if isinstance(recipe, dict):
+            recipe["status"] = "deterministic_fallback"
+        return plan
+
+
+def _project_reference_selected_reviewer(
+    request, parent_job, review_request, config,
+):
+    """Load the exact review selection in its queued fidelity phase."""
     from services import llm_service
 
-    if is_cancel_requested(parent_job):
-        raise RuntimeError("reference_job_cancelled")
-
-    def progress(event):
-        if not isinstance(event, dict):
-            return
-        rate = event.get("live_tps")
-        if rate is None:
-            rate = event.get("average_tps")
-        suffix = ""
-        if isinstance(rate, (int, float)) and not isinstance(rate, bool) and math.isfinite(float(rate)):
-            suffix = f" · {float(rate):.1f} tok/s"
-        update_job(
-            parent_job,
-            phase="Reviewing fidelity",
-            message=f"Reviewing reference-sheet fidelity{suffix}",
+    runtime = _project_reference_runtime_intelligence_selection(
+        request, config, config["review_selection"], purpose="review",
+    )
+    if runtime is None:
+        raise RuntimeError("review_unavailable")
+    runner = globals().get("_run_llm_with_selection")
+    if not callable(runner):
+        raise RuntimeError("review_unavailable")
+    operation = llm_service.generate
+    if runtime.get("provider") == "local":
+        def operation(*args, **kwargs):
+            try:
+                return llm_service.generate(*args, **kwargs)
+            finally:
+                llm_service.unload_model()
+    return runner(
+            runtime,
+            operation,
+            prompt=(
+                f"{review_request.instruction}\n"
+                f"Creative request:\n{review_request.creative_request}\n"
+                f"Ordered reference roles: {', '.join(review_request.sheet_roles)}"
+            ),
+            system_prompt=(
+                "Compare only the authored request and supplied outputs for the "
+                "exact bounded fidelity schema. Never moderate, decide "
+                "permissibility, classify maturity, analyze refusal, or infer an "
+                "unsupplied prompt or register. Return strict JSON."
+            ),
+            image_paths=[str(path) for path in review_request.sheet_paths],
+            max_new_tokens=512,
+            temperature=0.1,
+            top_p=0.9,
+            enable_thinking=False,
+            json_schema=dict(review_request.response_schema),
         )
-
-    result = _project_reference_local_generate(llm_service, parent_job, dict(
-        prompt=(
-            f"{review_request.instruction}\n"
-            f"Creative request:\n{review_request.creative_request}\n"
-            f"Ordered panel roles: {', '.join(review_request.panel_roles)}"
-        ),
-        system_prompt=(
-            "You are a local visual-fidelity reviewer. Evaluate only identity, "
-            "request, view, accessory, and style fidelity. Return strict JSON."
-        ),
-        image_paths=[str(review_request.sheet_path)],
-        max_new_tokens=512,
-        temperature=0.1,
-        top_p=0.9,
-        enable_thinking=False,
-        json_schema=dict(review_request.response_schema),
-        progress_callback=progress,
-    ))
-    if is_cancel_requested(parent_job):
-        raise RuntimeError("reference_job_cancelled")
-    return result
 
 
 def _attach_project_reference_result(
-    *, project_id, workspace_id, asset_id, asset_spec, result, parent_job,
-    candidate_index, candidate_count, parent_variant_id,
+    *, asset_id, result, parent_job, candidate_index, candidate_count,
+    parent_variant_id,
 ):
     if is_cancel_requested(parent_job):
         raise RuntimeError("reference_job_cancelled")
     artifacts = list(result.artifacts)
-    sheets = [item for item in artifacts if item.role == "sheet" and item.path is not None]
-    panels = [item for item in artifacts if item.role != "sheet" and item.path is not None]
-    if len(sheets) != 1:
-        raise RuntimeError("reference_sheet_output_invalid")
-    ordered = [sheets[0], *panels]
+    expected_output_roles = getattr(
+        result.plan, "output_roles", result.plan.sheet_roles,
+    )
+    if (
+        not artifacts
+        or tuple(item.role for item in artifacts) != expected_output_roles
+        or [item.index for item in artifacts] != list(range(len(artifacts)))
+    ):
+        raise RuntimeError("reference_pack_output_invalid")
     policy = public_output_policy(parent_job.get("access_policy") or {})
     lineage = {
         "parent_job_id": str(parent_job.get("id") or ""),
         "candidate_index": candidate_index + 1,
         "candidate_count": candidate_count,
+        "pack_sheet_count": len(artifacts),
         "parent_asset_id": asset_id,
         "parent_variant_id": parent_variant_id or None,
     }
+    reference_request = (
+        (parent_job.get("params") or {}).get("reference_pack") or {}
+    )
+    model_metadata = {
+        "generation_model": str(
+            reference_request.get("generation_model")
+            or result.plan.generation_model
+        ),
+    }
+    editor_model_type = reference_request.get("editor_model")
+    if isinstance(editor_model_type, str) and editor_model_type:
+        model_metadata["editor_model"] = editor_model_type
+    reference_metadata = {
+        **result.public_metadata(),
+        **model_metadata,
+        "planning_status": str(
+            reference_request.get("planning_status") or "deterministic"
+        ),
+    }
+    review = getattr(result, "review", None)
+    artifact_seals = tuple(getattr(review, "artifact_seals", ()) or ())
+    seal_by_index = {
+        seal.index: seal for seal in artifact_seals
+        if type(getattr(seal, "index", None)) is int
+    }
+    if artifact_seals and (
+        len(seal_by_index) != len(artifacts)
+        or any(
+            getattr(seal_by_index.get(artifact.index), "role", None)
+            != artifact.role
+            for artifact in artifacts
+        )
+    ):
+        raise RuntimeError("reference_pack_review_seal_invalid")
+    if (
+        getattr(result.plan, "review_contract", None)
+        == _PROJECT_REFERENCE_UNRESTRICTED_REVIEW
+        and len(seal_by_index) != len(artifacts)
+    ):
+        raise RuntimeError("reference_pack_review_seal_missing")
     outputs = []
-    for artifact in ordered:
+    for artifact in artifacts:
         artifact_metadata = artifact.public_metadata()
-        outputs.append({
+        # Visual concealment is deliberately orthogonal to access control.
+        # Clients may blur this output initially, while only ``policy`` decides
+        # whether the caller is authorized to fetch it.
+        artifact_metadata["private_output"] = bool(result.plan.private_output)
+        artifact_metadata["anchor_privacy"] = result.plan.anchor_privacy
+        artifact_metadata["initial_blur"] = bool(result.plan.initial_blur)
+        artifact_metadata["planning_status"] = reference_metadata[
+            "planning_status"
+        ]
+        schedule = (
+            reference_request.get("model_schedules") or {}
+        ).get(artifact.model)
+        if isinstance(schedule, dict):
+            artifact_metadata["schedule"] = dict(schedule)
+        output = {
             "source_path": str(artifact.path),
-            "label": "Reference sheet" if artifact.role == "sheet" else artifact.role,
+            "label": (
+                result.plan.sheets[artifact.index].label
+                if artifact.index < len(result.plan.sheets)
+                else f"Detail callout {artifact.index - len(result.plan.sheets) + 1}"
+            ),
             "metadata": {
                 **policy,
-                "reference_sheet": artifact_metadata,
+                "initial_blur": bool(result.plan.initial_blur),
+                "reference_pack": artifact_metadata,
                 "lineage": dict(lineage),
             },
-        })
+        }
+        approved = seal_by_index.get(artifact.index)
+        if approved is not None:
+            output["expected_source_identity"] = {
+                "device": approved.device,
+                "inode": approved.inode,
+                "size": approved.size,
+                "sha256": approved.sha256,
+            }
+        outputs.append(output)
         _write_project_reference_sidecar(
             str(artifact.path),
             parent_job=parent_job,
             model_type=artifact.model,
             artifact_metadata=artifact_metadata,
         )
+        if is_cancel_requested(parent_job):
+            raise RuntimeError("reference_job_cancelled")
 
-    variant_id = f"{parent_job['id']}_sheet_{candidate_index + 1}"
+    variant_id = f"{parent_job['id']}_pack_{candidate_index + 1}"
     variant_spec = {
         "id": variant_id,
-        "variant_type": "reference_sheet",
+        "variant_type": "reference_pack",
         "label": f"Candidate {candidate_index + 1}",
         "outputs": outputs,
         "provenance": {
@@ -13642,12 +16860,36 @@ def _attach_project_reference_result(
         },
         "status": "candidate",
         "metadata": {
-            "reference_sheet": result.public_metadata(),
+            "reference_pack": reference_metadata,
+            "private_authored_settings": copy.deepcopy(
+                result.plan.private_authored_settings()
+            ),
             "job": {
                 "id": str(parent_job.get("id") or ""),
-                "model": result.plan.model,
+                **model_metadata,
                 "candidate_index": candidate_index + 1,
                 "candidate_count": candidate_count,
+                "max_repair_attempts_per_candidate": (
+                    result.max_repair_attempts
+                ),
+                "repair_attempts_used_per_candidate": (
+                    result.repair_attempts_used
+                ),
+                "repair_attempts_requested_total": int(
+                    reference_request.get("repair_attempts_requested_total", 0)
+                    or 0
+                ),
+                "repair_attempts_used_total": int(
+                    reference_request.get("repair_attempts_used_total", 0)
+                    or 0
+                ),
+                "retry": {
+                    "parent_variant_id": parent_variant_id or None,
+                    "instruction_present": bool(
+                        reference_request.get("retry_instruction_present")
+                    ),
+                    "plan_seal": result.plan.plan_seal,
+                },
             },
             "policy": policy,
             "parent": {
@@ -13656,83 +16898,121 @@ def _attach_project_reference_result(
             },
         },
     }
-    store = _project_asset_store()
-    try:
-        asset = store.get_asset(project_id, workspace_id, asset_id)
-    except Exception as error:
-        from services.project_assets import ProjectAssetNotFoundError
-        if not isinstance(error, ProjectAssetNotFoundError):
-            raise
-        try:
-            asset = store.create_asset(
-                project_id,
-                workspace_id,
-                asset_id=asset_id,
-                name=asset_spec["name"],
-                asset_type=asset_spec["asset_type"],
-                description=asset_spec["description"],
-                tags=asset_spec["tags"],
-                provenance="generated",
-                metadata={},
-                variants=[variant_spec],
-            )
-            return next(item for item in asset["variants"] if item["id"] == variant_id)
-        except ValueError as create_error:
-            # A concurrent replay may have committed this stable identity
-            # after our miss. Re-read once; unrelated validation failures
-            # retain their original exception and never become an overwrite.
-            try:
-                asset = store.get_asset(project_id, workspace_id, asset_id)
-            except Exception:
-                raise create_error
-    existing = next(
-        (item for item in asset.get("variants") or [] if item.get("id") == variant_id),
-        None,
-    )
-    if existing is not None:
-        return existing
-    return store.add_variant(
-        project_id,
-        workspace_id,
-        asset_id,
-        variant_id=variant_id,
-        variant_type=variant_spec["variant_type"],
-        label=variant_spec["label"],
-        outputs=variant_spec["outputs"],
-        provenance=variant_spec["provenance"],
-        status=variant_spec["status"],
-        metadata=variant_spec["metadata"],
-    )
+    return variant_spec
 
 
 @api.post("/api/v1/projects/{project}/assets/generate")
 async def generate_project_asset_references(project: str, request: Request):
-    """Queue versioned local reference-sheet generation for one project card."""
+    """Queue one or more v2 ordered reference packs for a project card."""
+    from services.reference_sheets import (
+        PackIntelligenceSelection,
+        PackLoraSelection,
+        PackOperationRoute,
+        build_reference_pack_plan,
+    )
+
     project_id, workspace_id = _asset_scope(request, project)
     body = await request.json()
-    config = _project_reference_request_config(body, request)
-    # Keep the authorization guard visible at the route boundary as well as
-    # inside complete request validation; source-contract checks and future
-    # refactors must not be able to separate model visibility from submission.
+    owner_session_id = request.state.maestro_session_id
+    existing_asset = None
+    existing_asset_type = None
+    if isinstance(body, dict):
+        requested_asset_id = body.get("asset_id")
+        if (
+            isinstance(requested_asset_id, str)
+            and requested_asset_id
+            and len(requested_asset_id) <= 128
+        ):
+            try:
+                existing_asset = _require_project_asset_media_access(
+                    project_id,
+                    workspace_id,
+                    requested_asset_id,
+                    owner_session_id,
+                )
+                from services.reference_sheets import normalize_reference_pack_type
+                existing_asset_type = normalize_reference_pack_type(
+                    existing_asset.get("asset_type")
+                )
+            except Exception as error:
+                raise _project_asset_error(error) from error
+        parent_variant_id = body.get("parent_variant_id")
+        restore_private_fields = any(
+            field not in body for field in ("type_fields", "detail_callouts")
+        )
+        if (
+            restore_private_fields
+            and existing_asset is not None
+            and isinstance(parent_variant_id, str)
+            and parent_variant_id
+            and len(parent_variant_id) <= 128
+        ):
+            try:
+                _require_project_asset_media_access(
+                    project_id,
+                    workspace_id,
+                    requested_asset_id,
+                    owner_session_id,
+                    variant_id=parent_variant_id,
+                )
+                parent_variant = next(
+                    item for item in existing_asset.get("variants") or []
+                    if item.get("id") == parent_variant_id
+                )
+                if parent_variant.get("variant_type") == "reference_pack":
+                    private_snapshot = _project_reference_private_authored_snapshot(
+                        parent_variant,
+                    )
+                    body = copy.deepcopy(body)
+                    body.setdefault(
+                        "type_fields", private_snapshot["type_fields"],
+                    )
+                    body.setdefault(
+                        "detail_callouts",
+                        private_snapshot["detail_callouts"],
+                    )
+            except Exception as error:
+                raise _project_asset_error(error) from error
+    config = _project_reference_request_config(
+        body,
+        request,
+        existing_asset_type=existing_asset_type,
+    )
     _require_remote_visible_models(
         request,
         [config["model_type"], config.get("editor_model_type")],
     )
+    _require_model_recipe_terms(
+        list(dict.fromkeys(
+            model for model in (
+                config["model_type"],
+                config.get("editor_model_type"),
+                config["review_selection"].get("resolved_model"),
+                *(
+                    route.get("resolved_model")
+                    for route in config["operation_routing"]
+                ),
+            ) if model
+        )),
+    )
     workspace = project
     job_out_dir = _require_project_access(request, workspace)
-    owner_session_id = request.state.maestro_session_id
     asset_id = config["asset_id"]
+    new_asset_request = not bool(asset_id)
 
     try:
         if asset_id:
-            asset = _require_project_asset_media_access(
+            asset = existing_asset or _require_project_asset_media_access(
                 project_id, workspace_id, asset_id, owner_session_id,
             )
-            if asset.get("asset_type") not in {"character", "setting", "item", "style"}:
+            from services.reference_sheets import normalize_reference_pack_type
+            try:
+                existing_type = normalize_reference_pack_type(asset.get("asset_type"))
+            except ValueError as error:
                 raise HTTPException(status_code=400, detail="Unsupported reference asset type")
-            if body.get("asset_type") is not None and body.get("asset_type") != asset.get("asset_type"):
+            if body.get("asset_type") is not None and config["asset_type"] != existing_type:
                 raise HTTPException(status_code=409, detail="Reference asset type cannot change on retry")
-            config["asset_type"] = asset["asset_type"]
+            config["asset_type"] = existing_type
             if config["parent_variant_id"]:
                 _require_project_asset_media_access(
                     project_id,
@@ -13743,11 +17023,16 @@ async def generate_project_asset_references(project: str, request: Request):
                 )
             asset_spec = {
                 "name": asset["name"],
-                "asset_type": asset["asset_type"],
+                "asset_type": existing_type,
                 "description": asset.get("description") or "",
                 "tags": list(asset.get("tags") or []),
             }
-            response_asset = asset
+            authorized = _public_authorized_project_assets(
+                [asset], owner_session_id,
+            )
+            if not authorized:
+                raise HTTPException(status_code=404, detail="Reference asset not found")
+            response_asset = authorized[0]
         else:
             asset_id = uuid.uuid4().hex
             asset_spec = {
@@ -13771,15 +17056,130 @@ async def generate_project_asset_references(project: str, request: Request):
     creative_request = _project_reference_creative_request(asset, config)
     if not creative_request:
         raise HTTPException(status_code=400, detail="Reference request is empty")
+    sealed_operation_routing = tuple(
+        PackOperationRoute(**item) for item in config["operation_routing"]
+    )
+    plan = build_reference_pack_plan(
+        reference_type=config["asset_type"],
+        mode=config["mode"],
+        intent=config["intent"],
+        depth=config["depth"],
+        creative_request=creative_request,
+        generation_model=config["model_type"],
+        editor_model=config.get("editor_model_type"),
+        preset=config["preset"],
+        sheet_count=(config["sheet_count"] if config["depth"] == "custom" else None),
+        sheet_size=config["draft_size"],
+        anchor_basis=config["anchor_basis"],
+        managed_layout_assist=config["managed_layout_assist"],
+        user_lora_count=len(config["activated_loras"]),
+        type_fields=config["type_fields"],
+        detail_callouts=config["detail_callouts"],
+        planning=PackIntelligenceSelection(**config["planning"]),
+        review_selection=PackIntelligenceSelection(**config["review_selection"]),
+        generation_schedule=config["model_schedules"][config["model_type"]],
+        editor_schedule=(
+            config["model_schedules"][config["editor_model_type"]]
+            if config.get("editor_model_type") else None
+        ),
+        content_capability=config["content_capability"],
+        private_output=config["policy"]["private"],
+        initial_blur=config["initial_blur"],
+        intelligence_policy=config["intelligence_policy"],
+        review_contract=config["review_contract"],
+        operation_routing=sealed_operation_routing,
+    )
+    sealed_loras = []
+    for selection in config["additional_loras"]:
+        roles = []
+        if "generation" in selection["resolved_scopes"]:
+            roles.extend(
+                plan.sheet_roles
+                if plan.mode == "draft" else plan.sheet_roles[:1]
+            )
+        if "editing" in selection["resolved_scopes"] and plan.mode != "draft":
+            roles.extend(plan.output_roles[1:])
+        sealed_loras.append(PackLoraSelection(
+            lora_id=selection["id"],
+            multiplier=selection["multiplier"],
+            requested_scope=selection["requested_scope"],
+            resolved_scopes=tuple(selection["resolved_scopes"]),
+            roles=tuple(dict.fromkeys(roles)),
+            revision=selection["revision"],
+            source_sha256=selection["source_sha256"],
+            skipped_reason=selection["skipped_reason"],
+        ))
+    if sealed_loras:
+        plan = build_reference_pack_plan(
+            reference_type=config["asset_type"],
+            mode=config["mode"],
+            intent=config["intent"],
+            depth=config["depth"],
+            creative_request=creative_request,
+            generation_model=config["model_type"],
+            editor_model=config.get("editor_model_type"),
+            preset=config["preset"],
+            sheet_count=(config["sheet_count"] if config["depth"] == "custom" else None),
+            sheet_size=config["draft_size"],
+            anchor_basis=config["anchor_basis"],
+            managed_layout_assist=config["managed_layout_assist"],
+            user_lora_count=len(config["activated_loras"]),
+            type_fields=config["type_fields"],
+            detail_callouts=config["detail_callouts"],
+            planning=PackIntelligenceSelection(**config["planning"]),
+            review_selection=PackIntelligenceSelection(**config["review_selection"]),
+            generation_schedule=config["model_schedules"][config["model_type"]],
+            editor_schedule=(
+                config["model_schedules"][config["editor_model_type"]]
+                if config.get("editor_model_type") else None
+            ),
+            content_capability=config["content_capability"],
+            private_output=config["policy"]["private"],
+            initial_blur=config["initial_blur"],
+            intelligence_policy=config["intelligence_policy"],
+            review_contract=config["review_contract"],
+            operation_routing=sealed_operation_routing,
+            additional_loras=tuple(sealed_loras),
+        )
     job_id = uuid.uuid4().hex[:8]
-    panel_count = {
-        "character": 6, "setting": 5, "item": 5, "style": 5,
-    }[config["asset_type"]]
-    # Production/Hybrid reserve enough denominator for the bounded worst case:
-    # one repair and one second compose/review pass. A no-repair run simply
-    # completes before the ceiling and transitions to 100% at final attach.
-    operations_per_candidate = 3 if config["mode"] == "draft" else panel_count + 4
-    total_steps = operations_per_candidate * config["candidate_count"]
+    repair_budget = 0 if config["mode"] == "draft" else config["max_repair_attempts"]
+    # One failed canonical anchor regenerates every authored output in the
+    # candidate, while other failed roles repair only one output. Reserve the
+    # larger bounded path so step/total never moves backward when the reviewer
+    # selects the anchor late in execution.
+    operations_per_repair = max(2, len(plan.output_roles) + 1)
+    operations_per_candidate = (
+        len(plan.output_roles) + 2
+        + (operations_per_repair * repair_budget)
+    )
+    total_steps = 1 + operations_per_candidate * config["candidate_count"]
+    reference_params = {
+        **plan.public_preview(candidate_count=config["candidate_count"]),
+        "review_requested": config["review_selection"]["requested_model"] != "off",
+        "max_repair_attempts": repair_budget,
+        "max_repair_attempts_per_candidate": repair_budget,
+        "repair_attempts_requested_total": repair_budget * config["candidate_count"],
+        "repair_attempts_used": 0,
+        "repair_attempts_used_total": 0,
+        "model_schedules": copy.deepcopy(config["model_schedules"]),
+        "retry_instruction_present": bool(config["edit_instruction"]),
+        "intelligence_recipe": copy.deepcopy(config["intelligence_recipe"]),
+        "resource_seal": plan.resource_seal,
+        "sealed_additional_loras": [
+            {
+                "id": item.lora_id,
+                "weight": item.multiplier,
+                "requested_scope": item.requested_scope,
+                "resolved_scopes": list(item.resolved_scopes),
+                "roles": list(item.roles),
+                "revision": item.revision,
+                "source_sha256": item.source_sha256,
+                "skipped_reason": item.skipped_reason,
+            }
+            for item in sealed_loras
+        ],
+        "private_authored_settings": plan.private_authored_settings(),
+    }
     job = {
         "id": job_id,
         "status": "queued",
@@ -13787,22 +17187,9 @@ async def generate_project_asset_references(project: str, request: Request):
         "step": 0,
         "total_steps": total_steps,
         "phase": "Planning",
-        "message": "Queued reference-sheet planning",
+        "message": "Queued reference-pack planning",
         "created_at": time.time(),
-        "params": {
-            "reference_sheet": {
-                "schema_version": 1,
-                "planner_version": "reference-sheet-v1",
-                "mode": config["mode"],
-                "asset_type": config["asset_type"],
-                "candidate_count": config["candidate_count"],
-                "panel_size": list(config["panel_size"]),
-                "draft_size": list(config["draft_size"]),
-                "columns": config["columns"],
-                "palette_swatches": config["palette_swatches"],
-                "review_requested": config["review"],
-            },
-        },
+        "params": {"reference_pack": reference_params},
         "output_files": [],
         "error": None,
         "workspace": workspace,
@@ -13815,18 +17202,27 @@ async def generate_project_asset_references(project: str, request: Request):
         "prompt_preview": "",
         "model_type": config["model_type"],
         "generation_mode": "image",
-        "requested_outputs": config["candidate_count"],
+        "resource_intent": "text",
+        "resource_execution": "standard",
+        "preemption_mode": "none",
+        "resource_state": "queued",
+        "execution_attempt": 1,
+        "requested_outputs": len(plan.output_roles) * config["candidate_count"],
     }
     _begin_workspace_operation(project_id)
 
     def _run_and_attach_candidates(_job_id):
         from services.reference_sheets import (
-            build_reference_sheet_plan,
-            create_reference_sheet,
+            create_reference_pack,
         )
+
+        nonlocal plan
 
         parent_job = _jobs[_job_id]
         completed_sheets = []
+        published_variant_ids = []
+        replayed_variants = []
+        staged_results = []
         step_state = {"value": 0}
 
         def next_step(phase):
@@ -13843,38 +17239,179 @@ async def generate_project_asset_references(project: str, request: Request):
             return step_state["value"]
 
         try:
+            # Planning owns no image or GPU-generation slot. Queue pause/hold
+            # remains authoritative, but admitted local text may coexist with
+            # one ordinary GPU generation through the dedicated CPU lane.
+            while not is_cancel_requested(parent_job):
+                queue_state_reader = globals().get("queue_control_state")
+                paused = bool(
+                    callable(queue_state_reader)
+                    and queue_state_reader().get("paused", False)
+                )
+                if not parent_job.get("queue_held", False) and not paused:
+                    break
+                time.sleep(0.1)
             if not try_start(
                 parent_job,
-                message="Planning reference sheets",
+                message="Planning sealed reference packs",
                 phase="Planning",
                 total_steps=total_steps,
             ):
                 return
+            next_step("Planning sealed reference packs")
+
+            # Freeze potentially large user LoRAs only after durable job
+            # registration. Re-resolving here also detects selection drift
+            # before either an intelligence or image model is loaded.
+            if config["additional_loras"]:
+                update_job(
+                    parent_job,
+                    phase="Freezing reference resources",
+                    message="Freezing selected Reference Studio resources",
+                )
+                frozen_loras = _project_reference_resolve_additional_loras(
+                    body.get("additional_loras"),
+                    generation_model=config["model_type"],
+                    editor_model=config.get("editor_model_type"),
+                    operation_models=config["operation_models"],
+                    freeze=True,
+                )
+                frozen_selections = []
+                for selection in frozen_loras:
+                    roles = []
+                    if "generation" in selection["resolved_scopes"]:
+                        roles.extend(
+                            plan.sheet_roles
+                            if plan.mode == "draft" else plan.sheet_roles[:1]
+                        )
+                    if (
+                        "editing" in selection["resolved_scopes"]
+                        and plan.mode != "draft"
+                    ):
+                        roles.extend(plan.output_roles[1:])
+                    frozen_selections.append(PackLoraSelection(
+                        lora_id=selection["id"],
+                        multiplier=selection["multiplier"],
+                        requested_scope=selection["requested_scope"],
+                        resolved_scopes=tuple(selection["resolved_scopes"]),
+                        roles=tuple(dict.fromkeys(roles)),
+                        revision=selection["revision"],
+                        source_sha256=selection["source_sha256"],
+                        skipped_reason=selection["skipped_reason"],
+                    ))
+                config["additional_loras"] = frozen_loras
+                plan = build_reference_pack_plan(
+                    reference_type=config["asset_type"],
+                    mode=config["mode"],
+                    intent=config["intent"],
+                    depth=config["depth"],
+                    creative_request=creative_request,
+                    generation_model=config["model_type"],
+                    editor_model=config.get("editor_model_type"),
+                    preset=config["preset"],
+                    sheet_count=(
+                        config["sheet_count"]
+                        if config["depth"] == "custom" else None
+                    ),
+                    sheet_size=config["draft_size"],
+                    anchor_basis=config["anchor_basis"],
+                    managed_layout_assist=config["managed_layout_assist"],
+                    user_lora_count=len(config["activated_loras"]),
+                    type_fields=config["type_fields"],
+                    detail_callouts=config["detail_callouts"],
+                    planning=PackIntelligenceSelection(**config["planning"]),
+                    review_selection=PackIntelligenceSelection(
+                        **config["review_selection"]
+                    ),
+                    generation_schedule=config["model_schedules"][config["model_type"]],
+                    editor_schedule=(
+                        config["model_schedules"][config["editor_model_type"]]
+                        if config.get("editor_model_type") else None
+                    ),
+                    content_capability=config["content_capability"],
+                    private_output=config["policy"]["private"],
+                    initial_blur=config["initial_blur"],
+                    intelligence_policy=config["intelligence_policy"],
+                    review_contract=config["review_contract"],
+                    operation_routing=sealed_operation_routing,
+                    additional_loras=tuple(frozen_selections),
+                )
+                frozen_public = plan.public_preview(
+                    candidate_count=config["candidate_count"]
+                )
+                parent_job["params"]["reference_pack"].update(frozen_public)
+                parent_job["params"]["reference_pack"]["resource_seal"] = (
+                    plan.resource_seal
+                )
+                parent_job["params"]["reference_pack"]["sealed_additional_loras"] = [
+                    {
+                        "id": item.lora_id,
+                        "weight": item.multiplier,
+                        "requested_scope": item.requested_scope,
+                        "resolved_scopes": list(item.resolved_scopes),
+                        "roles": list(item.roles),
+                        "revision": item.revision,
+                        "source_sha256": item.source_sha256,
+                        "skipped_reason": item.skipped_reason,
+                    }
+                    for item in frozen_selections
+                ]
+            plan = _project_reference_run_planning(
+                request, parent_job, plan, config,
+            )
+            current_attempt = int(
+                parent_job.get("execution_attempt") or 1
+            )
+            transition = globals().get("transition_resource_execution")
+            if callable(transition):
+                if transition(
+                    parent_job,
+                    expected_execution_attempt=current_attempt,
+                    intent="text",
+                    execution="standard",
+                    preemption_mode="none",
+                    state="queued",
+                    message="Reference planning complete; waiting for image child",
+                ) is None:
+                    raise RuntimeError("reference_job_cancelled")
+            else:
+                # Isolated legacy harnesses have no durability adapter.
+                parent_job.update({
+                    "resource_intent": "text",
+                    "resource_execution": "standard",
+                    "preemption_mode": "none",
+                    "resource_state": "queued",
+                })
             for candidate_index in range(config["candidate_count"]):
-                variant_id = f"{job_id}_sheet_{candidate_index + 1}"
+                variant_id = f"{job_id}_pack_{candidate_index + 1}"
                 try:
                     current_asset = _project_asset_store().get_asset(
                         project_id, workspace_id, asset_id,
                     )
                 except Exception:
                     current_asset = None
-                if current_asset is not None and any(
-                    item.get("id") == variant_id
-                    for item in current_asset.get("variants") or []
-                ):
+                existing_variant = next((
+                    item for item in (current_asset or {}).get("variants") or []
+                    if item.get("id") == variant_id
+                ), None)
+                if existing_variant is not None:
+                    try:
+                        _project_reference_validate_committed_variant(
+                            _project_asset_store(),
+                            project_id,
+                            workspace_id,
+                            existing_variant,
+                            job_id=job_id,
+                            candidate_index=candidate_index + 1,
+                            candidate_count=config["candidate_count"],
+                            plan_seal=plan.plan_seal,
+                            mandatory_review=config["mandatory_review"],
+                        )
+                    except Exception:
+                        raise RuntimeError("reference_pack_variant_collision")
+                    replayed_variants.append(existing_variant)
                     step_state["value"] += operations_per_candidate
                     continue
-
-                plan = build_reference_sheet_plan(
-                    asset_type=config["asset_type"],
-                    mode=config["mode"],
-                    creative_request=creative_request,
-                    model=config["model_type"],
-                    panel_size=config["panel_size"],
-                    draft_size=config["draft_size"],
-                    columns=config["columns"],
-                    palette_swatches=config["palette_swatches"],
-                )
 
                 def adjusted_seed(index):
                     if config["seed"] < 0:
@@ -13884,111 +17421,133 @@ async def generate_project_asset_references(project: str, request: Request):
                         config["seed"] + candidate_index * 100 + index,
                     )
 
-                def generate_panel(panel_request):
+                def artifact_seed_metadata(sheet_request):
+                    metadata = {
+                        "schema_version": 2,
+                        "planner_version": "reference-pack-v2",
+                        "role": sheet_request.role,
+                        "index": sheet_request.index,
+                        "model": sheet_request.model,
+                        "provenance": {
+                            "strategy": sheet_request.strategy,
+                            "version": "reference-pack-v2",
+                            "anchor_role": plan.anchor_role,
+                        },
+                        "schedule": dict(config["model_schedules"][sheet_request.model]),
+                        "reason_codes": [],
+                    }
+                    if sheet_request.detail_custom_id is not None:
+                        metadata["detail"] = {
+                            "custom_id": sheet_request.detail_custom_id,
+                            "kind": sheet_request.detail_kind,
+                            "source_role": sheet_request.source_role,
+                            "requested_operation": sheet_request.requested_operation,
+                            "resolved_operation": sheet_request.operation,
+                            "label_digest": sheet_request.detail_label_digest,
+                            "seal": sheet_request.detail_seal,
+                        }
+                    return metadata
+
+                def generate_sheet(sheet_request):
                     phase = (
-                        f"Generating candidate {candidate_index + 1}/{config['candidate_count']} "
-                        f"panel {panel_request.index + 1}/{panel_request.panel_count}"
+                        f"Generating pack {candidate_index + 1}/{config['candidate_count']} "
+                        f"sheet {sheet_request.index + 1}/{sheet_request.sheet_count}"
                     )
                     step = next_step(phase)
-                    prompt = (
-                        f"Generate exactly one {panel_request.asset_type} reference panel. "
-                        f"Role: {panel_request.label}. Objective: {panel_request.objective}. "
-                        "Keep the requested identity and design consistent. No collage, "
-                        "no captions, no labels, no borders. "
-                        f"Creative request: {panel_request.creative_request}"
-                    )
+                    if sheet_request.strategy == "canonical_anchor":
+                        prompt = (
+                            f"Create the canonical {sheet_request.reference_type} reference sheet. "
+                            f"Anchor basis: {sheet_request.anchor_basis}. Role: {sheet_request.label}. "
+                            f"Objective: {sheet_request.objective}. This is the single immutable "
+                            "visual source for every derivative in this candidate pack. Use a "
+                            "deterministic clean reference layout and preserve exact requested "
+                            f"details. Creative request: {sheet_request.creative_request}"
+                        )
+                    else:
+                        prompt = (
+                            f"Create one Draft compatibility sheet for this {sheet_request.reference_type}. "
+                            f"Role: {sheet_request.label}. Objective: {sheet_request.objective}. "
+                            "This Draft is an independent one-shot and does not claim anchored "
+                            f"cross-sheet continuity. Creative request: {sheet_request.creative_request}"
+                        )
                     params = _project_reference_generation_params(
                         config,
-                        model_type=config["model_type"],
+                        model_type=sheet_request.model,
                         prompt=prompt,
-                        size=panel_request.panel_size,
-                        seed=adjusted_seed(panel_request.index),
+                        size=sheet_request.sheet_size,
+                        seed=adjusted_seed(sheet_request.index),
+                        operation_scope="generation",
                     )
                     return _run_project_reference_image_job(
                         parent_job, params,
-                        role=panel_request.role,
+                        role=sheet_request.role,
                         phase=phase,
                         step=step,
                         total_steps=total_steps,
+                        artifact_metadata=artifact_seed_metadata(sheet_request),
                     )
 
-                def edit_panel(anchor_path, panel_request):
+                def edit_sheet(primary_path, anchor_path, sheet_request):
                     phase = (
-                        f"Editing candidate {candidate_index + 1}/{config['candidate_count']} "
-                        f"panel {panel_request.index + 1}/{panel_request.panel_count}"
+                        f"Deriving pack {candidate_index + 1}/{config['candidate_count']} "
+                        f"sheet {sheet_request.index + 1}/{sheet_request.sheet_count}"
                     )
                     step = next_step(phase)
+                    exact_guard = (
+                        "Do not invent, reconstruct, or infer absent identity-bearing detail. "
+                        if sheet_request.intent == "exact_spec" else ""
+                    )
                     prompt = (
-                        "Create a new targeted reference view from the attached identity "
-                        "anchor. Preserve identity, design, materials, and palette. "
-                        f"Role: {panel_request.label}. Objective: {panel_request.objective}. "
-                        "Output one clean panel with no collage, captions, labels, or borders. "
-                        f"Creative request: {panel_request.creative_request}"
+                        "Create a new ordered reference sheet guided by the attached primary "
+                        "source and full canonical anchor. Preserve identity, geometry, design, "
+                        f"materials, and palette. {exact_guard}Role: {sheet_request.label}. "
+                        f"Objective: {sheet_request.objective}. Requested detail operation: "
+                        f"{sheet_request.operation or 'enhance'}. Creative request: "
+                        f"{sheet_request.creative_request}"
                     )
                     params = _project_reference_generation_params(
                         config,
-                        model_type=config["editor_model_type"],
+                        model_type=sheet_request.model,
                         prompt=prompt,
-                        size=panel_request.panel_size,
-                        seed=adjusted_seed(panel_request.index),
-                        reference_path=anchor_path,
+                        size=sheet_request.sheet_size,
+                        seed=adjusted_seed(sheet_request.index),
+                        reference_path=[primary_path, anchor_path],
+                        operation_scope="editing",
                     )
                     return _run_project_reference_image_job(
                         parent_job, params,
-                        role=panel_request.role,
+                        role=sheet_request.role,
                         phase=phase,
                         step=step,
                         total_steps=total_steps,
+                        artifact_metadata=artifact_seed_metadata(sheet_request),
                     )
 
-                def generate_draft(draft_request):
-                    phase = f"Generating draft sheet {candidate_index + 1}/{config['candidate_count']}"
-                    step = next_step(phase)
-                    prompt = (
-                        f"Create one compatibility reference sheet for this {draft_request.asset_type}: "
-                        f"{draft_request.creative_request}. Include the ordered views "
-                        f"{', '.join(draft_request.panel_labels)} and one embedded palette "
-                        "region within the sheet. Clear, identity-consistent design for "
-                        "future image and video conditioning; no separate palette image."
-                    )
-                    params = _project_reference_generation_params(
-                        config,
-                        model_type=config["model_type"],
-                        prompt=prompt,
-                        size=draft_request.draft_size,
-                        seed=adjusted_seed(0),
-                    )
-                    return _run_project_reference_image_job(
-                        parent_job, params,
-                        role="sheet",
-                        phase=phase,
-                        step=step,
-                        total_steps=total_steps,
-                    )
-
-                def repair_panel(original_path, repair_request):
+                def repair_sheet(original_path, anchor_path, repair_request):
                     phase = (
-                        f"Repairing candidate {candidate_index + 1}/{config['candidate_count']} "
-                        f"panel {repair_request.label}"
+                        f"Repairing pack {candidate_index + 1}/{config['candidate_count']} "
+                        f"sheet {repair_request.label}"
                     )
                     step = next_step(phase)
-                    use_editor = config["mode"] == "hybrid"
+                    exact_guard = (
+                        "Do not invent absent identity-bearing detail. "
+                        if config["intent"] == "exact_spec" else ""
+                    )
                     prompt = (
-                        "Create one corrected replacement reference panel. "
+                        "Create one corrected reference-guided replacement sheet. "
                         f"Role: {repair_request.label}. Objective: {repair_request.objective}. "
                         f"Correction reasons: {', '.join(repair_request.reason_codes)}. "
-                        "Preserve the requested design and output no collage, captions, "
-                        f"labels, or borders. Creative request: {repair_request.creative_request}"
+                        f"{exact_guard}Preserve the immutable canonical anchor, requested "
+                        f"design, and layout. Creative request: {repair_request.creative_request}"
                     )
                     params = _project_reference_generation_params(
                         config,
-                        model_type=(
-                            config["editor_model_type"] if use_editor else config["model_type"]
-                        ),
+                        model_type=repair_request.model,
                         prompt=prompt,
-                        size=repair_request.panel_size,
-                        seed=adjusted_seed(plan.panel_roles.index(repair_request.role) + 50),
-                        reference_path=original_path if use_editor else None,
+                        size=repair_request.sheet_size,
+                        seed=adjusted_seed(plan.output_roles.index(repair_request.role) + 50),
+                        reference_path=[original_path, anchor_path],
+                        operation_scope="editing",
                     )
                     return _run_project_reference_image_job(
                         parent_job, params,
@@ -14000,70 +17559,264 @@ async def generate_project_asset_references(project: str, request: Request):
 
                 def reviewer(review_request):
                     next_step(
-                        f"Composing candidate {candidate_index + 1}/{config['candidate_count']}"
+                        f"Reviewing pack {candidate_index + 1}/{config['candidate_count']}"
                     )
                     update_job(
                         parent_job,
                         phase="Reviewing fidelity",
                         message=(
-                            f"Reviewing candidate {candidate_index + 1}/"
+                            f"Reviewing pack {candidate_index + 1}/"
                             f"{config['candidate_count']} fidelity"
                         ),
                     )
-                    if not config["review"]:
+                    if config["review_selection"]["resolved_model"] is None:
                         raise RuntimeError("review_unavailable")
-                    return _project_reference_local_reviewer(parent_job, review_request)
+                    return _project_reference_selected_reviewer(
+                        request, parent_job, review_request, config,
+                    )
 
-                output_path = os.path.join(
-                    job_out_dir,
-                    f"reference_sheet_{job_id}_{candidate_index + 1}.png",
-                )
-                result = create_reference_sheet(
+                result = create_reference_pack(
                     plan,
-                    output_path,
-                    generate_panel=generate_panel,
-                    edit_panel=edit_panel,
-                    generate_draft=generate_draft,
+                    generate_sheet=generate_sheet,
+                    edit_sheet=edit_sheet if config["mode"] != "draft" else None,
                     reviewer=reviewer,
-                    repair_panel=repair_panel,
+                    repair_sheet=repair_sheet if config["mode"] != "draft" else None,
+                    max_repair_attempts=repair_budget,
                 )
+                reference_job_params = parent_job["params"]["reference_pack"]
+                reference_job_params["repair_attempts_used"] += (
+                    result.repair_attempts_used
+                )
+                reference_job_params["repair_attempts_used_total"] += (
+                    result.repair_attempts_used
+                )
+                reference_job_params["review"] = {
+                    **config["review_selection"],
+                    "status": result.review.status,
+                }
+                # All modes stage candidate specs before one manifest commit.
+                # Mandatory review failure therefore has no visibility window,
+                # while standard/off retains its existing review semantics.
+                staged_results.append((candidate_index, result))
+                if config["mandatory_review"] and result.review.status != "pass":
+                    reference_job_params["quality_failure"] = {
+                        "status": result.review.status,
+                        "failed_roles": list(result.review.failed_roles),
+                        "reason_codes": list(result.review.reason_codes),
+                        "review_contract": config["review_contract"],
+                    }
+                    raise RuntimeError(_PROJECT_REFERENCE_QUALITY_FAILURE)
                 next_step(
-                    f"Attaching candidate {candidate_index + 1}/{config['candidate_count']}"
+                    f"Staging pack {candidate_index + 1}/"
+                    f"{config['candidate_count']}"
                 )
-                _attach_project_reference_result(
-                    project_id=project_id,
-                    workspace_id=workspace_id,
+                if not _project_reference_wait_at_output_boundary(
+                    parent_job, "candidate",
+                ):
+                    raise RuntimeError("reference_job_cancelled")
+
+            update_job(
+                parent_job,
+                phase="Publishing reference packs",
+                message="Publishing prepared reference packs",
+            )
+            prepared_variants = []
+            for candidate_index, result in staged_results:
+                prepared_variants.append(_attach_project_reference_result(
                     asset_id=asset_id,
-                    asset_spec=asset_spec,
                     result=result,
                     parent_job=parent_job,
                     candidate_index=candidate_index,
                     candidate_count=config["candidate_count"],
                     parent_variant_id=config["parent_variant_id"],
-                )
-                completed_sheets.append(os.path.basename(str(result.sheet_path)))
+                ))
 
-            finish_job(
-                parent_job,
-                "completed",
-                progress=100,
-                step=total_steps,
-                total_steps=total_steps,
-                phase="",
-                message="Reference sheets ready",
-                output_files=completed_sheets,
-                error=None,
-            )
-        except Exception:
+            from services import job_lifecycle as _job_lifecycle
+            store = _project_asset_store()
+            # Cancellation, one-manifest publication, and terminal completion
+            # share the canonical lifecycle lock order. Cancellation can win
+            # only before the visible manifest commit; after commit, completion
+            # wins and durable recovery can repeat finalization without models.
+            with (
+                _job_lifecycle._queue_condition,
+                _job_lifecycle._lifecycle_lock,
+                store.publication_guard(),
+            ):
+                if is_cancel_requested(parent_job):
+                    finish_job(
+                        parent_job,
+                        "failed",
+                        progress=0,
+                        phase="",
+                        message="Reference-pack generation cancelled",
+                        error="Reference-pack generation cancelled",
+                    )
+                else:
+                    expected_variant_ids = [
+                        f"{job_id}_pack_{index + 1}"
+                        for index in range(config["candidate_count"])
+                    ]
+                    checkpoint = globals().get("checkpoint_recovery_job")
+                    if not callable(checkpoint) or not checkpoint(
+                        parent_job,
+                        recovery_state="publication_prepared",
+                        recovery_unit={
+                            "kind": "project_reference_publication",
+                            "asset_id": asset_id,
+                            "workspace_id": workspace_id,
+                            "variant_ids": expected_variant_ids,
+                            "candidate_count": config["candidate_count"],
+                            "plan_seal": plan.plan_seal,
+                            "mandatory_review": config["mandatory_review"],
+                        },
+                        reruns_denoise=False,
+                        phase="publishing_approved_reference_packs",
+                        message="Approved reference packs prepared for publication",
+                    ):
+                        raise RuntimeError(
+                            "reference_pack_publication_checkpoint_failed"
+                        )
+                    attached_variants = []
+                    if new_asset_request:
+                        published_asset = store.create_asset(
+                            project_id,
+                            workspace_id,
+                            asset_id=asset_id,
+                            name=asset_spec["name"],
+                            asset_type=asset_spec["asset_type"],
+                            description=asset_spec["description"],
+                            tags=asset_spec["tags"],
+                            provenance="generated",
+                            metadata={},
+                            variants=prepared_variants,
+                        )
+                        attached_variants = published_asset["variants"]
+                    else:
+                        attached_variants = store.add_variants_atomic(
+                            project_id,
+                            workspace_id,
+                            asset_id,
+                            prepared_variants,
+                            expected_existing_variants=replayed_variants,
+                        )
+                    committed_by_id = {
+                        item["id"]: item
+                        for item in (*replayed_variants, *attached_variants)
+                    }
+                    if set(committed_by_id) != set(expected_variant_ids):
+                        raise RuntimeError("reference_pack_publication_incomplete")
+                    for candidate_index, variant_id in enumerate(
+                        expected_variant_ids, start=1,
+                    ):
+                        _project_reference_validate_committed_variant(
+                            store,
+                            project_id,
+                            workspace_id,
+                            committed_by_id[variant_id],
+                            job_id=job_id,
+                            candidate_index=candidate_index,
+                            candidate_count=config["candidate_count"],
+                            plan_seal=plan.plan_seal,
+                            mandatory_review=config["mandatory_review"],
+                        )
+                    published_variant_ids.extend(expected_variant_ids)
+                    for variant_id in expected_variant_ids:
+                        completed_sheets.extend(
+                            output.get("relative_path")
+                            for output in (
+                                committed_by_id[variant_id].get("outputs") or []
+                            )
+                            if isinstance(output.get("relative_path"), str)
+                        )
+                    if published_variant_ids:
+                        try:
+                            finalized = finish_job(
+                                parent_job,
+                                "completed",
+                                progress=100,
+                                step=total_steps,
+                                total_steps=total_steps,
+                                phase="",
+                                message="Reference packs ready",
+                                output_files=completed_sheets,
+                                error=None,
+                                recovery_state="terminal",
+                            )
+                            if finalized is False:
+                                raise RuntimeError(
+                                    "reference_pack_finalization_pending"
+                                )
+                        except Exception:
+                            if parent_job.get("status") == "completed":
+                                continue_finalization = False
+                            else:
+                                continue_finalization = True
+                            pending = {
+                                "recovery_state": "publication_committed_finalization_pending",
+                                "reruns_denoise": False,
+                                "phase": "publication_committed",
+                                "message": (
+                                    "Reference packs committed; finalization requires recovery"
+                                ),
+                                "error": (
+                                    "Reference-pack finalization requires recovery"
+                                ),
+                                "resource_state": "blocked",
+                            }
+                            if continue_finalization:
+                                blocker = globals().get("block_generation_recovery")
+                                parked = False
+                                if callable(blocker):
+                                    try:
+                                        parked = bool(blocker(parent_job, **pending))
+                                    except Exception:
+                                        parked = False
+                                if not parked:
+                                    parent_job.update({
+                                        **pending,
+                                        "status": "queued",
+                                        "queue_held": True,
+                                    })
+                    else:
+                        finish_job(
+                            parent_job,
+                            "completed",
+                            progress=100,
+                            step=total_steps,
+                            total_steps=total_steps,
+                            phase="",
+                            message="Reference packs ready",
+                            output_files=completed_sheets,
+                            error=None,
+                        )
+        except Exception as error:
+            if (
+                parent_job.get("status") == "queued"
+                and not is_cancel_requested(parent_job)
+            ):
+                block_resource_admission_failure(parent_job)
+                return
+            quality_failed = str(error) == _PROJECT_REFERENCE_QUALITY_FAILURE
             finish_job(
                 parent_job,
                 "failed",
                 progress=0,
                 phase="",
-                message="Reference-sheet generation failed",
-                error="Reference-sheet generation failed",
+                message=(
+                    "Reference-pack fidelity quality review failed"
+                    if quality_failed else "Reference-pack generation failed"
+                ),
+                error=(
+                    "Reference-pack fidelity quality review failed"
+                    if quality_failed else "Reference-pack generation failed"
+                ),
             )
         finally:
+            for _candidate_index, result in staged_results:
+                for source_path in result.private_source_paths:
+                    _cleanup_project_reference_private_source(
+                        source_path, job_out_dir,
+                    )
             _end_workspace_operation(project_id)
 
     try:
@@ -14076,7 +17829,11 @@ async def generate_project_asset_references(project: str, request: Request):
     except Exception as error:
         _end_workspace_operation(project_id)
         raise _project_asset_error(error) from error
-    return {"job_id": job_id, "asset": response_asset}
+    return {
+        "job_id": job_id,
+        "asset": response_asset,
+        "plan": plan.public_preview(candidate_count=config["candidate_count"]),
+    }
 
 
 # ============================================================================
@@ -16664,6 +20421,749 @@ def _resolve_direct_llm_selection(request: Request) -> dict:
     return selection
 
 
+def _cpu_text_operation_eligible(
+    selection: dict,
+    *,
+    operation_name: str,
+    text_only: bool,
+    job: dict | None,
+) -> bool:
+    """Classify only server-owned operation/capability facts."""
+    if (
+        operation_name not in _CPU_TEXT_OPERATIONS
+        or text_only is not True
+        or str(selection.get("provider") or "local").casefold() != "local"
+        or selection.get("vision_capable") is not False
+    ):
+        return False
+    if isinstance(job, dict):
+        model_type = str(job.get("model_type") or "").casefold()
+        generation_mode = str(job.get("generation_mode") or "").casefold()
+        if model_type.startswith("minimax_h3"):
+            return False
+        if generation_mode not in {"", "image", "video", "avatar"}:
+            return False
+    return True
+
+
+def _cpu_text_required_host_bytes(llm_service, selection: dict) -> int:
+    """Return a conservative private load+KV/transient RAM requirement."""
+    model_gb = 0.0
+    known = False
+    estimator = getattr(llm_service, "_catalog_model_size_gb", None)
+    if callable(estimator):
+        try:
+            model_gb, known = estimator(
+                str(selection.get("model_id") or ""),
+                str(selection.get("local_gguf_path") or ""),
+            )
+        except (OSError, TypeError, ValueError):
+            model_gb, known = 0.0, False
+    if not known:
+        path = str(selection.get("local_gguf_path") or "")
+        try:
+            if path and os.path.isfile(path):
+                model_gb = os.path.getsize(path) / float(1 << 30)
+                known = True
+        except OSError:
+            known = False
+    # Unknown model size must fail CPU coexistence admission rather than guess
+    # around a resident generation stack. The standard lane remains available.
+    if not known or not math.isfinite(float(model_gb)) or model_gb <= 0:
+        return 1 << 62
+    return int(math.ceil((float(model_gb) * 1.30 + 4.0) * (1 << 30)))
+
+
+def _cpu_text_host_snapshot(llm_service, selection: dict) -> HostAdmissionSnapshot:
+    try:
+        available, total = wgp._host_memory_snapshot()
+    except Exception:
+        available, total = 0, 0
+    try:
+        import psutil
+        cpu_percent = float(psutil.cpu_percent(interval=None))
+    except Exception:
+        cpu_percent = 100.0
+    try:
+        defaults = llm_service.get_cpu_coexistence_defaults()
+    except Exception:
+        defaults = {}
+    worker_threads = max(1, min(64, int(defaults.get("max_threads", 8) or 8)))
+    return HostAdmissionSnapshot(
+        available_bytes=max(0, int(available or 0)),
+        total_bytes=max(0, int(total or 0)),
+        required_bytes=_cpu_text_required_host_bytes(llm_service, selection),
+        logical_threads=max(0, int(os.cpu_count() or 0)),
+        worker_threads=worker_threads,
+        cpu_percent=cpu_percent,
+    )
+
+
+def _cpu_text_generation_waiter_exists(job: dict | None = None) -> bool:
+    """Preserve generation queue/residency priority over opportunistic LLM GPU."""
+    return any(
+        candidate is not job
+        and candidate.get("status") == "queued"
+        and not candidate.get("queue_held", False)
+        and not is_cancel_requested(candidate)
+        and candidate.get("resource_intent", RESOURCE_INTENT_GENERATION)
+            == RESOURCE_INTENT_GENERATION
+        for candidate in _jobs.values()
+        if isinstance(candidate, dict)
+    )
+
+
+def _cpu_text_job_cancelled(job: dict | None) -> bool:
+    return bool(isinstance(job, dict) and is_cancel_requested(job))
+
+
+def _cpu_text_transition(
+    job: dict | None,
+    *,
+    expected_attempt: int | None,
+    state: str,
+    execution: str,
+    increment_attempt: bool = False,
+    reset_progress: bool = False,
+    **updates,
+) -> int | None:
+    if not isinstance(job, dict):
+        return 1 if expected_attempt is None else expected_attempt
+    updates.setdefault("_resource_preemption_eligible", False)
+    return transition_resource_execution(
+        job,
+        expected_execution_attempt=expected_attempt,
+        intent=RESOURCE_INTENT_TEXT,
+        execution=execution,
+        preemption_mode=(
+            "discard_restart"
+            if execution == RESOURCE_EXECUTION_CPU else "none"
+        ),
+        state=state,
+        increment_attempt=increment_attempt,
+        reset_progress=reset_progress,
+        **updates,
+    )
+
+
+def _cpu_text_runtime_preemption_eligible(control: object, tokens) -> bool:
+    """Accept only exact attempt-bound, decision-grade runtime evidence."""
+    if not isinstance(control, dict) or tokens is None:
+        return False
+    remaining = control.get("remaining")
+    if not isinstance(remaining, dict):
+        return False
+    runtime_generation = tokens.runtime_generation
+    runtime_attempt_id = tokens.runtime_attempt_id
+    estimate = control.get("remaining_estimate_seconds")
+    return bool(
+        control.get("abort_capable") is True
+        and control.get("preemptible") is True
+        and control.get("generation") == runtime_generation
+        and control.get("attempt_id") == runtime_attempt_id
+        and remaining.get("state") == "decision_grade"
+        and remaining.get("decision_eligible") is True
+        and remaining.get("runtime_generation") == runtime_generation
+        and remaining.get("attempt_id") == runtime_attempt_id
+        and isinstance(estimate, (int, float))
+        and not isinstance(estimate, bool)
+        and math.isfinite(float(estimate))
+        and estimate >= 0
+    )
+
+
+def _cpu_text_revoke_preemption_if_published(
+    job: dict | None,
+    execution_attempt: int,
+) -> None:
+    """Withdraw restart copy as soon as decision evidence becomes unknown."""
+    if not isinstance(job, dict) or job.get(
+        "_resource_preemption_eligible",
+    ) is not True:
+        return
+    _cpu_text_transition(
+        job,
+        expected_attempt=execution_attempt,
+        state="running",
+        execution=RESOURCE_EXECUTION_CPU,
+        message="Running text preparation on the slower CPU lane",
+    )
+
+
+def _cpu_text_restore_after_abandoned_preemption(
+    job: dict | None,
+    execution_attempt: int,
+) -> None:
+    """Return an untransferred CPU attempt to nonpreemptible running state."""
+    _cpu_text_transition(
+        job,
+        expected_attempt=execution_attempt,
+        state="running",
+        execution=RESOURCE_EXECUTION_CPU,
+        message="Continuing the CPU text attempt",
+    )
+
+
+def _cpu_text_speed_estimate(
+    llm_service,
+    selection: dict,
+    *,
+    device: str,
+) -> dict | None:
+    try:
+        estimate = llm_service.get_model_speed_estimate(
+            str(selection.get("model_id") or ""),
+            local_gguf_path=str(selection.get("local_gguf_path") or ""),
+            gguf_file_override=str(selection.get("gguf_file_override") or ""),
+            device=device,
+            multimodal=False,
+            use_current_measurement=False,
+        )
+    except Exception:
+        return None
+    if not isinstance(estimate, dict) or estimate.get("confidence") != "measured":
+        return None
+    rate = estimate.get("generation_tokens_per_second")
+    if (
+        not isinstance(rate, (int, float))
+        or isinstance(rate, bool)
+        or not math.isfinite(float(rate))
+        or rate <= 0
+    ):
+        return None
+    return estimate
+
+
+def _cpu_text_break_even_estimate(
+    llm_service,
+    selection: dict,
+    *,
+    runtime_remaining_seconds: float | None,
+) -> BreakEvenEstimate:
+    if (
+        not isinstance(runtime_remaining_seconds, (int, float))
+        or isinstance(runtime_remaining_seconds, bool)
+        or not math.isfinite(float(runtime_remaining_seconds))
+        or runtime_remaining_seconds < 0
+    ):
+        return BreakEvenEstimate(None, None, None, None)
+    cpu = _cpu_text_speed_estimate(llm_service, selection, device="cpu")
+    gpu = _cpu_text_speed_estimate(llm_service, selection, device="cuda")
+    if cpu is None or gpu is None:
+        return BreakEvenEstimate(None, None, None, None)
+    cpu_rate = float(cpu["generation_tokens_per_second"])
+    gpu_rate = float(gpu["generation_tokens_per_second"])
+    cpu_remaining = float(runtime_remaining_seconds)
+    remaining_tokens = cpu_remaining * cpu_rate
+    required = _cpu_text_required_host_bytes(llm_service, selection)
+    if required >= (1 << 61):
+        return BreakEvenEstimate(None, None, None, None)
+    # Abort has a hard 5s terminate + 5s kill budget. Model movement uses a
+    # conservative 1 GiB/s floor plus fixed startup/warmup, so a preemption
+    # must win despite—not by ignoring—weight movement.
+    model_gb = max(0.1, required / float(1 << 30) / 1.30)
+    return BreakEvenEstimate(
+        cpu_remaining_seconds=cpu_remaining,
+        stop_release_seconds=10.0,
+        gpu_load_seconds=10.0 + model_gb,
+        gpu_remaining_seconds=remaining_tokens / gpu_rate,
+    )
+
+
+def _cpu_text_preemption_monitor(
+    *,
+    llm_service,
+    selection: dict,
+    job: dict | None,
+    owner_key: str,
+    lease,
+    execution_attempt: int,
+    stopped: threading.Event,
+    outcome: dict,
+    handoff_ready: threading.Event,
+    handoff_acknowledged: threading.Event,
+    handoff_abandoned: threading.Event,
+    handoff_transferred: threading.Event,
+    monitor_done: threading.Event,
+) -> None:
+    """Reserve the GPU first, then abort only an exact known-slower CPU attempt."""
+    while not stopped.wait(0.5):
+        if _cpu_text_job_cancelled(job):
+            monitor_done.set()
+            return
+        tokens = _cpu_text_lane.runtime_tokens(owner_key)
+        if tokens is None:
+            _cpu_text_revoke_preemption_if_published(
+                job, execution_attempt,
+            )
+            continue
+        try:
+            control = llm_service.get_local_runtime_control()
+        except Exception:
+            _cpu_text_revoke_preemption_if_published(
+                job, execution_attempt,
+            )
+            continue
+        if not isinstance(control, dict):
+            _cpu_text_revoke_preemption_if_published(
+                job, execution_attempt,
+            )
+            continue
+        if (
+            control.get("execution") != "cooperative_cpu"
+            or not _cpu_text_runtime_preemption_eligible(control, tokens)
+        ):
+            _cpu_text_revoke_preemption_if_published(
+                job, execution_attempt,
+            )
+            continue
+        estimate = _cpu_text_break_even_estimate(
+            llm_service,
+            selection,
+            runtime_remaining_seconds=control.get(
+                "remaining_estimate_seconds",
+            ),
+        )
+        if not _cpu_text_preemption_gate.permits(owner_key, estimate):
+            continue
+        if _cpu_text_generation_waiter_exists(job):
+            continue
+        if not _gen_lock.acquire(blocking=False):
+            continue
+        keep_reservation = False
+        try:
+            requested = _cpu_text_transition(
+                job,
+                expected_attempt=execution_attempt,
+                state="preemption_requested",
+                execution=RESOURCE_EXECUTION_CPU,
+                message=(
+                    "Restarting text preparation on acceleration because it "
+                    "is predicted to finish sooner"
+                ),
+                _resource_preemption_eligible=True,
+            )
+            if requested is None:
+                return
+            if stopped.is_set():
+                _cpu_text_transition(
+                    job,
+                    expected_attempt=execution_attempt,
+                    state="running",
+                    execution=RESOURCE_EXECUTION_CPU,
+                    message="CPU text attempt completed before handoff",
+                )
+                return
+            current_tokens = _cpu_text_lane.runtime_tokens(owner_key)
+            if current_tokens != tokens:
+                _cpu_text_restore_after_abandoned_preemption(
+                    job, execution_attempt,
+                )
+                return
+            try:
+                fresh_control = llm_service.get_local_runtime_control()
+            except Exception:
+                fresh_control = None
+            if (
+                not isinstance(fresh_control, dict)
+                or fresh_control.get("execution") != "cooperative_cpu"
+                or not _cpu_text_runtime_preemption_eligible(
+                    fresh_control, current_tokens,
+                )
+            ):
+                _cpu_text_restore_after_abandoned_preemption(
+                    job, execution_attempt,
+                )
+                return
+            try:
+                result = llm_service.abort_local_cpu_runtime(
+                    tokens.runtime_generation,
+                    tokens.runtime_attempt_id,
+                    terminate_timeout=5.0,
+                    kill_timeout=5.0,
+                )
+            except Exception:
+                _cpu_text_transition(
+                    job,
+                    expected_attempt=execution_attempt,
+                    state="running",
+                    execution=RESOURCE_EXECUTION_CPU,
+                    message="Continuing the CPU text attempt",
+                )
+                return
+            if handoff_abandoned.is_set():
+                _cpu_text_restore_after_abandoned_preemption(
+                    job, execution_attempt,
+                )
+                return
+            if not isinstance(result, dict) or result.get("resources_released") is not True:
+                _cpu_text_transition(
+                    job,
+                    expected_attempt=execution_attempt,
+                    state="running",
+                    execution=RESOURCE_EXECUTION_CPU,
+                    message="Continuing the CPU text attempt",
+                )
+                return
+            releasing = _cpu_text_transition(
+                job,
+                expected_attempt=execution_attempt,
+                state="resources_releasing",
+                execution=RESOURCE_EXECUTION_CPU,
+                message="CPU text resources released",
+            )
+            if releasing is None:
+                return
+            if handoff_abandoned.is_set():
+                _cpu_text_restore_after_abandoned_preemption(
+                    job, execution_attempt,
+                )
+                return
+            handoff_ready.set()
+            while not handoff_acknowledged.wait(0.05):
+                if handoff_abandoned.is_set():
+                    _cpu_text_restore_after_abandoned_preemption(
+                        job, execution_attempt,
+                    )
+                    return
+            if handoff_abandoned.is_set():
+                _cpu_text_restore_after_abandoned_preemption(
+                    job, execution_attempt,
+                )
+                return
+            _cpu_text_preemption_gate.record(owner_key)
+            outcome.update({"preempted": True, "gpu_reserved": True})
+            keep_reservation = True
+            handoff_transferred.set()
+            return
+        finally:
+            if not keep_reservation:
+                _gen_lock.release()
+            monitor_done.set()
+    monitor_done.set()
+
+
+def _cpu_text_fenced_progress(
+    callback,
+    job: dict | None,
+    execution_attempt: int,
+):
+    if not callable(callback) or not isinstance(job, dict):
+        return callback
+
+    def publish(event):
+        from services import job_lifecycle as lifecycle
+        # The attempt check and downstream progress mutation share the same
+        # re-entrant lifecycle fence as restart/cancel. An attempt cannot
+        # increment in the gap between validation and publication.
+        with lifecycle._lifecycle_lock:
+            if (
+                not is_cancel_requested(job)
+                and job.get("execution_attempt", 1) == execution_attempt
+            ):
+                return callback(event)
+        return None
+
+    return publish
+
+
+def _run_cpu_text_llm_attempt(
+    selection: dict,
+    operation,
+    args: tuple,
+    kwargs: dict,
+    *,
+    job: dict | None,
+    operation_name: str,
+):
+    """Run one sealed operation on standard/GPU or the sole CPU text lane."""
+    from services import llm_service
+
+    owner_key = (
+        str(job.get("id") or "") if isinstance(job, dict)
+        else f"ephemeral-{uuid.uuid4().hex}"
+    )
+    execution_attempt = (
+        max(1, int(job.get("execution_attempt", 1) or 1))
+        if isinstance(job, dict) else 1
+    )
+    _cpu_text_transition(
+        job,
+        expected_attempt=execution_attempt,
+        state="queued",
+        execution=RESOURCE_EXECUTION_STANDARD,
+        message="Waiting for text execution resources",
+    )
+
+    cpu_lease = None
+    gpu_reserved = False
+    while not _cpu_text_job_cancelled(job):
+        # A queued generation retains residency/fairness priority. If no such
+        # work exists, atomically reserve the standard accelerator lane.
+        if not _cpu_text_generation_waiter_exists(job) and _gen_lock.acquire(
+            blocking=False,
+        ):
+            gpu_reserved = True
+            break
+        if _gen_lock.locked():
+            cpu_lease, decision = _cpu_text_lane.acquire(
+                owner_key,
+                snapshot_supplier=lambda: _cpu_text_host_snapshot(
+                    llm_service, selection,
+                ),
+                cancel_requested=lambda: _cpu_text_job_cancelled(job),
+                poll_interval=0.1,
+                timeout=0.35,
+            )
+            if cpu_lease is not None:
+                # The generation holder may have exited while this caller was
+                # waiting for the sole CPU lease. Prefer the accelerator when
+                # it is now atomically reservable; never start a stale slow
+                # attempt merely because the earlier observation was busy.
+                if (
+                    not _cpu_text_generation_waiter_exists(job)
+                    and _gen_lock.acquire(blocking=False)
+                ):
+                    cpu_lease.release()
+                    cpu_lease = None
+                    gpu_reserved = True
+                break
+            if (
+                decision.reason in {
+                    "memory_pressure", "thread_pressure", "cpu_pressure",
+                }
+                and isinstance(job, dict)
+                and job.get("resource_state") != "blocked"
+            ):
+                _cpu_text_transition(
+                    job,
+                    expected_attempt=execution_attempt,
+                    state="blocked",
+                    execution=RESOURCE_EXECUTION_STANDARD,
+                    message=(
+                        "Waiting for safe host resources for concurrent text "
+                        "preparation"
+                    ),
+                )
+        time.sleep(0.05)
+    if _cpu_text_job_cancelled(job):
+        if gpu_reserved:
+            _gen_lock.release()
+        _cpu_text_preemption_gate.clear(owner_key)
+        raise llm_service.LocalRuntimeAbortedError(
+            0, 0, resources_released=True,
+        )
+
+    load_args = {
+        key: selection.get(key, "")
+        for key in (
+            "model_id", "device", "provider", "remote_url", "api_key",
+            "local_gguf_path", "gguf_file_override",
+        )
+    }
+    if cpu_lease is None:
+        try:
+            resident_type = str(
+                getattr(wgp, "transformer_type", "") or ""
+            ).casefold()
+            if resident_type.startswith("minimax_h3") and (
+                getattr(wgp, "wan_model", None) is not None
+                or getattr(wgp, "offloadobj", None) is not None
+            ):
+                print("[LLM] Releasing H3 before local language-model load")
+                wgp.release_model()
+            current = _cpu_text_transition(
+                job,
+                expected_attempt=execution_attempt,
+                state="running",
+                execution=RESOURCE_EXECUTION_STANDARD,
+                message=f"Running {operation_name.replace('_', ' ')}",
+            )
+            if current is None:
+                raise llm_service.LocalRuntimeAbortedError(
+                    0, 0, resources_released=True,
+                )
+            attempt_kwargs = dict(kwargs)
+            if "progress_callback" in attempt_kwargs:
+                attempt_kwargs["progress_callback"] = _cpu_text_fenced_progress(
+                    attempt_kwargs.get("progress_callback"), job, current,
+                )
+            with llm_service.loaded_model_lease(**load_args):
+                return operation(*args, **attempt_kwargs)
+        finally:
+            if gpu_reserved:
+                _gen_lock.release()
+            _cpu_text_preemption_gate.clear(owner_key)
+
+    current = _cpu_text_transition(
+        job,
+        expected_attempt=execution_attempt,
+        state="admitted",
+        execution=RESOURCE_EXECUTION_CPU,
+        message="Admitted to the slower CPU text lane",
+    )
+    if current is None:
+        cpu_lease.release()
+        raise llm_service.LocalRuntimeAbortedError(
+            0, 0, resources_released=True,
+        )
+    outcome = {"preempted": False, "gpu_reserved": False}
+    stopped = threading.Event()
+    handoff_ready = threading.Event()
+    handoff_acknowledged = threading.Event()
+    handoff_abandoned = threading.Event()
+    handoff_transferred = threading.Event()
+    monitor_done = threading.Event()
+    monitor = None
+    result = None
+    aborted_error = None
+    try:
+        current = _cpu_text_transition(
+            job,
+            expected_attempt=current,
+            state="running",
+            execution=RESOURCE_EXECUTION_CPU,
+            message="Running text preparation on the slower CPU lane",
+        )
+        if current is None:
+            raise llm_service.LocalRuntimeAbortedError(
+                0, 0, resources_released=True,
+            )
+        attempt_kwargs = dict(kwargs)
+        if "progress_callback" in attempt_kwargs:
+            attempt_kwargs["progress_callback"] = _cpu_text_fenced_progress(
+                attempt_kwargs.get("progress_callback"), job, current,
+            )
+        with llm_service.loaded_model_lease(
+            **load_args, cpu_coexistence=True,
+        ):
+            control = llm_service.get_local_runtime_control()
+            generation = int(control.get("generation") or 0)
+            with llm_service.local_runtime_attempt(generation) as runtime_attempt:
+                runtime_tokens = _cpu_text_lane.bind_runtime_tokens(
+                    cpu_lease,
+                    runtime_generation=generation,
+                    runtime_attempt_id=runtime_attempt,
+                )
+                runtime_control = llm_service.get_local_runtime_control()
+                decision_eligible = _cpu_text_runtime_preemption_eligible(
+                    runtime_control, runtime_tokens,
+                )
+                current = _cpu_text_transition(
+                    job,
+                    expected_attempt=current,
+                    state="running",
+                    execution=RESOURCE_EXECUTION_CPU,
+                    message=(
+                        "Running text preparation on CPU; this attempt may "
+                        "restart on acceleration if delivery becomes faster"
+                        if decision_eligible
+                        else "Running text preparation on the slower CPU lane"
+                    ),
+                    _resource_preemption_eligible=decision_eligible,
+                )
+                if current is None:
+                    raise llm_service.LocalRuntimeAbortedError(
+                        generation, runtime_attempt, resources_released=False,
+                    )
+                monitor = threading.Thread(
+                    target=_cpu_text_preemption_monitor,
+                    kwargs={
+                        "llm_service": llm_service,
+                        "selection": selection,
+                        "job": job,
+                        "owner_key": owner_key,
+                        "lease": cpu_lease,
+                        "execution_attempt": current,
+                        "stopped": stopped,
+                        "outcome": outcome,
+                        "handoff_ready": handoff_ready,
+                        "handoff_acknowledged": handoff_acknowledged,
+                        "handoff_abandoned": handoff_abandoned,
+                        "handoff_transferred": handoff_transferred,
+                        "monitor_done": monitor_done,
+                    },
+                    daemon=True,
+                    name=f"cpu-text-preemption-{owner_key}",
+                )
+                monitor.start()
+                try:
+                    result = operation(*args, **attempt_kwargs)
+                except llm_service.LocalRuntimeAbortedError as error:
+                    aborted_error = error
+    finally:
+        stopped.set()
+        _cpu_text_lane.clear_runtime_tokens(cpu_lease)
+        cpu_lease.release()
+        if monitor is not None:
+            deadline = time.monotonic() + 12.0
+            while (
+                not handoff_ready.is_set()
+                and not monitor_done.is_set()
+                and time.monotonic() < deadline
+            ):
+                monitor_done.wait(timeout=0.05)
+            if handoff_ready.is_set() and not monitor_done.is_set():
+                handoff_acknowledged.set()
+                # After acknowledgment the monitor performs no blocking work;
+                # wait for the explicit ownership-transfer confirmation.
+                handoff_transferred.wait()
+                monitor.join()
+            else:
+                handoff_abandoned.set()
+                monitor.join(timeout=0.25)
+
+    if not outcome.get("preempted"):
+        if outcome.get("gpu_reserved"):
+            _gen_lock.release()
+        _cpu_text_preemption_gate.clear(owner_key)
+        if aborted_error is not None:
+            raise aborted_error
+        return result
+
+    # The previous result/error is intentionally discarded. The monitor holds
+    # the exact GPU reservation until this thread has confirmed CPU lease exit.
+    restarted_attempt = _cpu_text_transition(
+        job,
+        expected_attempt=current,
+        state="restarting_on_accelerator",
+        execution=RESOURCE_EXECUTION_STANDARD,
+        increment_attempt=True,
+        reset_progress=True,
+        message="Restarting the sealed text operation on acceleration",
+    )
+    if restarted_attempt is None:
+        _gen_lock.release()
+        _cpu_text_preemption_gate.clear(owner_key)
+        if aborted_error is not None:
+            raise aborted_error
+        raise llm_service.LocalRuntimeAbortedError(
+            0, 0, resources_released=True,
+        )
+    try:
+        running_attempt = _cpu_text_transition(
+            job,
+            expected_attempt=restarted_attempt,
+            state="running",
+            execution=RESOURCE_EXECUTION_STANDARD,
+            message="Running restarted text preparation on acceleration",
+        )
+        if running_attempt is None:
+            raise llm_service.LocalRuntimeAbortedError(
+                0, 0, resources_released=True,
+            )
+        restart_kwargs = dict(kwargs)
+        if "progress_callback" in restart_kwargs:
+            restart_kwargs["progress_callback"] = _cpu_text_fenced_progress(
+                restart_kwargs.get("progress_callback"), job, running_attempt,
+            )
+        with llm_service.loaded_model_lease(**load_args):
+            return operation(*args, **restart_kwargs)
+    finally:
+        _gen_lock.release()
+        _cpu_text_preemption_gate.clear(owner_key)
+
+
 def _run_authorized_llm_with_selection(
     request: Request,
     selection: dict,
@@ -16691,7 +21191,20 @@ def _run_authorized_llm_with_selection(
             return None
         return operation(*args, **kwargs)
 
-    return _run_llm_with_selection(selection, run_after_load)
+    return _run_llm_with_selection(
+        selection,
+        run_after_load,
+        _cpu_text_job=getattr(
+            request.state, "maestro_cpu_text_job", None,
+        ),
+        _cpu_text_operation=str(getattr(
+            request.state, "maestro_cpu_text_operation", "",
+        ) or ""),
+        _cpu_text_text_only=bool(getattr(
+            request.state, "maestro_cpu_text_text_only", False,
+        )),
+        _coordinate_generation=True,
+    )
 
 
 def _run_llm_with_selection(
@@ -16699,10 +21212,62 @@ def _run_llm_with_selection(
     operation=None,
     /,
     *args,
+    _coordinate_generation: bool = True,
+    _cpu_text_job: dict | None = None,
+    _cpu_text_operation: str = "",
+    _cpu_text_text_only: bool = False,
     **kwargs,
 ):
     """Hold one exact model identity across load and optional inference."""
     from services import llm_service
+
+    cpu_classifier = globals().get("_cpu_text_operation_eligible")
+    if callable(cpu_classifier) and cpu_classifier(
+        selection,
+        operation_name=_cpu_text_operation,
+        text_only=_cpu_text_text_only,
+        job=_cpu_text_job,
+    ):
+        if operation is None:
+            operation = lambda: None
+        return _run_cpu_text_llm_attempt(
+            selection,
+            operation,
+            args,
+            kwargs,
+            job=_cpu_text_job,
+            operation_name=_cpu_text_operation,
+        )
+
+    # A resident H3 stack and a local GGUF can together exhaust host RAM even
+    # when neither is using much VRAM. Serialize with the generation owner and
+    # retire H3 before the local model lease begins. Remote providers own no
+    # local model memory and intentionally skip this path.
+    if (
+        _coordinate_generation
+        and str(selection.get("provider") or "local").casefold() == "local"
+    ):
+        with _gen_lock:
+            resident_type = str(
+                getattr(wgp, "transformer_type", "") or ""
+            ).casefold()
+            if resident_type.startswith("minimax_h3") and (
+                getattr(wgp, "wan_model", None) is not None
+                or getattr(wgp, "offloadobj", None) is not None
+            ):
+                print("[LLM] Releasing H3 before local language-model load")
+                wgp.release_model()
+            load_args = {
+                key: selection.get(key, "")
+                for key in (
+                    "model_id", "device", "provider", "remote_url", "api_key",
+                    "local_gguf_path", "gguf_file_override",
+                )
+            }
+            with llm_service.loaded_model_lease(**load_args):
+                if operation is None:
+                    return None
+                return operation(*args, **kwargs)
 
     load_args = {
         key: selection.get(key, "")
@@ -16715,6 +21280,9 @@ def _run_llm_with_selection(
         if operation is None:
             return None
         return operation(*args, **kwargs)
+
+
+_run_llm_with_selection._maestro_cpu_text_lane = True
 
 
 def _prepare_llm_selection(selection: dict) -> None:
@@ -17880,6 +22448,9 @@ async def llm_enhance_prompt(request: Request):
     enhancer_enabled = int(wgp.server_config.get("enhancer_enabled", 0) or 0)
     explicit_guidance = _explicit_llm_guidance_allowed(body)
     explicit_provider = ""
+    durable_generation_preparation = bool(
+        getattr(request.state, "maestro_generation_preparation", False)
+    )
     if explicit_guidance:
         explicit_provider = str(
             wgp.server_config.get("services", {}).get("llm_provider")
@@ -17894,6 +22465,7 @@ async def llm_enhance_prompt(request: Request):
         enhancer_enabled > 0
         and not needs_h3_context_ir
         and not explicit_guidance
+        and not durable_generation_preparation
     ):
         try:
             # Support both single image_path and array image_paths
@@ -17912,6 +22484,11 @@ async def llm_enhance_prompt(request: Request):
         print(
             "[Enhance] Explicit request requires server-owned authoring "
             "guidance; bypassing the generic Wan2GP enhancer"
+        )
+    elif enhancer_enabled > 0 and durable_generation_preparation:
+        print(
+            "[Enhance] Durable generation preparation uses the serialized "
+            "local LLM lane"
         )
 
     # Use our local LLM service
@@ -17954,6 +22531,27 @@ async def llm_enhance_prompt(request: Request):
             _resolve_direct_llm_selection, request,
         )
     )
+    try:
+        selection["vision_capable"] = bool(
+            llm_service.get_model_capabilities(
+                str(selection.get("model_id") or ""),
+                local_gguf_path=str(
+                    selection.get("local_gguf_path") or ""
+                ),
+                gguf_file_override=str(
+                    selection.get("gguf_file_override") or ""
+                ),
+            ).get("vision_capable", True)
+        )
+    except Exception:
+        # Capability is a server stamp, not a caller hint. Unknown must remain
+        # on the ordinary serialized lane instead of risking multimodal RAM.
+        selection["vision_capable"] = None
+    if not getattr(request.state, "maestro_cpu_text_operation", None):
+        request.state.maestro_cpu_text_operation = "prompt_enhancement"
+    request.state.maestro_cpu_text_text_only = bool(
+        not authorized_image_paths and not needs_h3_context_ir
+    )
 
     # Collect image paths for vision-enabled LLM
     llm_image_paths = authorized_image_paths
@@ -17961,11 +22559,13 @@ async def llm_enhance_prompt(request: Request):
     # Load LoRA info for activated LoRAs — extract ONLY trigger words and key tips
     lora_hint_text = ""
     activated_loras = body.get("activated_loras") or []
-    print(f"[Enhance] LoRA check: activated_loras={activated_loras}, model_type={model_type}")
+    print(
+        "[Enhance] LoRA context: "
+        f"count={len(activated_loras)}, model_selected={bool(model_type)}"
+    )
     if activated_loras and model_type:
         try:
             lora_dir = wgp.get_lora_dir(model_type)
-            print(f"[Enhance] LoRA dir: {lora_dir}")
             # Only inject trigger words from the CivitAI sidecar's
             # trainedWords field. Do NOT extract triggers from guide prose —
             # guide descriptions like "include the trigger phrase 'Unchained'"
@@ -17985,7 +22585,6 @@ async def llm_enhance_prompt(request: Request):
 
                 if trigger_words:
                     trigger_lines.append(f"- {', '.join(trigger_words[:5])}")
-                print(f"[Enhance] LoRA '{lora_name}': triggers={trigger_words[:3]}, sidecar={os.path.isfile(sidecar_path)}")
 
             if trigger_lines:
                 any_leet = any(any(c.isdigit() for c in ln) for ln in trigger_lines)
@@ -18017,7 +22616,10 @@ async def llm_enhance_prompt(request: Request):
                     "Do NOT invent variants. Do NOT include a trigger that does not "
                     "match the scene." + leet_block + "]\n"
                 ) + "\n".join(trigger_lines)
-                print(f"[Enhance] Loaded {len(trigger_lines)} trigger block(s): {lora_hint_text[:200]}")
+                print(
+                    f"[Enhance] Loaded {len(trigger_lines)} private LoRA "
+                    "trigger block(s)"
+                )
             else:
                 print(f"[Enhance] No LoRA triggers extractable from {len(activated_loras)} LoRA(s)")
         except Exception as e:
@@ -18079,7 +22681,10 @@ async def llm_enhance_prompt(request: Request):
     except HTTPException:
         raise
     except Exception as error:
-        traceback.print_exc()
+        print(
+            "[Enhance] Prompt enhancement failed "
+            f"({type(error).__name__})"
+        )
         raise HTTPException(
             status_code=500,
             detail="Prompt enhancement failed; check the local Maestro logs",
@@ -20320,6 +24925,43 @@ async def director_v2_plan(request: Request):
         )
 
 
+def _plan_generation_submission(
+    body: dict,
+    request: Request,
+    *,
+    turbo_validation_authorized: bool = False,
+    require_terms: bool = True,
+) -> tuple[dict | None, dict | None]:
+    """Apply the authoritative H3 plan and return its bounded estimate."""
+    _require_h3_native_boundary_experimental(body)
+    _validate_h3_sampling_steps(body)
+    _validate_h3_explicit_multiclip_request(body)
+    plan = _prepare_h3_long_studio_request(body)
+    _require_h3_acceleration_available(body, plan)
+    estimate_context = _h3_estimate_context(body, plan)
+    _validate_h3_turbo_estimate_context(
+        estimate_context,
+        _h3_turbo_validation_authorized=turbo_validation_authorized,
+    )
+    _validate_h3_spectrum_estimate_context(estimate_context)
+    _validate_h3_lightx2v_estimate_context(estimate_context)
+    _require_remote_visible_models(
+        request,
+        _h3_effective_model_types(body, plan),
+    )
+    if require_terms:
+        _require_h3_generation_terms(body, plan)
+    estimate = None
+    if str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS:
+        estimate = _h3_profile_estimate_payload(
+            estimate_context,
+            include_residency=not bool(
+                getattr(request.state, "maestro_remote", False)
+            ),
+        )["current"]["estimate"]
+    return plan, estimate
+
+
 @api.post("/api/v1/generate/plan")
 async def preview_generation_plan(request: Request):
     """Build the same long-form plan used at submission without queuing work."""
@@ -20343,20 +24985,12 @@ async def preview_generation_plan(request: Request):
     _normalize_video_prompt_type(body)
     _normalize_image_prompt_type(body)
     try:
-        _require_h3_native_boundary_experimental(body)
-        _validate_h3_sampling_steps(body)
-        plan = _prepare_h3_long_studio_request(body)
-        _require_h3_acceleration_available(body, plan)
+        plan, _estimate = _plan_generation_submission(
+            body, request, require_terms=False,
+        )
         estimate_context = _h3_estimate_context(body, plan)
-        _validate_h3_turbo_estimate_context(estimate_context)
-        _validate_h3_spectrum_estimate_context(estimate_context)
-        _validate_h3_lightx2v_estimate_context(estimate_context)
     except (TypeError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _require_remote_visible_models(
-        request,
-        _h3_effective_model_types(body, plan),
-    )
     requirements = _h3_generation_requirements(body, plan)
     remote_visible = _remote_visible_model_ids(request)
     if remote_visible is not None:
@@ -20414,6 +25048,10 @@ def h3_acceleration_status(probe: bool = False):
 
 
 _h3_benchmark_cache = None
+_h3_allocation_ledger = None
+_H3_PEAK_RECOVERY_POLICY_VERSION = 1
+_H3_PEAK_RECOVERY_HEADROOM_RATIO = 0.85
+_H3_PEAK_RECOVERY_HOST_HEADROOM_RATIO = 0.25
 
 
 def _get_h3_benchmark_cache():
@@ -20424,6 +25062,131 @@ def _get_h3_benchmark_cache():
             os.path.join(_app_dir, "storage", "h3_benchmarks.json")
         )
     return _h3_benchmark_cache
+
+
+def _get_h3_allocation_ledger():
+    global _h3_allocation_ledger
+    if _h3_allocation_ledger is None:
+        from services.h3_benchmark import H3AllocationLedger
+        _h3_allocation_ledger = H3AllocationLedger(
+            os.path.join(_app_dir, "storage", "h3_allocation_evidence.json")
+        )
+    return _h3_allocation_ledger
+
+
+def _h3_allocation_scenario(
+    params: dict,
+    *,
+    frame_count: int,
+    resource_kind: str = "cuda_allocation",
+) -> dict:
+    custom = params.get("custom_settings")
+    custom = custom if isinstance(custom, dict) else {}
+    identity = _h3_peak_recovery_identity(params, frame_count=frame_count)
+    from services.oom_detect import safe_allocator_facts
+    allocator = safe_allocator_facts()
+    host_available, _host_total = wgp._host_memory_snapshot()
+    gib = 1 << 30
+    attention_payload = json.dumps({
+        key: identity[key]
+        for key in (
+            "attention_engine", "sol_tau", "sol_dense_steps",
+            "sol_dense_blocks", "sol_min_tokens",
+        )
+        if key in identity
+    }, sort_keys=True, separators=(",", ":"))
+    attention_signature = "sha256-" + hashlib.sha256(
+        attention_payload.encode("ascii")
+    ).hexdigest()
+    schedule = str(custom.get("h3_turbo_profile") or "native")
+    return {
+        "model_type": identity["model_type"],
+        "width": identity["width"],
+        "height": identity["height"],
+        "frame_count": int(frame_count),
+        "authored_steps": identity["sampling_steps"],
+        "effective_steps": int(
+            custom.get("h3_turbo_effective_steps")
+            or identity["sampling_steps"]
+        ),
+        "attention_engine": identity["attention_engine"],
+        "attention_signature": attention_signature,
+        "schedule_id": schedule,
+        "resource_kind": resource_kind,
+        "offload_profile": identity["offload_profile"],
+        "policy_version": _H3_PEAK_RECOVERY_POLICY_VERSION,
+        "host_ram_band_gib": max(0, int((host_available or 0) // gib)),
+        "free_vram_band_gib": max(
+            0, int(int(allocator.get("free_bytes") or 0) // gib),
+        ),
+        "residency_epoch_band": max(
+            0, int(getattr(wgp, "_h3_residency_epoch", 0) or 0),
+        ),
+    }
+
+
+def _h3_allocation_success_outcome(params: dict) -> str:
+    """Classify only an exact authored 20-step success as voting evidence."""
+    steps = params.get("num_inference_steps")
+    return (
+        "production_success"
+        if type(steps) is int and steps == 20
+        else "probe_success"
+    )
+
+
+def _record_h3_allocation_success_observations(
+    job: dict,
+    observations: list[tuple[dict, str]],
+) -> None:
+    """Persist content-free success evidence only from a clean episode."""
+    try:
+        clean_episode, _reason = _h3_allocation_outcome_is_clean(job)
+    except Exception:
+        return
+    if not clean_episode:
+        return
+    for scenario, outcome in observations:
+        try:
+            # Defend the ledger even if a future caller mislabels the tuple:
+            # a non-integer or non-20-step scenario never votes.
+            safe_outcome = (
+                "production_success"
+                if outcome == "production_success"
+                and type(scenario.get("authored_steps")) is int
+                and scenario.get("authored_steps") == 20
+                else "probe_success"
+            )
+            _get_h3_allocation_ledger().record(scenario, safe_outcome)
+        except Exception:
+            # Adaptive evidence is advisory and may never fail a completed job.
+            pass
+
+
+def _h3_allocation_outcome_is_clean(job: dict | None = None) -> tuple[bool, str]:
+    from services.oom_detect import safe_allocator_facts
+    facts = safe_allocator_facts()
+    try:
+        total = int(facts.get("total_bytes") or 0)
+        free = int(facts.get("free_bytes") or 0)
+        reserved = int(facts.get("reserved_bytes") or 0)
+        foreign = max(0, total - free - reserved)
+        host_available, host_total = wgp._host_memory_snapshot()
+    except (TypeError, ValueError, AttributeError):
+        return False, "measurement_unknown"
+    other_running = any(
+        candidate is not job and candidate.get("status") == "running"
+        for candidate in list(_jobs.values())
+    )
+    if total <= 0 or not host_available or not host_total:
+        return False, "measurement_unknown"
+    if other_running:
+        return False, "other_maestro_gpu_admission"
+    if foreign > 512 * 1024 * 1024:
+        return False, "foreign_gpu_allocation"
+    if host_available < int(host_total * 0.25):
+        return False, "host_headroom_low"
+    return True, ""
 
 
 def _h3_benchmark_input_signature(params: dict, case_id: str) -> dict:
@@ -20442,6 +25205,255 @@ def _h3_benchmark_input_signature(params: dict, case_id: str) -> dict:
         "audio_count": sum(bool(params.get(key)) for key in (
             "audio_guide", "audio_guide2", "audio_guide3",
         )),
+    }
+
+
+def _h3_effective_offload_profile(params: dict) -> int:
+    """Return the effective WGP profile as a content-free runtime factor."""
+    try:
+        override = int(params.get("override_profile", -1))
+    except (TypeError, ValueError):
+        override = -1
+    try:
+        image_mode = int(params.get("image_mode", 0) or 0)
+    except (TypeError, ValueError):
+        image_mode = 0
+    output_type = wgp.get_output_type_for_model(
+        str(params.get("model_type") or ""), image_mode,
+    )
+    return int(wgp.compute_profile(override, output_type))
+
+
+def _seal_h3_offload_plan_for_job(
+    params: dict | None,
+    *,
+    job: dict | None = None,
+    source: str | None = None,
+    replace: bool = False,
+    segment_profiles: list[int] | None = None,
+) -> dict | None:
+    """Seal the current H3 physical plan without changing runtime choices."""
+    if not isinstance(params, dict) or not str(
+        params.get("model_type") or ""
+    ).startswith("minimax_h3"):
+        return None
+    try:
+        plan = seal_h3_offload_plan(
+            params,
+            effective_profile=_h3_effective_offload_profile(params),
+            source=source,
+            replace=replace,
+            segment_profiles=segment_profiles,
+        )
+    except (H3OffloadPlanError, TypeError, ValueError) as error:
+        raise QueueRecoveryRuntimeError(
+            "H3 offload plan could not be sealed."
+        ) from error
+    if isinstance(job, dict):
+        job["h3_offload_plan"] = copy.deepcopy(plan)
+    return plan
+
+
+def _require_h3_offload_plan_parity(
+    job: dict,
+) -> dict | None:
+    """Require the exact manifest/journal contract before H3 dispatch."""
+    params = job.get("params")
+    if not isinstance(params, dict) or not str(
+        params.get("model_type") or ""
+    ).startswith("minimax_h3"):
+        return None
+    params_plan = params.get(H3_OFFLOAD_PLAN_PARAM_KEY)
+    recovered_plan = job.get("h3_offload_plan")
+    if (
+        params_plan is None
+        and recovered_plan is None
+        and job.get("_h3_offload_legacy_recovery") is True
+    ):
+        # Pre-v1 recovery records remain resumable under their existing peak
+        # evidence contract. Any one-sided/new record must still fail closed.
+        return None
+    if params_plan is None or recovered_plan is None:
+        raise QueueRecoveryRuntimeError(
+            "H3 offload plan recovery evidence is incomplete."
+        )
+    try:
+        return assert_h3_offload_plan_parity(
+            params_plan, recovered_plan, params=params,
+        )
+    except H3OffloadPlanError as error:
+        raise QueueRecoveryRuntimeError(
+            "H3 offload plan recovery evidence changed."
+        ) from error
+
+
+def _h3_peak_recovery_identity(params: dict, *, frame_count: int) -> dict:
+    """Build the path/content-free identity used by calibrated H3 recovery."""
+    custom = params.get("custom_settings")
+    custom = custom if isinstance(custom, dict) else {}
+    resolution = str(params.get("resolution") or "").casefold()
+    try:
+        width, height = (int(value) for value in resolution.split("x", 1))
+        steps = int(params.get("num_inference_steps") or 20)
+    except (TypeError, ValueError):
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery geometry is invalid."
+        ) from None
+    engine = str(custom.get("h3_attention_engine") or "sol_attn")
+    identity = {
+        "version": _H3_PEAK_RECOVERY_POLICY_VERSION,
+        "model_type": str(params.get("model_type") or ""),
+        "width": width,
+        "height": height,
+        "frame_count": int(frame_count),
+        "sampling_steps": steps,
+        "offload_profile": _h3_effective_offload_profile(params),
+        "attention_engine": engine,
+    }
+    if engine == "sol_attn":
+        identity.update({
+            "sol_tau": float(custom.get("h3_sol_tau", 1.0)),
+            "sol_dense_steps": int(custom.get("h3_sol_dense_steps", 10)),
+            "sol_dense_blocks": int(custom.get("h3_sol_dense_blocks", 2)),
+            "sol_min_tokens": int(custom.get("h3_sol_min_tokens", 4096)),
+        })
+    return identity
+
+
+def _h3_calibrated_peak_choice(
+    params: dict,
+    records: list[dict] | None = None,
+    *,
+    allocator: dict | None = None,
+) -> dict | None:
+    """Choose only an exact 20-step, headroom-safe local calibration."""
+    try:
+        requested_frames = int(params.get("video_length") or 0)
+        current_profile = _h3_effective_offload_profile(params)
+        target = _h3_peak_recovery_identity(
+            params, frame_count=requested_frames,
+        )
+    except (TypeError, ValueError, QueueRecoveryRuntimeError):
+        return None
+    if target["sampling_steps"] != 20:
+        return None
+    if records is None:
+        records = _get_h3_benchmark_cache().load()
+    if allocator is None:
+        from services.oom_detect import safe_allocator_facts
+        allocator = safe_allocator_facts()
+    try:
+        total_vram = int((allocator or {}).get("total_bytes") or 0)
+        free_vram = int((allocator or {}).get("free_bytes") or 0)
+        host_available, host_total = wgp._host_memory_snapshot()
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if (
+        total_vram <= 0 or free_vram <= 0
+        or not host_available or not host_total
+        or host_available < int(
+            host_total * _H3_PEAK_RECOVERY_HOST_HEADROOM_RATIO
+        )
+    ):
+        return None
+    allowed_profiles = {current_profile, 5}
+    current_gpu = (
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    )
+    current_runtime = {
+        "torch": str(torch.__version__),
+        "cuda": str(getattr(torch.version, "cuda", "") or ""),
+        "triton": str(
+            getattr(sys.modules.get("triton"), "__version__", "unknown")
+        ),
+    }
+    candidates = []
+    for record in records or []:
+        if not isinstance(record, dict) or record.get("output_valid") is not True:
+            continue
+        spec = record.get("spec")
+        spec = spec if isinstance(spec, dict) else {}
+        task = spec.get("task")
+        task = task if isinstance(task, dict) else {}
+        model = spec.get("model")
+        model = model if isinstance(model, dict) else {}
+        engine = spec.get("engine")
+        engine = engine if isinstance(engine, dict) else {}
+        hardware = spec.get("hardware")
+        hardware = hardware if isinstance(hardware, dict) else {}
+        runtime = spec.get("runtime")
+        runtime = runtime if isinstance(runtime, dict) else {}
+        try:
+            profile = int(task.get("offload_profile"))
+            frames = int(task.get("frame_count"))
+            peak = int(record.get("peak_gpu_memory_bytes"))
+        except (TypeError, ValueError):
+            continue
+        exact = (
+            profile in allowed_profiles
+            and model.get("id") == target["model_type"]
+            and int(task.get("width") or 0) == target["width"]
+            and int(task.get("height") or 0) == target["height"]
+            and int(task.get("sampling_steps") or 0) == 20
+            and int(task.get("recovery_policy_version") or 0)
+                == _H3_PEAK_RECOVERY_POLICY_VERSION
+            and str(engine.get("id") or "") == target["attention_engine"]
+            and str(hardware.get("gpu") or "") == current_gpu
+            and all(
+                str(runtime.get(key) or "") == value
+                for key, value in current_runtime.items()
+            )
+        )
+        if target["attention_engine"] == "sol_attn":
+            exact = exact and (
+                float(engine.get("tau", 0)) == target["sol_tau"]
+                and int(engine.get("dense_steps") or 0)
+                    == target["sol_dense_steps"]
+                and int(engine.get("dense_blocks") or 0)
+                    == target["sol_dense_blocks"]
+                and int(engine.get("min_tokens") or 0)
+                    == target["sol_min_tokens"]
+            )
+        if (
+            exact and 0 < frames <= requested_frames and 0 < peak
+            and not (frames == requested_frames and profile == current_profile)
+            and peak <= int(total_vram * _H3_PEAK_RECOVERY_HEADROOM_RATIO)
+            and peak <= int((free_vram + int((allocator or {}).get(
+                "allocated_bytes", 0,
+            ) or 0)) * _H3_PEAK_RECOVERY_HEADROOM_RATIO)
+        ):
+            candidate_params = {
+                **params,
+                "video_length": frames,
+                "override_profile": profile,
+            }
+            try:
+                allocation_snapshot = _get_h3_allocation_ledger().snapshot(
+                    _h3_allocation_scenario(
+                        candidate_params, frame_count=frames,
+                    )
+                )
+            except Exception:
+                # Corrupt/unavailable adaptive evidence fails closed. It may
+                # never authorize an allocation retry.
+                continue
+            if allocation_snapshot.get("globally_suppressed") is True:
+                continue
+            candidates.append((
+                frames, profile, peak, allocation_snapshot,
+            ))
+    if not candidates:
+        return None
+    frames, profile, peak, allocation_snapshot = max(
+        candidates, key=lambda item: (item[0], item[1]),
+    )
+    return {
+        "frame_ceiling": frames,
+        "offload_profile": profile,
+        "peak_gpu_memory_bytes": peak,
+        "policy_version": _H3_PEAK_RECOVERY_POLICY_VERSION,
+        "allocation_revision": allocation_snapshot["revision"],
+        "allocation_snapshot": allocation_snapshot["digest"],
     }
 
 
@@ -20577,6 +25589,8 @@ def _record_h3_benchmark_observation(
             "processed_frame_count": frames,
             "lora_count": len(params.get("activated_loras") or []),
             "cache_enabled": bool(params.get("tea_cache")),
+            "offload_profile": _h3_effective_offload_profile(params),
+            "recovery_policy_version": _H3_PEAK_RECOVERY_POLICY_VERSION,
         },
     )
     peak = None
@@ -20950,6 +25964,41 @@ def _h3_model_is_resident(model_type: str) -> bool:
         and getattr(wgp, "offloadobj", None) is not None
         and not bool(getattr(wgp, "reload_needed", False))
     )
+
+
+def _run_generation_task_with_llm_exclusion(
+    model_type: str,
+    send_cmd,
+    operation,
+):
+    """Keep a local LLM out of an H3 model/generation residency window."""
+    try:
+        base_model_type = str(wgp.get_base_model_type(model_type) or "")
+    except Exception:
+        base_model_type = str(model_type or "")
+    if not base_model_type.casefold().startswith("minimax_h3"):
+        return operation()
+
+    from services import llm_service
+    # Every local load/inference path uses this re-entrant lease. Holding it
+    # through H3 work closes the race where Chat could reload a large GGUF
+    # between eviction and MMGP's first host allocation.
+    with llm_service._lock:
+        status = llm_service.get_status()
+        if (
+            str(status.get("provider") or "local").casefold() == "local"
+            and status.get("loaded") is True
+        ):
+            started_at = time.monotonic()
+            send_cmd(
+                "status",
+                wgp._load_resource_status(
+                    "Releasing local language model before H3",
+                    started_at,
+                ),
+            )
+            llm_service.unload_model()
+        return operation()
 
 
 def _h3_estimate_for_context(
@@ -21434,16 +26483,568 @@ async def h3_evaluation_preflight(request: Request):
     return {"manifest": manifest, "report": report}
 
 
+class _GenerationPreparationRequest:
+    """Minimal immutable request authority retained by one preparation worker."""
+
+    def __init__(self, request: Request, body: dict | None = None):
+        from types import SimpleNamespace
+
+        self.headers = dict(request.headers)
+        self.base_url = str(request.base_url)
+        self.client = getattr(request, "client", None)
+        self.state = SimpleNamespace(
+            maestro_session_id=str(request.state.maestro_session_id),
+            maestro_remote=bool(
+                getattr(request.state, "maestro_remote", False)
+            ),
+            maestro_llm_progress_callback=None,
+            # Local LLM/H3 exclusion is provided by llm_service's lease.
+            # Preparation must never occupy the generation scheduler lock.
+            maestro_generation_preparation=True,
+        )
+        self._body = copy.deepcopy(body) if isinstance(body, dict) else {}
+
+    def with_body(self, body: dict) -> "_GenerationPreparationRequest":
+        clone = object.__new__(type(self))
+        clone.headers = dict(self.headers)
+        clone.base_url = self.base_url
+        clone.client = self.client
+        clone.state = self.state
+        clone._body = copy.deepcopy(body)
+        return clone
+
+    async def json(self) -> dict:
+        return copy.deepcopy(self._body)
+
+
+_PLAN_REVIEW_TIMEOUT_SECONDS = 16.0
+_plan_review_timer_lock = threading.Lock()
+_plan_review_timers: dict[str, threading.Timer] = {}
+_plan_terms_reconciliation_lock = threading.RLock()
+
+
+def _ref2va_host_terms_accepted() -> bool:
+    """Read exact current host acceptance without exposing its record."""
+    from services.host_terms import REF2VA_TERM, host_term_accepted
+    with _services_config_lock:
+        services = wgp.server_config.get("services", {})
+        return bool(
+            isinstance(services, dict)
+            and host_term_accepted(services, REF2VA_TERM)
+        )
+
+
+def _waiting_plan_project_is_current(job: dict) -> bool:
+    """Fence an internal review transition to its admitted project instance."""
+    workspace = str(job.get("workspace") or "default")
+    try:
+        project_dir = _existing_workspace_dir(workspace)
+        if os.path.normcase(os.path.realpath(project_dir)) != os.path.normcase(
+            os.path.realpath(str(job.get("out_dir") or ""))
+        ):
+            return False
+        current_digest = _queue_recovery_existing_project_identity(project_dir)
+    except (
+        HTTPException, QueueRecoveryAdapterError, OSError, ValueError,
+    ):
+        return False
+    return hmac.compare_digest(
+        current_digest,
+        str(job.get("_recovery_project_digest") or ""),
+    )
+
+
+def _arm_ref2va_waiting_plan_review(
+    job: dict,
+    *,
+    deadline: float,
+    schedule_timer: bool = True,
+) -> bool:
+    """Durably arm one frozen plan, then attach its process-local timer."""
+    if not _waiting_plan_project_is_current(job):
+        return False
+    armed = arm_prepared_job_plan_review(
+        job,
+        plan_review_deadline=deadline,
+        phase="awaiting_plan_approval",
+        message="Review the generation plan",
+    )
+    if not armed:
+        return False
+    if not schedule_timer:
+        return True
+    try:
+        _schedule_plan_review_auto_approval(job)
+    except Exception:
+        if job.get("status") != "waiting_for_plan_approval":
+            # Manual approval or cancellation may win after the durable arm
+            # but before process-local timer installation.  That later
+            # lifecycle result is complete and needs no timer.
+            return True
+        fail_preparation(
+            job,
+            error="Automatic plan approval could not be scheduled",
+            message="Automatic plan approval could not be scheduled",
+            phase="preparation_failed",
+        )
+        raise
+    return True
+
+
+def _reconcile_ref2va_waiting_plan_reviews(
+    *,
+    request: Request | None = None,
+    workspace: str | None = None,
+    schedule_timers: bool = True,
+) -> None:
+    """Arm every valid frozen plan unblocked by host-wide acceptance.
+
+    ``request`` and ``workspace`` are retained only for source compatibility;
+    they are deliberately not authority inputs because acceptance is host-wide.
+    Each candidate is fenced by its durable owner/project-instance manifest and
+    no job identity is returned or exposed to the accepting caller.
+    """
+    with _plan_terms_reconciliation_lock:
+        if not _ref2va_host_terms_accepted():
+            return
+        first_error: Exception | None = None
+        for candidate in list(_jobs.values()):
+            if (
+                not isinstance(candidate, dict)
+                or candidate.get("status") != "waiting_for_plan_approval"
+                or candidate.get("plan_review_required") is not True
+                or candidate.get("plan_review_terms_required") is not True
+                or candidate.get("plan_review_deadline") is not None
+            ):
+                continue
+            current_project_check = globals().get(
+                "_waiting_plan_project_is_current"
+            )
+            if callable(current_project_check):
+                if not current_project_check(candidate):
+                    continue
+            elif request is not None and workspace is not None:
+                # Isolated compatibility harnesses may provide only the
+                # original request fence. Production always uses the durable
+                # project-instance check above.
+                if str(candidate.get("workspace") or "default") != workspace:
+                    continue
+                try:
+                    candidate = _require_owned_job_project(
+                        str(candidate.get("id") or ""),
+                        request,
+                        str(candidate.get("workspace") or "default"),
+                    )
+                except HTTPException:
+                    continue
+            else:
+                continue
+            revalidate = globals().get("_queue_recovery_revalidate_job")
+            if callable(revalidate) and not revalidate(candidate):
+                continue
+            try:
+                arm_kwargs = {
+                    "deadline": time.time() + _PLAN_REVIEW_TIMEOUT_SECONDS,
+                }
+                if not schedule_timers:
+                    arm_kwargs["schedule_timer"] = False
+                _arm_ref2va_waiting_plan_review(candidate, **arm_kwargs)
+            except Exception as error:
+                # Continue so one journal/timer failure cannot strand later
+                # eligible jobs.  The idempotent route retry can heal an arm
+                # whose durable transition did not commit.
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+
+def _cancel_plan_review_timer(job_id: str) -> None:
+    with _plan_review_timer_lock:
+        timer = _plan_review_timers.pop(job_id, None)
+    if timer is not None and timer is not threading.current_thread():
+        timer.cancel()
+
+
+def _expire_plan_review(job_id: str) -> None:
+    """Accept an unchanged sealed plan when its durable deadline expires."""
+    with _plan_review_timer_lock:
+        current = _plan_review_timers.get(job_id)
+        if current is threading.current_thread():
+            _plan_review_timers.pop(job_id, None)
+    job = _jobs.get(job_id)
+    if (
+        not isinstance(job, dict)
+        or job.get("status") != "waiting_for_plan_approval"
+    ):
+        return
+    deadline = job.get("plan_review_deadline")
+    if (
+        type(deadline) in {int, float}
+        and math.isfinite(deadline)
+        and time.time() < float(deadline)
+    ):
+        _schedule_plan_review_auto_approval(job)
+        return
+    try:
+        _approve_waiting_generation_plan(
+            job,
+            request=None,
+            segment_overrides=[],
+            boundary_overrides=[],
+            accepted=None,
+            name_prefix="studio-generation-auto-approved",
+        )
+    except Exception:
+        if job.get("status") == "waiting_for_plan_approval":
+            fail_preparation(
+                job,
+                error="Automatic plan approval failed",
+                message="Automatic plan approval failed",
+                phase="preparation_failed",
+            )
+
+
+def _schedule_plan_review_auto_approval(job: dict) -> None:
+    """Arm one process-local timer from the journaled absolute deadline."""
+    job_id = str(job.get("id") or "")
+    deadline = job.get("plan_review_deadline")
+    if (
+        not job_id
+        or type(deadline) not in {int, float}
+        or not math.isfinite(deadline)
+        or deadline <= 0
+    ):
+        raise ValueError("waiting plan has no valid review deadline")
+    timer = threading.Timer(
+        max(0.0, float(deadline) - time.time()),
+        _expire_plan_review,
+        args=(job_id,),
+    )
+    timer.daemon = True
+    timer.name = f"studio-plan-review-{job_id}"
+    with _plan_review_timer_lock:
+        previous = _plan_review_timers.get(job_id)
+        _plan_review_timers[job_id] = timer
+    if previous is not None:
+        previous.cancel()
+    try:
+        timer.start()
+    except Exception:
+        with _plan_review_timer_lock:
+            if _plan_review_timers.get(job_id) is timer:
+                _plan_review_timers.pop(job_id, None)
+        raise
+
+
+def _generation_enhancement_request(body: dict, workspace: str) -> dict:
+    """Project generation parameters into the standalone enhancer contract."""
+    mode = str(body.get("generation_mode") or "video")
+    image_paths: list[str] = []
+    if mode == "image":
+        refs = body.get("image_refs") or []
+        image_paths = list(refs) if isinstance(refs, list) else []
+    else:
+        start = body.get("image_start")
+        if isinstance(start, str) and start:
+            image_paths = [start]
+    try:
+        duration = max(
+            0.0,
+            float(body.get("_duration_seconds") or 0),
+        )
+    except (TypeError, ValueError):
+        duration = 0.0
+    model_type = str(body.get("model_type") or "")
+    window_count = None
+    if model_type in _H3_LONG_STUDIO_MODELS and duration > 0:
+        window_count = max(1, int(math.ceil(duration / 15.0)))
+    activated_loras = body.get("activated_loras")
+    return {
+        "workspace": workspace,
+        "prompt": str(body.get("prompt") or ""),
+        "mode": mode,
+        "model_type": model_type,
+        "image_paths": image_paths or None,
+        "duration_seconds": duration or None,
+        "window_count": window_count,
+        "activated_loras": (
+            list(activated_loras) if isinstance(activated_loras, list) else []
+        ),
+        "explicit_output": body.get("explicit_output") is True,
+        "preserve_global_timeline": bool(
+            body.get("multi_prompts_gen_type") == 2
+        ),
+    }
+
+
+def _start_generation_worker(job: dict, *, name_prefix: str) -> None:
+    """Start the ordinary GPU worker after a durable queued transition."""
+    _require_h3_offload_plan_parity(job)
+    thread = threading.Thread(
+        target=_run_generation,
+        args=(str(job.get("id") or ""),),
+        daemon=False,
+        name=f"{name_prefix}-{job.get('id')}",
+    )
+    try:
+        thread.start()
+    except Exception as error:
+        job["_recovery_reason_code"] = "worker_start_failed"
+        _queue_recovery_checkpoint(
+            job,
+            queue_held=True,
+            recovery_state="blocked",
+            reruns_denoise=False,
+            message="Recovery worker could not be started",
+        )
+        raise QueueRecoveryRuntimeError(
+            "Generation worker could not be started."
+        ) from error
+
+
+def _run_generation_preparation(
+    job_id: str,
+    request: _GenerationPreparationRequest,
+    *,
+    enhance: bool,
+) -> None:
+    """Enhance and plan a published job without entering GPU queue admission."""
+    job = _jobs.get(job_id)
+    if not isinstance(job, dict) or is_cancel_requested(job):
+        return
+    request.state.maestro_cpu_text_job = job
+    request.state.maestro_cpu_text_operation = (
+        "prompt_enhancement" if enhance else "generation_preparation"
+    )
+    request.state.maestro_cpu_text_text_only = True
+    phase = "enhancing_prompt" if enhance else "planning_generation"
+    sealed_pointer = None
+    previous_pointer = dict(job.get("_recovery_manifest_pointer") or {})
+    try:
+        prepared_params = copy.deepcopy(dict(job.get("params") or {}))
+        if enhance:
+            if not update_preparation_job(
+                job,
+                phase=phase,
+                message="Enhancing prompt",
+                progress=5,
+                expected_execution_attempt=int(
+                    job.get("execution_attempt") or 1
+                ),
+            ):
+                return
+            enhance_body = _generation_enhancement_request(
+                prepared_params,
+                str(job.get("workspace") or "default"),
+            )
+            result = asyncio.run(
+                llm_enhance_prompt(request.with_body(enhance_body))
+            )
+            enhanced = str((result or {}).get("enhanced") or "").strip()
+            if not enhanced:
+                raise RuntimeError("Enhancer returned no prepared text")
+            prepared_params["prompt"] = enhanced
+            if is_cancel_requested(job):
+                return
+
+        phase = "planning_generation"
+        if not update_preparation_job(
+            job,
+            phase=phase,
+            message="Planning generation",
+            progress=45,
+            expected_execution_attempt=int(
+                job.get("execution_attempt") or 1
+            ),
+        ):
+            return
+        if (
+            int(prepared_params.get("image_mode") or 0) != 2
+            and int(prepared_params.get("multi_prompts_gen_type") or 0) != 3
+        ):
+            from shared.utils import prompt_parser as _studio_prompt_parser
+            if _studio_prompt_parser.has_global_timeline(
+                prepared_params.get("prompt", "")
+            ):
+                prepared_params["multi_prompts_gen_type"] = 2
+        enhanced_source_params = copy.deepcopy(prepared_params)
+        plan, estimate = _plan_generation_submission(
+            prepared_params,
+            request,
+            turbo_validation_authorized=bool(
+                job.get("_h3_turbo_validation_authorized")
+            ),
+            require_terms=False,
+        )
+        clip_count = max(0, int((plan or {}).get("clip_count") or 0))
+        waiting = bool(plan and clip_count > 1)
+        if not waiting:
+            _require_h3_generation_terms(prepared_params, plan)
+        if waiting:
+            # Approval derives only from this private immutable enhanced
+            # source, never from public geometry and never by repeating LLM.
+            prepared_params["_maestro_prepared_source"] = (
+                enhanced_source_params
+            )
+        requirements = _h3_generation_requirements(prepared_params, plan)
+        terms_blocked = bool(
+            waiting
+            and requirements.get("ref2va_terms_required")
+            and not _ref2va_host_terms_accepted()
+        )
+        remote_visible = _remote_visible_model_ids(request)
+        if remote_visible is not None:
+            requirements = dict(requirements)
+            requirements["checkpoint_options"] = [
+                option
+                for option in requirements.get("checkpoint_options") or []
+                if str(option.get("model_type") or "") in remote_visible
+            ]
+        public_plan = _public_h3_long_plan(plan, requirements)
+        offload_plan = _seal_h3_offload_plan_for_job(prepared_params)
+        manifest_job = dict(job)
+        manifest_job["params"] = prepared_params
+        sealed_pointer = write_sealed_request_manifest(
+            str(job.get("out_dir") or ""),
+            job_id=job_id,
+            params=prepared_params,
+            inputs=_queue_recovery_input_descriptors(
+                manifest_job,
+                str(job.get("_recovery_owner_digest") or ""),
+            ),
+        )
+        if terms_blocked:
+            _plan_terms_reconciliation_lock.acquire()
+        try:
+            completed = complete_preparation(
+                job,
+                expected_execution_attempt=int(
+                    job.get("execution_attempt") or 1
+                ),
+                request_manifest=sealed_pointer,
+                waiting_for_approval=waiting,
+                plan_review_deadline=(
+                    time.time() + _PLAN_REVIEW_TIMEOUT_SECONDS
+                    if waiting and not terms_blocked else None
+                ),
+                plan_review_terms_required=terms_blocked,
+                kind=(
+                    "studio_generation_preparation"
+                    if waiting else "studio_generation"
+                ),
+                params=prepared_params,
+                _recovery_manifest_pointer=dict(sealed_pointer),
+                phase=(
+                    "awaiting_plan_terms" if terms_blocked
+                    else "awaiting_plan_approval" if waiting else "queued"
+                ),
+                message=(
+                    "Approval required to accept Ref2VA terms"
+                    if terms_blocked
+                    else "Review the generation plan" if waiting else "Queued"
+                ),
+                progress=(60 if waiting else 0),
+                h3_segment_plan=public_plan,
+                h3_estimate=estimate,
+                window_total=clip_count,
+                clip_total=clip_count,
+                resource_intent="generation",
+                resource_execution="standard",
+                preemption_mode="none",
+                resource_state="queued",
+                **(
+                    {"h3_offload_plan": offload_plan}
+                    if offload_plan is not None else {}
+                ),
+            )
+            if not completed:
+                remove_request_manifest(
+                    str(job.get("out_dir") or ""), sealed_pointer,
+                )
+                return
+            # The coordinator now owns this pointer. Never remove it from an
+            # error path after the atomic pointer/job transition has committed.
+            sealed_pointer = None
+            if terms_blocked and _ref2va_host_terms_accepted():
+                _arm_ref2va_waiting_plan_review(
+                    job,
+                    deadline=time.time() + _PLAN_REVIEW_TIMEOUT_SECONDS,
+                )
+        finally:
+            if terms_blocked:
+                _plan_terms_reconciliation_lock.release()
+        remove_request_manifest(
+            str(job.get("out_dir") or ""), previous_pointer,
+        )
+        if waiting and not terms_blocked:
+            _schedule_plan_review_auto_approval(job)
+        elif not waiting:
+            try:
+                _stamp_requested_generation_residency(job, replace=True)
+                _start_generation_worker(
+                    job, name_prefix="studio-generation-prepared",
+                )
+            except Exception:
+                if not _queue_recovery_is_blocked(job):
+                    job["_recovery_reason_code"] = "worker_start_failed"
+                    _queue_recovery_checkpoint(
+                        job,
+                        queue_held=True,
+                        recovery_state="blocked",
+                        reruns_denoise=False,
+                        message="Generation worker could not be started",
+                    )
+                return
+    except Exception:
+        if sealed_pointer is not None:
+            remove_request_manifest(
+                str(job.get("out_dir") or ""), sealed_pointer,
+            )
+        if is_cancel_requested(job):
+            return
+        message = (
+            "Prompt enhancement failed"
+            if enhance and phase == "enhancing_prompt"
+            else "Generation planning failed"
+        )
+        fail_preparation(
+            job,
+            error=message,
+            message=message,
+            phase="preparation_failed",
+            expected_execution_attempt=int(
+                job.get("execution_attempt") or 1
+            ),
+        )
+
+
 @api.post("/api/v1/generate")
 async def generate(request: Request):
     """Submit a generation job. Returns immediately with a job_id."""
     body = await request.json()
     workspace = body.pop("workspace", None) or _get_active_workspace()
+    enhance_before_generate = body.pop(
+        "enhance_before_generate", False,
+    )
+    if not isinstance(enhance_before_generate, bool):
+        raise HTTPException(
+            status_code=400,
+            detail="enhance_before_generate must be a boolean",
+        )
     job_out_dir = _require_project_access(request, workspace)
+    is_sfx = body.get("sfx_mode")
+    if not body.get("model_type"):
+        raise HTTPException(status_code=400, detail="model_type is required")
+    # SFX virtual models (mmaudio_*) are frontend-only; skip backend model validation.
+    if not is_sfx and wgp.get_model_def(body["model_type"]) is None:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {body['model_type']}")
+    _require_remote_visible_models(request, [body.get("model_type")])
+    if not is_sfx:
+        _require_model_recipe_terms([body["model_type"]])
     _reject_client_h3_internal_state(body)
     _reject_client_h3_turbo_validation_controls(body)
     _authorize_generation_media_inputs(request, body, workspace)
-    _require_remote_visible_models(request, [body.get("model_type")])
     _h3_turbo_validation_reference_bytes = (
         _authorize_h3_turbo_benchmark_request(request, body)
     )
@@ -21454,14 +27055,12 @@ async def generate(request: Request):
         _apply_h3_adaptive_checkpoint(body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    is_sfx = body.get("sfx_mode")
-    if not body.get("model_type"):
-        raise HTTPException(status_code=400, detail="model_type is required")
     if not is_sfx and not body.get("prompt"):
         raise HTTPException(status_code=400, detail="prompt is required")
-    # SFX virtual models (mmaudio_*) are frontend-only; skip backend model validation
-    if not is_sfx and wgp.get_model_def(body["model_type"]) is None:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {body['model_type']}")
+    durable_generation_preparation = bool(
+        enhance_before_generate
+        or str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
+    )
 
     # A complete Studio prompt with global timestamps must remain one
     # structured prompt until wgp knows the backend's effective FPS and exact
@@ -21495,37 +27094,24 @@ async def generate(request: Request):
     # planned as consecutive legal H3 clips, using the existing multi-clip
     # renderer/concatenator. This runs after input normalization so stale
     # anchor flags cannot leak into the generated clip manifest.
-    try:
-        _require_h3_native_boundary_experimental(body)
-        _validate_h3_sampling_steps(body)
-        _validate_h3_explicit_multiclip_request(body)
-        _h3_long_plan = _prepare_h3_long_studio_request(body)
-        _require_h3_acceleration_available(body, _h3_long_plan)
-        _h3_submission_estimate_context = _h3_estimate_context(
-            body, _h3_long_plan,
-        )
-        _validate_h3_turbo_estimate_context(
-            _h3_submission_estimate_context,
-            _h3_turbo_validation_authorized=(
-                _h3_turbo_validation_authorized
-            ),
-        )
-        _validate_h3_spectrum_estimate_context(
-            _h3_submission_estimate_context,
-        )
-        _validate_h3_lightx2v_estimate_context(
-            _h3_submission_estimate_context,
-        )
-    except (TypeError, ValueError, RuntimeError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unable to plan long MiniMax H3 generation: {exc}",
-        ) from exc
-    _require_remote_visible_models(
-        request,
-        _h3_effective_model_types(body, _h3_long_plan),
-    )
-    _require_h3_generation_terms(body, _h3_long_plan)
+    _h3_long_plan = None
+    _submitted_h3_estimate = None
+    if not durable_generation_preparation:
+        try:
+            _h3_long_plan, _submitted_h3_estimate = (
+                _plan_generation_submission(
+                    body,
+                    request,
+                    turbo_validation_authorized=(
+                        _h3_turbo_validation_authorized
+                    ),
+                )
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unable to plan long MiniMax H3 generation: {exc}",
+            ) from exc
     if _h3_long_plan:
         print(
             "[Generate] MiniMax H3 long Studio plan: "
@@ -21674,8 +27260,11 @@ async def generate(request: Request):
         _planned_clip_count = max(0, int(_long_plan.get("clip_count") or 0))
     except (TypeError, ValueError):
         _planned_clip_count = 0
-    _submitted_h3_estimate = None
-    if str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS:
+    if (
+        not durable_generation_preparation
+        and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
+        and _submitted_h3_estimate is None
+    ):
         _submitted_h3_estimate = _h3_profile_estimate_payload(
             _h3_estimate_context(body, _long_plan),
             include_residency=not bool(
@@ -21684,12 +27273,22 @@ async def generate(request: Request):
         )["current"]["estimate"]
     job = {
         "id": job_id,
-        "status": "queued",
+        "status": (
+            "preparing" if durable_generation_preparation else "queued"
+        ),
         "progress": 0,
         "step": 0,
         "total_steps": 0,
-        "phase": "",
-        "message": "Queued",
+        "phase": (
+            "enhancing_prompt" if enhance_before_generate
+            else "planning_generation" if durable_generation_preparation
+            else ""
+        ),
+        "message": (
+            "Enhancing prompt" if enhance_before_generate
+            else "Planning generation" if durable_generation_preparation
+            else "Queued"
+        ),
         "created_at": time.time(),
         "params": body,
         "output_files": [],
@@ -21700,9 +27299,11 @@ async def generate(request: Request):
         "access_policy": access_policy,
         "private": access_policy["private"],
         "explicit": access_policy["explicit"],
-        "prompt_preview": str(
-            _long_plan.get("global_prompt") or body.get("prompt") or ""
-        )[:500],
+        "prompt_preview": (
+            "" if durable_generation_preparation else str(
+                _long_plan.get("global_prompt") or body.get("prompt") or ""
+            )[:500]
+        ),
         "model_type": str(body.get("model_type") or ""),
         "generation_mode": str(body.get("generation_mode") or "video"),
         "window_current": 0,
@@ -21720,6 +27321,14 @@ async def generate(request: Request):
         "current_segment_reason": "",
         "current_segment_boundary": None,
         "h3_estimate": _submitted_h3_estimate,
+        "plan_review_required": False,
+        "resource_intent": (
+            "text" if enhance_before_generate else "generation"
+        ),
+        "resource_execution": "standard",
+        "preemption_mode": "none",
+        "resource_state": "queued",
+        "execution_attempt": 1,
         "_h3_turbo_validation_authorized": bool(
             _h3_turbo_validation_authorized
         ),
@@ -21729,11 +27338,24 @@ async def generate(request: Request):
     }
     # Registration, owner/project identity, and the request manifest are
     # durable before the job becomes observable or its worker can run.
-    _queue_recovery_register_and_publish(job)
+    if durable_generation_preparation:
+        preparation_request = _GenerationPreparationRequest(request)
+        _queue_recovery_register_and_publish(
+            job,
+            worker=lambda queued_job_id: _run_generation_preparation(
+                queued_job_id,
+                preparation_request,
+                enhance=enhance_before_generate,
+            ),
+            recovery_kind="studio_generation_preparation",
+            thread_name=f"studio-generation-preparation-{job_id}",
+        )
+    else:
+        _queue_recovery_register_and_publish(job)
 
     return {
         "job_id": job_id,
-        "status": "queued",
+        "status": job["status"],
         "h3_estimate": _submitted_h3_estimate,
     }
 
@@ -35799,6 +41421,7 @@ def _generation_tasks_succeeded(
 def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
     """Build and run a job, optionally deferring success finalization."""
     from shared.utils.thread_utils import AsyncStream, async_run
+    import copy
     import inspect
 
     job = _jobs[job_id]
@@ -35810,14 +41433,46 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
     # the same residency-aware ordering, while preserving all existing tiers.
     _stamp_requested_generation_residency(job, replace=True)
 
-    with generation_slot(_gen_lock, job) as acquired:
+    with generation_slot(
+        _gen_lock, job, block_on_persistence_failure=True,
+    ) as acquired:
         if not acquired:
             return False
         try:
             if not try_start(
-                job, generation_lock=_gen_lock, message="Preparing...",
+                job,
+                generation_lock=_gen_lock,
+                block_on_persistence_failure=True,
+                message="Preparing...",
             ):
                 return False
+
+            try:
+                sealed_h3_offload_plan = _require_h3_offload_plan_parity(job)
+            except QueueRecoveryRuntimeError:
+                finish_job(
+                    job,
+                    "failed",
+                    error="Sealed H3 offload plan validation failed.",
+                    message="Sealed H3 offload plan validation failed",
+                )
+                return False
+
+            # Recheck durable/internal/recovery jobs after the lifecycle has
+            # entered ``running`` so a refusal can be terminalized instead of
+            # leaving a queued job stuck. Delivery-only recovery owns already
+            # verified native bytes and does not load or use a model.
+            if _queue_recovery_delivery_pending(job) is None:
+                try:
+                    _require_job_model_recipe_terms(job)
+                except HTTPException as error:
+                    finish_job(
+                        job,
+                        "failed",
+                        error=str(error.detail),
+                        message="Model terms acceptance is required",
+                    )
+                    return False
 
             # Per-job VRAM coefficient adjustment — accounts for active
             # LoRAs and pipeline stage count beyond what the auto-tuned
@@ -35867,6 +41522,7 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
 
             # Build task manifest from user params
             raw_params = job["params"].copy()
+            raw_params.pop("_h3_offload_plan", None)
             validation_reference_bytes = job.get(
                 "_h3_turbo_validation_reference_bytes"
             )
@@ -36233,8 +41889,6 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
             # run through the ordinary task engine but defer concatenation and
             # publication to their finishing worker.
             if shot_manifest is not None:
-                import copy
-
                 if not isinstance(shot_manifest, list):
                     finish_job(
                         job,
@@ -36315,6 +41969,12 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 # prevented exact segment/concat reconciliation.
                 group_id = f"mc_{job_id}"
                 clip_count = max(len(prompt_lines), len(image_starts), 1)
+                execution_shots = (
+                    _h3_execution_shots_for_dispatch(
+                        h3_longform, prompt_lines, clip_count,
+                    )
+                    if h3_longform else None
+                )
 
                 # Get model latent_size for frame quantization — wgp.py quantizes
                 # video_length to (n-1)//latent_size*latent_size+1, so we must match
@@ -36353,6 +42013,50 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                     wgp.task_id += 1
                     clip_params = raw_params.copy()
                     clip_params["prompt"] = prompt_lines[i] if i < len(prompt_lines) else (prompt_lines[-1] if prompt_lines else "")
+                    execution_shot = None
+                    if execution_shots is not None:
+                        execution_shot = execution_shots[i]
+                        if not isinstance(execution_shot, dict):
+                            raise ValueError(
+                                "H3 semantic execution slice is invalid"
+                            )
+                        execution_slice = execution_shot.get("execution_slice")
+                        try:
+                            execution_valid = (
+                                isinstance(execution_slice, dict)
+                                and int(execution_shot.get("index")) == i
+                                and int(execution_slice.get("segment_index")) == i
+                                and int(execution_shot.get("execution_cursor_frame"))
+                                    == int(execution_slice.get("start_frame"))
+                                and str(execution_shot.get("prompt"))
+                                    == clip_params["prompt"]
+                            )
+                        except (TypeError, ValueError):
+                            execution_valid = False
+                        if not execution_valid:
+                            raise ValueError(
+                                "H3 semantic execution slice does not match its child"
+                            )
+                        clip_params.update({
+                            "_h3_authored_shot_id": str(
+                                execution_shot.get("authored_shot_id") or ""
+                            ),
+                            "_h3_physical_segment_id": str(
+                                execution_shot.get("physical_segment_id") or ""
+                            ),
+                            "_h3_semantic_shot_index": int(
+                                execution_shot.get("semantic_shot_index")
+                            ),
+                            "_h3_execution_cursor_frame": int(
+                                execution_shot.get("execution_cursor_frame")
+                            ),
+                            "_h3_execution_slice": copy.deepcopy(execution_slice),
+                            "_h3_predecessor_physical_segment_id": (
+                                str(execution_shot.get(
+                                    "predecessor_physical_segment_id"
+                                ) or "") or None
+                            ),
+                        })
                     clip_params["image_start"] = image_starts[i] if i < len(image_starts) else None
                     clip_end = image_ends[i] if i < len(image_ends) else None
                     clip_params["image_end"] = clip_end if clip_end else None
@@ -36540,6 +42244,25 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                             raise ValueError(
                                 "H3 segment publication geometry does not match its model frames"
                             )
+                        if execution_shot is not None:
+                            execution_slice = execution_shot["execution_slice"]
+                            try:
+                                execution_geometry_valid = (
+                                    int(execution_shot.get("frames")) == clip_frames
+                                    and int(execution_shot.get("published_frames"))
+                                        == clip_frames - trim_tail
+                                    and int(execution_shot.get("trim_tail_frames"))
+                                        == trim_tail
+                                    and int(execution_slice.get("end_frame_exclusive"))
+                                        - int(execution_slice.get("start_frame"))
+                                        == clip_frames - trim_tail
+                                )
+                            except (TypeError, ValueError):
+                                execution_geometry_valid = False
+                            if not execution_geometry_valid:
+                                raise ValueError(
+                                    "H3 semantic execution slice geometry is invalid"
+                                )
                     elif has_end:
                         trim_tail = _mc_fs
                         last_se_clip_end_image = clip_end
@@ -36603,6 +42326,44 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                                 segment_plan.get("discard_frames") or 0
                             ),
                         })
+                        peak_identities = h3_longform.get(
+                            "peak_recovery_identities"
+                        )
+                        if (
+                            isinstance(peak_identities, list)
+                            and i < len(peak_identities)
+                            and isinstance(peak_identities[i], dict)
+                        ):
+                            clip_params["multi_clip_info"][
+                                "peak_recovery_identity"
+                            ] = copy.deepcopy(peak_identities[i])
+                        if execution_shot is not None:
+                            clip_params["multi_clip_info"].update({
+                                "semantic_physical_contract_version": 1,
+                                "semantic_shot_index": int(
+                                    execution_shot["semantic_shot_index"]
+                                ),
+                                "physical_segment_index": int(
+                                    execution_shot["physical_segment_index"]
+                                ),
+                                "physical_segment_count": int(
+                                    execution_shot["physical_segment_count"]
+                                ),
+                                "predecessor_segment_index": (
+                                    int(execution_shot[
+                                        "predecessor_segment_index"
+                                    ])
+                                    if execution_shot.get(
+                                        "predecessor_segment_index"
+                                    ) is not None else None
+                                ),
+                                "execution_cursor_frame": int(
+                                    execution_shot["execution_cursor_frame"]
+                                ),
+                                "execution_slice": copy.deepcopy(
+                                    execution_shot["execution_slice"]
+                                ),
+                            })
                     # Structured H3 local timelines must stay intact. Mode 0
                     # splits newline content into separate prompts; mode 2 is
                     # the WGP structured Studio prompt path.
@@ -36734,6 +42495,10 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                     "plugin_data": {},
                 }]
 
+            _apply_h3_offload_plan_to_manifest(
+                manifest, sealed_h3_offload_plan,
+            )
+
             # WanGP's manifest parser materializes authorized image/video
             # paths into PIL/tensor objects. Freeze the producer metadata
             # before that boundary so later sidecar publication never tries
@@ -36798,6 +42563,7 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
             cancelled = False
             first_task_error = None
             first_failure_details = None
+            allocation_success_observations: list[tuple[dict, str]] = []
             clip_output_files: dict[int, str] = {}
             join_output_file = None
             producer_artifact_roles: dict[str, str] = {}
@@ -37334,8 +43100,7 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 job["_eta_subtask_window_current"] = 0
                 task_file_start = len(gen.get("file_list") or [])
                 task_artifact_start = len(gen.get("artifact_list") or [])
-                prompt_preview = (task.get('prompt', '') or '')[:60]
-                print(f"\n[Task {task_no}/{total_tasks}] {prompt_preview}...")
+                print(f"\n[Task {task_no}/{total_tasks}] Starting")
                 if is_multiclip:
                     progress_info = (
                         (task.get("params") or {}).get("multi_clip_info")
@@ -37367,7 +43132,9 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                         current_segment_reason=str(
                             progress_info.get("conditioning_reason") or ""
                         ),
-                        current_segment_boundary=progress_info.get("boundary_plan"),
+                        current_segment_boundary=_public_h3_boundary(
+                            progress_info.get("boundary_plan")
+                        ),
                     ):
                         cancelled = True
                         break
@@ -37970,7 +43737,16 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                                 if _h3_model_is_resident(call_model)
                                 else "cold"
                             )
-                            wgp.generate_video(task, send_cmd, plugin_data=plugin_data, **filtered_params)
+                            _run_generation_task_with_llm_exclusion(
+                                call_model,
+                                send_cmd,
+                                lambda: wgp.generate_video(
+                                    task,
+                                    send_cmd,
+                                    plugin_data=plugin_data,
+                                    **filtered_params,
+                                ),
+                            )
                         except Exception as e:
                             print(f"\n  [ERROR] {e}")
                             traceback.print_exc()
@@ -38197,13 +43973,38 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                             last_msg_len = len(status_line)
                             in_status_line = True
                     elif cmd == "status":
+                        if job.get("status") != "running":
+                            continue
+                        if isinstance(data, dict):
+                            status_message = str(
+                                data.get("message") or "Preparing model runtime"
+                            )
+                            status_phase = str(
+                                data.get("phase") or status_message
+                            )
+                            load_telemetry = {}
+                            for key in (
+                                "elapsed_seconds",
+                                "host_ram_available_bytes",
+                                "host_ram_total_bytes",
+                                "vram_available_bytes",
+                                "vram_total_bytes",
+                            ):
+                                value = data.get(key)
+                                if isinstance(value, (int, float)) and value >= 0:
+                                    load_telemetry[f"model_load_{key}"] = value
+                        else:
+                            status_message = str(data)
+                            status_phase = status_message
+                            load_telemetry = {}
                         status_updates = {
-                            "message": str(data),
-                            "phase": str(data),
+                            "message": status_message,
+                            "phase": status_phase,
                             "step": 0,
                             "total_steps": 0,
                             "progress": 0,
                             "progress_indeterminate": True,
+                            **load_telemetry,
                         }
                         _publish_window_progress(status_updates)
                         if not update_job(
@@ -38211,12 +44012,12 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                             **status_updates,
                         ):
                             continue
-                        if "Loading" in str(data):
-                            print(data)
+                        if "Loading" in status_message:
+                            print(status_message)
                             in_status_line = False
                             last_msg_len = 0
                         else:
-                            status_line = f"\r  {data}"
+                            status_line = f"\r  {status_message}"
                             print(status_line.ljust(max(last_msg_len, len(status_line))), end="", flush=True)
                             last_msg_len = len(status_line)
                             in_status_line = True
@@ -38270,6 +44071,15 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                                 _h3_call_timing.get("model_load_state") or "unknown"
                             ),
                         )
+                        allocation_success_observations.append((
+                            _h3_allocation_scenario(
+                                task_params,
+                                frame_count=int(
+                                    task_params.get("video_length") or 0
+                                ),
+                            ),
+                            _h3_allocation_success_outcome(task_params),
+                        ))
                     except Exception as benchmark_error:
                         print(f"[H3 Estimate] Observation skipped: {benchmark_error}")
                 task_video_names = [
@@ -39584,6 +45394,43 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                     **deferred_updates,
                 )
 
+            if (
+                not success
+                and isinstance(first_failure_details, dict)
+                and first_failure_details.get("is_oom") is True
+                and _h3_incomplete_recovery_prefix(job) is not None
+            ):
+                # A generation OOM with a dependency-closed prefix is not
+                # terminal. Park it before publication; owner-scoped retry
+                # must calibrate and reseal a different peak identity first.
+                try:
+                    clean_episode, contamination = (
+                        _h3_allocation_outcome_is_clean(job)
+                    )
+                    _get_h3_allocation_ledger().record(
+                        _h3_allocation_scenario(
+                            task_params,
+                            frame_count=int(
+                                task_params.get("video_length") or 0
+                            ),
+                        ),
+                        "clean_oom" if clean_episode else "contaminated_oom",
+                        contamination_reason=contamination,
+                    )
+                except Exception:
+                    # Adaptive evidence must never prevent the immediate
+                    # no-unchanged-retry safety transition for this job.
+                    pass
+                block_generation_recovery(
+                    job,
+                    _recovery_reason_code="h3_peak_calibration_required",
+                    recovery_state="blocked",
+                    reruns_denoise=False,
+                    message="Calibrated H3 recovery capacity is required",
+                    error=None,
+                )
+                return False
+
             published = finish_job(
                 job,
                 "completed" if success else "failed",
@@ -39617,6 +45464,9 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 else:
                     _rollback_h3_delivery_publication(job)
             if success and job.get("status") == "completed":
+                _record_h3_allocation_success_observations(
+                    job, allocation_success_observations,
+                )
                 # H3 still/tail handoffs and WGP preprocessing files remain
                 # private until every dependent segment, concat, and delivery
                 # checkpoint has completed. Retire them only at that terminal
@@ -40561,6 +46411,16 @@ _QUEUE_RECOVERY_REASON_TEXT = {
     "preparation_must_resubmit": "This preparation must be resubmitted",
     "project_missing_or_recreated": "The recovery project is missing or was recreated",
     "worker_start_failed": "The recovery worker could not be started",
+    "model_terms_required": "Review and accept this model recipe's terms",
+    "h3_generation_recovery_authorization_required": (
+        "Authorize calibrated recovery for the unfinished H3 segment"
+    ),
+    "h3_peak_calibration_required": (
+        "A matching 20-step H3 capacity calibration is required"
+    ),
+    "h3_generation_oom_replanned": (
+        "The calibrated H3 replacement plan is ready"
+    ),
 }
 
 
@@ -40587,8 +46447,6 @@ def _recovered_job_remote_project_accessible(
     """Bind recovered remote reads/actions to the unlocked project instance."""
     if not bool(getattr(request.state, "maestro_remote", False)):
         return True
-    if not job.get("_recovery_owner_digest"):
-        return True
     workspace = str(job.get("workspace") or "default")
     session_id = str(getattr(request.state, "maestro_session_id", "") or "")
     with _remote_active_projects_lock:
@@ -40597,20 +46455,26 @@ def _recovered_job_remote_project_accessible(
         return False
     try:
         project_dir = _existing_workspace_dir(workspace)
-        access = _project_access.status(workspace, project_dir, session_id)
+        access = _project_access.status(
+            workspace, project_dir, session_id, True,
+        )
         if not access.protected or not access.unlocked:
             return False
         if os.path.normcase(os.path.realpath(project_dir)) != os.path.normcase(
             os.path.realpath(str(job.get("out_dir") or "")),
         ):
             return False
-        current_digest = _queue_recovery_existing_project_identity(project_dir)
+        recovered_project = str(job.get("_recovery_project_digest") or "")
+        current_digest = (
+            _queue_recovery_existing_project_identity(project_dir)
+            if recovered_project else ""
+        )
     except (
         HTTPException, QueueRecoveryAdapterError, OSError, ValueError,
     ):
         return False
-    return hmac.compare_digest(
-        current_digest, str(job.get("_recovery_project_digest") or ""),
+    return not recovered_project or hmac.compare_digest(
+        current_digest, recovered_project,
     )
 
 
@@ -40632,7 +46496,7 @@ def _job_owned_by_request(job: dict | None, request: Request) -> bool:
             and _recovered_job_remote_project_accessible(job, request)
         )
     if owner == request.state.maestro_session_id:
-        return True
+        return _recovered_job_remote_project_accessible(job, request)
     return owner is None and not bool(
         getattr(request.state, "maestro_remote", False)
     )
@@ -40687,6 +46551,10 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
             actions = ["resume"]
         elif state == "blocked" and reason in {
             "input_missing_or_changed", "worker_start_failed",
+            "h3_generation_recovery_authorization_required",
+            "h3_peak_calibration_required",
+            "h3_generation_oom_replanned",
+            "model_terms_required",
         }:
             actions = ["retry"]
     return {
@@ -40701,6 +46569,26 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
         "recovery_actionable": bool(actions),
         "recovery_actions": actions,
     }
+
+
+def _public_resource_metadata(job: dict) -> dict:
+    """Project one closed, content-free resource descriptor."""
+    return {"resource_descriptor": resource_descriptor(job)}
+
+
+def _public_parent_job_id(job: dict) -> str | None:
+    """Return one bounded opaque parent relation, never a raw owner key."""
+    value = job.get("parent_job_id")
+    if (
+        type(value) is str
+        and 0 < len(value) <= 256
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not any(ord(character) < 32 for character in value)
+    ):
+        return value
+    return None
 
 
 def _queue_wait_reason_for_job(job: dict) -> str | None:
@@ -40771,20 +46659,34 @@ def _public_job_prompt_fields(job: dict) -> dict:
     }
 
 
+def _public_job_created_at(job: dict) -> float:
+    """Return one content-free, sortable server job incarnation timestamp."""
+    created_at = job.get("created_at")
+    if (
+        type(created_at) in {int, float}
+        and math.isfinite(created_at)
+        and created_at >= 0
+    ):
+        return float(created_at)
+    return 0.0
+
+
 @api.get("/api/v1/status/{job_id}")
 def get_status(job_id: str, request: Request, response: Response):
     """Get generation job status."""
     _set_recovery_no_store(response)
-    if job_id not in _jobs:
+    job = _jobs.get(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not _job_owned_by_request(_jobs[job_id], request):
+    if not _job_owned_by_request(job, request):
         raise HTTPException(status_code=404, detail="Job not found")
-    j = snapshot_job(_jobs[job_id])
+    j = snapshot_job(job)
     recovery_blocked = _queue_recovery_is_blocked(j)
     eta_seconds, subtask_eta_seconds = _job_eta_values(j)
     public_prompt_fields = _public_job_prompt_fields(j)
     return {
         "job_id": j["id"],
+        "created_at": _public_job_created_at(j),
         "status": j["status"],
         "progress": j["progress"],
         "step": j.get("step", 0),
@@ -40812,19 +46714,41 @@ def get_status(job_id: str, request: Request, response: Response):
         "clip_total": j.get("clip_total", 0),
         "clip_progress": j.get("clip_progress", 0),
         "h3_segment_plan": j.get("h3_segment_plan"),
+        "h3_offload_plan": public_h3_offload_plan(
+            j.get("h3_offload_plan")
+        ),
+        "plan_review_required": bool(
+            j.get("status") == "waiting_for_plan_approval"
+            and j.get("plan_review_required", False)
+        ),
+        "plan_review_terms_required": bool(
+            j.get("status") == "waiting_for_plan_approval"
+            and j.get("plan_review_terms_required", False)
+        ),
+        "plan_review_deadline": (
+            float(j["plan_review_deadline"])
+            if j.get("status") == "waiting_for_plan_approval"
+            and type(j.get("plan_review_deadline")) in {int, float}
+            and math.isfinite(j["plan_review_deadline"])
+            else None
+        ),
         "current_segment_model": j.get("current_segment_model", ""),
         "current_segment_reason": j.get("current_segment_reason", ""),
-        "current_segment_boundary": j.get("current_segment_boundary"),
+        "current_segment_boundary": _public_h3_boundary(
+            j.get("current_segment_boundary")
+        ),
         "queue_priority": j.get("queue_priority", 0),
         "queue_held": bool(j.get("queue_held", False)),
         "hold_after_output": bool(j.get("hold_after_output", False)),
         "queue_position": (
-            None if recovery_blocked else queue_position(_jobs[job_id])
+            None if recovery_blocked else queue_position(job)
         ),
         "queue_wait_reason": (
             None if recovery_blocked
-            else _queue_wait_reason_for_job(_jobs[job_id])
+            else _queue_wait_reason_for_job(job)
         ),
+        "parent_job_id": _public_parent_job_id(j),
+        **_public_resource_metadata(j),
         **_public_queue_residency_metadata(
             j, remote=bool(getattr(request.state, "maestro_remote", False)),
         ),
@@ -40839,7 +46763,7 @@ def get_status(job_id: str, request: Request, response: Response):
         "estimate_after_resume": (
             j.get("h3_estimate") if recovery_blocked else None
         ),
-        "events": job_events(_jobs[job_id], 100),
+        "events": job_events(job, 100),
         "queue": queue_control_state(),
         **_public_queue_recovery_metadata(j),
     }
@@ -40849,17 +46773,46 @@ def get_status(job_id: str, request: Request, response: Response):
 def cancel_job(job_id: str, request: Request, response: Response):
     """Cancel a queued or running generation job."""
     _set_recovery_no_store(response)
-    if job_id not in _jobs:
+    job = _jobs.get(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not _job_owned_by_request(_jobs[job_id], request):
+    if not _job_owned_by_request(job, request):
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = _jobs[job_id]
     result = request_cancel(
         job,
         job_id=job_id,
         active_states=_active_gen_states,
     )
+    # Cancellation is already the durable terminal winner before touching the
+    # process. Abort only the exact CPU-runtime generation/attempt bound to
+    # this job; stale tokens can never terminate a replacement request.
+    cpu_lane = globals().get("_cpu_text_lane")
+    runtime_tokens = (
+        cpu_lane.runtime_tokens(job_id)
+        if cpu_lane is not None else None
+    )
+    if runtime_tokens is not None:
+        from services import llm_service
+        try:
+            abort_result = llm_service.abort_local_cpu_runtime(
+                runtime_tokens.runtime_generation,
+                runtime_tokens.runtime_attempt_id,
+                terminate_timeout=5.0,
+                kill_timeout=5.0,
+            )
+            if not isinstance(abort_result, dict) or (
+                abort_result.get("resources_released") is not True
+            ):
+                print("[Cancel] CPU text runtime release remains pending")
+        except Exception as error:
+            # Durable cancel/finality already won; never turn a successful
+            # cancellation into a content-bearing process-control error.
+            print(
+                "[Cancel] CPU text runtime abort failed "
+                f"({type(error).__name__})"
+            )
+        cpu_lane.notify()
     if result.abort_signalled:
         print(f"[Cancel] Signalling abort for job {job_id}")
     return {"status": job["status"], "was_running": result.was_running}
@@ -40874,7 +46827,10 @@ def list_jobs(request: Request, response: Response):
         if not _job_owned_by_request(job, request):
             continue
         j = snapshot_job(job)
-        if j["status"] in ("queued", "running", "failed", "cancelled"):
+        if j["status"] in (
+            "preparing", "waiting_for_plan_approval",
+            "queued", "running", "failed", "cancelled",
+        ):
             recovery_blocked = _queue_recovery_is_blocked(j)
             eta_seconds, subtask_eta_seconds = _job_eta_values(j)
             public_prompt_fields = _public_job_prompt_fields(j)
@@ -40890,7 +46846,7 @@ def list_jobs(request: Request, response: Response):
                 "error": j["error"],
                 "failure_details": j.get("failure_details"),
                 "oom_info": j.get("oom_info"),
-                "created_at": j.get("created_at", 0),
+                "created_at": _public_job_created_at(j),
                 "prompt_preview": public_prompt_fields["prompt_preview"],
                 "model_type": j.get("model_type", ""),
                 "generation_mode": j.get("generation_mode", ""),
@@ -40906,9 +46862,29 @@ def list_jobs(request: Request, response: Response):
                 "clip_total": j.get("clip_total", 0),
                 "clip_progress": j.get("clip_progress", 0),
                 "h3_segment_plan": j.get("h3_segment_plan"),
+                "h3_offload_plan": public_h3_offload_plan(
+                    j.get("h3_offload_plan")
+                ),
+                "plan_review_required": bool(
+                    j.get("status") == "waiting_for_plan_approval"
+                    and j.get("plan_review_required", False)
+                ),
+                "plan_review_terms_required": bool(
+                    j.get("status") == "waiting_for_plan_approval"
+                    and j.get("plan_review_terms_required", False)
+                ),
+                "plan_review_deadline": (
+                    float(j["plan_review_deadline"])
+                    if j.get("status") == "waiting_for_plan_approval"
+                    and type(j.get("plan_review_deadline")) in {int, float}
+                    and math.isfinite(j["plan_review_deadline"])
+                    else None
+                ),
                 "current_segment_model": j.get("current_segment_model", ""),
                 "current_segment_reason": j.get("current_segment_reason", ""),
-                "current_segment_boundary": j.get("current_segment_boundary"),
+                "current_segment_boundary": _public_h3_boundary(
+                    j.get("current_segment_boundary")
+                ),
                 "queue_priority": j.get("queue_priority", 0),
                 "queue_held": bool(j.get("queue_held", False)),
                 "hold_after_output": bool(j.get("hold_after_output", False)),
@@ -40918,6 +46894,8 @@ def list_jobs(request: Request, response: Response):
                 "queue_wait_reason": (
                     None if recovery_blocked else _queue_wait_reason_for_job(job)
                 ),
+                "parent_job_id": _public_parent_job_id(j),
+                **_public_resource_metadata(j),
                 **_public_queue_residency_metadata(
                     j,
                     remote=bool(getattr(request.state, "maestro_remote", False)),
@@ -40947,6 +46925,279 @@ def _require_owned_job(job_id: str, request: Request) -> dict:
     if not _job_owned_by_request(job, request):
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+def _require_owned_job_project(
+    job_id: str,
+    request: Request,
+    workspace: str,
+) -> dict:
+    """Return one owner/project-scoped job without creating a project."""
+    job = _require_owned_job(job_id, request)
+    expected = str(job.get("workspace") or "default")
+    if workspace != expected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        out_dir = _existing_workspace_dir(expected)
+        remote = bool(getattr(request.state, "maestro_remote", False))
+        access = _project_access.status(
+            expected,
+            out_dir,
+            request.state.maestro_session_id,
+            remote,
+        )
+        if (remote and not access.protected) or not access.unlocked:
+            raise ValueError("project unavailable")
+        if os.path.normcase(os.path.realpath(out_dir)) != os.path.normcase(
+            os.path.realpath(str(job.get("out_dir") or ""))
+        ):
+            raise ValueError("project changed")
+        project_digest = _queue_recovery_existing_project_identity(out_dir)
+        if not hmac.compare_digest(
+            project_digest,
+            str(job.get("_recovery_project_digest") or ""),
+        ):
+            raise ValueError("project changed")
+    except Exception as error:
+        raise HTTPException(status_code=404, detail="Job not found") from error
+    return job
+
+
+def _approve_waiting_generation_plan(
+    job: dict,
+    *,
+    request: Request | None,
+    segment_overrides: list,
+    boundary_overrides: list,
+    accepted: bool | None,
+    name_prefix: str,
+) -> dict | None:
+    """Promote one immutable prepared plan; the lifecycle decides the race."""
+    job_id = str(job.get("id") or "")
+    workspace = str(job.get("workspace") or "default")
+    try:
+        project_digest = _queue_recovery_existing_project_identity(
+            str(job.get("out_dir") or ""),
+        )
+    except (QueueRecoveryAdapterError, OSError, ValueError) as error:
+        raise QueueRecoveryRuntimeError("Recovery project changed.") from error
+    if not hmac.compare_digest(
+        project_digest,
+        str(job.get("_recovery_project_digest") or ""),
+    ):
+        raise QueueRecoveryRuntimeError("Recovery project changed.")
+    pointer = dict(job.get("_recovery_manifest_pointer") or {})
+    manifest = load_request_manifest(
+        str(job.get("out_dir") or ""),
+        pointer,
+        expected_job_id=job_id,
+    )
+    validate_manifest_inputs(
+        manifest,
+        lambda descriptor: _queue_recovery_manifest_validator(
+            dict(descriptor),
+            owner_digest=str(job.get("_recovery_owner_digest") or ""),
+            workspace=workspace,
+            project_dir=str(job.get("out_dir") or ""),
+        ),
+    )
+    sealed_params = copy.deepcopy(dict(manifest["params"]))
+    prepared_source = sealed_params.pop("_maestro_prepared_source", None)
+    if not isinstance(prepared_source, dict):
+        raise ValueError("sealed enhanced source is unavailable")
+    if accepted is None and _ref2va_host_terms_accepted():
+        # Host acceptance is authoritative for both the timer and a manual
+        # unchanged-plan approval.  The frozen geometry remains untouched.
+        accepted = True
+
+    has_overrides = bool(segment_overrides or boundary_overrides)
+    if has_overrides:
+        prepared_params = prepared_source
+        prepared_params["h3_segment_overrides"] = copy.deepcopy(
+            segment_overrides
+        )
+        prepared_params["h3_boundary_overrides"] = copy.deepcopy(
+            boundary_overrides
+        )
+        if accepted is not None:
+            prepared_params["h3_ref2va_terms_accepted"] = accepted
+        plan, estimate = _plan_generation_submission(
+            prepared_params,
+            request,
+            turbo_validation_authorized=bool(
+                job.get("_h3_turbo_validation_authorized")
+            ),
+        )
+        if not plan or int(plan.get("clip_count") or 0) <= 1:
+            raise ValueError("approved plan geometry changed")
+        requirements = _h3_generation_requirements(prepared_params, plan)
+        remote_visible = _remote_visible_model_ids(request)
+        if remote_visible is not None:
+            requirements = dict(requirements)
+            requirements["checkpoint_options"] = [
+                option
+                for option in requirements.get("checkpoint_options") or []
+                if str(option.get("model_type") or "") in remote_visible
+            ]
+        public_plan = _public_h3_long_plan(plan, requirements)
+    else:
+        # Empty/default approval accepts the already-authored geometry exactly;
+        # it never repeats enhancement or planning.
+        prepared_params = sealed_params
+        if accepted is not None:
+            prepared_params["h3_ref2va_terms_accepted"] = accepted
+        plan = prepared_params.get("_h3_longform")
+        if not isinstance(plan, dict) or int(plan.get("clip_count") or 0) <= 1:
+            raise ValueError("sealed plan geometry is unavailable")
+        _require_h3_generation_terms(prepared_params, plan)
+        estimate = job.get("h3_estimate")
+        public_plan = copy.deepcopy(job.get("h3_segment_plan"))
+        if not isinstance(public_plan, dict):
+            public_plan = _public_h3_long_plan(
+                plan, _h3_generation_requirements(prepared_params, plan),
+            )
+
+    offload_plan = _seal_h3_offload_plan_for_job(
+        prepared_params,
+        replace=has_overrides,
+    )
+    approved_pointer = write_sealed_request_manifest(
+        str(job.get("out_dir") or ""),
+        job_id=job_id,
+        params=prepared_params,
+        inputs=list(manifest["inputs"]),
+    )
+    approved = approve_prepared_job(
+        job,
+        request_manifest=approved_pointer,
+        kind="studio_generation",
+        params=prepared_params,
+        _recovery_manifest_pointer=dict(approved_pointer),
+        phase="queued",
+        message="Queued",
+        progress=0,
+        h3_segment_plan=public_plan,
+        h3_offload_plan=offload_plan,
+        h3_estimate=estimate,
+        window_total=int(plan.get("clip_count") or 0),
+        clip_total=int(plan.get("clip_count") or 0),
+    )
+    if not approved:
+        remove_request_manifest(
+            str(job.get("out_dir") or ""), approved_pointer,
+        )
+        return None
+    _cancel_plan_review_timer(job_id)
+    remove_request_manifest(str(job.get("out_dir") or ""), pointer)
+    try:
+        _stamp_requested_generation_residency(job, replace=True)
+        _start_generation_worker(job, name_prefix=name_prefix)
+    except Exception:
+        if not _queue_recovery_is_blocked(job):
+            job["_recovery_reason_code"] = "worker_start_failed"
+            _queue_recovery_checkpoint(
+                job,
+                queue_held=True,
+                recovery_state="blocked",
+                reruns_denoise=False,
+                message="Generation worker could not be started",
+            )
+        raise QueueRecoveryRuntimeError(
+            "Generation worker could not be started."
+        )
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "h3_segment_plan": public_plan,
+        "h3_estimate": estimate,
+    }
+
+
+@api.post("/api/v1/generate/{job_id}/plan/approve")
+async def approve_generation_plan(
+    job_id: str,
+    request: Request,
+    response: Response,
+):
+    """Approve one sealed enhanced plan and resume the same durable job."""
+    _set_recovery_no_store(response)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid plan approval")
+    allowed = {
+        "workspace", "segment_overrides", "boundary_overrides",
+        "h3_ref2va_terms_accepted",
+    }
+    if set(body).difference(allowed):
+        raise HTTPException(status_code=400, detail="Invalid plan approval")
+    workspace = body.get("workspace")
+    if not isinstance(workspace, str) or not workspace:
+        raise HTTPException(status_code=400, detail="workspace is required")
+    job = _require_owned_job_project(job_id, request, workspace)
+    if job.get("status") != "waiting_for_plan_approval":
+        raise HTTPException(
+            status_code=409,
+            detail="This job is not waiting for plan approval",
+        )
+    deadline = job.get("plan_review_deadline")
+    if (
+        type(deadline) in {int, float}
+        and math.isfinite(deadline)
+        and time.time() >= float(deadline)
+    ):
+        _expire_plan_review(job_id)
+        raise HTTPException(
+            status_code=409,
+            detail="This job is no longer waiting for plan approval",
+        )
+    segment_overrides = body.get("segment_overrides", [])
+    boundary_overrides = body.get("boundary_overrides", [])
+    if not isinstance(segment_overrides, list) or not isinstance(
+        boundary_overrides, list
+    ):
+        raise HTTPException(status_code=400, detail="Invalid plan overrides")
+    accepted = body.get("h3_ref2va_terms_accepted")
+    if accepted is not None and not isinstance(accepted, bool):
+        raise HTTPException(status_code=400, detail="Invalid terms acceptance")
+
+    try:
+        result = _approve_waiting_generation_plan(
+            job,
+            request=request,
+            segment_overrides=segment_overrides,
+            boundary_overrides=boundary_overrides,
+            accepted=accepted,
+            name_prefix="studio-generation-approved",
+        )
+    except HTTPException:
+        raise
+    except QueueRecoveryRuntimeError as error:
+        if job.get("status") == "queued":
+            raise HTTPException(
+                status_code=503,
+                detail="Generation worker could not be started",
+            ) from error
+        fail_preparation(
+            job,
+            error="Prepared generation state is invalid",
+            message="Prepared generation state is invalid",
+            phase="preparation_failed",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Prepared generation state is invalid",
+        ) from error
+    except (TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Plan overrides are invalid",
+        ) from error
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This job is no longer waiting for plan approval",
+        )
+    return result
 
 
 def _require_generic_queue_control_job(
@@ -40979,10 +47230,11 @@ def _require_h3_delivery_recovery_job(
         # Recovery must never create a missing local project as a side effect
         # of an authorization probe. All access denials share one opaque shape.
         out_dir = _existing_workspace_dir(expected_workspace)
+        remote = bool(getattr(request.state, "maestro_remote", False))
         status = _project_access.status(
             expected_workspace, out_dir, request.state.maestro_session_id,
+            remote,
         )
-        remote = bool(getattr(request.state, "maestro_remote", False))
         if (remote and not status.protected) or not status.unlocked:
             raise HTTPException(status_code=404, detail="Job not found")
     except Exception as error:
@@ -41156,7 +47408,9 @@ def _require_remote_queue_project(request: Request) -> None:
 
     try:
         workspace_dir = _existing_workspace_dir(project)
-        access = _project_access.status(project, workspace_dir, session_id)
+        access = _project_access.status(
+            project, workspace_dir, session_id, True,
+        )
     except HTTPException as error:
         with _remote_active_projects_lock:
             if _remote_active_projects.get(session_id) == project:
@@ -41189,9 +47443,14 @@ def get_queue_state(request: Request, response: Response):
         snapshot = scheduler["states"].get(id(job))
         if not snapshot or not _job_owned_by_request(snapshot, request):
             continue
-        if snapshot.get("status") not in ("queued", "running"):
+        if snapshot.get("status") not in (
+            "preparing", "waiting_for_plan_approval", "queued", "running",
+        ):
             continue
         recovery_blocked = _queue_recovery_is_blocked(snapshot)
+        pre_gpu = snapshot.get("status") in {
+            "preparing", "waiting_for_plan_approval",
+        }
         eta_seconds, subtask_eta_seconds = _job_eta_values(snapshot)
         jobs.append({
             "job_id": snapshot.get("id"),
@@ -41199,23 +47458,46 @@ def get_queue_state(request: Request, response: Response):
             "priority": snapshot.get("queue_priority", 0),
             "held": bool(snapshot.get("queue_held", False)),
             "hold_after_output": bool(snapshot.get("hold_after_output", False)),
+            "plan_review_required": bool(
+                snapshot.get("status") == "waiting_for_plan_approval"
+                and snapshot.get("plan_review_required", False)
+            ),
+            "plan_review_terms_required": bool(
+                snapshot.get("status") == "waiting_for_plan_approval"
+                and snapshot.get("plan_review_terms_required", False)
+            ),
+            "plan_review_deadline": (
+                float(snapshot["plan_review_deadline"])
+                if snapshot.get("status") == "waiting_for_plan_approval"
+                and type(snapshot.get("plan_review_deadline")) in {int, float}
+                and math.isfinite(snapshot["plan_review_deadline"])
+                else None
+            ),
             "position": (
-                None if recovery_blocked
+                None if recovery_blocked or pre_gpu
                 else scheduler["positions"].get(id(job))
             ),
             "wait_reason": (
                 None if recovery_blocked
-                else scheduler["wait_reasons"].get(id(job))
+                else (
+                    _queue_wait_reason_for_job(job)
+                    if snapshot.get("resource_intent") == "generation"
+                    else scheduler["wait_reasons"].get(id(job))
+                )
             ),
+            "parent_job_id": _public_parent_job_id(snapshot),
+            **_public_resource_metadata(snapshot),
             **_public_queue_residency_metadata(
                 snapshot,
                 remote=bool(getattr(request.state, "maestro_remote", False)),
             ),
             "requested_outputs": snapshot.get("requested_outputs", 1),
             "produced_outputs": len(snapshot.get("output_files") or []),
-            "eta_seconds": None if recovery_blocked else eta_seconds,
+            "eta_seconds": (
+                None if recovery_blocked or pre_gpu else eta_seconds
+            ),
             "subtask_eta_seconds": (
-                None if recovery_blocked else subtask_eta_seconds
+                None if recovery_blocked or pre_gpu else subtask_eta_seconds
             ),
             "estimate_after_resume": (
                 snapshot.get("h3_estimate") if recovery_blocked else None
@@ -41231,7 +47513,14 @@ def get_queue_state(request: Request, response: Response):
         "jobs": jobs,
         "paused": scheduler["paused"],
         "pause_after_current": scheduler["pause_after_current"],
-        "summary": scheduler["summary"],
+        "summary": {
+            **scheduler["summary"],
+            **(
+                globals()["_cpu_text_lane"].aggregate_snapshot()
+                if "_cpu_text_lane" in globals()
+                else {"cpu_text_running": 0, "cpu_text_waiting": 0}
+            ),
+        },
     }
 
 
@@ -41312,7 +47601,13 @@ def _resume_recovered_job(
         allowed_reasons = (
             {"owner_reauthentication_required"}
             if state == "blocked_remote_reauth"
-            else {"input_missing_or_changed", "worker_start_failed"}
+            else {
+                "input_missing_or_changed", "worker_start_failed",
+                "h3_generation_recovery_authorization_required",
+                "h3_peak_calibration_required",
+                "h3_generation_oom_replanned",
+                "model_terms_required",
+            }
         )
         if reason not in allowed_reasons:
             raise HTTPException(
@@ -41330,6 +47625,46 @@ def _resume_recovered_job(
             request_owner, str(job.get("_recovery_owner_digest") or ""),
         ):
             raise HTTPException(status_code=404, detail="Job not found")
+        if not _queue_recovery_revalidate_job(job):
+            reason = str(job.get("_recovery_reason_code") or "")
+            message = (
+                "Recovery project is missing or was recreated"
+                if reason == "project_missing_or_recreated"
+                else "Recovery request or input validation failed"
+            )
+            _queue_recovery_checkpoint(
+                job,
+                queue_held=True,
+                recovery_state="blocked",
+                message=message,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=_QUEUE_RECOVERY_REASON_TEXT.get(
+                    reason, "Recovery evidence is missing or changed",
+                ),
+            )
+        if _queue_recovery_delivery_pending(job) is None:
+            _require_job_model_recipe_terms(job)
+        if reason in {
+            "h3_generation_recovery_authorization_required",
+            "h3_peak_calibration_required",
+        }:
+            try:
+                prepared = _prepare_h3_peak_recovery(job)
+            except (QueueRecoveryRuntimeError, ValueError, TypeError) as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The H3 recovery plan could not be prepared safely",
+                ) from error
+            if not prepared:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_QUEUE_RECOVERY_REASON_TEXT[
+                        "h3_peak_calibration_required"
+                    ],
+                )
+            reason = "h3_generation_oom_replanned"
         worker = _queue_recovery_worker(job)
         if worker is None:
             job["_recovery_reason_code"] = "preparation_must_resubmit"
@@ -41358,34 +47693,8 @@ def _resume_recovered_job(
                 status_code=409,
                 detail="Recovery attempt limit reached",
             )
-        if not _queue_recovery_revalidate_job(job):
-            reason = str(job.get("_recovery_reason_code") or "")
-            message = (
-                "Recovery project is missing or was recreated"
-                if reason == "project_missing_or_recreated"
-                else "Recovery request or input validation failed"
-            )
-            _queue_recovery_checkpoint(
-                job,
-                queue_held=True,
-                recovery_state="blocked",
-                recovery_attempt=attempt,
-                message=message,
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=_QUEUE_RECOVERY_REASON_TEXT.get(
-                    reason, "Recovery evidence is missing or changed",
-                ),
-            )
-        job["session_id"] = request.state.maestro_session_id
-        job["access_policy"] = {
-            "private": bool(job.get("private", False)),
-            "explicit": bool(job.get("explicit", False)),
-        }
-        job["_recovery_reason_code"] = ""
         reruns_denoise = _queue_recovery_delivery_pending(job) is None
-        _queue_recovery_checkpoint(
+        if not _queue_recovery_checkpoint(
             job,
             status="queued",
             queue_held=False,
@@ -41393,7 +47702,16 @@ def _resume_recovered_job(
             recovery_state="retrying",
             reruns_denoise=reruns_denoise,
             message="Queued for recovery",
-        )
+            session_id=request.state.maestro_session_id,
+            access_policy={
+                "private": bool(job.get("private", False)),
+                "explicit": bool(job.get("explicit", False)),
+            },
+            _recovery_reason_code="",
+        ):
+            raise HTTPException(
+                status_code=409, detail="Recovery was cancelled",
+            )
         if not update_queue_job(job, held=False):
             raise HTTPException(
                 status_code=409, detail="Recovery could not be queued",
@@ -41424,6 +47742,775 @@ def _resume_recovered_job(
             "recovery_state": "retrying",
             "reruns_denoise": reruns_denoise,
         }
+
+
+def _local_h3_recovery_cursor_digest(job: dict) -> str:
+    """Return one content-free assertion over the current durable cursor."""
+    encoded = json.dumps(
+        job.get("recovery_cursor") or {},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _local_h3_discovery_owner_digest(manifest: dict) -> str:
+    """Recover only upload ownership authority; never expose its principal."""
+    recovered = ""
+    for descriptor in manifest.get("inputs") or []:
+        if not isinstance(descriptor, dict) or descriptor.get("scope") not in {
+            "upload", "upload_audio",
+        }:
+            continue
+        access = read_upload_access_sidecar(str(descriptor.get("path") or ""))
+        if not isinstance(access, dict):
+            raise QueueRecoveryRuntimeError(
+                "Recovery upload owner evidence is unavailable."
+            )
+        candidate = owner_principal_digest(
+            _session_secret(), str(access.get("owner_session_id") or ""),
+        )
+        if recovered and not hmac.compare_digest(recovered, candidate):
+            raise QueueRecoveryRuntimeError(
+                "Recovery upload owner evidence is inconsistent."
+            )
+        recovered = candidate
+    return recovered or owner_principal_digest(
+        _session_secret(), "host-local-recovery",
+    )
+
+
+def _local_h3_recovery_candidates(
+    workspace: str,
+    project_dir: str,
+    *,
+    expected_manifest_sha256: str = "",
+) -> list[dict]:
+    """Reconstruct valid incomplete H3 chains from private sealed evidence."""
+    candidates = []
+    for entry in discover_request_manifest_pointers(
+        project_dir,
+        expected_sha256=expected_manifest_sha256,
+    ):
+        job_id = str(entry.get("job_id") or "")
+        pointer = entry.get("pointer")
+        try:
+            manifest = load_request_manifest(
+                project_dir, pointer, expected_job_id=job_id,
+            )
+            owner_digest = _local_h3_discovery_owner_digest(manifest)
+            validate_manifest_inputs(
+                manifest,
+                lambda descriptor: _queue_recovery_manifest_validator(
+                    dict(descriptor),
+                    owner_digest=owner_digest,
+                    workspace=workspace,
+                    project_dir=project_dir,
+                ),
+            )
+            params = copy.deepcopy(manifest["params"])
+            requested_outputs = max(
+                1, int(params.get("repeat_generation", 1) or 1),
+            )
+            job = {
+                "id": job_id,
+                "kind": "studio_generation",
+                "created_at": time.time(),
+                "status": "queued",
+                "queue_held": True,
+                "recovery_state": "blocked",
+                "reruns_denoise": False,
+                "_recovery_reason_code": (
+                    "h3_generation_recovery_authorization_required"
+                ),
+                "message": "Calibrated H3 recovery authorization is required",
+                "error": None,
+                "workspace": workspace,
+                "out_dir": project_dir,
+                "params": params,
+                "model_type": str(params.get("model_type") or ""),
+                "generation_mode": str(
+                    params.get("generation_mode") or "video"
+                ),
+                "requested_outputs": requested_outputs,
+                "output_files": [],
+                "artifact_files": [],
+                "source_remote": False,
+                "private": True,
+                "explicit": bool(params.get("explicit_output", False)),
+                "access_policy": {
+                    "private": True,
+                    "explicit": bool(params.get("explicit_output", False)),
+                },
+                "recovery_attempt": 0,
+                "recovery_cursor": {"completed_units": []},
+                "_recovery_owner_digest": owner_digest,
+                "_recovery_manifest_pointer": dict(pointer),
+            }
+            _queue_recovery_reconcile_cursor(job, project_dir)
+            if _h3_incomplete_recovery_prefix(job) is None:
+                continue
+        except (QueueRecoveryRuntimeError, TypeError, ValueError):
+            # Discovery is also the liveness proof used by startup cleanup.
+            # Once a sealed pointer passed the bounded directory scan, an
+            # inability to validate its private manifest/input/cursor evidence
+            # is uncertainty, not proof that the pointer is orphaned.  Bubble
+            # the failure so startup skips destructive cleanup for the whole
+            # project until a later retry can validate the evidence.
+            raise QueueRecoveryRuntimeError(
+                "Local H3 recovery evidence could not be validated."
+            ) from None
+        candidates.append(job)
+    return candidates
+
+
+def _preserve_local_h3_recovery_evidence(
+    workspace: str,
+    project_dir: str,
+    live_manifests: dict[str, list[str]],
+    live_staging_jobs: dict[str, list[str]],
+) -> bool:
+    """Project valid candidates into cleanup liveness, or fail closed."""
+    try:
+        candidates = _local_h3_recovery_candidates(workspace, project_dir)
+    except Exception:
+        return False
+    for candidate in candidates:
+        candidate_id = candidate.get("id")
+        pointer = candidate.get("_recovery_manifest_pointer")
+        path = pointer.get("path") if isinstance(pointer, dict) else None
+        if isinstance(candidate_id, str):
+            live_staging_jobs.setdefault(workspace, []).append(candidate_id)
+        if isinstance(path, str):
+            live_manifests.setdefault(workspace, []).append(path)
+    return True
+
+
+def discover_local_h3_generation_recovery(
+    workspace: str,
+    *,
+    expected_project_digest: str = "",
+    expected_manifest_sha256: str = "",
+) -> dict:
+    """Return one unique content-free host-local recovery assertion."""
+    project_dir = _existing_workspace_dir(str(workspace or ""))
+    project_digest = _queue_recovery_project_identity(workspace, project_dir)
+    if expected_project_digest and not hmac.compare_digest(
+        project_digest, str(expected_project_digest),
+    ):
+        raise QueueRecoveryRuntimeError("Recovery project identity changed.")
+    candidates = _local_h3_recovery_candidates(
+        workspace,
+        project_dir,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+    if len(candidates) != 1:
+        raise QueueRecoveryRuntimeError(
+            "Recovery evidence is not a unique incomplete H3 chain."
+        )
+    job = candidates[0]
+    return {
+        "job_id": str(job["id"]),
+        "workspace": str(workspace),
+        "project_digest": project_digest,
+        "manifest_sha256": str(
+            job["_recovery_manifest_pointer"]["sha256"]
+        ),
+        "cursor_sha256": _local_h3_recovery_cursor_digest(job),
+        "completed_segments": int(_h3_incomplete_recovery_prefix(job) or 0),
+        "status": "blocked",
+    }
+
+
+def _register_discovered_local_h3_recovery(
+    job: dict,
+    *,
+    project_digest: str,
+) -> dict:
+    """Durably publish one exact discovered chain without starting a worker."""
+    prepared = _jobs.prepare(job)
+    job_id = str(prepared.get("id") or "")
+    owner_digest = str(prepared.get("_recovery_owner_digest") or "")
+    pointer = dict(prepared.get("_recovery_manifest_pointer") or {})
+    with _workspace_lifecycle_lock:
+        _require_job_workspace_available(prepared)
+        current_project = _queue_recovery_project_identity(
+            str(prepared.get("workspace") or ""),
+            str(prepared.get("out_dir") or ""),
+        )
+        if not hmac.compare_digest(current_project, project_digest):
+            raise QueueRecoveryRuntimeError("Recovery project identity changed.")
+        _queue_recovery_with_bounded_compaction(
+            lambda: _queue_recovery_coordinator.register_job(
+                prepared,
+                owner_digest=owner_digest,
+                project_digest=project_digest,
+                request_manifest=pointer,
+                global_state=durable_queue_state(additions=(prepared,)),
+            )
+        )
+        prepared["_recovery_project_digest"] = project_digest
+        try:
+            _jobs.publish_prepared(job_id, prepared)
+        except Exception:
+            _queue_recovery_with_bounded_compaction(
+                lambda: _queue_recovery_coordinator.prospective_transition(
+                    DurableTransition(
+                        name="local_h3_discovery_rollback",
+                        tombstones=(job_id,),
+                        global_state=durable_queue_state(),
+                    )
+                )
+            )
+            raise
+    return prepared
+
+
+def _rollback_discovered_local_h3_recovery(job_id: str) -> None:
+    """Remove one provisional held registration after exactness loses."""
+    _queue_recovery_with_bounded_compaction(
+        lambda: _queue_recovery_coordinator.prospective_transition(
+            DurableTransition(
+                name="local_h3_discovery_rollback",
+                tombstones=(str(job_id),),
+                global_state=durable_queue_state(),
+            )
+        )
+    )
+    _jobs.pop(str(job_id), None)
+
+
+def prepare_local_h3_generation_recovery(
+    job_id: str,
+    *,
+    expected_manifest_sha256: str,
+    expected_cursor_sha256: str,
+    workspace: str = "",
+    expected_project_digest: str = "",
+) -> dict:
+    """Host-local exact-evidence preparation; never queues or starts work."""
+    with _queue_recovery_checkpoint_lock:
+        job = _jobs.get(str(job_id))
+        discovered_registration = False
+        if not isinstance(job, dict) and workspace and expected_project_digest:
+            project_dir = _existing_workspace_dir(workspace)
+            project_digest = _queue_recovery_project_identity(
+                workspace, project_dir,
+            )
+            if not hmac.compare_digest(
+                project_digest, str(expected_project_digest),
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "Recovery project identity changed."
+                )
+            candidates = _local_h3_recovery_candidates(
+                workspace,
+                project_dir,
+                expected_manifest_sha256=expected_manifest_sha256,
+            )
+            if len(candidates) != 1:
+                raise QueueRecoveryRuntimeError(
+                    "Recovery evidence is not a unique incomplete H3 chain."
+                )
+            candidate = candidates[0]
+            if (
+                not hmac.compare_digest(
+                    str(candidate.get("id") or ""), str(job_id),
+                )
+                or not hmac.compare_digest(
+                    _local_h3_recovery_cursor_digest(candidate),
+                    str(expected_cursor_sha256 or ""),
+                )
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "Recovery evidence changed before local preparation."
+                )
+            job = _register_discovered_local_h3_recovery(
+                candidate,
+                project_digest=project_digest,
+            )
+            discovered_registration = True
+            # Reconcile once more after durable publication. A sidecar or
+            # artifact winner between discovery and registration must retract
+            # the provisional job rather than leave changed evidence held.
+            try:
+                _queue_recovery_reconcile_cursor(job, project_dir)
+            except Exception:
+                _rollback_discovered_local_h3_recovery(str(job_id))
+                raise
+            if not hmac.compare_digest(
+                _local_h3_recovery_cursor_digest(job),
+                str(expected_cursor_sha256 or ""),
+            ):
+                _rollback_discovered_local_h3_recovery(str(job_id))
+                raise QueueRecoveryRuntimeError(
+                    "Recovery evidence changed before local preparation."
+                )
+        if not isinstance(job, dict):
+            raise QueueRecoveryRuntimeError("Recovery job is unavailable.")
+        try:
+            pointer = job.get("_recovery_manifest_pointer")
+            if (
+                not isinstance(pointer, dict)
+                or not hmac.compare_digest(
+                    str(pointer.get("sha256") or ""),
+                    str(expected_manifest_sha256 or ""),
+                )
+                or not hmac.compare_digest(
+                    _local_h3_recovery_cursor_digest(job),
+                    str(expected_cursor_sha256 or ""),
+                )
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "Recovery evidence changed before local preparation."
+                )
+            reason = _queue_recovery_reason_code(job)
+            if reason not in {
+                "h3_generation_recovery_authorization_required",
+                "h3_peak_calibration_required",
+            }:
+                raise QueueRecoveryRuntimeError(
+                    "This job is not waiting for H3 recovery preparation."
+                )
+            if not _queue_recovery_revalidate_job(job):
+                raise QueueRecoveryRuntimeError(
+                    "Recovery project or input evidence changed."
+                )
+            if not _prepare_h3_peak_recovery(job):
+                return {
+                    "job_id": str(job_id),
+                    "status": "blocked",
+                    "recovery_reason": "h3_peak_calibration_required",
+                }
+        except Exception:
+            if discovered_registration and str(job_id) in _jobs:
+                _rollback_discovered_local_h3_recovery(str(job_id))
+            raise
+        return {
+            "job_id": str(job_id),
+            "status": "blocked",
+            "recovery_reason": "h3_generation_oom_replanned",
+            "manifest_sha256": str(
+                (job.get("_recovery_manifest_pointer") or {}).get("sha256")
+                or ""
+            ),
+            "cursor_sha256": _local_h3_recovery_cursor_digest(job),
+        }
+
+
+def start_local_h3_generation_recovery(
+    job_id: str,
+    *,
+    expected_manifest_sha256: str,
+    expected_cursor_sha256: str,
+) -> dict:
+    """Start one separately prepared host-local recovery after exact asserts."""
+    with _queue_recovery_checkpoint_lock:
+        job = _jobs.get(str(job_id))
+        if not isinstance(job, dict):
+            raise QueueRecoveryRuntimeError("Recovery job is unavailable.")
+        pointer = job.get("_recovery_manifest_pointer")
+        if (
+            not isinstance(pointer, dict)
+            or not hmac.compare_digest(
+                str(pointer.get("sha256") or ""),
+                str(expected_manifest_sha256 or ""),
+            )
+            or not hmac.compare_digest(
+                _local_h3_recovery_cursor_digest(job),
+                str(expected_cursor_sha256 or ""),
+            )
+            or _queue_recovery_reason_code(job)
+                != "h3_generation_oom_replanned"
+        ):
+            raise QueueRecoveryRuntimeError(
+                "Prepared recovery evidence changed before start."
+            )
+        if not _queue_recovery_revalidate_job(job):
+            raise QueueRecoveryRuntimeError(
+                "Recovery project or input evidence changed."
+            )
+        if _queue_recovery_delivery_pending(job) is None:
+            _require_job_model_recipe_terms(job)
+        attempt, may_retry = next_recovery_attempt(job)
+        if not may_retry:
+            raise QueueRecoveryRuntimeError("Recovery attempt limit reached.")
+        if not _queue_recovery_checkpoint(
+            job,
+            status="queued",
+            queue_held=False,
+            recovery_attempt=attempt,
+            recovery_state="retrying",
+            reruns_denoise=True,
+            message="Queued for calibrated H3 recovery",
+            _recovery_reason_code="",
+        ) or not update_queue_job(job, held=False):
+            raise QueueRecoveryRuntimeError("Recovery was cancelled.")
+        worker = _queue_recovery_worker(job)
+        if worker is None:
+            raise QueueRecoveryRuntimeError("Recovery worker is unavailable.")
+        try:
+            threading.Thread(
+                target=worker,
+                args=(str(job_id),),
+                daemon=False,
+                name=f"studio-local-recovery-{job_id}",
+            ).start()
+        except Exception as error:
+            job["_recovery_reason_code"] = "worker_start_failed"
+            _queue_recovery_checkpoint(
+                job,
+                queue_held=True,
+                recovery_state="blocked",
+                message="Recovery worker could not be started",
+            )
+            raise QueueRecoveryRuntimeError(
+                "Recovery worker could not be started."
+            ) from error
+        return {
+            "job_id": str(job_id),
+            "status": "queued",
+            "recovery_attempt": attempt,
+            "recovery_state": "retrying",
+        }
+
+
+_LOCAL_H3_RECOVERY_ASSERTION_KEYS = frozenset({
+    "workspace", "project_digest", "manifest_sha256", "cursor_sha256",
+})
+_LOCAL_H3_RECOVERY_JOB_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
+
+
+def _require_local_recovery_control_request(request: Request) -> None:
+    """Defense in depth for direct handler calls outside middleware."""
+    if _local_recovery_control_denial(request) is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="Local recovery controls require direct loopback",
+        )
+
+
+def _validate_local_h3_recovery_assertion(
+    body: object,
+    *,
+    job_id: str,
+) -> dict:
+    """Accept only opaque, content-free exact-evidence assertions."""
+    if (
+        type(body) is not dict
+        or set(body) != _LOCAL_H3_RECOVERY_ASSERTION_KEYS
+        or _LOCAL_H3_RECOVERY_JOB_ID_RE.fullmatch(str(job_id or "")) is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="An exact local recovery assertion is required",
+        )
+    assertion = {
+        key: body.get(key) for key in _LOCAL_H3_RECOVERY_ASSERTION_KEYS
+    }
+    if (
+        any(type(value) is not str for value in assertion.values())
+        or not assertion["workspace"]
+        or re.fullmatch(
+            r"project:v1:[0-9a-f]{64}", assertion["project_digest"],
+        )
+            is None
+        or re.fullmatch(r"[0-9a-f]{64}", assertion["manifest_sha256"])
+            is None
+        or re.fullmatch(r"[0-9a-f]{64}", assertion["cursor_sha256"])
+            is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="An exact local recovery assertion is required",
+        )
+    return assertion
+
+
+async def _read_local_h3_recovery_assertion(
+    request: Request,
+    *,
+    job_id: str,
+) -> dict:
+    """Authorize the transport before reading or decoding a mutation body."""
+    _require_local_recovery_control_request(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="An exact local recovery assertion is required",
+        ) from None
+    return _validate_local_h3_recovery_assertion(body, job_id=job_id)
+
+
+def _require_current_local_h3_recovery_project(
+    workspace: str,
+    *,
+    expected_project_digest: str = "",
+) -> tuple[str, str]:
+    """Bind host-local authority to the active, existing project instance."""
+    if not isinstance(workspace, str) or workspace != _get_active_workspace():
+        raise HTTPException(status_code=404, detail="Recovery project not found")
+    _require_workspace_not_deleting(workspace)
+    project_dir = _existing_workspace_dir(workspace)
+    project_digest = _queue_recovery_project_identity(workspace, project_dir)
+    if expected_project_digest and not hmac.compare_digest(
+        project_digest, str(expected_project_digest),
+    ):
+        raise HTTPException(status_code=409, detail="Recovery evidence changed")
+    return project_dir, project_digest
+
+
+def _local_h3_recovery_control_status(
+    job: dict,
+    *,
+    project_digest: str,
+) -> dict:
+    """Project one recovery job through a strict content-free allowlist."""
+    pointer = job.get("_recovery_manifest_pointer")
+    if not isinstance(pointer, dict):
+        raise QueueRecoveryRuntimeError("Recovery manifest is unavailable.")
+    reason = _queue_recovery_reason_code(job)
+    if reason not in {
+        "h3_generation_recovery_authorization_required",
+        "h3_peak_calibration_required",
+        "h3_generation_oom_replanned",
+    }:
+        reason = ""
+    return {
+        "job_id": str(job.get("id") or ""),
+        "workspace": str(job.get("workspace") or ""),
+        "project_digest": str(project_digest),
+        "manifest_sha256": str(pointer.get("sha256") or ""),
+        "cursor_sha256": _local_h3_recovery_cursor_digest(job),
+        "status": str(job.get("status") or ""),
+        "recovery_state": str(job.get("recovery_state") or ""),
+        "recovery_reason": reason or None,
+        "queue_held": bool(job.get("queue_held", False)),
+    }
+
+
+def _raise_local_h3_recovery_http_error(error: Exception) -> None:
+    """Keep private evidence failures opaque at the process boundary."""
+    if isinstance(error, HTTPException):
+        raise error
+    raise HTTPException(
+        status_code=409,
+        detail="Local recovery evidence is unavailable or changed",
+    ) from None
+
+
+def _validate_local_h3_recovery_discovery_selectors(
+    project_digest: object,
+    manifest_sha256: object,
+) -> dict[str, str]:
+    """Accept only absent or exact content-free revision selectors."""
+    if (
+        type(project_digest) is not str
+        or type(manifest_sha256) is not str
+        or (
+            project_digest
+            and re.fullmatch(r"project:v1:[0-9a-f]{64}", project_digest)
+                is None
+        )
+        or (
+            manifest_sha256
+            and re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Exact local recovery selectors are required",
+        )
+    return {
+        "project_digest": project_digest,
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+@api.get("/api/v1/local-recovery/h3/discovery")
+def get_local_h3_recovery_discovery(
+    request: Request,
+    response: Response,
+    workspace: str = "",
+    project_digest: str = "",
+    manifest_sha256: str = "",
+):
+    """Discover one exact sealed chain without registering or starting it."""
+    _require_local_recovery_control_request(request)
+    _set_recovery_no_store(response)
+    selectors = _validate_local_h3_recovery_discovery_selectors(
+        project_digest, manifest_sha256,
+    )
+    try:
+        with _reserve_workspace_operations(workspace):
+            _, current_project_digest = (
+                _require_current_local_h3_recovery_project(
+                    workspace,
+                    expected_project_digest=selectors["project_digest"],
+                )
+            )
+            return discover_local_h3_generation_recovery(
+                workspace,
+                expected_project_digest=current_project_digest,
+                expected_manifest_sha256=selectors["manifest_sha256"],
+            )
+    except Exception as error:
+        _raise_local_h3_recovery_http_error(error)
+
+
+@api.get("/api/v1/local-recovery/h3/{job_id}")
+def get_local_h3_recovery_status(
+    job_id: str,
+    request: Request,
+    response: Response,
+    workspace: str = "",
+    project_digest: str = "",
+    manifest_sha256: str = "",
+    cursor_sha256: str = "",
+):
+    """Return exact held/retry state without prompts, paths, or media facts."""
+    _require_local_recovery_control_request(request)
+    _set_recovery_no_store(response)
+    assertion = _validate_local_h3_recovery_assertion({
+        "workspace": workspace,
+        "project_digest": project_digest,
+        "manifest_sha256": manifest_sha256,
+        "cursor_sha256": cursor_sha256,
+    }, job_id=job_id)
+    try:
+        with _reserve_workspace_operations(assertion["workspace"]):
+            _, current_project_digest = (
+                _require_current_local_h3_recovery_project(
+                    assertion["workspace"],
+                    expected_project_digest=assertion["project_digest"],
+                )
+            )
+            job = _jobs.get(str(job_id))
+            pointer = (
+                job.get("_recovery_manifest_pointer")
+                if isinstance(job, dict) else None
+            )
+            validation_candidate = (
+                copy.deepcopy(job) if isinstance(job, dict) else None
+            )
+            if (
+                not isinstance(job, dict)
+                or str(job.get("workspace") or "") != assertion["workspace"]
+                or not isinstance(pointer, dict)
+                or not hmac.compare_digest(
+                    str(pointer.get("sha256") or ""),
+                    assertion["manifest_sha256"],
+                )
+                or not hmac.compare_digest(
+                    _local_h3_recovery_cursor_digest(job),
+                    assertion["cursor_sha256"],
+                )
+                # The shared validator intentionally refreshes params and
+                # reason state for a real resume. A GET must remain pure: run
+                # it on a detached snapshot so polling cannot consume the
+                # prepared reason required by the later explicit start.
+                or not _queue_recovery_revalidate_job(validation_candidate)
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "Recovery evidence changed before status."
+                )
+            return _local_h3_recovery_control_status(
+                job, project_digest=current_project_digest,
+            )
+    except Exception as error:
+        _raise_local_h3_recovery_http_error(error)
+
+
+@api.post("/api/v1/local-recovery/h3/{job_id}/prepare")
+async def prepare_local_h3_recovery_control(
+    job_id: str,
+    request: Request,
+    response: Response,
+):
+    """Durably prepare one exact chain while leaving it held and workerless."""
+    assertion = await _read_local_h3_recovery_assertion(
+        request, job_id=job_id,
+    )
+    _set_recovery_no_store(response)
+    try:
+        with _reserve_workspace_operations(assertion["workspace"]):
+            _require_current_local_h3_recovery_project(
+                assertion["workspace"],
+                expected_project_digest=assertion["project_digest"],
+            )
+            result = prepare_local_h3_generation_recovery(
+                job_id,
+                expected_manifest_sha256=assertion["manifest_sha256"],
+                expected_cursor_sha256=assertion["cursor_sha256"],
+                workspace=assertion["workspace"],
+                expected_project_digest=assertion["project_digest"],
+            )
+            job = _jobs.get(str(job_id))
+            if not isinstance(job, dict):
+                raise QueueRecoveryRuntimeError(
+                    "Prepared recovery job is unavailable."
+                )
+            current_project_digest = _queue_recovery_project_identity(
+                assertion["workspace"], str(job.get("out_dir") or ""),
+            )
+            projected = _local_h3_recovery_control_status(
+                job, project_digest=current_project_digest,
+            )
+            projected["status"] = str(result.get("status") or "blocked")
+            return projected
+    except Exception as error:
+        _raise_local_h3_recovery_http_error(error)
+
+
+@api.post("/api/v1/local-recovery/h3/{job_id}/start")
+async def start_local_h3_recovery_control(
+    job_id: str,
+    request: Request,
+    response: Response,
+):
+    """Separately start one already-prepared exact recovery assertion."""
+    assertion = await _read_local_h3_recovery_assertion(
+        request, job_id=job_id,
+    )
+    _set_recovery_no_store(response)
+    try:
+        with _reserve_workspace_operations(assertion["workspace"]):
+            _require_current_local_h3_recovery_project(
+                assertion["workspace"],
+                expected_project_digest=assertion["project_digest"],
+            )
+            job = _jobs.get(str(job_id))
+            if (
+                not isinstance(job, dict)
+                or str(job.get("workspace") or "")
+                    != assertion["workspace"]
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "Prepared recovery job is unavailable."
+                )
+            result = start_local_h3_generation_recovery(
+                job_id,
+                expected_manifest_sha256=assertion["manifest_sha256"],
+                expected_cursor_sha256=assertion["cursor_sha256"],
+            )
+            response.status_code = 202
+            return {
+                "job_id": str(result.get("job_id") or ""),
+                "status": str(result.get("status") or "queued"),
+                "recovery_state": str(
+                    result.get("recovery_state") or "retrying"
+                ),
+                "recovery_attempt": int(
+                    result.get("recovery_attempt", 0) or 0
+                ),
+            }
+    except Exception as error:
+        _raise_local_h3_recovery_http_error(error)
 
 
 @api.post("/api/v1/queue/{job_id}/recovery-resume")

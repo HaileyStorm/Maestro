@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -411,6 +412,56 @@ Promise.resolve(build({port: async () => 7860}))
         self.assertNotIn("&", command)
         self.assertNotIn("nohup", command)
         self.assertNotIn("detached", command)
+
+    def test_blender_bridge_readiness_advances_main_start_without_daemon_subroutine(self):
+        definition = self._load_start_with_environment(
+            "PINOKIO_SHARE_CLOUDFLARE=false\nPINOKIO_STABLE_SHARE_URL=\n",
+            {},
+        )
+        steps = definition["run"]
+        bridge_index = next(
+            index
+            for index, step in enumerate(steps)
+            if "start_blender_bridge.py" in " ".join(
+                step.get("params", {}).get("message", [])
+            )
+        )
+        backend_index = next(
+            index
+            for index, step in enumerate(steps)
+            if "launch.py" in " ".join(step.get("params", {}).get("message", []))
+        )
+        bridge = steps[bridge_index]
+
+        self.assertLess(bridge_index, backend_index)
+        self.assertEqual(bridge["method"], "shell.run")
+        self.assertEqual(bridge["when"], "{{exists('app/tools/blender/runtime.json')}}")
+        self.assertEqual(bridge["params"]["path"], "app")
+        self.assertEqual(
+            bridge["params"]["message"],
+            [
+                "python -m services.blender_mcp_service attest-runtime --marker tools/blender/runtime.json",
+                "python scripts/start_blender_bridge.py",
+            ],
+        )
+        self.assertTrue(bridge["params"]["on"][0]["done"])
+        event = bridge["params"]["on"][0]["event"]
+        self.assertTrue(event.startswith("/") and event.endswith("/"))
+        readiness = re.compile(event[1:-1])
+        self.assertIsNotNone(readiness.fullmatch("MCP server started on 127.0.0.1:9876"))
+        self.assertIsNotNone(
+            readiness.fullmatch("Blender bridge already ready at 127.0.0.1:9876")
+        )
+        self.assertIsNone(readiness.fullmatch("Blender bridge starting"))
+        self.assertIsNone(readiness.fullmatch("http://127.0.0.1:9876"))
+        self.assertNotIn(
+            "blender_runtime_start.js",
+            [
+                step.get("params", {}).get("uri")
+                for step in steps
+                if step.get("method") == "script.start"
+            ],
+        )
 
     def test_cloudflare_secrets_are_masked_from_every_non_share_child_shell(self):
         files = [

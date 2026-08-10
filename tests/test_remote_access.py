@@ -70,6 +70,7 @@ def _security_namespace():
         "_request_is_https",
         "_reject_cross_origin_mutation",
         "_remote_local_only_denial",
+        "_local_recovery_control_denial",
         "_is_loopback_request_client",
         "_runtime_share_registration_is_local",
         "get_access_context",
@@ -431,6 +432,41 @@ class OriginPolicyTests(unittest.TestCase):
             self.assertTrue(classify(request))
             self.assertEqual(deny(request).status_code, 403)
 
+    def test_local_recovery_requires_direct_loopback_exact_origin(self):
+        deny = self.security["_local_recovery_control_denial"]
+        local = _Request(
+            method="GET",
+            path="/api/v1/local-recovery/h3/discovery",
+            origin="http://127.0.0.1:7860",
+        )
+        self.assertIsNone(deny(local))
+        self.assertEqual(deny(_Request(
+            method="GET",
+            path="/api/v1/local-recovery/h3/discovery",
+        )).status_code, 403)
+        self.assertEqual(deny(_Request(
+            path="/api/v1/local-recovery/h3/job/start",
+            origin="http://127.0.0.1:7860",
+            client_host="192.0.2.9",
+        )).status_code, 403)
+
+        rewritten_tunnel = _Request(
+            path="/api/v1/local-recovery/h3/job/start",
+            origin="http://127.0.0.1:7860",
+            cf_ray="recovery-DEN",
+            cf_connecting_ip="203.0.113.9",
+        )
+        with patch.dict(
+            os.environ, {"PINOKIO_SHARE_CLOUDFLARE": "true"}, clear=False,
+        ):
+            self.assertEqual(deny(rewritten_tunnel).status_code, 403)
+            self.assertEqual(
+                self.security["_remote_local_only_denial"](
+                    rewritten_tunnel,
+                ).status_code,
+                403,
+            )
+
     def test_remote_control_plane_denies_custom_sources_but_allows_catalog_download(self):
         deny = self.security["_remote_local_only_denial"]
         remote_headers = {
@@ -571,12 +607,14 @@ class LaunchSecurityContractTests(unittest.TestCase):
     def test_generate_authorizes_all_attachment_shapes_before_probing(self):
         generate = self._function_source("generate")
         plan = self._function_source("preview_generation_plan")
+        planner = self._function_source("_plan_generation_submission")
         reject_at = generate.index("_reject_client_h3_internal_state")
         authorize_at = generate.index("_authorize_generation_media_inputs")
-        h3_probe_at = generate.index("_validate_h3_explicit_multiclip_request")
+        planner_at = generate.index("_plan_generation_submission")
 
         self.assertLess(reject_at, authorize_at)
-        self.assertLess(authorize_at, h3_probe_at)
+        self.assertLess(authorize_at, planner_at)
+        self.assertIn("_validate_h3_explicit_multiclip_request", planner)
         self.assertLess(
             plan.index("_reject_client_h3_internal_state"),
             plan.index("_authorize_generation_media_inputs"),
@@ -676,10 +714,12 @@ class LaunchSecurityContractTests(unittest.TestCase):
 
         generate = self._function_source("generate")
         plan = self._function_source("preview_generation_plan")
+        planner = self._function_source("_plan_generation_submission")
         for source in (generate, plan):
             guard_at = source.index("_reject_client_h3_turbo_validation_controls")
-            validation_at = source.index("_validate_h3_sampling_steps")
-            self.assertLess(guard_at, validation_at)
+            planner_at = source.index("_plan_generation_submission")
+            self.assertLess(guard_at, planner_at)
+        self.assertIn("_validate_h3_sampling_steps", planner)
 
     def test_ref2va_turbo_benchmark_capability_is_fixed_local_and_content_pinned(self):
         namespace = _turbo_benchmark_namespace()
@@ -841,6 +881,61 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn("Remote projects require a password", create)
         self.assertIn("_existing_workspace_dir(name)", unlock)
         self.assertIn("not enabled for remote access", unlock)
+        self.assertNotIn("_remote_active_projects", unlock)
+
+    def test_remote_default_workspace_is_hidden_and_cannot_be_selected(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        request = types.SimpleNamespace(state=types.SimpleNamespace(
+            maestro_remote=True,
+            maestro_session_id="remote-session",
+        ))
+        project_access = types.SimpleNamespace(status=lambda *_args: (
+            types.SimpleNamespace(protected=True, unlocked=True)
+        ))
+        namespace = self._function_namespace(
+            (
+                "_workspace_access_fields", "list_workspaces_endpoint",
+                "_request_project_workspace",
+            ),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "_list_workspaces": lambda: [
+                    {"name": "default", "path": "/outputs", "file_count": 8},
+                    {"name": "x_test", "path": "/outputs/x_test", "file_count": 2},
+                ],
+                "_project_access": project_access,
+                "_remote_active_projects": {"remote-session": "default"},
+                "_remote_active_projects_lock": threading.RLock(),
+                "_get_active_workspace": lambda: "default",
+            },
+        )
+        listed = namespace["list_workspaces_endpoint"](request)
+        self.assertEqual(
+            [item["name"] for item in listed["workspaces"]], ["x_test"],
+        )
+        self.assertEqual(listed["active"], "")
+        for selected in ("", "default"):
+            with self.subTest(selected=selected):
+                with self.assertRaises(FakeHTTPException) as raised:
+                    namespace["_request_project_workspace"](request, selected)
+                self.assertIn(raised.exception.status_code, {400, 404})
+
+        require_source = self._function_source("_require_project_access")
+        unlock_source = self._function_source("unlock_workspace")
+        self.assertLess(
+            require_source.index('workspace == "default"'),
+            require_source.index("_existing_workspace_dir(workspace)"),
+        )
+        self.assertLess(
+            unlock_source.index('name == "default"'),
+            unlock_source.index("_existing_workspace_dir(name)"),
+        )
 
     def test_remote_mutations_require_an_unlocked_protected_project(self):
         node = next(
@@ -870,14 +965,14 @@ class LaunchSecurityContractTests(unittest.TestCase):
         guard = namespace["_require_remote_project_mutation_access"]
 
         for protected, unlocked in ((False, True), (True, False), (False, False)):
-            project_access.status = lambda *_args, p=protected, u=unlocked: types.SimpleNamespace(
+            project_access.authorize = lambda *_args, p=protected, u=unlocked: types.SimpleNamespace(
                 protected=p, unlocked=u,
             )
             with self.assertRaises(FakeHTTPException) as raised:
                 guard(request, "project", "/outputs/project")
             self.assertEqual(raised.exception.status_code, 423)
 
-        project_access.status = lambda *_args: types.SimpleNamespace(
+        project_access.authorize = lambda *_args: types.SimpleNamespace(
             protected=True, unlocked=True,
         )
         allowed = guard(request, "project", "/outputs/project")
@@ -902,6 +997,47 @@ class LaunchSecurityContractTests(unittest.TestCase):
             delete.index("safe_delete_dir(ws_dir)"),
         )
 
+    def test_project_unlock_grants_are_class_scoped_revocable_and_poll_safe(self):
+        require = self._function_source("_require_project_access")
+        listing = self._function_source("list_workspaces_endpoint")
+        unlock = self._function_source("unlock_workspace")
+        lock_one = self._function_source("lock_workspace")
+        lock_all = self._function_source("lock_all_workspaces")
+        password = self._function_source("set_workspace_password")
+        delete = self._function_source("delete_workspace")
+
+        self.assertIn("remote,", require)
+        self.assertIn("_project_access.authorize", require)
+        self.assertIn("else _project_access.status", require)
+        self.assertIn("remote,", listing)
+        self.assertIn("_workspace_remember_policy(body)", unlock)
+        self.assertIn("_workspace_access_fields(status)", unlock)
+        self.assertIn("_project_access.lock(", lock_one)
+        self.assertIn("_project_access.lock_all(", lock_all)
+        self.assertIn("_workspace_remember_policy(body)", password)
+        self.assertIn("_project_access.revoke_workspace(name)", delete)
+        self.assertLess(
+            delete.index("_project_access.revoke_workspace(name)"),
+            delete.index("safe_delete_dir(ws_dir)"),
+        )
+        # CSRF remains centralized for every state-changing workspace route.
+        self.assertIn('"POST", "PUT", "PATCH", "DELETE"', self.source)
+        hard_remote_helpers = (
+            "_recovered_job_remote_project_accessible",
+            "_require_remote_queue_project",
+        )
+        for helper in hard_remote_helpers:
+            source = self._function_source(helper)
+            self.assertIn("session_id, True,", source, helper)
+        request_class_helpers = (
+            "_require_owned_job_project",
+            "_require_h3_delivery_recovery_job",
+        )
+        for helper in request_class_helpers:
+            source = self._function_source(helper)
+            self.assertIn('maestro_remote", False)', source, helper)
+            self.assertIn("remote,", source, helper)
+
     def test_remote_jobs_hide_sessionless_legacy_records(self):
         helper = self._function_source("_job_owned_by_request")
         for name in ("get_status", "cancel_job", "list_jobs", "_require_owned_job", "get_queue_state"):
@@ -912,7 +1048,8 @@ class LaunchSecurityContractTests(unittest.TestCase):
         queue = self._function_source("get_queue_state")
         self.assertIn("_require_remote_queue_project(request)", queue)
         self.assertIn("queue_scheduler_snapshot(active_jobs)", queue)
-        self.assertIn('"summary": scheduler["summary"]', queue)
+        self.assertIn('**scheduler["summary"]', queue)
+        self.assertIn("aggregate_snapshot()", queue)
         self.assertLess(
             queue.index("_require_remote_queue_project(request)"),
             queue.index("queue_scheduler_snapshot(active_jobs)"),
@@ -1046,7 +1183,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
         for capability in ("H3 control", "Queue + resume", "Blender guidance"):
             self.assertIn(capability, welcome)
         self.assertIn("Cloudflare sessions, and share links", welcome)
-        self.assertIn("this Maestro host downloads and prepares model files", welcome)
+        self.assertIn("this {PRODUCT_NAME} host downloads and prepares model files", welcome)
         self.assertIn("Allowed local and remote users reuse that host cache", welcome)
         self.assertIn('aria-modal="true"', welcome)
         self.assertNotIn("PG-13", welcome)
@@ -1193,6 +1330,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
         model_options = self._function_source("get_model_options")
         plan = self._function_source("preview_generation_plan")
         generate = self._function_source("generate")
+        planner = self._function_source("_plan_generation_submission")
         self.assertIn("remote_visible = _remote_visible_model_ids(request)", listing)
         self.assertLess(
             download.index("_require_remote_visible_models"),
@@ -1203,9 +1341,11 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn("Model download failed", download_status)
         for implementation in (plan, generate):
             self.assertGreaterEqual(
-                implementation.count("_require_remote_visible_models"), 2,
+                implementation.count("_require_remote_visible_models"), 1,
             )
-            self.assertIn("_h3_effective_model_types", implementation)
+            self.assertIn("_plan_generation_submission", implementation)
+        self.assertIn("_require_remote_visible_models", planner)
+        self.assertIn("_h3_effective_model_types", planner)
         self.assertIn('requirements["checkpoint_options"]', plan)
 
         director_auth = self._function_source("_authorize_director_media_inputs")
@@ -1243,6 +1383,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
         ast.fix_missing_locations(module)
         remote_context = Context(True)
         namespace = {
+            "threading": threading,
             "HTTPException": FakeHTTPException,
             "_request_remote": remote_context,
             "_request_session_id": Context(None),
@@ -1637,6 +1778,9 @@ class LaunchSecurityContractTests(unittest.TestCase):
                     ),
                     "_output_share_manager": lambda: types.SimpleNamespace(
                         revoke_workspace=lambda name: shares_revoked.append(name),
+                    ),
+                    "_project_access": types.SimpleNamespace(
+                        revoke_workspace=lambda _name: None,
                     ),
                     "_remote_active_projects": {},
                     "_remote_active_projects_lock": threading.RLock(),

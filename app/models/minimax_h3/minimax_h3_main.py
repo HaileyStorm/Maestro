@@ -126,27 +126,44 @@ def _advance_paired_h3_latents(
     num_condition_video_rows: int,
     num_condition_audio_rows: int,
     locked_target_audio_rows: torch.Tensor | None = None,
+    advance_video: bool = True,
+    advance_audio: bool = True,
 ) -> None:
-    """Advance both members of H3's inseparable video/audio prediction pair."""
+    """Atomically publish the requested members of one H3 prediction pair."""
     video_velocity, audio_velocity = prediction
-    video_rows[num_condition_video_rows:] = video_scheduler.step(
-        video_velocity[0, num_condition_video_rows:].float(),
-        video_timestep,
-        video_rows[num_condition_video_rows:],
-        return_dict=False,
-    )[0]
-    next_audio_rows = audio_scheduler.step(
-        audio_velocity[0, num_condition_audio_rows:].float(),
-        audio_timestep,
-        audio_rows[num_condition_audio_rows:],
-        return_dict=False,
-    )[0]
-    if locked_target_audio_rows is not None:
-        if tuple(locked_target_audio_rows.shape) != tuple(next_audio_rows.shape):
+    next_video_rows = None
+    next_audio_rows = None
+    if advance_video:
+        next_video_rows = video_scheduler.step(
+            video_velocity[0, num_condition_video_rows:].float(),
+            video_timestep,
+            video_rows[num_condition_video_rows:],
+            return_dict=False,
+        )[0]
+    if advance_audio:
+        next_audio_rows = audio_scheduler.step(
+            audio_velocity[0, num_condition_audio_rows:].float(),
+            audio_timestep,
+            audio_rows[num_condition_audio_rows:],
+            return_dict=False,
+        )[0]
+        if (
+            locked_target_audio_rows is not None
+            and tuple(locked_target_audio_rows.shape) != tuple(next_audio_rows.shape)
+        ):
             raise RuntimeError("Locked H3 source audio changed target-row shape")
-        audio_rows[num_condition_audio_rows:] = locked_target_audio_rows
-    else:
-        audio_rows[num_condition_audio_rows:] = next_audio_rows
+
+    # Scheduler calls mutate their own indices. Publish tensors only after
+    # every requested call succeeds; the enclosing loop resets both clocks on
+    # cancellation or failure before this tick can be retried.
+    if next_video_rows is not None:
+        video_rows[num_condition_video_rows:] = next_video_rows
+    if next_audio_rows is not None:
+        audio_rows[num_condition_audio_rows:] = (
+            locked_target_audio_rows
+            if locked_target_audio_rows is not None
+            else next_audio_rows
+        )
 
 
 def _fit_h3_source_waveform(
@@ -190,10 +207,55 @@ def _reset_paired_h3_schedulers(
     audio_scheduler: MiniMaxH3Scheduler,
     grid_points: int,
     device: torch.device | str,
+    audio_grid_points: int | None = None,
 ) -> None:
-    """Reset both stateful schedulers before replaying the same H3 grid."""
+    """Reset both stateful schedulers before replaying the same H3 clocks."""
     video_scheduler.set_timesteps(grid_points, device=device)
-    audio_scheduler.set_timesteps(grid_points, device=device)
+    audio_scheduler.set_timesteps(
+        grid_points if audio_grid_points is None else audio_grid_points,
+        device=device,
+    )
+
+
+def _run_h3_master_schedule(
+    *,
+    timesteps,
+    audio_timesteps,
+    row_plan,
+    video_advance_ticks,
+    interrupt_requested,
+    predict,
+    advance,
+    after_step,
+    reset,
+) -> bool:
+    """Execute one H3 master clock and reset both schedulers on any abort."""
+
+    completed = False
+    try:
+        for index, (video_timestep, audio_timestep) in enumerate(
+            zip(timesteps, audio_timesteps)
+        ):
+            if interrupt_requested():
+                return False
+            unique_timesteps, timestep_indices = row_plan[index]
+            prediction = predict(index, unique_timesteps, timestep_indices)
+            if prediction is None or interrupt_requested():
+                return False
+            advance(
+                prediction,
+                video_timestep,
+                audio_timestep,
+                advance_video=index in video_advance_ticks,
+            )
+            after_step(index)
+            if interrupt_requested():
+                return False
+        completed = True
+        return True
+    finally:
+        if not completed:
+            reset()
 
 
 AUDIO_LATENTS_MEAN = (
@@ -519,6 +581,15 @@ class MiniMaxH3Model:
         self.selected_model_type = str(_kwargs.get("selected_model_type") or "")
         self.reference_mode = bool(model_def.get("minimax_h3_reference_mode", False))
         self.assets_root = model_def.get("minimax_h3_assets_root", "minimax_h3")
+        self.transformer = None
+        self.conditioner = None
+        self.vae = None
+        self.audio_vae = None
+        self.scheduler = None
+        self.audio_scheduler = None
+        self._ref2va_handoff_cache = None
+        self._last_spectrum_stats = None
+        self.__interrupt = False
 
         transformer_path = _first_path(model_filename)
         if not transformer_path:
@@ -537,19 +608,46 @@ class MiniMaxH3Model:
             if callable(load_status_callback):
                 load_status_callback(label)
 
-        report_load_stage("Loading H3 transformer checkpoint")
-        self.transformer = _load_transformer(transformer_path, dtype)
-        report_load_stage("Loading H3 conditioner checkpoint")
-        self.conditioner = _load_conditioner(text_encoder_filename, self.assets_root, dtype)
-        report_load_stage("Loading H3 video VAE checkpoint")
-        self.vae = _load_video_vae(video_vae_path)
-        report_load_stage("Loading H3 audio VAE checkpoint")
-        self.audio_vae = _load_audio_vae(audio_vae_path)
-        self.scheduler = MiniMaxH3Scheduler(shift=12.0)
-        self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
+        try:
+            report_load_stage("Loading H3 transformer checkpoint")
+            self.transformer = _load_transformer(transformer_path, dtype)
+            report_load_stage("Loading H3 conditioner checkpoint")
+            self.conditioner = _load_conditioner(text_encoder_filename, self.assets_root, dtype)
+            report_load_stage("Loading H3 video VAE checkpoint")
+            self.vae = _load_video_vae(video_vae_path)
+            report_load_stage("Loading H3 audio VAE checkpoint")
+            self.audio_vae = _load_audio_vae(audio_vae_path)
+            self.scheduler = MiniMaxH3Scheduler(shift=12.0)
+            self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
+        except Exception:
+            # A checkpoint OOM can occur before the wrapper is returned to
+            # WGP. Sever every component already constructed so the allocator
+            # can reclaim the partial stack and a later job can retry cleanly.
+            self.release()
+            try:
+                offload.flush_torch_caches()
+            except Exception:
+                pass
+            raise
+
+    def release(self) -> None:
+        """Sever every heavyweight H3 component during model replacement."""
+        self.__interrupt = True
+        for component_name in ("transformer", "conditioner"):
+            component = getattr(self, component_name, None)
+            if component is not None:
+                try:
+                    component._interrupt = True
+                except Exception:
+                    pass
         self._ref2va_handoff_cache = None
         self._last_spectrum_stats = None
-        self.__interrupt = False
+        self.transformer = None
+        self.conditioner = None
+        self.vae = None
+        self.audio_vae = None
+        self.scheduler = None
+        self.audio_scheduler = None
 
     @property
     def _interrupt(self) -> bool:
@@ -558,9 +656,9 @@ class MiniMaxH3Model:
     @_interrupt.setter
     def _interrupt(self, value: bool) -> None:
         self.__interrupt = bool(value)
-        if hasattr(self, "transformer"):
+        if getattr(self, "transformer", None) is not None:
             self.transformer._interrupt = self.__interrupt
-        if hasattr(self, "conditioner"):
+        if getattr(self, "conditioner", None) is not None:
             self.conditioner._interrupt = self.__interrupt
 
     @property
@@ -835,7 +933,7 @@ class MiniMaxH3Model:
             if callable(progress_status):
                 progress_status(label)
         from services.h3_turbo import (
-            scheduler_grid_points,
+            resolve_h3_turbo_schedule,
             turbo_requested,
             validate_turbo_request,
         )
@@ -992,6 +1090,11 @@ class MiniMaxH3Model:
             and isinstance(cached_handoff, dict)
             and cached_handoff.get("chain_id") == handoff_chain_id
         )
+        # A Ref2VA handoff is single-consumer state. Keep the candidate local
+        # for this request and clear the instance slot before any cancellable
+        # work; only a fully decoded successor may publish the next handoff.
+        if self.reference_mode:
+            self._ref2va_handoff_cache = None
         if not isinstance(input_prompt, str):
             raise ValueError("MiniMax H3 accepts one text prompt per generation.")
         if height % 32 or width % 32:
@@ -1455,19 +1558,28 @@ class MiniMaxH3Model:
         if source_audio_condition_rows is not None:
             audio_rows = torch.cat([source_audio_condition_rows, audio_rows])
 
+        turbo_schedule = None
         if lightx2v_enabled:
-            scheduler_points = lightx2v_scheduler_grid_points(sampling_steps)
+            video_scheduler_points = lightx2v_scheduler_grid_points(sampling_steps)
+            audio_scheduler_points = video_scheduler_points
         elif spectrum_config is not None:
             from .spectrum import spectrum_scheduler_grid_points
 
-            scheduler_points = spectrum_scheduler_grid_points(sampling_steps)
+            video_scheduler_points = spectrum_scheduler_grid_points(sampling_steps)
+            audio_scheduler_points = video_scheduler_points
+        elif turbo_enabled:
+            turbo_schedule = resolve_h3_turbo_schedule(sampling_steps)
+            video_scheduler_points = turbo_schedule.video_grid_points
+            audio_scheduler_points = turbo_schedule.audio_grid_points
         else:
-            scheduler_points = (
-                scheduler_grid_points(sampling_steps)
-                if turbo_enabled else int(sampling_steps)
-            )
-        self.scheduler.set_timesteps(scheduler_points, device=self.device)
-        self.audio_scheduler.set_timesteps(scheduler_points, device=self.device)
+            # MiniMaxH3Scheduler includes terminal zero in its grid. Authored
+            # native steps are model evaluations, so N/N needs N+1 points.
+            video_scheduler_points = int(sampling_steps) + 1
+            audio_scheduler_points = video_scheduler_points
+        self.scheduler.set_timesteps(video_scheduler_points, device=self.device)
+        self.audio_scheduler.set_timesteps(
+            audio_scheduler_points, device=self.device,
+        )
         if source_audio_roles.mode == "remix_source":
             # Preserve the paired call count while beginning only the audio
             # clock at the requested source-denoise strength.  The two row
@@ -1480,11 +1592,25 @@ class MiniMaxH3Model:
                 sigmas=remix_sigmas,
                 device=self.device,
             )
-        timesteps = self.scheduler.timesteps
-        audio_timesteps = self.audio_scheduler.timesteps
+        video_timesteps = self.scheduler.timesteps
+        base_audio_timesteps = self.audio_scheduler.timesteps
+        if turbo_schedule is not None:
+            timesteps = tuple(
+                video_timesteps[index]
+                for index in turbo_schedule.video_timestep_indices
+            )
+            audio_timesteps = tuple(
+                base_audio_timesteps[index]
+                for index in turbo_schedule.audio_timestep_indices
+            )
+            video_advance_ticks = turbo_schedule.video_advance_ticks
+        else:
+            timesteps = video_timesteps
+            audio_timesteps = base_audio_timesteps
+            video_advance_ticks = tuple(range(len(timesteps)))
         if len(timesteps) != len(audio_timesteps):
             raise RuntimeError(
-                "MiniMax H3 video shift-12 and audio shift-3 schedules must have equal lengths"
+                "MiniMax H3 effective video/audio master schedules must have equal lengths"
             )
         report_phase("Preparing H3 denoising schedule")
         row_plan = [
@@ -1548,7 +1674,13 @@ class MiniMaxH3Model:
                 })
             return self.transformer(**transformer_kwargs)
 
-        def advance_latents(prediction, video_timestep, audio_timestep):
+        def advance_latents(
+            prediction,
+            video_timestep,
+            audio_timestep,
+            *,
+            advance_video=True,
+        ):
             _advance_paired_h3_latents(
                 video_rows=video_rows,
                 audio_rows=audio_rows,
@@ -1560,37 +1692,39 @@ class MiniMaxH3Model:
                 num_condition_video_rows=layout.num_condition_video_rows,
                 num_condition_audio_rows=layout.num_condition_audio_rows,
                 locked_target_audio_rows=locked_target_audio_rows,
+                advance_video=advance_video,
             )
 
         def reset_denoising_schedulers():
             _reset_paired_h3_schedulers(
                 self.scheduler,
                 self.audio_scheduler,
-                scheduler_points,
+                video_scheduler_points,
                 self.device,
+                audio_scheduler_points,
             )
 
         def run_native_denoising(*, progress_label="MiniMax H3 denoising"):
             report_phase("Running first H3 denoising step (runtime warmup)")
             with tqdm(total=len(timesteps), desc=progress_label) as progress:
-                for index, (video_timestep, audio_timestep) in enumerate(
-                    zip(timesteps, audio_timesteps)
-                ):
-                    if self._interrupt:
-                        return False
-                    unique_timesteps, timestep_indices = row_plan[index]
-                    prediction = run_transformer_step(
-                        index, unique_timesteps, timestep_indices
-                    )
-                    if prediction is None or self._interrupt:
-                        return False
+                def after_step(index):
                     if index == 0:
                         report_phase("H3 denoising")
-                    advance_latents(prediction, video_timestep, audio_timestep)
                     if callback is not None:
                         callback(index, None)
                     progress.update()
-            return True
+
+                return _run_h3_master_schedule(
+                    timesteps=timesteps,
+                    audio_timesteps=audio_timesteps,
+                    row_plan=row_plan,
+                    video_advance_ticks=video_advance_ticks,
+                    interrupt_requested=lambda: self._interrupt,
+                    predict=run_transformer_step,
+                    advance=advance_latents,
+                    after_step=after_step,
+                    reset=reset_denoising_schedulers,
+                )
 
         if spectrum_config is None:
             if not run_native_denoising():

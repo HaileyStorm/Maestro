@@ -23,6 +23,7 @@ from models.minimax_h3.minimax_h3_main import (  # noqa: E402
     _advance_paired_h3_latents,
     _fit_h3_source_audio_latents,
     _fit_h3_source_waveform,
+    _run_h3_master_schedule,
 )
 from models.minimax_h3.minimax_h3_handler import family_handler  # noqa: E402
 from services.h3_audio import (  # noqa: E402
@@ -31,9 +32,9 @@ from services.h3_audio import (  # noqa: E402
     remap_primary_audio,
     remap_prompt_audio_ordinals,
     resolve_h3_audio_roles,
-    validate_multirate_evidence_request,
     validate_prompt_media_ordinals,
 )
+from services.h3_turbo import resolve_h3_turbo_schedule  # noqa: E402
 from services.h3_benchmark import (  # noqa: E402
     H3BenchmarkError,
     build_benchmark_spec,
@@ -190,16 +191,15 @@ class H3SourceAudioRoleTests(unittest.TestCase):
                     skip_steps_cache_type=disabled_cache,
                 )).experimental)
 
-    def test_multirate_profile_is_descriptor_only_and_runtime_inaccessible(self):
-        custom = {"h3_multirate_profile": "t8_4v8a_evidence_v1"}
-        with self.assertRaisesRegex(H3AudioCompatibilityError, "dry-run only"):
-            validate_multirate_evidence_request(custom)
-        descriptor = validate_multirate_evidence_request(
-            custom, benchmark_dry_run=True,
+    def test_obsolete_multirate_runtime_predecessor_is_removed(self):
+        audio_source = (APP / "services" / "h3_audio.py").read_text(
+            encoding="utf-8"
         )
-        self.assertEqual(descriptor["video_evaluations"], 4)
-        self.assertEqual(descriptor["audio_evaluations"], 8)
-        self.assertFalse(descriptor["enabled_for_generation"])
+        handler_source = (
+            APP / "models" / "minimax_h3" / "minimax_h3_handler.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("validate_multirate_evidence_request", audio_source)
+        self.assertNotIn("h3_multirate_profile", handler_source)
 
 
 class H3MediaOrdinalTests(unittest.TestCase):
@@ -350,6 +350,96 @@ class H3SourceAudioLatentTests(unittest.TestCase):
         self.assertTrue(torch.equal(audio, locked))
         self.assertEqual((video_scheduler.calls, audio_scheduler.calls), (1, 1))
 
+    def test_turbo_four_advances_audio_twice_per_frozen_video_state(self):
+        class Scheduler:
+            def __init__(self, delta):
+                self.delta = delta
+                self.calls = 0
+
+            def step(self, _velocity, _timestep, sample, return_dict=False):
+                self.calls += 1
+                return (sample + self.delta,)
+
+        schedule = resolve_h3_turbo_schedule(4)
+        video = torch.zeros((2, 3))
+        audio = torch.zeros((4, 3))
+        video_scheduler = Scheduler(1)
+        audio_scheduler = Scheduler(2)
+        prediction = (torch.zeros((1, 2, 3)), torch.zeros((1, 4, 3)))
+        video_states = []
+        for tick in range(schedule.master_evaluations):
+            _advance_paired_h3_latents(
+                video_rows=video,
+                audio_rows=audio,
+                prediction=prediction,
+                video_timestep=torch.tensor(0.0),
+                audio_timestep=torch.tensor(0.0),
+                video_scheduler=video_scheduler,
+                audio_scheduler=audio_scheduler,
+                num_condition_video_rows=0,
+                num_condition_audio_rows=0,
+                advance_video=tick in schedule.video_advance_ticks,
+            )
+            video_states.append(float(video[0, 0]))
+
+        self.assertEqual(video_states, [0, 1, 1, 2, 2, 3, 3, 4])
+        self.assertTrue(torch.equal(audio, torch.full_like(audio, 16)))
+        self.assertEqual((video_scheduler.calls, audio_scheduler.calls), (4, 8))
+
+    def test_tick_tensor_publication_is_atomic_when_audio_step_fails(self):
+        class VideoScheduler:
+            def step(self, _velocity, _timestep, sample, return_dict=False):
+                return (sample + 1,)
+
+        class FailingAudioScheduler:
+            def step(self, *_args, **_kwargs):
+                raise RuntimeError("audio clock failed")
+
+        video = torch.zeros((2, 3))
+        audio = torch.zeros((4, 3))
+        prediction = (torch.zeros((1, 2, 3)), torch.zeros((1, 4, 3)))
+        with self.assertRaisesRegex(RuntimeError, "audio clock failed"):
+            _advance_paired_h3_latents(
+                video_rows=video,
+                audio_rows=audio,
+                prediction=prediction,
+                video_timestep=torch.tensor(0.0),
+                audio_timestep=torch.tensor(0.0),
+                video_scheduler=VideoScheduler(),
+                audio_scheduler=FailingAudioScheduler(),
+                num_condition_video_rows=0,
+                num_condition_audio_rows=0,
+            )
+        self.assertTrue(torch.equal(video, torch.zeros_like(video)))
+        self.assertTrue(torch.equal(audio, torch.zeros_like(audio)))
+
+    def test_final_tick_cancellation_resets_both_clocks(self):
+        interrupted = False
+        resets = []
+        advanced = []
+
+        def after_step(index):
+            nonlocal interrupted
+            if index == 1:
+                interrupted = True
+
+        completed = _run_h3_master_schedule(
+            timesteps=(0.0, 1.0),
+            audio_timesteps=(0.0, 1.0),
+            row_plan=(((), ()), ((), ())),
+            video_advance_ticks=(0, 1),
+            interrupt_requested=lambda: interrupted,
+            predict=lambda *_args: object(),
+            advance=lambda *_args, **kwargs: advanced.append(
+                kwargs["advance_video"]
+            ),
+            after_step=after_step,
+            reset=lambda: resets.append("both"),
+        )
+        self.assertFalse(completed)
+        self.assertEqual(advanced, [True, True])
+        self.assertEqual(resets, ["both"])
+
 
 class H3AudioBenchmarkIsolationTests(unittest.TestCase):
     def test_estimator_executes_the_same_source_audio_compatibility_matrix(self):
@@ -481,7 +571,7 @@ class H3AudioBenchmarkIsolationTests(unittest.TestCase):
         estimate = source[start:end]
         for key in (
             "h3_source_audio_mode", "h3_primary_audio_ordinal",
-            "h3_audio_remix_strength", "h3_multirate_profile",
+            "h3_audio_remix_strength",
         ):
             self.assertIn(f'"{key}"', estimate)
         self.assertNotIn("drive_audio", estimate)

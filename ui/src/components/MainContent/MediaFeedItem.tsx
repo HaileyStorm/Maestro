@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, type CSSProperties } from 'react'
+import { useState, useRef, useEffect, useCallback, type CSSProperties, type KeyboardEvent } from 'react'
 import { Play, Pencil, RefreshCw, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked, EyeOff, Share2, Link2Off } from 'lucide-react'
 import { SaveRecipeDialog } from '../Recipes/SaveRecipeDialog'
 import { useStore } from '../../stores/useStore'
@@ -18,7 +18,8 @@ interface Props {
   index: number
   isActive: boolean
   onVisible: (index: number) => void
-  onMeasured: (index: number, height: number) => void
+  measurementEpoch: number
+  onMeasured: (identity: string, epoch: number, height: number) => void
   style?: CSSProperties
 }
 
@@ -74,7 +75,7 @@ function RetryImage({ url, alt }: { url: string; alt: string }) {
   )
 }
 
-export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, style }: Props) {
+export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpoch, onMeasured, style }: Props) {
   const setSelectedOutput = useStore(s => s.setSelectedOutput)
   const loadSettingsFromOutput = useStore(s => s.loadSettingsFromOutput)
   const rerollGeneration = useStore(s => s.rerollGeneration)
@@ -124,12 +125,26 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
     file.private && privatePreviewWasRevealed(privateRevealKey) ? privateRevealKey : '',
   )
   const privateRevealed = file.private && revealedPrivateKey === privateRevealKey
+  const privateBlurred = file.private && !privateRevealed
   const [shareUrl, setShareUrl] = useState('')
   const [sharing, setSharing] = useState(false)
   const [shareMessage, setShareMessage] = useState('')
   const moveRef = useRef<HTMLDivElement>(null)
   const itemRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+
+  const releaseVideoSource = useCallback((video: HTMLVideoElement | null) => {
+    if (!video) return
+    video.pause()
+    video.removeAttribute('src')
+    video.load()
+  }, [])
+
+  const setVideoElement = useCallback((video: HTMLVideoElement | null) => {
+    const previous = videoRef.current
+    if (previous && previous !== video) releaseVideoSource(previous)
+    videoRef.current = video
+  }, [releaseVideoSource])
 
   useEffect(() => () => {
     clearTimeout(timeoutRef.current)
@@ -159,11 +174,11 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
     if (!el) return
     const ro = new ResizeObserver((entries) => {
       const height = entries[0].borderBoxSize?.[0]?.blockSize ?? entries[0].contentRect.height
-      onMeasured(index, height)
+      onMeasured(privateRevealKey, measurementEpoch, height)
     })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [index, onMeasured])
+  }, [measurementEpoch, onMeasured, privateRevealKey])
 
   // IntersectionObserver to detect visibility (for active tracking)
   useEffect(() => {
@@ -199,13 +214,15 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
     return () => observer.disconnect()
   }, [file.workspace, file.name, file.revision, metaLoaded])
 
-  // Pause video when scrolled out of view (but don't auto-play when scrolled in)
+  // Blurred private videos keep no decoder/network source. Revealing restores
+  // the source through React, but this lifecycle intentionally never calls play().
+  // Non-active videos are also paused without changing their source.
   useEffect(() => {
-    if (!videoRef.current) return
-    if (!isActive) {
-      videoRef.current.pause()
-    }
-  }, [isActive])
+    const video = videoRef.current
+    if (!video) return
+    if (privateBlurred) releaseVideoSource(video)
+    else if (!isActive) video.pause()
+  }, [isActive, privateBlurred, releaseVideoSource])
 
   const params = meta?.params as Record<string, unknown> | null
   const uploadFilenames = meta?.upload_filenames
@@ -258,6 +275,13 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
   const handleSelect = useCallback(() => {
     setSelectedOutput(index)
   }, [index, setSelectedOutput])
+
+  const handleCardKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    handleSelect()
+  }, [handleSelect])
 
   const handleLoadSettings = useCallback(() => {
     setSelectedOutput(index)
@@ -529,8 +553,13 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
     <div
       ref={itemRef}
       data-feed-index={index}
+      data-feed-identity={encodeURIComponent(privateRevealKey)}
+      role="group"
+      tabIndex={0}
+      aria-current={isActive ? 'true' : undefined}
+      aria-label={`${file.name}. Press Enter or Space to select`}
       style={style}
-      className={`rounded-xl border-2 overflow-hidden transition-colors ${
+      className={`rounded-xl border-2 overflow-hidden transition-colors focus-within:z-20 ${
         // Active frame: theme-aware bezel via frame-active-gradient.
         //
         // Default theme: linear gradient with both stops set to
@@ -549,10 +578,11 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
         // because the visual character lives ON the bezel itself,
         // not as an outward glow.
         isActive
-          ? 'border-transparent frame-active-gradient shadow-active-ring'
+          ? 'z-10 border-transparent frame-active-gradient shadow-active-ring'
           : 'border-border bg-bg-tertiary'
       }`}
       onClick={handleSelect}
+      onKeyDown={handleCardKeyDown}
     >
       {/* Media player — bg-media-canvas keeps the letterbox dark even on light themes */}
       <div className="w-full aspect-video flex items-center justify-center bg-media-canvas relative overflow-hidden">
@@ -571,13 +601,14 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
           </label>
         )}
         <div className={`w-full h-full flex items-center justify-center transition-[filter] duration-200 ${
-          file.private && !privateRevealed ? 'blur-2xl' : ''
-        }`} inert={file.private && !privateRevealed}>
+          privateBlurred ? 'blur-2xl' : ''
+        }`} inert={privateBlurred}>
         {file.type === 'video' ? (
           <video
-            ref={videoRef}
+            ref={setVideoElement}
             key={file.url}
-            src={file.url}
+            src={privateBlurred ? undefined : file.url}
+            preload={privateBlurred ? 'none' : 'metadata'}
             controls
             loop
             className="w-full h-full object-contain"
@@ -595,23 +626,25 @@ export function MediaFeedItem({ file, index, isActive, onVisible, onMeasured, st
           <RetryImage key={file.url} url={file.url} alt={file.name} />
         )}
         </div>
-        {file.private && !privateRevealed && (
+        {privateBlurred && (
           <button
             type="button"
             onClick={(event) => { event.stopPropagation(); revealPrivatePreview() }}
+            aria-label={`Reveal blurred preview for ${file.name}`}
             className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/25 text-white"
-            title="Click, tap, or press Enter to reveal for this browser session"
+            title="Click, tap, or press Enter to Reveal for this browser session"
           >
             <EyeOff size={24} />
-            <span className="rounded-full bg-black/60 px-3 py-1 text-[11px]">Private preview — click to reveal</span>
+            <span className="rounded-full bg-black/60 px-3 py-1 text-[11px]">Blurred preview — click to Reveal</span>
           </button>
         )}
         {file.private && privateRevealed && (
           <button
             type="button"
             onClick={(event) => { event.stopPropagation(); hidePrivatePreview() }}
+            aria-label={`Blur preview for ${file.name}`}
             className="absolute right-2 top-2 z-10 rounded-full bg-black/65 p-1.5 text-white/80 hover:text-white"
-            title="Blur this private preview again"
+            title="Blur this preview"
           >
             <EyeOff size={13} />
           </button>

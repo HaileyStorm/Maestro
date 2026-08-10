@@ -53,19 +53,20 @@ process.stdout.write(JSON.stringify(cases.map(([name, payload, locked]) => [
         self.assertEqual(payloads["preview-base-locked"]["sliding_window_size"], 192)
         self.assertEqual(payloads["generate-ref2va-locked"]["sliding_window_size"], 192)
 
-    def test_preview_and_submit_share_policy_and_restore_recovers_lock_mode(self):
+    def test_submit_applies_segment_policy_and_restore_recovers_lock_mode(self):
         source = STORE.read_text(encoding="utf-8")
         generation = source[
-            source.index("// Long H3 jobs are expensive"):
+            source.index("const enhanceBeforeGenerate"):
             source.index("stopGeneration: (jobId)")
         ]
-        self.assertEqual(generation.count("applyH3SegmentCeilingPolicy("), 2)
+        self.assertEqual(generation.count("applyH3SegmentCeilingPolicy("), 1)
+        self.assertNotIn("api.previewGenerationPlan(params)", generation)
         self.assertLess(
             generation.index("applyH3SegmentCeilingPolicy("),
-            generation.index("api.previewGenerationPlan(params)"),
+            generation.index("api.submitGeneration(params)"),
         )
         self.assertLess(
-            generation.rindex("applyH3SegmentCeilingPolicy("),
+            generation.index("jobs: [newJob, ...s.jobs]"),
             generation.index("api.submitGeneration(params)"),
         )
         restore = source[source.index("const automaticH3Longform"):source.index("// Derive resolution preset")]

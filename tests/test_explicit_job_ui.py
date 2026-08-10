@@ -333,10 +333,12 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("await selectModel(model.model_type)", MODEL_SELECTOR)
         self.assertNotIn("disabled={pinkProfileIncompatible}", MODEL_SELECTOR)
 
-        self.assertIn("pinkReconciliationLabel", H3_PLAN_DIALOG)
-        self.assertIn("await selectModel(model)", H3_PLAN_DIALOG)
+        # A queued plan is frozen to its exact job/project. Editing its
+        # overrides must not mutate the current Studio model/profile.
+        self.assertIn("serverOptions", H3_PLAN_DIALOG)
+        self.assertNotIn("selectModel(model)", H3_PLAN_DIALOG)
         self.assertIn("setModels(values =>", H3_PLAN_DIALOG)
-        self.assertNotIn("disabled={Boolean(pinkReconciliationLabel", H3_PLAN_DIALOG)
+        self.assertIn("approve({", H3_PLAN_DIALOG)
 
         director_picker = (ROOT / "ui/src/components/Sidebar/DirectorChat.tsx").read_text(
             encoding="utf-8"
@@ -403,43 +405,126 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("h3SelectedProfile: 'high' as const", STORE)
 
     def test_private_preview_requires_deliberate_session_scoped_reveal(self):
-        self.assertIn("file.private && !privateRevealed ? 'blur-2xl'", MEDIA_ITEM)
+        self.assertIn("const privateBlurred = file.private && !privateRevealed", MEDIA_ITEM)
+        self.assertIn("privateBlurred ? 'blur-2xl'", MEDIA_ITEM)
         self.assertNotIn("group-hover/private:blur-none", MEDIA_ITEM)
-        self.assertIn("Private preview — click to reveal", MEDIA_ITEM)
-        self.assertIn("Click, tap, or press Enter", MEDIA_ITEM)
+        self.assertIn("Blurred preview — click to Reveal", MEDIA_ITEM)
+        self.assertIn("Reveal blurred preview for", MEDIA_ITEM)
+        self.assertIn("Blur preview for", MEDIA_ITEM)
         self.assertIn("privatePreviewIdentity(file.workspace, file.name, file.revision)", MEDIA_ITEM)
         self.assertIn("privatePreviewWasRevealed(privateRevealKey)", MEDIA_ITEM)
         self.assertIn("rememberPrivatePreviewReveal(privateRevealKey)", MEDIA_ITEM)
         self.assertIn("forgetPrivatePreviewReveal(privateRevealKey)", MEDIA_ITEM)
         self.assertIn("`${workspace}\\u0000${name}\\u0000${revision}`", PRIVATE_PREVIEW)
-        self.assertIn("sessionStorage.getItem(privateRevealStorageKey(identity))", PRIVATE_PREVIEW)
+        self.assertIn("storedFlag(privateRevealStorageKey(identity), memoryRevealed.get(identity))", PRIVATE_PREVIEW)
         self.assertIn("sessionStorage.setItem(privateRevealStorageKey(identity), '1')", PRIVATE_PREVIEW)
         self.assertIn("sessionStorage.removeItem(privateRevealStorageKey(identity))", PRIVATE_PREVIEW)
         self.assertIn("subscribePrivatePreviewReveal(privateRevealKey, syncReveal)", MEDIA_ITEM)
+        self.assertIn("src={privateBlurred ? undefined : file.url}", MEDIA_ITEM)
+        self.assertIn("video.removeAttribute('src')", MEDIA_ITEM)
+        self.assertIn("video.load()", MEDIA_ITEM)
+        self.assertNotIn("video.play()", MEDIA_ITEM)
         self.assertIn("return subscribePrivatePreviewChanges", PRIVATE_PREVIEW)
         self.assertIn("new CustomEvent(PRIVATE_REVEAL_CHANGE_EVENT", PRIVATE_PREVIEW)
+        self.assertIn("hidePrivatePreviewsForWorkspace", PRIVATE_PREVIEW)
+        self.assertIn("setPrivatePreviewsForWorkspaceRevealed", PRIVATE_PREVIEW)
+        self.assertIn("PRIVATE_PROJECT_REVEAL_SESSION_PREFIX", PRIVATE_PREVIEW)
+        self.assertIn("PRIVATE_HIDDEN_SESSION_PREFIX", PRIVATE_PREVIEW)
         self.assertNotIn("updateOutputPrivacy", MEDIA_ITEM)
 
     def test_private_thumbnail_and_reference_previews_use_same_reveal_contract(self):
-        self.assertIn("file.private && !privateRevealed ? 'blur-md'", THUMBNAILS)
+        self.assertIn("const privateBlurred = file.private && !privateRevealed", THUMBNAILS)
+        self.assertIn("privateBlurred ? 'blur-md'", THUMBNAILS)
         self.assertIn("privatePreviewIdentity(file.workspace, file.name, file.revision)", THUMBNAILS)
         self.assertIn("revealPrivatePreview(privateIdentity)", THUMBNAILS)
         self.assertIn("subscribePrivatePreviewChanges(() =>", THUMBNAILS)
         self.assertIn('type="button"', THUMBNAILS)
-        self.assertIn("Reveal private preview and select", THUMBNAILS)
-        self.assertIn("Click, tap, or press Enter", THUMBNAILS)
+        self.assertIn("Reveal blurred preview and select", THUMBNAILS)
+        self.assertIn("Reveal this blurred preview", THUMBNAILS)
+        withheld_thumbnail = THUMBNAILS[
+            THUMBNAILS.index("{privateBlurred ? ("):
+            THUMBNAILS.index(") : file.type === 'video'")
+        ]
+        self.assertNotIn("file.url", withheld_thumbnail)
+        self.assertNotIn("<img", withheld_thumbnail)
+        self.assertNotIn("<VideoThumbnail", withheld_thumbnail)
+        self.assertIn("src={file.url}", THUMBNAILS)
+        self.assertIn("requestThumbnail(src, cacheKey, controller.signal)", THUMBNAILS)
+        self.assertIn("controller.abort()", THUMBNAILS)
+        self.assertNotIn("autoPlay", THUMBNAILS)
+        self.assertNotIn("video.play(", THUMBNAILS)
         self.assertNotIn("group-hover/private:blur-none", THUMBNAILS)
         self.assertIn("output.metadata?.private === true", REFERENCE_LIBRARY)
         self.assertIn(
             "privatePreviewIdentity(project, `asset:${assetId}:${output.id}`, output.relative_path)",
             REFERENCE_LIBRARY,
         )
-        self.assertIn("isPrivate && !revealed ? 'blur-xl'", REFERENCE_LIBRARY)
-        self.assertIn("Reveal private reference preview", REFERENCE_LIBRARY)
+        preview_scope = REFERENCE_LIBRARY[
+            REFERENCE_LIBRARY.index("function ProjectAssetPreview"):
+            REFERENCE_LIBRARY.index("export function ProjectReferenceLibrary")
+        ]
+        self.assertIn("const needsInitialBlur = projectAssetOutputNeedsInitialBlur(output)", preview_scope)
+        self.assertIn("const privateBlurred = needsInitialBlur && !revealed", preview_scope)
+        self.assertIn("privateBlurred ? 'blur-xl'", preview_scope)
+        self.assertEqual(
+            preview_scope.count("src={privateBlurred ? undefined : getProjectAssetMediaUrl"),
+            2,
+        )
+        self.assertIn(": <img\n              src={privateBlurred ? undefined : getProjectAssetMediaUrl", preview_scope)
+        self.assertIn("subscribePrivatePreviewReveal(identity, syncReveal)", preview_scope)
+        self.assertIn("Reveal reference preview", preview_scope)
+        self.assertNotIn("fetch(", preview_scope)
+        self.assertNotIn("setProjectAssetVariantStatus", preview_scope)
         self.assertNotIn("group-hover/private:blur-none", REFERENCE_LIBRARY)
         self.assertIn("Blur previews", MAIN_CONTENT)
         self.assertIn("Show previews", MAIN_CONTENT)
+        self.assertIn("'Blur all' : 'Reveal all'", MAIN_CONTENT)
+        self.assertIn("aria-pressed={anyProjectPrivatePreviewRevealed}", MAIN_CONTENT)
+        self.assertIn("Browser-session preview only; project access unchanged.", MAIN_CONTENT)
+        self.assertIn("setPrivatePreviewsForWorkspaceRevealed(", MAIN_CONTENT)
+        self.assertIn("activeWorkspace && !browsingUploads", MAIN_CONTENT)
         self.assertNotIn("> Public", MAIN_CONTENT)
+
+    def test_gallery_virtualization_and_card_stacking_follow_output_identity(self):
+        self.assertIn("Map<string, { height: number; epoch: number }>", MAIN_CONTENT)
+        self.assertIn("measurement?.epoch === measurementEpoch", MAIN_CONTENT)
+        self.assertIn("if (epoch !== measurementEpoch) return", MAIN_CONTENT)
+        self.assertIn("currentOutputIdentities.current.has(identity)", MAIN_CONTENT)
+        self.assertIn("estimatedItemHeight, measurementVersion]", MAIN_CONTENT)
+        self.assertNotIn("Map<number, number>", MAIN_CONTENT)
+        self.assertIn("key={identity}", MAIN_CONTENT)
+        self.assertIn("viewportAnchor", MAIN_CONTENT)
+        self.assertIn("intraItemOffset", MAIN_CONTENT)
+        self.assertIn("galleryScopeKey", MAIN_CONTENT)
+        self.assertIn("scopeFence.current.generation", MAIN_CONTENT)
+        self.assertIn("listFence.current.generation", MAIN_CONTENT)
+        self.assertIn("requestAnimationFrame(() => requestAnimationFrame(align))", MAIN_CONTENT)
+        self.assertIn("focus-within:z-20", MEDIA_ITEM)
+        self.assertIn("event.target !== event.currentTarget", MEDIA_ITEM)
+        self.assertIn("event.key !== 'Enter' && event.key !== ' '", MEDIA_ITEM)
+
+    def test_preview_reveals_are_scrubbed_on_exact_project_access_transitions(self):
+        load_scope = STORE[
+            STORE.index("loadWorkspaces: async"):
+            STORE.index("switchWorkspace: async")
+        ]
+        switch_scope = STORE[
+            STORE.index("switchWorkspace: async"):
+            STORE.index("createWorkspace: async")
+        ]
+        self.assertIn("revokedWorkspaces", load_scope)
+        self.assertIn("hidePrivatePreviewsForWorkspace(workspace)", load_scope)
+        self.assertIn("hidePrivatePreviewsForWorkspace(activeWorkspace)", switch_scope)
+        self.assertIn("hidePrivatePreviewsForWorkspace(previousWorkspace)", switch_scope)
+        for start, end in (
+            ("\n  createWorkspace: async", "\n  unlockWorkspace: async"),
+            ("\n  unlockWorkspace: async", "\n  lockWorkspace: async"),
+            ("\n  lockWorkspace: async", "\n  lockAllWorkspaces: async"),
+            ("\n  lockAllWorkspaces: async", "\n  deleteWorkspace: async"),
+            ("\n  deleteWorkspace: async", "\n  storageDashboardOpen:"),
+        ):
+            action = STORE[STORE.index(start):STORE.index(end, STORE.index(start))]
+            self.assertIn("hidePrivatePreviewsForWorkspace", action)
 
     def test_move_and_share_do_not_clear_private_flag(self):
         move_block = MEDIA_ITEM[

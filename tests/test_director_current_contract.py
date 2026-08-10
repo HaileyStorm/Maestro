@@ -40,6 +40,9 @@ class _HTTPException(Exception):
 class _Request:
     def __init__(self, body: dict | None = None):
         self.body = body or {}
+        self.state = type(
+            "State", (), {"maestro_llm_progress_callback": None},
+        )()
 
     async def json(self):
         return dict(self.body)
@@ -77,7 +80,7 @@ def _launch_functions_namespace(function_names, **extras):
     return namespace
 
 
-def _director_plan_namespace(ensure_loaded):
+def _director_plan_namespace(fail_operation):
     source = LAUNCH_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(LAUNCH_PATH))
     function = next(
@@ -94,10 +97,21 @@ def _director_plan_namespace(ensure_loaded):
         "Request": _Request,
         "HTTPException": _HTTPException,
         "_authorize_director_media_inputs": lambda request, body: None,
-        "_ensure_llm_loaded": ensure_loaded,
+        "_resolve_direct_llm_selection": lambda request: {},
+        "_run_authorized_llm_with_selection": (
+            lambda request, selection, operation: fail_operation(operation)
+        ),
     }
     exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
     return namespace
+
+
+def _blocking_shield_stub(invocations):
+    async def run_blocking_shielded(function, /, *args, **kwargs):
+        invocations.append((function, args, kwargs))
+        return function(*args, **kwargs)
+
+    return run_blocking_shielded
 
 
 def _list_models_namespace(registry):
@@ -196,6 +210,7 @@ class _Registry:
 class _CatalogRegistry(_Registry):
     def __init__(self, models: dict[str, dict]):
         super().__init__(models)
+        self.models_def = self.models
         self.displayed_model_types = list(models)
         self.families_infos = {
             "test": (1, "Test"),
@@ -242,14 +257,32 @@ class TestDirectorPreviewFailureContract(unittest.TestCase):
             "/media/hailey/private/provider-config.json"
         )
 
-        def fail():
+        operations = []
+        shielded_calls = []
+
+        def fail(operation):
+            operations.append(operation)
             raise RuntimeError(private_detail)
 
         namespace = _director_plan_namespace(fail)
-        with patch("traceback.print_exc") as print_exc:
+        request = _Request()
+        with patch(
+            "services.llm_operations.run_blocking_shielded",
+            new=_blocking_shield_stub(shielded_calls),
+        ), patch("traceback.print_exc") as print_exc:
             with self.assertRaises(_HTTPException) as raised:
-                asyncio.run(namespace["director_v2_plan"](_Request()))
+                asyncio.run(namespace["director_v2_plan"](request))
 
+        self.assertEqual(len(shielded_calls), 2)
+        self.assertIs(
+            shielded_calls[0][0], namespace["_resolve_direct_llm_selection"],
+        )
+        self.assertIs(
+            shielded_calls[1][0],
+            namespace["_run_authorized_llm_with_selection"],
+        )
+        self.assertEqual(operations, [shielded_calls[1][1][2]])
+        self.assertEqual(operations[0].__name__, "run_director_plan")
         print_exc.assert_called_once_with()
         self.assertEqual(raised.exception.status_code, 500)
         self.assertEqual(
@@ -279,14 +312,32 @@ class TestDirectorPreviewFailureContract(unittest.TestCase):
             detail=private_detail,
         )
 
-        def fail():
+        operations = []
+        shielded_calls = []
+
+        def fail(operation):
+            operations.append(operation)
             raise dependency_error
 
         namespace = _director_plan_namespace(fail)
-        with patch("traceback.print_exc") as print_exc:
+        request = _Request()
+        with patch(
+            "services.llm_operations.run_blocking_shielded",
+            new=_blocking_shield_stub(shielded_calls),
+        ), patch("traceback.print_exc") as print_exc:
             with self.assertRaises(_HTTPException) as raised:
-                asyncio.run(namespace["director_v2_plan"](_Request()))
+                asyncio.run(namespace["director_v2_plan"](request))
 
+        self.assertEqual(len(shielded_calls), 2)
+        self.assertIs(
+            shielded_calls[0][0], namespace["_resolve_direct_llm_selection"],
+        )
+        self.assertIs(
+            shielded_calls[1][0],
+            namespace["_run_authorized_llm_with_selection"],
+        )
+        self.assertEqual(operations, [shielded_calls[1][1][2]])
+        self.assertEqual(operations[0].__name__, "run_director_plan")
         print_exc.assert_called_once_with()
         self.assertEqual(raised.exception.status_code, 500)
         self.assertEqual(

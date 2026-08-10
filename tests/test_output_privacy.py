@@ -3,6 +3,7 @@ import base64
 import builtins
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -327,6 +328,12 @@ class UploadAccessTests(unittest.TestCase):
 
 
 class ProjectPasswordTests(unittest.TestCase):
+    @staticmethod
+    def _durable_manager(root, clock=lambda: 1_000.0):
+        return ProjectAccessManager(
+            os.path.join(root, "grants.json"), b"g" * 32, clock=clock,
+        )
+
     def test_new_passwords_have_a_strong_minimum(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = ProjectAccessManager()
@@ -447,6 +454,236 @@ class ProjectPasswordTests(unittest.TestCase):
             self.assertTrue(
                 manager.unlock("project", directory, other, "second password")
             )
+
+    def test_device_grants_survive_restart_for_multiple_projects_without_secrets(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = os.path.join(root, "first")
+            second = os.path.join(root, "second")
+            os.makedirs(first)
+            os.makedirs(second)
+            session = "a" * 32
+            manager = self._durable_manager(root)
+            manager.set_password(
+                "first", first, session, "first password", "device", False,
+            )
+            manager.set_password(
+                "second", second, session, "second password", "device", False,
+            )
+
+            restarted = self._durable_manager(root)
+            self.assertTrue(restarted.require("first", first, session))
+            self.assertTrue(restarted.require("second", second, session))
+            self.assertFalse(restarted.require("first", first, "b" * 32))
+
+            grants_path = os.path.join(root, "grants.json")
+            with open(grants_path, "r", encoding="utf-8") as handle:
+                serialized = handle.read()
+                payload = json.loads(serialized)
+            self.assertNotIn(session, serialized)
+            self.assertNotIn("first password", serialized)
+            self.assertNotIn("second password", serialized)
+            self.assertNotIn("password", serialized.lower())
+            self.assertEqual(len(payload["grants"]), 2)
+            self.assertTrue(all(
+                record["principal_digest"].startswith("principal:v1:")
+                and record["project_instance_digest"].startswith("project:v1:")
+                and record["credential_revision"].startswith("credential:v1:")
+                and record["access_class"] == "local"
+                for record in payload["grants"]
+            ))
+            if os.name != "nt":
+                self.assertEqual(os.stat(grants_path).st_mode & 0o777, 0o600)
+
+    def test_local_and_remote_grants_are_separate_and_lock_scopes_are_explicit(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = os.path.join(root, "first")
+            second = os.path.join(root, "second")
+            os.makedirs(first)
+            os.makedirs(second)
+            session = "a" * 32
+            manager = self._durable_manager(root)
+            manager.set_password(
+                "first", first, session, "first password", "device", False,
+            )
+            manager.set_password(
+                "second", second, session, "second password", "device", False,
+            )
+            self.assertFalse(manager.require("first", first, session, True))
+            self.assertTrue(manager.unlock(
+                "first", first, session, "first password", "device", True,
+            ))
+            self.assertTrue(manager.require("first", first, session, True))
+
+            self.assertEqual(manager.lock("first", session, False), 1)
+            self.assertFalse(manager.require("first", first, session, False))
+            self.assertTrue(manager.require("first", first, session, True))
+            self.assertTrue(manager.require("second", second, session, False))
+            self.assertEqual(manager.lock_all(session, False), 1)
+            self.assertFalse(manager.require("second", second, session, False))
+            self.assertTrue(manager.require("first", first, session, True))
+
+    def test_status_polls_do_not_extend_idle_expiry(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "project")
+            os.makedirs(project)
+            now = [1_000.0]
+            manager = self._durable_manager(root, clock=lambda: now[0])
+            status = manager.set_password(
+                "project", project, "a" * 32, "long password", "device", False,
+            )
+            original_idle = status.unlock_idle_expires_at
+            self.assertEqual(status.unlock_expires_at, 1_000.0 + 30 * 24 * 60 * 60)
+            self.assertEqual(original_idle, 1_000.0 + 7 * 24 * 60 * 60)
+            grants_path = os.path.join(root, "grants.json")
+            with open(grants_path, "rb") as handle:
+                original_bytes = handle.read()
+
+            now[0] += 60 * 60
+            for _ in range(20):
+                polled = manager.status("project", project, "a" * 32, False)
+                self.assertEqual(polled.unlock_idle_expires_at, original_idle)
+            with open(grants_path, "rb") as handle:
+                self.assertEqual(handle.read(), original_bytes)
+
+            now[0] = float(original_idle) + 0.001
+            self.assertFalse(manager.require("project", project, "a" * 32))
+
+    def test_real_authorized_activity_slides_idle_but_never_absolute_expiry(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "project")
+            os.makedirs(project)
+            now = [1_000.0]
+            manager = self._durable_manager(root, clock=lambda: now[0])
+            initial = manager.set_password(
+                "project", project, "a" * 32, "long password", "device", False,
+            )
+            absolute = float(initial.unlock_expires_at)
+            first_idle = float(initial.unlock_idle_expires_at)
+
+            now[0] = first_idle - 60
+            self.assertTrue(manager.require("project", project, "a" * 32))
+            refreshed = manager.status("project", project, "a" * 32)
+            self.assertGreater(refreshed.unlock_idle_expires_at, first_idle)
+            self.assertEqual(refreshed.unlock_expires_at, absolute)
+
+            poll_idle = refreshed.unlock_idle_expires_at
+            now[0] += 30
+            self.assertEqual(
+                manager.status(
+                    "project", project, "a" * 32,
+                ).unlock_idle_expires_at,
+                poll_idle,
+            )
+            current_idle = float(poll_idle)
+            while current_idle < absolute:
+                now[0] = current_idle - 60
+                self.assertTrue(manager.require("project", project, "a" * 32))
+                current_idle = float(manager.status(
+                    "project", project, "a" * 32,
+                ).unlock_idle_expires_at)
+            self.assertEqual(current_idle, absolute)
+            now[0] = absolute
+            self.assertFalse(manager.require("project", project, "a" * 32))
+
+    @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-specific")
+    def test_grant_store_fsyncs_file_then_replace_then_parent_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = self._durable_manager(root)
+            events = []
+            real_fsync = os.fsync
+            real_replace = os.replace
+
+            def tracked_fsync(descriptor):
+                events.append(
+                    "dir-fsync" if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                    else "file-fsync"
+                )
+                return real_fsync(descriptor)
+
+            def tracked_replace(source, destination):
+                events.append("replace")
+                return real_replace(source, destination)
+
+            with mock.patch.object(os, "fsync", side_effect=tracked_fsync), mock.patch.object(
+                os, "replace", side_effect=tracked_replace,
+            ):
+                manager._save_device_grants([])
+
+            self.assertLess(events.index("file-fsync"), events.index("replace"))
+            self.assertLess(events.index("replace"), events.index("dir-fsync"))
+
+    def test_corrupt_grant_store_fails_locked_until_password_is_proved_again(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "project")
+            os.makedirs(project)
+            session = "a" * 32
+            manager = self._durable_manager(root)
+            manager.set_password(
+                "project", project, session, "long password", "device", False,
+            )
+            with open(os.path.join(root, "grants.json"), "w", encoding="utf-8") as handle:
+                handle.write("{not-json")
+            self.assertFalse(manager.require("project", project, session))
+            self.assertTrue(manager.unlock(
+                "project", project, session, "long password", "device", False,
+            ))
+            self.assertTrue(manager.require("project", project, session))
+
+    def test_grant_record_hmac_prevents_local_to_remote_store_reclassification(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "project")
+            os.makedirs(project)
+            session = "a" * 32
+            manager = self._durable_manager(root)
+            manager.set_password(
+                "project", project, session, "long password", "device", False,
+            )
+            grants_path = os.path.join(root, "grants.json")
+            with open(grants_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            payload["grants"][0]["access_class"] = "remote"
+            with open(grants_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            self.assertFalse(manager.require("project", project, session, True))
+            self.assertFalse(manager.require("project", project, session, False))
+
+    def test_project_instance_and_password_revisions_fence_stale_device_grants(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "project")
+            os.makedirs(project)
+            session = "a" * 32
+            manager = self._durable_manager(root)
+            manager.set_password(
+                "project", project, session, "first password", "device", False,
+            )
+            marker = os.path.join(project, ".maestro-project-instance")
+            os.remove(marker)
+            self.assertFalse(manager.require("project", project, session))
+            self.assertFalse(os.path.exists(marker))
+            self.assertTrue(manager.unlock(
+                "project", project, session, "first password", "device", False,
+            ))
+            self.assertTrue(os.path.isfile(marker))
+
+            manager.set_password(
+                "project", project, session, "second password", "device", False,
+            )
+            self.assertFalse(manager.unlock(
+                "project", project, "b" * 32, "first password", "device", False,
+            ))
+            manager.set_password("project", project, session, "")
+            self.assertFalse(manager.status(
+                "project", project, session,
+            ).protected)
+
+    def test_unknown_remember_policy_is_rejected_without_authorizing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ProjectAccessManager()
+            with self.assertRaisesRegex(ValueError, "remember"):
+                manager.set_password(
+                    "project", directory, "a" * 32, "long password", "forever",
+                )
+            self.assertFalse(os.path.exists(manager.metadata_path(directory)))
 
 
 class RemoteProjectScopeTests(unittest.TestCase):

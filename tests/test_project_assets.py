@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -210,6 +212,404 @@ class ProjectAssetStoreTests(unittest.TestCase):
         self.assertFalse(copied.exists())
         self.assertFalse(self.store.delete_variant("film_1", "default", "hero", "summer"))
 
+    def test_atomic_variant_batch_uses_one_commit_and_publishes_all(self):
+        self._create_character(asset_id="hero")
+        specs = [
+            {
+                "id": "batch_one",
+                "variant_type": "pose",
+                "label": "Batch one",
+                "outputs": [self._media("batch-one.png", b"one")],
+            },
+            {
+                "id": "batch_two",
+                "variant_type": "pose",
+                "label": "Batch two",
+                "outputs": [self._media("batch-two.png", b"two")],
+            },
+        ]
+        with mock.patch.object(
+            self.store, "_write_manifest", wraps=self.store._write_manifest,
+        ) as write_manifest:
+            variants = self.store.add_variants_atomic(
+                "film_1", "default", "hero", specs,
+            )
+        self.assertEqual(write_manifest.call_count, 1)
+        self.assertEqual([item["id"] for item in variants], ["batch_one", "batch_two"])
+        reopened = ProjectAssetStore(self.storage, [self.sources])
+        self.assertEqual(
+            [item["id"] for item in reopened.get_asset(
+                "film_1", "default", "hero",
+            )["variants"]],
+            ["batch_one", "batch_two"],
+        )
+
+    def test_atomic_batch_validates_exact_existing_replays_before_copy(self):
+        source = self._media("existing-replay.png", b"existing")
+        asset = self._create_character(asset_id="hero", variants=[{
+            "id": "existing_replay",
+            "variant_type": "pose",
+            "label": "Existing replay",
+            "outputs": [source],
+        }])
+        expected = asset["variants"][0]
+        with mock.patch.object(
+            self.store, "_write_manifest", wraps=self.store._write_manifest,
+        ) as write_manifest:
+            self.assertEqual(
+                self.store.add_variants_atomic(
+                    "film_1", "default", "hero", [],
+                    expected_existing_variants=[expected],
+                ),
+                [],
+            )
+        write_manifest.assert_not_called()
+
+        self.store.set_variant_status(
+            "film_1", "default", "hero", "existing_replay", "kept",
+        )
+        with mock.patch.object(
+            self.store, "_copy_outputs", wraps=self.store._copy_outputs,
+        ) as copy_outputs, self.assertRaisesRegex(
+            ValueError, "^existing variant changed: existing_replay$",
+        ):
+            self.store.add_variants_atomic(
+                "film_1", "default", "hero", [{
+                    "id": "must_not_publish",
+                    "variant_type": "pose",
+                    "label": "Must not publish",
+                    "outputs": [self._media("must-not-publish.png", b"new")],
+                }],
+                expected_existing_variants=[expected],
+            )
+        copy_outputs.assert_not_called()
+        current = self.store.get_asset("film_1", "default", "hero")
+        self.assertEqual(
+            [item["id"] for item in current["variants"]],
+            ["existing_replay"],
+        )
+
+    def test_atomic_batch_rejects_missing_expected_replay_media_before_copy(self):
+        source = self._media("replay-media.png", b"existing")
+        asset = self._create_character(asset_id="hero", variants=[{
+            "id": "existing_replay",
+            "variant_type": "pose",
+            "label": "Existing replay",
+            "outputs": [source],
+        }])
+        expected = asset["variants"][0]
+        copied = Path(self.store.resolve_output_path(
+            "film_1", "default", expected["outputs"][0]["relative_path"],
+        ))
+        copied.unlink()
+        with mock.patch.object(
+            self.store, "_copy_outputs", wraps=self.store._copy_outputs,
+        ) as copy_outputs, mock.patch.object(
+            self.store, "_write_manifest", wraps=self.store._write_manifest,
+        ) as write_manifest, self.assertRaisesRegex(
+            ValueError, "^existing variant media changed: existing_replay$",
+        ):
+            self.store.add_variants_atomic(
+                "film_1", "default", "hero", [{
+                    "id": "must_not_publish",
+                    "variant_type": "pose",
+                    "label": "Must not publish",
+                    "outputs": [self._media("must-not-copy.png", b"new")],
+                }],
+                expected_existing_variants=[expected],
+            )
+        copy_outputs.assert_not_called()
+        write_manifest.assert_not_called()
+        self.assertEqual(
+            [item["id"] for item in self.store.get_asset(
+                "film_1", "default", "hero",
+            )["variants"]],
+            ["existing_replay"],
+        )
+
+    def test_publication_guard_serializes_other_store_instances(self):
+        self._create_character(asset_id="hero")
+        second = ProjectAssetStore(self.storage, [self.sources])
+        started = threading.Event()
+        finished = threading.Event()
+
+        def mutate():
+            started.set()
+            second.update_asset(
+                "film_1", "default", "hero", {"description": "changed"},
+            )
+            finished.set()
+
+        with self.store.publication_guard():
+            thread = threading.Thread(target=mutate)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.wait(0.05))
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(finished.is_set())
+
+    def test_reviewed_source_identity_is_verified_during_final_copy(self):
+        self._create_character(asset_id="hero")
+        source = self._media("reviewed.png", b"reviewed bytes")
+        approved = source.stat()
+        expected = {
+            "device": approved.st_dev,
+            "inode": approved.st_ino,
+            "size": approved.st_size,
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        }
+        replacement = self._media("replacement.png", b"replacement bytes")
+        os.replace(replacement, source)
+        with self.assertRaisesRegex(ValueError, "reviewed source identity changed"):
+            self.store.add_variants_atomic(
+                "film_1", "default", "hero", [{
+                    "id": "reviewed_candidate",
+                    "variant_type": "reference_pack",
+                    "label": "Reviewed candidate",
+                    "outputs": [{
+                        "source_path": source,
+                        "expected_source_identity": expected,
+                    }],
+                }],
+            )
+        self.assertEqual(
+            self.store.get_asset("film_1", "default", "hero")["variants"],
+            [],
+        )
+        media_root = (
+            self.storage / "projects" / "film_1" / "workspaces" / "default"
+            / "media" / "hero"
+        )
+        self.assertFalse((media_root / "reviewed_candidate").exists())
+
+    def test_reviewed_source_identity_is_transient_on_success(self):
+        self._create_character(asset_id="hero")
+        source = self._media("approved.png", b"approved bytes")
+        approved = source.stat()
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        variants = self.store.add_variants_atomic(
+            "film_1", "default", "hero", [{
+                "id": "approved_candidate",
+                "variant_type": "reference_pack",
+                "label": "Approved candidate",
+                "outputs": [{
+                    "source_path": source,
+                    "expected_source_identity": {
+                        "device": approved.st_dev,
+                        "inode": approved.st_ino,
+                        "size": approved.st_size,
+                        "sha256": digest,
+                    },
+                }],
+            }],
+        )
+        self.assertNotIn("expected_source_identity", variants[0]["outputs"][0])
+        manifest = (
+            self.storage / "projects" / "film_1" / "project-assets.json"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("expected_source_identity", manifest)
+        self.assertNotIn(digest, manifest)
+
+    def test_restart_cleanup_removes_only_unreferenced_transaction_media(self):
+        source = self._media("kept-reference.png", b"kept")
+        asset = self._create_character(asset_id="hero", variants=[{
+            "id": "kept_variant",
+            "variant_type": "reference_pack",
+            "label": "Kept",
+            "outputs": [source],
+        }])
+        kept_relative = asset["variants"][0]["outputs"][0]["relative_path"]
+        kept_path = Path(self.store.resolve_output_path(
+            "film_1", "default", kept_relative,
+        ))
+        media_root = kept_path.parents[2]
+        orphan = media_root / "hero" / "orphan_variant"
+        orphan.mkdir()
+        (orphan / "private.png").write_bytes(b"private")
+        hidden = media_root / "hero" / ".staged.0123456789abcdef.tmp"
+        hidden.mkdir()
+        (hidden / "private.png").write_bytes(b"private")
+        orphan_asset = media_root / "orphan_asset" / "candidate"
+        orphan_asset.mkdir(parents=True)
+        (orphan_asset / "private.png").write_bytes(b"private")
+
+        corrupt_project = self.storage / "projects" / "corrupt"
+        corrupt_media = (
+            corrupt_project / "workspaces" / "default" / "media"
+            / "private_asset" / "private_variant"
+        )
+        corrupt_media.mkdir(parents=True)
+        (corrupt_media / "must-remain.png").write_bytes(b"uncertain")
+        (corrupt_project / "project-assets.json").write_text(
+            "not-json", encoding="utf-8",
+        )
+
+        self.assertEqual(self.store.cleanup_unreferenced_media(), 3)
+        self.assertTrue(kept_path.is_file())
+        self.assertFalse(orphan.exists())
+        self.assertFalse(hidden.exists())
+        self.assertFalse(orphan_asset.exists())
+        self.assertTrue(corrupt_media.is_dir())
+
+    def test_atomic_variant_batch_copy_or_replace_failure_leaves_no_partial_media(self):
+        before = self._create_character(asset_id="hero")
+        valid = {
+            "id": "batch_one",
+            "variant_type": "pose",
+            "label": "Batch one",
+            "outputs": [self._media("batch-one.png", b"one")],
+        }
+        invalid = {
+            "id": "batch_two",
+            "variant_type": "pose",
+            "label": "Batch two",
+            "outputs": [self.sources / "missing.png"],
+        }
+        with self.assertRaises(ValueError):
+            self.store.add_variants_atomic(
+                "film_1", "default", "hero", [valid, invalid],
+            )
+        self.assertEqual(
+            ProjectAssetStore(self.storage, [self.sources]).get_asset(
+                "film_1", "default", "hero",
+            ),
+            before,
+        )
+
+        with mock.patch.object(
+            self.store,
+            "_write_manifest",
+            side_effect=OSError("simulated batch write failure"),
+        ), self.assertRaises(OSError):
+            self.store.add_variants_atomic(
+                "film_1", "default", "hero", [valid],
+            )
+        self.assertEqual(
+            ProjectAssetStore(self.storage, [self.sources]).get_asset(
+                "film_1", "default", "hero",
+            ),
+            before,
+        )
+
+        manifest = self.storage / "projects" / "film_1" / "project-assets.json"
+        real_replace = os.replace
+
+        def fail_manifest_replace(source, destination):
+            if Path(destination) == manifest:
+                raise OSError("simulated batch replace failure")
+            return real_replace(source, destination)
+
+        with mock.patch(
+            "services.project_assets.os.replace", side_effect=fail_manifest_replace,
+        ), self.assertRaises(OSError):
+            self.store.add_variants_atomic(
+                "film_1", "default", "hero", [valid, {
+                    **invalid,
+                    "outputs": [self._media("batch-two.png", b"two")],
+                }],
+            )
+        self.assertEqual(
+            ProjectAssetStore(self.storage, [self.sources]).get_asset(
+                "film_1", "default", "hero",
+            ),
+            before,
+        )
+        media_root = manifest.parent / "workspaces" / "default" / "media" / "hero"
+        self.assertEqual(list(media_root.glob("batch_*")), [])
+        self.assertEqual(list(media_root.glob(".*.tmp")), [])
+
+    def test_atomic_variant_batch_rejects_stable_id_collisions_before_copy(self):
+        existing_source = self._media("existing.png", b"existing")
+        before = self._create_character(asset_id="hero", variants=[{
+            "id": "stable_id",
+            "variant_type": "pose",
+            "label": "Existing",
+            "outputs": [existing_source],
+        }])
+        with mock.patch.object(
+            self.store, "_copy_outputs", wraps=self.store._copy_outputs,
+        ) as copy_outputs, self.assertRaises(ValueError):
+            self.store.add_variants_atomic(
+                "film_1", "default", "hero", [{
+                    "id": "STABLE_ID",
+                    "variant_type": "pose",
+                    "label": "Collision",
+                    "outputs": [self._media("collision.png", b"collision")],
+                }],
+            )
+        copy_outputs.assert_not_called()
+        self.assertEqual(
+            ProjectAssetStore(self.storage, [self.sources]).get_asset(
+                "film_1", "default", "hero",
+            ),
+            before,
+        )
+
+    def test_atomic_batch_cleanup_fallback_keeps_stable_id_retryable(self):
+        self._create_character(asset_id="hero")
+        spec = {
+            "id": "retryable_id",
+            "variant_type": "pose",
+            "label": "Retryable",
+            "outputs": [self._media("retryable.png", b"retryable")],
+        }
+        with mock.patch.object(
+            self.store,
+            "_write_manifest",
+            side_effect=OSError("simulated pre-commit failure"),
+        ), mock.patch(
+            "services.project_assets.shutil.rmtree",
+            side_effect=OSError("simulated cleanup helper failure"),
+        ), self.assertRaises(OSError):
+            self.store.add_variants_atomic(
+                "film_1", "default", "hero", [spec],
+            )
+        media_root = (
+            self.storage / "projects" / "film_1" / "workspaces" / "default"
+            / "media" / "hero"
+        )
+        self.assertFalse((media_root / "retryable_id").exists())
+        self.assertEqual(list(media_root.glob(".*.tmp")), [])
+        retried = self.store.add_variants_atomic(
+            "film_1", "default", "hero", [spec],
+        )
+        self.assertEqual(retried[0]["id"], "retryable_id")
+
+    @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-only")
+    def test_post_replace_directory_fsync_failure_keeps_committed_media(self):
+        self._create_character(asset_id="hero")
+        source = self._media("committed.png", b"committed")
+        real_fsync = os.fsync
+        calls = {"count": 0}
+
+        def fail_directory_fsync(descriptor):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("simulated directory fsync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch(
+            "services.project_assets.os.fsync", side_effect=fail_directory_fsync,
+        ):
+            variants = self.store.add_variants_atomic(
+                "film_1", "default", "hero", [{
+                    "id": "committed_variant",
+                    "variant_type": "pose",
+                    "label": "Committed variant",
+                    "outputs": [source],
+                }],
+            )
+        self.assertEqual(calls["count"], 2)
+        persisted = ProjectAssetStore(self.storage, [self.sources]).get_variant(
+            "film_1", "default", "hero", "committed_variant",
+        )
+        copied = Path(self.store.resolve_output_path(
+            "film_1", "default", persisted["outputs"][0]["relative_path"],
+        ))
+        self.assertEqual(variants[0]["id"], "committed_variant")
+        self.assertEqual(copied.read_bytes(), b"committed")
+
     def test_project_and_workspace_scopes_are_isolated(self):
         for project, workspace, name in (
             ("film_a", "default", "A default"),
@@ -235,6 +635,15 @@ class ProjectAssetStoreTests(unittest.TestCase):
             self.store.get_asset("film_b", "default", "shared_id")["name"],
             "B default",
         )
+
+    def test_list_assets_is_read_only_when_absent_and_reloads_persisted_cards(self):
+        missing_project = self.storage / "projects" / "unstarted"
+        self.assertEqual(self.store.list_assets("unstarted", "default"), [])
+        self.assertFalse(missing_project.exists())
+
+        created = self._create_character(asset_id="persisted_card")
+        reopened = ProjectAssetStore(self.storage, [self.sources])
+        self.assertEqual(reopened.list_assets("film_1", "default"), [created])
 
     def test_delete_project_removes_manifest_and_all_copied_reference_media(self):
         source = self._media("old-private-reference.mp4", b"video")
@@ -377,7 +786,7 @@ class ProjectAssetStoreTests(unittest.TestCase):
         )
         self.assertEqual(list(manifest.parent.glob(".project-assets-*.tmp")), [])
 
-    def test_invalid_updates_and_corrupt_manifests_fail_closed(self):
+    def test_invalid_updates_fail_closed(self):
         self._create_character(asset_id="hero")
         with self.assertRaises(ValueError):
             self.store.update_asset(
@@ -388,10 +797,14 @@ class ProjectAssetStoreTests(unittest.TestCase):
                 "film_1", "default", "hero", {"provenance": "unknown"},
             )
 
+    def test_list_assets_rejects_corrupt_manifest_without_reflecting_content(self):
+        self._create_character(asset_id="hero")
         manifest = self.storage / "projects" / "film_1" / "project-assets.json"
-        manifest.write_text("not-json", encoding="utf-8")
-        with self.assertRaises(ProjectAssetPersistenceError):
+        corrupt_content = "private-corrupt-manifest-content"
+        manifest.write_text(corrupt_content, encoding="utf-8")
+        with self.assertRaises(ProjectAssetPersistenceError) as raised:
             self.store.list_assets("film_1", "default")
+        self.assertNotIn(corrupt_content, str(raised.exception))
 
     def test_deleting_asset_removes_its_copied_media_after_manifest_publish(self):
         source = self._media("prop.png")

@@ -31,6 +31,13 @@ from services.oom_detect import (  # noqa: E402
     normalize_failure_details,
 )
 from services.output_access import stamp_sidecar_policy  # noqa: E402
+from services.queue_recovery_runtime import (  # noqa: E402
+    QueueRecoveryRuntimeError,
+    artifact_descriptor,
+    recovery_unit_id,
+    sha256_file,
+    validate_artifact_descriptor,
+)
 
 
 def _load_launch_symbols(*names: str, namespace: dict | None = None) -> dict:
@@ -177,6 +184,152 @@ class H3DeliveryTransactionTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_live_shaped_native_policy_restamp_reseals_without_accepting_media_change(self):
+        filename = self.files[0]
+        unit_id = recovery_unit_id("job-1", "ordinary_repeat", index=0)
+        sidecar_path = Path(self.out_dir, Path(filename).stem + ".meta.json")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar.update({
+            "job_id": "job-1",
+            "producer_unit_id": unit_id,
+            "producer_unit_kind": "ordinary_repeat",
+            "producer_unit_variant": 0,
+            "producer_unit_index": 0,
+            "producer_unit_dependencies": [],
+            "producer_artifact_class": "final",
+            "artifact_class": "final",
+        })
+        media_size, media_sha256 = sha256_file(Path(self.out_dir, filename))
+        sidecar.update({
+            "producer_media_size": media_size,
+            "producer_media_sha256": media_sha256,
+        })
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+        stale = artifact_descriptor(
+            self.out_dir,
+            basename=filename,
+            sidecar_basename=sidecar_path.name,
+            producer_unit_id=unit_id,
+        )
+        unit = {
+            "artifacts": [stale],
+            "dependencies": [],
+            "index": 0,
+            "kind": "ordinary_repeat",
+            "state": "completed",
+            "unit_id": unit_id,
+            "variant": 0,
+        }
+        self.job["params"] = {
+            "spatial_upsampling": "flashvsr3",
+            "delivery_resolution": "3840x2160",
+            "delivery_fit": "center_crop",
+        }
+        self.job["recovery_cursor"] = {"completed_units": [unit]}
+
+        # This is the exact sanctioned refresh that invalidated the live safe-
+        # unit descriptor: producer evidence/media stay fixed while delivery
+        # makes the native owner-private and temporary before protection.
+        sidecar.update({
+            "private": True,
+            "owner_session_id": "owner-session",
+            "artifact_class": "temporary",
+            "delivery_native_source": True,
+        })
+        sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+        self.assertFalse(validate_artifact_descriptor(
+            self.out_dir, stale, producer_unit_id=unit_id,
+        ))
+        restamped_sidecar_bytes = sidecar_path.read_bytes()
+
+        symbols = _load_launch_symbols(
+            "_atomic_write_json",
+            "_queue_recovery_expected_artifact_role",
+            "_queue_recovery_reseal_delivery_source",
+            "_queue_recovery_delivery_plan",
+            "_stage_h3_delivery_native_outputs",
+            namespace={
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_RECOVERY_ARTIFACT_ROLES": {"final", "window"},
+                "_RECOVERY_UNIT_FIXED_ARTIFACT_ROLES": {},
+                "_queue_recovery_units": lambda job: list(
+                    (job.get("recovery_cursor") or {}).get("completed_units") or []
+                ),
+                "_recovery_artifact_descriptor": artifact_descriptor,
+                "_recovery_sha256_file": sha256_file,
+                "hashlib": hashlib,
+                "hmac": hmac,
+                "recovery_unit_id": recovery_unit_id,
+                "validate_artifact_descriptor": validate_artifact_descriptor,
+            },
+        )
+        plan = symbols["_queue_recovery_delivery_plan"](
+            self.job,
+            self.out_dir,
+            [filename],
+            spatial_upsampling="flashvsr3",
+            delivery_resolution="3840x2160",
+            delivery_fit="center_crop",
+        )
+        refreshed = plan["staging"][0]["source"]
+        self.assertEqual(refreshed["sha256"], stale["sha256"])
+        self.assertEqual(refreshed["size"], stale["size"])
+        self.assertNotEqual(refreshed["sidecar_sha256"], stale["sidecar_sha256"])
+        self.assertTrue(validate_artifact_descriptor(
+            self.out_dir, refreshed, producer_unit_id=unit_id,
+        ))
+        self.assertEqual(sidecar_path.read_bytes(), restamped_sidecar_bytes)
+
+        current_sidecar_bytes = sidecar_path.read_bytes()
+        forged_unit_id = recovery_unit_id("job-1", "ordinary_repeat", index=1)
+        forged_unit = dict(unit, index=1, unit_id=forged_unit_id)
+        forged_sidecar = json.loads(current_sidecar_bytes.decode("utf-8"))
+        forged_sidecar.update({
+            "producer_unit_id": forged_unit_id,
+            "producer_unit_index": 1,
+        })
+        sidecar_path.write_text(json.dumps(forged_sidecar), encoding="utf-8")
+        self.job["recovery_cursor"] = {"completed_units": [forged_unit]}
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError,
+            "verified native producer unit",
+        ):
+            symbols["_queue_recovery_delivery_plan"](
+                self.job,
+                self.out_dir,
+                [filename],
+                spatial_upsampling="flashvsr3",
+                delivery_resolution="3840x2160",
+                delivery_fit="center_crop",
+            )
+        sidecar_path.write_bytes(current_sidecar_bytes)
+        self.job["recovery_cursor"] = {"completed_units": [unit]}
+
+        media_path = Path(self.out_dir, filename)
+        original_media = media_path.read_bytes()
+        media_path.write_bytes(original_media + b"-changed")
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError,
+            "verified native producer unit",
+        ):
+            symbols["_queue_recovery_delivery_plan"](
+                self.job,
+                self.out_dir,
+                [filename],
+                spatial_upsampling="flashvsr3",
+                delivery_resolution="3840x2160",
+                delivery_fit="center_crop",
+            )
+        media_path.write_bytes(original_media)
+
+        staged = symbols["_stage_h3_delivery_native_outputs"](
+            self.job, self.out_dir, [filename], plan,
+        )
+        self.assertEqual(len(staged), 1)
+        self.assertTrue(Path(staged[0]["native_path"]).is_file())
+        self.assertTrue(Path(staged[0]["native_meta"]).is_file())
+        self.assertFalse(Path(self.out_dir, filename).exists())
 
     def _symbols(self, upscale, fit, *, cancelled=None):
         release = Mock(return_value=["released_h3", "cleared_cuda_cache"])

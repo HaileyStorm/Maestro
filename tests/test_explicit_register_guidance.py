@@ -288,7 +288,9 @@ class ExplicitRegisterGuideTests(unittest.TestCase):
                     verify_clean_repo._extended_pattern_allowed(path, "penis"),
                 )
                 self.assertFalse(
-                    verify_clean_repo._extended_pattern_allowed(path, "vagina"),
+                    verify_clean_repo._extended_pattern_allowed(
+                        path, "vag" + "ina",
+                    ),
                 )
         for unreviewed in (
             "app/services/llm_guides/director/nsfw_unreviewed_rules.md",

@@ -19,7 +19,6 @@ from services.h3_shot_planner import (  # noqa: E402
     plan_h3_native_shots,
 )
 from shared.utils.prompt_parser import (  # noqa: E402
-    build_global_timeline_clip_prompts,
     classify_timeline_clip_boundaries,
 )
 
@@ -236,11 +235,23 @@ class H3SharedShotPlannerTests(unittest.TestCase):
         )
         self.assertEqual(shot_plan["clip_trim_tail_frames"], [14, 9])
         self.assertEqual(shot_plan["clip_published_frames"], [144, 336])
-        self.assertEqual(sum(
-            item.count(dialogue) for item in shot_plan["clip_prompts"]
-        ), 1)
-        self.assertNotIn("guest faces camera", shot_plan["clip_prompts"][0])
-        self.assertIn("guest faces camera", shot_plan["clip_prompts"][1])
+        self.assertEqual(shot_plan["clip_prompts"], [prompt, prompt])
+        self.assertEqual(len(shot_plan["dialogue_manifest"]), 1)
+        self.assertEqual(
+            shot_plan["semantic_shots"][0]["execution_slices"],
+            [
+                {
+                    "segment_index": 0, "physical_segment_index": 0,
+                    "start_frame": 0, "end_frame_exclusive": 144,
+                    "start_seconds": 0.0, "end_seconds": 6.0,
+                },
+                {
+                    "segment_index": 1, "physical_segment_index": 1,
+                    "start_frame": 144, "end_frame_exclusive": 480,
+                    "start_seconds": 6.0, "end_seconds": 20.0,
+                },
+            ],
+        )
 
         irregular_prompt = (
             "[Shot 1] At 0 seconds, the host enters. "
@@ -281,7 +292,7 @@ class H3SharedShotPlannerTests(unittest.TestCase):
         self.assertEqual(policy["clip_requested_frames"], [150, 330])
         self.assertTrue(policy["density_weighted"])
 
-    def test_untimed_prose_is_partitioned_chronologically_without_repetition(self):
+    def test_untimed_semantic_prompt_is_not_partitioned_for_physical_segments(self):
         prompt = (
             "SETTING: a rain-dark station with amber lamps\n"
             "Mara enters the station. Then she crosses the empty platform. "
@@ -294,13 +305,11 @@ class H3SharedShotPlannerTests(unittest.TestCase):
         )
 
         prompts = plan["clip_prompts"]
-        self.assertTrue(all("SETTING: a rain-dark station" in item for item in prompts))
-        for authored in (
-            "Mara enters the station.",
-            "Then she crosses the empty platform.",
-            "Finally, she boards the train.",
-        ):
-            self.assertEqual(sum(authored in item for item in prompts), 1)
+        self.assertEqual(prompts, [prompt, prompt, prompt])
+        self.assertEqual(len(plan["semantic_shots"]), 1)
+        self.assertFalse(
+            plan["semantic_shots"][0]["prompt_rewrite_for_physical_split"],
+        )
         self.assertEqual(
             [shot["continuity_mode"] for shot in plan["shots"]],
             ["independent", "extend_previous", "extend_previous"],
@@ -312,23 +321,18 @@ class H3SharedShotPlannerTests(unittest.TestCase):
 
     def test_cast_section_does_not_repeat_future_action_as_visual_context(self):
         future = "Alice later opens the vault and reveals the ending."
+        prompt = (
+            "CAST:\nAlice: adult mechanic in green.\n"
+            f"{future}\n"
+            "[Shot 1] Alice enters. Then she checks the door. Finally she sits."
+        )
         plan = plan_h3_native_shots(
-            global_prompt=(
-                "CAST:\nAlice: adult mechanic in green.\n"
-                f"{future}\n"
-                "[Shot 1] Alice enters. Then she checks the door. Finally she sits."
-            ),
+            global_prompt=prompt,
             clip_frame_counts=[124, 124, 124],
             fps=24,
         )
 
-        self.assertTrue(all(
-            "Alice: adult mechanic in green." in prompt
-            for prompt in plan["clip_prompts"]
-        ))
-        self.assertEqual(sum(
-            future in prompt for prompt in plan["clip_prompts"]
-        ), 1)
+        self.assertEqual(plan["clip_prompts"], [prompt, prompt, prompt])
 
     def test_dialogue_is_atomic_exact_and_owned_once(self):
         dialogue = "<d>[English] Keep  **every**\nword, exactly.</d>"
@@ -341,9 +345,9 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             fps=24,
         )
 
-        self.assertEqual(sum(
-            prompt.count(dialogue) for prompt in plan["clip_prompts"]
-        ), 1)
+        self.assertTrue(all(
+            prompt.count(dialogue) == 1 for prompt in plan["clip_prompts"]
+        ))
         self.assertEqual(len(plan["dialogue_manifest"]), 1)
         self.assertEqual(plan["dialogue_manifest"][0]["exact_block"], dialogue)
 
@@ -361,7 +365,10 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             fps=24,
         )
 
-        self.assertEqual(sum(item.count(block) for item in plan["clip_prompts"]), 2)
+        self.assertTrue(all(
+            item.count(block) == 2 for item in plan["clip_prompts"]
+        ))
+        self.assertEqual(plan["clip_prompts"][0], plan["clip_prompts"][1])
         self.assertNotIn("<d>[English] <d>", "\n".join(plan["clip_prompts"]))
         self.assertEqual(len(plan["dialogue_manifest"]), 2)
         self.assertTrue(all(
@@ -370,7 +377,7 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             for item in plan["dialogue_manifest"]
         ))
 
-    def test_timed_mapping_matches_existing_mapper_but_dialogue_does_not_duplicate(self):
+    def test_timed_semantic_prompt_is_reused_without_rebase(self):
         dialogue = "<d>[English] One exact line.</d>"
         prompt = (
             "Keep the same adult pilot and orange suit.\n"
@@ -378,9 +385,6 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             "[15-30s] The pilot enters the cockpit."
         )
         counts = [240, 240, 240]
-        expected = build_global_timeline_clip_prompts(
-            prompt, clip_frame_counts=counts, fps=24,
-        )
         plan = plan_h3_native_shots(
             global_prompt=prompt,
             clip_frame_counts=counts,
@@ -390,15 +394,8 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             ),
         )
 
-        # All non-dialogue timestamp clipping remains byte-for-byte identical.
-        scrub = lambda value: value.replace(dialogue, "").replace("  ", " ").strip()
-        self.assertEqual(
-            [scrub(item) for item in plan["clip_prompts"]],
-            [scrub(item) for item in expected],
-        )
-        self.assertEqual(sum(
-            item.count(dialogue) for item in plan["clip_prompts"]
-        ), 1)
+        self.assertEqual(plan["clip_prompts"], [prompt, prompt, prompt])
+        self.assertEqual(len(plan["dialogue_manifest"]), 1)
 
     def test_inline_timed_marker_shaped_dialogue_remains_atomic(self):
         dialogue = "<d>[English] I remember [Scene 1] and [Scene 2]</d>"
@@ -411,9 +408,9 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             fps=24,
         )
 
-        self.assertEqual(
-            sum(prompt.count(dialogue) for prompt in plan["clip_prompts"]), 1,
-        )
+        self.assertTrue(all(
+            prompt.count(dialogue) == 1 for prompt in plan["clip_prompts"]
+        ))
         self.assertEqual(len(plan["dialogue_manifest"]), 1)
         for prompt in plan["clip_prompts"]:
             stripped = prompt.replace(dialogue, "")
@@ -432,8 +429,9 @@ class H3SharedShotPlannerTests(unittest.TestCase):
         )
 
         self.assertTrue(all(literal in item for item in plan["clip_prompts"]))
-        self.assertNotIn(dialogue, plan["clip_prompts"][0])
-        self.assertIn(dialogue, plan["clip_prompts"][1])
+        self.assertTrue(all(
+            dialogue in prompt for prompt in plan["clip_prompts"]
+        ))
         self.assertEqual(len(plan["dialogue_manifest"]), 1)
 
     def test_final_blocking_words_inside_dialogue_are_not_metadata(self):
@@ -451,9 +449,10 @@ class H3SharedShotPlannerTests(unittest.TestCase):
                     clip_frame_counts=[240, 240],
                     fps=24,
                 )
-                self.assertEqual(sum(
-                    item.count(dialogue) for item in plan["clip_prompts"]
-                ), 1)
+                self.assertTrue(all(
+                    item.count(dialogue) == 1
+                    for item in plan["clip_prompts"]
+                ))
                 self.assertTrue(all(
                     not source["authored_final_blocking"]
                     for source in plan["source_contracts"]
@@ -482,9 +481,10 @@ class H3SharedShotPlannerTests(unittest.TestCase):
                     clip_frame_counts=[240, 240],
                     fps=24,
                 )
-                self.assertEqual(sum(
-                    item.count(dialogue) for item in plan["clip_prompts"]
-                ), 1)
+                self.assertTrue(all(
+                    item.count(dialogue) == 1
+                    for item in plan["clip_prompts"]
+                ))
                 self.assertEqual(len(plan["dialogue_manifest"]), 1)
                 without_dialogue = "\n".join(plan["clip_prompts"]).replace(
                     dialogue, "",
@@ -503,8 +503,11 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             clip_frame_counts=[240, 240],
             fps=24,
         )
-        self.assertNotIn(blocking, plan["clip_prompts"][0])
-        self.assertIn(f"FINAL BLOCKING: {blocking}", plan["clip_prompts"][1])
+        self.assertEqual(plan["clip_prompts"], [plan["global_prompt"]] * 2)
+        self.assertTrue(all(
+            f"FINAL BLOCKING: {blocking}" in prompt
+            for prompt in plan["clip_prompts"]
+        ))
 
     def test_inline_context_ir_final_blocking_belongs_only_to_final_segment(self):
         blocking = "the adult pilot closes the visor and faces camera"
@@ -519,11 +522,7 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             fps=24,
         )
 
-        self.assertNotIn(blocking, plan["clip_prompts"][0])
-        self.assertEqual(
-            sum(item.count(blocking) for item in plan["clip_prompts"]), 1,
-        )
-        self.assertIn(f"FINAL BLOCKING: {blocking}", plan["clip_prompts"][1])
+        self.assertEqual(plan["clip_prompts"], [prompt, prompt])
 
     def test_structured_director_context_excludes_plot_and_future_dialogue(self):
         shot = {
@@ -583,6 +582,77 @@ class H3SharedShotPlannerTests(unittest.TestCase):
         )
         self.assertIn("FINAL BLOCKING: the host rests both hands on the desk", plan["clip_prompts"][1])
         self.assertIn("FINAL BLOCKING: the guest looks directly into camera", plan["clip_prompts"][2])
+
+    def test_semantic_shot_split_has_stable_ids_cursors_and_predecessors(self):
+        first_prompt = (
+            "subject_definitions: <Subject 1> is Mara from <Picture 1>.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0.00s-12.00s] shot_name: Exact action | "
+            "audiovisual_description: <Subject 1> opens the red door. | "
+            "dialogue_and_vocalizations: <Subject 1> (S1) says: "
+            "<d>[English] Keep this exact.</d>\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        second_prompt = "A separate authored reaction with <Audio 1>."
+        plan = plan_h3_native_shots(
+            global_prompt=first_prompt + "\n\n" + second_prompt,
+            source_prompts=[first_prompt, second_prompt],
+            source_indices=[0, 0, 1],
+            structured_shots=[
+                {"shot_id": "authored-A"},
+                {"shot_id": "authored-B"},
+            ],
+            clip_frame_counts=[158, 158, 124],
+            clip_requested_frames=[144, 144, 120],
+            fps=24,
+        )
+
+        self.assertEqual(
+            plan["clip_prompts"],
+            [first_prompt, first_prompt, second_prompt],
+        )
+        self.assertEqual(plan["published_frames"], 408)
+        self.assertEqual(
+            [shot["authored_shot_id"] for shot in plan["shots"]],
+            ["authored-A", "authored-A", "authored-B"],
+        )
+        self.assertEqual(
+            [shot["execution_cursor_frame"] for shot in plan["shots"]],
+            [0, 144, 0],
+        )
+        self.assertEqual(
+            [shot["predecessor_physical_segment_id"] for shot in plan["shots"]],
+            [None, "authored-A:segment-1", "authored-A:segment-2"],
+        )
+        self.assertEqual(
+            plan["semantic_shots"][0]["reference_labels"],
+            ["<Subject 1>", "<Picture 1>"],
+        )
+        self.assertEqual(len(plan["dialogue_manifest"]), 1)
+        self.assertEqual(
+            plan["dialogue_manifest"][0]["authored_shot_id"],
+            "authored-A",
+        )
+        rebuilt = plan_h3_native_shots(
+            global_prompt=plan["global_prompt"],
+            source_prompts=[
+                contract["semantic_prompt"]
+                for contract in plan["semantic_shots"]
+            ],
+            source_indices=[shot["source_index"] for shot in plan["shots"]],
+            structured_shots=plan["semantic_shots"],
+            clip_frame_counts=plan["clip_frames"],
+            clip_requested_frames=plan["clip_published_frames"],
+            fps=24,
+        )
+        self.assertEqual(
+            rebuilt["dialogue_manifest"], plan["dialogue_manifest"],
+        )
+        self.assertEqual(
+            [shot["authored_shot_id"] for shot in rebuilt["shots"]],
+            ["authored-A", "authored-A", "authored-B"],
+        )
 
     def test_unbalanced_dialogue_fails_closed(self):
         for prompt in (

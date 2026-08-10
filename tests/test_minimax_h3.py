@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import contextlib
+import copy
 import importlib.util
 import json
 import os
@@ -9,6 +12,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +44,164 @@ _H3_DIALECT_GUIDE_PATH = _APP / "services" / "llm_guides" / "dialect" / "minimax
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+class _HTTPException(Exception):
+    def __init__(self, *, status_code: int, detail):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+class _AdmissionRequest:
+    def __init__(self, body: dict):
+        self._body = body
+        self.state = types.SimpleNamespace(maestro_remote=False)
+
+    async def json(self) -> dict:
+        return copy.deepcopy(self._body)
+
+
+def _load_launch_functions(names: set[str], namespace: dict) -> dict:
+    tree = ast.parse(_read(_LAUNCH_PATH), filename=str(_LAUNCH_PATH))
+    selected = []
+    for node in tree.body:
+        if not (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in names
+        ):
+            continue
+        node = copy.deepcopy(node)
+        node.decorator_list = []
+        selected.append(node)
+    module = ast.Module(body=selected, type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), str(_LAUNCH_PATH), "exec"),
+        namespace,
+    )
+    return namespace
+
+
+def _w4a8_admission_namespace():
+    """Load W4A8 admission paths without importing or invoking a model."""
+    forbidden_events: list[str] = []
+    failed_preparations: list[dict] = []
+    finished_jobs: list[tuple] = []
+    capability_probes: list[bool] = []
+    worker_admissions: list[str] = []
+
+    def forbidden(name: str):
+        def reject(*args, **kwargs):
+            forbidden_events.append(name)
+            raise AssertionError(f"{name} ran after W4A8 rejection")
+
+        return reject
+
+    acceleration = types.ModuleType("services.h3_acceleration")
+
+    def unavailable_status(*, probe_kernel: bool):
+        capability_probes.append(probe_kernel)
+        return {
+            "w4a8": {
+                "available": False,
+                "reason": "model-free test runtime",
+            },
+        }
+
+    acceleration.get_h3_acceleration_status = unavailable_status
+    namespace = {
+        "Request": _AdmissionRequest,
+        "_GenerationPreparationRequest": object,
+        "HTTPException": _HTTPException,
+        "copy": copy,
+        "hashlib": __import__("hashlib"),
+        "os": os,
+        "time": types.SimpleNamespace(time=lambda: 1.0),
+        "traceback": __import__("traceback"),
+        "torch": types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+        ),
+        "wgp": types.SimpleNamespace(get_model_def=lambda model_type: {}),
+        "_H3_LONG_STUDIO_MODELS": {
+            "minimax_h3", "minimax_h3_w4a8_fl2va",
+        },
+        "_H3_W4A8_FL2VA_MODEL": "minimax_h3_w4a8_fl2va",
+        "_H3_TURBO_BENCHMARK_REFERENCE_BYTES": 0,
+        "_H3_TURBO_BENCHMARK_REFERENCE_SHA256": "",
+        "_require_h3_native_boundary_experimental": lambda body: None,
+        "_validate_h3_sampling_steps": lambda body: None,
+        "_validate_h3_explicit_multiclip_request": lambda body: None,
+        "_prepare_h3_long_studio_request": lambda body: None,
+        "_validate_h3_lightx2v_recovery_identity": lambda body: None,
+        "_get_active_workspace": lambda: "default",
+        "_require_project_access": lambda request, workspace: "/tmp/project",
+        "_reject_client_h3_internal_state": lambda body: None,
+        "_reject_client_h3_turbo_validation_controls": lambda body: None,
+        "_authorize_generation_media_inputs": (
+            lambda request, body, workspace: None
+        ),
+        "_require_remote_visible_models": lambda request, models: None,
+        "_apply_h3_adaptive_checkpoint": lambda body: None,
+        "_normalize_video_prompt_type": lambda body: None,
+        "_normalize_image_prompt_type": lambda body: None,
+        "_jobs": {},
+        "is_cancel_requested": lambda job: False,
+        "update_preparation_job": lambda job, **updates: True,
+        "fail_preparation": (
+            lambda job, **updates: failed_preparations.append(dict(updates))
+        ),
+        "generation_slot": (
+            lambda lock, job, **kwargs: contextlib.nullcontext(True)
+        ),
+        "_gen_lock": object(),
+        "_active_gen_states": {"other-worker": {}},
+        "_stamp_requested_generation_residency": lambda job, **kwargs: None,
+        "try_start": lambda job, **kwargs: (
+            worker_admissions.append(str(job.get("id") or "")) or True
+        ),
+        "_queue_recovery_delivery_pending": lambda job: None,
+        "_require_h3_offload_plan_parity": lambda job: None,
+        "_require_job_model_recipe_terms": lambda job: None,
+        "_apply_per_job_coefficient": lambda job: None,
+        "finish_job": (
+            lambda *args, **kwargs: finished_jobs.append((args, kwargs))
+        ),
+        "_restore_base_coefficient": lambda: None,
+    }
+    for name in (
+        "_h3_estimate_context",
+        "_validate_h3_turbo_estimate_context",
+        "_require_h3_generation_terms",
+        "_h3_generation_requirements",
+        "write_sealed_request_manifest",
+        "complete_preparation",
+        "_start_generation_worker",
+        "_ensure_versioned_model_current",
+        "_ensure_h3_effective_models_current",
+        "register_abort_state",
+    ):
+        namespace[name] = forbidden(name)
+    _load_launch_functions(
+        {
+            "_trusted_h3_prepared_plan",
+            "_h3_effective_model_types",
+            "_require_h3_acceleration_available",
+            "_plan_generation_submission",
+            "preview_generation_plan",
+            "_run_generation_preparation",
+            "_run_generation",
+        },
+        namespace,
+    )
+    return (
+        namespace,
+        acceleration,
+        forbidden_events,
+        failed_preparations,
+        finished_jobs,
+        capability_probes,
+        worker_admissions,
+    )
 
 
 def _load_handler_class():
@@ -224,7 +386,10 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         store = _read(_STORE_PATH)
         default_block = store.split("const DEFAULT_ENABLED_MODELS = new Set([", 1)[1].split("])\n", 1)[0]
         self.assertIn("'minimax_h3'", default_block)
-        self.assertIn("const DEFAULTS_VERSION = 7", store)
+        defaults_version = int(
+            store.split("const DEFAULTS_VERSION = ", 1)[1].splitlines()[0]
+        )
+        self.assertGreaterEqual(defaults_version, 7)
         self.assertIn("6: ['minimax_h3']", store)
         self.assertIn("7: ['minimax_h3_ref2va']", store)
         self.assertIn('md.get("returns_audio", False)', _read(_LAUNCH_PATH))
@@ -341,12 +506,86 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         ]
         self.assertIn("'spectrum_experimental'", profile_ids)
 
-    def test_w4a8_is_capability_gated_in_selector_and_backend(self):
+    def test_w4a8_rejects_public_planning_before_work_and_worker_before_model(self):
         launch = _read(_LAUNCH_PATH)
         selector = _read(_MODEL_SELECTOR_PATH)
         advanced = _read(_ADVANCED_SETTINGS_PATH)
         self.assertIn("def _require_h3_acceleration_available", launch)
-        self.assertGreaterEqual(launch.count("_require_h3_acceleration_available("), 4)
+        self.assertEqual(launch.count("_require_h3_acceleration_available("), 3)
+        tree = ast.parse(launch, filename=str(_LAUNCH_PATH))
+        shared_planning_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_plan_generation_submission"
+        )
+        shared_planning = ast.get_source_segment(
+            launch, shared_planning_node,
+        )
+        self.assertIn("_require_h3_acceleration_available(body, plan)", shared_planning)
+        worker_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_run_generation"
+        )
+        worker = ast.get_source_segment(launch, worker_node)
+        self.assertIn("_require_h3_acceleration_available(\n                    raw_params", worker)
+
+        (
+            admission,
+            acceleration,
+            forbidden_events,
+            failed,
+            finished,
+            probes,
+            worker_admissions,
+        ) = _w4a8_admission_namespace()
+        rejected_body = {
+            "workspace": "default",
+            "model_type": "minimax_h3_w4a8_fl2va",
+            "prompt": "model-free admission probe",
+            "image_mode": 2,
+        }
+        with mock.patch.dict(
+            sys.modules,
+            {"services.h3_acceleration": acceleration},
+        ):
+            with self.assertRaises(_HTTPException) as preview_error:
+                asyncio.run(admission["preview_generation_plan"](
+                    _AdmissionRequest(rejected_body),
+                ))
+            self.assertEqual(worker_admissions, [])
+            preparation_job = {
+                "id": "w4a8-preparation",
+                "params": copy.deepcopy(rejected_body),
+                "workspace": "default",
+                "out_dir": "/tmp/project",
+            }
+            admission["_jobs"] = {"w4a8-preparation": preparation_job}
+            admission["_run_generation_preparation"](
+                "w4a8-preparation",
+                _AdmissionRequest({}),
+                enhance=False,
+            )
+            self.assertEqual(worker_admissions, [])
+            worker_job = {
+                "id": "w4a8-worker",
+                "params": copy.deepcopy(rejected_body),
+                "status": "queued",
+                "out_dir": "",
+            }
+            admission["_jobs"] = {"w4a8-worker": worker_job}
+            self.assertFalse(admission["_run_generation"]("w4a8-worker"))
+
+        self.assertEqual(preview_error.exception.status_code, 400)
+        self.assertIn("W4A8 FL2VA is unavailable", preview_error.exception.detail)
+        self.assertEqual(probes, [False, False, False])
+        self.assertEqual(worker_admissions, ["w4a8-worker"])
+        self.assertEqual(forbidden_events, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["phase"], "preparation_failed")
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0][0][1], "failed")
+        self.assertIn("W4A8 FL2VA is unavailable", finished[0][1]["error"])
         self.assertIn("w4a8Capability?.available !== true", selector)
         self.assertIn("disabled={w4a8Unavailable}", selector)
         self.assertIn("setH3Custom('h3_sol_dense_steps', 0)", advanced)

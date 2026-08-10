@@ -1,6 +1,7 @@
 """Model-free lifecycle integration tests for durable queue recovery."""
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 import tempfile
@@ -20,6 +21,7 @@ from services.queue_recovery_adapter import (
     serialize_global_state,
     serialize_job,
 )
+from services.h3_offload_plan import build_h3_offload_plan
 
 
 class QueueRecoveryIntegrationTests(unittest.TestCase):
@@ -73,6 +75,89 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             global_state=global_state,
         )
 
+    def test_server_job_incarnation_timestamp_round_trips_exactly(self):
+        job = self._job("discovered-job", created_at=4_321.25)
+        self._register(job)
+        restored = self.coordinator.restore().jobs[job["id"]]
+        self.assertEqual(restored["created_at"], 4_321.25)
+
+    def test_resource_intent_is_closed_and_legacy_active_jobs_restore_conservatively(self):
+        job = self._job(
+            "resource-job",
+            resource_intent="generation",
+            parent_job_id="parent-job",
+        )
+        self._register(job)
+        restored = self.coordinator.restore().jobs[job["id"]]
+        self.assertEqual(restored["resource_intent"], "generation")
+        self.assertEqual(restored["parent_job_id"], "parent-job")
+
+        with self.assertRaises(QueueRecoveryAdapterError):
+            serialize_job(
+                self._job("bad-resource", resource_intent="raw-device-key"),
+                owner_digest=self.owner,
+                project_digest=self.project,
+                request_manifest={"kind": "synthetic"},
+            )
+        with self.assertRaises(QueueRecoveryAdapterError):
+            serialize_job(
+                self._job("bad-parent", parent_job_id="../raw-parent"),
+                owner_digest=self.owner,
+                project_digest=self.project,
+                request_manifest={"kind": "synthetic"},
+            )
+
+        legacy = self._job("legacy-resource")
+        self._register(legacy)
+        recovered = QueueRecoveryCoordinator(self.journal).restore().jobs[
+            legacy["id"]
+        ]
+        self.assertEqual(recovered["resource_intent"], "generation")
+
+        cpu = self._job(
+            "cpu-resource",
+            resource_intent="text",
+            resource_execution="cpu",
+            preemption_mode="discard_restart",
+            resource_state="running",
+            execution_attempt=3,
+        )
+        self._register(cpu)
+        recovered_cpu = QueueRecoveryCoordinator(self.journal).restore().jobs[
+            cpu["id"]
+        ]
+        self.assertEqual(recovered_cpu["resource_intent"], "text")
+        self.assertEqual(recovered_cpu["resource_execution"], "standard")
+        self.assertEqual(recovered_cpu["preemption_mode"], "none")
+        self.assertEqual(recovered_cpu["resource_state"], "queued")
+        self.assertEqual(recovered_cpu["execution_attempt"], 3)
+
+    def test_blocked_resource_admission_survives_coordinator_restart(self):
+        job = self._job(
+            "blocked-resource",
+            kind="studio_project_asset_preparation",
+            resource_intent="generation",
+        )
+        self._register(job, global_state={
+            "paused": False,
+            "pause_after_current": False,
+            "manual_order_sequence": 0,
+            "queue_order": [job["id"]],
+        })
+        lifecycle.configure_durability_hook(
+            self.coordinator.prospective_transition,
+        )
+        self.assertTrue(lifecycle.block_resource_admission_failure(job))
+        restored = QueueRecoveryCoordinator(self.journal).restore().jobs[
+            job["id"]
+        ]
+        self.assertEqual(restored["status"], "queued")
+        self.assertTrue(restored["queue_held"])
+        self.assertEqual(restored["recovery_state"], "blocked_preparation")
+        self.assertEqual(restored["phase"], "resource_admission_failed")
+        self.assertEqual(restored["resource_intent"], "generation")
+        self.assertNotIn("session_id", restored)
+
     def test_positive_allowlist_preserves_authority_ui_and_unit_state_only(self):
         job = self._job(
             recovery_unit={"kind": "segment", "index": 2, "complete": True},
@@ -86,11 +171,27 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             clip_total=4,
             clip_progress=0.25,
             current_segment_model="hunyuan3d",
+            current_segment_boundary={
+                "type": "cut", "source": "explicit_cut",
+                "at_seconds": 5.0, "event": "AUTHORED_SENTINEL",
+            },
             h3_segment_plan={
                 "kind": "h3_segments",
                 "clip_count": 2,
                 "fps": 24,
                 "published_frames": 240,
+                "checkpoint_options": [{
+                    "model_type": "minimax_h3_ref2va",
+                    "name": "Ref2VA",
+                    "conditioning_mode": "semantic_references",
+                    "is_downloaded": False,
+                    "managed_download": True,
+                    "auto_download": True,
+                    "terms_required": True,
+                    "available": True,
+                    "unavailable_reason": "",
+                    "download_url": "must not persist",
+                }],
                 "segments": [{
                     "index": 1,
                     "frames": 124,
@@ -100,6 +201,11 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
                     "generated_duration_seconds": 124 / 24,
                     "published_duration_seconds": 116 / 24,
                     "model_type": "hunyuan3d",
+                    "boundary_from_previous": {
+                        "type": "transition",
+                        "source": "explicit_transition",
+                        "event": "AUTHORED_SENTINEL",
+                    },
                     "prompt_preview": "implicit prompt must be dropped",
                 }],
             },
@@ -127,10 +233,20 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             116 / 24,
         )
         self.assertEqual(snapshot["request_manifest"]["prompt"], "explicit synthetic manifest")
+        self.assertEqual(
+            recovered_plan["checkpoint_options"][0]["model_type"],
+            "minimax_h3_ref2va",
+        )
+        self.assertNotIn("download_url", recovered_plan["checkpoint_options"][0])
         self.assertNotIn("must not leak implicitly", rendered)
         self.assertNotIn("session_id", rendered)
         self.assertNotIn("out_dir", rendered)
         self.assertNotIn("prompt_preview", rendered)
+        self.assertNotIn("AUTHORED_SENTINEL", rendered)
+        self.assertEqual(
+            snapshot["current_segment_boundary"],
+            {"type": "cut", "source": "explicit_cut", "at_seconds": 5.0},
+        )
 
     def test_h3_recovery_geometry_rejects_nonfinite_or_boolean_numbers(self):
         base_plan = {
@@ -189,6 +305,41 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             request_manifest={"prompt": "synthetic"},
         )
         self.assertEqual(snapshot["output_files"], ["clips/safe.mp4"])
+
+    def test_h3_offload_plan_round_trips_exactly_and_tampering_fails_closed(self):
+        params = {
+            "model_type": "minimax_h3",
+            "resolution": "1344x768",
+            "video_length": 124,
+            "num_inference_steps": 20,
+            "override_profile": 4,
+            "prompt": "PRIVATE_OFFLOAD_SENTINEL",
+        }
+        plan = build_h3_offload_plan(params, effective_profile=5)
+        job = self._job(
+            model_type="minimax_h3",
+            h3_offload_plan=plan,
+        )
+        self._register(job)
+        restored = self.coordinator.restore().jobs[job["id"]]
+        self.assertEqual(restored["h3_offload_plan"], plan)
+        self.assertNotIn("PRIVATE_OFFLOAD_SENTINEL", repr(restored))
+
+        tampered = copy.deepcopy(plan)
+        tampered["profile"] = 5
+        with self.assertRaises(QueueRecoveryAdapterError):
+            serialize_job(
+                self._job(h3_offload_plan=tampered),
+                owner_digest=self.owner,
+                project_digest=self.project,
+                request_manifest={"schema": 1},
+            )
+
+    def test_legacy_recovery_job_without_offload_plan_remains_compatible(self):
+        job = self._job("legacy-h3", model_type="minimax_h3")
+        self._register(job)
+        restored = self.coordinator.restore().jobs[job["id"]]
+        self.assertNotIn("h3_offload_plan", restored)
 
     def test_hmac_owner_interface_never_persists_raw_principal(self):
         job = self._job()
@@ -422,6 +573,77 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
         self.assertTrue(restarted.jobs[job["id"]]["queue_held"])
         self.assertFalse(restarted.global_state["paused"])
         self.assertNotIn("_queue_enqueued_monotonic", repr(restarted.jobs))
+
+    def test_sealed_preparation_pointer_and_waiting_state_commit_together(self):
+        job = self._job(status="preparing", message="Enhancing prompt")
+        initial = {
+            "path": ".maestro-recovery/job-a.request.json",
+            "schema": 1, "sha256": "a" * 64, "size": 10,
+        }
+        prepared = {
+            "path": ".maestro-recovery/job-a.11111111111111111111111111111111.request.json",
+            "schema": 1, "sha256": "b" * 64, "size": 11,
+        }
+        self._register(job, manifest=initial)
+        lifecycle.configure_durability_hook(
+            self.coordinator.prospective_transition,
+        )
+        self.assertTrue(lifecycle.complete_preparation(
+            job,
+            request_manifest=prepared,
+            waiting_for_approval=True,
+            plan_review_deadline=time.time() + 16,
+            params={"prompt": "private enhanced prompt"},
+            phase="awaiting_plan_approval",
+            message="Review the generation plan",
+        ))
+
+        restored = QueueRecoveryCoordinator(
+            QueueRecoveryJournal(self.root / "queue.jsonl"),
+        ).restore().jobs[job["id"]]
+        self.assertEqual(restored["status"], "waiting_for_plan_approval")
+        self.assertTrue(restored["plan_review_required"])
+        self.assertGreater(restored["plan_review_deadline"], time.time())
+        self.assertEqual(restored["request_manifest"], prepared)
+        self.assertNotIn("private enhanced prompt", repr(restored))
+
+    def test_terms_unblock_deadline_is_durable_and_keeps_frozen_manifest(self):
+        job = self._job(status="preparing", message="Planning generation")
+        initial = {
+            "path": ".maestro-recovery/job-a.request.json",
+            "schema": 1, "sha256": "a" * 64, "size": 10,
+        }
+        prepared = {
+            "path": ".maestro-recovery/job-a.22222222222222222222222222222222.request.json",
+            "schema": 1, "sha256": "b" * 64, "size": 11,
+        }
+        self._register(job, manifest=initial)
+        lifecycle.configure_durability_hook(
+            self.coordinator.prospective_transition,
+        )
+        self.assertTrue(lifecycle.complete_preparation(
+            job,
+            request_manifest=prepared,
+            waiting_for_approval=True,
+            plan_review_terms_required=True,
+            phase="awaiting_plan_terms",
+            message="Approval required to accept Ref2VA terms",
+        ))
+        deadline = time.time() + 16
+        self.assertTrue(lifecycle.arm_prepared_job_plan_review(
+            job,
+            plan_review_deadline=deadline,
+            phase="awaiting_plan_approval",
+            message="Review the generation plan",
+        ))
+
+        restored = QueueRecoveryCoordinator(
+            QueueRecoveryJournal(self.root / "queue.jsonl"),
+        ).restore().jobs[job["id"]]
+        self.assertEqual(restored["status"], "waiting_for_plan_approval")
+        self.assertFalse(restored["plan_review_terms_required"])
+        self.assertEqual(restored["plan_review_deadline"], deadline)
+        self.assertEqual(restored["request_manifest"], prepared)
 
     def test_initial_registration_can_atomically_include_scheduler_order(self):
         job = self._job()

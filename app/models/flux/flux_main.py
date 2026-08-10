@@ -12,7 +12,7 @@ from transformers import SiglipVisionModel, SiglipImageProcessor
 import torchvision.transforms.functional as TVF
 import math
 from shared.utils.utils import convert_image_to_tensor, convert_tensor_to_image
-from shared.utils import files_locator as fl 
+from shared.utils import files_locator as fl
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLProcessor
 from .modules.autoencoder_flux2 import AutoencoderKLFlux2, AutoEncoderParamsFlux2
 from shared.qtypes import nunchaku_int4 as _nunchaku_int4
@@ -28,6 +28,26 @@ from .flux2_adapter import (
 from .modules.autoencoder_flux2 import AutoencoderKLFlux2
 
 from PIL import Image
+
+
+def _text_encoder_tokenizer_folder(model_def):
+    """Resolve tokenizer assets independently from variant encoder weights."""
+    return (
+        model_def.get("text_encoder_tokenizer_folder")
+        or model_def.get("text_encoder_folder")
+    )
+
+
+def _qwen3_encoder_asset_paths(model_def, locate_file):
+    """Resolve shared tokenizer/config assets for an isolated encoder recipe."""
+    folder = _text_encoder_tokenizer_folder(model_def)
+    tokenizer_config = locate_file(os.path.join(folder, "tokenizer_config.json"))
+    config_path = None
+    if model_def.get("text_encoder_tokenizer_folder"):
+        config_path = locate_file(os.path.join(folder, "config.json"))
+    return os.path.dirname(tokenizer_config), config_path
+
+
 def preprocess_ref(raw_image: Image.Image, long_size: int = 512):
     # 获取原始图像的宽度和高度
     image_w, image_h = raw_image.size
@@ -110,12 +130,18 @@ class model_factory:
             text_encoder_type = model_def.get("text_encoder_type", "mistral3")
             if text_encoder_type == "qwen3":
                 from .modules.text_encoder_qwen3 import Qwen3Embedder
-                text_encoder_folder = model_def.get("text_encoder_folder")
-                tokenizer_path = os.path.dirname(fl.locate_file(os.path.join(text_encoder_folder, "tokenizer_config.json")))
+                tokenizer_path, config_path = _qwen3_encoder_asset_paths(
+                    model_def,
+                    fl.locate_file,
+                )
+                encoder_kwargs = {}
+                if config_path is not None:
+                    encoder_kwargs["config_path"] = config_path
 
                 self.mistral = Qwen3Embedder(
                     model_spec=text_encoder_filename,
                     tokenizer_path=tokenizer_path,
+                    **encoder_kwargs,
                 )
             else:
                 from .modules.text_encoder_mistral import Mistral3SmallEmbedder

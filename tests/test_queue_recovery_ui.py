@@ -16,6 +16,13 @@ STORE = (ROOT / "ui/src/stores/useStore.ts").read_text(encoding="utf-8")
 MAIN = (ROOT / "ui/src/components/MainContent/MainContent.tsx").read_text(
     encoding="utf-8"
 )
+PLAN_DIALOG = (ROOT / "ui/src/components/H3GenerationPlanDialog.tsx").read_text(
+    encoding="utf-8"
+)
+RECOVERY_ADAPTER = (ROOT / "app/services/queue_recovery_adapter.py").read_text(
+    encoding="utf-8"
+)
+LAUNCH = (ROOT / "app/launch.py").read_text(encoding="utf-8")
 DIRECTOR_CHAT = (ROOT / "ui/src/components/Sidebar/DirectorChat.tsx").read_text(
     encoding="utf-8"
 )
@@ -30,6 +37,94 @@ def source_slice(source: str, start: str, end: str) -> str:
 
 
 class QueueRecoveryUiContracts(unittest.TestCase):
+    def test_preparation_and_plan_review_are_durable_per_job_actions(self):
+        generation = source_slice(STORE, "startGeneration: async", "stopGeneration: (jobId)")
+        review = source_slice(STORE, "openH3PlanReview: async", "startGeneration: async")
+        placeholder = source_slice(MAIN, "function JobPlaceholder", "function queueSummaryLabel")
+        self.assertIn("enhance_before_generate", generation)
+        self.assertNotIn("get().enhancePrompt()", generation)
+        self.assertNotIn("previewGenerationPlan(params)", generation)
+        self.assertIn("'preparing' | 'waiting_for_plan_approval'", CLIENT)
+        self.assertIn("plan_review_required?: boolean", CLIENT)
+        self.assertIn("plan_review_deadline?: number | null", CLIENT)
+        self.assertIn("plan_review_terms_required?: boolean", CLIENT)
+        self.assertIn("waiting_for_plan_approval", TYPES)
+        self.assertIn("Review plan", placeholder)
+        self.assertIn("Server auto-accepts its frozen plan", placeholder)
+        self.assertIn("Approval required to accept Ref2VA terms", placeholder)
+        self.assertIn("openH3PlanReview(job.id)", MAIN)
+        self.assertIn("api.approveGenerationPlan(jobId", review)
+        self.assertIn("workspace !== workspace", review)
+        self.assertIn("job.id === jobId", review)
+        self.assertIn("job.status === 'waiting_for_plan_approval'", STORE)
+        self.assertIn("planReviewDeadline", PLAN_DIALOG)
+        self.assertIn("Server auto-accepts this frozen plan", PLAN_DIALOG)
+        self.assertIn("Approval required to accept Ref2VA terms", PLAN_DIALOG)
+        self.assertIn("editorJobId === planJobId", PLAN_DIALOG)
+        self.assertIn("!plan || !editsReady", PLAN_DIALOG)
+        self.assertNotIn("if (seconds <= 0) submit()", PLAN_DIALOG)
+        self.assertNotIn("_h3PlanDecisionResolver", STORE)
+        self.assertIn("Approve & resume", PLAN_DIALOG)
+        self.assertIn("Cancel generation", PLAN_DIALOG)
+
+    def test_restarted_terms_blocked_plan_retains_authoritative_checkpoint_catalog(self):
+        self.assertIn('"checkpoint_options"', RECOVERY_ADAPTER)
+        self.assertIn(
+            "result[key] = _safe_h3_checkpoint_options(child)",
+            RECOVERY_ADAPTER,
+        )
+        self.assertIn("serverOptions !== undefined", PLAN_DIALOG)
+        self.assertNotIn("serverOptions?.length", PLAN_DIALOG)
+        self.assertIn("plan_review_terms_required?: boolean", CLIENT)
+        self.assertIn("Approval required to accept Ref2VA terms", PLAN_DIALOG)
+
+    def test_plan_review_hydration_records_ownership_before_await(self):
+        review = source_slice(STORE, "openH3PlanReview: async", "closeH3PlanReview: ()")
+        self.assertLess(
+            review.index("pendingH3PlanJobId: jobId"),
+            review.index("await api.fetchJobStatus(jobId)"),
+        )
+        self.assertLess(
+            review.index("pendingH3PlanWorkspace: workspace"),
+            review.index("await api.fetchJobStatus(jobId)"),
+        )
+        self.assertIn("get().pendingH3PlanJobId !== jobId", review)
+        self.assertIn("get().pendingH3PlanWorkspace !== workspace", review)
+        self.assertIn("current.createdAt !== initial.createdAt", review)
+        self.assertIn("status.created_at !== current.createdAt", review)
+        self.assertIn("get().closeH3PlanReview()", review)
+
+    def test_live_status_exposes_the_server_job_incarnation_timestamp(self):
+        status_route = source_slice(
+            LAUNCH,
+            '@api.get("/api/v1/status/{job_id}")',
+            '@api.post("/api/v1/cancel/{job_id}")',
+        )
+        timestamp_helper = source_slice(
+            LAUNCH,
+            "def _public_job_created_at",
+            '@api.get("/api/v1/status/{job_id}")',
+        )
+        active_jobs_route = source_slice(
+            LAUNCH,
+            '@api.get("/api/v1/jobs")',
+            "def _require_owned_job",
+        )
+        api_status = source_slice(
+            CLIENT,
+            "export interface ApiJobStatus",
+            "export interface QueueJobState",
+        )
+        mapper = source_slice(STORE, "function _jobStatusDetails", "function _mergeJobStatus")
+        self.assertIn('created_at = job.get("created_at")', timestamp_helper)
+        self.assertIn("math.isfinite(created_at)", timestamp_helper)
+        self.assertIn("created_at >= 0", timestamp_helper)
+        self.assertIn('"created_at": _public_job_created_at(j)', status_route)
+        self.assertIn('"created_at": _public_job_created_at(j)', active_jobs_route)
+        self.assertIn("created_at: number", api_status)
+        self.assertNotIn("created_at?: number", api_status)
+        self.assertIn("createdAt: status.created_at", mapper)
+
     def test_all_public_recovery_fields_map_through_api_and_job_state(self):
         fields = (
             "recovery_state",
@@ -79,7 +174,7 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         self.assertIn(".filter(j => !existingIds.has(j.job_id))", reconnect)
         # Existing cards merge against their prior state above; genuinely new
         # reconnect cards have no prior client state and map the server record.
-        self.assertIn("..._jobStatusDetails(j)", reconnect)
+        self.assertIn(".map(_newGenerationJobFromStatus)", reconnect)
         terminal_poll = source_slice(STORE, "_pollRecoveredJob: (jobId)", "reconnectJobs: async")
         self.assertIn("_recoveryJobPolls.get(jobId)", terminal_poll)
         self.assertIn("api.fetchJobStatus(jobId)", terminal_poll)
@@ -109,12 +204,24 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         self.assertIn("setUnlockTarget(workspace)", workspace)
         self.assertIn("const password = unlockPassword", workspace)
         self.assertIn("setUnlockPassword('')", workspace)
-        self.assertIn("await unlockWorkspace(unlockTarget, password)", workspace)
-        self.assertIn("await switchWorkspace(unlockTarget)", workspace)
+        self.assertIn("await unlockWorkspace(target, password, remember)", workspace)
+        self.assertIn("await switchWorkspace(target)", workspace)
         self.assertIn("await reconnectJobs()", workspace)
-        self.assertIn("await resumeJobRecovery(unlockRecoveryJobId)", workspace)
+        self.assertIn("await resumeJobRecovery(recoveryJobId)", workspace)
         self.assertIn("QUEUE_REFRESH_EVENT", workspace)
         self.assertNotIn("set({ unlockPassword", workspace)
+        self.assertLess(
+            workspace.index("await unlockWorkspace(target, password, remember)"),
+            workspace.index("await reconnectJobs()"),
+        )
+        self.assertLess(
+            workspace.index("await reconnectJobs()"),
+            workspace.index("await switchWorkspace(target)"),
+        )
+        self.assertLess(
+            workspace.index("await switchWorkspace(target)"),
+            workspace.index("await resumeJobRecovery(recoveryJobId)"),
+        )
 
     def test_generic_recovery_does_not_replace_delivery_oom_flow(self):
         placeholder = source_slice(MAIN, "function JobPlaceholder", "function queueSummaryLabel")
