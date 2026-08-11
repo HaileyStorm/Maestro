@@ -581,6 +581,15 @@ export interface GenerationJob {
   message: string
   outputFiles: string[]
   error: string | null
+  /** Allowlisted, privacy-safe failure envelope. Unknown backend keys are dropped. */
+  failureDetails?: {
+    code?: string | null
+    detail?: string | null
+  } | null
+  /** Terminal Reference-child correlation supplied on the owning parent. */
+  failedChildJobId?: string | null
+  failedChildStatus?: 'failed' | 'cancelled' | 'blocked' | null
+  failedChildReason?: string | null
   /** Present on failed generation or delivery jobs that ran out of VRAM. */
   oomInfo?: OomInfo | null
   promptPreview?: string

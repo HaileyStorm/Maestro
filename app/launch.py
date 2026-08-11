@@ -6745,6 +6745,24 @@ def _public_manual_installation_manifest(model_def):
     version_id = checkpoint.get("version_id")
     precision = checkpoint.get("precision")
     declared_urls = model_def.get("URLs")
+    # Civitai's authoritative PornMaster V4 artifact URL is queryless. Keep
+    # that exception bound to the complete registered artifact identity so a
+    # lookalike recipe cannot weaken the normal exact selector requirement.
+    pornmaster_queryless_download = bool(
+        checkpoint.get("artifact_kind") == "exact_family_tune"
+        and checkpoint.get("creator") == "iamddtla"
+        and model_id == 2382648
+        and version_id == 2973304
+        and checkpoint.get("file_id") is None
+        and filename == "pornmasterFlux2Klein_v4TurboFp8.safetensors"
+        and size_bytes == 9433104872
+        and isinstance(sha256, str)
+        and sha256.casefold()
+        == "e90eeb50140a10806341b7521c340214c6f76cec2f8f8dae7a443c5806072df7"
+        and precision == "fp8"
+        and download_url
+        == "https://civitai.com/api/download/models/2973304"
+    )
     if (
         checkpoint.get("provider") != "civitai"
         or not isinstance(filename, str)
@@ -6771,11 +6789,15 @@ def _public_manual_installation_manifest(model_def):
         or not safe_public_url(
             download_url,
             path=f"/api/download/models/{version_id}",
-            expected_query={
-                "type": "Diffusion Model",
-                "format": "SafeTensor",
-                "fp": precision,
-            },
+            expected_query=(
+                {}
+                if pornmaster_queryless_download
+                else {
+                    "type": "Diffusion Model",
+                    "format": "SafeTensor",
+                    "fp": precision,
+                }
+            ),
         )
         or not isinstance(declared_urls, list)
         or filename not in declared_urls
@@ -17227,6 +17249,81 @@ def _project_reference_wait_at_output_boundary(parent_job, boundary):
     ))
 
 
+def _project_reference_safe_failure_envelope(state):
+    """Copy only normalized, content-free child failure diagnostics."""
+    from services.oom_detect import (
+        normalize_failure_details,
+        oom_info_from_failure_details,
+    )
+
+    updates = {}
+    raw_details = state.get("failure_details")
+    if isinstance(raw_details, dict):
+        details = normalize_failure_details(raw_details)
+        updates.update({
+            "failure_details": details,
+            "error": details["detail"],
+            "message": details["detail"],
+        })
+
+    raw_oom = state.get("oom_info")
+    if isinstance(raw_oom, dict) and raw_oom.get("is_oom") is True:
+        oom_details = normalize_failure_details({
+            **raw_oom,
+            "is_oom": True,
+        })
+        coefficient = raw_oom.get("current_coefficient")
+        if (
+            type(coefficient) not in {int, float}
+            or not math.isfinite(coefficient)
+            or not 0.0 < coefficient <= 1.0
+        ):
+            coefficient = 0.80
+        safe_oom = oom_info_from_failure_details(
+            oom_details, float(coefficient),
+        )
+        if safe_oom is not None:
+            updates["oom_info"] = safe_oom
+    return updates
+
+
+def _project_reference_child_failure_updates(snapshot):
+    """Build one bounded parent stamp for a terminal non-completed child."""
+    child_id = _public_parent_job_id({
+        "parent_job_id": snapshot.get("id"),
+    })
+    raw_status = str(snapshot.get("status") or "")
+    blocked = bool(
+        snapshot.get("resource_state") == "blocked"
+        or str(snapshot.get("recovery_state") or "").startswith("blocked")
+    )
+    if raw_status == "cancelled":
+        child_status = "cancelled"
+    elif blocked or raw_status in {"queued", "running"}:
+        child_status = "blocked"
+    else:
+        child_status = "failed"
+
+    safe_failure = _project_reference_safe_failure_envelope(snapshot)
+    details = safe_failure.get("failure_details")
+    reason = (
+        details.get("code")
+        if isinstance(details, dict)
+        else {
+            "failed": "child_failed",
+            "cancelled": "child_cancelled",
+            "blocked": "child_blocked",
+        }[child_status]
+    )
+    updates = {
+        "failed_child_job_id": child_id,
+        "failed_child_status": child_status,
+        "failed_child_reason": reason,
+    }
+    updates.update(safe_failure)
+    return updates
+
+
 def _run_project_reference_image_job(
     parent_job, params, *, role, phase, step, total_steps,
     artifact_metadata=None,
@@ -17313,12 +17410,19 @@ def _run_project_reference_image_job(
             request_cancel(child, job_id=child_id, active_states=_active_gen_states)
     snapshot = snapshot_job(child)
     if snapshot.get("status") != "completed":
+        failure_updates = _project_reference_child_failure_updates(snapshot)
         update_job(
             parent_job,
             resource_intent="text",
             resource_execution="standard",
             resource_state="blocked",
-            message="Reference image child did not complete",
+            message=failure_updates.get(
+                "message", "Reference image child did not complete",
+            ),
+            **{
+                key: value for key, value in failure_updates.items()
+                if key != "message"
+            },
         )
         raise RuntimeError("reference_image_generation_failed")
     candidates = []
@@ -18770,19 +18874,33 @@ async def generate_project_asset_references(project: str, request: Request):
                 block_resource_admission_failure(parent_job)
                 return
             quality_failed = str(error) == _PROJECT_REFERENCE_QUALITY_FAILURE
+            child_failure = {}
+            if (
+                not quality_failed
+                and _public_parent_job_id({
+                    "parent_job_id": parent_job.get("failed_child_job_id"),
+                }) is not None
+            ):
+                child_failure = _project_reference_safe_failure_envelope(
+                    parent_job,
+                )
+            terminal_failure = {
+                "message": (
+                    "Reference-pack fidelity quality review failed"
+                    if quality_failed else "Reference-pack generation failed"
+                ),
+                "error": (
+                    "Reference-pack fidelity quality review failed"
+                    if quality_failed else "Reference-pack generation failed"
+                ),
+            }
+            terminal_failure.update(child_failure)
             finish_job(
                 parent_job,
                 "failed",
                 progress=0,
                 phase="",
-                message=(
-                    "Reference-pack fidelity quality review failed"
-                    if quality_failed else "Reference-pack generation failed"
-                ),
-                error=(
-                    "Reference-pack fidelity quality review failed"
-                    if quality_failed else "Reference-pack generation failed"
-                ),
+                **terminal_failure,
             )
         finally:
             for _candidate_index, result in staged_results:
@@ -47564,6 +47682,43 @@ def _public_parent_job_id(job: dict) -> str | None:
     return None
 
 
+def _public_failed_child_metadata(job: dict, request: Request) -> dict:
+    """Project one owner-fenced reverse child relation using closed tokens."""
+    empty = {
+        "failed_child_job_id": None,
+        "failed_child_status": None,
+        "failed_child_reason": None,
+    }
+    child_id = _public_parent_job_id({
+        "parent_job_id": job.get("failed_child_job_id"),
+    })
+    parent_id = _public_parent_job_id({
+        "parent_job_id": job.get("id"),
+    })
+    if child_id is None or parent_id is None:
+        return empty
+    child = _jobs.get(child_id)
+    if (
+        not _job_owned_by_request(child, request)
+        or _public_parent_job_id(child) != parent_id
+    ):
+        return empty
+    status = job.get("failed_child_status")
+    if status not in {"failed", "cancelled", "blocked"}:
+        return empty
+    reason = job.get("failed_child_reason")
+    if (
+        type(reason) is not str
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", reason) is None
+    ):
+        return empty
+    return {
+        "failed_child_job_id": child_id,
+        "failed_child_status": status,
+        "failed_child_reason": reason,
+    }
+
+
 def _queue_wait_reason_for_job(job: dict) -> str | None:
     """Explain a queue wait without revealing another session's job details."""
     generation_busy = _gen_lock.locked()
@@ -47721,6 +47876,15 @@ def get_status(job_id: str, request: Request, response: Response):
             else _queue_wait_reason_for_job(job)
         ),
         "parent_job_id": _public_parent_job_id(j),
+        **(
+            _public_failed_child_metadata(j, request)
+            if callable(globals().get("_public_failed_child_metadata"))
+            else {
+                "failed_child_job_id": None,
+                "failed_child_status": None,
+                "failed_child_reason": None,
+            }
+        ),
         **_public_resource_metadata(j),
         **_public_queue_residency_metadata(
             j, remote=bool(getattr(request.state, "maestro_remote", False)),
@@ -47868,6 +48032,15 @@ def list_jobs(request: Request, response: Response):
                     None if recovery_blocked else _queue_wait_reason_for_job(job)
                 ),
                 "parent_job_id": _public_parent_job_id(j),
+                **(
+                    _public_failed_child_metadata(j, request)
+                    if callable(globals().get("_public_failed_child_metadata"))
+                    else {
+                        "failed_child_job_id": None,
+                        "failed_child_status": None,
+                        "failed_child_reason": None,
+                    }
+                ),
                 **_public_resource_metadata(j),
                 **_public_queue_residency_metadata(
                     j,

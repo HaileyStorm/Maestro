@@ -106,7 +106,8 @@ Multiple isolated output directories with a quick switcher in the sidebar. Usefu
 - Remote visitors cannot change machine settings, start/stop services, browse storage/model folders, or import arbitrary Hugging Face/CivitAI URLs. Curated model weights may still download when their generation needs them.
 - After unlocking a project, remote visitors can browse and apply Maestro's bundled Recipes in Studio. Host-global user recipes are never listed remotely; saving, importing, deleting, and installing recipe LoRAs remain local host-owner actions.
 - Project passwords protect access through Maestro and its remote-sharing flow.
-- The Project References creation tool makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Studio semantic-reference workflows.
+- **Reference Studio** is a header-level peer to Studio and Director. It opens as a modal without changing the current sidebar destination; project name/description are first-class fields, and Queue closes the modal only after the queue submission and job reconnect are confirmed. Locked projects keep the action visible with an unlock diagnostic.
+- Reference Studio makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Studio semantic-reference workflows. The catalog includes explicit Moody Krea 2 quick-select cards when a recipe is enabled and present; disabled, missing, and manual-install states remain visible and are never auto-enabled or auto-selected.
 - Gallery selection supports bulk move, privacy, and deletion. Finals are shown by default; All, Components, Windows, and Temporary views expose intermediate artifacts when needed. Deleting a final can atomically include its linked parts.
 - Read-only single-output share links work for local owners and through the same Cloudflare URL, and are revoked when the output is moved, changed, deleted, or its project is removed.
 
@@ -121,7 +122,7 @@ held and resumed.
 
 ### 🧊 Blender scene guides
 
-The Tools area and Project References dialog include a structured Blender scene tool. It creates primitives/materials, animates the full requested frame range, inspects the scene, and samples multiple frames into protected project references. Pinokio installs a pinned portable Blender runtime plus the official Blender Lab MCP extension, then starts its localhost-only bridge with Maestro. Remote project users can invoke the same hosted tool through Maestro's project-scoped API; they never receive filesystem or machine-control access. Maestro never exposes the upstream arbitrary-Python surface.
+The Tools area and Reference Studio creation-method surface include a structured Blender scene tool. It creates primitives/materials, animates the full requested frame range, inspects the scene, and samples multiple frames into protected project references. Blender uses a separate reference name/privacy contract and does not add a durable asset type; Reference Studio's image-pack description remains on the authored pack. Pinokio installs a pinned portable Blender runtime plus the official Blender Lab MCP extension, then starts its localhost-only bridge with Maestro. Remote project users can invoke the same hosted tool through Maestro's project-scoped API; they never receive filesystem or machine-control access. Maestro never exposes the upstream arbitrary-Python surface.
 
 ### 🔒 Explicit guidance + experimental gate
 - **Explicit prompt guidance** is an opt-in authoring aid with a disclaimer step. It never hides models, LoRAs, recipes, prompts, or locally processed outputs, and it does not moderate local content.

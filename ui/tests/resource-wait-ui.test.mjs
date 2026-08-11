@@ -55,6 +55,7 @@ async function loadJobPlaceholder() {
         bundle.onResolve({ filter: /^(\.\/TabFilter|\.\/ThumbnailGallery|\.\/MediaFeedItem|\.\.\/LlmChat|\.\.\/H3DeliveryRecoveryStatus)$/ }, () => ({ path: 'components', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /api\/client$/ }, () => ({ path: 'api', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /lib\/(privatePreview|useVisibilityPolling)$/ }, () => ({ path: 'lib', namespace: 'resource-wait' }))
+        bundle.onResolve({ filter: /lib\/clipboard$/ }, () => ({ path: 'clipboard', namespace: 'resource-wait' }))
         bundle.onLoad({ filter: /.*/, namespace: 'resource-wait' }, args => {
           if (args.path === 'react') {
             return { contents: `
@@ -64,7 +65,13 @@ async function loadJobPlaceholder() {
               export const useLayoutEffect = () => {}
               export const useMemo = callback => callback()
               export const useRef = initial => ({ current: initial })
-              export const useState = initial => [typeof initial === 'function' ? initial() : initial, () => {}]
+              export const useState = initial => {
+                const fallback = typeof initial === 'function' ? initial() : initial
+                const value = globalThis.__resourceWaitStateOverrides?.length
+                  ? globalThis.__resourceWaitStateOverrides.shift()
+                  : fallback
+                return [value, update => globalThis.__resourceWaitStateUpdates?.push(update)]
+              }
             ` }
           }
           if (args.path === 'jsx-runtime') {
@@ -88,7 +95,7 @@ async function loadJobPlaceholder() {
           if (args.path === 'api') {
             return { contents: `
               const record = (name, ...args) => globalThis.__resourceWaitApiCalls?.push([name, ...args])
-              export const isBackendJobId = () => false
+              export const isBackendJobId = jobId => /^[0-9a-f]{8}$/i.test(jobId)
               export const fetchJobLog = async () => ({ events: [] })
               export const resumeQueue = async () => record('resumeQueue'), pauseQueueAfterOutput = async value => record('pauseQueueAfterOutput', value), setQueueOutputCount = async (id, value) => record('setQueueOutputCount', id, value), startQueueJobNext = async id => record('startQueueJobNext', id), setQueuePriority = async (id, value) => record('setQueuePriority', id, value), resumeQueueJob = async id => record('resumeQueueJob', id), holdQueueJob = async id => record('holdQueueJob', id)
             ` }
@@ -97,6 +104,14 @@ async function loadJobPlaceholder() {
             return { contents: `
               export const privatePreviewIdentity = () => '', privatePreviewWorkspaceHasRevealed = () => false, setPrivatePreviewsForWorkspaceRevealed = () => {}, subscribePrivatePreviewChanges = () => () => {}, boundedBackoffDelay = () => 0, useVisibilityPolling = () => {}
               export const POLL_INTERVAL_MS = {}
+            ` }
+          }
+          if (args.path === 'clipboard') {
+            return { contents: `
+              export const copyTextToClipboard = async value => {
+                globalThis.__resourceWaitCopiedText = value
+                return globalThis.__resourceWaitCopyResult !== false
+              }
             ` }
           }
           return { contents: 'export const useStore = selector => selector(globalThis.__resourceWaitStore)' }
@@ -305,6 +320,47 @@ test('status, jobs, and queue mappings preserve plan-terms wait and owner child 
   assert.equal(Object.hasOwn(legacyQueue, 'parentJobId'), false)
 })
 
+test('status mappings preserve terminal Reference child correlation and allowlist failure details', async () => {
+  const { _jobStatusDetails, _newGenerationJobFromStatus } = await loadStoreMappers()
+  const status = {
+    job_id: 'faceb00c',
+    status: 'failed',
+    progress: 0,
+    step: 0,
+    total_steps: 0,
+    phase: 'reference_generation',
+    message: 'Reference generation failed',
+    output_files: [],
+    error: 'Reference child failed',
+    failed_child_job_id: 'deadbeef',
+    failed_child_status: 'failed',
+    failed_child_reason: 'reference_child_failed',
+    failure_details: {
+      code: 'reference_image_generation_failed',
+      detail: 'The image worker stopped before publishing an output.',
+      traceback: '/private/path/worker.py:17',
+      nested: { raw: 'must not cross the UI mapping boundary' },
+    },
+  }
+
+  const details = _jobStatusDetails(status)
+  assert.equal(details.failedChildJobId, 'deadbeef')
+  assert.equal(details.failedChildStatus, 'failed')
+  assert.equal(details.failedChildReason, 'reference_child_failed')
+  assert.deepEqual(details.failureDetails, {
+    code: 'reference_image_generation_failed',
+    detail: 'The image worker stopped before publishing an output.',
+  })
+
+  const reconnected = _newGenerationJobFromStatus(status)
+  assert.equal(reconnected.failedChildJobId, 'deadbeef')
+  assert.deepEqual(reconnected.failureDetails, details.failureDetails)
+
+  const legacy = _jobStatusDetails({ status: 'failed' })
+  assert.equal(Object.hasOwn(legacy, 'failedChildJobId'), false)
+  assert.equal(Object.hasOwn(legacy, 'failureDetails'), false)
+})
+
 test('resource-wait job card renders durable queued copy without execution warnings', async t => {
   const previousStore = globalThis.__resourceWaitStore
   globalThis.__resourceWaitStore = {
@@ -341,6 +397,106 @@ test('resource-wait job card renders durable queued copy without execution warni
   const renderedText = elementText(tree)
   assert.match(renderedText, /GPU generation queued/)
   assert.doesNotMatch(renderedText, /CPU|restart|fairness|residen|preempt/i)
+})
+
+test('backend job cards expose a compact accessible copy control for the Job ID', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  const previousCopiedText = globalThis.__resourceWaitCopiedText
+  const previousStateUpdates = globalThis.__resourceWaitStateUpdates
+  const previousStateOverrides = globalThis.__resourceWaitStateOverrides
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  globalThis.__resourceWaitStateUpdates = []
+  t.after(() => {
+    globalThis.__resourceWaitStore = previousStore
+    globalThis.__resourceWaitCopiedText = previousCopiedText
+    globalThis.__resourceWaitStateUpdates = previousStateUpdates
+    globalThis.__resourceWaitStateOverrides = previousStateOverrides
+  })
+
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const tree = JobPlaceholder({
+    job: {
+      id: 'faceb00c',
+      status: 'queued',
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: '',
+      message: 'Queued',
+      outputFiles: [],
+      error: null,
+    },
+    onStop() {},
+    onDismiss() {},
+  })
+  const elements = flattenElements(tree)
+  const copyable = elements.find(element => element.type?.name === 'CopyableJobId')
+  assert.ok(copyable)
+  const copyTree = copyable.type(copyable.props)
+  const copyElements = flattenElements(copyTree)
+  const copy = copyElements.find(element => element.props?.['aria-label'] === 'Copy job id faceb00c')
+  assert.ok(copy)
+  assert.match(elementText(copy), /Job IDfaceb00cCopy/)
+  assert.ok(copyElements.find(element => element.props?.role === 'status' && element.props?.['aria-live'] === 'polite'))
+
+  copy.props.onClick()
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.equal(globalThis.__resourceWaitCopiedText, 'faceb00c')
+  assert.deepEqual(globalThis.__resourceWaitStateUpdates, ['copied'])
+
+  globalThis.__resourceWaitStateOverrides = ['copied']
+  const copiedTree = copyable.type(copyable.props)
+  assert.match(elementText(copiedTree), /Job IDfaceb00cCopied/)
+  assert.match(elementText(copiedTree), /Job ID faceb00c copied/)
+})
+
+test('Reference parent failure renders only allowlisted child diagnostics', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const tree = JobPlaceholder({
+    job: {
+      id: 'faceb00c',
+      status: 'failed',
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: 'reference_generation',
+      message: 'Reference generation failed',
+      outputFiles: [],
+      error: 'Reference child failed',
+      failedChildJobId: 'deadbeef',
+      failedChildStatus: 'failed',
+      failedChildReason: 'reference_child_failed',
+      failureDetails: {
+        code: 'reference_image_generation_failed',
+        detail: 'The image worker stopped before publishing an output.',
+        traceback: '/private/path/worker.py:17',
+      },
+    },
+    onStop() {},
+    onDismiss() {},
+  })
+  const text = elementText(tree)
+  assert.match(text, /Reference Generation Failed/)
+  const childId = flattenElements(tree).find(element => (
+    element.type?.name === 'CopyableJobId' && element.props?.jobId === 'deadbeef'
+  ))
+  assert.equal(childId?.props.label, 'Child job ID')
+  assert.match(text, /Child status: failed/)
+  assert.match(text, /Reason: reference_child_failed/)
+  assert.match(text, /Code: reference_image_generation_failed/)
+  assert.match(text, /Detail: The image worker stopped before publishing an output\./)
+  assert.doesNotMatch(text, /private\/path|traceback|nested|raw/)
 })
 
 test('preemptible CPU-only owner card is visibly slower and keeps an unknown ETA unknown', async t => {
@@ -880,6 +1036,31 @@ test('Reference parent projects only an ordinary live child and scheduler contro
       `${label} child must retain its own actionable card`,
     )
   }
+
+  const correlatedFailedParent = makeJob(parent.id, undefined, {
+    status: 'failed',
+    failedChildJobId: child.id,
+    failedChildStatus: 'failed',
+    failedChildReason: 'reference_child_failed',
+  })
+  const failedChild = makeJob(child.id, parent.id, { status: 'failed' })
+  const correlatedCards = renderCards(
+    [correlatedFailedParent, failedChild],
+    [parentQueue, childQueue],
+  )
+  assert.equal(correlatedCards.length, 1, 'correlated terminal child should not create a duplicate failed card')
+  assert.equal(correlatedCards[0].props.job.id, parent.id)
+
+  const actionableFailedChild = makeJob(child.id, parent.id, {
+    status: 'failed',
+    recoveryActionable: true,
+    recoveryActions: ['retry'],
+  })
+  assert.equal(
+    renderCards([correlatedFailedParent, actionableFailedChild], [parentQueue, childQueue]).length,
+    2,
+    'an actionable terminal child must retain its own card',
+  )
 
   const orphanVisible = renderCards([child], [childQueue])
   assert.equal(orphanVisible.length, 1)

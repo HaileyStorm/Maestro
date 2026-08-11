@@ -193,6 +193,10 @@ export interface ApiJobStatus extends QueueRecoveryMetadata {
   error: string | null
   error_code?: string | null
   failure_details?: Record<string, unknown> | null
+  /** Bounded, owner-safe correlation for a terminal Reference child. */
+  failed_child_job_id?: string | null
+  failed_child_status?: 'failed' | 'cancelled' | 'blocked' | null
+  failed_child_reason?: string | null
   /** Present only on failed jobs that look like CUDA OOMs.
    *  See `OomInfo` in types/index.ts. */
   oom_info?: import('../types').OomInfo | null

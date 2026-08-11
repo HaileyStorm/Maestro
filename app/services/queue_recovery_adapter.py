@@ -27,12 +27,17 @@ from services.h3_offload_plan import (
     H3OffloadPlanError,
     validate_h3_offload_plan,
 )
+from services.oom_detect import (
+    normalize_failure_details,
+    oom_info_from_failure_details,
+)
 
 
 _OWNER_PREFIX = "owner:v1:"
 _PROJECT_PREFIX = "project:v1:"
 _DIGEST_RE = re.compile(r"^(?:owner|project):v1:[0-9a-f]{64}$")
 _MARKER_RE = re.compile(r"^[0-9a-f]{32}$")
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 # Runtime dictionaries contain prompts, filesystem roots, request objects,
 # tensors, callbacks, credentials, and engine internals.  Only these fields
@@ -58,6 +63,8 @@ _JOB_FIELDS = frozenset({
     "plan_review_terms_required",
     "resource_intent", "resource_execution", "preemption_mode",
     "resource_state", "execution_attempt", "parent_job_id",
+    "failure_details", "oom_info", "failed_child_job_id", "failed_child_status",
+    "failed_child_reason",
     "queue_residency_bypass_count", "queue_residency_bypassed_waiters",
     "residency_base_key", "residency_affinity_key", "_queue_manual_order",
     "recovery_attempt", "recovery_state", "reruns_denoise",
@@ -85,6 +92,7 @@ _RESOURCE_STATES = frozenset({
     "resources_releasing", "restarting_on_accelerator", "blocked",
     "released",
 })
+_FAILED_CHILD_STATUSES = frozenset({"failed", "cancelled", "blocked"})
 _MAX_EXECUTION_ATTEMPT = 1_000_000
 
 
@@ -543,6 +551,11 @@ def serialize_job(
         if key not in job or key == "id":
             continue
         value = job[key]
+        if key in {
+            "failure_details", "oom_info", "failed_child_job_id",
+            "failed_child_status", "failed_child_reason",
+        } and value is None:
+            continue
         if key in {"output_files", "artifact_files"}:
             result[key] = [
                 safe for safe in (_safe_filename(item) for item in (value or []))
@@ -620,6 +633,34 @@ def serialize_job(
                     "job.parent_job_id is invalid."
                 )
             result[key] = value
+        elif key == "failure_details":
+            if not isinstance(value, Mapping):
+                raise QueueRecoveryAdapterError(
+                    "job.failure_details is invalid."
+                )
+            result[key] = normalize_failure_details(value)
+        elif key == "oom_info":
+            # Reconstructed below only after the canonical failure envelope is
+            # available; raw OOM strings and unknown fields never cross.
+            continue
+        elif key == "failed_child_job_id":
+            if not _valid_job_id(value) or value == job_id:
+                raise QueueRecoveryAdapterError(
+                    "job.failed_child_job_id is invalid."
+                )
+            result[key] = value
+        elif key == "failed_child_status":
+            if value not in _FAILED_CHILD_STATUSES:
+                raise QueueRecoveryAdapterError(
+                    "job.failed_child_status is invalid."
+                )
+            result[key] = value
+        elif key == "failed_child_reason":
+            if type(value) is not str or _SAFE_TOKEN_RE.fullmatch(value) is None:
+                raise QueueRecoveryAdapterError(
+                    "job.failed_child_reason is invalid."
+                )
+            result[key] = value
         elif key == "current_segment_boundary":
             result[key] = _safe_h3_boundary(value)
         elif key in _PATH_REDACTABLE_JOB_FIELDS:
@@ -633,6 +674,48 @@ def serialize_job(
                 result[key] = _redact_runtime_paths(value, path=f"job.{key}")
         else:
             result[key] = _safe_json(value, path=f"job.{key}")
+    child_fields = {
+        "failed_child_job_id", "failed_child_status", "failed_child_reason",
+    }
+    present_child_fields = child_fields.intersection(result)
+    if present_child_fields and (
+        present_child_fields != child_fields or result.get("status") != "failed"
+    ):
+        raise QueueRecoveryAdapterError(
+            "job failed-child relation is incomplete."
+        )
+    if (
+        present_child_fields == child_fields
+        and "oom_info" in job
+        and job.get("oom_info") is not None
+    ):
+        raw_oom = job["oom_info"]
+        details = result.get("failure_details")
+        if (
+            not isinstance(raw_oom, Mapping)
+            or raw_oom.get("is_oom") is not True
+            or not isinstance(details, Mapping)
+            or details.get("is_oom") is not True
+        ):
+            raise QueueRecoveryAdapterError("job.oom_info is invalid.")
+        coefficient = raw_oom.get("current_coefficient")
+        if (
+            type(coefficient) not in {int, float}
+            or not math.isfinite(coefficient)
+            or not 0.0 < coefficient <= 1.0
+        ):
+            raise QueueRecoveryAdapterError("job.oom_info is invalid.")
+        oom_details = normalize_failure_details({
+            **details,
+            "allocator": raw_oom.get("allocator", details.get("allocator")),
+            "is_oom": True,
+        })
+        safe_oom = oom_info_from_failure_details(
+            oom_details, float(coefficient),
+        )
+        if safe_oom is None:
+            raise QueueRecoveryAdapterError("job.oom_info is invalid.")
+        result["oom_info"] = safe_oom
     return result
 
 

@@ -46,9 +46,11 @@ from services.queue_recovery_runtime import (
     write_sealed_request_manifest,
 )
 from services.queue_recovery_adapter import (
+    QueueRecoveryCoordinator,
     owner_principal_digest,
     project_instance_digest,
 )
+from services.queue_recovery import QueueRecoveryJournal
 from services.h3_benchmark import H3AllocationLedger
 from services.h3_offload_plan import (
     H3OffloadPlanError,
@@ -3671,6 +3673,171 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(
             list_response.headers["Cache-Control"], "private, no-store",
         )
+
+    def test_reference_terminal_journal_restore_projects_child_oom_correlation(self):
+        secret = b"reference-journal-projection-secret"
+        owner = "owner-session"
+        owner_digest = owner_principal_digest(secret, owner)
+        project_digest = project_instance_digest(secret, "a" * 32)
+        private_error = "/private/reference/prompt-and-traceback"
+        child = {
+            "id": "reference-child",
+            "status": "failed",
+            "workspace": "project",
+            "model_type": "flux2_klein_9b",
+            "generation_mode": "image",
+            "created_at": 101.0,
+            "progress": 0,
+            "message": "Generation failed.",
+            "output_files": [],
+            "parent_job_id": "reference-parent",
+        }
+        parent = {
+            "id": "reference-parent",
+            "status": "failed",
+            "workspace": "project",
+            "model_type": "flux2_klein_9b",
+            "generation_mode": "image",
+            "created_at": 100.0,
+            "progress": 0,
+            "message": "Generation failed.",
+            "output_files": [],
+            "failed_child_job_id": child["id"],
+            "failed_child_status": "failed",
+            "failed_child_reason": "cuda_oom",
+            "failure_details": {
+                "code": "cuda_oom",
+                "stage": "denoise",
+                "detail": private_error,
+                "exception_type": "OutOfMemoryError",
+                "is_oom": True,
+                "allocator": {"device_type": "cuda", "free_bytes": 12},
+            },
+            "oom_info": {
+                "is_oom": True,
+                "stage": "denoise",
+                "current_coefficient": 0.8,
+                "suggested_coefficient": 0.7,
+                "message": private_error,
+                "traceback": private_error,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = QueueRecoveryJournal(Path(temporary) / "queue.jsonl")
+            coordinator = QueueRecoveryCoordinator(journal)
+            for job in (parent, child):
+                coordinator.register_job(
+                    job,
+                    owner_digest=owner_digest,
+                    project_digest=project_digest,
+                    request_manifest={"kind": "synthetic"},
+                )
+            restored = QueueRecoveryCoordinator(journal).restore().jobs
+
+            materializer = _isolated_functions(
+                self.launch,
+                ("_queue_recovery_materialize_job",),
+                {
+                    "hmac": hmac,
+                    "math": __import__("math"),
+                    "time": time,
+                    "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                    "load_request_manifest": lambda *_args, **_kwargs: {
+                        "params": {}, "inputs": [],
+                    },
+                    "validate_manifest_inputs": lambda *_args: None,
+                    "_queue_recovery_manifest_validator": (
+                        lambda *_args, **_kwargs: True
+                    ),
+                    "_require_h3_offload_plan_parity": lambda _job: None,
+                    "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                    "_h3_incomplete_recovery_prefix": lambda _job: None,
+                },
+            )["_queue_recovery_materialize_job"]
+            jobs = {
+                job_id: materializer(
+                    snapshot,
+                    {"project": ("/safe/project", project_digest)},
+                )[0]
+                for job_id, snapshot in restored.items()
+            }
+
+            fake_api = types.SimpleNamespace(
+                get=lambda *_args, **_kwargs: lambda function: function,
+            )
+            namespace = _isolated_functions(
+                self.launch,
+                (
+                    "_job_owned_by_request", "_public_parent_job_id",
+                    "_public_failed_child_metadata", "_public_job_prompt_fields",
+                    "_public_job_created_at", "get_status", "list_jobs",
+                ),
+                {
+                    "api": fake_api,
+                    "Request": object,
+                    "Response": object,
+                    "HTTPException": Exception,
+                    "_jobs": jobs,
+                    "hmac": hmac,
+                    "math": __import__("math"),
+                    "re": re,
+                    "owner_principal_digest": owner_principal_digest,
+                    "_session_secret": lambda: secret,
+                    "_recovered_job_remote_project_accessible": (
+                        lambda *_args: True
+                    ),
+                    "snapshot_job": lambda value: dict(value),
+                    "_set_recovery_no_store": lambda response: None,
+                    "_queue_recovery_is_blocked": lambda _job: False,
+                    "_job_eta_values": lambda _job: (None, None),
+                    "queue_position": lambda _job: None,
+                    "_queue_wait_reason_for_job": lambda _job: None,
+                    "_public_h3_boundary": lambda _value: None,
+                    "public_h3_offload_plan": lambda _value: None,
+                    "_public_resource_metadata": lambda _job: {},
+                    "_public_queue_residency_metadata": (
+                        lambda *_args, **_kwargs: {}
+                    ),
+                    "_public_progress_telemetry": lambda _job: {},
+                    "job_events": lambda *_args: [],
+                    "queue_control_state": lambda: {},
+                    "_public_queue_recovery_metadata": lambda _job: {},
+                },
+            )
+            request = types.SimpleNamespace(state=types.SimpleNamespace(
+                maestro_session_id=owner,
+                maestro_remote=False,
+            ))
+            status = namespace["get_status"](
+                parent["id"], request, types.SimpleNamespace(headers={}),
+            )
+            listed = namespace["list_jobs"](
+                request, types.SimpleNamespace(headers={}),
+            )
+
+        relation = {
+            "failed_child_job_id": child["id"],
+            "failed_child_status": "failed",
+            "failed_child_reason": "cuda_oom",
+        }
+        self.assertEqual({key: status[key] for key in relation}, relation)
+        self.assertEqual(status["failure_details"]["code"], "cuda_oom")
+        self.assertEqual(
+            status["oom_info"]["message"],
+            "The operation ran out of GPU memory.",
+        )
+        parent_row = next(
+            row for row in listed["jobs"] if row["job_id"] == parent["id"]
+        )
+        child_row = next(
+            row for row in listed["jobs"] if row["job_id"] == child["id"]
+        )
+        self.assertEqual(
+            {key: parent_row[key] for key in relation}, relation,
+        )
+        self.assertEqual(child_row["parent_job_id"], parent["id"])
+        self.assertNotIn(private_error, repr(status))
+        self.assertNotIn(private_error, repr(listed))
 
     def test_wgp_completed_repeat_offset_skips_only_outer_dispatch(self):
         generate = _function(self.wgp, "generate_video")

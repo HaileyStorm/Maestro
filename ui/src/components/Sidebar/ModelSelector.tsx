@@ -3,6 +3,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useStore, getFamiliesForMode, getModelsForFamily } from '../../stores/useStore'
 import { fetchH3AccelerationStatus, verifyManualCheckpoint } from '../../api/client'
 import { InfoTooltip } from './InfoTooltip'
+import { formatManualInstallationBytes, manualInstallationDestination } from '../../lib/manualInstallation'
 
 export function ModelSelector() {
   const models = useStore(s => s.models)
@@ -179,11 +180,29 @@ export function ModelSelector() {
       )}
       {currentModel?.downloadable === false && (
         <div role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
+          {currentModel.manual_installation && (
+            <dl className="mb-1.5 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5">
+              <dt className="text-amber-200">Filename</dt>
+              <dd className="break-all font-mono select-all">{currentModel.manual_installation.filename}</dd>
+              <dt className="text-amber-200">Place in</dt>
+              <dd className="break-all font-mono select-all">{manualInstallationDestination(currentModel.manual_installation)}</dd>
+              <dt className="text-amber-200">Size</dt>
+              <dd>{formatManualInstallationBytes(currentModel.manual_installation.size_bytes)}</dd>
+              <dt className="text-amber-200">SHA-256</dt>
+              <dd className="break-all font-mono select-all">{currentModel.manual_installation.sha256}</dd>
+            </dl>
+          )}
+          {currentModel.manual_installation && (
+            <div className="mb-1 flex flex-wrap gap-x-2 gap-y-0.5">
+              <a href={currentModel.manual_installation.source_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Open source page</a>
+              <a href={currentModel.manual_installation.download_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Open exact manual download</a>
+            </div>
+          )}
           {currentModel.manual_checkpoint_verified ? (
             <p>Exact local checkpoint verified for this host. Routine catalog polling does not re-hash it.</p>
           ) : (
             <>
-              <p>Manual install required. Place the exact published checkpoint in a linked or local model folder, then verify its byte size and SHA-256. Maestro will not download this checkpoint.</p>
+              <p>Manual install required. Place the exact published checkpoint in the destination above, then verify its byte size and SHA-256 locally on the host. Maestro will not download this checkpoint.</p>
               {manualVerificationPending && machineControls && (
                 <button
                   type="button"
@@ -196,7 +215,7 @@ export function ModelSelector() {
                 </button>
               )}
               {manualVerificationPending && !machineControls && (
-                <p className="mt-1 text-amber-200">Verify this host-global checkpoint from Maestro on the local machine.</p>
+                <p className="mt-1 text-amber-200">Local-only verification: open Maestro on the host machine and choose Verify local checkpoint.</p>
               )}
               {!currentModel.manual_checkpoint_verification_required && (
                 <p className="mt-1 text-red-300">No supported exact verification contract is available for this recipe.</p>

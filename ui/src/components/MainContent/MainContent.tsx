@@ -15,6 +15,7 @@ import {
   subscribePrivatePreviewChanges,
 } from '../../lib/privatePreview'
 import { boundedBackoffDelay, POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
+import { copyTextToClipboard } from '../../lib/clipboard'
 
 const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
@@ -26,6 +27,38 @@ type ResourcePresentation = {
   title: string
   warning?: string
   tone: 'accelerated' | 'cpu' | 'transition' | 'neutral'
+}
+
+function CopyableJobId({ jobId, label = 'Job ID' }: { jobId: string; label?: string }) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const copy = async () => {
+    const copied = await copyTextToClipboard(jobId)
+    setCopyState(copied ? 'copied' : 'failed')
+  }
+  const feedback = copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'
+
+  return (
+    <span className="inline-flex flex-col items-center">
+      <button
+        type="button"
+        onClick={() => void copy()}
+        aria-label={`Copy ${label.toLowerCase()} ${jobId}`}
+        title={copyState === 'copied' ? `${label} copied` : copyState === 'failed' ? `Could not copy ${label.toLowerCase()}` : `Copy ${label.toLowerCase()}`}
+        className="inline-flex max-w-full items-center gap-1 rounded border border-border bg-bg-secondary/70 px-1.5 py-0.5 text-[9px] text-text-muted hover:bg-bg-hover hover:text-text-primary"
+      >
+        <span>{label}</span>
+        <code className="truncate font-mono text-text-secondary">{jobId}</code>
+        <span className={copyState === 'failed' ? 'text-red-300' : copyState === 'copied' ? 'text-accent-green' : ''}>{feedback}</span>
+      </button>
+      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {copyState === 'copied'
+          ? `${label} ${jobId} copied`
+          : copyState === 'failed'
+            ? `${label} ${jobId} could not be copied`
+            : ''}
+      </span>
+    </span>
+  )
 }
 
 function describeResourceExecution(
@@ -963,6 +996,10 @@ function JobPlaceholder({
   const hasLocalEvents = (job.logEvents?.length || 0) > 0
   const canOpenLog = (!job.oomInfo || machineControls) && (hasLocalEvents || api.isBackendJobId(job.id))
   const errorText = job.error || job.message || (job.status === 'cancelled' ? 'Cancelled' : 'Generation failed')
+  const failedChildJobId = job.status === 'failed' ? job.failedChildJobId : null
+  const hasFailedChild = !!failedChildJobId
+  const failedChildDetail = job.failureDetails?.detail || null
+  const failedChildCode = job.failureDetails?.code || null
   const resourcePresentation = describeResourceExecution(job.resourceDescriptor)
   const resourceWaitTitle = job.queueWaitReason === 'resource_wait' ? RESOURCE_WAIT_TITLE : undefined
   const queueWaitLabel = job.status !== 'running' && !isFailed && !recoveryBlocked ? ({
@@ -1007,6 +1044,8 @@ function JobPlaceholder({
               {isFailed
                 ? (job.status === 'cancelled'
                     ? 'Cancelled'
+                    : hasFailedChild
+                      ? 'Reference Generation Failed'
                     : isDeliveryOom
                       ? isDeliveryRecoveryChild
                         ? 'Delivery Retry Failed'
@@ -1028,6 +1067,11 @@ function JobPlaceholder({
                             ? 'Plan ready for review'
                             : job.status === 'queued' ? 'Queued...' : 'Generating...'}
             </p>
+            {api.isBackendJobId(job.id) && (
+              <div className="mt-1.5 flex justify-center">
+                <CopyableJobId jobId={job.id} />
+              </div>
+            )}
             {!isFailed && (queueWaitLabel || phase) && (
               <p className="text-xs mt-1 truncate" title={resourceWaitTitle}>{queueWaitLabel || phase}</p>
             )}
@@ -1211,6 +1255,25 @@ function JobPlaceholder({
                       ? 'Generation failed. Open technical details or event history for more information.'
                       : 'Generation failed before a server job was created. The technical details below contain the available error.'}
                 </p>
+                {failedChildJobId && (
+                  <div className="mt-2 space-y-1 rounded border border-red-500/25 bg-red-500/10 px-2.5 py-2 text-[10px] text-text-secondary" data-reference-child-failure>
+                    <div className="flex justify-center">
+                      <CopyableJobId jobId={failedChildJobId} label="Child job ID" />
+                    </div>
+                    {job.failedChildStatus && (
+                      <p><span className="text-text-muted">Child status:</span> {job.failedChildStatus}</p>
+                    )}
+                    {job.failedChildReason && (
+                      <p><span className="text-text-muted">Reason:</span> <code className="font-mono">{job.failedChildReason}</code></p>
+                    )}
+                    {failedChildCode && (
+                      <p><span className="text-text-muted">Code:</span> <code className="font-mono">{failedChildCode}</code></p>
+                    )}
+                    {failedChildDetail && (
+                      <p className="whitespace-pre-wrap break-words"><span className="text-text-muted">Detail:</span> {failedChildDetail}</p>
+                    )}
+                  </div>
+                )}
                 {isDeliveryOom && !isDeliveryRecoveryChild && job.workspace && api.isBackendJobId(job.id) && (
                   <div className="mt-2">
                     <H3DeliveryRecoveryStatus
@@ -1365,7 +1428,18 @@ function QueuePanel({
     const projectedChildIds = new Set(
       [...projectedChildByParent.values()].map(child => child.id),
     )
-    return jobs.filter(job => !projectedChildIds.has(job.id))
+    const correlatedFailedChildIds = new Set<string>()
+    const jobsById = new Map(jobs.map(job => [job.id, job]))
+    for (const parent of jobs) {
+      if (parent.status !== 'failed' || !parent.failedChildJobId) continue
+      const child = jobsById.get(parent.failedChildJobId)
+      if (!child || child.parentJobId !== parent.id) continue
+      if (child.status !== 'failed' && child.status !== 'cancelled') continue
+      if (child.recoveryActionable || child.recoveryBlocked || child.recoveryInterrupted
+        || (child.recoveryActions?.length ?? 0) > 0) continue
+      correlatedFailedChildIds.add(child.id)
+    }
+    return jobs.filter(job => !projectedChildIds.has(job.id) && !correlatedFailedChildIds.has(job.id))
   }, [jobs, projectedChildByParent])
 
   const act = async (action: () => Promise<unknown>) => {

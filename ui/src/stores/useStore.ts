@@ -544,6 +544,29 @@ function _jobStatusDetails(
     ...(status.parent_job_id !== undefined
       ? { parentJobId: status.parent_job_id }
       : {}),
+    ...(status.failed_child_job_id !== undefined
+      ? { failedChildJobId: status.failed_child_job_id }
+      : {}),
+    ...(status.failed_child_status !== undefined
+      ? { failedChildStatus: status.failed_child_status }
+      : {}),
+    ...(status.failed_child_reason !== undefined
+      ? { failedChildReason: status.failed_child_reason }
+      : {}),
+    ...(status.failure_details !== undefined
+      ? {
+          failureDetails: status.failure_details == null
+            ? null
+            : {
+                ...(typeof status.failure_details.code === 'string'
+                  ? { code: status.failure_details.code }
+                  : {}),
+                ...(typeof status.failure_details.detail === 'string'
+                  ? { detail: status.failure_details.detail }
+                  : {}),
+              },
+        }
+      : {}),
     h3SegmentPlan: status.h3_segment_plan,
     planReviewRequired: status.plan_review_required === true,
     ...(status.plan_review_terms_required != null
@@ -4303,6 +4326,7 @@ export const useStore = create<AppState>((set, get) => ({
         availability_status: m.availability_status,
         manual_checkpoint_verification_required: m.manual_checkpoint_verification_required ?? false,
         manual_checkpoint_verified: m.manual_checkpoint_verified ?? false,
+        manual_installation: m.manual_installation,
         supported_operations: m.supported_operations ?? [],
         automatic_routing: m.automatic_routing ?? false,
         verified: m.verified ?? false,

@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Check, Eye, Loader2, Play, RotateCcw, X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 
 type Primitive = 'cube' | 'sphere' | 'cylinder' | 'cone' | 'torus' | 'plane'
 type LtxControlMode = 'VG' | 'TVG' | 'EVG' | 'PTVG' | 'TEVG'
+type BlenderOperation = { sequence: number; workspace: string }
 
 function parseVector(value: string): [number, number, number] {
   const parts = value.split(',').map(part => Number(part.trim()))
@@ -20,9 +21,25 @@ function rgba(hex: string): [number, number, number, number] {
   return [0, 2, 4].map(index => parseInt(value.slice(index, index + 2), 16) / 255).concat(1) as [number, number, number, number]
 }
 
-export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
+export function BlenderSceneTool({
+  compact = false,
+  referenceName,
+  referenceDescription,
+  privateOutput = true,
+}: {
+  compact?: boolean
+  /** Reference Studio passes these explicitly; Blender keeps its own contract. */
+  referenceName?: string
+  referenceDescription?: string
+  privateOutput?: boolean
+}) {
   const workspace = useStore(state => state.activeWorkspace)
   const refreshOutputs = useStore(state => state.refreshOutputs)
+  const mountedRef = useRef(false)
+  const workspaceRef = useRef(workspace)
+  const statusRequest = useRef(0)
+  const operationSequence = useRef(0)
+  const activeOperation = useRef<BlenderOperation | null>(null)
   const [installed, setInstalled] = useState<boolean | null>(null)
   const [ready, setReady] = useState(false)
   const [readiness, setReadiness] = useState<api.BlenderStatus | null>(null)
@@ -45,10 +62,47 @@ export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
   const endFrame = frameCount - 1
   const maxDuration = maxTotalFrames / fps
   const sampleFrames = useMemo(() => [0, Math.round(endFrame / 2), endFrame], [endFrame])
+  workspaceRef.current = workspace
+  const resolvedReferenceName = referenceName?.trim() || 'Blender scene guide'
+  const isOperationCurrent = (operation: BlenderOperation | null): boolean => Boolean(
+    mountedRef.current
+      && operation
+      && activeOperation.current?.sequence === operation.sequence
+      && activeOperation.current.workspace === operation.workspace
+      && workspaceRef.current === operation.workspace,
+  )
 
   useEffect(() => {
-    if (!workspace) return
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      statusRequest.current += 1
+      operationSequence.current += 1
+      activeOperation.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    operationSequence.current += 1
+    activeOperation.current = null
+    setDirectorPlan(null)
+    setDirectorFinal(null)
+    setBusy('')
+    setMessage('')
+    setEditPrompt('')
+  }, [workspace])
+
+  useEffect(() => {
+    const request = ++statusRequest.current
+    if (!workspace) {
+      setReadiness(null)
+      setInstalled(false)
+      setReady(false)
+      return
+    }
+    let active = true
     void api.fetchBlenderStatus(workspace).then(status => {
+      if (!active || request !== statusRequest.current || workspaceRef.current !== workspace) return
       setReadiness(status)
       setInstalled(status.installed)
       setReady(status.ready)
@@ -57,15 +111,21 @@ export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
         ? `Blender ready · ${status.blender_version || 'installed'}`
         : status.recovery_action)
     }).catch(error => {
+      if (!active || request !== statusRequest.current || workspaceRef.current !== workspace) return
       setReadiness(null)
       setInstalled(false)
       setReady(false)
       setMessage(error instanceof Error ? error.message : 'Blender is unavailable')
     })
+    return () => { active = false }
   }, [workspace])
 
   const run = async (label: string, task: () => Promise<unknown>) => {
+    const operationWorkspace = workspace
+    const operation = { sequence: ++operationSequence.current, workspace: operationWorkspace }
+    activeOperation.current = operation
     if (!ready) {
+      activeOperation.current = null
       setMessage(readiness?.recovery_action || 'Blender is not ready on the Maestro host.')
       return
     }
@@ -73,11 +133,16 @@ export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
     setMessage('')
     try {
       await task()
+      if (!isOperationCurrent(operation)) return
       setMessage(`${label} complete`)
     } catch (error) {
+      if (!isOperationCurrent(operation)) return
       setMessage(error instanceof Error ? error.message : `${label} failed`)
     } finally {
-      setBusy('')
+      if (isOperationCurrent(operation)) {
+        setBusy('')
+        activeOperation.current = null
+      }
     }
   }
 
@@ -108,7 +173,9 @@ export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
 
   const inspect = () => run('Scene inspection', () => api.inspectBlenderScene({ workspace, objects: [name] }))
 
-  const planWithDirector = async () => {
+  const planWithDirector = async (): Promise<api.BlenderDirectorPlan | null> => {
+    const operation = activeOperation.current
+    if (!operation || !isOperationCurrent(operation)) return null
     const plan = await api.planBlenderScene({
       workspace,
       prompt: directorPrompt,
@@ -117,31 +184,40 @@ export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
       fps,
       style: 'cinematic blocking reference',
     })
+    if (!isOperationCurrent(operation)) return null
     setDirectorPlan(plan)
     return plan
   }
 
-  const finalizePlan = async (plan: api.BlenderDirectorPlan, requestedEdits = '') => {
+  const finalizePlan = async (plan: api.BlenderDirectorPlan, requestedEdits = ''): Promise<boolean> => {
+    const operation = activeOperation.current
+    if (!operation || !isOperationCurrent(operation)) return false
     const result = await api.finalizeBlenderScene({
       workspace,
       plan,
       edit_prompt: requestedEdits,
-      reference_name: 'Director Blender motion reference',
+      reference_name: resolvedReferenceName,
       recommended_video_prompt_type: controlMode,
-      private_output: true,
+      private_output: privateOutput,
     })
+    if (!isOperationCurrent(operation)) return false
     setDirectorPlan(result.final_plan)
     setDirectorFinal(result)
+    if (!isOperationCurrent(operation)) return false
     await refreshOutputs()
+    return isOperationCurrent(operation)
   }
 
   const runDirector = () => run('Director visual review', async () => {
+    if (!isOperationCurrent(activeOperation.current)) return
     setDirectorFinal(null)
     const plan = await planWithDirector()
+    if (!plan || !isOperationCurrent(activeOperation.current)) return
     await finalizePlan(plan)
   })
 
   const runManualDirector = () => run('Director visual review', async () => {
+    if (!isOperationCurrent(activeOperation.current)) return
     setDirectorFinal(null)
     const plan: api.BlenderDirectorPlan = {
       workspace,
@@ -187,6 +263,7 @@ export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
       },
     }
     setDirectorPlan(plan)
+    if (!isOperationCurrent(activeOperation.current)) return
     await finalizePlan(plan)
   })
 
@@ -194,16 +271,20 @@ export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
     status === 'kept' ? 'Reference approval' : 'Reference rejection',
     async () => {
       if (!directorFinal) return
+      const operation = activeOperation.current
       await api.setProjectAssetVariantStatus(
         workspace, directorFinal.asset_id, directorFinal.variant_id, status,
       )
+      if (!isOperationCurrent(operation)) return
       setMessage(status === 'kept' ? 'Full video approved as a project reference' : 'Full video rejected')
     },
   )
 
   const requestEdits = () => run('Director edit review', async () => {
     if (!directorPlan || !editPrompt.trim()) return
+    const operation = activeOperation.current
     await finalizePlan(directorPlan, editPrompt.trim())
+    if (!isOperationCurrent(operation)) return
     setEditPrompt('')
   })
 
@@ -233,6 +314,10 @@ export function BlenderSceneTool({ compact = false }: { compact?: boolean }) {
         <span className={`text-[9px] ${ready ? 'text-accent-green' : 'text-amber-400'}`}>{installed == null ? 'checking' : ready ? 'ready' : installed ? 'not connected' : 'setup needed'}</span>
       </div>
       <p className="text-[9px] leading-relaxed text-text-muted">Blender runs on the Maestro host. Previews stay in the selected project and follow its access permissions; only approved scene operations are available.</p>
+      <p className="rounded border border-border/70 bg-bg-secondary/40 px-2 py-1 text-[8px] leading-relaxed text-text-muted">
+        Blender uses a separate reference contract: <span className="text-text-secondary">{resolvedReferenceName}</span> · {privateOutput ? 'private output' : 'project-visible output'}.
+        {referenceDescription?.trim() ? ' The Reference Studio description remains on the authored pack; Blender uses its own scene metadata.' : ' Reference Studio description is kept on the authored pack.'}
+      </p>
       {readiness && (
         <div className="grid grid-cols-3 gap-1 text-center text-[8px] uppercase tracking-wide text-text-muted">
           <span className={`rounded border px-1 py-1 ${readiness.mcp_attested ? 'border-accent-green/30 text-accent-green' : 'border-amber-400/30 text-amber-400'}`}>MCP {readiness.mcp_attested ? 'attested' : 'setup'}</span>

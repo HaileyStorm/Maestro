@@ -132,6 +132,268 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
         self.assertEqual(recovered_cpu["resource_state"], "queued")
         self.assertEqual(recovered_cpu["execution_attempt"], 3)
 
+    def test_reference_terminal_parent_child_failure_round_trips_safely(self):
+        private_error = "/private/models/secret.safetensors traceback payload"
+        child = self._job(
+            "reference-child",
+            status="failed",
+            parent_job_id="reference-parent",
+            message="Generation failed.",
+            resource_intent="generation",
+            resource_execution="standard",
+            preemption_mode="none",
+            resource_state="released",
+            execution_attempt=1,
+        )
+        parent = self._job(
+            "reference-parent",
+            status="failed",
+            message="Generation failed.",
+            resource_intent="text",
+            resource_execution="standard",
+            preemption_mode="none",
+            resource_state="released",
+            execution_attempt=1,
+            failed_child_job_id=child["id"],
+            failed_child_status="failed",
+            failed_child_reason="model_load_failed",
+            failure_details={
+                "code": "model_load_failed",
+                "stage": "model_load",
+                "detail": private_error,
+                "exception_type": "RuntimeError",
+                "is_oom": False,
+                "private_path": private_error,
+            },
+            error=private_error,
+            traceback=private_error,
+        )
+        self._register(parent)
+        self._register(child)
+
+        restored = QueueRecoveryCoordinator(self.journal).restore().jobs
+        restored_parent = restored[parent["id"]]
+        restored_child = restored[child["id"]]
+        self.assertEqual(
+            restored_parent["failed_child_job_id"], child["id"],
+        )
+        self.assertEqual(restored_parent["failed_child_status"], "failed")
+        self.assertEqual(
+            restored_parent["failed_child_reason"], "model_load_failed",
+        )
+        self.assertEqual(restored_parent["failure_details"], {
+            "code": "model_load_failed",
+            "stage": "model_load",
+            "detail": (
+                "The generation model could not be loaded with the available host memory."
+            ),
+            "exception_type": "RuntimeError",
+            "is_oom": False,
+        })
+        self.assertEqual(restored_child["parent_job_id"], parent["id"])
+        self.assertNotIn(private_error, repr(restored))
+        self.assertNotIn(
+            private_error,
+            (self.root / "queue.jsonl").read_text(encoding="utf-8"),
+        )
+
+    def test_reference_parent_child_oom_round_trips_only_safe_banner_fields(self):
+        private_error = "/private/cuda/allocator traceback"
+        child = self._job(
+            "reference-oom-child",
+            status="failed",
+            parent_job_id="reference-oom-parent",
+        )
+        parent = self._job(
+            "reference-oom-parent",
+            status="failed",
+            failed_child_job_id=child["id"],
+            failed_child_status="failed",
+            failed_child_reason="cuda_oom",
+            failure_details={
+                "code": "cuda_oom",
+                "stage": "denoise",
+                "detail": private_error,
+                "exception_type": "OutOfMemoryError",
+                "is_oom": True,
+                "allocator": {
+                    "device_type": "cuda",
+                    "free_bytes": 10,
+                    "private_path": private_error,
+                },
+            },
+            oom_info={
+                "is_oom": True,
+                "stage": "denoise",
+                "current_coefficient": 0.8,
+                "suggested_coefficient": 0.7,
+                "message": private_error,
+                "allocator": {
+                    "device_type": "cuda",
+                    "free_bytes": 10,
+                    "private_path": private_error,
+                },
+                "traceback": private_error,
+            },
+        )
+        self._register(parent)
+        self._register(child)
+
+        restored = QueueRecoveryCoordinator(self.journal).restore().jobs
+        restored_parent = restored[parent["id"]]
+        self.assertEqual(restored_parent["failure_details"]["code"], "cuda_oom")
+        self.assertEqual(restored_parent["oom_info"], {
+            "is_oom": True,
+            "stage": "denoise",
+            "current_coefficient": 0.8,
+            "suggested_coefficient": 0.7,
+            "message": "The operation ran out of GPU memory.",
+            "allocator": {"device_type": "cuda", "free_bytes": 10},
+        })
+        self.assertNotIn(private_error, repr(restored_parent))
+        self.assertNotIn(
+            private_error,
+            (self.root / "queue.jsonl").read_text(encoding="utf-8"),
+        )
+
+    def test_optional_failure_diagnostics_nulls_are_omitted(self):
+        snapshot = serialize_job(
+            self._job(
+                "completed-job",
+                status="completed",
+                failure_details=None,
+                oom_info=None,
+            ),
+            owner_digest=self.owner,
+            project_digest=self.project,
+            request_manifest={"kind": "synthetic"},
+        )
+        self.assertNotIn("failure_details", snapshot)
+        self.assertNotIn("oom_info", snapshot)
+
+    def test_non_reference_rich_oom_info_retains_existing_drop_behavior(self):
+        snapshot = serialize_job(
+            self._job(
+                "h3-delivery-failure",
+                status="failed",
+                failure_details={
+                    "code": "cuda_oom",
+                    "stage": "delivery",
+                    "exception_type": "RuntimeError",
+                    "is_oom": True,
+                },
+                oom_info={
+                    "is_oom": True,
+                    "delivery_resolution": "3840x2160",
+                    "manual_retry_count": 3,
+                    "recovery_action": "private-rich-h3-contract",
+                },
+            ),
+            owner_digest=self.owner,
+            project_digest=self.project,
+            request_manifest={"kind": "synthetic"},
+        )
+        self.assertEqual(snapshot["failure_details"]["stage"], "delivery")
+        self.assertNotIn("oom_info", snapshot)
+        self.assertNotIn("private-rich-h3-contract", repr(snapshot))
+
+    def test_reference_failure_durable_fields_fail_closed(self):
+        valid = {
+            "failed_child_job_id": "reference-child",
+            "failed_child_status": "failed",
+            "failed_child_reason": "generation_failed",
+        }
+        invalid_updates = (
+            {"failed_child_job_id": "../private-child"},
+            {"failed_child_job_id": "reference-parent"},
+            {"failed_child_status": "running"},
+            {"failed_child_reason": "private/path"},
+            {"failed_child_reason": "a" * 65},
+            {"failed_child_reason": True},
+            {"failed_child_job_id": "reference-child"},
+            {**valid, "failed_child_status": None},
+        )
+        for index, updates in enumerate(invalid_updates):
+            with self.subTest(index=index, updates=updates):
+                with self.assertRaises(QueueRecoveryAdapterError):
+                    serialize_job(
+                        self._job(
+                            "reference-parent", status="failed", **updates,
+                        ),
+                        owner_digest=self.owner,
+                        project_digest=self.project,
+                        request_manifest={"kind": "synthetic"},
+                    )
+
+        for invalid_details in ("raw traceback", ["raw traceback"]):
+            with self.subTest(invalid_details=invalid_details):
+                with self.assertRaises(QueueRecoveryAdapterError):
+                    serialize_job(
+                        self._job(
+                            "reference-parent",
+                            status="failed",
+                            failure_details=invalid_details,
+                        ),
+                        owner_digest=self.owner,
+                        project_digest=self.project,
+                        request_manifest={"kind": "synthetic"},
+                    )
+
+        invalid_oom = (
+            "raw traceback",
+            {"is_oom": False, "current_coefficient": 0.8},
+            {"is_oom": True, "current_coefficient": True},
+            {"is_oom": True, "current_coefficient": float("inf")},
+            {"is_oom": True, "current_coefficient": 1.1},
+        )
+        for value in invalid_oom:
+            with self.subTest(invalid_oom=value):
+                with self.assertRaises(QueueRecoveryAdapterError):
+                    serialize_job(
+                        self._job(
+                            "reference-parent",
+                            status="failed",
+                            **valid,
+                            failure_details={
+                                "code": "cuda_oom",
+                                "stage": "generation",
+                                "exception_type": "RuntimeError",
+                                "is_oom": True,
+                            },
+                            oom_info=value,
+                        ),
+                        owner_digest=self.owner,
+                        project_digest=self.project,
+                        request_manifest={"kind": "synthetic"},
+                    )
+
+        with self.assertRaises(QueueRecoveryAdapterError):
+            serialize_job(
+                self._job(
+                    "reference-parent",
+                    status="failed",
+                    **valid,
+                    failure_details={
+                        "code": "generation_failed",
+                        "stage": "generation",
+                        "exception_type": "RuntimeError",
+                        "is_oom": False,
+                    },
+                    oom_info={"is_oom": True, "current_coefficient": 0.8},
+                ),
+                owner_digest=self.owner,
+                project_digest=self.project,
+                request_manifest={"kind": "synthetic"},
+            )
+
+        with self.assertRaises(QueueRecoveryAdapterError):
+            serialize_job(
+                self._job("reference-parent", status="running", **valid),
+                owner_digest=self.owner,
+                project_digest=self.project,
+                request_manifest={"kind": "synthetic"},
+            )
+
     def test_blocked_resource_admission_survives_coordinator_restart(self):
         job = self._job(
             "blocked-resource",

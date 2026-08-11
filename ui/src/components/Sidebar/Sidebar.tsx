@@ -360,6 +360,7 @@ export function Sidebar() {
           <div className="px-4 py-3 border-b border-border flex items-center justify-between">
             {productIdentity}
             <div className="flex items-center gap-1.5">
+              <ProjectReferenceLibrary header compact />
               {modeToggle('sm')}
               <button
                 ref={mobileCloseRef}
@@ -376,7 +377,6 @@ export function Sidebar() {
             isDirector ? 'overflow-hidden' : 'overflow-y-auto'
           }`}>
             <GenerationPrivacyControls />
-            <ProjectReferenceLibrary />
             {isDirector ? <DirectorChat /> : studioControls}
             {machineControls && <HardwareStatusBar />}
           </div>
@@ -392,6 +392,7 @@ export function Sidebar() {
       <div className="px-4 py-3 border-b border-border flex items-center justify-between">
         {productIdentity}
         <div className="flex items-center gap-2">
+          <ProjectReferenceLibrary header />
           {modeToggle('md')}
           {machineControls && <button
             type="button"
@@ -405,7 +406,6 @@ export function Sidebar() {
         </div>
       </div>
       <GenerationPrivacyControls />
-      <ProjectReferenceLibrary />
       {isDirector ? <DirectorChat /> : studioControls}
       {machineControls && <HardwareStatusBar />}
     </aside>

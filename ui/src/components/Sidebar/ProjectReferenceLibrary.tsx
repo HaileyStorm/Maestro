@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { createPortal } from 'react-dom'
 import { Check, ChevronDown, EyeOff, FileUp, ImagePlus, Library, Loader2, MapPin, Package, Pencil, RotateCcw, Trash2, UserRound, X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import {
@@ -68,6 +69,9 @@ import { BlenderSceneTool } from './BlenderSceneTool'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 import { hidePrivatePreview, privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../../lib/privatePreview'
 import { POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
+import { installModalFocus } from '../../lib/modalFocus'
+import { confirmReconnectedJob } from '../../lib/referenceQueue'
+import { formatManualInstallationBytes, manualInstallationDestination } from '../../lib/manualInstallation'
 
 const ASSET_TYPES = [
   { value: 'character', label: 'Character', icon: UserRound },
@@ -113,11 +117,6 @@ function cloneAdditionalLoras(
       parameter_values: { ...(lora.parameter_values ?? {}) },
     } : {}),
   }))
-}
-
-function formatManualBytes(size: number): string {
-  if (!Number.isFinite(size) || size < 0) return 'Unknown size'
-  return `${(size / (1024 ** 3)).toFixed(2)} GiB (${size.toLocaleString()} bytes)`
 }
 
 function LoraParameterFields({
@@ -604,7 +603,13 @@ function ProjectAssetPreview({ project, assetId, output, label }: {
   )
 }
 
-export function ProjectReferenceLibrary() {
+export function ProjectReferenceLibrary({
+  header = false,
+  compact = false,
+}: {
+  header?: boolean
+  compact?: boolean
+}) {
   const project = useStore(s => s.activeWorkspace)
   const workspaces = useStore(s => s.workspaces)
   const jobs = useStore(s => s.jobs)
@@ -702,10 +707,16 @@ export function ProjectReferenceLibrary() {
   }>>({})
   const [authoringAvailability, setAuthoringAvailability] = useState<Record<string, ReferenceAuthoringAvailability>>({})
   const [privateReplayRetry, setPrivateReplayRetry] = useState(0)
+  const closeModal = useCallback(() => setOpen(false), [])
   const requestSequence = useRef(0)
+  const catalogRequestSequence = useRef(0)
   const projectEpoch = useRef(0)
   const previousProject = useRef(project)
   const currentProject = useRef(project)
+  const enabledModelsSignature = useMemo(
+    () => [...enabledModels].sort().join('\u001f'),
+    [enabledModels],
+  )
   const pendingSheetActionLocks = useRef(new Set<string>())
   const authoredSettingsSnapshots = useRef(new Map<string, ReferenceAuthoredSnapshot>())
   const loraParameterSnapshots = useRef(new Map<string, ProjectReferenceAdditionalLora[]>())
@@ -1226,11 +1237,13 @@ export function ProjectReferenceLibrary() {
     if (!open || projectExplicitlyLocked) return
     const epoch = projectEpoch.current
     const submittedProject = project
+    const catalogSequence = ++catalogRequestSequence.current
     let active = true
     setModelLoadError('')
     void fetchModels().then(data => {
       if (
         !active
+        || catalogSequence !== catalogRequestSequence.current
         || !isProjectAssetOperationCurrent(
           submittedProject, epoch, currentProject.current, projectEpoch.current,
         )
@@ -1239,6 +1252,7 @@ export function ProjectReferenceLibrary() {
     }).catch(() => {
       if (
         !active
+        || catalogSequence !== catalogRequestSequence.current
         || !isProjectAssetOperationCurrent(
           submittedProject, epoch, currentProject.current, projectEpoch.current,
         )
@@ -1246,8 +1260,11 @@ export function ProjectReferenceLibrary() {
       setCatalogModels([])
       setModelLoadError('Could not load Reference Studio model choices.')
     })
-    return () => { active = false }
-  }, [open, project, projectExplicitlyLocked])
+    return () => {
+      active = false
+      if (catalogSequence === catalogRequestSequence.current) catalogRequestSequence.current += 1
+    }
+  }, [enabledModelsSignature, modelsLoaded, open, project, projectExplicitlyLocked])
 
   useEffect(() => {
     if (
@@ -1315,16 +1332,24 @@ export function ProjectReferenceLibrary() {
   }, [open, project, projectExplicitlyLocked])
 
   useEffect(() => {
-    if (!open) return
-    const opener = openButtonRef.current
-    window.requestAnimationFrame(() => closeButtonRef.current?.focus())
-    return () => { opener?.focus() }
-  }, [open])
+    if (!open || !dialogRef.current || !closeButtonRef.current) return
+    return installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: closeButtonRef.current,
+      restoreFocus: openButtonRef.current,
+      appRoot: document.getElementById('root'),
+      onClose: closeModal,
+    })
+  }, [closeModal, open])
 
   const handleDialogKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // The modal is portalled outside the mobile drawer. Stop Escape/Tab from
+    // reaching Sidebar's document listener and closing the drawer underneath.
+    event.stopPropagation()
     if (event.key === 'Escape') {
       event.preventDefault()
-      setOpen(false)
+      closeModal()
       return
     }
     if (event.key !== 'Tab') return
@@ -1861,7 +1886,11 @@ export function ProjectReferenceLibrary() {
           cloneAdditionalLoras(additionalLoras),
         )
       }
-      await reconnectJobs()
+      await confirmReconnectedJob(
+        response.job_id,
+        reconnectJobs,
+        () => useStore.getState().jobs,
+      )
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setName('')
       setDescription('')
@@ -1869,6 +1898,9 @@ export function ProjectReferenceLibrary() {
       const queuedSheets = response.plan?.sheet_count ?? sheetCount
       setQueuedMessage(`Queued ${candidateCount} ${candidateCount === 1 ? 'candidate pack' : 'candidate packs'} with ${queuedSheets} ${queuedSheets === 1 ? 'sheet' : 'sheets'} each (${response.job_id}). They will appear here when complete.`)
       requestRefresh()
+      // Queue success is only confirmed after reconnecting the current
+      // operation. Keep the modal open for every blocker/failure path.
+      setOpen(false)
     } catch (reason) {
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setActionError(projectReferenceSafeErrorMessage(reason, 'Could not queue reference generation.'))
@@ -2092,7 +2124,11 @@ export function ProjectReferenceLibrary() {
           cloneAdditionalLoras(sourceSettings.additional_loras ?? []),
         )
       }
-      await reconnectJobs()
+      await confirmReconnectedJob(
+        response.job_id,
+        reconnectJobs,
+        () => useStore.getState().jobs,
+      )
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setPendingSheetActions(current => ({
         ...current,
@@ -2249,21 +2285,32 @@ export function ProjectReferenceLibrary() {
       <button
         ref={openButtonRef}
         type="button"
-        onClick={() => setOpen(true)}
-        disabled={browsingUploads || !project || projectExplicitlyLocked}
-        title={projectExplicitlyLocked ? 'Unlock this project to use project references' : undefined}
-        className="mx-4 my-2 flex items-center justify-center gap-1.5 rounded-lg border border-border bg-bg-tertiary px-3 py-1.5 text-[11px] text-text-secondary hover:border-accent-blue/50 hover:text-accent-blue disabled:opacity-40"
+        onClick={() => { if (!projectExplicitlyLocked) setOpen(true) }}
+        disabled={browsingUploads || !project}
+        aria-label={projectExplicitlyLocked ? 'Unlock project to use Reference Studio' : 'Open Reference Studio'}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-disabled={projectExplicitlyLocked}
+        title={projectExplicitlyLocked ? 'Unlock this project to use Reference Studio' : 'Open Reference Studio'}
+        className={header
+          ? `${compact ? 'p-1.5' : 'px-2.5 py-1.5'} flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-border bg-bg-tertiary text-[11px] text-text-secondary hover:border-accent-blue/50 hover:text-accent-blue disabled:opacity-40`
+          : 'mx-4 my-2 flex items-center justify-center gap-1.5 rounded-lg border border-border bg-bg-tertiary px-3 py-1.5 text-[11px] text-text-secondary hover:border-accent-blue/50 hover:text-accent-blue disabled:opacity-40'}
       >
-        <Library size={13} /> {projectExplicitlyLocked ? 'Unlock project to use references' : 'Project references & creation tool'}
+        <Library size={13} aria-hidden="true" />
+        <span className={compact ? 'sr-only' : ''}>{projectExplicitlyLocked ? 'Unlock project to use references (Reference Studio)' : 'Reference Studio'}</span>
+        {projectExplicitlyLocked && <span className="text-[8px] text-amber-200">Locked</span>}
       </button>
 
-      {open && !projectExplicitlyLocked && (
-        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 p-3">
+      {open && !projectExplicitlyLocked && createPortal(
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 p-3"
+          onClick={event => { if (event.target === event.currentTarget) closeModal() }}
+        >
           <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="project-reference-title" tabIndex={-1} onKeyDown={handleDialogKeyDown} className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-2xl">
             <div className="flex items-center justify-between border-b border-border px-4 py-3">
               <div>
-                <h2 id="project-reference-title" className="text-sm font-semibold text-text-primary">Project references</h2>
-                <p className="text-[10px] text-text-muted">{project} · characters, locations, props, vehicles, creatures, wardrobe, worlds, and generated packs</p>
+                <h2 id="project-reference-title" className="text-sm font-semibold text-text-primary">Reference Studio</h2>
+                <p className="text-[10px] text-text-muted">{project} · author, review, and apply project reference packs</p>
               </div>
               <button ref={closeButtonRef} type="button" aria-label="Close project references" onClick={() => setOpen(false)} className="text-text-muted hover:text-text-primary"><X size={17} /></button>
             </div>
@@ -2288,6 +2335,25 @@ export function ProjectReferenceLibrary() {
                     )
                   })}
                 </div>
+                <label htmlFor="project-reference-name" className="mt-3 block text-[10px] text-text-secondary">Name
+                  <input id="project-reference-name" aria-label="Reference name" value={name} onChange={event => setName(event.target.value)} placeholder="Name" className="mt-1 w-full rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary" />
+                </label>
+                <label htmlFor="project-reference-description" className="mt-2 block text-[10px] text-text-secondary">Description
+                  <textarea id="project-reference-description" aria-label="Reference description" value={description} onChange={event => setDescription(event.target.value)} placeholder="Detailed description / card (optional)" rows={5} className="mt-1 w-full resize-y rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary" />
+                </label>
+                <section aria-label="Reference creation method" className="mt-3 rounded-md border border-accent-blue/30 bg-accent-blue/5 p-2">
+                  <h4 className="text-[10px] font-medium text-text-primary">Creation method</h4>
+                  <p className="mt-0.5 text-[8px] leading-relaxed text-text-muted">Choose the authored image-pack workflow below, or use Blender as a separate structured scene reference. Blender does not add a durable asset type.</p>
+                  <details className="mt-1.5 rounded border border-border/70 px-2 py-1.5">
+                    <summary className="cursor-pointer text-[10px] text-accent-blue">Build / sample a Blender scene guide</summary>
+                    <BlenderSceneTool
+                      compact
+                      referenceName={name}
+                      referenceDescription={description}
+                      privateOutput={referenceExplicitOutput || privateOutput}
+                    />
+                  </details>
+                </section>
                 <fieldset className="mt-3">
                   <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Intent</legend>
                   <div className="grid grid-cols-3 gap-1">
@@ -2367,12 +2433,6 @@ export function ProjectReferenceLibrary() {
                     ))}
                   </div>
                 </fieldset>
-                <label htmlFor="project-reference-name" className="mt-3 block text-[10px] text-text-secondary">Name
-                  <input id="project-reference-name" aria-label="Reference name" value={name} onChange={event => setName(event.target.value)} placeholder="Name" className="mt-1 w-full rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary" />
-                </label>
-                <label htmlFor="project-reference-description" className="mt-2 block text-[10px] text-text-secondary">Description
-                  <textarea id="project-reference-description" aria-label="Reference description" value={description} onChange={event => setDescription(event.target.value)} placeholder="Detailed description / card (optional)" rows={5} className="mt-1 w-full resize-y rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary" />
-                </label>
                 <div className="mt-3 space-y-2" aria-label="Editable reference sections">
                   {sectionDefinitions.map(definition => {
                     const section = sections.find(candidate => candidate.id === definition.id)
@@ -2489,6 +2549,46 @@ export function ProjectReferenceLibrary() {
                     </select>
                   </label>
                 )}
+                <section aria-label="Moody Krea 2 quick select" className="mt-2 rounded border border-accent-blue/25 bg-accent-blue/5 p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <h4 className="text-[10px] font-medium text-text-primary">Moody Krea 2 quick select</h4>
+                    <span className="text-[8px] text-text-muted">catalog-backed · manual install</span>
+                  </div>
+                  <div className="mt-1.5 grid grid-cols-1 gap-1 sm:grid-cols-2">
+                    {MOODY_MODEL_TYPES.map(modelType => {
+                      const model = catalogModels.find(candidate => candidate.model_type === modelType)
+                      const enabled = enabledModels.has(modelType)
+                      const verified = Boolean(model) && (
+                        model?.downloadable !== false || model?.manual_checkpoint_verified === true
+                      )
+                      const selectable = enabled && Boolean(model) && verified
+                      const status = !enabled
+                        ? 'Disabled in Enabled Models'
+                        : !model
+                          ? 'Missing from current catalog'
+                          : !verified
+                            ? 'Install and verify locally'
+                            : 'Select for generation'
+                      return (
+                        <button
+                          key={modelType}
+                          type="button"
+                          disabled={!selectable}
+                          aria-label={`${MOODY_MODEL_NAMES[modelType]} · ${status}`}
+                          onClick={() => {
+                            if (!selectable) return
+                            setReferenceModelCustomized(true)
+                            setReferenceModelType(modelType)
+                          }}
+                          className={`rounded border px-2 py-1.5 text-left text-[9px] ${referenceModelType === modelType ? 'border-accent-blue bg-accent-blue/15 text-accent-blue' : 'border-border text-text-secondary'} disabled:cursor-not-allowed disabled:opacity-50`}
+                        >
+                          <span className="block font-medium">{MOODY_MODEL_NAMES[modelType]}</span>
+                          <span className="mt-0.5 block text-[8px] text-text-muted">{status}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </section>
                 {disabledMoodyModels.length > 0 && (
                   <div role="status" className="mt-2 rounded border border-border bg-bg-tertiary/60 px-2 py-1.5 text-[9px] text-text-secondary">
                     <p>Moody Krea 2 recipes are available but are not enabled for this host: {disabledMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')}.</p>
@@ -2527,8 +2627,8 @@ export function ProjectReferenceLibrary() {
                     {model.manual_installation ? (
                       <dl className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[8px]">
                         <dt className="text-amber-200">Filename</dt><dd className="break-all font-mono select-all">{model.manual_installation.filename}</dd>
-                        <dt className="text-amber-200">Place in</dt><dd className="font-mono select-all">{model.manual_installation.destination_hint}</dd>
-                        <dt className="text-amber-200">Size</dt><dd>{formatManualBytes(model.manual_installation.size_bytes)}</dd>
+                        <dt className="text-amber-200">Place in</dt><dd className="break-all font-mono select-all">{manualInstallationDestination(model.manual_installation)}</dd>
+                        <dt className="text-amber-200">Size</dt><dd>{formatManualInstallationBytes(model.manual_installation.size_bytes)}</dd>
                         <dt className="text-amber-200">SHA-256</dt><dd className="break-all font-mono select-all">{model.manual_installation.sha256}</dd>
                         <dt className="text-amber-200">Verification</dt><dd>{model.manual_installation.local_verification_required ? 'Local host only · required' : 'Not required by this manifest'}</dd>
                       </dl>
@@ -2571,7 +2671,7 @@ export function ProjectReferenceLibrary() {
                     ) : !model.manual_checkpoint_verification_required ? (
                       <p className="mt-1 text-red-300">No supported exact verification contract is available for this recipe.</p>
                     ) : (
-                      <p className="mt-1 text-amber-200">After placing the exact file, open Maestro at localhost on the host machine and choose Verify local checkpoint. Verification is intentionally unavailable from LAN sessions.</p>
+                      <p className="mt-1 text-amber-200">Local-only verification: after placing the exact file, open Maestro at localhost on the host machine and choose Verify local checkpoint. Verification is intentionally unavailable from LAN sessions.</p>
                     )}
                   </div>
                 ))}
@@ -2713,10 +2813,6 @@ export function ProjectReferenceLibrary() {
                   {submitting ? <Loader2 size={13} className="animate-spin" /> : <ImagePlus size={13} />} Queue reference packs
                 </button>
                 <p className="mt-2 text-[9px] leading-relaxed text-text-muted">Each candidate is one ordered reference pack containing the planned number of sheets. Candidate count creates alternatives; sheet count controls deliverables inside each pack. Keep one or more; originals and rejected candidates remain recorded until you delete them.</p>
-                <details className="mt-3">
-                  <summary className="cursor-pointer text-[10px] text-accent-blue">Build / sample a Blender scene guide</summary>
-                  <BlenderSceneTool compact />
-                </details>
                 {queuedMessage && <p role="status" className="mt-2 text-[10px] text-accent-blue">{queuedMessage}</p>}
                 {pendingFreshJobIds.map(jobId => {
                   const job = jobs.find(candidate => candidate.id === jobId)
@@ -2960,7 +3056,8 @@ export function ProjectReferenceLibrary() {
               </div>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </>
   )

@@ -74,6 +74,8 @@ def _load_route_symbols(namespace):
         "_write_project_reference_sidecar",
         "_cleanup_project_reference_private_source",
         "_project_reference_wait_at_output_boundary",
+        "_project_reference_safe_failure_envelope",
+        "_project_reference_child_failure_updates",
         "_run_project_reference_image_job",
         "_project_reference_runtime_intelligence_selection",
         "_project_reference_run_planning",
@@ -95,6 +97,12 @@ def _load_route_symbols(namespace):
         "set_project_asset_variant_status",
         "generate_project_asset_references",
         "_job_model_term_ids",
+        "_public_parent_job_id",
+        "_public_failed_child_metadata",
+        "_public_job_prompt_fields",
+        "_public_job_created_at",
+        "get_status",
+        "list_jobs",
     }
     tree = ast.parse(LAUNCH.read_text(encoding="utf-8"))
     nodes = []
@@ -291,6 +299,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         namespace = {
             "HTTPException": HTTPException,
             "Request": object,
+            "Response": object,
             "Path": Path,
             "copy": copy,
             "glob": glob,
@@ -3831,6 +3840,11 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 self.assertTrue(manifest["download_url"].startswith("https://"))
                 self.assertNotRegex(json.dumps(manifest), r"(?i)(token|api[_-]?key)=")
                 for unsafe_url in (
+                    (
+                        "https://civitai.com/api/download/models/3209007"
+                        if model_type == "krea2_moody_mix_v7_fp8"
+                        else "https://civitai.com/api/download/models/3211049"
+                    ),
                     "https://user:password@example.invalid/model",
                     "https://example.invalid/model?token=private",
                     "https://example.invalid/model?api%5Fkey=private",
@@ -3846,6 +3860,63 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                     self.assertIsNone(
                         self.ns["_public_manual_installation_manifest"](unsafe),
                     )
+
+    def test_pornmaster_manual_manifest_allows_only_registered_queryless_tuple(self):
+        model_def = json.loads((
+            ROOT / "app" / "defaults"
+            / "flux2_klein_9b_pornmaster_v4_turbo_fp8_ponpoke.json"
+        ).read_text())["model"]
+        manifest = self.ns["_public_manual_installation_manifest"](model_def)
+        self.assertEqual(manifest, {
+            "filename": "pornmasterFlux2Klein_v4TurboFp8.safetensors",
+            "size_bytes": 9433104872,
+            "sha256": (
+                "e90eeb50140a10806341b7521c340214c6f76cec2f8f8dae7a443c5806072df7"
+            ),
+            "source_url": (
+                "https://civitai.com/models/2382648?modelVersionId=2973304"
+            ),
+            "download_url": "https://civitai.com/api/download/models/2973304",
+            "destination_hint": "app/ckpts",
+            "local_verification_required": True,
+        })
+
+        drift_cases = {
+            "model_id": 2382649,
+            "version_id": 2973305,
+            "file_id": 1,
+            "filename": "lookalike.safetensors",
+            "size_bytes": 9433104873,
+            "sha256": "0" * 64,
+            "precision": "fp16",
+            "artifact_kind": "lookalike",
+            "creator": "lookalike",
+        }
+        for field, value in drift_cases.items():
+            with self.subTest(field=field):
+                unsafe = copy.deepcopy(model_def)
+                unsafe["artifact_provenance"]["checkpoint"][field] = value
+                if field == "filename":
+                    unsafe["URLs"] = [value]
+                self.assertIsNone(
+                    self.ns["_public_manual_installation_manifest"](unsafe),
+                )
+
+        for unsafe_url in (
+            "https://user:password@civitai.com/api/download/models/2973304",
+            "https://civitai.com/api/download/models/2973304#fragment",
+            "https://civitai.com/api/download/models/2973305",
+            "https://civitai.com/api/download/models/2973304?token=private",
+            "https://www.civitai.com/api/download/models/2973304",
+        ):
+            with self.subTest(unsafe_url=unsafe_url):
+                unsafe = copy.deepcopy(model_def)
+                unsafe["artifact_provenance"]["checkpoint"][
+                    "download_url"
+                ] = unsafe_url
+                self.assertIsNone(
+                    self.ns["_public_manual_installation_manifest"](unsafe),
+                )
 
     def test_v2_deferred_lora_freeze_keeps_returned_plan_seal_stable(self):
         lora = self.root / "deferred.safetensors"
@@ -4120,6 +4191,393 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertNotIn("SECRET_PROMPT", json.dumps(sidecar))
         self.assertEqual(sidecar["params"]["reference_pack"]["role"], "identity_front")
         self.assertEqual(sidecar["reference_parent_job_id"], parent["id"])
+
+    def test_slow_reference_child_remains_pending_until_it_succeeds(self):
+        parent = {
+            "id": "slow-child-parent",
+            "status": "running",
+            "workspace": "project",
+            "out_dir": str(self.output),
+            "session_id": "owner-session",
+            "source_remote": False,
+            "access_policy": {"private": True, "explicit": False},
+            "hold_after_output": False,
+        }
+        child_started = threading.Event()
+        release_child = threading.Event()
+        call_finished = threading.Event()
+        result = {}
+
+        def register(child, **_kwargs):
+            self.jobs[child["id"]] = child
+
+            def complete_when_released():
+                child["status"] = "running"
+                child_started.set()
+                release_child.wait()
+                output = self.output / "slow-child-output.png"
+                Image.new("RGB", (64, 64), "blue").save(output)
+                child.update({
+                    "status": "completed",
+                    "progress": 100,
+                    "output_files": [output.name],
+                })
+
+            thread = threading.Thread(target=complete_when_released)
+            thread.start()
+            return thread
+
+        def run_parent_call():
+            try:
+                result["path"] = self.real_image_job(
+                    parent,
+                    {
+                        "model_type": "flux2_klein_9b",
+                        "prompt": "synthetic",
+                        "resolution": "64x64",
+                    },
+                    role="identity_front",
+                    phase="Generating panel",
+                    step=1,
+                    total_steps=2,
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                result["error"] = error
+            finally:
+                call_finished.set()
+
+        self.ns["_queue_recovery_register_and_publish"] = register
+        call = threading.Thread(target=run_parent_call)
+        try:
+            call.start()
+            self.assertTrue(child_started.wait(timeout=2))
+            self.assertFalse(call_finished.is_set())
+            self.assertEqual(parent["status"], "running")
+            release_child.set()
+            call.join(timeout=2)
+            self.assertFalse(call.is_alive())
+            self.assertNotIn("error", result)
+            self.assertEqual(
+                result["path"], str(self.output / "slow-child-output.png"),
+            )
+        finally:
+            release_child.set()
+            call.join(timeout=2)
+
+    def test_failed_reference_child_preserves_safe_parent_envelope_and_code(self):
+        private_error = f"private traceback at {self.root}/secret-model.safetensors"
+        captured = {}
+
+        def register(job, *, worker=None, **_kwargs):
+            job.setdefault("access_policy", {
+                "private": bool(job.pop("private", False)),
+                "explicit": bool(job.pop("explicit", False)),
+            })
+            self.jobs[job["id"]] = job
+            if not job.get("parent_job_id"):
+                worker(job["id"])
+                return _DoneThread()
+
+            captured["child"] = job
+
+            def fail_child():
+                job.update({
+                    "status": "failed",
+                    "resource_state": "released",
+                    "message": private_error,
+                    "error": private_error,
+                    "traceback": private_error,
+                    "failure_details": {
+                        "code": "model_load_failed",
+                        "stage": "model_load",
+                        "detail": private_error,
+                        "exception_type": "RuntimeError",
+                        "is_oom": False,
+                        "private_path": private_error,
+                    },
+                    "oom_info": {
+                        "is_oom": False,
+                        "message": private_error,
+                    },
+                })
+
+            thread = threading.Thread(target=fail_child)
+            thread.start()
+            return thread
+
+        self.ns["_queue_recovery_register_and_publish"] = register
+        self.ns["_run_project_reference_image_job"] = self.real_image_job
+        response = self._run(self._body())
+        parent = self.jobs[response["job_id"]]
+        child = captured["child"]
+
+        self.assertEqual(parent["status"], "failed")
+        self.assertEqual(parent["failed_child_job_id"], child["id"])
+        self.assertEqual(parent["failed_child_status"], "failed")
+        self.assertEqual(parent["failed_child_reason"], "model_load_failed")
+        self.assertEqual(parent["failure_details"], {
+            "code": "model_load_failed",
+            "stage": "model_load",
+            "detail": (
+                "The generation model could not be loaded with the available host memory."
+            ),
+            "exception_type": "RuntimeError",
+            "is_oom": False,
+        })
+        self.assertEqual(parent["error"], parent["failure_details"]["detail"])
+        self.assertNotIn("oom_info", parent)
+        self.assertNotIn(private_error, json.dumps(parent))
+        self.assertEqual(self._assets(), [])
+
+    def test_reference_child_cancel_and_blocked_fallbacks_are_bounded(self):
+        cases = (
+            (
+                {
+                    "id": "cancelled-child",
+                    "status": "cancelled",
+                    "error": "private /path/to/input.png",
+                },
+                "cancelled",
+                "child_cancelled",
+            ),
+            (
+                {
+                    "id": "blocked-child",
+                    "status": "queued",
+                    "resource_state": "blocked",
+                    "recovery_state": "blocked_preparation",
+                    "message": "private prompt and traceback",
+                },
+                "blocked",
+                "child_blocked",
+            ),
+        )
+        for snapshot, expected_status, expected_reason in cases:
+            with self.subTest(expected_status=expected_status):
+                updates = self.ns[
+                    "_project_reference_child_failure_updates"
+                ](snapshot)
+                self.assertEqual(
+                    updates["failed_child_job_id"], snapshot["id"],
+                )
+                self.assertEqual(
+                    updates["failed_child_status"], expected_status,
+                )
+                self.assertEqual(
+                    updates["failed_child_reason"], expected_reason,
+                )
+                self.assertRegex(expected_reason, r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+                self.assertNotIn("private", json.dumps(updates))
+
+        invalid = self.ns["_project_reference_child_failure_updates"]({
+            "id": "../private-child",
+            "status": "failed",
+        })
+        self.assertIsNone(invalid["failed_child_job_id"])
+
+    def test_reference_parent_cancel_wins_child_failure_stamp_race(self):
+        lifecycle._reset_queue_state_for_tests()
+        parent = {
+            "id": "cancel-wins-parent",
+            "status": "running",
+            "workspace": "project",
+            "out_dir": str(self.output),
+            "session_id": "owner-session",
+            "source_remote": False,
+            "access_policy": {"private": True, "explicit": False},
+            "hold_after_output": False,
+        }
+        child_started = threading.Event()
+        release_child = threading.Event()
+        captured = {}
+        result = {}
+
+        def register(child, **_kwargs):
+            captured["child"] = child
+
+            def fail_after_release():
+                lifecycle.try_start(child)
+                child_started.set()
+                release_child.wait()
+                lifecycle.finish_job(
+                    child,
+                    "failed",
+                    failure_details={
+                        "code": "generation_failed",
+                        "stage": "generation",
+                        "detail": "private traceback",
+                        "exception_type": "RuntimeError",
+                        "is_oom": False,
+                    },
+                )
+
+            thread = threading.Thread(target=fail_after_release)
+            thread.start()
+            return thread
+
+        def run_parent_call():
+            try:
+                self.real_image_job(
+                    parent,
+                    {
+                        "model_type": "flux2_klein_9b",
+                        "prompt": "synthetic",
+                        "resolution": "64x64",
+                    },
+                    role="identity_front",
+                    phase="Generating panel",
+                    step=1,
+                    total_steps=2,
+                )
+            except Exception as error:
+                result["error"] = str(error)
+
+        with mock.patch.dict(self.ns, {
+            "_queue_recovery_register_and_publish": register,
+            "update_job": lifecycle.update_job,
+            "snapshot_job": lifecycle.snapshot_job,
+            "request_cancel": lifecycle.request_cancel,
+            "set_job_hold": lifecycle.set_job_hold,
+            "is_cancel_requested": lifecycle.is_cancel_requested,
+            "_active_gen_states": {},
+        }):
+            call = threading.Thread(target=run_parent_call)
+            try:
+                call.start()
+                self.assertTrue(child_started.wait(timeout=2))
+                self.assertTrue(lifecycle.request_cancel(parent).changed)
+                release_child.set()
+                call.join(timeout=2)
+                self.assertFalse(call.is_alive())
+            finally:
+                release_child.set()
+                call.join(timeout=2)
+                lifecycle._reset_queue_state_for_tests()
+
+        self.assertEqual(parent["status"], "cancelled")
+        # The child's own terminal failure may win independently, but it cannot
+        # revoke the parent's earlier cancellation or stamp new diagnostics.
+        self.assertEqual(captured["child"]["status"], "failed")
+        self.assertNotIn("failed_child_job_id", parent)
+        self.assertNotIn("failure_details", parent)
+        self.assertEqual(result["error"], "reference_image_generation_failed")
+
+    def test_reference_failed_child_relation_projects_in_status_and_list(self):
+        parent = {
+            "id": "reference-parent",
+            "status": "failed",
+            "progress": 0,
+            "message": "Generation failed.",
+            "output_files": [],
+            "error": "Generation failed.",
+            "created_at": 123.0,
+            "session_id": "owner-session",
+            "failed_child_job_id": "reference-child",
+            "failed_child_status": "failed",
+            "failed_child_reason": "model_load_failed",
+        }
+        child = {
+            "id": "reference-child",
+            "parent_job_id": parent["id"],
+            "status": "failed",
+            "progress": 0,
+            "message": "Generation failed.",
+            "output_files": [],
+            "error": "Generation failed.",
+            "created_at": 124.0,
+            "session_id": "owner-session",
+        }
+        self.jobs.update({parent["id"]: parent, child["id"]: child})
+        request = _Request({})
+        response = types.SimpleNamespace(headers={})
+
+        def owned(job, owner_request):
+            return bool(
+                job
+                and job.get("session_id")
+                == owner_request.state.maestro_session_id
+            )
+
+        endpoint_stubs = {
+            "_set_recovery_no_store": lambda value: value.headers.update({
+                "Cache-Control": "private, no-store",
+            }),
+            "_job_owned_by_request": owned,
+            "_queue_recovery_is_blocked": lambda _job: False,
+            "_job_eta_values": lambda _job: (None, None),
+            "queue_position": lambda _job: None,
+            "_queue_wait_reason_for_job": lambda _job: None,
+            "_public_h3_boundary": lambda _value: None,
+            "public_h3_offload_plan": lambda _value: None,
+            "_public_resource_metadata": lambda _job: {},
+            "_public_queue_residency_metadata": lambda *_args, **_kwargs: {},
+            "_public_progress_telemetry": lambda _job: {},
+            "job_events": lambda *_args: [],
+            "queue_control_state": lambda: {},
+            "_public_queue_recovery_metadata": lambda _job: {},
+        }
+        with mock.patch.dict(self.ns, endpoint_stubs):
+            status = self.ns["get_status"](
+                parent["id"], request, response,
+            )
+            listed = self.ns["list_jobs"](
+                request, types.SimpleNamespace(headers={}),
+            )
+
+            relation = {
+                "failed_child_job_id": "reference-child",
+                "failed_child_status": "failed",
+                "failed_child_reason": "model_load_failed",
+            }
+            self.assertEqual(
+                {key: status[key] for key in relation}, relation,
+            )
+            parent_row = next(
+                item for item in listed["jobs"]
+                if item["job_id"] == parent["id"]
+            )
+            self.assertEqual(
+                {key: parent_row[key] for key in relation}, relation,
+            )
+            self.assertEqual(
+                response.headers["Cache-Control"], "private, no-store",
+            )
+
+            child["session_id"] = "other-session"
+            fenced = self.ns["get_status"](
+                parent["id"], request, types.SimpleNamespace(headers={}),
+            )
+            self.assertIsNone(fenced["failed_child_job_id"])
+            self.assertIsNone(fenced["failed_child_status"])
+            self.assertIsNone(fenced["failed_child_reason"])
+
+            child["session_id"] = "owner-session"
+            child["parent_job_id"] = "different-parent"
+            mismatched = self.ns["get_status"](
+                parent["id"], request, types.SimpleNamespace(headers={}),
+            )
+            self.assertIsNone(mismatched["failed_child_job_id"])
+            self.assertIsNone(mismatched["failed_child_status"])
+            self.assertIsNone(mismatched["failed_child_reason"])
+
+            child["parent_job_id"] = parent["id"]
+            for field, invalid in (
+                ("failed_child_status", "running"),
+                ("failed_child_reason", "private/path"),
+                ("failed_child_reason", "a" * 65),
+            ):
+                with self.subTest(field=field, invalid=invalid):
+                    original = parent[field]
+                    parent[field] = invalid
+                    malformed = self.ns["get_status"](
+                        parent["id"],
+                        request,
+                        types.SimpleNamespace(headers={}),
+                    )
+                    self.assertIsNone(malformed["failed_child_job_id"])
+                    self.assertIsNone(malformed["failed_child_status"])
+                    self.assertIsNone(malformed["failed_child_reason"])
+                    parent[field] = original
 
     def test_reference_output_boundary_holds_then_resumes_without_work(self):
         parent = {

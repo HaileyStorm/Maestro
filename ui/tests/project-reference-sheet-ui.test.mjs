@@ -42,6 +42,12 @@ import {
 } from '../src/api/client.ts'
 
 const componentUrl = new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url)
+const sidebarUrl = new URL('../src/components/Sidebar/Sidebar.tsx', import.meta.url)
+const modelSelectorUrl = new URL('../src/components/Sidebar/ModelSelector.tsx', import.meta.url)
+const blenderUrl = new URL('../src/components/Sidebar/BlenderSceneTool.tsx', import.meta.url)
+const storeUrl = new URL('../src/stores/useStore.ts', import.meta.url)
+const referenceQueueUrl = new URL('../src/lib/referenceQueue.ts', import.meta.url)
+const manualInstallationUrl = new URL('../src/lib/manualInstallation.ts', import.meta.url)
 const clientUrl = new URL('../src/api/client.ts', import.meta.url)
 const typesUrl = new URL('../src/types/index.ts', import.meta.url)
 
@@ -1107,15 +1113,17 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /isProjectAssetOperationCurrent\(submittedProject, epoch, currentProject\.current, projectEpoch\.current\)/)
   assert.match(source, /setPendingSheetActions\(\{\}\)/)
   assert.match(source, /setPendingFreshJobIds\(\[\]\)/)
-  assert.match(source, /await reconnectJobs\(\)/)
+  assert.match(source, /await confirmReconnectedJob\(/)
   assert.doesNotMatch(source, /setInterval/)
   assert.match(source, /workspace\.name === project && workspace\.unlocked === false/)
-  assert.match(source, /disabled=\{browsingUploads \|\| !project \|\| projectExplicitlyLocked\}/)
+  assert.match(source, /disabled=\{browsingUploads \|\| !project\}/)
+  assert.match(source, /aria-disabled=\{projectExplicitlyLocked\}/)
   assert.match(source, /enabled: open && !browsingUploads && !projectExplicitlyLocked/)
   assert.match(source, /Unlock project to use references/)
   assert.match(source, /useLayoutEffect\(\(\) => \{\s+if \(!projectExplicitlyLocked\) return\s+projectEpoch\.current \+= 1/)
-  assert.match(source, /\{open && !projectExplicitlyLocked && \(/)
+  assert.match(source, /\{open && !projectExplicitlyLocked && createPortal\(/)
 
+  assert.match(source, /createPortal\(/)
   assert.match(source, /role="dialog" aria-modal="true"/)
   assert.match(source, /aria-label="Close project references"/)
   assert.match(source, /onKeyDown=\{handleDialogKeyDown\}/)
@@ -1171,7 +1179,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /aria-label="Reference Studio editor model"/)
   assert.match(source, /Open Settings → System → Enabled Models/)
   assert.match(source, /model\.manual_installation\.filename/)
-  assert.match(source, /model\.manual_installation\.destination_hint/)
+  assert.match(source, /manualInstallationDestination\(model\.manual_installation\)/)
   assert.match(source, /model\.manual_installation\.sha256/)
   assert.match(source, /model\.manual_installation\.local_verification_required/)
   assert.match(source, /Local host only · required/)
@@ -1284,4 +1292,107 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.doesNotMatch(source, /job\?\.error/)
   assert.match(source, /projectReferenceSafeErrorMessage\(reason/)
   assert.doesNotMatch(source, /localStorage/)
+})
+
+test('Reference Studio header, catalog races, Moody cards, manifests, and Blender contract stay explicit', async () => {
+  const [source, sidebar, selector, blender, store, manualInstallation] = await Promise.all([
+    readFile(componentUrl, 'utf8'),
+    readFile(sidebarUrl, 'utf8'),
+    readFile(modelSelectorUrl, 'utf8'),
+    readFile(blenderUrl, 'utf8'),
+    readFile(storeUrl, 'utf8'),
+    readFile(manualInstallationUrl, 'utf8'),
+  ])
+
+  assert.match(sidebar, /<ProjectReferenceLibrary header compact \/>/)
+  assert.match(sidebar, /<ProjectReferenceLibrary header \/>/)
+  assert.doesNotMatch(sidebar, /<ProjectReferenceLibrary \/>/)
+  assert.match(source, /header = false/)
+  assert.match(source, /compact = false/)
+  assert.match(source, /enabledModelsSignature/)
+  assert.match(source, /catalogRequestSequence/)
+  assert.match(source, /enabledModelsSignature, modelsLoaded, open, project, projectExplicitlyLocked/)
+  assert.match(source, /catalogSequence !== catalogRequestSequence\.current/)
+  assert.match(source, /createPortal\(/)
+  assert.match(source, /installModalFocus\(/)
+  assert.match(source, /event\.stopPropagation\(\)/)
+  assert.match(source, /aria-haspopup="dialog"/)
+  assert.match(source, /aria-disabled=\{projectExplicitlyLocked\}/)
+  assert.match(source, /projectExplicitlyLocked && <span className="text-\[8px\] text-amber-200">Locked<\/span>/)
+
+  const nameIndex = source.indexOf('id="project-reference-name"')
+  const intentIndex = source.indexOf('>Intent</legend>')
+  assert.ok(nameIndex >= 0 && intentIndex > nameIndex, 'name must precede intent controls')
+  assert.match(source, /aria-label="Moody Krea 2 quick select"/)
+  assert.match(source, /Disabled in Enabled Models/)
+  assert.match(source, /Missing from current catalog/)
+  assert.match(source, /Install and verify locally/)
+  assert.match(source, /setReferenceModelCustomized\(true\)/)
+
+  const reconnectIndex = source.indexOf('await confirmReconnectedJob(')
+  const closeAfterReconnect = source.indexOf('setOpen(false)', reconnectIndex)
+  assert.ok(reconnectIndex >= 0 && closeAfterReconnect > reconnectIndex, 'successful Queue closes only after reconnect')
+  assert.match(source, /manualInstallationDestination\(model\.manual_installation\)/)
+  assert.match(selector, /manualInstallationDestination\(currentModel\.manual_installation\)/)
+  assert.match(manualInstallation, /formatManualInstallationBytes/)
+  assert.match(manualInstallation, /manualInstallationDestination/)
+  assert.match(selector, /Open exact manual download/)
+  assert.match(selector, /Local-only verification:/)
+  assert.match(store, /manual_installation: m\.manual_installation/)
+
+  assert.match(source, /aria-label="Reference creation method"/)
+  assert.match(source, /referenceName=\{name\}/)
+  assert.match(source, /referenceDescription=\{description\}/)
+  assert.match(source, /privateOutput=\{referenceExplicitOutput \|\| privateOutput\}/)
+  assert.match(source, /does not add a durable asset type/)
+  assert.match(blender, /reference_name: resolvedReferenceName/)
+  assert.match(blender, /private_output: privateOutput/)
+  assert.match(blender, /statusRequest/)
+  assert.match(blender, /operationSequence/)
+  assert.match(blender, /isOperationCurrent\(operation\)/)
+  assert.match(blender, /await refreshOutputs\(\)/)
+  assert.match(blender, /setDirectorPlan\(null\)/)
+  assert.match(blender, /workspaceRef\.current === operation\.workspace/)
+  assert.match(blender, /separate reference contract/)
+})
+
+test('Reference queue confirmation rejects reconnect failures and missing job rediscovery', async () => {
+  const { confirmReconnectedJob } = await import(referenceQueueUrl.href)
+  await assert.rejects(
+    confirmReconnectedJob('job-failure', async () => { throw new Error('network down') }, () => []),
+    /network down/,
+  )
+  await assert.rejects(
+    confirmReconnectedJob('job-missing', async () => {}, () => [{ id: 'other-job' }]),
+    /could not be confirmed after reconnect/,
+  )
+  await assert.doesNotReject(
+    confirmReconnectedJob('job-present', async () => {}, () => [{ id: 'job-present' }]),
+  )
+})
+
+test('Blender async work is fenced after unmount and project switches', async () => {
+  const blender = await readFile(blenderUrl, 'utf8')
+
+  assert.match(blender, /const mountedRef = useRef\(false\)/)
+  assert.match(blender, /mountedRef\.current\s+&& operation/)
+  assert.match(blender, /mountedRef\.current = true/)
+  assert.match(
+    blender,
+    /return \(\) => \{\s+mountedRef\.current = false\s+statusRequest\.current \+= 1\s+operationSequence\.current \+= 1\s+activeOperation\.current = null\s+\}/,
+  )
+
+  const finalizeGuard = blender.indexOf('if (!isOperationCurrent(operation)) return false', blender.indexOf('const result = await api.finalizeBlenderScene'))
+  const finalPlanWrite = blender.indexOf('setDirectorPlan(result.final_plan)', finalizeGuard)
+  const finalResultWrite = blender.indexOf('setDirectorFinal(result)', finalPlanWrite)
+  const refreshGuard = blender.indexOf('if (!isOperationCurrent(operation)) return false', finalResultWrite)
+  const refreshCall = blender.indexOf('await refreshOutputs()', refreshGuard)
+  assert.ok(
+    finalizeGuard >= 0
+      && finalPlanWrite > finalizeGuard
+      && finalResultWrite > finalPlanWrite
+      && refreshGuard > finalResultWrite
+      && refreshCall > refreshGuard,
+    'final Director state and output refresh must remain behind the active mounted operation fence',
+  )
 })
