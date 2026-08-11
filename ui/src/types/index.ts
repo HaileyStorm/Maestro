@@ -734,6 +734,11 @@ export interface OutputSearchFilters {
   before?: string
 }
 
+/**
+ * Gallery media kind plus legacy saved-view aliases. The first four values
+ * are the composable media facet; the remaining values retain the existing
+ * Edits, Multi-clip, and Favorites views.
+ */
 export type MediaFilter = 'all' | 'images' | 'videos' | 'audio' | 'avatars' | 'multiclip' | 'favorites'
 export type ArtifactClass = 'final' | 'component' | 'window' | 'temporary'
 export type OutputArtifactScope = 'final' | 'all' | 'components' | 'component' | 'window' | 'temporary'

@@ -29,6 +29,7 @@ class SessionStorageFake {
 }
 
 const mainContentUrl = new URL('../src/components/MainContent/MainContent.tsx', import.meta.url)
+const tabFilterUrl = new URL('../src/components/MainContent/TabFilter.tsx', import.meta.url)
 const mediaFeedItemUrl = new URL('../src/components/MainContent/MediaFeedItem.tsx', import.meta.url)
 const thumbnailsUrl = new URL('../src/components/MainContent/ThumbnailGallery.tsx', import.meta.url)
 const referencesUrl = new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url)
@@ -176,6 +177,151 @@ async function loadThumbnailGalleryHarness() {
     compiledModule.exports,
   )
   return compiledModule.exports.ThumbnailGallery
+}
+
+async function loadTabFilterHarness() {
+  const modules = new Map([
+    ['react', `
+      export function useState(initial) { return globalThis.__tabFilterHooks.useState(initial) }
+      export function useEffect(effect, dependencies) { return globalThis.__tabFilterHooks.useEffect(effect, dependencies) }
+      export function useRef(initial) { return globalThis.__tabFilterHooks.useRef(initial) }
+    `],
+    ['react/jsx-runtime', `
+      export const Fragment = Symbol('Fragment')
+      export function jsx(type, props, key) { return { type, props: props || {}, key } }
+      export const jsxs = jsx
+    `],
+    ['lucide-react', `
+      const icon = props => ({ type: 'svg', props: props || {} })
+      export const Heart = icon
+      export const Film = icon
+      export const Search = icon
+      export const SlidersHorizontal = icon
+      export const X = icon
+    `],
+    ['../../stores/useStore', `
+      export function useStore(selector) { return selector(globalThis.__tabFilterStore) }
+    `],
+  ])
+  const result = await build({
+    entryPoints: [tabFilterUrl.pathname],
+    bundle: true,
+    format: 'cjs',
+    jsx: 'automatic',
+    platform: 'node',
+    write: false,
+    plugins: [{
+      name: 'tab-filter-test-mocks',
+      setup(builder) {
+        builder.onResolve({ filter: /.*/ }, args => (
+          modules.has(args.path) ? { path: args.path, namespace: 'tab-filter-test' } : undefined
+        ))
+        builder.onLoad({ filter: /.*/, namespace: 'tab-filter-test' }, args => ({
+          contents: modules.get(args.path),
+          loader: 'js',
+        }))
+      },
+    }],
+  })
+  const compiledModule = { exports: {} }
+  const require = createRequire(import.meta.url)
+  new Function('require', 'module', 'exports', result.outputFiles[0].text)(
+    require,
+    compiledModule,
+    compiledModule.exports,
+  )
+  return compiledModule.exports.TabFilter
+}
+
+function createTabFilterRuntime(stateSeeds = {}, storeOverrides = {}) {
+  const states = []
+  const stateInitialized = new Set()
+  const refs = []
+  const effects = []
+  const cleanups = []
+  let stateCursor = 0
+  let refCursor = 0
+  const calls = { media: [], artifact: [], search: [], reset: 0 }
+  const store = {
+    mediaFilter: 'all',
+    outputArtifactScope: 'final',
+    outputSearchQuery: '',
+    selectedOutputKeys: ['default\u0000kept.png'],
+    setMediaFilter(value) {
+      calls.media.push(value)
+      store.mediaFilter = value
+      store.selectedOutputKeys = []
+    },
+    setOutputArtifactScope(value) {
+      calls.artifact.push(value)
+      store.outputArtifactScope = value
+      store.selectedOutputKeys = []
+    },
+    setOutputSearchQuery(value) {
+      calls.search.push(value)
+      store.outputSearchQuery = value
+    },
+    resetGalleryFilters() { calls.reset += 1 },
+    ...storeOverrides,
+  }
+  const listeners = new Map()
+  const fakeDocument = {
+    addEventListener(type, listener) { listeners.set(type, listener) },
+    removeEventListener(type, listener) {
+      if (listeners.get(type) === listener) listeners.delete(type)
+    },
+    dispatch(type, event) { listeners.get(type)?.(event) },
+  }
+  const fakeWindow = {
+    setTimeout(callback) { callback(); return 1 },
+    clearTimeout() {},
+    requestAnimationFrame(callback) { callback(); return 1 },
+    cancelAnimationFrame() {},
+  }
+  const hooks = {
+    begin() {
+      stateCursor = 0
+      refCursor = 0
+      effects.length = 0
+    },
+    useState(initial) {
+      const index = stateCursor++
+      if (!stateInitialized.has(index)) {
+        states[index] = Object.hasOwn(stateSeeds, index)
+          ? stateSeeds[index]
+          : typeof initial === 'function' ? initial() : initial
+        stateInitialized.add(index)
+      }
+      return [states[index], value => {
+        states[index] = typeof value === 'function' ? value(states[index]) : value
+      }]
+    },
+    useRef(initial) {
+      const index = refCursor++
+      if (!refs[index]) refs[index] = { current: initial }
+      return refs[index]
+    },
+    useEffect(effect) { effects.push(effect) },
+  }
+  return {
+    calls,
+    cleanups,
+    document: fakeDocument,
+    hooks,
+    refs,
+    states,
+    store,
+    window: fakeWindow,
+    flushEffects() {
+      for (const effect of effects.splice(0)) {
+        const cleanup = effect()
+        if (typeof cleanup === 'function') cleanups.push(cleanup)
+      }
+    },
+    cleanup() {
+      for (const cleanup of cleanups.splice(0).reverse()) cleanup()
+    },
+  }
 }
 
 async function loadProjectAssetPreviewHarness() {
@@ -691,6 +837,186 @@ test('gallery privacy, revocation, and virtualization contracts are wired withou
   const loadWorkspaceScope = store.slice(store.indexOf('loadWorkspaces: async'), store.indexOf('switchWorkspace: async'))
   assert.match(loadWorkspaceScope, /revokedWorkspaces/)
   assert.match(loadWorkspaceScope, /hidePrivatePreviewsForWorkspace\(workspace\)/)
+})
+
+test('gallery uses compact composable media and artifact facets', async () => {
+  const [filters, main, store, client] = await Promise.all([
+    readFile(tabFilterUrl, 'utf8'),
+    readFile(mainContentUrl, 'utf8'),
+    readFile(storeUrl, 'utf8'),
+    readFile(new URL('../src/api/client.ts', import.meta.url), 'utf8'),
+  ])
+
+  assert.match(filters, /aria-controls="gallery-filter-popover"/)
+  assert.match(filters, /aria-labelledby="gallery-filter-title"/)
+  assert.match(filters, /Media, artifact, and metadata selections all combine\./)
+  for (const label of ['All', 'Images', 'Videos', 'Audio', 'Finals', 'Components', 'Windows', 'Temporary']) {
+    assert.match(filters, new RegExp(`label: '${label}'`))
+  }
+  assert.doesNotMatch(filters, /ResizeObserver|overflow-x-auto/)
+  assert.match(filters, /resetGalleryFilters\(\)/)
+  assert.match(store, /resetGalleryFilters: \(\) =>/)
+  assert.match(store, /mediaFilter: 'all'/)
+  assert.match(store, /outputArtifactScope: 'final'/)
+  assert.match(store, /if \(f === get\(\)\.mediaFilter\) return/)
+  assert.match(client, /params\.set\('artifact_scope'/)
+  assert.match(client, /params\.set\('media_type'/)
+
+  const scopeKey = main.slice(main.indexOf('const galleryScopeKey'), main.indexOf('const outputIdentities'))
+  assert.match(scopeKey, /mediaFilter/)
+  assert.match(scopeKey, /outputArtifactScope/)
+  assert.match(scopeKey, /outputSearchQuery/)
+})
+
+test('active Gallery media and quick-view choices are behavioral no-ops', async t => {
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const TabFilter = await loadTabFilterHarness()
+  t.after(() => {
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    delete globalThis.__tabFilterHooks
+    delete globalThis.__tabFilterStore
+  })
+
+  const activeMedia = createTabFilterRuntime({ 1: true })
+  globalThis.window = activeMedia.window
+  globalThis.document = activeMedia.document
+  globalThis.__tabFilterHooks = activeMedia.hooks
+  globalThis.__tabFilterStore = activeMedia.store
+  activeMedia.hooks.begin()
+  const mediaTree = materialize(TabFilter())
+  const allMedia = findElements(mediaTree, element => (
+    element.type === 'button' && element.props?.['data-gallery-filter-initial'] === ''
+  ))[0]
+  assert.ok(allMedia)
+  allMedia.props.onClick()
+  assert.deepEqual(activeMedia.calls.media, [])
+  assert.deepEqual(activeMedia.store.selectedOutputKeys, ['default\u0000kept.png'])
+
+  const activeQuickView = createTabFilterRuntime(
+    { 1: true },
+    { mediaFilter: 'favorites' },
+  )
+  globalThis.window = activeQuickView.window
+  globalThis.document = activeQuickView.document
+  globalThis.__tabFilterHooks = activeQuickView.hooks
+  globalThis.__tabFilterStore = activeQuickView.store
+  activeQuickView.hooks.begin()
+  const quickViewTree = materialize(TabFilter())
+  const favorites = findElements(quickViewTree, element => (
+    element.type === 'button'
+    && element.props?.['aria-pressed'] === true
+    && String(element.props?.children).includes('Favorites')
+  ))[0]
+  assert.ok(favorites)
+  favorites.props.onClick()
+  assert.deepEqual(activeQuickView.calls.media, [])
+  assert.deepEqual(activeQuickView.store.selectedOutputKeys, ['default\u0000kept.png'])
+})
+
+test('Gallery search X clears only free text and preserves structured filters', async t => {
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const TabFilter = await loadTabFilterHarness()
+  const runtime = createTabFilterRuntime(
+    { 0: true },
+    { outputSearchQuery: 'portrait model:"h3" reference:"with"' },
+  )
+  globalThis.window = runtime.window
+  globalThis.document = runtime.document
+  globalThis.__tabFilterHooks = runtime.hooks
+  globalThis.__tabFilterStore = runtime.store
+  t.after(() => {
+    runtime.cleanup()
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    delete globalThis.__tabFilterHooks
+    delete globalThis.__tabFilterStore
+  })
+
+  runtime.hooks.begin()
+  const tree = materialize(TabFilter())
+  const clearSearch = findElements(tree, element => (
+    element.type === 'button'
+    && element.props?.['aria-label'] === 'Clear search text and close search'
+  ))[0]
+  assert.ok(clearSearch)
+  clearSearch.props.onClick()
+  assert.equal(runtime.calls.search.at(-1), 'model:"h3" reference:"with"')
+  assert.equal(runtime.states[0], false)
+  assert.deepEqual(runtime.states[3], { model: 'h3', reference: 'with' })
+})
+
+test('Gallery filter popover transfers focus and dismisses on Escape or outside pointer', async t => {
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const TabFilter = await loadTabFilterHarness()
+  t.after(() => {
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    delete globalThis.__tabFilterHooks
+    delete globalThis.__tabFilterStore
+  })
+
+  const escapeRuntime = createTabFilterRuntime()
+  globalThis.window = escapeRuntime.window
+  globalThis.document = escapeRuntime.document
+  globalThis.__tabFilterHooks = escapeRuntime.hooks
+  globalThis.__tabFilterStore = escapeRuntime.store
+  escapeRuntime.hooks.begin()
+  let tree = materialize(TabFilter())
+  let trigger = findElements(tree, element => element.props?.['aria-controls'] === 'gallery-filter-popover')[0]
+  const triggerNode = { focusCount: 0, focus() { this.focusCount += 1 }, contains() { return false } }
+  trigger.props.ref.current = triggerNode
+  trigger.props.onClick()
+  assert.equal(escapeRuntime.states[1], true)
+
+  escapeRuntime.hooks.begin()
+  tree = materialize(TabFilter())
+  trigger = findElements(tree, element => element.props?.['aria-controls'] === 'gallery-filter-popover')[0]
+  trigger.props.ref.current = triggerNode
+  const dialog = findElements(tree, element => element.props?.id === 'gallery-filter-popover')[0]
+  const initialControl = { focusCount: 0, focus() { this.focusCount += 1 } }
+  dialog.props.ref.current = {
+    contains() { return false },
+    querySelector() { return initialControl },
+  }
+  escapeRuntime.flushEffects()
+  assert.equal(initialControl.focusCount, 1)
+  let prevented = 0
+  let propagationStopped = 0
+  escapeRuntime.document.dispatch('keydown', {
+    key: 'Escape',
+    preventDefault() { prevented += 1 },
+    stopPropagation() { propagationStopped += 1 },
+  })
+  assert.equal(escapeRuntime.states[1], false)
+  assert.equal(prevented, 1)
+  assert.equal(propagationStopped, 1)
+  assert.equal(triggerNode.focusCount, 1)
+  escapeRuntime.cleanup()
+
+  const outsideRuntime = createTabFilterRuntime({ 1: true })
+  globalThis.window = outsideRuntime.window
+  globalThis.document = outsideRuntime.document
+  globalThis.__tabFilterHooks = outsideRuntime.hooks
+  globalThis.__tabFilterStore = outsideRuntime.store
+  outsideRuntime.hooks.begin()
+  tree = materialize(TabFilter())
+  trigger = findElements(tree, element => element.props?.['aria-controls'] === 'gallery-filter-popover')[0]
+  const outsideTrigger = { focusCount: 0, focus() { this.focusCount += 1 }, contains() { return false } }
+  trigger.props.ref.current = outsideTrigger
+  const outsideDialog = findElements(tree, element => element.props?.id === 'gallery-filter-popover')[0]
+  outsideDialog.props.ref.current = {
+    contains() { return false },
+    querySelector() { return { focus() {} } },
+  }
+  outsideRuntime.flushEffects()
+  outsideRuntime.document.dispatch('pointerdown', { target: {} })
+  assert.equal(outsideRuntime.states[1], false)
+  assert.equal(outsideTrigger.focusCount, 0)
+  outsideRuntime.cleanup()
 })
 
 test('last thumbnail consumer abort releases an active private-video decode', async t => {

@@ -144,6 +144,7 @@ _RECOVERY_FIXED_ROLES = {
     "h3_segment": "component",
     "h3_concat": "final",
     "h3_delivery": "final",
+    "director_rejoin": "final",
 }
 
 

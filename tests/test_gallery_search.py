@@ -338,6 +338,18 @@ class ArtifactClassificationTests(unittest.TestCase):
             {"delivery.mp4"},
         )
 
+    def test_director_rejoin_is_a_modern_final_not_a_component(self):
+        classes = classify_gallery_artifacts([
+            {
+                "name": "director_rejoin_pipeline-1.mp4",
+                "meta": {
+                    "producer_unit_kind": "director_rejoin",
+                    "artifact_class": "component",
+                },
+            },
+        ])
+        self.assertEqual(classes["director_rejoin_pipeline-1.mp4"], "final")
+
     def test_default_all_and_components_scopes_never_discard_artifacts(self):
         finals = {name for name, cls in self.classes.items() if artifact_matches_scope(cls, ArtifactScope.FINAL)}
         all_files = {name for name, cls in self.classes.items() if artifact_matches_scope(cls, ArtifactScope.ALL)}
@@ -553,8 +565,14 @@ class GalleryApiUiContractTests(unittest.TestCase):
         with open(os.path.join(_ROOT, "ui", "src", "components", "MainContent", "MediaFeedItem.tsx"), "r", encoding="utf-8") as handle:
             item = handle.read()
         self.assertIn("params.set('artifact_scope'", client)
+        self.assertIn("params.set('media_type'", client)
         for label in ("Finals", "All", "Components", "Windows", "Temporary"):
             self.assertIn(f"label: '{label}'", tabs)
+        for label in ("Images", "Videos", "Audio"):
+            self.assertIn(f"label: '{label}'", tabs)
+        self.assertIn('role="dialog"', tabs)
+        self.assertIn('aria-controls="gallery-filter-popover"', tabs)
+        self.assertIn('Media, artifact, and metadata selections all combine.', tabs)
         self.assertIn("deleteOutputComponents(file.name, file.workspace)", item)
         self.assertIn("params.set('delete_components', 'true')", client)
         self.assertIn("params.set('workspace', workspace)", client)
@@ -581,7 +599,7 @@ class GalleryApiUiContractTests(unittest.TestCase):
             Path(_ROOT) / "ui" / "src" / "components" / "MainContent" / "MainContent.tsx"
         ).read_text(encoding="utf-8"))
         self.assertIn("clearTimeout(debounceRef.current)", tabs)
-        self.assertIn("setSearchQuery('')", tabs)
+        self.assertIn("setSearchQuery(buildOutputSearchQuery('', filters))", tabs)
 
     def test_metadata_filters_are_composed_before_output_pagination(self):
         launch = (Path(_APP_DIR) / "launch.py").read_text(encoding="utf-8")
@@ -600,14 +618,21 @@ class GalleryApiUiContractTests(unittest.TestCase):
         self.assertIn("buildOutputSearchQuery", tabs)
         self.assertIn("OUTPUT_SEARCH_FIELDS", client)
 
-    def test_filter_groups_wrap_whole_and_compact_from_available_width(self):
+    def test_gallery_facets_use_one_compact_popover_not_a_long_chip_row(self):
         tabs = (Path(_ROOT) / "ui" / "src" / "components" / "MainContent" / "TabFilter.tsx").read_text(encoding="utf-8")
         main = (Path(_ROOT) / "ui" / "src" / "components" / "MainContent" / "MainContent.tsx").read_text(encoding="utf-8")
 
-        self.assertIn("basis-[42rem] flex-wrap", tabs)
-        self.assertIn("new ResizeObserver(updateLayout)", tabs)
-        self.assertIn("getBoundingClientRect().width < 760", tabs)
-        self.assertIn("shortLabel: 'Edits'", tabs)
+        self.assertIn('aria-haspopup="dialog"', tabs)
+        self.assertIn('aria-controls="gallery-filter-popover"', tabs)
+        self.assertIn('aria-labelledby="gallery-filter-title"', tabs)
+        self.assertIn('Media type', tabs)
+        self.assertIn('Artifact', tabs)
+        self.assertIn('Quick view', tabs)
+        self.assertIn('Reset all', tabs)
+        self.assertIn("event.key !== 'Escape'", tabs)
+        self.assertIn("document.addEventListener('pointerdown'", tabs)
+        self.assertIn("filterTriggerRef.current?.focus()", tabs)
+        self.assertNotIn("new ResizeObserver(updateLayout)", tabs)
         self.assertNotIn("overflow-x-auto", tabs)
         self.assertIn("items-start justify-between", main)
 
@@ -643,13 +668,26 @@ class GalleryApiUiContractTests(unittest.TestCase):
         delete_scope = store[delete_start:store.index("storageDashboardOpen:", delete_start)]
         self.assertIn("selectedOutputKeys: []", delete_scope)
 
+        implementation_start = store.index("outputs: []", store.index("loraPickerSort:"))
         for start, end in (
             ("setMediaFilter: (f)", "setOutputArtifactScope:"),
             ("setOutputArtifactScope: (scope)", "setOutputSearchQuery:"),
-            ("setOutputSearchQuery: (q)", "filteredOutputs:"),
+            ("setOutputSearchQuery: (q)", "resetGalleryFilters:"),
+            ("resetGalleryFilters: ()", "filteredOutputs:"),
         ):
-            action = store[store.index(start):store.index(end, store.index(start))]
+            action_start = store.index(start, implementation_start)
+            action = store[action_start:store.index(end, action_start)]
             self.assertIn("selectedOutputKeys: []", action)
+
+        media_action_start = store.index("setMediaFilter: (f)", implementation_start)
+        media_action = store[media_action_start:store.index("setOutputArtifactScope:", media_action_start)]
+        self.assertIn("if (f === get().mediaFilter) return", media_action)
+
+        reset_start = store.index("resetGalleryFilters: ()", implementation_start)
+        reset = store[reset_start:store.index("filteredOutputs:", reset_start)]
+        self.assertIn("mediaFilter: 'all'", reset)
+        self.assertIn("outputArtifactScope: 'final'", reset)
+        self.assertIn("gallerySelectionMode: false", reset)
 
         main = (Path(_ROOT) / "ui" / "src" / "components" / "MainContent" / "MainContent.tsx").read_text(encoding="utf-8")
         self.assertNotIn("clearOutputSelection = useStore", main)
@@ -657,6 +695,26 @@ class GalleryApiUiContractTests(unittest.TestCase):
         self.assertIn("feedEl.scrollTo({ top: 0, behavior: 'auto' })", main)
         self.assertIn("viewportAnchor", main)
         self.assertIn("intraItemOffset", main)
+        scope_key = main[main.index("const galleryScopeKey"):main.index("const outputIdentities")]
+        self.assertIn("mediaFilter", scope_key)
+        self.assertIn("outputArtifactScope", scope_key)
+        self.assertIn("outputSearchQuery", scope_key)
+
+    def test_gallery_facets_are_applied_after_authorization_and_before_pagination(self):
+        launch = (Path(_APP_DIR) / "launch.py").read_text(encoding="utf-8")
+        route = launch[
+            launch.index('@api.get("/api/v1/outputs")'):
+            launch.index('@api.get("/api/v1/file/{filename:path}")')
+        ]
+        authorization = route.index("can_access_output")
+        artifact_filter = route.index("artifact_matches_scope")
+        media_filter = route.index("normalized_media_type")
+        total = route.index("total = len(files)")
+        pagination = route.index("files = files[offset:offset + limit]")
+        self.assertLess(authorization, artifact_filter)
+        self.assertLess(artifact_filter, media_filter)
+        self.assertLess(media_filter, total)
+        self.assertLess(total, pagination)
 
 
 if __name__ == "__main__":

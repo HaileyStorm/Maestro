@@ -2236,6 +2236,7 @@ interface AppState {
   setMediaFilter: (f: MediaFilter) => void
   setOutputArtifactScope: (scope: OutputArtifactScope) => void
   setOutputSearchQuery: (q: string) => void
+  resetGalleryFilters: () => void
   filteredOutputs: () => OutputFile[]
   outputsLoading: boolean
   loadOutputs: () => Promise<boolean>
@@ -9805,6 +9806,7 @@ export const useStore = create<AppState>((set, get) => ({
   outputArtifactScope: 'final',
   outputSearchQuery: '',
   setMediaFilter: (f) => {
+    if (f === get().mediaFilter) return
     _metadataRequestGeneration++
     set({
       mediaFilter: f,
@@ -9832,6 +9834,7 @@ export const useStore = create<AppState>((set, get) => ({
     get().loadOutputs()
   },
   setOutputSearchQuery: (q) => {
+    if (q === get().outputSearchQuery) return
     _metadataRequestGeneration++
     set({
       outputSearchQuery: q,
@@ -9843,6 +9846,29 @@ export const useStore = create<AppState>((set, get) => ({
     })
     // Reload on both entry and clear; otherwise a cleared search could leave
     // stale results under a client-side media filter.
+    get().loadOutputs()
+  },
+  resetGalleryFilters: () => {
+    const {
+      mediaFilter, outputArtifactScope, outputSearchQuery,
+    } = get()
+    if (
+      mediaFilter === 'all'
+      && outputArtifactScope === 'final'
+      && !outputSearchQuery
+    ) return
+    _metadataRequestGeneration++
+    set({
+      mediaFilter: 'all',
+      outputArtifactScope: 'final',
+      outputSearchQuery: '',
+      selectedOutput: 0,
+      selectedOutputMeta: null,
+      selectedOutputMetaName: null,
+      metadataLoading: false,
+      selectedOutputKeys: [],
+      gallerySelectionMode: false,
+    })
     get().loadOutputs()
   },
   filteredOutputs: () => {
