@@ -31,7 +31,7 @@ async function loadStoreMappers() {
 }
 
 async function loadJobPlaceholder() {
-  const source = `${await readFile(mainUrl, 'utf8')}\nexport { JobPlaceholder, QueuePanel }\n`
+  const source = `${await readFile(mainUrl, 'utf8')}\nexport { describeResourceExecution, JobPlaceholder, QueuePanel }\n`
   const result = await build({
     stdin: {
       contents: source,
@@ -157,6 +157,32 @@ const cpuDescriptor = {
   state: 'running',
   execution_attempt: 7,
 }
+
+test('standard text execution is named GPU text with a concrete CPU contrast', async () => {
+  const { describeResourceExecution } = await loadJobPlaceholder()
+  const running = describeResourceExecution({
+    intent: 'text',
+    execution: 'standard',
+    preemptible: false,
+    preemption_mode: 'none',
+    state: 'running',
+    execution_attempt: 1,
+  })
+  assert.equal(running.label, 'GPU text')
+  assert.match(running.title, /planning or review text step/i)
+  assert.match(running.title, /GPU execution/i)
+  assert.match(running.title, /CPU-only text lane/i)
+
+  const queued = describeResourceExecution({
+    intent: 'text',
+    execution: 'standard',
+    preemptible: false,
+    preemption_mode: 'none',
+    state: 'queued',
+    execution_attempt: 1,
+  })
+  assert.equal(queued.label, 'GPU text queued')
+})
 
 test('status and queue mappers preserve the bounded resource descriptor across legacy responses', async () => {
   const { _jobStatusDetails, _queueJobDetails } = await loadStoreMappers()

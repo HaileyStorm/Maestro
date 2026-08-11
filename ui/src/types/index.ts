@@ -174,7 +174,17 @@ export interface LoraParameterDefinition {
 export interface LoraParameterSchema {
   schema_version: 1
   schema_digest: string
-  schema_source?: 'maestro_sidecar' | 'civitai_sidecar'
+  schema_source?: 'maestro_sidecar' | 'civitai_sidecar' | 'server_known_contract'
+  trigger_disclosure?: {
+    source: 'server_known_contract'
+    activation_phrases: Array<{
+      parameter_id: string
+      value: string | boolean
+      text: string
+    }>
+    scopes: ['generation']
+    roles: string[]
+  }
   parameters: LoraParameterDefinition[]
 }
 

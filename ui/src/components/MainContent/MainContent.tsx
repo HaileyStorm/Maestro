@@ -134,15 +134,15 @@ function describeResourceExecution(
 
   return {
     label: descriptor.state === 'queued'
-      ? 'Accelerated text queued'
+      ? 'GPU text queued'
       : descriptor.state === 'admitted'
-        ? 'Starting accelerated text'
+        ? 'Starting GPU text'
         : descriptor.state === 'blocked'
-          ? 'Accelerated text waiting'
+          ? 'GPU text waiting'
           : descriptor.state === 'released'
             ? 'Text resources released'
-            : 'Accelerated text',
-    title: 'This text step is using accelerated execution.',
+            : 'GPU text',
+    title: 'This planning or review text step is using GPU execution rather than the slower CPU-only text lane.',
     tone: descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'accelerated',
   }
 }

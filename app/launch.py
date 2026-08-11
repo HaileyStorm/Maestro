@@ -7463,6 +7463,40 @@ _PROJECT_REFERENCE_LORA_PARAMETER_TYPES = frozenset({
 _PROJECT_REFERENCE_LORA_PARAMETER_SCOPES = frozenset({
     "generation", "editing",
 })
+_PROJECT_REFERENCE_BREAST_SIZE_LORA = {
+    "contract_id": "breast_size_v1",
+    "filename": "BreastSize-000001.safetensors",
+    "size_bytes": 332_548_896,
+    "sha256": "18d59be2361418f861383e5470c5013620ea7ccec0e44924e4c606c3e88a787f",
+    "model_id": 2_201_959,
+    "version_id": 2_479_253,
+    "base_model": "Flux.2 D",
+    "compatible_architectures": ("flux2_dev", "pi_flux2"),
+    "trained_words": (
+        "tiny breasts", "small breasts", "saggy breasts",
+        "breast implants", "huge breasts", "skin detail",
+    ),
+    "roles": (
+        "canonical_identity", "turnaround", "expressions", "wardrobe",
+        "identity_details",
+    ),
+}
+_PROJECT_REFERENCE_SEXGOD_LORA = {
+    "contract_id": "female_nude_style_v1",
+    "filename": "SexGod_Flux2D_FemaleNudeStyle_v1.safetensors",
+    "size_bytes": 780_200_696,
+    "sha256": "00db73439bd87c77f4153abfaab61abaa27eea116aa864d60a6d96daa58a9186",
+    "model_id": 2_604_891,
+    "version_id": 2_924_930,
+    "base_model": "Flux.2 D",
+    "compatible_architectures": ("flux2_dev", "pi_flux2"),
+    "trained_words": (),
+    "roles": _PROJECT_REFERENCE_BREAST_SIZE_LORA["roles"],
+}
+_PROJECT_REFERENCE_KNOWN_LORAS = (
+    _PROJECT_REFERENCE_BREAST_SIZE_LORA,
+    _PROJECT_REFERENCE_SEXGOD_LORA,
+)
 
 
 def _project_reference_private_commitment(value) -> str:
@@ -7876,6 +7910,169 @@ def _read_lora_parameter_schema(candidates):
     return None
 
 
+def _project_reference_known_lora_parameter_schema(model_type, weight_path):
+    """Return an exact server-known contract without trusting a lookalike.
+
+    The relatively cheap identity checks are sufficient for catalog/request
+    discovery. The expected content digest travels with the resolved schema
+    and is enforced during the durable worker's existing resource-freeze pass.
+    """
+    try:
+        architecture = wgp.get_base_model_type(model_type)
+    except Exception:
+        return None
+    if os.path.islink(weight_path):
+        return None
+    candidates = _project_reference_lora_schema_sidecars(
+        model_type, weight_path,
+    )
+    contract = None
+    for candidate in _PROJECT_REFERENCE_KNOWN_LORAS:
+        if (
+            architecture not in candidate["compatible_architectures"]
+            or os.path.basename(weight_path) != candidate["filename"]
+        ):
+            continue
+        try:
+            if os.path.getsize(weight_path) != candidate["size_bytes"]:
+                continue
+        except OSError:
+            continue
+        for path, source in candidates:
+            if (
+                source != "civitai_sidecar"
+                or not os.path.isfile(path)
+                or os.path.islink(path)
+            ):
+                continue
+            try:
+                if os.path.getsize(path) > 1_048_576:
+                    continue
+                with open(path, "r", encoding="utf-8") as handle:
+                    metadata = json.load(handle)
+            except (OSError, TypeError, ValueError):
+                continue
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("modelId") == candidate["model_id"]
+                and metadata.get("versionId") == candidate["version_id"]
+                and metadata.get("baseModel") == candidate["base_model"]
+                and metadata.get("trainedWords") == list(candidate["trained_words"])
+            ):
+                contract = candidate
+                break
+        if contract is not None:
+            break
+    if contract is None:
+        return None
+
+    roles = list(contract["roles"])
+    if contract["contract_id"] == "breast_size_v1":
+        options = [
+            ("tiny", "Tiny", "tiny breasts"),
+            ("small", "Small", "small breasts"),
+            ("saggy", "Saggy", "saggy breasts"),
+            ("implants", "Implants", "breast implants"),
+            ("huge", "Huge", "huge breasts"),
+        ]
+        parameter_schema = {
+            "schema_version": 1,
+            "parameters": [{
+                "id": "breast_size",
+                "label": "Breast size",
+                "description": "Select the exact creator-authored activation phrase.",
+                "type": "enum",
+                "required": True,
+                "scopes": ["generation"],
+                "roles": roles,
+                "options": [{
+                    "value": value,
+                    "label": label,
+                    "prompt_fragment": phrase,
+                } for value, label, phrase in options],
+            }, {
+                "id": "skin_detail",
+                "label": "Skin detail",
+                "description": "Apply the creator-authored skin-detail activation phrase.",
+                "type": "boolean",
+                "default": True,
+                "required": False,
+                "scopes": ["generation"],
+                "roles": roles,
+                "true_prompt_fragment": "skin detail",
+                "false_prompt_fragment": "",
+            }],
+        }
+        activation_phrases = [
+            *({
+                "parameter_id": "breast_size",
+                "value": value,
+                "text": phrase,
+            } for value, _label, phrase in options),
+            {
+                "parameter_id": "skin_detail",
+                "value": True,
+                "text": "skin detail",
+            },
+        ]
+    else:
+        parameter_schema = {
+            "schema_version": 1,
+            "parameters": [{
+                "id": "activation_keyword",
+                "label": "Use creator activation keyword",
+                "description": "Apply the creator-published activation keyword.",
+                "type": "boolean",
+                "default": True,
+                "required": False,
+                "scopes": ["generation"],
+                "roles": roles,
+                "true_prompt_fragment": "femalenudestyle",
+                "false_prompt_fragment": "",
+            }],
+        }
+        activation_phrases = [{
+            "parameter_id": "activation_keyword",
+            "value": True,
+            "text": "femalenudestyle",
+        }]
+    schema = _normalize_lora_parameter_schema(parameter_schema)
+    schema.update({
+        "schema_source": "server_known_contract",
+        "_expected_source_sha256": contract["sha256"],
+        "_activation_parameter_id": (
+            "breast_size"
+            if contract["contract_id"] == "breast_size_v1"
+            else "activation_keyword"
+        ),
+        "_public_trigger_disclosure": {
+            "source": "server_known_contract",
+            "activation_phrases": activation_phrases,
+            "scopes": ["generation"],
+            "roles": roles,
+        },
+    })
+    return schema
+
+
+def _project_reference_lora_parameter_schema(model_type, weight_path):
+    """Resolve owner schema, then exact known contract, then imported schema."""
+    candidates = _project_reference_lora_schema_sidecars(
+        model_type, weight_path,
+    )
+    owner = [item for item in candidates if item[1] == "maestro_sidecar"]
+    schema = _read_lora_parameter_schema(owner)
+    if schema is not None:
+        return schema
+    schema = _project_reference_known_lora_parameter_schema(
+        model_type, weight_path,
+    )
+    if schema is not None:
+        return schema
+    imported = [item for item in candidates if item[1] == "civitai_sidecar"]
+    return _read_lora_parameter_schema(imported)
+
+
 def _public_lora_parameter_schema(schema):
     if not isinstance(schema, dict):
         return None
@@ -7892,12 +8089,20 @@ def _public_lora_parameter_schema(schema):
                 for item in definition["options"]
             ]
         public_parameters.append(public)
-    return {
+    result = {
         "schema_version": 1,
         "schema_digest": schema["schema_digest"],
         "schema_source": schema["schema_source"],
         "parameters": public_parameters,
     }
+    if (
+        schema.get("schema_source") == "server_known_contract"
+        and isinstance(schema.get("_public_trigger_disclosure"), dict)
+    ):
+        result["trigger_disclosure"] = copy.deepcopy(
+            schema["_public_trigger_disclosure"],
+        )
+    return result
 
 
 def _normalize_lora_parameter_values(
@@ -10188,8 +10393,8 @@ def list_loras_details(model_type: str):
             except Exception:
                 meta = None
         try:
-            parameter_schema = _read_lora_parameter_schema(
-                _project_reference_lora_schema_sidecars(model_type, f),
+            parameter_schema = _project_reference_lora_parameter_schema(
+                model_type, f,
             )
         except ValueError:
             parameter_schema = None
@@ -16250,7 +16455,8 @@ def _project_reference_sha256_file(path):
 
 def _project_reference_resolve_additional_loras(
     value, *, generation_model, editor_model, operation_models=None,
-    freeze=False, commitment_contexts=None,
+    operation_roles=None, reference_type=None, freeze=False,
+    commitment_contexts=None,
 ):
     """Validate compatibility cheaply, then optionally freeze file identity.
 
@@ -16286,6 +16492,20 @@ def _project_reference_resolve_additional_loras(
         )
     ):
         raise HTTPException(status_code=400, detail="Invalid operation model scope")
+    if operation_roles is not None and (
+        not isinstance(operation_roles, dict)
+        or set(operation_roles) != {"generation", "editing"}
+        or any(
+            not isinstance(roles, (list, tuple))
+            or any(not isinstance(role, str) or not role for role in roles)
+            for roles in operation_roles.values()
+        )
+    ):
+        raise HTTPException(status_code=400, detail="Invalid operation role scope")
+    if reference_type is not None and (
+        not isinstance(reference_type, str) or not reference_type
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Reference type scope")
     resolved = []
     seen = set()
     for item in value:
@@ -16337,19 +16557,17 @@ def _project_reference_resolve_additional_loras(
                     paths = []
                     break
                 real_path = os.path.realpath(path)
-                parameter_schema = None
-                if parameterized_request:
-                    try:
-                        parameter_schema = _read_lora_parameter_schema(
-                            _project_reference_lora_schema_sidecars(
-                                model, real_path,
-                            ),
-                        )
-                    except ValueError as error:
+                try:
+                    parameter_schema = _project_reference_lora_parameter_schema(
+                        model, real_path,
+                    )
+                except ValueError as error:
+                    if parameterized_request:
                         raise HTTPException(
                             status_code=400,
                             detail="Additional LoRA parameter schema is invalid",
                         ) from error
+                    parameter_schema = None
                 paths.append((model, real_path, parameter_schema))
             if paths:
                 compatible[scope] = tuple(paths)
@@ -16390,6 +16608,14 @@ def _project_reference_resolve_additional_loras(
             for scope in resolved_scopes
             for _model, _path, schema in compatible[scope]
         ]
+        if not parameterized_request:
+            selected_schemas = [
+                schema for schema in selected_schemas
+                if (
+                    schema is not None
+                    and schema.get("schema_source") == "server_known_contract"
+                )
+            ]
         schema_digests = {
             schema["schema_digest"]
             for schema in selected_schemas
@@ -16406,6 +16632,17 @@ def _project_reference_resolve_additional_loras(
         selected_schema = next(
             (schema for schema in selected_schemas if schema is not None), None,
         )
+        if (
+            not parameterized_request
+            and selected_schema is not None
+            and selected_schema.get("schema_source") == "server_known_contract"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Server-known LoRA requires its published parameters",
+            )
+        if not parameterized_request:
+            selected_schema = None
         if selected_schema is None and parameterized_request:
             raise HTTPException(
                 status_code=400,
@@ -16448,6 +16685,51 @@ def _project_reference_resolve_additional_loras(
                 status_code=400,
                 detail="Invalid additional LoRA parameter values",
             ) from error
+        if (
+            selected_schema is not None
+            and selected_schema.get("schema_source") == "server_known_contract"
+        ):
+            if reference_type is not None and reference_type != "character":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Server-known character LoRA is not applicable to "
+                        "the selected Reference type"
+                    ),
+                )
+        if (
+            selected_schema is not None
+            and selected_schema.get("schema_source") == "server_known_contract"
+            and operation_roles is not None
+        ):
+            activation_definition = next(
+                (
+                    definition for definition in selected_schema["parameters"]
+                    if definition["id"]
+                    == selected_schema.get("_activation_parameter_id")
+                ),
+                None,
+            )
+            for operation_scope in resolved_scopes:
+                applicable_roles = operation_roles.get(operation_scope, ())
+                if (
+                    activation_definition is None
+                    or operation_scope not in activation_definition["scopes"]
+                    or (
+                        activation_definition["roles"]
+                        and not any(
+                            role in activation_definition["roles"]
+                            for role in applicable_roles
+                        )
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Server-known LoRA trigger is not applicable to "
+                            "the selected Reference roles"
+                        ),
+                    )
         sources = {}
         revisions = {}
         for scope in resolved_scopes:
@@ -16455,7 +16737,23 @@ def _project_reference_resolve_additional_loras(
             scope_revisions = {}
             for model, path, _schema in compatible[scope]:
                 if freeze:
-                    scope_sources[model] = _project_reference_sha256_file(path)
+                    actual_sha256 = _project_reference_sha256_file(path)
+                    expected_sha256 = (
+                        selected_schema.get("_expected_source_sha256")
+                        if selected_schema is not None else None
+                    )
+                    if (
+                        expected_sha256 is not None
+                        and not hmac.compare_digest(actual_sha256, expected_sha256)
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Additional LoRA source does not match its "
+                                "server-known contract"
+                            ),
+                        )
+                    scope_sources[model] = actual_sha256
                 sidecar = os.path.splitext(path)[0] + ".civitai.json"
                 revision = "pending"
                 if freeze:
@@ -16484,6 +16782,10 @@ def _project_reference_resolve_additional_loras(
             ),
             "parameter_schema_digest": (
                 selected_schema["schema_digest"]
+                if selected_schema is not None else None
+            ),
+            "expected_source_sha256": (
+                selected_schema.get("_expected_source_sha256")
                 if selected_schema is not None else None
             ),
             "parameter_commitment_context": parameter_commitment_context,
@@ -16818,6 +17120,26 @@ def _project_reference_request_config(
         field: [item.private_metadata() for item in items]
         for field, items in sealed_type_fields
     }
+    explicit_convenience = body.get("explicit_output") is True
+    if asset_type == "character" and explicit_convenience:
+        nude_anatomy = {
+            "id": "anatomy:nude-anatomy",
+            "label": "nude anatomy",
+            "custom": False,
+            "group": "anatomy",
+        }
+        if (
+            preset != "anatomy"
+            or anchor_basis != "anatomy"
+            or nude_anatomy not in normalized_type_fields.get("poses", [])
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Explicit character references require the Anatomy preset, "
+                    "an anatomy anchor, and the canonical nude anatomy field"
+                ),
+            )
     legacy_type_fields = {
         "poses": {"character", "creature"},
         "outfits": {"character"},
@@ -16843,7 +17165,6 @@ def _project_reference_request_config(
             detail="Draft mode does not support editor-dependent detail callouts",
         )
 
-    explicit_convenience = body.get("explicit_output") is True
     content_capability = body.get("content_capability")
     if content_capability is None:
         content_capability = (
@@ -17081,6 +17402,12 @@ def _project_reference_request_config(
             if route["operation"] != "generation" and route["resolved_model"]
         )),
     }
+    operation_roles = {
+        "generation": tuple(
+            available_roles if mode == "draft" else available_roles[:1]
+        ),
+        "editing": tuple(() if mode == "draft" else available_roles[1:]),
+    }
 
     resolution = body.get("resolution")
     resolution_size = (
@@ -17118,6 +17445,8 @@ def _project_reference_request_config(
         generation_model=model_type,
         editor_model=editor_model_type,
         operation_models=operation_models,
+        operation_roles=operation_roles,
+        reference_type=asset_type,
         commitment_contexts=commitment_contexts,
     )
 
@@ -17176,6 +17505,7 @@ def _project_reference_request_config(
         "intelligence_recipe": intelligence_recipe,
         "operation_routing": operation_routing,
         "operation_models": operation_models,
+        "operation_roles": operation_roles,
         "additional_loras": additional_loras,
         "planning": planning_selection,
         "review_selection": review_selection,
@@ -18481,6 +18811,8 @@ async def generate_project_asset_references(project: str, request: Request):
                     generation_model=config["model_type"],
                     editor_model=config.get("editor_model_type"),
                     operation_models=config["operation_models"],
+                    operation_roles=config["operation_roles"],
+                    reference_type=config["asset_type"],
                     freeze=True,
                     commitment_contexts={
                         item["id"]: item["parameter_commitment_context"]
@@ -18501,6 +18833,7 @@ async def generate_project_asset_references(project: str, request: Request):
                             for key in (
                                 "multiplier", "requested_scope",
                                 "resolved_scopes", "parameter_schema_digest",
+                                "expected_source_sha256",
                                 "parameter_commitment_context",
                                 "parameter_values", "parameter_values_digest",
                                 "parameter_expansion_digest", "skipped_reason",

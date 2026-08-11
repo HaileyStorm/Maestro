@@ -17,6 +17,7 @@ import {
   getProjectAssetComponentOutputs,
   getProjectAssetMediaUrl,
   getProjectReferenceEditorModels,
+  getProjectReferenceExplicitConvenienceState,
   getProjectReferenceGenerationModels,
   getProjectReferencePreferredGenerationModel,
   getProjectReferenceModelAvailabilityCopy,
@@ -32,6 +33,7 @@ import {
   hasProjectReferenceLoraParameterSummary,
   isProjectReferenceReviewMandatory,
   isProjectReferenceReviewerEligible,
+  isProjectReferenceExplicitCharacterStateValid,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
   loadLlm,
@@ -139,6 +141,27 @@ function LoraParameterFields({
   return (
     <fieldset className="mt-1.5 space-y-1.5 rounded border border-accent-blue/20 bg-bg-primary/40 p-1.5">
       <legend className="px-1 text-[8px] font-medium text-accent-blue">LoRA inputs</legend>
+      {schema.trigger_disclosure && (
+        <div className="rounded border border-amber-400/20 bg-amber-400/5 p-1.5 text-[8px] text-text-muted" aria-label={`${loraId} published activation phrases`}>
+          <p className="font-medium text-amber-200">Known activation phrases</p>
+          <ul className="mt-0.5 space-y-0.5">
+            {schema.trigger_disclosure.activation_phrases.map(phrase => {
+              const parameter = schema.parameters.find(item => item.id === phrase.parameter_id)
+              const option = parameter?.options?.find(item => item.value === phrase.value)
+              const valueLabel = option?.label ?? (typeof phrase.value === 'boolean'
+                ? phrase.value ? 'Yes' : 'No'
+                : phrase.value)
+              return (
+                <li key={`${phrase.parameter_id}:${String(phrase.value)}`}>
+                  <span className="text-text-secondary">{parameter?.label ?? phrase.parameter_id} · {valueLabel}:</span>{' '}
+                  <span className="font-mono">{phrase.text}</span>
+                </li>
+              )
+            })}
+          </ul>
+          <p className="mt-1">The selected values add these exact phrases only to matching Character generation prompts. LoRA multiplier remains a separate strength control.</p>
+        </div>
+      )}
       {schema.parameters.map(parameter => {
         const value = getLoraParameterValue(parameter, values)
         const helpId = `${loraId}-${parameter.id}-help`.replace(/[^a-zA-Z0-9_-]/g, '-')
@@ -361,8 +384,8 @@ function defaultSectionValues(
 ): ProjectReferenceTypeFieldItem[] {
   const count = depth === 'compact' ? 1 : depth === 'standard' ? 2 : depth === 'comprehensive'
     ? section.options.length : Math.min(section.options.length, Math.max(1, customSheetCount))
-  // Anatomy/Nude is never inferred by depth. It is added only by its explicit
-  // preset or chip, so Explicit output cannot silently alter the anchor.
+  // Anatomy/Nude is never inferred by depth. It is added only by an authored
+  // preset/chip or by the explicit Character convenience action.
   if (section.id === 'anatomy') return []
   return section.options.slice(0, count).map(label => ({
     id: section.id === 'details'
@@ -438,6 +461,19 @@ function resolveAnchorBasis(
     ))
   ))
   return anatomySelected ? 'anatomy' : 'primary_outfit'
+}
+
+function selectCanonicalCharacterAnatomy(
+  sections: ReferenceSectionState[],
+  capability: ProjectReferenceCapabilities['reference_types'][number] | undefined,
+): ReferenceSectionState[] {
+  const definition = REFERENCE_TYPE_DEFINITIONS.character.sections
+    .find(section => section.id === 'anatomy')
+  if (!definition) return sections
+  const nudeAnatomy = sectionOptionItem(capability, definition, 'nude anatomy')
+  return sections.map(section => section.id === 'anatomy'
+    ? { ...section, values: nudeAnatomy ? [nudeAnatomy] : [], pinned: false }
+    : section)
 }
 
 function buildTypeFields(
@@ -620,6 +656,9 @@ export function ProjectReferenceLibrary({
   const browsingUploads = useStore(s => s.browsingUploads)
   const privateOutput = useStore(s => s.privateOutput)
   const explicitOutput = useStore(s => s.explicitOutput)
+  const initialExplicitConvenience = getProjectReferenceExplicitConvenienceState(
+    'character', explicitOutput,
+  )
   const explicitOutputRef = useRef(explicitOutput)
   const privateOutputRef = useRef(privateOutput)
   const generationMode = useStore(s => s.generationMode)
@@ -666,9 +705,15 @@ export function ProjectReferenceLibrary({
   const [intent, setIntent] = useState<ProjectReferenceIntent>('generic')
   const [depth, setDepth] = useState<ProjectReferenceDepth>('standard')
   const [customSheetCount, setCustomSheetCount] = useState(3)
-  const [preset, setPreset] = useState<ProjectReferencePreset>('identity')
+  const [preset, setPreset] = useState<ProjectReferencePreset>(
+    initialExplicitConvenience.preset ?? 'identity',
+  )
   const [sections, setSections] = useState<ReferenceSectionState[]>(() => (
-    createSectionState('character', 'standard', 3)
+    initialExplicitConvenience.anatomy_option
+      ? selectCanonicalCharacterAnatomy(
+        createSectionState('character', 'standard', 3), undefined,
+      )
+      : createSectionState('character', 'standard', 3)
   ))
   const [customSectionInputs, setCustomSectionInputs] = useState<Partial<Record<ReferenceSectionId, string>>>({})
   const [authoringStatus, setAuthoringStatus] = useState('')
@@ -834,6 +879,12 @@ export function ProjectReferenceLibrary({
     }]
   }, [authoritativeTypeCapabilities, typeDefinition.sections])
   const anchorBasis = resolveAnchorBasis(assetType, preset, sections)
+  const explicitCharacterStateValid = isProjectReferenceExplicitCharacterStateValid(
+    assetType,
+    referenceExplicitOutput,
+    preset,
+    sections.find(section => section.id === 'anatomy')?.values ?? [],
+  )
   const typeFields = useMemo(
     () => buildTypeFields(sections, sectionDefinitions),
     [sectionDefinitions, sections],
@@ -998,7 +1049,7 @@ export function ProjectReferenceLibrary({
     incompatible_lora: hasInvalidExplicitLora,
     invalid_lora_multiplier: hasInvalidLoraMultiplier,
     invalid_lora_parameters: hasInvalidLoraParameters,
-    invalid_authored_settings: hasInvalidAuthoredSettings,
+    invalid_authored_settings: hasInvalidAuthoredSettings || !explicitCharacterStateValid,
     review_unavailable: reviewSelectionUnavailable,
   })
   currentProject.current = project
@@ -1017,8 +1068,13 @@ export function ProjectReferenceLibrary({
         })
         return { ...existing, values: orderSectionValues(definition, values) }
       }
+      const existingNudeAnatomy = definition.id === 'anatomy' && existing?.values.some(
+        item => item.label.toLowerCase() === 'nude anatomy',
+      )
       const defaults = definition.id === 'anatomy' && preset === 'anatomy'
-        ? definition.options.filter(label => label.toLowerCase() === 'anatomy')
+        ? definition.options.filter(label => label.toLowerCase() === (
+          existingNudeAnatomy ? 'nude anatomy' : 'anatomy'
+        ))
         : defaultSectionValues(definition, depth, customSheetCount).map(item => item.label)
       return {
         id: definition.id,
@@ -1033,18 +1089,29 @@ export function ProjectReferenceLibrary({
 
   useEffect(() => {
     if (open) return
-    setReferenceExplicitOutput(explicitOutput)
+    const convenience = getProjectReferenceExplicitConvenienceState(assetType, explicitOutput)
+    setReferenceExplicitOutput(convenience.explicit_output)
+    if (convenience.preset) setPreset(convenience.preset)
+    if (convenience.anatomy_option) {
+      setSections(current => selectCanonicalCharacterAnatomy(
+        current, authoritativeTypeCapabilities,
+      ))
+    }
     setContentCapability(explicitOutput ? 'unrestricted_local' : 'standard')
     setInitialBlur(explicitOutput || privateOutput)
     setIntelligencePolicy(explicitOutput ? 'uncensored_auto' : 'standard_auto')
     setIntelligenceCustomized(false)
-  }, [explicitOutput, open, privateOutput])
+  }, [assetType, authoritativeTypeCapabilities, explicitOutput, open, privateOutput])
 
   useEffect(() => {
     if (previousProject.current === project) return
     previousProject.current = project
     projectEpoch.current += 1
     requestSequence.current += 1
+    const resetConvenience = getProjectReferenceExplicitConvenienceState(
+      'character', explicitOutputRef.current,
+    )
+    const resetSections = createSectionState('character', 'standard', 3)
     setAssets([])
     setCatalogModels([])
     setReferenceCapabilities(null)
@@ -1059,8 +1126,10 @@ export function ProjectReferenceLibrary({
     setIntent('generic')
     setDepth('standard')
     setCustomSheetCount(3)
-    setPreset('identity')
-    setSections(createSectionState('character', 'standard', 3))
+    setPreset(resetConvenience.preset ?? 'identity')
+    setSections(resetConvenience.anatomy_option
+      ? selectCanonicalCharacterAnatomy(resetSections, undefined)
+      : resetSections)
     setCustomSectionInputs({})
     setAuthoringStatus('')
     setDetailSettings({})
@@ -1106,6 +1175,10 @@ export function ProjectReferenceLibrary({
     if (!projectExplicitlyLocked) return
     projectEpoch.current += 1
     requestSequence.current += 1
+    const resetConvenience = getProjectReferenceExplicitConvenienceState(
+      'character', explicitOutputRef.current,
+    )
+    const resetSections = createSectionState('character', 'standard', 3)
     pendingSheetActionLocks.current.clear()
     authoredSettingsSnapshots.current.clear()
     loraParameterSnapshots.current.clear()
@@ -1126,8 +1199,10 @@ export function ProjectReferenceLibrary({
     setIntent('generic')
     setDepth('standard')
     setCustomSheetCount(3)
-    setPreset('identity')
-    setSections(createSectionState('character', 'standard', 3))
+    setPreset(resetConvenience.preset ?? 'identity')
+    setSections(resetConvenience.anatomy_option
+      ? selectCanonicalCharacterAnatomy(resetSections, undefined)
+      : resetSections)
     setCustomSectionInputs({})
     setAuthoringStatus('')
     setDetailSettings({})
@@ -1618,14 +1693,29 @@ export function ProjectReferenceLibrary({
 
   const changeAssetType = (nextType: ProjectReferenceAssetType) => {
     const definition = REFERENCE_TYPE_DEFINITIONS[nextType]
+    const convenience = getProjectReferenceExplicitConvenienceState(
+      nextType, referenceExplicitOutput,
+    )
+    const nextPreset = convenience.preset ?? definition.defaultPreset
+    const nextSections = createSectionState(nextType, depth, customSheetCount)
     setAssetType(nextType)
-    setPreset(definition.defaultPreset)
-    setSections(createSectionState(nextType, depth, customSheetCount))
+    setPreset(nextPreset)
+    setSections(convenience.anatomy_option
+      ? selectCanonicalCharacterAnatomy(
+        nextSections,
+        referenceCapabilities?.reference_types.find(capability => capability.id === nextType),
+      )
+      : nextSections)
     setCustomSectionInputs({})
     setAuthoringStatus('')
     setDetailSettings({})
-    if (!intelligenceCustomized) {
-      setIntelligencePolicy(referenceExplicitOutput ? 'uncensored_auto' : 'standard_auto')
+    if (convenience.content_capability) setContentCapability(convenience.content_capability)
+    if (convenience.initial_blur) setInitialBlur(convenience.initial_blur)
+    if (convenience.intelligence_policy) {
+      setIntelligencePolicy(convenience.intelligence_policy)
+      setIntelligenceCustomized(false)
+    } else if (!intelligenceCustomized) {
+      setIntelligencePolicy('standard_auto')
     }
   }
 
@@ -1643,13 +1733,21 @@ export function ProjectReferenceLibrary({
   const changeDepth = (nextDepth: ProjectReferenceDepth) => {
     setDepth(nextDepth)
     const definitions = sectionDefinitions
-    setSections(current => current.map(section => {
-      if (section.pinned) return section
-      const definition = definitions.find(candidate => candidate.id === section.id)
-      return definition
-        ? { ...section, values: defaultSectionValues(definition, nextDepth, customSheetCount) }
-        : section
-    }))
+    const convenience = getProjectReferenceExplicitConvenienceState(
+      assetType, referenceExplicitOutput,
+    )
+    setSections(current => {
+      const next = current.map(section => {
+        if (section.pinned) return section
+        const definition = definitions.find(candidate => candidate.id === section.id)
+        return definition
+          ? { ...section, values: defaultSectionValues(definition, nextDepth, customSheetCount) }
+          : section
+      })
+      return convenience.anatomy_option
+        ? selectCanonicalCharacterAnatomy(next, authoritativeTypeCapabilities)
+        : next
+    })
   }
 
   const changeCustomSheetCount = (nextCount: number) => {
@@ -1657,24 +1755,44 @@ export function ProjectReferenceLibrary({
     setCustomSheetCount(bounded)
     if (depth !== 'custom') return
     const definitions = sectionDefinitions
-    setSections(current => current.map(section => {
-      if (section.pinned) return section
-      const definition = definitions.find(candidate => candidate.id === section.id)
-      return definition
-        ? { ...section, values: defaultSectionValues(definition, 'custom', bounded) }
-        : section
-    }))
+    const convenience = getProjectReferenceExplicitConvenienceState(
+      assetType, referenceExplicitOutput,
+    )
+    setSections(current => {
+      const next = current.map(section => {
+        if (section.pinned) return section
+        const definition = definitions.find(candidate => candidate.id === section.id)
+        return definition
+          ? { ...section, values: defaultSectionValues(definition, 'custom', bounded) }
+          : section
+      })
+      return convenience.anatomy_option
+        ? selectCanonicalCharacterAnatomy(next, authoritativeTypeCapabilities)
+        : next
+    })
   }
 
   const changePreset = (nextPreset: ProjectReferencePreset) => {
+    const presetConvenience = getProjectReferenceExplicitConvenienceState(
+      assetType, referenceExplicitOutput, nextPreset,
+    )
+    const exitsCharacterConvenience = referenceExplicitOutput
+      && !presetConvenience.explicit_output
+    if (exitsCharacterConvenience) setReferenceExplicitOutput(false)
     setPreset(nextPreset)
     if (nextPreset === 'anatomy') setContentCapability('unrestricted_local')
     setSections(current => current.map(section => {
+      if (exitsCharacterConvenience && section.id === 'anatomy') {
+        return { ...section, values: [], pinned: false }
+      }
       if (section.pinned) return section
       const definition = sectionDefinitions.find(item => item.id === section.id)
       if (!definition) return section
       if (section.id === 'anatomy') {
-        const anatomy = sectionOptionItem(authoritativeTypeCapabilities, definition, 'anatomy')
+        const anatomyLabel = assetType === 'character' && referenceExplicitOutput
+          ? 'nude anatomy'
+          : 'anatomy'
+        const anatomy = sectionOptionItem(authoritativeTypeCapabilities, definition, anatomyLabel)
         return { ...section, values: nextPreset === 'anatomy' && anatomy ? [anatomy] : [] }
       }
       if (section.id === 'wardrobe' && nextPreset === 'underlayers') {
@@ -1697,11 +1815,18 @@ export function ProjectReferenceLibrary({
   }
 
   const applyExplicitConvenience = (enabled: boolean) => {
-    setReferenceExplicitOutput(enabled)
-    if (!enabled) return
-    setContentCapability('unrestricted_local')
-    setInitialBlur(true)
-    setIntelligencePolicy('uncensored_auto')
+    const convenience = getProjectReferenceExplicitConvenienceState(assetType, enabled)
+    setReferenceExplicitOutput(convenience.explicit_output)
+    if (!convenience.explicit_output) return
+    if (convenience.preset) setPreset(convenience.preset)
+    if (convenience.anatomy_option) {
+      setSections(current => selectCanonicalCharacterAnatomy(
+        current, authoritativeTypeCapabilities,
+      ))
+    }
+    if (convenience.content_capability) setContentCapability(convenience.content_capability)
+    if (convenience.initial_blur) setInitialBlur(convenience.initial_blur)
+    if (convenience.intelligence_policy) setIntelligencePolicy(convenience.intelligence_policy)
     setIntelligenceCustomized(false)
   }
 
@@ -2446,9 +2571,9 @@ export function ProjectReferenceLibrary({
                   <legend className="px-1 text-[10px] font-medium text-text-secondary">Output handling</legend>
                   <label className="flex items-center gap-2 text-[9px] text-text-secondary">
                     <input type="checkbox" checked={referenceExplicitOutput} onChange={event => applyExplicitConvenience(event.target.checked)} />
-                    Explicit convenience preset
+                    Explicit convenience
                   </label>
-                  <p className="mt-1 text-[8px] text-text-muted">Applies unrestricted local content, initial blur, and uncensored-capable Auto. Coverage, anatomy, and construction mode stay unchanged; each setting remains editable.</p>
+                  <p className="mt-1 text-[8px] text-text-muted">For Characters, this atomically selects Anatomy / Nude with the nude anatomy anchor, unrestricted local content, initial blur, and mandatory local fidelity review. Other reference types keep their native preset and anchor. Individual settings remain editable; choosing another Character preset turns this convenience off.</p>
                   <div className="mt-2 grid grid-cols-1 gap-1.5">
                     <label htmlFor="project-reference-content-capability" className="text-[9px] text-text-muted">Content capability
                       <select id="project-reference-content-capability" value={contentCapability} onChange={event => setContentCapability(event.target.value as 'standard' | 'unrestricted_local')} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary">
@@ -2870,6 +2995,7 @@ export function ProjectReferenceLibrary({
                 )}
                 {capabilitiesLoadError && <p role="status" className="mt-2 text-[10px] text-red-300">{capabilitiesLoadError}</p>}
                 {hasInvalidAuthoredSettings && <p role="status" className="mt-2 text-[9px] text-red-300">Authored values must be unique, bounded, and free of leading or trailing spaces; every detail output also needs an available source sheet.</p>}
+                {!explicitCharacterStateValid && <p role="status" className="mt-2 text-[9px] text-red-300">Character Explicit convenience requires the Anatomy / Nude preset and nude anatomy selection. Choose Anatomy / Nude again or turn off Explicit convenience.</p>}
                 {queueBlockers.length > 0 && (
                   <section id="project-reference-queue-blockers" aria-label="Queue blocked by" className="mt-3 rounded border border-red-400/30 bg-red-400/5 px-2 py-1.5">
                     <h4 className="text-[9px] font-medium text-red-200">Queue blocked by</h4>

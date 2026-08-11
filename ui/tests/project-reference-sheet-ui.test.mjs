@@ -14,6 +14,7 @@ import {
   getProjectAssetApplyOutputs,
   getProjectAssetComponentOutputs,
   getProjectReferenceEditorModels,
+  getProjectReferenceExplicitConvenienceState,
   getProjectReferenceGenerationModels,
   getProjectReferencePreferredGenerationModel,
   getProjectReferenceQueueBlockers,
@@ -27,6 +28,7 @@ import {
   getProjectReferenceRetrySettings,
   isProjectReferenceReviewMandatory,
   isProjectReferenceReviewerEligible,
+  isProjectReferenceExplicitCharacterStateValid,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
   loadLlm,
@@ -420,6 +422,65 @@ test('Reference Studio model helpers filter the server catalog and preserve loca
   assert.equal(selectProjectReferenceModel([], 'missing'), '')
 })
 
+test('Explicit convenience owns one atomic Character Anatomy contract only', () => {
+  const canonicalCharacter = getProjectReferenceExplicitConvenienceState('character', true)
+  assert.deepEqual(canonicalCharacter, {
+    explicit_output: true,
+    preset: 'anatomy',
+    anatomy_option: 'nude anatomy',
+    content_capability: 'unrestricted_local',
+    initial_blur: true,
+    intelligence_policy: 'uncensored_auto',
+  })
+  for (const transition of ['initial state', 'external sync', 'depth change', 'custom sheet count']) {
+    assert.equal(isProjectReferenceExplicitCharacterStateValid(
+      'character',
+      canonicalCharacter.explicit_output,
+      canonicalCharacter.preset,
+      [{
+        id: 'anatomy:nude-anatomy', label: canonicalCharacter.anatomy_option,
+        custom: false, group: 'anatomy',
+      }],
+    ), true, `${transition} retains the canonical nude Anatomy state`)
+  }
+  assert.equal(isProjectReferenceExplicitCharacterStateValid(
+    'character', true, 'identity', [],
+  ), false)
+  assert.equal(isProjectReferenceExplicitCharacterStateValid(
+    'character', true, 'anatomy', [{
+      id: 'anatomy:anatomy', label: 'anatomy', custom: false, group: 'anatomy',
+    }],
+  ), false, 'generic anatomy is not the canonical nude convenience selection')
+  assert.equal(isProjectReferenceExplicitCharacterStateValid(
+    'character', true, 'anatomy', [{
+      id: 'custom:abcdefghijkl', label: 'nude anatomy', custom: true, group: 'anatomy',
+    }],
+  ), false, 'a custom lookalike label cannot satisfy the canonical section guard')
+  assert.equal(isProjectReferenceExplicitCharacterStateValid(
+    'creature', true, 'behavior', [],
+  ), true, 'non-character authored state is outside the Character-only guard')
+  for (const assetType of ['location', 'prop', 'vehicle', 'creature', 'wardrobe', 'world']) {
+    const state = getProjectReferenceExplicitConvenienceState(assetType, true)
+    assert.equal(state.explicit_output, true)
+    assert.equal(state.preset, undefined, `${assetType} keeps its native preset`)
+    assert.equal(state.anatomy_option, undefined, `${assetType} keeps its native anchor`)
+    assert.equal(state.content_capability, 'unrestricted_local')
+  }
+  assert.deepEqual(getProjectReferenceExplicitConvenienceState('character', false), {
+    explicit_output: false,
+  })
+  assert.deepEqual(
+    getProjectReferenceExplicitConvenienceState('character', true, 'underlayers'),
+    { explicit_output: false },
+    'a later deliberate Character preset change exits convenience instead of snapping back',
+  )
+  assert.equal(
+    getProjectReferenceExplicitConvenienceState('creature', true, 'behavior').explicit_output,
+    true,
+    'native creature preset changes do not acquire Character-only semantics',
+  )
+})
+
 test('Moody Krea 2 recipes are generation-selectable but never presented as editors', () => {
   const catalog = [
     { model_type: 'krea2_moody_mix_v7_fp8', name: 'Moody Mix', image_outputs: true, supports_ref_images: false },
@@ -527,6 +588,110 @@ test('LoRA parameter defaults and validation remain server-schema authoritative'
   assert.equal(getLoraParameterValue(category, { category: 'small' }), 'small')
   const note = schema.parameters[4]
   assert.equal(getLoraParameterValue(note, { note: '' }), '')
+})
+
+test('Breast Size known contract keeps required controls, defaults, triggers, and multiplier separate', async t => {
+  const exactRoles = [
+    'canonical_identity', 'turnaround', 'expressions', 'wardrobe', 'identity_details',
+  ]
+  const schema = {
+    schema_version: 1,
+    schema_digest: 'known-breast-size-contract',
+    schema_source: 'server_known_contract',
+    trigger_disclosure: {
+      source: 'server_known_contract',
+      activation_phrases: [
+        { parameter_id: 'breast_size', value: 'tiny', text: 'tiny breasts' },
+        { parameter_id: 'breast_size', value: 'small', text: 'small breasts' },
+        { parameter_id: 'breast_size', value: 'saggy', text: 'saggy breasts' },
+        { parameter_id: 'breast_size', value: 'implants', text: 'breast implants' },
+        { parameter_id: 'breast_size', value: 'huge', text: 'huge breasts' },
+        { parameter_id: 'skin_detail', value: true, text: 'skin detail' },
+      ],
+      scopes: ['generation'],
+      roles: exactRoles,
+    },
+    parameters: [
+      {
+        id: 'breast_size', label: 'Breast size', type: 'enum', required: true,
+        scopes: ['generation'], roles: exactRoles,
+        options: [
+          { value: 'tiny', label: 'Tiny' }, { value: 'small', label: 'Small' },
+          { value: 'saggy', label: 'Saggy' }, { value: 'implants', label: 'Implants' },
+          { value: 'huge', label: 'Huge' },
+        ],
+      },
+      {
+        id: 'skin_detail', label: 'Skin detail', type: 'boolean', required: false,
+        default: true, scopes: ['generation'], roles: exactRoles,
+      },
+    ],
+  }
+  assert.deepEqual(getLoraParameterDefaults(schema), { skin_detail: true })
+  assert.deepEqual(validateLoraParameterValues(schema, { skin_detail: true }), [
+    'Breast size is required.',
+  ])
+  assert.deepEqual(validateLoraParameterValues(schema, {
+    breast_size: 'huge', skin_detail: true,
+  }), [])
+  assert.deepEqual(schema.trigger_disclosure.activation_phrases.map(item => item.text), [
+    'tiny breasts', 'small breasts', 'saggy breasts', 'breast implants',
+    'huge breasts', 'skin detail',
+  ])
+  const sexGodSchema = {
+    schema_version: 1,
+    schema_digest: 'known-sexgod-contract',
+    schema_source: 'server_known_contract',
+    trigger_disclosure: {
+      source: 'server_known_contract',
+      activation_phrases: [{
+        parameter_id: 'activation_keyword', value: true, text: 'femalenudestyle',
+      }],
+      scopes: ['generation'],
+      roles: exactRoles,
+    },
+    parameters: [{
+      id: 'activation_keyword', label: 'Activation keyword', type: 'boolean',
+      required: false, default: true, scopes: ['generation'], roles: exactRoles,
+    }],
+  }
+  assert.deepEqual(getLoraParameterDefaults(sexGodSchema), { activation_keyword: true })
+  assert.deepEqual(validateLoraParameterValues(sexGodSchema, {}), [])
+  assert.equal(sexGodSchema.trigger_disclosure.activation_phrases[0].text, 'femalenudestyle')
+
+  const originalFetch = globalThis.fetch
+  const bodies = []
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)))
+    return new Response(JSON.stringify({ job_id: `job-${bodies.length}`, asset: {} }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  await generateProjectAssetReferences('project', {
+    name: 'Known controls',
+    additional_loras: [{
+      id: 'BreastSize-000001.safetensors', multiplier: 0.65, scope: 'generation',
+      parameter_schema_digest: schema.schema_digest,
+      parameter_values: { breast_size: 'huge', skin_detail: true },
+    }],
+  })
+  await generateProjectAssetReferences('project', {
+    name: 'Strength only',
+    additional_loras: [{
+      id: 'unknown-local.safetensors', multiplier: 1.2, scope: 'generation',
+    }],
+  })
+  assert.deepEqual(bodies[0].additional_loras, [{
+    id: 'BreastSize-000001.safetensors', multiplier: 0.65, scope: 'generation',
+    parameter_schema_digest: schema.schema_digest,
+    parameter_values: { breast_size: 'huge', skin_detail: true },
+  }])
+  assert.deepEqual(bodies[1].additional_loras, [{
+    id: 'unknown-local.safetensors', multiplier: 1.2, scope: 'generation',
+  }])
 })
 
 test('ambiguous JSON-equivalent enum choices block Queue while distinct numeric choices remain valid', () => {
@@ -1249,6 +1414,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.doesNotMatch(referenceTypes, /anchor_privacy: 'private_blurred' \| 'standard'/)
   assert.match(referenceTypes, /operation_routing: ProjectReferenceOperationRouting/)
   assert.match(referenceTypes, /private_output: boolean/)
+  assert.match(referenceTypes, /'server_known_contract'/)
+  assert.match(referenceTypes, /activation_phrases: Array/)
   assert.match(referenceTypes, /custom_id: string[\s\S]*?label: string[\s\S]*?operation: ProjectReferenceDetailOperation[\s\S]*?source_role: string/)
   assert.match(referenceTypes, /ProjectReferenceTypeFieldItem\[\]/)
   assert.match(referenceTypes, /detail_callout_count: number/)
@@ -1266,7 +1433,9 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
     'Depth changes update untouched sections only',
     'Subject and content LoRAs are never enabled automatically',
     'Wardrobe & underlayers',
-    'Explicit convenience preset',
+    'Explicit convenience',
+    'nude anatomy anchor',
+    'choosing another Character preset turns this convenience off',
     'Uncensored-capable Auto',
     'Auto never sends data remotely',
   ]) assert.match(source, new RegExp(copy))
@@ -1355,6 +1524,9 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /parameter_schema_digest: schema\?\.schema_digest/)
   assert.match(source, /parameter_values: schema \? getLoraParameterDefaults\(schema\)/)
   assert.match(source, /<LoraParameterFields/)
+  assert.match(source, /schema\.trigger_disclosure\.activation_phrases\.map/)
+  assert.match(source, /Known activation phrases/)
+  assert.match(source, /LoRA multiplier remains a separate strength control/)
   assert.match(source, /aria-invalid=\{fieldErrors\.length > 0\}/)
   assert.match(source, /const describedBy = \[parameter\.description \? helpId/)
   assert.match(source, /loraParameterSnapshots\.current\.set/)
@@ -1374,6 +1546,17 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /model\.vision_capable === true && model\.vision_available === true/)
   assert.match(source, /referenceCapabilities\?\.uncensored_auto_review/)
   assert.match(source, /getProjectReferencePreferredGenerationModel\(/)
+  assert.match(source, /getProjectReferenceExplicitConvenienceState\(/)
+  assert.match(source, /initialExplicitConvenience\.preset \?\? 'identity'/)
+  assert.match(source, /if \(open\) return[\s\S]*?getProjectReferenceExplicitConvenienceState\(\s*assetType, explicitOutput/)
+  assert.equal(source.match(/const resetConvenience = getProjectReferenceExplicitConvenienceState/g)?.length, 2)
+  assert.match(source, /const changeDepth[\s\S]*?convenience\.anatomy_option[\s\S]*?selectCanonicalCharacterAnatomy/)
+  assert.match(source, /const changeCustomSheetCount[\s\S]*?convenience\.anatomy_option[\s\S]*?selectCanonicalCharacterAnatomy/)
+  assert.match(source, /selectCanonicalCharacterAnatomy\(/)
+  assert.match(source, /isProjectReferenceExplicitCharacterStateValid\(/)
+  assert.match(source, /invalid_authored_settings: hasInvalidAuthoredSettings \|\| !explicitCharacterStateValid/)
+  assert.match(source, /Character Explicit convenience requires the Anatomy \/ Nude preset and nude anatomy selection/)
+  assert.match(source, /setReferenceExplicitOutput\(false\)/)
   assert.match(source, /referenceModelCustomized\) return selectProjectReferenceModel\(referenceModels, current\)/)
   assert.match(source, /referenceCapabilities\?\.review_policy/)
   assert.match(source, /isProjectReferenceReviewMandatory\(/)

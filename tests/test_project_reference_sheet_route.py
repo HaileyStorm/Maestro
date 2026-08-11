@@ -63,6 +63,8 @@ def _load_route_symbols(namespace):
         "_project_reference_lora_fragment",
         "_normalize_lora_parameter_schema",
         "_read_lora_parameter_schema",
+        "_project_reference_known_lora_parameter_schema",
+        "_project_reference_lora_parameter_schema",
         "_public_lora_parameter_schema",
         "_normalize_lora_parameter_values",
         "_project_reference_sha256_file",
@@ -560,6 +562,40 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         body.update(updates)
         return body
 
+    def _explicit_body(self, **updates):
+        body = self._body(
+            preset="anatomy",
+            anchor_basis="anatomy",
+            type_fields={"poses": [{
+                "id": "anatomy:nude-anatomy",
+                "label": "nude anatomy",
+                "custom": False,
+                "group": "anatomy",
+            }]},
+            explicit_output=True,
+        )
+        body.update(updates)
+        return body
+
+    def _known_lora(self, constant_name):
+        contract = self.ns[constant_name]
+        lora = self.root / contract["filename"]
+        lora.write_bytes(b"synthetic-known-breast-size-lora")
+        lora.with_suffix(".civitai.json").write_text(json.dumps({
+            "modelId": contract["model_id"],
+            "versionId": contract["version_id"],
+            "baseModel": contract["base_model"],
+            "trainedWords": list(contract["trained_words"]),
+        }))
+        real_getsize = os.path.getsize
+
+        def contract_getsize(path):
+            if os.path.realpath(path) == os.path.realpath(lora):
+                return contract["size_bytes"]
+            return real_getsize(path)
+
+        return contract, lora, contract_getsize
+
     def _install_verified_operation_routes(self):
         editor = "qwen_image_edit_2511_20B_fp8_lightning_8step"
         resolved = {
@@ -862,8 +898,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 review=False,
                 review_model="off",
             ),
-            self._body(
-                explicit_output=True,
+            self._explicit_body(
                 content_capability="standard",
                 review=False,
                 review_model="off",
@@ -957,7 +992,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             return result
 
         self.review = malformed
-        response = self._run(self._body(explicit_output=True))
+        response = self._run(self._explicit_body())
         job = self.jobs[response["job_id"]]
         self.assertEqual(job["status"], "failed")
         self.assertEqual(self._assets(), [])
@@ -1597,8 +1632,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             return self._passing_review(request)
 
         self.review = review
-        self._run(self._body(
-            explicit_output=True,
+        self._run(self._explicit_body(
             detail_callouts=[{"kind": "face", "operation": "reconstruct"}],
             max_repair_attempts=1,
         ))
@@ -1958,10 +1992,9 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(current["variants"][1]["id"], f"{response['job_id']}_pack_1")
 
     def test_public_variant_metadata_is_prompt_free_path_free_and_policy_scoped(self):
-        response = self._run(self._body(
+        response = self._run(self._explicit_body(
             description="DO_NOT_PERSIST_IN_VARIANT_METADATA",
             mode="draft",
-            explicit_output=True,
         ))
         job = self.jobs[response["job_id"]]
         self.assertEqual(job["session_id"], "owner-session")
@@ -2455,10 +2488,20 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         ), _Request({}))
         self.assertEqual(anatomy["anchor_basis"], "anatomy")
         self.assertTrue(anatomy["policy"]["private"])
-        clothed_explicit = validate(self._body(
-            preset="identity", explicit_output=True,
-        ), _Request({}))
-        self.assertEqual(clothed_explicit["anchor_basis"], "primary_outfit")
+        for update in (
+            {"preset": "identity"},
+            {"anchor_basis": "primary_outfit"},
+            {"type_fields": {}},
+            {"type_fields": {"poses": [{
+                "id": "custom:aaaaaaaaaaaaaaaa",
+                "label": "nude anatomy",
+                "custom": True,
+                "group": "anatomy",
+            }]}},
+        ):
+            with self.subTest(update=update), self.assertRaises(HTTPException) as raised:
+                validate(self._explicit_body(**update), _Request({}))
+            self.assertEqual(raised.exception.status_code, 400)
 
     def test_v2_privacy_and_initial_blur_seal_all_four_truthful_states(self):
         for private, blurred, expected in (
@@ -2805,27 +2848,28 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertIn("test-vlm", scanned)
         self.assertEqual(scanned.count("test-vlm"), 1)
 
-    def test_v2_explicit_convenience_controls_are_independent_from_reference_coverage(self):
+    def test_v2_explicit_character_requires_canonical_nude_anatomy_state(self):
         validate = self.ns["_project_reference_request_config"]
-        initialized = validate(self._body(
-            preset="underlayers",
-            explicit_output=True,
-        ), _Request({}))
+        initialized = validate(self._explicit_body(), _Request({}))
         self.assertEqual(initialized["mode"], "production")
-        self.assertEqual(initialized["preset"], "underlayers")
-        self.assertEqual(initialized["anchor_basis"], "primary_outfit")
+        self.assertEqual(initialized["preset"], "anatomy")
+        self.assertEqual(initialized["anchor_basis"], "anatomy")
+        self.assertIn({
+            "id": "anatomy:nude-anatomy",
+            "label": "nude anatomy",
+            "custom": False,
+            "group": "anatomy",
+        }, initialized["type_fields"]["poses"])
         self.assertEqual(initialized["content_capability"], "unrestricted_local")
         self.assertTrue(initialized["initial_blur"])
         self.assertEqual(initialized["intelligence_policy"], "uncensored_auto")
 
-        overridden = validate(self._body(
-            preset="underlayers",
-            explicit_output=True,
+        overridden = validate(self._explicit_body(
             content_capability="standard",
             initial_blur=False,
             intelligence_policy="standard_auto",
         ), _Request({}))
-        self.assertEqual(overridden["anchor_basis"], "primary_outfit")
+        self.assertEqual(overridden["anchor_basis"], "anatomy")
         self.assertEqual(overridden["content_capability"], "standard")
         self.assertFalse(overridden["initial_blur"])
         self.assertEqual(overridden["intelligence_policy"], "standard_auto")
@@ -2833,6 +2877,17 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             route["status"] == "standard" and "reason" not in route
             for route in overridden["operation_routing"]
         ))
+
+        location = validate(self._body(
+            asset_type="location", preset="spatial",
+            explicit_output=True,
+        ), _Request({}))
+        self.assertEqual(location["anchor_basis"], "least_occluded")
+        creature = validate(self._body(
+            asset_type="creature", preset="identity",
+            explicit_output=True,
+        ), _Request({}))
+        self.assertEqual(creature["anchor_basis"], "primary_outfit")
 
     def test_v2_uncensored_auto_uses_only_its_exact_local_visual_reviewer(self):
         recipe = self.ns["_PROJECT_REFERENCE_ABLITERATED_RECIPE"]
@@ -2861,7 +2916,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
 
         self.ns["_project_reference_intelligence_selection"] = selection
         config = self.ns["_project_reference_request_config"](
-            self._body(explicit_output=True), _Request({}),
+            self._explicit_body(), _Request({}),
         )
         self.assertEqual(calls, [("planning", "auto", None)])
         self.assertEqual(config["review_selection"]["requested_model"], "auto_local")
@@ -2886,7 +2941,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         )
         for update in invalid:
             with self.subTest(update=update), self.assertRaises(HTTPException):
-                validate(self._body(explicit_output=True, **update), _Request({}))
+                validate(self._explicit_body(**update), _Request({}))
 
     def test_v2_uncensored_review_setup_is_queue_ready_without_residency(self):
         from services import llm_service
@@ -2964,7 +3019,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         }
         with self.assertRaises(HTTPException) as raised:
             self.ns["_project_reference_request_config"](
-                self._body(explicit_output=True), _Request({}),
+                self._explicit_body(), _Request({}),
             )
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("missing_projector", raised.exception.detail)
@@ -3038,11 +3093,11 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             _ModelRegistry, "get_default_settings", side_effect=defaults,
         ):
             explicit = self.ns["_project_reference_request_config"](
-                self._body(explicit_output=True, model_type=None), _Request({}),
+                self._explicit_body(model_type=None), _Request({}),
             )
             hybrid = self.ns["_project_reference_request_config"](
-                self._body(
-                    mode="hybrid", explicit_output=True, model_type=None,
+                self._explicit_body(
+                    mode="hybrid", model_type=None,
                 ),
                 _Request({}),
             )
@@ -3053,13 +3108,12 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 self._body(mode="draft", model_type=None), _Request({}),
             )
             supplied = self.ns["_project_reference_request_config"](
-                self._body(explicit_output=True, model_type="flux2_dev"),
+                self._explicit_body(model_type="flux2_dev"),
                 _Request({}),
             )
             hybrid_supplied = self.ns["_project_reference_request_config"](
-                self._body(
+                self._explicit_body(
                     mode="hybrid",
-                    explicit_output=True,
                     model_type="flux2_dev",
                 ),
                 _Request({}),
@@ -3671,6 +3725,320 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             ],
         )
 
+    def test_server_known_lora_contracts_require_exact_identity_and_disclose_triggers(self):
+        _ModelRegistry.lora_dir = str(self.root)
+        cases = (
+            (
+                "_PROJECT_REFERENCE_BREAST_SIZE_LORA",
+                "breast_size",
+                [
+                    "tiny breasts", "small breasts", "saggy breasts",
+                    "breast implants", "huge breasts", "skin detail",
+                ],
+            ),
+            (
+                "_PROJECT_REFERENCE_SEXGOD_LORA",
+                "activation_keyword",
+                ["femalenudestyle"],
+            ),
+        )
+        for constant_name, parameter_id, expected_phrases in cases:
+            with self.subTest(contract=constant_name):
+                contract, lora, contract_getsize = self._known_lora(
+                    constant_name,
+                )
+                with mock.patch("os.path.getsize", side_effect=contract_getsize):
+                    schema = self.ns[
+                        "_project_reference_lora_parameter_schema"
+                    ]("flux2_dev", str(lora))
+                    details = self.ns["list_loras_details"]("flux2_dev")
+                self.assertEqual(schema["schema_source"], "server_known_contract")
+                self.assertEqual(schema["_expected_source_sha256"], contract["sha256"])
+                self.assertEqual(schema["parameters"][0]["id"], parameter_id)
+                row = next(
+                    item for item in details["loras"]
+                    if item["filename"] == contract["filename"]
+                )
+                public_schema = row["parameter_schema"]
+                self.assertEqual(
+                    public_schema["schema_source"], "server_known_contract",
+                )
+                disclosure = public_schema["trigger_disclosure"]
+                self.assertEqual(disclosure["source"], "server_known_contract")
+                self.assertEqual(
+                    [item["text"] for item in disclosure["activation_phrases"]],
+                    expected_phrases,
+                )
+                self.assertEqual(disclosure["scopes"], ["generation"])
+                self.assertNotIn("_expected_source_sha256", json.dumps(public_schema))
+
+                with mock.patch("os.path.getsize", side_effect=contract_getsize):
+                    self.assertIsNone(self.ns[
+                        "_project_reference_lora_parameter_schema"
+                    ]("flux2_klein_9b", str(lora)))
+                lookalike = self.root / f"lookalike-{contract['filename']}"
+                lookalike.write_bytes(b"lookalike")
+                lookalike.with_suffix(".civitai.json").write_text(
+                    lora.with_suffix(".civitai.json").read_text(),
+                )
+                real_getsize = os.path.getsize
+
+                def lookalike_getsize(path):
+                    if os.path.realpath(path) == os.path.realpath(lookalike):
+                        return contract["size_bytes"]
+                    return real_getsize(path)
+
+                with mock.patch("os.path.getsize", side_effect=lookalike_getsize):
+                    self.assertIsNone(self.ns[
+                        "_project_reference_lora_parameter_schema"
+                    ]("flux2_dev", str(lookalike)))
+                sidecar_path = lora.with_suffix(".civitai.json")
+                exact_metadata = json.loads(sidecar_path.read_text())
+                mismatched_metadata = dict(exact_metadata)
+                mismatched_metadata["versionId"] += 1
+                sidecar_path.write_text(json.dumps(mismatched_metadata))
+                with mock.patch("os.path.getsize", side_effect=contract_getsize):
+                    self.assertIsNone(self.ns[
+                        "_project_reference_lora_parameter_schema"
+                    ]("flux2_dev", str(lora)))
+                sidecar_path.write_text(json.dumps(exact_metadata))
+
+        contract, lora, contract_getsize = self._known_lora(
+            "_PROJECT_REFERENCE_BREAST_SIZE_LORA",
+        )
+        lora.with_suffix(".maestro.json").write_text(json.dumps({
+            "maestro_lora_parameter_schema": {
+                "schema_version": 1,
+                "parameters": [{
+                    "id": "owner_override",
+                    "label": "Owner override",
+                    "type": "boolean",
+                    "default": True,
+                    "true_prompt_fragment": "private owner phrase",
+                }],
+            },
+        }))
+        with mock.patch("os.path.getsize", side_effect=contract_getsize):
+            owner = self.ns["_project_reference_lora_parameter_schema"](
+                "flux2_dev", str(lora),
+            )
+        self.assertEqual(owner["schema_source"], "maestro_sidecar")
+        self.assertEqual(owner["parameters"][0]["id"], "owner_override")
+        self.assertNotIn(
+            "trigger_disclosure",
+            self.ns["_public_lora_parameter_schema"](owner),
+        )
+        advisory = self.root / "trained-words-only.safetensors"
+        advisory.write_bytes(b"advisory-only")
+        advisory.with_suffix(".civitai.json").write_text(json.dumps({
+            "modelId": 999,
+            "versionId": 1000,
+            "baseModel": "Flux.2 D",
+            "trainedWords": ["huge breasts", "femalenudestyle"],
+        }))
+        details = self.ns["list_loras_details"]("flux2_dev")
+        advisory_row = next(
+            item for item in details["loras"]
+            if item["filename"] == advisory.name
+        )
+        self.assertNotIn("parameter_schema", advisory_row)
+        self.assertNotIn("parameter_schema_status", advisory_row)
+
+    def test_server_known_loras_apply_by_role_freeze_exact_hash_and_retry(self):
+        _ModelRegistry.lora_dir = str(self.root)
+        cases = (
+            (
+                "_PROJECT_REFERENCE_BREAST_SIZE_LORA",
+                {"breast_size": "huge", "skin_detail": True},
+                ["huge breasts", "skin detail"],
+            ),
+            (
+                "_PROJECT_REFERENCE_SEXGOD_LORA",
+                {"activation_keyword": True},
+                ["femalenudestyle"],
+            ),
+        )
+        for constant_name, values, expected_phrases in cases:
+            with self.subTest(contract=constant_name):
+                contract, lora, contract_getsize = self._known_lora(
+                    constant_name,
+                )
+
+                def resolve(model, filename):
+                    if model == "flux2_dev" and filename == lora.name:
+                        return str(lora)
+                    return ""
+
+                with mock.patch("os.path.getsize", side_effect=contract_getsize), mock.patch.object(
+                    _ModelRegistry, "resolve_lora_path", side_effect=resolve,
+                ):
+                    schema = self.ns[
+                        "_project_reference_lora_parameter_schema"
+                    ]("flux2_dev", str(lora))
+                    selection = {
+                        "id": lora.name,
+                        "multiplier": 0.85,
+                        "scope": "generation",
+                        "parameter_schema_digest": schema["schema_digest"],
+                        "parameter_values": values,
+                    }
+                    with self.assertRaises(HTTPException) as missing_parameters:
+                        self.ns["_project_reference_resolve_additional_loras"]([{
+                            "id": lora.name,
+                            "multiplier": 0.85,
+                            "scope": "generation",
+                        }], generation_model="flux2_dev", editor_model=None)
+                    self.assertEqual(
+                        missing_parameters.exception.status_code, 400,
+                    )
+                    config = self.ns["_project_reference_request_config"](
+                        self._body(
+                            model_type="flux2_dev",
+                            additional_loras=[selection],
+                        ),
+                        _Request({}),
+                    )
+                self.assertEqual(
+                    config["additional_loras"][0]["expected_source_sha256"],
+                    contract["sha256"],
+                )
+                params = self.ns["_project_reference_generation_params"](
+                    config,
+                    model_type="flux2_dev",
+                    prompt="base prompt",
+                    size=(64, 64),
+                    seed=1,
+                    operation_scope="generation",
+                    operation_role="canonical_identity",
+                )
+                for phrase in expected_phrases:
+                    self.assertIn(phrase, params["prompt"])
+                other_role = self.ns["_project_reference_generation_params"](
+                    config,
+                    model_type="flux2_dev",
+                    prompt="base prompt",
+                    size=(64, 64),
+                    seed=1,
+                    operation_scope="generation",
+                    operation_role="canonical_space",
+                )
+                for phrase in expected_phrases:
+                    self.assertNotIn(phrase, other_role["prompt"])
+
+                with mock.patch("os.path.getsize", side_effect=contract_getsize), mock.patch.object(
+                    _ModelRegistry, "resolve_lora_path", side_effect=resolve,
+                ), mock.patch.dict(self.ns, {
+                    "_project_reference_sha256_file": mock.Mock(
+                        return_value=contract["sha256"],
+                    ),
+                }):
+                    frozen = self.ns[
+                        "_project_reference_resolve_additional_loras"
+                    ](
+                        [selection],
+                        generation_model="flux2_dev",
+                        editor_model=None,
+                        operation_roles={
+                            "generation": ("canonical_identity",),
+                            "editing": (),
+                        },
+                        freeze=True,
+                        commitment_contexts={
+                            lora.name: config["additional_loras"][0][
+                                "parameter_commitment_context"
+                            ],
+                        },
+                    )
+                self.assertEqual(
+                    frozen[0]["expected_source_sha256"], contract["sha256"],
+                )
+                with mock.patch("os.path.getsize", side_effect=contract_getsize), mock.patch.object(
+                    _ModelRegistry, "resolve_lora_path", side_effect=resolve,
+                ), mock.patch.dict(self.ns, {
+                    "_project_reference_sha256_file": mock.Mock(
+                        return_value="0" * 64,
+                    ),
+                }), self.assertRaises(HTTPException) as mismatch:
+                    self.ns["_project_reference_resolve_additional_loras"](
+                        [selection],
+                        generation_model="flux2_dev",
+                        editor_model=None,
+                        operation_roles={
+                            "generation": ("canonical_identity",),
+                            "editing": (),
+                        },
+                        freeze=True,
+                    )
+                self.assertEqual(mismatch.exception.status_code, 409)
+
+        contract, lora, contract_getsize = self._known_lora(
+            "_PROJECT_REFERENCE_BREAST_SIZE_LORA",
+        )
+
+        def resolve_breast(model, filename):
+            return str(lora) if model == "flux2_dev" and filename == lora.name else ""
+
+        with mock.patch("os.path.getsize", side_effect=contract_getsize), mock.patch.object(
+            _ModelRegistry, "resolve_lora_path", side_effect=resolve_breast,
+        ):
+            schema = self.ns["_project_reference_lora_parameter_schema"](
+                "flux2_dev", str(lora),
+            )
+            location_selection = {
+                "id": lora.name,
+                "multiplier": 1.0,
+                "scope": "generation",
+                "parameter_schema_digest": schema["schema_digest"],
+                "parameter_values": {
+                    "breast_size": "small", "skin_detail": True,
+                },
+            }
+            for asset_type, preset in (
+                ("location", "spatial"),
+                ("creature", "identity"),
+            ):
+                with self.subTest(asset_type=asset_type), self.assertRaises(
+                    HTTPException,
+                ) as inapplicable:
+                    self.ns["_project_reference_request_config"](
+                        self._body(
+                            asset_type=asset_type, preset=preset,
+                            model_type="flux2_dev",
+                            additional_loras=[location_selection],
+                        ),
+                        _Request({}),
+                    )
+                self.assertEqual(inapplicable.exception.status_code, 409)
+
+        with mock.patch("os.path.getsize", side_effect=contract_getsize), mock.patch.object(
+            _ModelRegistry, "resolve_lora_path", side_effect=resolve_breast,
+        ), mock.patch.dict(self.ns, {
+            "_project_reference_sha256_file": mock.Mock(
+                return_value=contract["sha256"],
+            ),
+        }):
+            first = self._run(self._body(
+                model_type="flux2_dev",
+                additional_loras=[location_selection],
+            ))
+            first_variant = self._assets()[0]["variants"][0]
+            first_call_count = len(self.calls)
+            retry = self._run(self._body(
+                asset_id=first["asset"]["id"],
+                parent_variant_id=first_variant["id"],
+                model_type="flux2_dev",
+            ))
+        self.assertIn("small breasts", self.calls[0]["prompt"])
+        self.assertIn("small breasts", self.calls[first_call_count]["prompt"])
+        self.assertEqual(
+            self.jobs[first["job_id"]]["params"]["reference_pack"][
+                "private_authored_settings"
+            ]["additional_lora_parameters"],
+            self.jobs[retry["job_id"]]["params"]["reference_pack"][
+                "private_authored_settings"
+            ]["additional_lora_parameters"],
+        )
+
     def test_v2_lora_parameter_schema_required_optional_and_control_validation(self):
         normalize = self.ns["_normalize_lora_parameter_schema"]
         normalize_values = self.ns["_normalize_lora_parameter_values"]
@@ -3969,6 +4337,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(
             row["parameter_schema"]["schema_source"], "maestro_sidecar",
         )
+        self.assertNotIn("trigger_disclosure", row["parameter_schema"])
         self.assertNotIn("PRIVATE_DETAILS_FRAGMENT", json.dumps(row))
 
         primary = self.root / "catalog-primary"

@@ -1468,6 +1468,50 @@ export interface ProjectReferenceModelCatalogEntry {
   manual_installation?: ModelManualInstallation
 }
 
+export interface ProjectReferenceExplicitConvenienceState {
+  explicit_output: boolean
+  preset?: 'anatomy'
+  anatomy_option?: 'nude anatomy'
+  content_capability?: 'unrestricted_local'
+  initial_blur?: true
+  intelligence_policy?: 'uncensored_auto'
+}
+
+/** Return only state intentionally owned by the Explicit convenience action. */
+export function getProjectReferenceExplicitConvenienceState(
+  assetType: ProjectReferenceAssetType,
+  enabled: boolean,
+  deliberatePreset?: ProjectReferencePreset,
+): ProjectReferenceExplicitConvenienceState {
+  if (!enabled) return { explicit_output: false }
+  if (assetType === 'character' && deliberatePreset !== undefined
+    && deliberatePreset !== 'anatomy') return { explicit_output: false }
+  return {
+    explicit_output: true,
+    ...(assetType === 'character' ? {
+      preset: 'anatomy' as const,
+      anatomy_option: 'nude anatomy' as const,
+    } : {}),
+    content_capability: 'unrestricted_local',
+    initial_blur: true,
+    intelligence_policy: 'uncensored_auto',
+  }
+}
+
+export function isProjectReferenceExplicitCharacterStateValid(
+  assetType: ProjectReferenceAssetType,
+  explicitOutput: boolean,
+  preset: ProjectReferencePreset,
+  anatomyOptions: Array<Pick<ProjectReferenceTypeFieldItem, 'id' | 'label' | 'custom' | 'group'>>,
+): boolean {
+  if (assetType !== 'character' || !explicitOutput) return true
+  return preset === 'anatomy'
+    && anatomyOptions.some(option => option.id === 'anatomy:nude-anatomy'
+      && option.label.toLowerCase() === 'nude anatomy'
+      && option.custom === false
+      && option.group === 'anatomy')
+}
+
 export function getLoraParameterDefaults(
   schema: LoraParameterSchema | undefined,
 ): Record<string, LoraParameterValue> {
