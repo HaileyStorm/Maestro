@@ -15881,6 +15881,10 @@ _PROJECT_REFERENCE_BODY_FIELDS = frozenset({
     "private_output", "explicit_output",
 })
 _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL = "flux2_dev"
+_PROJECT_REFERENCE_EXPLICIT_CREATE_MODELS = (
+    "krea2_moody_mix_v7_fp8",
+    "krea2_moody_cutie_v4_fp8",
+)
 _PROJECT_REFERENCE_DEFAULT_EDITOR_MODEL = (
     "qwen_image_edit_2511_20B_fp8_lightning_8step"
 )
@@ -16505,6 +16509,140 @@ def _project_reference_resolve_additional_loras(
     return resolved
 
 
+def _project_reference_uncensored_review_setup():
+    """Return content-free setup facts for the exact local fidelity reviewer."""
+    from services import llm_service
+
+    model_id = _PROJECT_REFERENCE_ABLITERATED_RECIPE["model_id"]
+    catalog_model = next((
+        item for item in llm_service.get_available_models(provider="local")
+        if item.get("id") == model_id
+    ), {})
+    status = llm_service.get_status()
+    provider = str(status.get("provider") or "local")
+    resident = bool(
+        status.get("loaded")
+        and status.get("model_id") == model_id
+        and provider == "local"
+    )
+    download = status.get("download")
+    loading_model_id = status.get("loading_model_id") or (
+        download.get("model_id") if isinstance(download, dict) else None
+    )
+    loading = bool(status.get("loading") and loading_model_id == model_id)
+    installed = catalog_model.get("downloaded") is True
+    projector_available = catalog_model.get("projector_available") is True
+    vision_capable = catalog_model.get("vision_capable") is True
+    vision_available = (
+        bool(status.get("vision_available")) if resident else None
+    )
+    if loading:
+        setup_state = "loading"
+    elif not installed:
+        setup_state = "missing_model"
+    elif not projector_available or not vision_capable:
+        setup_state = "missing_projector"
+    elif resident and vision_available is not True:
+        setup_state = "loaded_without_vision"
+    elif resident:
+        setup_state = "ready_resident"
+    else:
+        setup_state = "ready_unloaded"
+    queue_ready = setup_state in {"ready_unloaded", "ready_resident"}
+    return {
+        "requested_model": "auto_local",
+        "resolved_model": model_id,
+        "resolved_provider": "local",
+        "vision_required": True,
+        "required_projector": _PROJECT_REFERENCE_ABLITERATED_RECIPE["projector"],
+        "installed": installed,
+        "projector_available": projector_available,
+        "vision_capable": vision_capable,
+        "resident": resident,
+        "vision_available": vision_available,
+        "loading": loading,
+        "loading_phase": (
+            str(status.get("loading_phase") or "loading model")
+            if loading else None
+        ),
+        "setup_state": setup_state,
+        "queue_ready": queue_ready,
+    }
+
+
+def _project_reference_explicit_generation_model():
+    """Resolve an explicit-only default without changing global routing policy."""
+    from services.model_terms import (
+        model_terms_manifest_valid,
+        model_terms_statuses,
+    )
+
+    visibility_reader = globals().get("_model_visibility_response")
+    visibility = (
+        visibility_reader() if callable(visibility_reader) else {
+            "configured": False,
+            "enabled_models": [],
+        }
+    )
+    enabled_models = set(
+        visibility.get("enabled_models") or ()
+        if visibility.get("configured") else ()
+    )
+    services = getattr(wgp, "server_config", {}).get("services", {})
+    manual_ready = getattr(wgp, "manual_checkpoint_integrity_ready", None)
+    candidates = []
+    for model_type in _PROJECT_REFERENCE_EXPLICIT_CREATE_MODELS:
+        model_def = wgp.get_model_def(model_type)
+        manifest_valid = bool(
+            isinstance(model_def, dict)
+            and model_terms_manifest_valid(model_type, wgp.models_def)
+        )
+        checkpoint_verified = bool(
+            manifest_valid
+            and callable(manual_ready)
+            and manual_ready(model_type, model_def, wgp.models_def)
+        )
+        term_statuses = (
+            model_terms_statuses(services, model_type, wgp.models_def)
+            if manifest_valid else []
+        )
+        terms_accepted = bool(
+            manifest_valid
+            and term_statuses
+            and all(item.get("accepted") is True for item in term_statuses)
+        )
+        enabled = model_type in enabled_models
+        downloaded = bool(
+            checkpoint_verified and _check_model_downloaded(model_type)
+        )
+        ready = bool(
+            enabled and checkpoint_verified and terms_accepted
+        )
+        candidates.append({
+            "model_type": model_type,
+            "enabled": enabled,
+            "manual_checkpoint_verified": checkpoint_verified,
+            "terms_accepted": terms_accepted,
+            "downloaded": downloaded,
+            "ready": ready,
+        })
+    preferred = next((
+        candidate["model_type"] for candidate in candidates
+        if candidate["ready"]
+    ), _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL)
+    return {
+        "preferred_order": list(_PROJECT_REFERENCE_EXPLICIT_CREATE_MODELS),
+        "resolved_model": preferred,
+        "fallback_model": _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL,
+        "selection_source": (
+            "verified_manual_preference"
+            if preferred != _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL
+            else "fallback"
+        ),
+        "candidates": candidates,
+    }
+
+
 def _project_reference_capabilities():
     from services.reference_sheets import (
         MAX_PACK_SHEETS,
@@ -16563,12 +16701,8 @@ def _project_reference_capabilities():
         "lora_scopes": ["auto", "generation", "editing"],
         "content_capabilities": ["standard", "unrestricted_local"],
         "intelligence_policies": ["standard_auto", "uncensored_auto"],
-        "uncensored_auto_review": {
-            "requested_model": "auto_local",
-            "resolved_model": _PROJECT_REFERENCE_ABLITERATED_RECIPE["model_id"],
-            "resolved_provider": "local",
-            "vision_required": True,
-        },
+        "uncensored_auto_review": _project_reference_uncensored_review_setup(),
+        "explicit_generation_model": _project_reference_explicit_generation_model(),
         "review_policy": {
             "mandatory_for_content_capabilities": ["unrestricted_local"],
             "mandatory_when_explicit_output": True,
@@ -16709,7 +16843,27 @@ def _project_reference_request_config(
             detail="Draft mode does not support editor-dependent detail callouts",
         )
 
-    model_type = body.get("model_type") or _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL
+    explicit_convenience = body.get("explicit_output") is True
+    content_capability = body.get("content_capability")
+    if content_capability is None:
+        content_capability = (
+            "unrestricted_local"
+            if explicit_convenience or anchor_basis == "anatomy" else "standard"
+        )
+    if content_capability not in {"standard", "unrestricted_local"}:
+        raise HTTPException(status_code=400, detail="Invalid content_capability")
+
+    requested_model_type = body.get("model_type")
+    if requested_model_type:
+        model_type = requested_model_type
+    elif mode != "draft" and (
+        explicit_convenience or content_capability == "unrestricted_local"
+    ):
+        model_type = _project_reference_explicit_generation_model()[
+            "resolved_model"
+        ]
+    else:
+        model_type = _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL
     if not isinstance(model_type, str) or not 1 <= len(model_type) <= 128:
         raise HTTPException(status_code=400, detail="Invalid reference image model")
     _require_remote_visible_models(request, [model_type])
@@ -16795,15 +16949,6 @@ def _project_reference_request_config(
     if not isinstance(review, bool):
         raise HTTPException(status_code=400, detail="review must be a boolean")
 
-    explicit_convenience = body.get("explicit_output") is True
-    content_capability = body.get("content_capability")
-    if content_capability is None:
-        content_capability = (
-            "unrestricted_local"
-            if explicit_convenience or anchor_basis == "anatomy" else "standard"
-        )
-    if content_capability not in {"standard", "unrestricted_local"}:
-        raise HTTPException(status_code=400, detail="Invalid content_capability")
     mandatory_review = bool(
         content_capability == "unrestricted_local" or explicit_convenience
     )
@@ -16873,6 +17018,15 @@ def _project_reference_request_config(
                 raise HTTPException(
                     status_code=409,
                     detail="Uncensored Auto requires its compatible local vision reviewer",
+                )
+            reviewer_setup = _project_reference_uncensored_review_setup()
+            if reviewer_setup["queue_ready"] is not True:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The exact local Uncensored Auto reviewer is not ready "
+                        f"({reviewer_setup['setup_state']})."
+                    ),
                 )
             review_selection = {
                 "requested_model": review_model,
@@ -17488,9 +17642,23 @@ def _project_reference_runtime_intelligence_selection(
     if runtime.get("provider") != sealed.get("resolved_provider"):
         raise RuntimeError("reference_intelligence_provider_changed")
     if purpose == "review":
+        exact_recipe = (
+            recipe
+            if config.get("intelligence_policy") == "uncensored_auto"
+            and isinstance(recipe, dict)
+            else None
+        )
         if (
             runtime.get("vision_capable") is not True
             or runtime.get("response_model_id") != sealed.get("resolved_model")
+            or (
+                exact_recipe is not None
+                and (
+                    sealed.get("resolved_model") != exact_recipe.get("model_id")
+                    or runtime.get("model_id") != exact_recipe.get("model_id")
+                    or runtime.get("provider") != "local"
+                )
+            )
         ):
             raise RuntimeError("review_unavailable")
     return runtime
@@ -17676,6 +17844,19 @@ def _project_reference_selected_reviewer(
     if runtime.get("provider") == "local":
         def operation(*args, **kwargs):
             try:
+                if config.get("intelligence_policy") == "uncensored_auto":
+                    recipe = config.get("intelligence_recipe")
+                    status = llm_service.get_status()
+                    if (
+                        not isinstance(recipe, dict)
+                        or runtime.get("model_id") != recipe.get("model_id")
+                        or runtime.get("provider") != "local"
+                        or status.get("loaded") is not True
+                        or status.get("model_id") != recipe.get("model_id")
+                        or str(status.get("provider") or "local") != "local"
+                        or status.get("vision_available") is not True
+                    ):
+                        raise RuntimeError("review_unavailable")
                 return llm_service.generate(*args, **kwargs)
             finally:
                 llm_service.unload_model()

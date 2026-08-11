@@ -4042,14 +4042,17 @@ _MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS = {
 }
 _MANUAL_CHECKPOINT_VERIFICATION_CACHE = {}
 _MANUAL_CHECKPOINT_VERIFICATION_LOCK = threading.RLock()
+_MANUAL_CHECKPOINT_RECEIPT_SCHEMA_VERSION = 1
+_MANUAL_CHECKPOINT_RECEIPT_MAX_BYTES = 16 * 1024
+_MANUAL_CHECKPOINT_VERIFICATION_STATE_DIR = os.path.join(
+    os.path.dirname(p),
+    "cache",
+    "manual_checkpoint_integrity",
+)
 
 
 def _manual_checkpoint_cache_key(spec):
-    return (
-        spec["filename"],
-        spec["size_bytes"],
-        spec["sha256"],
-    )
+    return tuple(sorted(spec.items()))
 
 
 def _checkpoint_stat_identity(stat_result):
@@ -4059,6 +4062,222 @@ def _checkpoint_stat_identity(stat_result):
         stat_result.st_size,
         stat_result.st_mtime_ns,
     )
+
+
+def _manual_checkpoint_resolved_path(local_path):
+    return os.path.realpath(os.path.abspath(local_path))
+
+
+def _manual_checkpoint_path_digest(local_path):
+    resolved_path = _manual_checkpoint_resolved_path(local_path)
+    return hashlib.sha256(
+        os.fsencode(os.path.normcase(resolved_path)),
+    ).hexdigest()
+
+
+def _manual_checkpoint_receipt_path(spec):
+    recipe_id = spec.get("recipe_id") if isinstance(spec, dict) else None
+    if (
+        not isinstance(recipe_id, str)
+        or not recipe_id
+        or any(
+            not (character.isalnum() or character in "-_.")
+            for character in recipe_id
+        )
+    ):
+        return None
+    return os.path.join(
+        _MANUAL_CHECKPOINT_VERIFICATION_STATE_DIR,
+        f"{recipe_id}.json",
+    )
+
+
+def _delete_manual_checkpoint_receipt(spec):
+    receipt_path = _manual_checkpoint_receipt_path(spec)
+    if receipt_path is None:
+        return
+    try:
+        os.unlink(receipt_path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _store_manual_checkpoint_receipt(spec, record):
+    """Atomically store content-free evidence for exact restart recovery."""
+    receipt_path = _manual_checkpoint_receipt_path(spec)
+    identity = record.get("identity") if isinstance(record, dict) else None
+    path_digest = record.get("path_digest") if isinstance(record, dict) else None
+    if (
+        receipt_path is None
+        or not isinstance(identity, tuple)
+        or len(identity) != 4
+        or not all(type(value) is int for value in identity)
+        or not isinstance(path_digest, str)
+    ):
+        _delete_manual_checkpoint_receipt(spec)
+        return False
+
+    state_dir = _MANUAL_CHECKPOINT_VERIFICATION_STATE_DIR
+    temporary_path = None
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        state_stat = os.lstat(state_dir)
+        if not stat.S_ISDIR(state_stat.st_mode):
+            raise OSError("manual checkpoint receipt root is not a directory")
+        os.chmod(state_dir, 0o700)
+
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".manual-checkpoint-",
+            suffix=".tmp",
+            dir=state_dir,
+        )
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "schema_version": _MANUAL_CHECKPOINT_RECEIPT_SCHEMA_VERSION,
+                        "recipe_id": spec["recipe_id"],
+                        "contract": spec,
+                        "expected_size": spec["size_bytes"],
+                        "expected_sha256": spec["sha256"],
+                        "path_digest": path_digest,
+                        "identity": list(identity),
+                    },
+                    handle,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        os.replace(temporary_path, receipt_path)
+        temporary_path = None
+        os.chmod(receipt_path, 0o600)
+        try:
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_descriptor = os.open(state_dir, directory_flags)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError:
+            pass
+        return True
+    except Exception:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        _delete_manual_checkpoint_receipt(spec)
+        return False
+
+
+def _recover_manual_checkpoint_receipt(spec):
+    """Recover one exact receipt using metadata and stat checks only."""
+    receipt_path = _manual_checkpoint_receipt_path(spec)
+    if receipt_path is None:
+        return None
+    try:
+        state_stat = os.lstat(_MANUAL_CHECKPOINT_VERIFICATION_STATE_DIR)
+        receipt_stat = os.lstat(receipt_path)
+        if (
+            not stat.S_ISDIR(state_stat.st_mode)
+            or not stat.S_ISREG(receipt_stat.st_mode)
+            or (
+                os.name == "posix"
+                and (
+                    stat.S_IMODE(state_stat.st_mode) != 0o700
+                    or stat.S_IMODE(receipt_stat.st_mode) != 0o600
+                )
+            )
+            or receipt_stat.st_size > _MANUAL_CHECKPOINT_RECEIPT_MAX_BYTES
+        ):
+            raise ValueError("unsafe manual checkpoint receipt")
+
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(receipt_path, flags)
+        try:
+            opened_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or (
+                    os.name == "posix"
+                    and stat.S_IMODE(opened_stat.st_mode) != 0o600
+                )
+                or opened_stat.st_dev != receipt_stat.st_dev
+                or opened_stat.st_ino != receipt_stat.st_ino
+                or opened_stat.st_size != receipt_stat.st_size
+            ):
+                raise ValueError("replaced manual checkpoint receipt")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = None
+                serialized = handle.read(
+                    _MANUAL_CHECKPOINT_RECEIPT_MAX_BYTES + 1
+                )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if len(serialized.encode("utf-8")) > _MANUAL_CHECKPOINT_RECEIPT_MAX_BYTES:
+            raise ValueError("oversized manual checkpoint receipt")
+        receipt = json.loads(serialized)
+        expected_keys = {
+            "schema_version",
+            "recipe_id",
+            "contract",
+            "expected_size",
+            "expected_sha256",
+            "path_digest",
+            "identity",
+        }
+        identity = receipt.get("identity") if isinstance(receipt, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != expected_keys
+            or receipt.get("schema_version")
+            != _MANUAL_CHECKPOINT_RECEIPT_SCHEMA_VERSION
+            or receipt.get("recipe_id") != spec["recipe_id"]
+            or receipt.get("contract") != spec
+            or receipt.get("expected_size") != spec["size_bytes"]
+            or receipt.get("expected_sha256") != spec["sha256"]
+            or not isinstance(receipt.get("path_digest"), str)
+            or not isinstance(identity, list)
+            or len(identity) != 4
+            or not all(type(value) is int for value in identity)
+        ):
+            raise ValueError("stale manual checkpoint receipt")
+
+        local_path = get_local_model_filename(spec["filename"])
+        if not isinstance(local_path, str):
+            raise ValueError("manual checkpoint is unavailable")
+        resolved_path = _manual_checkpoint_resolved_path(local_path)
+        current_stat = os.stat(resolved_path)
+        current_identity = _checkpoint_stat_identity(current_stat)
+        if (
+            not stat.S_ISREG(current_stat.st_mode)
+            or current_identity != tuple(identity)
+            or current_stat.st_size != spec["size_bytes"]
+            or _manual_checkpoint_path_digest(resolved_path)
+            != receipt["path_digest"]
+        ):
+            raise ValueError("stale manual checkpoint receipt")
+        return {
+            "path": resolved_path,
+            "identity": current_identity,
+            "path_digest": receipt["path_digest"],
+        }
+    except Exception:
+        _delete_manual_checkpoint_receipt(spec)
+        return None
 
 
 def _manual_checkpoint_integrity_spec(model_type, model_def, model_defs=None):
@@ -4157,7 +4376,9 @@ def _manual_checkpoint_integrity_spec(model_type, model_def, model_defs=None):
         raise RuntimeError(
             f"Manual checkpoint integrity contract is invalid for '{selected_model_type}'."
         )
-    return dict(contract)
+    spec = dict(contract)
+    spec["recipe_id"] = candidate_model_type
+    return spec
 
 
 def _verified_local_checkpoint_record(
@@ -4234,11 +4455,13 @@ def _require_manual_checkpoint_integrity(model_type, model_def, model_defs=None)
     cache_key = _manual_checkpoint_cache_key(spec)
     with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
         _MANUAL_CHECKPOINT_VERIFICATION_CACHE.pop(cache_key, None)
+        _delete_manual_checkpoint_receipt(spec)
     local_path = get_local_model_filename(spec["filename"])
     if not isinstance(local_path, str) or not os.path.isfile(local_path):
         raise RuntimeError(
             f"Manual checkpoint for '{model_type}' is missing or unavailable."
         )
+    local_path = _manual_checkpoint_resolved_path(local_path)
 
     record = _verified_local_checkpoint_record(
         local_path,
@@ -4246,6 +4469,8 @@ def _require_manual_checkpoint_integrity(model_type, model_def, model_defs=None)
         expected_size=spec["size_bytes"],
         expected_sha256=spec["sha256"],
     )
+    record["path_digest"] = _manual_checkpoint_path_digest(record["path"])
+    _store_manual_checkpoint_receipt(spec, record)
     with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
         _MANUAL_CHECKPOINT_VERIFICATION_CACHE[cache_key] = record
     return record["path"]
@@ -4306,7 +4531,7 @@ def manual_checkpoint_integrity_required(model_type, model_def, model_defs=None)
 
 
 def manual_checkpoint_integrity_ready(model_type, model_def, model_defs=None):
-    """Return cached exact-artifact readiness without hashing or side effects."""
+    """Return exact-artifact readiness without hashing checkpoint contents."""
     try:
         spec = _manual_checkpoint_integrity_spec(
             model_type,
@@ -4320,6 +4545,10 @@ def manual_checkpoint_integrity_ready(model_type, model_def, model_defs=None):
     cache_key = _manual_checkpoint_cache_key(spec)
     with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
         record = _MANUAL_CHECKPOINT_VERIFICATION_CACHE.get(cache_key)
+        if not isinstance(record, dict):
+            record = _recover_manual_checkpoint_receipt(spec)
+            if isinstance(record, dict):
+                _MANUAL_CHECKPOINT_VERIFICATION_CACHE[cache_key] = record
     if not isinstance(record, dict):
         return False
     path = record.get("path")
@@ -4328,12 +4557,13 @@ def manual_checkpoint_integrity_ready(model_type, model_def, model_defs=None):
         return False
     try:
         current_identity = _checkpoint_stat_identity(os.stat(path))
-    except OSError:
+    except Exception:
         current_identity = None
     if current_identity != identity:
         with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
             if _MANUAL_CHECKPOINT_VERIFICATION_CACHE.get(cache_key) is record:
                 _MANUAL_CHECKPOINT_VERIFICATION_CACHE.pop(cache_key, None)
+                _delete_manual_checkpoint_receipt(spec)
         return False
     with _MANUAL_CHECKPOINT_VERIFICATION_LOCK:
         return _MANUAL_CHECKPOINT_VERIFICATION_CACHE.get(cache_key) is record

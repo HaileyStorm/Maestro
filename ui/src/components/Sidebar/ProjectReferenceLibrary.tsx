@@ -18,6 +18,7 @@ import {
   getProjectAssetMediaUrl,
   getProjectReferenceEditorModels,
   getProjectReferenceGenerationModels,
+  getProjectReferencePreferredGenerationModel,
   getProjectReferenceModelAvailabilityCopy,
   getProjectReferenceQueueBlockers,
   getProjectReferenceVisibilityHints,
@@ -25,12 +26,15 @@ import {
   getLoraParameterOptionToken,
   getLoraParameterValue,
   getProjectReferenceRepairCopy,
+  getProjectReferenceReviewerAction,
+  getProjectReferenceReviewerSetupCopy,
   getProjectReferenceRetrySettings,
   hasProjectReferenceLoraParameterSummary,
   isProjectReferenceReviewMandatory,
   isProjectReferenceReviewerEligible,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
+  loadLlm,
   loraParameterSchemasConflict,
   projectAssetRequestError,
   projectAssetOutputNeedsInitialBlur,
@@ -645,6 +649,8 @@ export function ProjectReferenceLibrary({
   const [submitting, setSubmitting] = useState(false)
   const [loadError, setLoadError] = useState('')
   const [modelLoadError, setModelLoadError] = useState('')
+  const [reviewerAction, setReviewerAction] = useState<'refreshing' | 'loading' | null>(null)
+  const [reviewerActionError, setReviewerActionError] = useState('')
   const [verifyingManualModel, setVerifyingManualModel] = useState('')
   const [actionError, setActionError] = useState('')
   const [catalogModels, setCatalogModels] = useState<ApiModel[]>([])
@@ -893,26 +899,30 @@ export function ProjectReferenceLibrary({
     [planningModels],
   )
   const uncensoredReviewContract = referenceCapabilities?.uncensored_auto_review
-  const uncensoredReviewModel = reviewModels.find(model => (
+  const uncensoredReviewCatalogModel = llmCatalogModels.find(model => (
     model.id === uncensoredReviewContract?.resolved_model
     && (model.provider ?? 'local') === uncensoredReviewContract?.resolved_provider
   ))
   const selectableReviewModels = intelligencePolicy === 'uncensored_auto'
-    ? (uncensoredReviewModel ? [uncensoredReviewModel] : [])
+    ? (uncensoredReviewCatalogModel ? [uncensoredReviewCatalogModel] : [])
     : reviewModels
   const uncensoredReviewSelectionValid = reviewModel === 'off'
     || reviewModel === 'auto_local'
     || (reviewModel === uncensoredReviewContract?.resolved_model
-      && uncensoredReviewModel?.id === reviewModel)
+      && (selectedReviewModel?.provider ?? 'local') === uncensoredReviewContract?.resolved_provider)
   const uncensoredReviewUnavailable = intelligencePolicy === 'uncensored_auto'
     && reviewModel !== 'off'
-    && (!uncensoredReviewContract || !uncensoredReviewModel || !uncensoredReviewSelectionValid)
+    && (!uncensoredReviewContract?.queue_ready || !uncensoredReviewSelectionValid)
   const mandatoryReviewSelectionEligible = isProjectReferenceReviewerEligible(
     intelligencePolicy, reviewModel, selectedReviewModel?.provider,
     reviewModels, referenceCapabilities,
   )
   const mandatoryReviewUnavailable = mandatoryReview && !mandatoryReviewSelectionEligible
   const reviewSelectionUnavailable = uncensoredReviewUnavailable || mandatoryReviewUnavailable
+  const reviewerSetupCopy = getProjectReferenceReviewerSetupCopy(uncensoredReviewContract)
+  const reviewerSetupAction = getProjectReferenceReviewerAction(
+    uncensoredReviewContract?.setup_state,
+  )
   explicitOutputRef.current = explicitOutput
   privateOutputRef.current = privateOutput
   const availablePendingLoras = useMemo(() => {
@@ -1087,6 +1097,8 @@ export function ProjectReferenceLibrary({
     setQueuedMessage('')
     setLoadError('')
     setModelLoadError('')
+    setReviewerAction(null)
+    setReviewerActionError('')
     setActionError('')
   }, [project])
 
@@ -1148,18 +1160,20 @@ export function ProjectReferenceLibrary({
     setQueuedMessage('')
     setLoadError('')
     setModelLoadError('')
+    setReviewerAction(null)
+    setReviewerActionError('')
     setActionError('')
   }, [projectExplicitlyLocked])
 
   useEffect(() => {
-    const preferred = sheetMode === 'draft'
-      ? 'flux2_klein_9b'
-      : referenceCapabilities?.default_models.generation_model ?? ''
+    const preferred = getProjectReferencePreferredGenerationModel(
+      sheetMode, referenceExplicitOutput, contentCapability, referenceCapabilities,
+    )
     setReferenceModelType(current => {
       if (referenceModelCustomized) return selectProjectReferenceModel(referenceModels, current)
       return referenceModels.some(model => model.model_type === preferred) ? preferred : ''
     })
-  }, [referenceCapabilities, referenceModelCustomized, referenceModels, sheetMode])
+  }, [contentCapability, referenceCapabilities, referenceExplicitOutput, referenceModelCustomized, referenceModels, sheetMode])
 
   useEffect(() => {
     const preferred = referenceCapabilities?.default_models.editor_model ?? ''
@@ -1181,7 +1195,7 @@ export function ProjectReferenceLibrary({
     }
     if (intelligencePolicy === 'uncensored_auto') {
       const exactLocalSelection = reviewModel === uncensoredReviewContract?.resolved_model
-        && uncensoredReviewModel?.id === reviewModel
+        && (selectedReviewModel?.provider ?? 'local') === uncensoredReviewContract?.resolved_provider
       if (reviewModel !== 'auto_local' && reviewModel !== 'off' && !exactLocalSelection) {
         setReviewModel('auto_local')
       }
@@ -1189,7 +1203,7 @@ export function ProjectReferenceLibrary({
     }
     if (reviewModel !== 'auto_local' && reviewModel !== 'off'
       && !reviewModels.some(model => model.id === reviewModel)) setReviewModel('auto_local')
-  }, [intelligencePolicy, mandatoryReview, reviewModel, reviewModels, uncensoredReviewContract?.resolved_model, uncensoredReviewModel?.id])
+  }, [intelligencePolicy, mandatoryReview, reviewModel, reviewModels, selectedReviewModel?.provider, uncensoredReviewContract?.resolved_model, uncensoredReviewContract?.resolved_provider])
 
   useEffect(() => {
     let active = true
@@ -1411,6 +1425,43 @@ export function ProjectReferenceLibrary({
     requestSequence.current += 1
     refreshNow()
   }, [refreshNow])
+
+  const refreshReviewerSetup = useCallback(async (loadRequired = false) => {
+    const modelId = uncensoredReviewContract?.resolved_model
+    if (loadRequired && (!machineControls || !modelId)) return
+    const epoch = projectEpoch.current
+    const submittedProject = project
+    setReviewerAction(loadRequired ? 'loading' : 'refreshing')
+    setReviewerActionError('')
+    try {
+      if (loadRequired) {
+        await loadLlm({ model_id: modelId, provider: 'local' })
+        if (!isProjectAssetOperationCurrent(
+          submittedProject, epoch, currentProject.current, projectEpoch.current,
+        )) return
+      }
+      const [llmCatalog, capabilities] = await Promise.all([
+        fetchLlmModels(project),
+        fetchProjectReferenceCapabilities(project),
+      ])
+      if (!isProjectAssetOperationCurrent(
+        submittedProject, epoch, currentProject.current, projectEpoch.current,
+      )) return
+      setLlmCatalogModels(llmCatalog.models)
+      setReferenceCapabilities(capabilities)
+    } catch {
+      if (!isProjectAssetOperationCurrent(
+        submittedProject, epoch, currentProject.current, projectEpoch.current,
+      )) return
+      setReviewerActionError(loadRequired
+        ? 'Could not install or load the required reviewer. Check the local model service, then refresh reviewer status.'
+        : 'Could not refresh reviewer status. Check the local model service and try again.')
+    } finally {
+      if (isProjectAssetOperationCurrent(
+        submittedProject, epoch, currentProject.current, projectEpoch.current,
+      )) setReviewerAction(null)
+    }
+  }, [machineControls, project, uncensoredReviewContract?.resolved_model])
 
   useEffect(() => {
     if (!open || browsingUploads || projectExplicitlyLocked || privateAuthoringTargetSignature === '[]') return
@@ -2763,13 +2814,38 @@ export function ProjectReferenceLibrary({
                   <select id="project-reference-review-model" aria-label="Reference Studio visual review model" value={reviewModel} onChange={event => setReviewModel(event.target.value)} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary">
                     <option value="auto_local">{intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract ? `Auto local · ${uncensoredReviewContract.resolved_model}` : 'Auto local'}</option>
                     <option value="off" disabled={mandatoryReview}>{mandatoryReview ? 'Off · unavailable for unrestricted / explicit output' : 'Off'}</option>
-                    {selectableReviewModels.map(model => <option key={model.id} value={model.id}>{model.label} · {model.provider ?? 'local'} · vision ready</option>)}
+                    {selectableReviewModels.map(model => <option key={model.id} value={model.id}>{model.label} · {model.provider ?? 'local'} · {intelligencePolicy !== 'uncensored_auto' || uncensoredReviewContract?.setup_state === 'ready_resident' ? 'vision ready' : uncensoredReviewContract?.setup_state === 'ready_unloaded' ? 'installed; auto-loads for review' : 'setup required'}</option>)}
                   </select>
                 </label>
-                <p className="mt-1 text-[8px] text-text-muted">Auto never sends data remotely. Standard Auto uses standard local options; Uncensored-capable Auto uses local abliterated options only when explicitly selected or applied by Explicit / Anatomy. Explicit model choices list only the exact healthy loaded provider entry.</p>
+                <p className="mt-1 text-[8px] text-text-muted">Auto never sends data remotely. Standard Auto uses currently loaded local vision options. Uncensored-capable Auto pins the exact local Paperscarecrow reviewer and MMProj; when both are installed, they may load automatically when fidelity review starts.</p>
                 {mandatoryReview && <p role="status" className="mt-1 text-[9px] text-amber-200">Vision fidelity review is required for unrestricted or explicit output and cannot be turned off.</p>}
-                {intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract && <p className="mt-1 text-[8px] text-text-muted">Uncensored-capable review is pinned to {uncensoredReviewContract.resolved_model} on this host; it never falls back to a remote or generic reviewer.</p>}
-                {reviewSelectionUnavailable && <p role="status" className="mt-1 text-[9px] text-red-300">{mandatoryReview ? 'A compatible vision reviewer must be loaded and selected before this unrestricted or explicit reference pack can be queued.' : 'The required local uncensored-capable vision reviewer is unavailable. Review can be turned off, or the exact local reviewer must be loaded before queueing.'}</p>}
+                {intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract && (
+                  <div aria-label="Required visual reviewer setup" className="mt-1.5 rounded border border-border bg-bg-primary/50 p-1.5 text-[8px] leading-relaxed text-text-muted">
+                    <p>Selected: {uncensoredReviewContract.resolved_model} · local only · no generic or remote fallback</p>
+                    <p>Checkpoint: {uncensoredReviewContract.installed ? 'installed' : 'missing'} · MMProj: {uncensoredReviewContract.projector_available ? 'installed' : 'missing'} ({uncensoredReviewContract.required_projector})</p>
+                    <p>Runtime: {uncensoredReviewContract.loading ? `loading${uncensoredReviewContract.loading_phase ? ` (${uncensoredReviewContract.loading_phase})` : ''}` : uncensoredReviewContract.resident ? 'loaded' : uncensoredReviewContract.queue_ready ? 'not loaded; automatic load available' : 'not loaded'} · Vision: {!uncensoredReviewContract.vision_capable ? 'not registered' : uncensoredReviewContract.vision_available === true ? 'ready' : uncensoredReviewContract.vision_available === false ? 'unavailable' : 'checked after load'}</p>
+                    <p role="status" className={uncensoredReviewContract.queue_ready ? 'mt-0.5 text-accent-green' : 'mt-0.5 text-red-300'}>{reviewerSetupCopy}</p>
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {reviewerSetupAction && machineControls && (
+                        <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(true) }} className="rounded border border-accent-blue/40 px-1.5 py-0.5 text-accent-blue disabled:opacity-40">
+                          {reviewerAction === 'loading' ? 'Preparing required reviewer…' : reviewerSetupAction.label}
+                        </button>
+                      )}
+                      <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="rounded border border-border px-1.5 py-0.5 text-text-secondary disabled:opacity-40">
+                        {reviewerAction === 'refreshing' ? 'Refreshing reviewer status…' : 'Refresh reviewer status'}
+                      </button>
+                    </div>
+                    {reviewerSetupAction && !machineControls && <p className="mt-1 text-amber-200">Open Maestro at localhost on the host machine to install, load, or reload the required reviewer. LAN sessions can refresh status but cannot change the local model runtime.</p>}
+                    {reviewerActionError && <p role="status" className="mt-1 text-red-300">{reviewerActionError}</p>}
+                  </div>
+                )}
+                {intelligencePolicy === 'uncensored_auto' && !uncensoredReviewContract && (
+                  <div className="mt-1 text-[9px]">
+                    <p role="status" className="text-red-300">{reviewerSetupCopy}</p>
+                    <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="mt-1 rounded border border-border px-1.5 py-0.5 text-text-secondary disabled:opacity-40">{reviewerAction === 'refreshing' ? 'Refreshing reviewer status…' : 'Refresh reviewer status'}</button>
+                    {reviewerActionError && <p role="status" className="mt-1 text-red-300">{reviewerActionError}</p>}
+                  </div>
+                )}
                 {intelligencePolicy === 'standard_auto' && selectedReviewModel && (selectedReviewModel.provider ?? 'local') !== 'local' && <p className="mt-1 text-[9px] text-amber-300">Selected remote visual review sends generated reference images to {selectedReviewModel.provider}; that provider’s terms and privacy policy apply.</p>}
                 <details className="mt-2 rounded border border-border px-2 py-1.5">
                   <summary className="cursor-pointer text-[10px] text-text-secondary">Advanced</summary>
@@ -3023,7 +3099,7 @@ export function ProjectReferenceLibrary({
                                     && ((requiresPrivateAuthoring && !exactAuthoringReady) || (requiresPrivateLoraInputs && !exactLoraInputsReady)) && (
                                     <button type="button" onClick={() => setPrivateReplayRetry(current => current + 1)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5 text-[8px] text-amber-100">Retry private replay</button>
                                   )}
-                                  {!retryReview.ready && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">Retry and Edit require a compatible vision reviewer for this unrestricted or explicit source pack. Load and select an eligible reviewer first.</p>}
+                                  {!retryReview.ready && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{retryReview.intelligence_policy === 'uncensored_auto' ? `Retry and Edit are waiting for the required local fidelity reviewer. ${reviewerSetupCopy}` : 'Retry and Edit require a loaded local vision reviewer for this source pack. Load and select an eligible reviewer first.'}</p>}
                                   {retryReview.use_current_reviewer && <p role="status" className="mt-1 text-[8px] leading-relaxed text-text-muted">The recorded reviewer is unavailable; Retry or Edit will use the current compatible reviewer.</p>}
                                   {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry/Edit preserves recorded source mode, resolved model pair, privacy, repair, planning, and review policy. The kept parent remains unchanged.</p>}
                                   {editing && (variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && (

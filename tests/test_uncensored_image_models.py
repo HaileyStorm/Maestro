@@ -26,6 +26,23 @@ _PORNMASTER_PONPOKE_RECIPE = (
 )
 _KREA2_MOODY_MIX_RECIPE = "krea2_moody_mix_v7_fp8"
 _KREA2_MOODY_CUTIE_RECIPE = "krea2_moody_cutie_v4_fp8"
+_MANUAL_CHECKPOINT_INTEGRITY_FUNCTIONS = {
+    "_checkpoint_stat_identity",
+    "_delete_manual_checkpoint_receipt",
+    "_manual_checkpoint_cache_key",
+    "_manual_checkpoint_integrity_spec",
+    "_manual_checkpoint_path_digest",
+    "_manual_checkpoint_receipt_path",
+    "_manual_checkpoint_resolved_path",
+    "_recover_manual_checkpoint_receipt",
+    "_require_manual_checkpoint_integrity",
+    "_store_manual_checkpoint_receipt",
+    "_verified_local_checkpoint_record",
+    "_verify_local_checkpoint_integrity",
+    "manual_checkpoint_integrity_ready",
+    "manual_checkpoint_integrity_required",
+    "verify_manual_checkpoint_integrity",
+}
 
 
 def _load_default(model_id: str) -> dict:
@@ -56,6 +73,33 @@ def _load_functions(path: Path, names: set[str]):
     module = ast.Module(body=functions, type_ignores=[])
     exec(compile(module, str(path), "exec"), namespace)
     return namespace
+
+
+def _configure_manual_checkpoint_loader(
+    loader,
+    contracts,
+    state_dir,
+    *,
+    cache=None,
+):
+    loader.update({
+        "hashlib": __import__("hashlib"),
+        "json": __import__("json"),
+        "stat": __import__("stat"),
+        "tempfile": __import__("tempfile"),
+        "PORNMASTER_V4_PONPOKE_RECIPE": _PORNMASTER_PONPOKE_RECIPE,
+        "_MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS": contracts,
+        "_MANUAL_CHECKPOINT_RECEIPT_MAX_BYTES": 16 * 1024,
+        "_MANUAL_CHECKPOINT_RECEIPT_SCHEMA_VERSION": 1,
+        "_MANUAL_CHECKPOINT_VERIFICATION_CACHE": (
+            {} if cache is None else cache
+        ),
+        "_MANUAL_CHECKPOINT_VERIFICATION_LOCK": __import__(
+            "threading"
+        ).RLock(),
+        "_MANUAL_CHECKPOINT_VERIFICATION_STATE_DIR": str(state_dir),
+    })
+    return loader
 
 
 def _load_encoder_asset_resolvers():
@@ -441,33 +485,18 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
     def test_manual_checkpoint_preflight_verifies_bytes_before_load_work(self):
         loader = _load_functions(
             _WGP,
-            {
-                "_checkpoint_stat_identity",
-                "_manual_checkpoint_cache_key",
-                "_manual_checkpoint_integrity_spec",
-                "_require_manual_checkpoint_integrity",
-                "_verify_local_checkpoint_integrity",
-                "_verified_local_checkpoint_record",
-                "manual_checkpoint_integrity_ready",
-            },
+            _MANUAL_CHECKPOINT_INTEGRITY_FUNCTIONS,
         )
-        loader.update({
-            "hashlib": __import__("hashlib"),
-            "PORNMASTER_V4_PONPOKE_RECIPE": _PORNMASTER_PONPOKE_RECIPE,
-            "_MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS": {
-                _PORNMASTER_PONPOKE_RECIPE: {
-                    "filename": "pornmasterFlux2Klein_v4TurboFp8.safetensors",
-                    "size_bytes": 9433104872,
-                    "sha256": (
-                        "e90eeb50140a10806341b7521c340214c6f76cec2f8f8dae7a443c5806072df7"
-                    ),
-                },
+        contracts = {
+            _PORNMASTER_PONPOKE_RECIPE: {
+                "filename": "pornmasterFlux2Klein_v4TurboFp8.safetensors",
+                "size_bytes": 9433104872,
+                "sha256": (
+                    "e90eeb50140a10806341b7521c340214c6f76cec2f8f8dae7a443c5806072df7"
+                ),
             },
-            "_MANUAL_CHECKPOINT_VERIFICATION_CACHE": {},
-            "_MANUAL_CHECKPOINT_VERIFICATION_LOCK": __import__(
-                "threading"
-            ).RLock(),
-        })
+        }
+        _configure_manual_checkpoint_loader(loader, contracts, "unused")
         spec = loader["_manual_checkpoint_integrity_spec"](
             _PORNMASTER_PONPOKE_RECIPE,
             self.model,
@@ -478,9 +507,13 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
             "sha256": (
                 "e90eeb50140a10806341b7521c340214c6f76cec2f8f8dae7a443c5806072df7"
             ),
+            "recipe_id": _PORNMASTER_PONPOKE_RECIPE,
         })
 
         with tempfile.TemporaryDirectory() as tmp:
+            loader["_MANUAL_CHECKPOINT_VERIFICATION_STATE_DIR"] = str(
+                Path(tmp, "receipts")
+            )
             artifact = Path(tmp, spec["filename"])
             artifact.write_bytes(b"wrong-size")
             loader["get_local_model_filename"] = lambda _filename: str(artifact)
@@ -673,16 +706,7 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
     def test_manual_checkpoint_status_requires_stable_cached_preflight(self):
         loader = _load_functions(
             _WGP,
-            {
-                "_checkpoint_stat_identity",
-                "_manual_checkpoint_cache_key",
-                "_manual_checkpoint_integrity_spec",
-                "_require_manual_checkpoint_integrity",
-                "_verified_local_checkpoint_record",
-                "manual_checkpoint_integrity_required",
-                "manual_checkpoint_integrity_ready",
-                "verify_manual_checkpoint_integrity",
-            },
+            _MANUAL_CHECKPOINT_INTEGRITY_FUNCTIONS,
         )
         payload = b"synthetic-checkpoint"
         digest = __import__("hashlib").sha256(payload).hexdigest()
@@ -698,17 +722,9 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
             "sha256": digest.upper(),
         })
         cache = {}
-        loader.update({
-            "hashlib": __import__("hashlib"),
-            "PORNMASTER_V4_PONPOKE_RECIPE": _PORNMASTER_PONPOKE_RECIPE,
-            "_MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS": {
-                _PORNMASTER_PONPOKE_RECIPE: contract,
-            },
-            "_MANUAL_CHECKPOINT_VERIFICATION_CACHE": cache,
-            "_MANUAL_CHECKPOINT_VERIFICATION_LOCK": __import__(
-                "threading"
-            ).RLock(),
-        })
+        contracts = {
+            _PORNMASTER_PONPOKE_RECIPE: contract,
+        }
         alias_id = "pornmaster_manual_alias"
         alias = {
             "architecture": "flux2_klein_9b",
@@ -718,6 +734,12 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
             alias_id: alias,
             _PORNMASTER_PONPOKE_RECIPE: synthetic,
         }
+        _configure_manual_checkpoint_loader(
+            loader,
+            contracts,
+            "unused",
+            cache=cache,
+        )
         required = loader["manual_checkpoint_integrity_required"]
         self.assertTrue(required(
             _PORNMASTER_PONPOKE_RECIPE,
@@ -749,6 +771,13 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
         ))
 
         with tempfile.TemporaryDirectory() as tmp:
+            receipt_dir = Path(tmp, "receipts")
+            _configure_manual_checkpoint_loader(
+                loader,
+                contracts,
+                receipt_dir,
+                cache=cache,
+            )
             artifact = Path(tmp, contract["filename"])
             artifact.write_bytes(payload)
             loader["get_local_model_filename"] = lambda _filename: str(artifact)
@@ -771,13 +800,48 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
             ))
             self.assertTrue(ready(alias_id, alias, definitions))
 
+            receipt = receipt_dir / f"{_PORNMASTER_PONPOKE_RECIPE}.json"
+            self.assertTrue(receipt.is_file())
+            receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(receipt_data["schema_version"], 1)
+            self.assertEqual(
+                receipt_data["recipe_id"],
+                _PORNMASTER_PONPOKE_RECIPE,
+            )
+            self.assertEqual(receipt_data["expected_size"], len(payload))
+            self.assertEqual(receipt_data["expected_sha256"], digest)
+            self.assertEqual(len(receipt_data["identity"]), 4)
+            self.assertNotIn(str(artifact), receipt.read_text(encoding="utf-8"))
+            self.assertNotIn(payload.decode("ascii"), receipt.read_text(
+                encoding="utf-8",
+            ))
+            if __import__("os").name == "posix":
+                self.assertEqual(receipt_dir.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+
             cache.clear()
-            self.assertTrue(verify(alias_id, alias, definitions))
+            real_hashlib = __import__("hashlib")
+
+            class MetadataOnlyHashlib:
+                @staticmethod
+                def sha256(data=b""):
+                    if not data:
+                        raise AssertionError(
+                            "status helper must not start a checkpoint hash"
+                        )
+                    return real_hashlib.sha256(data)
+
+            loader["hashlib"] = MetadataOnlyHashlib
             self.assertTrue(ready(alias_id, alias, definitions))
+            self.assertTrue(ready(
+                _PORNMASTER_PONPOKE_RECIPE,
+                synthetic,
+                definitions,
+            ))
 
             class NoHashingAllowed:
                 @staticmethod
-                def sha256():
+                def sha256(*_args, **_kwargs):
                     raise AssertionError("status helper must not hash")
 
             loader["hashlib"] = NoHashingAllowed
@@ -805,18 +869,32 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
 
             loader["os"] = real_os
             loader["hashlib"] = __import__("hashlib")
+            moved_dir = Path(tmp, "moved")
+            moved_dir.mkdir()
+            moved_artifact = moved_dir / artifact.name
+            artifact.replace(moved_artifact)
+            loader["get_local_model_filename"] = (
+                lambda _filename: str(moved_artifact)
+            )
+            self.assertFalse(ready(alias_id, alias, definitions))
+            self.assertFalse(receipt.exists())
+            moved_artifact.replace(artifact)
+            loader["get_local_model_filename"] = lambda _filename: str(artifact)
+
             loader["_require_manual_checkpoint_integrity"](
                 _PORNMASTER_PONPOKE_RECIPE,
                 synthetic,
                 definitions,
             )
             artifact.write_bytes(b"synthetic-checkpoinu")
+            cache.clear()
             self.assertFalse(ready(
                 _PORNMASTER_PONPOKE_RECIPE,
                 synthetic,
                 definitions,
             ))
             self.assertEqual(cache, {})
+            self.assertFalse(receipt.exists())
 
             artifact.write_bytes(payload)
             loader["_require_manual_checkpoint_integrity"](
@@ -831,6 +909,43 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
                 definitions,
             ))
             self.assertEqual(cache, {})
+            self.assertFalse(receipt.exists())
+
+            artifact.write_bytes(payload)
+            self.assertTrue(verify(
+                _PORNMASTER_PONPOKE_RECIPE,
+                synthetic,
+                definitions,
+            ))
+            cache.clear()
+            stale_receipt = json.loads(receipt.read_text(encoding="utf-8"))
+            stale_receipt["contract"]["sha256"] = "0" * 64
+            receipt.write_text(json.dumps(stale_receipt), encoding="utf-8")
+            receipt.chmod(0o600)
+            self.assertFalse(ready(alias_id, alias, definitions))
+            self.assertFalse(receipt.exists())
+
+            self.assertTrue(verify(
+                _PORNMASTER_PONPOKE_RECIPE,
+                synthetic,
+                definitions,
+            ))
+            cache.clear()
+            if __import__("os").name == "posix":
+                receipt.chmod(0o644)
+                self.assertFalse(ready(alias_id, alias, definitions))
+                self.assertFalse(receipt.exists())
+                self.assertTrue(verify(
+                    _PORNMASTER_PONPOKE_RECIPE,
+                    synthetic,
+                    definitions,
+                ))
+                cache.clear()
+
+            receipt.write_text("{malformed", encoding="utf-8")
+            receipt.chmod(0o600)
+            self.assertFalse(ready(alias_id, alias, definitions))
+            self.assertFalse(receipt.exists())
 
         class NoLocalLookup:
             def __call__(self, _filename):
@@ -942,23 +1057,9 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
 
         loader = _load_functions(
             _WGP,
-            {
-                "_checkpoint_stat_identity",
-                "_manual_checkpoint_cache_key",
-                "_manual_checkpoint_integrity_spec",
-                "_require_manual_checkpoint_integrity",
-                "_verified_local_checkpoint_record",
-                "manual_checkpoint_integrity_required",
-            },
+            _MANUAL_CHECKPOINT_INTEGRITY_FUNCTIONS,
         )
-        loader.update({
-            "hashlib": __import__("hashlib"),
-            "_MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS": contracts,
-            "_MANUAL_CHECKPOINT_VERIFICATION_CACHE": {},
-            "_MANUAL_CHECKPOINT_VERIFICATION_LOCK": __import__(
-                "threading"
-            ).RLock(),
-        })
+        _configure_manual_checkpoint_loader(loader, contracts, "unused")
 
         def model_for(contract):
             return {
@@ -996,7 +1097,7 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
                         model,
                         definitions,
                     ),
-                    contract,
+                    contract | {"recipe_id": root_id},
                 )
                 alias_id = f"{root_id}_alias"
                 alias = {"URLs": root_id}
@@ -1007,7 +1108,7 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
                         alias,
                         alias_definitions,
                     ),
-                    contract,
+                    contract | {"recipe_id": root_id},
                 )
                 with self.assertRaisesRegex(RuntimeError, "contract is invalid"):
                     loader["_manual_checkpoint_integrity_spec"](
@@ -1089,6 +1190,9 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
             ],
         })
         with tempfile.TemporaryDirectory() as tmp:
+            loader["_MANUAL_CHECKPOINT_VERIFICATION_STATE_DIR"] = str(
+                Path(tmp, "receipts")
+            )
             for root_id, exact_contract in expected.items():
                 payload = root_id.encode("ascii")
                 tiny_contract = dict(exact_contract)

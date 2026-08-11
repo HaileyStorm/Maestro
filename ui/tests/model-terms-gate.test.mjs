@@ -167,7 +167,7 @@ test('manual-only catalog metadata suppresses generic download affordance', asyn
   )
 })
 
-test('Moody Krea candidates stay full-catalog experimental and out of defaults', async () => {
+test('Moody Krea stays outside global defaults while a scoped Reference preference remains separate', async () => {
   const store = await source('../src/stores/useStore.ts')
   const notices = await source('../src/lib/hostTerms.ts')
   const recipes = [

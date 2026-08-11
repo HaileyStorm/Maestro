@@ -998,9 +998,10 @@ MODEL_REGISTRY = {
         ],
     },
     "paperscarecrow/Gemma-4-31B-it-abliterated-gguf": {
-        # Registry-only refinement model. It remains selectable by exact ID
-        # for owner-authorized local evaluation but is intentionally omitted
-        # from the curated public picker below.
+        # Optional local vision/refinement model. It is exposed under this
+        # canonical ID so an installed GGUF is never reduced to an opaque
+        # linked-file identity; ordinary chat still keeps the separate
+        # MoonRide text model as its configured/default selection.
         "label": "Gemma 4 31B Abliterated Q4_K_M (Vision)",
         "gguf_file": "gemma-4-31b-abliterated-Q4_K_M.gguf",
         "mmproj_file": "mmproj-gemma-4-31B-it-BF16.gguf",
@@ -1084,6 +1085,7 @@ _PUBLIC_MODEL_ORDER = [
     "Youssofal/Qwen3.6-27B-Abliterated-Heretic-Uncensored-GGUF",
     "Nesuwka/gemma-4-E2B-it-heretic-ara-Q4_K_M-GGUF",
     "MoonRide/gemma-4-31B-it-heretic-ara-GGUF",                   # Director default
+    "paperscarecrow/Gemma-4-31B-it-abliterated-gguf",            # Optional vision reviewer
 ]
 
 CHAT_MAX_MESSAGES = 64

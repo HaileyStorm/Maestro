@@ -1397,6 +1397,37 @@ export interface ProjectReferenceCapabilities {
     resolved_model: string
     resolved_provider: 'local'
     vision_required: true
+    required_projector: string
+    installed: boolean
+    projector_available: boolean
+    vision_capable: boolean
+    resident: boolean
+    vision_available: boolean | null
+    loading: boolean
+    loading_phase: string | null
+    setup_state:
+      | 'missing_model'
+      | 'missing_projector'
+      | 'loading'
+      | 'loaded_without_vision'
+      | 'ready_unloaded'
+      | 'ready_resident'
+    /** Server-authoritative worker-time readiness; residency is not required. */
+    queue_ready: boolean
+  }
+  explicit_generation_model: {
+    preferred_order: string[]
+    resolved_model: string
+    fallback_model: string
+    selection_source: 'verified_manual_preference' | 'fallback'
+    candidates: Array<{
+      model_type: string
+      enabled: boolean
+      manual_checkpoint_verified: boolean
+      terms_accepted: boolean
+      downloaded: boolean
+      ready: boolean
+    }>
   }
   review_policy: {
     mandatory_for_content_capabilities: Array<'unrestricted_local'>
@@ -1619,7 +1650,7 @@ const PROJECT_REFERENCE_QUEUE_BLOCKER_COPY: Record<
   invalid_lora_multiplier: 'Set every LoRA multiplier between -10 and 10.',
   invalid_lora_parameters: 'Complete every required LoRA parameter with a valid published value.',
   invalid_authored_settings: 'Fix invalid or unavailable authored reference details.',
-  review_unavailable: 'Load and select the required compatible local vision reviewer.',
+  review_unavailable: 'Prepare the required local fidelity reviewer and MMProj shown above.',
 }
 
 export function getProjectReferenceQueueBlockers(
@@ -1654,6 +1685,21 @@ export function selectProjectReferenceModel(
   if (models.some(model => model.model_type === current)) return current
   if (preferred && models.some(model => model.model_type === preferred)) return preferred
   return models[0]?.model_type ?? ''
+}
+
+export function getProjectReferencePreferredGenerationModel(
+  mode: ProjectReferenceSheetMode,
+  explicitOutput: boolean,
+  contentCapability: 'standard' | 'unrestricted_local',
+  capabilities: ProjectReferenceCapabilities | null,
+): string {
+  if (mode === 'draft') return 'flux2_klein_9b'
+  if (explicitOutput || contentCapability === 'unrestricted_local') {
+    return capabilities?.explicit_generation_model?.resolved_model
+      || capabilities?.default_models.generation_model
+      || ''
+  }
+  return capabilities?.default_models.generation_model ?? ''
 }
 
 export function getEffectiveProjectReferenceRepairAttempts(
@@ -1854,14 +1900,10 @@ export function isProjectReferenceReviewerEligible(
   if (!modelId || modelId === 'off') return false
   if (intelligencePolicy === 'uncensored_auto') {
     const contract = capabilities?.uncensored_auto_review
-    if (!contract) return false
-    const exactModel = reviewModels.find(model => (
-      model.id === contract.resolved_model
-      && (model.provider ?? 'local') === contract.resolved_provider
-    ))
-    return Boolean(exactModel) && (modelId === 'auto_local'
+    if (!contract?.queue_ready) return false
+    return modelId === 'auto_local'
       || (modelId === contract.resolved_model
-        && (!provider || provider === contract.resolved_provider)))
+        && (!provider || provider === contract.resolved_provider))
   }
   if (modelId === 'auto_local') {
     return reviewModels.some(model => (model.provider ?? 'local') === 'local')
@@ -1869,6 +1911,40 @@ export function isProjectReferenceReviewerEligible(
   return reviewModels.some(model => (
     model.id === modelId && (!provider || (model.provider ?? 'local') === provider)
   ))
+}
+
+export function getProjectReferenceReviewerSetupCopy(
+  contract: ProjectReferenceCapabilities['uncensored_auto_review'] | undefined,
+): string {
+  if (!contract) {
+    return 'The required local fidelity-review setup is unavailable. Refresh Reference Studio and try again.'
+  }
+  switch (contract.setup_state) {
+    case 'ready_resident':
+      return 'Paperscarecrow is loaded with its MMProj and ready for local fidelity review.'
+    case 'ready_unloaded':
+      return 'Paperscarecrow and its MMProj are installed. They will load automatically when local fidelity review starts.'
+    case 'loading':
+      return `Paperscarecrow is loading${contract.loading_phase ? ` (${contract.loading_phase})` : ''}. Queueing will unlock when its MMProj setup is confirmed.`
+    case 'missing_model':
+      return 'The required Paperscarecrow reviewer checkpoint is not installed. Install and verify that exact local model before queueing.'
+    case 'missing_projector':
+      return 'Paperscarecrow is installed, but its required MMProj is missing. Install the listed MMProj before queueing.'
+    case 'loaded_without_vision':
+      return 'Paperscarecrow is loaded, but vision is unavailable because its MMProj did not initialize. Reload or repair the local reviewer before queueing.'
+  }
+}
+
+export function getProjectReferenceReviewerAction(
+  setupState: ProjectReferenceCapabilities['uncensored_auto_review']['setup_state'] | undefined,
+): { kind: 'load' | 'reload'; label: string } | null {
+  if (setupState === 'missing_model' || setupState === 'missing_projector') {
+    return { kind: 'load', label: 'Install / load required reviewer' }
+  }
+  if (setupState === 'loaded_without_vision') {
+    return { kind: 'reload', label: 'Reload required reviewer' }
+  }
+  return null
 }
 
 export interface ProjectReferenceRetryReviewDecision {
@@ -4001,7 +4077,7 @@ export async function fetchLlmStatus(signal?: AbortSignal): Promise<import('../t
 }
 
 export async function loadLlm(
-  params?: { model_id?: string; device?: string },
+  params?: { model_id?: string; device?: string; provider?: 'local' },
   signal?: AbortSignal,
 ): Promise<import('../types').LlmStatus & { status: string }> {
   const res = await fetch(`${BASE}/api/v1/llm/load`, {

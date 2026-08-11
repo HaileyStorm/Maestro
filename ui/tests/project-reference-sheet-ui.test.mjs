@@ -15,17 +15,21 @@ import {
   getProjectAssetComponentOutputs,
   getProjectReferenceEditorModels,
   getProjectReferenceGenerationModels,
+  getProjectReferencePreferredGenerationModel,
   getProjectReferenceQueueBlockers,
   getProjectReferenceVisibilityHints,
   getLoraParameterDefaults,
   getLoraParameterValue,
   hasProjectReferenceLoraParameterSummary,
   getProjectReferenceRepairCopy,
+  getProjectReferenceReviewerAction,
+  getProjectReferenceReviewerSetupCopy,
   getProjectReferenceRetrySettings,
   isProjectReferenceReviewMandatory,
   isProjectReferenceReviewerEligible,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
+  loadLlm,
   loraParameterSchemasConflict,
   normalizeProjectReferenceAssetType,
   normalizeProjectReferenceAnchorPrivacy,
@@ -426,6 +430,51 @@ test('Moody Krea 2 recipes are generation-selectable but never presented as edit
     ['krea2_moody_mix_v7_fp8', 'krea2_moody_cutie_v4_fp8'],
   )
   assert.deepEqual(getProjectReferenceEditorModels(catalog), [])
+})
+
+test('verified server preference defaults untouched non-Draft explicit Reference flows to Moody only', () => {
+  const capabilities = {
+    explicit_generation_model: {
+      preferred_order: ['krea2_moody_mix_v7_fp8', 'krea2_moody_cutie_v4_fp8'],
+      resolved_model: 'krea2_moody_mix_v7_fp8',
+      fallback_model: 'flux2_dev',
+      selection_source: 'verified_manual_preference',
+      candidates: [
+        { model_type: 'krea2_moody_mix_v7_fp8', ready: true },
+        { model_type: 'krea2_moody_cutie_v4_fp8', ready: true },
+      ],
+    },
+    default_models: { generation_model: 'flux2_dev', editor_model: 'qwen_image_edit_2511' },
+  }
+  assert.equal(getProjectReferencePreferredGenerationModel(
+    'production', true, 'unrestricted_local', capabilities,
+  ), 'krea2_moody_mix_v7_fp8')
+  assert.equal(getProjectReferencePreferredGenerationModel(
+    'production', false, 'unrestricted_local', capabilities,
+  ), 'krea2_moody_mix_v7_fp8')
+  assert.equal(getProjectReferencePreferredGenerationModel(
+    'hybrid', true, 'standard', capabilities,
+  ), 'krea2_moody_mix_v7_fp8')
+  const hybridPreferred = getProjectReferencePreferredGenerationModel(
+    'hybrid', false, 'unrestricted_local', capabilities,
+  )
+  assert.equal(hybridPreferred, 'krea2_moody_mix_v7_fp8')
+  assert.equal(getProjectReferencePreferredGenerationModel(
+    'production', false, 'standard', capabilities,
+  ), 'flux2_dev')
+  assert.equal(getProjectReferencePreferredGenerationModel(
+    'draft', true, 'unrestricted_local', capabilities,
+  ), 'flux2_klein_9b')
+
+  const choices = getProjectReferenceGenerationModels([
+    { model_type: 'flux2_dev', image_outputs: true },
+    { model_type: 'krea2_moody_mix_v7_fp8', image_outputs: true },
+  ])
+  assert.equal(
+    selectProjectReferenceModel(choices, 'flux2_dev', hybridPreferred),
+    'flux2_dev',
+    'an existing Hybrid user choice must win over the automatic explicit preference',
+  )
 })
 
 test('LoRA parameter defaults and validation remain server-schema authoritative', () => {
@@ -845,6 +894,26 @@ test('capabilities helper returns authoritative ordered roles for prequeue previ
         resolved_model: 'local-abliterated-vision',
         resolved_provider: 'local',
         vision_required: true,
+        required_projector: 'local-vision-mmproj',
+        installed: true,
+        projector_available: true,
+        vision_capable: true,
+        resident: false,
+        vision_available: null,
+        loading: false,
+        loading_phase: null,
+        setup_state: 'ready_unloaded',
+        queue_ready: true,
+      },
+      explicit_generation_model: {
+        preferred_order: ['krea2_moody_mix_v7_fp8', 'krea2_moody_cutie_v4_fp8'],
+        resolved_model: 'krea2_moody_mix_v7_fp8',
+        fallback_model: 'flux2_dev',
+        selection_source: 'verified_manual_preference',
+        candidates: [{
+          model_type: 'krea2_moody_mix_v7_fp8', enabled: true,
+          manual_checkpoint_verified: true, terms_accepted: true, downloaded: true, ready: true,
+        }],
       },
       review_policy: {
         mandatory_for_content_capabilities: ['unrestricted_local'],
@@ -887,7 +956,19 @@ test('capabilities helper returns authoritative ordered roles for prequeue previ
     resolved_model: 'local-abliterated-vision',
     resolved_provider: 'local',
     vision_required: true,
+    required_projector: 'local-vision-mmproj',
+    installed: true,
+    projector_available: true,
+    vision_capable: true,
+    resident: false,
+    vision_available: null,
+    loading: false,
+    loading_phase: null,
+    setup_state: 'ready_unloaded',
+    queue_ready: true,
   })
+  assert.equal(capabilities.explicit_generation_model.resolved_model, 'krea2_moody_mix_v7_fp8')
+  assert.equal(capabilities.explicit_generation_model.candidates[0].ready, true)
   assert.deepEqual(capabilities.review_policy, {
     mandatory_for_content_capabilities: ['unrestricted_local'],
     mandatory_when_explicit_output: true,
@@ -903,6 +984,7 @@ test('mandatory retry review fails closed for recorded Off or unavailable review
       resolved_model: 'local-abliterated-vision',
       resolved_provider: 'local',
       vision_required: true,
+      queue_ready: true,
     },
     review_policy: {
       mandatory_for_content_capabilities: ['unrestricted_local'],
@@ -953,6 +1035,90 @@ test('mandatory retry review fails closed for recorded Off or unavailable review
   }, { review_model: 'auto_local' }, exactLocalModels, capabilities)
   assert.equal(safelySubstituted.ready, true)
   assert.equal(safelySubstituted.use_current_reviewer, true)
+})
+
+test('required Paperscarecrow reviewer is queue-ready while installed but unloaded', () => {
+  const base = {
+    requested_model: 'auto_local',
+    resolved_model: 'paperscarecrow/Gemma-4-31B-it-abliterated-gguf',
+    resolved_provider: 'local',
+    vision_required: true,
+    required_projector: 'ggml-org/Gemma-4-31B-IT-GGUF:BF16-mmproj',
+    installed: true,
+    projector_available: true,
+    vision_capable: true,
+    resident: false,
+    vision_available: null,
+    loading: false,
+    loading_phase: null,
+    setup_state: 'ready_unloaded',
+    queue_ready: true,
+  }
+  const capabilities = { uncensored_auto_review: base }
+  assert.equal(isProjectReferenceReviewerEligible(
+    'uncensored_auto', 'auto_local', undefined, [], capabilities,
+  ), true)
+  assert.equal(isProjectReferenceReviewerEligible(
+    'uncensored_auto', base.resolved_model, 'local', [], capabilities,
+  ), true)
+  assert.equal(isProjectReferenceReviewerEligible(
+    'uncensored_auto', base.resolved_model, 'remote', [], capabilities,
+  ), false)
+  assert.equal(
+    getProjectReferenceReviewerSetupCopy(base),
+    'Paperscarecrow and its MMProj are installed. They will load automatically when local fidelity review starts.',
+  )
+  assert.equal(getProjectReferenceReviewerAction(base.setup_state), null)
+
+  for (const [setup_state, patch, expected] of [
+    ['missing_model', { installed: false, queue_ready: false }, /checkpoint is not installed/],
+    ['missing_projector', { projector_available: false, queue_ready: false }, /required MMProj is missing/],
+    ['loading', { loading: true, loading_phase: 'loading projector', queue_ready: false }, /loading \(loading projector\)/],
+    ['loaded_without_vision', { resident: true, vision_available: false, queue_ready: false }, /MMProj did not initialize/],
+    ['ready_resident', { resident: true, vision_available: true, queue_ready: true }, /loaded with its MMProj/],
+  ]) {
+    const contract = { ...base, ...patch, setup_state }
+    assert.equal(isProjectReferenceReviewerEligible(
+      'uncensored_auto', 'auto_local', undefined,
+      [{ id: base.resolved_model, provider: 'local' }],
+      { uncensored_auto_review: contract },
+    ), contract.queue_ready)
+    assert.match(getProjectReferenceReviewerSetupCopy(contract), expected)
+  }
+  assert.deepEqual(getProjectReferenceReviewerAction('missing_model'), {
+    kind: 'load', label: 'Install / load required reviewer',
+  })
+  assert.deepEqual(getProjectReferenceReviewerAction('missing_projector'), {
+    kind: 'load', label: 'Install / load required reviewer',
+  })
+  assert.deepEqual(getProjectReferenceReviewerAction('loaded_without_vision'), {
+    kind: 'reload', label: 'Reload required reviewer',
+  })
+  assert.equal(getProjectReferenceReviewerAction('loading'), null)
+  assert.equal(getProjectReferenceReviewerAction('ready_resident'), null)
+})
+
+test('required reviewer load action submits only the exact model id', async t => {
+  const originalFetch = globalThis.fetch
+  let request
+  globalThis.fetch = async (url, init) => {
+    request = { url: String(url), init }
+    return new Response(JSON.stringify({ status: 'ready', loaded: true }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  await loadLlm({
+    model_id: 'paperscarecrow/Gemma-4-31B-it-abliterated-gguf',
+    provider: 'local',
+  })
+  assert.equal(request.url, '/api/v1/llm/load')
+  assert.equal(request.init.method, 'POST')
+  assert.deepEqual(JSON.parse(request.init.body), {
+    model_id: 'paperscarecrow/Gemma-4-31B-it-abliterated-gguf',
+    provider: 'local',
+  })
 })
 
 test('private authored settings use the exact owner route and no-store request', async t => {
@@ -1207,6 +1373,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /llmCatalogModels\.filter\(model => model\.loaded === true\)/)
   assert.match(source, /model\.vision_capable === true && model\.vision_available === true/)
   assert.match(source, /referenceCapabilities\?\.uncensored_auto_review/)
+  assert.match(source, /getProjectReferencePreferredGenerationModel\(/)
+  assert.match(source, /referenceModelCustomized\) return selectProjectReferenceModel\(referenceModels, current\)/)
   assert.match(source, /referenceCapabilities\?\.review_policy/)
   assert.match(source, /isProjectReferenceReviewMandatory\(/)
   assert.match(source, /mandatoryReview && reviewModel === 'off'/)
@@ -1214,10 +1382,23 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /Vision fidelity review is required for unrestricted or explicit output and cannot be turned off/)
   assert.match(source, /model\.id === uncensoredReviewContract\?\.resolved_model/)
   assert.match(source, /\(model\.provider \?\? 'local'\) === uncensoredReviewContract\?\.resolved_provider/)
-  assert.match(source, /intelligencePolicy === 'uncensored_auto'[\s\S]*?uncensoredReviewModel \? \[uncensoredReviewModel\] : \[\]/)
+  assert.match(source, /intelligencePolicy === 'uncensored_auto'[\s\S]*?uncensoredReviewCatalogModel \? \[uncensoredReviewCatalogModel\] : \[\]/)
+  assert.match(source, /!uncensoredReviewContract\?\.queue_ready \|\| !uncensoredReviewSelectionValid/)
   assert.match(source, /reviewModel !== 'auto_local' && reviewModel !== 'off' && !exactLocalSelection/)
-  assert.match(source, /Uncensored-capable review is pinned to/)
-  assert.match(source, /it never falls back to a remote or generic reviewer/)
+  assert.match(source, /aria-label="Required visual reviewer setup"/)
+  assert.match(source, /MMProj: \{uncensoredReviewContract\.projector_available/)
+  assert.match(source, /not loaded; automatic load available/)
+  assert.match(source, /no generic or remote fallback/)
+  assert.match(source, /getProjectReferenceReviewerAction\(/)
+  assert.match(source, /loadRequired && \(!machineControls \|\| !modelId\)/)
+  assert.match(source, /await loadLlm\(\{ model_id: modelId, provider: 'local' \}\)/)
+  assert.match(source, /Promise\.all\(\[\s*fetchLlmModels\(project\),\s*fetchProjectReferenceCapabilities\(project\)/)
+  assert.match(source, /isProjectAssetOperationCurrent\(\s*submittedProject, epoch, currentProject\.current, projectEpoch\.current/)
+  assert.match(clientSource, /Install \/ load required reviewer/)
+  assert.match(clientSource, /Reload required reviewer/)
+  assert.match(source, /Refresh reviewer status/)
+  assert.match(source, /LAN sessions can refresh status but cannot change the local model runtime/)
+  assert.match(source, /Could not install or load the required reviewer/)
   assert.match(source, /intelligencePolicy === 'standard_auto' && selectedReviewModel/)
   assert.match(source, /const queueBlockers = getProjectReferenceQueueBlockers\(/)
   assert.match(source, /disabled=\{queueBlockers\.length > 0\}/)
@@ -1328,6 +1509,8 @@ test('Reference Studio header, catalog races, Moody cards, manifests, and Blende
   assert.match(source, /Missing from current catalog/)
   assert.match(source, /Install and verify locally/)
   assert.match(source, /setReferenceModelCustomized\(true\)/)
+  assert.match(source, /getProjectReferencePreferredGenerationModel\(/)
+  assert.match(source, /referenceExplicitOutput, contentCapability, referenceCapabilities/)
 
   const reconnectIndex = source.indexOf('await confirmReconnectedJob(')
   const closeAfterReconnect = source.indexOf('setOpen(false)', reconnectIndex)

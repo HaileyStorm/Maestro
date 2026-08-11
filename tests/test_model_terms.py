@@ -856,12 +856,16 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
         for recipe_id in krea_contracts:
             model = definitions[recipe_id]
             self.assertTrue(required(recipe_id, model, definitions))
-            self.assertEqual(spec(recipe_id, model, definitions), contracts[recipe_id])
+            resolved = spec(recipe_id, model, definitions)
+            self.assertEqual(resolved.pop("recipe_id"), recipe_id)
+            self.assertEqual(resolved, contracts[recipe_id])
             alias_id = f"{recipe_id}_alias"
             alias = {"URLs": recipe_id}
             aliased = {**definitions, alias_id: alias}
             self.assertTrue(required(alias_id, alias, aliased))
-            self.assertEqual(spec(alias_id, alias, aliased), contracts[recipe_id])
+            resolved_alias = spec(alias_id, alias, aliased)
+            self.assertEqual(resolved_alias.pop("recipe_id"), recipe_id)
+            self.assertEqual(resolved_alias, contracts[recipe_id])
             self.assertTrue(required(alias_id, alias, {alias_id: alias}))
             with self.assertRaisesRegex(RuntimeError, "contract is invalid"):
                 spec(alias_id, alias, {alias_id: alias})

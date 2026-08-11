@@ -286,7 +286,7 @@ class LlmRuntimeTests(unittest.TestCase):
             "MoonRide/gemma-4-31B-it-heretic-ara-GGUF",
         )
 
-    def test_private_31b_refinement_model_is_loadable_hidden_and_not_retired(self):
+    def test_31b_vision_refinement_model_is_public_optional_and_not_default(self):
         model_id = "paperscarecrow/Gemma-4-31B-it-abliterated-gguf"
         entry = llm_service.MODEL_REGISTRY[model_id]
         self.assertEqual(
@@ -298,7 +298,10 @@ class LlmRuntimeTests(unittest.TestCase):
         self.assertEqual(
             entry["mmproj_repo"], "ggml-org/gemma-4-31B-it-GGUF",
         )
-        self.assertNotIn(model_id, llm_service._PUBLIC_MODEL_ORDER)
+        self.assertIn(model_id, llm_service._PUBLIC_MODEL_ORDER)
+        catalog = llm_service.get_available_models(provider="local")
+        published = next(item for item in catalog if item["id"] == model_id)
+        self.assertTrue(published["vision_capable"])
         self.assertNotIn(model_id, llm_service.RETIRED_MODEL_IDS)
         self.assertEqual(llm_service._migrate_retired_model_id(model_id), model_id)
         self.assertEqual(

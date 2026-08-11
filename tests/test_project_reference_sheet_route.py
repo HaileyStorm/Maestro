@@ -67,6 +67,8 @@ def _load_route_symbols(namespace):
         "_normalize_lora_parameter_values",
         "_project_reference_sha256_file",
         "_project_reference_resolve_additional_loras",
+        "_project_reference_uncensored_review_setup",
+        "_project_reference_explicit_generation_model",
         "_project_reference_capabilities",
         "_project_reference_request_config",
         "_project_reference_creative_request",
@@ -369,6 +371,32 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "is_cancel_requested": lambda job: bool(job.get("cancel_requested")),
         }
         self.ns = _load_route_symbols(namespace)
+        self.real_uncensored_review_setup = self.ns[
+            "_project_reference_uncensored_review_setup"
+        ]
+        self.real_explicit_generation_model = self.ns[
+            "_project_reference_explicit_generation_model"
+        ]
+        self.ns["_project_reference_uncensored_review_setup"] = lambda: {
+            "requested_model": "auto_local",
+            "resolved_model": self.ns[
+                "_PROJECT_REFERENCE_ABLITERATED_RECIPE"
+            ]["model_id"],
+            "resolved_provider": "local",
+            "vision_required": True,
+            "required_projector": self.ns[
+                "_PROJECT_REFERENCE_ABLITERATED_RECIPE"
+            ]["projector"],
+            "installed": True,
+            "projector_available": True,
+            "vision_capable": True,
+            "resident": False,
+            "vision_available": None,
+            "loading": False,
+            "loading_phase": None,
+            "setup_state": "ready_unloaded",
+            "queue_ready": True,
+        }
         self.real_intelligence_selection = self.ns[
             "_project_reference_intelligence_selection"
         ]
@@ -377,6 +405,9 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         )
         self.real_image_job = self.ns["_run_project_reference_image_job"]
         self.ns["_run_project_reference_image_job"] = self._image_job
+        self.real_selected_reviewer = self.ns[
+            "_project_reference_selected_reviewer"
+        ]
         self.ns["_project_reference_selected_reviewer"] = (
             lambda request, job, review_request, config: self.review(review_request)
         )
@@ -2806,12 +2837,14 @@ class ProjectReferenceRouteTests(unittest.TestCase):
     def test_v2_uncensored_auto_uses_only_its_exact_local_visual_reviewer(self):
         recipe = self.ns["_PROJECT_REFERENCE_ABLITERATED_RECIPE"]
         capabilities = self.ns["_project_reference_capabilities"]()
-        self.assertEqual(capabilities["uncensored_auto_review"], {
-            "requested_model": "auto_local",
-            "resolved_model": recipe["model_id"],
-            "resolved_provider": "local",
-            "vision_required": True,
-        })
+        self.assertEqual(
+            capabilities["uncensored_auto_review"],
+            self.ns["_project_reference_uncensored_review_setup"](),
+        )
+        self.assertEqual(
+            capabilities["explicit_generation_model"]["resolved_model"],
+            "flux2_dev",
+        )
         calls = []
 
         def selection(
@@ -2854,6 +2887,189 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         for update in invalid:
             with self.subTest(update=update), self.assertRaises(HTTPException):
                 validate(self._body(explicit_output=True, **update), _Request({}))
+
+    def test_v2_uncensored_review_setup_is_queue_ready_without_residency(self):
+        from services import llm_service
+
+        recipe = self.ns["_PROJECT_REFERENCE_ABLITERATED_RECIPE"]
+        catalog = [{
+            "id": recipe["model_id"],
+            "downloaded": True,
+            "projector_available": True,
+            "vision_capable": True,
+        }]
+        with mock.patch.object(
+            llm_service, "get_available_models", return_value=catalog,
+        ), mock.patch.object(llm_service, "get_status", return_value={
+            "loaded": False,
+            "provider": "local",
+            "loading": False,
+        }):
+            setup = self.real_uncensored_review_setup()
+        self.assertEqual(setup["setup_state"], "ready_unloaded")
+        self.assertTrue(setup["queue_ready"])
+        self.assertFalse(setup["resident"])
+        self.assertIsNone(setup["vision_available"])
+        self.assertEqual(setup["required_projector"], recipe["projector"])
+
+    def test_v2_uncensored_review_setup_reports_projector_and_runtime_failures(self):
+        from services import llm_service
+
+        recipe = self.ns["_PROJECT_REFERENCE_ABLITERATED_RECIPE"]
+        base = {
+            "id": recipe["model_id"],
+            "downloaded": True,
+            "projector_available": False,
+            "vision_capable": True,
+        }
+        cases = (
+            (
+                base,
+                {"loaded": False, "provider": "local", "loading": False},
+                "missing_projector",
+            ),
+            (
+                {
+                    **base,
+                    "projector_available": True,
+                    "vision_capable": False,
+                },
+                {"loaded": False, "provider": "local", "loading": False},
+                "missing_projector",
+            ),
+            (
+                {**base, "projector_available": True},
+                {
+                    "loaded": True,
+                    "model_id": recipe["model_id"],
+                    "provider": "local",
+                    "vision_available": False,
+                    "loading": False,
+                },
+                "loaded_without_vision",
+            ),
+        )
+        for catalog_model, status, expected in cases:
+            with self.subTest(expected=expected), mock.patch.object(
+                llm_service, "get_available_models", return_value=[catalog_model],
+            ), mock.patch.object(llm_service, "get_status", return_value=status):
+                setup = self.real_uncensored_review_setup()
+            self.assertEqual(setup["setup_state"], expected)
+            self.assertFalse(setup["queue_ready"])
+
+    def test_v2_uncensored_auto_fails_closed_when_exact_setup_is_not_ready(self):
+        self.ns["_project_reference_uncensored_review_setup"] = lambda: {
+            "setup_state": "missing_projector",
+            "queue_ready": False,
+        }
+        with self.assertRaises(HTTPException) as raised:
+            self.ns["_project_reference_request_config"](
+                self._body(explicit_output=True), _Request({}),
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("missing_projector", raised.exception.detail)
+
+    def test_v2_explicit_generation_preference_does_not_require_support_downloads(self):
+        model_terms = __import__("services.model_terms", fromlist=["unused"])
+        previous_downloaded = self.ns["_check_model_downloaded"]
+        self.addCleanup(
+            lambda: self.ns.__setitem__("_check_model_downloaded", previous_downloaded),
+        )
+        self.ns["_check_model_downloaded"] = lambda _model: False
+        self.ns["_model_visibility_response"] = lambda: {
+            "configured": True,
+            "enabled_models": list(
+                self.ns["_PROJECT_REFERENCE_EXPLICIT_CREATE_MODELS"]
+            ),
+        }
+        with mock.patch.object(
+            model_terms, "model_terms_manifest_valid", return_value=True,
+        ), mock.patch.object(
+            model_terms,
+            "model_terms_statuses",
+            return_value=[{"accepted": True}],
+        ), mock.patch.object(
+            _ModelRegistry,
+            "manual_checkpoint_integrity_ready",
+            return_value=True,
+            create=True,
+        ), mock.patch.object(
+            _ModelRegistry,
+            "get_model_def",
+            return_value={"image_outputs": True},
+        ):
+            preferred = self.real_explicit_generation_model()
+        self.assertEqual(
+            preferred["resolved_model"], "krea2_moody_mix_v7_fp8",
+        )
+        self.assertEqual(
+            preferred["selection_source"], "verified_manual_preference",
+        )
+        self.assertTrue(preferred["candidates"][0]["ready"])
+        self.assertFalse(preferred["candidates"][0]["downloaded"])
+
+    def test_v2_explicit_omission_uses_scoped_preference_but_standard_and_draft_do_not(self):
+        self.ns["_project_reference_explicit_generation_model"] = lambda: {
+            "resolved_model": "krea2_moody_mix_v7_fp8",
+        }
+        previous_definitions = dict(_ModelRegistry.definitions)
+        previous_bases = dict(_ModelRegistry.bases)
+
+        def restore_registry():
+            _ModelRegistry.definitions.clear()
+            _ModelRegistry.definitions.update(previous_definitions)
+            _ModelRegistry.bases.clear()
+            _ModelRegistry.bases.update(previous_bases)
+
+        self.addCleanup(restore_registry)
+        _ModelRegistry.definitions["krea2_moody_mix_v7_fp8"] = {
+            "image_outputs": True,
+            "image_ref_choices": {"choices": [("Reference", "KI")]},
+        }
+        _ModelRegistry.bases["krea2_moody_mix_v7_fp8"] = "krea2_raw"
+        original_defaults = _ModelRegistry.get_default_settings
+
+        def defaults(model):
+            if model == "krea2_moody_mix_v7_fp8":
+                return {"num_inference_steps": 52, "guidance_scale": 3.5}
+            return original_defaults(model)
+
+        with mock.patch.object(
+            _ModelRegistry, "get_default_settings", side_effect=defaults,
+        ):
+            explicit = self.ns["_project_reference_request_config"](
+                self._body(explicit_output=True, model_type=None), _Request({}),
+            )
+            hybrid = self.ns["_project_reference_request_config"](
+                self._body(
+                    mode="hybrid", explicit_output=True, model_type=None,
+                ),
+                _Request({}),
+            )
+            standard = self.ns["_project_reference_request_config"](
+                self._body(model_type=None), _Request({}),
+            )
+            draft = self.ns["_project_reference_request_config"](
+                self._body(mode="draft", model_type=None), _Request({}),
+            )
+            supplied = self.ns["_project_reference_request_config"](
+                self._body(explicit_output=True, model_type="flux2_dev"),
+                _Request({}),
+            )
+            hybrid_supplied = self.ns["_project_reference_request_config"](
+                self._body(
+                    mode="hybrid",
+                    explicit_output=True,
+                    model_type="flux2_dev",
+                ),
+                _Request({}),
+            )
+        self.assertEqual(explicit["model_type"], "krea2_moody_mix_v7_fp8")
+        self.assertEqual(hybrid["model_type"], "krea2_moody_mix_v7_fp8")
+        self.assertEqual(standard["model_type"], "flux2_dev")
+        self.assertEqual(draft["model_type"], "flux2_dev")
+        self.assertEqual(supplied["model_type"], "flux2_dev")
+        self.assertEqual(hybrid_supplied["model_type"], "flux2_dev")
 
     def test_v2_initial_blur_is_output_concealment_not_private_access(self):
         self._run(self._body(
@@ -2931,6 +3147,66 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 sealed,
                 purpose="review",
             )
+
+    def test_v2_uncensored_reviewer_revalidates_loaded_identity_and_vision(self):
+        from services import llm_service
+
+        recipe = dict(self.ns["_PROJECT_REFERENCE_ABLITERATED_RECIPE"])
+        selection = self.ns["_project_reference_seal_intelligence_selection"]({
+            "requested_model": "auto_local",
+            "resolved_model": recipe["model_id"],
+            "resolved_provider": "local",
+        })
+        config = {
+            "intelligence_policy": "uncensored_auto",
+            "intelligence_recipe": recipe,
+            "review_selection": selection,
+        }
+        self.ns["_resolve_llm_chat_model"] = lambda _request, model: {
+            "model_id": model,
+            "response_model_id": model,
+            "provider": "local",
+            "vision_capable": True,
+        }
+        self.ns["_run_llm_with_selection"] = (
+            lambda _selection, operation, **kwargs: operation(**kwargs)
+        )
+        review_request = types.SimpleNamespace(
+            instruction="bounded fidelity review",
+            creative_request="synthetic authored request",
+            sheet_roles=("canonical_identity",),
+            sheet_paths=(self.root / "synthetic.png",),
+            response_schema={"type": "object"},
+        )
+        with mock.patch.object(llm_service, "get_status", return_value={
+            "loaded": True,
+            "model_id": recipe["model_id"],
+            "provider": "local",
+            "vision_available": False,
+        }), mock.patch.object(llm_service, "generate") as generate, mock.patch.object(
+            llm_service, "unload_model",
+        ) as unload:
+            with self.assertRaisesRegex(RuntimeError, "review_unavailable"):
+                self.real_selected_reviewer(
+                    _Request({}), {}, review_request, config,
+                )
+        generate.assert_not_called()
+        unload.assert_called_once_with()
+
+        with mock.patch.object(llm_service, "get_status", return_value={
+            "loaded": True,
+            "model_id": recipe["model_id"],
+            "provider": "local",
+            "vision_available": True,
+        }), mock.patch.object(
+            llm_service, "generate", return_value='{"status":"pass"}',
+        ) as generate, mock.patch.object(llm_service, "unload_model") as unload:
+            result = self.real_selected_reviewer(
+                _Request({}), {}, review_request, config,
+            )
+        self.assertEqual(result, '{"status":"pass"}')
+        generate.assert_called_once()
+        unload.assert_called_once_with()
 
     def test_v2_selected_planner_runs_and_validates_bounded_schema_in_worker(self):
         from services import llm_service
