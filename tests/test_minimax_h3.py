@@ -142,6 +142,8 @@ def _w4a8_admission_namespace():
         ),
         "_require_remote_visible_models": lambda request, models: None,
         "_apply_h3_adaptive_checkpoint": lambda body: None,
+        "_resolve_h3_style_workflow_request": lambda body: None,
+        "_apply_h3_style_workflow_to_request": lambda body: None,
         "_normalize_video_prompt_type": lambda body: None,
         "_normalize_image_prompt_type": lambda body: None,
         "_jobs": {},
@@ -160,6 +162,7 @@ def _w4a8_admission_namespace():
             worker_admissions.append(str(job.get("id") or "")) or True
         ),
         "_queue_recovery_delivery_pending": lambda job: None,
+        "_director_image_role_wire_mode": lambda body: "legacy",
         "_require_h3_offload_plan_parity": lambda job: None,
         "_require_job_model_recipe_terms": lambda job: None,
         "_apply_per_job_coefficient": lambda job: None,
@@ -184,6 +187,7 @@ def _w4a8_admission_namespace():
     _load_launch_functions(
         {
             "_trusted_h3_prepared_plan",
+            "_require_job_runtime_model_admission",
             "_h3_effective_model_types",
             "_require_h3_acceleration_available",
             "_plan_generation_submission",
@@ -505,6 +509,349 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             types_source.index("export type H3EstimateConfidence")
         ]
         self.assertIn("'spectrum_experimental'", profile_ids)
+
+    def test_h3_style_workflow_route_admission_is_id_only_and_server_resolved(self):
+        from services.h3_upstream_skills import builtin_catalog
+
+        catalog = builtin_catalog()
+        namespace = {
+            "HTTPException": _HTTPException,
+            "_H3_LONG_STUDIO_MODELS": {
+                "minimax_h3", "minimax_h3_ref2va",
+            },
+            "_h3_skill_catalog_updater": types.SimpleNamespace(
+                load=lambda: copy.deepcopy(catalog),
+            ),
+        }
+        _load_launch_functions({
+            "_resolve_h3_style_workflow_request",
+            "_apply_h3_style_workflow_to_request",
+        }, namespace)
+        resolve = namespace["_resolve_h3_style_workflow_request"]
+        apply = namespace["_apply_h3_style_workflow_to_request"]
+        style_id = catalog["styles"][0]["id"]
+
+        body = {
+            "model_type": "minimax_h3",
+            "prompt": "A freeform H3 scene.",
+            "h3_style_workflow": style_id,
+        }
+        resolved = resolve(body)
+        self.assertEqual(body["h3_style_workflow"], resolved)
+        self.assertEqual(resolved["id"], style_id)
+        self.assertEqual(resolved["catalog_revision"], "bundled")
+        self.assertEqual(apply(body), "freeform")
+        self.assertTrue(body["prompt"].startswith(
+            f"H3 workflow guidance [{style_id}]:",
+        ))
+
+        omitted = {"model_type": "minimax_h3", "h3_style_workflow": ""}
+        self.assertIsNone(resolve(omitted))
+        self.assertNotIn("h3_style_workflow", omitted)
+        for rejected in (
+            {
+                "model_type": "minimax_h3",
+                "h3_style_workflow": {"id": style_id},
+            },
+            {
+                "model_type": "other",
+                "h3_style_workflow": style_id,
+            },
+            {
+                "model_type": "minimax_h3",
+                "h3_style_workflow": "unknown-style",
+            },
+            {
+                "model_type": "minimax_h3",
+                "h3_style_workflow": style_id,
+                "h3_style_workflow_prompt_brief": "client brief",
+            },
+        ):
+            with self.subTest(rejected=rejected):
+                with self.assertRaises(_HTTPException) as error:
+                    resolve(rejected)
+                self.assertEqual(error.exception.status_code, 400)
+
+        launch = _read(_LAUNCH_PATH)
+        self.assertIn(
+            '_resolve_h3_style_workflow_request(body, model_field="video_model")',
+            launch,
+        )
+        self.assertIn(
+            "workflow = _resolve_h3_style_workflow_request(\n"
+            "        body, model_field=\"video_model\",\n"
+            "    )",
+            launch,
+        )
+        self.assertGreaterEqual(
+            launch.count("_resolve_h3_style_workflow_request(body)"), 2,
+        )
+        self.assertIn(
+            'planner_kwargs_base["h3_style_workflow_present"] = workflow is not None',
+            launch,
+        )
+
+    def test_h3_style_workflow_route_exposes_persisted_refresh_failure(self):
+        from services.h3_upstream_skills import builtin_catalog
+
+        offline = builtin_catalog()
+        offline.update({
+            "update_status": "offline_fallback",
+            "last_refresh_attempt_at": 200.0,
+            "update_error": "offline",
+        })
+        namespace = {
+            "_h3_skill_catalog_updater": types.SimpleNamespace(
+                load=lambda: copy.deepcopy(offline),
+            ),
+        }
+        _load_launch_functions({"h3_style_workflow_catalog"}, namespace)
+        self.assertEqual(
+            namespace["h3_style_workflow_catalog"](), offline,
+        )
+
+    def test_generation_enhancer_projection_validates_workflow_and_hides_brief(self):
+        from services.h3_upstream_skills import (
+            builtin_catalog,
+            resolve_h3_style_workflow,
+        )
+
+        catalog = builtin_catalog()
+        workflow = resolve_h3_style_workflow(
+            catalog["styles"][0]["id"], catalog,
+        )
+        namespace = {
+            "math": __import__("math"),
+            "_H3_LONG_STUDIO_MODELS": {"minimax_h3"},
+        }
+        _load_launch_functions({"_generation_enhancement_request"}, namespace)
+        project = namespace["_generation_enhancement_request"]({
+            "model_type": "minimax_h3",
+            "generation_mode": "video",
+            "prompt": "a paper-crafted harbor",
+            "visual_style": "hand-painted gouache",
+            "h3_style_workflow": workflow,
+            "_duration_seconds": 30,
+        }, "project-a")
+        self.assertIs(project["h3_style_workflow_present"], True)
+        self.assertEqual(project["visual_style"], "hand-painted gouache")
+        self.assertNotIn("h3_style_workflow", project)
+        self.assertNotIn(workflow["prompt_brief"], json.dumps(project))
+
+        drifted = copy.deepcopy(workflow)
+        drifted["prompt_brief"] += " drift"
+        with self.assertRaises(ValueError):
+            namespace["_generation_enhancement_request"]({
+                "model_type": "minimax_h3",
+                "prompt": "a paper-crafted harbor",
+                "h3_style_workflow": drifted,
+            }, "project-a")
+
+    def test_enhancer_route_trusts_workflow_presence_only_for_durable_generation(self):
+        from services import llm_operations, llm_service
+
+        captured = []
+
+        class Request:
+            def __init__(self, *, durable: bool):
+                self.state = types.SimpleNamespace(
+                    maestro_generation_preparation=durable,
+                    maestro_cpu_text_operation="prompt_enhancement",
+                )
+
+            async def json(self):
+                return {
+                    "workspace": "project-a",
+                    "prompt": "a paper-crafted harbor",
+                    "mode": "video",
+                    "model_type": "minimax_h3",
+                    "visual_style": "hand-painted gouache",
+                    "h3_style_workflow_present": True,
+                }
+
+        async def run_blocking(operation, *args, **kwargs):
+            return operation(*args, **kwargs)
+
+        namespace = {
+            "Request": Request,
+            "HTTPException": _HTTPException,
+            "wgp": types.SimpleNamespace(server_config={
+                "enhancer_enabled": 0,
+                "services": {},
+            }),
+            "os": os,
+            "json": json,
+            "_promote_external_llm_request": lambda _request: None,
+            "_request_project_workspace": lambda _request, value: value,
+            "_require_project_access": lambda _request, _workspace: None,
+            "_resolve_authorized_request_media": (
+                lambda _request, path, _workspace: path
+            ),
+            "_explicit_llm_guidance_allowed": lambda _body: False,
+            "_resolve_prompt_enhancer_selection": (
+                lambda *_args, **_kwargs: ("test-enhancer", "cpu", False)
+            ),
+            "_resolved_local_response_assist": (
+                lambda _body, _selection: None
+            ),
+            "_llm_route_progress_callback": lambda _request: None,
+            "_run_authorized_llm_with_selection": (
+                lambda _request, _selection, operation: operation()
+            ),
+        }
+        _load_launch_functions({"llm_enhance_prompt"}, namespace)
+
+        def enhance_prompt(**kwargs):
+            captured.append(dict(kwargs))
+            return "enhanced H3 prompt"
+
+        with mock.patch.object(
+            llm_operations, "run_blocking_shielded", side_effect=run_blocking,
+        ), mock.patch.object(
+            llm_service, "enhance_prompt", side_effect=enhance_prompt,
+        ):
+            durable = asyncio.run(namespace["llm_enhance_prompt"](
+                Request(durable=True),
+            ))
+            public = asyncio.run(namespace["llm_enhance_prompt"](
+                Request(durable=False),
+            ))
+
+        self.assertEqual(durable["enhanced"], "enhanced H3 prompt")
+        self.assertEqual(public["enhanced"], "enhanced H3 prompt")
+        self.assertIs(captured[0]["h3_style_workflow_present"], True)
+        self.assertIs(captured[1]["h3_style_workflow_present"], False)
+        self.assertEqual(captured[0]["visual_style"], "hand-painted gouache")
+
+    def test_durable_generate_enhances_before_server_workflow_compilation(self):
+        from services.h3_upstream_skills import (
+            builtin_catalog,
+            resolve_h3_style_workflow,
+        )
+
+        catalog = builtin_catalog()
+        workflow = resolve_h3_style_workflow(
+            catalog["styles"][0]["id"], catalog,
+        )
+        enhanced_prompt = (
+            "subject_definitions:\n"
+            "<Subject 1> is a paper harbor keeper.\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0.00s-5.00s] shot_name: Paper doorway | "
+            "audiovisual_description: <Subject 1> opens a folded-paper door. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape:\nsoft paper movement.\n"
+            "non_diegetic_music:\nnone."
+        )
+        captured = {}
+        failures = []
+
+        class PreparationRequest:
+            def __init__(self, body=None):
+                self.state = types.SimpleNamespace(
+                    maestro_cpu_text_job=None,
+                    maestro_cpu_text_operation=None,
+                    maestro_cpu_text_text_only=False,
+                )
+                self._body = copy.deepcopy(body or {})
+
+            def with_body(self, body):
+                clone = PreparationRequest(body)
+                clone.state = self.state
+                return clone
+
+            async def json(self):
+                return copy.deepcopy(self._body)
+
+        async def enhance(request):
+            captured["enhance_body"] = await request.json()
+            return {"enhanced": enhanced_prompt}
+
+        job = {
+            "id": "h3-style-enhance",
+            "workspace": "project-a",
+            "out_dir": "/tmp/project-a",
+            "execution_attempt": 1,
+            "params": {
+                "model_type": "minimax_h3",
+                "generation_mode": "video",
+                "prompt": "a paper-crafted harbor",
+                "visual_style": "",
+                "h3_style_workflow": workflow,
+            },
+        }
+
+        def prepare(body):
+            captured["planned_body"] = copy.deepcopy(body)
+            return None
+
+        namespace = {
+            "Request": object,
+            "copy": copy,
+            "asyncio": asyncio,
+            "math": __import__("math"),
+            "time": types.SimpleNamespace(time=lambda: 100.0),
+            "_H3_LONG_STUDIO_MODELS": {"minimax_h3"},
+            "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
+            "_jobs": {job["id"]: job},
+            "is_cancel_requested": lambda _job: False,
+            "update_preparation_job": lambda _job, **_updates: True,
+            "llm_enhance_prompt": enhance,
+            "_require_h3_native_boundary_experimental": lambda _body: None,
+            "_validate_h3_sampling_steps": lambda _body: None,
+            "_validate_h3_explicit_multiclip_request": lambda _body: None,
+            "_prepare_h3_long_studio_request": prepare,
+            "_require_h3_acceleration_available": lambda _body, _plan: None,
+            "_h3_estimate_context": lambda _body, _plan: {},
+            "_validate_h3_turbo_estimate_context": lambda *_args, **_kwargs: None,
+            "_validate_h3_spectrum_estimate_context": lambda _context: None,
+            "_validate_h3_lightx2v_estimate_context": lambda _context: None,
+            "_require_remote_visible_models": lambda _request, _models: None,
+            "_h3_effective_model_types": lambda _body, _plan: [],
+            "_require_h3_generation_terms": lambda _body, _plan: None,
+            "_h3_profile_estimate_payload": lambda *_args, **_kwargs: {
+                "current": {"estimate": {}},
+            },
+            "_h3_generation_requirements": lambda _body, _plan: {
+                "ref2va_terms_required": False,
+                "checkpoint_options": [],
+            },
+            "_remote_visible_model_ids": lambda _request: None,
+            "_public_h3_long_plan": lambda _plan, _requirements: None,
+            "_seal_h3_offload_plan_for_job": lambda _params: None,
+            "_queue_recovery_input_descriptors": lambda *_args: [],
+            "write_sealed_request_manifest": lambda *_args, **_kwargs: {
+                "path": "request.json",
+            },
+            "complete_preparation": lambda *_args, **_kwargs: False,
+            "remove_request_manifest": lambda *_args, **_kwargs: None,
+            "fail_preparation": (
+                lambda *_args, **kwargs: failures.append(dict(kwargs))
+            ),
+        }
+        _load_launch_functions({
+            "_apply_authoritative_generation_prompt",
+            "_generation_enhancement_request",
+            "_apply_h3_style_workflow_to_request",
+            "_plan_generation_submission",
+            "_run_generation_preparation",
+        }, namespace)
+        namespace["_run_generation_preparation"](
+            job["id"], PreparationRequest(), enhance=True,
+        )
+
+        enhance_body = captured["enhance_body"]
+        planned_body = captured["planned_body"]
+        self.assertIs(enhance_body["h3_style_workflow_present"], True)
+        self.assertNotIn("h3_style_workflow", enhance_body)
+        self.assertNotIn(workflow["prompt_brief"], json.dumps(enhance_body))
+        self.assertEqual(failures, [])
+        self.assertEqual(planned_body["h3_style_workflow"], workflow)
+        self.assertIn(
+            f"H3 workflow guidance [{workflow['id']}]",
+            planned_body["prompt"],
+        )
+        self.assertNotIn("photorealistic realism", planned_body["prompt"])
 
     def test_w4a8_rejects_public_planning_before_work_and_worker_before_model(self):
         launch = _read(_LAUNCH_PATH)

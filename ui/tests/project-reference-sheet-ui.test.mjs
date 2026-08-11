@@ -1,15 +1,18 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import { resolveSidebarNavigation } from '../src/lib/sidebarNavigation.ts'
 
 import {
   addProjectAssetVariant,
   createProjectAsset,
   deleteProjectAssetVariant,
+  directorV2Plan,
   fetchProjectAssets,
   fetchProjectReferenceAuthoring,
   fetchProjectReferenceCapabilities,
   generateProjectAssetReferences,
+  getDirectorProjectReferenceKind,
   getEffectiveProjectReferenceRepairAttempts,
   getProjectAssetApplyOutputs,
   getProjectAssetComponentOutputs,
@@ -27,6 +30,7 @@ import {
   getProjectReferenceReviewerSetupCopy,
   getProjectReferenceRetrySettings,
   isProjectReferenceReviewMandatory,
+  isProjectReferenceStyleReplayReady,
   isProjectReferenceReviewerEligible,
   isProjectReferenceExplicitCharacterStateValid,
   isProjectAssetOperationCurrent,
@@ -49,6 +53,8 @@ import {
 
 const componentUrl = new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url)
 const sidebarUrl = new URL('../src/components/Sidebar/Sidebar.tsx', import.meta.url)
+const directorUrl = new URL('../src/components/Sidebar/DirectorChat.tsx', import.meta.url)
+const advancedSettingsUrl = new URL('../src/components/Sidebar/AdvancedSettings.tsx', import.meta.url)
 const modelSelectorUrl = new URL('../src/components/Sidebar/ModelSelector.tsx', import.meta.url)
 const blenderUrl = new URL('../src/components/Sidebar/BlenderSceneTool.tsx', import.meta.url)
 const storeUrl = new URL('../src/stores/useStore.ts', import.meta.url)
@@ -345,6 +351,8 @@ test('v2 retry never fabricates unavailable private custom labels after refresh'
     anchor_basis: 'primary_outfit',
     authored_settings: {
       seal: 'sealed-private-authoring',
+      style_present: true,
+      style_commitment: 'a'.repeat(64),
       type_fields: [{ field: 'poses', items: [{ id: 'custom:abcdefghijkl', custom: true, group: 'expressions' }] }],
       detail_callouts: [{
         custom_id: 'custom:mnopqrstuvwx', kind: 'custom', requested_operation: 'crop',
@@ -354,6 +362,19 @@ test('v2 retry never fabricates unavailable private custom labels after refresh'
     },
   }
   assert.equal(projectReferenceRetryNeedsPrivateAuthoring(source), true)
+  assert.equal(isProjectReferenceStyleReplayReady(
+    source.metadata.reference_pack.authored_settings, 'hand-painted stop motion',
+  ), true)
+  assert.equal(isProjectReferenceStyleReplayReady(
+    source.metadata.reference_pack.authored_settings, '',
+  ), false)
+  assert.equal(isProjectReferenceStyleReplayReady({ style_present: false }, undefined), false)
+  assert.equal(isProjectReferenceStyleReplayReady({ style_commitment: 'a'.repeat(64) }, undefined), false)
+  assert.equal(isProjectReferenceStyleReplayReady({
+    style_present: false,
+    style_commitment: 'a'.repeat(64),
+  }, undefined), true)
+  assert.equal(isProjectReferenceStyleReplayReady(undefined, undefined), true)
   const settings = getProjectReferenceRetrySettings(source, {
     mode: 'production', model_type: 'flux2_dev', editor_model_type: 'qwen-edit',
     private_output: false, explicit_output: false, review: false, max_repair_attempts: 0,
@@ -363,11 +384,13 @@ test('v2 retry never fabricates unavailable private custom labels after refresh'
   })
   assert.equal('type_fields' in settings, false)
   assert.equal('detail_callouts' in settings, false)
+  assert.equal('style' in settings, false)
 
   const exactSnapshot = getProjectReferenceRetrySettings(source, {
     mode: 'production', model_type: 'flux2_dev', editor_model_type: 'qwen-edit',
     private_output: false, explicit_output: false, review: false, max_repair_attempts: 0,
     asset_type: 'character', authored_settings_seal: 'sealed-private-authoring',
+    style: 'hand-painted stop motion',
     type_fields: { poses: [{
       id: 'custom:abcdefghijkl', label: 'Source expression', custom: true, group: 'expressions',
     }] },
@@ -385,6 +408,7 @@ test('v2 retry never fabricates unavailable private custom labels after refresh'
     custom_id: 'custom:mnopqrstuvwx', label: 'Source ring engraving', kind: 'custom',
     operation: 'crop', source_role: 'canonical_identity',
   }])
+  assert.equal(exactSnapshot.style, 'hand-painted stop motion')
 
   source.metadata.reference_pack.authored_settings = {
     seal: 'built-in-only',
@@ -900,6 +924,7 @@ test('generation helper preserves fresh modes and retry/edit lineage payloads ex
     asset_id: 'asset-1',
     parent_variant_id: 'kept-source',
     edit_instruction: 'change only the coat',
+    style: 'hand-painted stop motion',
     mode: 'hybrid',
     candidate_count: 1,
   })
@@ -929,6 +954,7 @@ test('generation helper preserves fresh modes and retry/edit lineage payloads ex
     asset_id: 'asset-1',
     parent_variant_id: 'kept-source',
     edit_instruction: 'change only the coat',
+    style: 'hand-painted stop motion',
     mode: 'hybrid',
     candidate_count: 1,
   })
@@ -962,6 +988,8 @@ test('v2 generation keeps pack candidates separate from custom sheet deliverable
         managed_layout_assist: { schema_version: 1, mode: 'off', id: null, provenance: { kind: 'server_allowlist', version: 'managed-layout-v1' } },
         authored_settings: {
           seal: 'authored-seal',
+          style_present: true,
+          style_commitment: 'b'.repeat(64),
           type_fields: [{ field: 'poses', items: [{ id: 'custom:abcdefghijkl', custom: true, group: 'expressions' }] }],
           detail_callouts: [{
             custom_id: 'custom:mnopqrstuvwx', kind: 'custom', requested_operation: 'enhance',
@@ -979,6 +1007,7 @@ test('v2 generation keeps pack candidates separate from custom sheet deliverable
     schema_version: 2,
     name: 'Ari',
     asset_type: 'character',
+    style: 'hand-painted stop motion',
     intent: 'exact_spec',
     depth: 'custom',
     sheet_count: 4,
@@ -1294,6 +1323,7 @@ test('private authored settings use the exact owner route and no-store request',
     variant_id: 'variant two',
     authored_settings: {
       seal: 'sealed-private-authoring',
+      style: 'hand-painted stop motion',
       type_fields: { poses: [{
         id: 'custom:abcdefghijkl', label: 'Private expression', custom: true, group: 'expressions',
       }] },
@@ -1409,6 +1439,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   const clientSource = await readFile(clientUrl, 'utf8')
   const referenceTypes = await readFile(typesUrl, 'utf8')
 
+  assert.match(source, /id="project-reference-title"[^>]*>Reference Studio<\/h2>/)
+
   assert.match(referenceTypes, /'private_blurred' \| 'private_visible' \| 'project_blurred' \| 'project_visible'/)
   assert.match(referenceTypes, /ProjectReferenceLegacyAnchorPrivacy = ProjectReferenceAnchorPrivacy \| 'standard'/)
   assert.doesNotMatch(referenceTypes, /anchor_privacy: 'private_blurred' \| 'standard'/)
@@ -1451,20 +1483,14 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /await confirmReconnectedJob\(/)
   assert.doesNotMatch(source, /setInterval/)
   assert.match(source, /workspace\.name === project && workspace\.unlocked === false/)
-  assert.match(source, /disabled=\{browsingUploads \|\| !project\}/)
-  assert.match(source, /aria-disabled=\{projectExplicitlyLocked\}/)
   assert.match(source, /enabled: open && !browsingUploads && !projectExplicitlyLocked/)
-  assert.match(source, /Unlock project to use references/)
+  assert.match(source, /Unlock this project to create or manage references/)
   assert.match(source, /useLayoutEffect\(\(\) => \{\s+if \(!projectExplicitlyLocked\) return\s+projectEpoch\.current \+= 1/)
-  assert.match(source, /\{open && !projectExplicitlyLocked && createPortal\(/)
-
-  assert.match(source, /createPortal\(/)
-  assert.match(source, /role="dialog" aria-modal="true"/)
-  assert.match(source, /aria-label="Close project references"/)
-  assert.match(source, /onKeyDown=\{handleDialogKeyDown\}/)
-  assert.match(source, /event\.key === 'Escape'/)
-  assert.match(source, /event\.key !== 'Tab'/)
-  assert.match(source, /element\.getClientRects\(\)\.length > 0/)
+  assert.match(source, /export function ProjectReferenceLibrary\(\{ active \}: \{ active: boolean \}\)/)
+  assert.match(source, /aria-hidden=\{!active\}/)
+  assert.match(source, /hidden=\{!active\}/)
+  assert.match(source, /inert=\{!active \? true : undefined\}/)
+  assert.doesNotMatch(source, /createPortal\(|aria-modal="true"|installModalFocus/)
   assert.match(source, /aria-pressed=\{assetType === option\.value\}/)
   assert.match(source, /aria-label="Reference name"/)
   for (const [id, label] of [
@@ -1499,6 +1525,9 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /orderSectionValues\(definition/)
   assert.match(source, /role="status" aria-live="polite"/)
   assert.match(source, /Source sheet/)
+  assert.match(source, /breasts \(front\) and breasts \(profile\)/)
+  assert.match(source, /Source Sheet chooses the authored pack sheet to crop from/)
+  assert.match(source, /Operation chooses whether Maestro auto-selects, crops, enhances, or reconstructs/)
   assert.match(source, /validDetailSourceRoles\.map/)
   assert.match(source, /Draft does not create editor-dependent detail outputs/)
   assert.match(source, /detailCallouts\.length} detail/)
@@ -1510,8 +1539,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /fetchModels\(\)/)
   assert.match(source, /getProjectReferenceGenerationModels\(catalogModels\)/)
   assert.match(source, /getProjectReferenceEditorModels\(catalogModels\)/)
-  assert.match(source, /aria-label="Reference Studio generation model"/)
-  assert.match(source, /aria-label="Reference Studio editor model"/)
+  assert.match(source, /aria-label="Reference generation model"/)
+  assert.match(source, /aria-label="Reference editor model"/)
   assert.match(source, /Open Settings → System → Enabled Models/)
   assert.match(source, /model\.manual_installation\.filename/)
   assert.match(source, /manualInstallationDestination\(model\.manual_installation\)/)
@@ -1538,8 +1567,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /Retry private replay/)
   assert.match(source, /its published parameter schema changed/)
   assert.match(source, /values will not be guessed or migrated/)
-  assert.match(source, /aria-label="Reference Studio planning model"/)
-  assert.match(source, /aria-label="Reference Studio visual review model"/)
+  assert.match(source, /aria-label="Reference planning model"/)
+  assert.match(source, /aria-label="Reference visual review model"/)
   assert.match(source, /Auto \(local only\)/)
   assert.match(source, /Auto local/)
   assert.match(source, /llmCatalogModels\.filter\(model => model\.loaded === true\)/)
@@ -1548,7 +1577,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /getProjectReferencePreferredGenerationModel\(/)
   assert.match(source, /getProjectReferenceExplicitConvenienceState\(/)
   assert.match(source, /initialExplicitConvenience\.preset \?\? 'identity'/)
-  assert.match(source, /if \(open\) return[\s\S]*?getProjectReferenceExplicitConvenienceState\(\s*assetType, explicitOutput/)
+  assert.doesNotMatch(source, /if \(open\) return[\s\S]*?getProjectReferenceExplicitConvenienceState\(\s*assetType, explicitOutput/)
   assert.equal(source.match(/const resetConvenience = getProjectReferenceExplicitConvenienceState/g)?.length, 2)
   assert.match(source, /const changeDepth[\s\S]*?convenience\.anatomy_option[\s\S]*?selectCanonicalCharacterAnatomy/)
   assert.match(source, /const changeCustomSheetCount[\s\S]*?convenience\.anatomy_option[\s\S]*?selectCanonicalCharacterAnatomy/)
@@ -1613,8 +1642,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.doesNotMatch(source, /accept="image\/\*,video\/\*"\s+className="hidden"/)
   assert.match(source, /aria-expanded=\{editing\}/)
   assert.match(source, /htmlFor=\{`reference-sheet-edit-instruction-/)
-  assert.match(source, /overflow-y-auto md:grid-cols/)
-  assert.match(source, /md:overflow-y-auto/)
+  assert.match(source, /className="grid min-h-0 grid-cols-1"/)
+  assert.doesNotMatch(source, /md:grid-cols-\[320px_1fr\]/)
 
   assert.match(source, /const applyOutputs = getProjectAssetApplyOutputs\(variant\)/)
   assert.match(source, /void applyReference\(asset, variant\)/)
@@ -1625,12 +1654,12 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /projectReferenceRetryNeedsPrivateAuthoring\(variant\)/)
   assert.match(source, /fetchProjectReferenceAuthoring\(/)
   assert.match(source, /response\.authored_settings\.seal !== target\.authoredSeal/)
-  assert.match(source, /Exact custom authoring is unavailable for this candidate/)
+  assert.match(source, /Exact private authoring is unavailable for this candidate/)
   assert.match(source, /disabled=\{Boolean\(pendingAction\) \|\| !exactRetryReady\}/)
   assert.match(source, /resolveProjectReferenceRetryReview\(/)
   assert.match(source, /if \(!retryReview\.ready\)/)
   assert.match(source, /The recorded reviewer is unavailable; Retry or Edit will use the current compatible reviewer/)
-  assert.match(source, /custom fields and details are never silently dropped/)
+  assert.match(source, /style, custom fields, and details are never silently dropped/)
   assert.match(source, /const sourcePreset = sourceAssetType === assetType/)
   assert.match(source, /asset_type: sourceSettings\.asset_type/)
   assert.match(source, /mode: sourceSettings\.mode/)
@@ -1650,7 +1679,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /aria-label="Dismiss project reference error"/)
   assert.match(source, /modelLoadError && <p role="status"/)
   assert.match(source, /source mode, model, privacy, and repair policy were preserved;/)
-  assert.match(source, /preserves recorded source mode, resolved model pair, privacy, repair, planning, and review policy/)
+  assert.match(source, /preserves recorded style, source mode, resolved model pair, privacy, repair, planning, and review policy/)
   assert.doesNotMatch(source, /One bounded repair/)
   assert.equal(source.match(/setActionError\(''\)/g)?.length, 3)
   assert.doesNotMatch(source, /job\?\.error/)
@@ -1658,7 +1687,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.doesNotMatch(source, /localStorage/)
 })
 
-test('Reference Studio header, catalog races, Moody cards, manifests, and Blender contract stay explicit', async () => {
+test('Reference peer, catalog races, Moody cards, manifests, and Blender contract stay explicit', async () => {
   const [source, sidebar, selector, blender, store, manualInstallation] = await Promise.all([
     readFile(componentUrl, 'utf8'),
     readFile(sidebarUrl, 'utf8'),
@@ -1668,21 +1697,23 @@ test('Reference Studio header, catalog races, Moody cards, manifests, and Blende
     readFile(manualInstallationUrl, 'utf8'),
   ])
 
-  assert.match(sidebar, /<ProjectReferenceLibrary header compact \/>/)
-  assert.match(sidebar, /<ProjectReferenceLibrary header \/>/)
-  assert.doesNotMatch(sidebar, /<ProjectReferenceLibrary \/>/)
-  assert.match(source, /header = false/)
-  assert.match(source, /compact = false/)
+  assert.equal(sidebar.match(/<ProjectReferenceLibrary active=\{isReference\} \/>/g)?.length, 2)
+  for (const label of ['Generate', 'Director', 'Reference']) {
+    assert.match(sidebar, new RegExp(`>\\s*${label}\\s*<`))
+  }
+  assert.match(sidebar, /role="group" aria-label="Creative workspace"/)
+  assert.match(sidebar, /disabled=\{!activeWorkspace \|\| browsingUploads \|\| referenceLocked\}/)
+  assert.match(sidebar, /w-\[clamp\(460px,24vw,560px\)\]/)
+  assert.match(sidebar, /grid-cols-\[minmax\(0,1fr\)_auto\]/)
+  assert.match(sidebar, /col-span-2 min-w-0/)
+  assert.match(source, /export function ProjectReferenceLibrary\(\{ active \}: \{ active: boolean \}\)/)
   assert.match(source, /enabledModelsSignature/)
   assert.match(source, /catalogRequestSequence/)
   assert.match(source, /enabledModelsSignature, modelsLoaded, open, project, projectExplicitlyLocked/)
   assert.match(source, /catalogSequence !== catalogRequestSequence\.current/)
-  assert.match(source, /createPortal\(/)
-  assert.match(source, /installModalFocus\(/)
-  assert.match(source, /event\.stopPropagation\(\)/)
-  assert.match(source, /aria-haspopup="dialog"/)
-  assert.match(source, /aria-disabled=\{projectExplicitlyLocked\}/)
-  assert.match(source, /projectExplicitlyLocked && <span className="text-\[8px\] text-amber-200">Locked<\/span>/)
+  assert.match(source, /if \(active && projectExplicitlyLocked\) setSidebarMode\(referenceReturnMode\)/)
+  assert.doesNotMatch(source, /createPortal\(|installModalFocus\(|aria-haspopup="dialog"/)
+  assert.match(source, /create and manage reusable reference packs/)
 
   const nameIndex = source.indexOf('id="project-reference-name"')
   const intentIndex = source.indexOf('>Intent</legend>')
@@ -1696,8 +1727,8 @@ test('Reference Studio header, catalog races, Moody cards, manifests, and Blende
   assert.match(source, /referenceExplicitOutput, contentCapability, referenceCapabilities/)
 
   const reconnectIndex = source.indexOf('await confirmReconnectedJob(')
-  const closeAfterReconnect = source.indexOf('setOpen(false)', reconnectIndex)
-  assert.ok(reconnectIndex >= 0 && closeAfterReconnect > reconnectIndex, 'successful Queue closes only after reconnect')
+  const navigateAfterReconnect = source.indexOf('setSidebarMode(referenceReturnMode)', reconnectIndex)
+  assert.ok(reconnectIndex >= 0 && navigateAfterReconnect > reconnectIndex, 'successful Queue navigates only after durable reconnect')
   assert.match(source, /manualInstallationDestination\(model\.manual_installation\)/)
   assert.match(selector, /manualInstallationDestination\(currentModel\.manual_installation\)/)
   assert.match(manualInstallation, /formatManualInstallationBytes/)
@@ -1707,10 +1738,13 @@ test('Reference Studio header, catalog races, Moody cards, manifests, and Blende
   assert.match(store, /manual_installation: m\.manual_installation/)
 
   assert.match(source, /aria-label="Reference creation method"/)
+  assert.match(source, /Image Reference Pack/)
+  assert.match(source, /Blender Motion Video/)
+  assert.match(source, /Create, preview, Keep, and apply a structured motion\/camera reference to Generate/)
   assert.match(source, /referenceName=\{name\}/)
   assert.match(source, /referenceDescription=\{description\}/)
   assert.match(source, /privateOutput=\{referenceExplicitOutput \|\| privateOutput\}/)
-  assert.match(source, /does not add a durable asset type/)
+  assert.match(source, /separate from the durable Character, Location, Wardrobe/)
   assert.match(blender, /reference_name: resolvedReferenceName/)
   assert.match(blender, /private_output: privateOutput/)
   assert.match(blender, /statusRequest/)
@@ -1720,6 +1754,154 @@ test('Reference Studio header, catalog races, Moody cards, manifests, and Blende
   assert.match(blender, /setDirectorPlan\(null\)/)
   assert.match(blender, /workspaceRef\.current === operation\.workspace/)
   assert.match(blender, /separate reference contract/)
+  assert.match(blender, /Keep motion video/)
+})
+
+test('Reference and Director expose style, skill, flow, and truthful Blender choices', async () => {
+  const [reference, director, advancedSettings, store, client] = await Promise.all([
+    readFile(componentUrl, 'utf8'),
+    readFile(directorUrl, 'utf8'),
+    readFile(advancedSettingsUrl, 'utf8'),
+    readFile(storeUrl, 'utf8'),
+    readFile(clientUrl, 'utf8'),
+  ])
+
+  const construction = reference.indexOf('>Sheet construction mode</legend>')
+  const output = reference.indexOf('>Output handling</legend>')
+  assert.ok(construction >= 0 && output > construction, 'Construction must precede Output handling')
+  assert.match(reference, /aria-label="Reference visual style"/)
+  assert.match(reference, />Realistic \(default\)<\/option>/)
+  assert.match(reference, /const authoredStyle = visualStyle === 'custom'/)
+  assert.match(reference, /style: authoredStyle \|\| undefined/)
+  assert.match(reference, /styleCommitment: packMetadata\?\.authored_settings\?\.style_commitment \?\? ''/)
+  assert.match(reference, /response\.authored_settings\.style\.trim\(\)\.length === 0/)
+  assert.match(reference, /style: sourceAuthoredSnapshot\?\.style/)
+  assert.match(reference, /style: sourceSettings\.style \|\| undefined/)
+  assert.match(reference, /isProjectReferenceStyleReplayReady\(/)
+  assert.match(reference, /Exact private style is unavailable or its commitment changed/)
+  assert.match(reference, /use Custom when your own freeform style should be authoritative/)
+  assert.match(reference, /section\.values\.length >= 8/)
+
+  assert.match(director, /Welcome to Maestro Director\. Choose a Skill below/)
+  assert.match(director, /<fieldset aria-label="Director Skills"/)
+  assert.match(director, /<legend[^>]*>Skills<\/legend>/)
+  assert.match(director, /aria-label="Director visual style"/)
+  assert.match(director, /use Custom when your own freeform style should be authoritative/)
+  assert.match(director, /<legend[^>]*>Additional references<\/legend>/)
+  assert.match(director, /aria-label="Additional reference methods"/)
+  assert.match(director, /Character photos/)
+  assert.match(director, /Scene photos/)
+  assert.doesNotMatch(director, /reference_video_paths|blender_motion_video_path/)
+  assert.match(advancedSettings, /md:left-\[clamp\(460px,24vw,560px\)\]/)
+  assert.match(advancedSettings, /md:w-\[min\(380px,calc\(100vw-clamp\(460px,24vw,560px\)\)\)\]/)
+  assert.doesNotMatch(advancedSettings, /md:left-\[420px\]/)
+  const simulatedAdvancedPanel = viewportWidth => {
+    const sidebarWidth = Math.min(560, Math.max(460, viewportWidth * 0.24))
+    const panelWidth = Math.min(380, viewportWidth - sidebarWidth)
+    return { left: sidebarWidth, width: panelWidth, right: sidebarWidth + panelWidth }
+  }
+  for (const viewportWidth of [768, 769, 800, 839, 840, 1920, 3840]) {
+    const panel = simulatedAdvancedPanel(viewportWidth)
+    assert.ok(panel.width > 0, `Advanced panel must remain visible at ${viewportWidth}px`)
+    assert.ok(panel.right <= viewportWidth, `Advanced panel must not clip at ${viewportWidth}px`)
+  }
+
+  assert.equal(client.match(/visual_style\?: string/g)?.length, 4)
+  assert.equal(store.match(/visual_style:/g)?.length, 9)
+  assert.match(client, /skill_type: string\s+video_model\?: string\s+\/\*\* Null is the explicit new-role automatic-creator sentinel\. \*\/\s+image_creator_model\?: string \| null\s+image_editor_model\?: string\s+image_creator_loras\?: DirectorImageRoleLoraSelection\[\]\s+image_editor_loras\?: DirectorImageRoleLoraSelection\[\]/)
+  assert.match(client, /Legacy combined image wire; never mix with the role fields above\. \*\/\s+image_model\?: string/)
+  const v2PlanBodies = [...store.matchAll(/api\.directorV2Plan\(\{([\s\S]*?)\}, \{ signal:/g)].map(match => match[1])
+  assert.equal(v2PlanBodies.length, 3)
+  for (const body of v2PlanBodies) {
+    assert.match(body, /video_model: get\(\)\.selectedModelPerMode\.video/)
+    assert.match(body, /\.\.\.imageRoleRequest\.wire/)
+    assert.doesNotMatch(body, /image_model:/)
+  }
+  assert.match(store, /resolveSidebarNavigation\(current, mode\)/)
+  assert.match(store, /!current\.directorAudioFile && !transition\.preserveDirectorState/)
+  assert.match(reference, /setSidebarMode\(referenceReturnMode\)/)
+  assert.match(reference, /destination = 'studio'/)
+  assert.match(reference, /setSidebarMode\(destination\)/)
+})
+
+test('Reference navigation round trips preserve the originating workspace state', () => {
+  const fromDirector = resolveSidebarNavigation({
+    sidebarMode: 'director',
+    referenceReturnMode: 'studio',
+  }, 'reference')
+  assert.deepEqual(fromDirector, {
+    sidebarMode: 'reference',
+    referenceReturnMode: 'director',
+    preserveDirectorState: false,
+  })
+
+  const backToDirector = resolveSidebarNavigation(fromDirector, 'director')
+  assert.deepEqual(backToDirector, {
+    sidebarMode: 'director',
+    referenceReturnMode: 'director',
+    preserveDirectorState: true,
+  })
+
+  const fromGenerate = resolveSidebarNavigation({
+    sidebarMode: 'studio',
+    referenceReturnMode: 'director',
+  }, 'reference')
+  assert.equal(fromGenerate.referenceReturnMode, 'studio')
+  assert.equal(resolveSidebarNavigation(fromGenerate, 'studio').preserveDirectorState, false)
+  assert.deepEqual(resolveSidebarNavigation(fromDirector, 'reference'), fromDirector)
+})
+
+test('Director reference routing accepts only its currently supported semantic types', () => {
+  assert.equal(getDirectorProjectReferenceKind('character'), 'character')
+  assert.equal(getDirectorProjectReferenceKind('location'), 'location')
+  assert.equal(getDirectorProjectReferenceKind('setting'), 'location')
+  for (const unsupported of ['creature', 'wardrobe', 'prop', 'item', 'vehicle', 'world', 'style']) {
+    assert.equal(getDirectorProjectReferenceKind(unsupported), null)
+  }
+})
+
+test('Director v2 client sends selected model and authored style fields to the route', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    calls.push({ url, init })
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return new Response(JSON.stringify({ operation_id: 'prepare-model-wire', status: 'ready' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    if (url.endsWith('/api/v1/director/v2/plan')) {
+      return new Response(JSON.stringify({ clip_plans: [], production_plan: {}, skill_type: 'short_film' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    throw new Error(`Unexpected request: ${url}`)
+  }
+
+  try {
+    await directorV2Plan({
+      workspace: 'wire-project',
+      skill_type: 'short_film',
+      video_model: 'minimax_h3',
+      image_model: 'flux2_klein_9b',
+      visual_style: 'hand-painted stop motion',
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  const routeCall = calls.find(({ url }) => url.endsWith('/api/v1/director/v2/plan'))
+  assert.ok(routeCall, 'Director v2 route must be called')
+  assert.deepEqual(JSON.parse(routeCall.init.body), {
+    workspace: 'wire-project',
+    skill_type: 'short_film',
+    video_model: 'minimax_h3',
+    image_model: 'flux2_klein_9b',
+    visual_style: 'hand-painted stop motion',
+  })
 })
 
 test('Reference queue confirmation rejects reconnect failures and missing job rediscovery', async () => {

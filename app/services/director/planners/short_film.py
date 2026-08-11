@@ -21,7 +21,14 @@ from ..schema import (
     AssetRef, SubjectRef, DialogueBeat, CameraPlan, AudioPlan,
     VALID_CONTINUITY_STRATEGIES,
 )
-from ..policies import build_character_rules_block, build_camera_style_block
+from ..policies import (
+    build_character_rules_block,
+    build_camera_style_block,
+    build_visual_style_authority_block,
+    build_visual_style_default_block,
+    build_visual_style_provenance_block,
+    resolve_planned_visual_style,
+)
 from ..guide_loader import load_guide as _load_guide_helper
 from ..h3_dialogue import (
     compile_h3_vocal_contract as _inject_h3_vocal_contract,
@@ -131,6 +138,10 @@ _SHOT_PROPERTIES = {
     "spatial_setup": {"type": "string"},
     "environment": {"type": "string"},
     "visual_style": {"type": "string"},
+    "visual_style_source": {
+        "type": "string",
+        "enum": ["authored_request", "planner_default"],
+    },
     "lighting": {"type": "string"},
     "mood": {"type": "string"},
     "action_beats": {"type": "array", "items": {"type": "string"}},
@@ -266,6 +277,12 @@ def _shot_list_schema(
     include_image_fields: bool = True,
 ) -> dict:
     """JSON schema for a Pass 2 shot list: a bounded array of closed shot objects."""
+    required = list(required)
+    if (
+        "visual_style" in required
+        and "visual_style_source" not in required
+    ):
+        required.append("visual_style_source")
     properties = {
         key: value
         for key, value in _SHOT_PROPERTIES.items()
@@ -2421,6 +2438,12 @@ class ShortFilmPlanner(BasePlanner):
         If no clips → story-driven mode (LLM plans scene structure from scratch).
         """
         has_reference = bool(reference_image_path)
+        self._authored_visual_style = (
+            kwargs.get("visual_style") or kwargs.get("style") or ""
+        )
+        self._structured_visual_style_present = bool(
+            kwargs.get("h3_style_workflow_present")
+        )
         is_audio_mode = bool(clips)
         # Store extra ref info for use in private methods
         self._num_character_refs = len(kwargs.get("character_ref_paths", []) or [])
@@ -2822,7 +2845,15 @@ FULL SCREENPLAY FOR ACTION AND RELATIONSHIP CONTEXT:
             char_profiles if char_profiles else None,
             preserve_names=preserve_names,
         )
-        camera_block = build_camera_style_block()
+        camera_block = build_camera_style_block(
+            structured_style_present=getattr(
+                self, "_structured_visual_style_present", False,
+            ),
+        )
+        style_block = build_visual_style_authority_block(
+            getattr(self, "_authored_visual_style", ""),
+        )
+        style_provenance_block = build_visual_style_provenance_block()
         # Audio-driven mode also uses dialect-aware Pass 2 guides — see
         # _route_video_pass2_guide / get_image_prompt_rules for routing.
         video_model = getattr(self, '_video_model', '') or ''
@@ -3010,6 +3041,10 @@ and how dialogue is staged. Write a DETAILED {"video_prompt and image_prompt" if
 
 {camera_block}
 
+{style_block}
+
+{style_provenance_block}
+
 SHORT FILM PLANNING RULES:
 - The audio is PRE-RECORDED — you are planning VISUALS to match existing dialogue.
 - Focus on acting, body language, and emotional expression that matches what's being said.
@@ -3037,6 +3072,7 @@ OUTPUT FORMAT — respond with ONLY a JSON array:
     "spatial_setup": "How subjects are arranged",
     "environment": "Setting description",
     "visual_style": "Visual look",
+    "visual_style_source": "authored_request|planner_default",
     "lighting": "Lighting description",
     "mood": "Emotional tone",
     "action_beats": ["Physical actions in chronological order"],
@@ -3395,7 +3431,15 @@ PREVIOUS JSON:
                 subjects_on_screen=subjects,
                 spatial_setup=raw.get("spatial_setup", ""),
                 environment=raw.get("environment", ""),
-                visual_style=raw.get("visual_style", ""),
+                visual_style=resolve_planned_visual_style(
+                    getattr(self, "_authored_visual_style", ""),
+                    raw.get("visual_style", ""),
+                    has_visual_reference=has_reference,
+                    planned_style_source=raw.get("visual_style_source", ""),
+                    structured_style_present=getattr(
+                        self, "_structured_visual_style_present", False,
+                    ),
+                ),
                 lighting=raw.get("lighting", ""),
                 mood=raw.get("mood", ""),
                 action_beats=raw.get("action_beats", []),
@@ -3840,6 +3884,12 @@ H3 CHARACTER-AUTHENTICITY RULES:
 
         pass2_system = f"""You are a film director breaking a screenplay into shots. Output ONLY the JSON array.
 
+{build_visual_style_default_block(structured_style_present=getattr(self, "_structured_visual_style_present", False))}
+
+{build_visual_style_authority_block(getattr(self, "_authored_visual_style", ""))}
+
+{build_visual_style_provenance_block()}
+
 {char_rules}
 
 {shot_structure}
@@ -3864,6 +3914,7 @@ OUTPUT — respond with ONLY a JSON array:
     "subjects_on_screen": [{{"visual_description": "woman in red", "character_id": "char_0", "speaker_name": "Nancy"}}],
     "environment": "Setting details",
     "visual_style": "Style",
+    "visual_style_source": "authored_request|planner_default",
     "lighting": "Lighting",
     "mood": "Tone",
     "action_beats": ["Action 1", "Action 2"],
@@ -5304,6 +5355,12 @@ SCREENPLAY:
 
         pass2_system = f"""You are a film director breaking a screenplay into shots for MiniMax H3. Output ONLY the JSON array.
 
+{build_visual_style_default_block(structured_style_present=getattr(self, "_structured_visual_style_present", False))}
+
+{build_visual_style_authority_block(getattr(self, "_authored_visual_style", ""))}
+
+{build_visual_style_provenance_block()}
+
 H3 NATIVE SHOT CONTRACT — NON-NEGOTIABLE:
 - Every array item is ONE bounded H3 generation lasting {minimum_seconds:.2f}-{maximum_seconds:.2f} seconds.
 - Use video_prompt for every item and set window_prompts to []. Never write 20-second windows, timeline ranges, or prompt instructions referring to a previous/preceding shot. The structured continuity_strategy and continuity_group fields are required planning metadata, while every video_prompt must remain self-contained.
@@ -5347,6 +5404,7 @@ OUTPUT — one closed object per native shot:
     "spatial_setup": "Exact first-frame screen blocking for every visible person and important prop",
     "environment": "Exact world/franchise and complete physical location",
     "visual_style": "Series/film visual language and medium",
+    "visual_style_source": "authored_request|planner_default",
     "lighting": "Shot lighting",
     "mood": "Tone",
     "action_beats": ["Chronological visible actions"],
@@ -6107,7 +6165,15 @@ repeating that prose across every metadata field."""
                 subjects_on_screen=subjects,
                 spatial_setup=raw.get("spatial_setup", ""),
                 environment=raw.get("environment", ""),
-                visual_style=raw.get("visual_style", ""),
+                visual_style=resolve_planned_visual_style(
+                    getattr(self, "_authored_visual_style", ""),
+                    raw.get("visual_style", ""),
+                    has_visual_reference=has_reference,
+                    planned_style_source=raw.get("visual_style_source", ""),
+                    structured_style_present=getattr(
+                        self, "_structured_visual_style_present", False,
+                    ),
+                ),
                 lighting=raw.get("lighting", ""),
                 mood=raw.get("mood", ""),
                 action_beats=raw.get("action_beats", []),
@@ -6195,6 +6261,12 @@ repeating that prose across every metadata field."""
         )
 
         system_prompt = f"""You are a short film director. Create a scene plan. Output ONLY the JSON array.
+
+{build_visual_style_default_block(structured_style_present=getattr(self, "_structured_visual_style_present", False))}
+
+{build_visual_style_authority_block(getattr(self, "_authored_visual_style", ""))}
+
+{build_visual_style_provenance_block()}
 
 {f"You are given a REFERENCE PHOTO." if has_reference else ""}
 

@@ -1,9 +1,10 @@
-"""Data-only updater for MiniMax H3's official prepared-style catalog.
+"""Data-only catalog and resolver for official MiniMax H3 style workflows.
 
 Maestro does not install, execute, or follow upstream agent skills.  It reads
 only bounded text files from the official MiniMax-H3 GitHub repository,
-normalizes a small display/prompt schema, and atomically publishes that schema
-as a last-known-good cache for Studio's optional style selector.
+normalizes a bounded provenance/display schema, and atomically publishes a
+last-known-good catalog. Generate and Director accept only an exact workflow
+ID; the server resolves and revision-binds Maestro's adapted prompt brief.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ _CONTENTS_ROOT = (
 )
 CONTENTS_API = _CONTENTS_ROOT + "skills/README.md?ref=main"
 UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_STYLES = 32
 MAX_LINKED_FILES = 48
 MAX_README_BYTES = 512 * 1024
@@ -36,6 +37,20 @@ MAX_SKILL_BYTES = 512 * 1024
 MAX_TEMPLATE_BYTES = 96 * 1024
 MAX_TOTAL_LINKED_BYTES = 4 * 1024 * 1024
 MAX_TEMPLATES_PER_STYLE = 2
+WORKFLOW_SELECTION_SCHEMA_VERSION = 1
+WORKFLOW_IDENTITY_SOURCE = "official_minimax_h3_skill"
+WORKFLOW_SURFACE = "huggingface_hub_canvas"
+PROMPT_BRIEF_PROVENANCE = "maestro_adapted"
+SUPPORTED_PROMPT_SCHEMAS = (
+    "base_context_ir", "ref2va_context_ir", "freeform",
+)
+SUPPORTED_H3_MODES = ("t2va", "fl2va", "ref2va")
+SUPPORTED_MODEL_TYPES = (
+    "minimax_h3",
+    "minimax_h3_pinkcherry_fl2va",
+    "minimax_h3_w4a8_fl2va",
+    "minimax_h3_ref2va",
+)
 
 _STYLE_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
@@ -57,6 +72,14 @@ _UNSAFE_DATA = re.compile(
 _LEADING_INSTRUCTION = re.compile(
     r"^(?:ask|call|choose|confirm|create|delete|do|download|execute|generate|"
     r"install|open|provide|read|remove|run|send|use|write)\b",
+    re.IGNORECASE,
+)
+_WORKFLOW_GUIDANCE = re.compile(r"H3 workflow guidance \[[a-z0-9-]+\]:")
+_CANONICAL_RECORD = re.compile(
+    r"(?P<head>\[(?:Shot|Scene)\s+\d+\][^\r\n|]*\|\s*"
+    r"audiovisual_description\s*:\s*)"
+    r"(?P<visual>[^\r\n|]*)"
+    r"(?P<tail>\s*\|\s*dialogue_and_vocalizations\s*:[^\r\n]*)",
     re.IGNORECASE,
 )
 
@@ -280,20 +303,54 @@ def _template_paths(skill_path: str, markdown: str) -> list[str]:
     return result
 
 
-def _normalize_style(style: dict[str, Any]) -> dict[str, str]:
+def _workflow_source(style_id: str) -> str:
+    return f"{SOURCE_PAGE}/{style_id}"
+
+
+def _normalize_style(style: dict[str, Any]) -> dict[str, Any]:
     style_id = str(style.get("id") or "")
     if not _STYLE_ID.fullmatch(style_id):
         raise ValueError("Invalid H3 style identifier")
     label = _safe_text(style.get("label", ""), limit=100)
     description = _safe_text(style.get("description", ""), limit=600)
     prompt_brief = _safe_text(style.get("prompt_brief", ""), limit=400)
-    if not label or len(description) < 20 or len(prompt_brief) < 20:
+    if (
+        not label
+        or len(description) < 20
+        or len(prompt_brief) < 20
+        or "|" in prompt_brief
+        or re.search(
+            r"(?:<\s*/?d\b|(?:subject_definitions|summary|retention_analysis|"
+            r"integrated_multimodal_description|detailed_description|"
+            r"overall_soundscape|non_diegetic_music)\s*:)",
+            prompt_brief,
+            re.IGNORECASE,
+        )
+    ):
         raise ValueError("Incomplete H3 style data")
     return {
         "id": style_id,
         "label": label,
         "description": description,
         "prompt_brief": prompt_brief,
+        "workflow_identity_source": WORKFLOW_IDENTITY_SOURCE,
+        "workflow_source": _workflow_source(style_id),
+        "prompt_brief_provenance": PROMPT_BRIEF_PROVENANCE,
+        "surface": WORKFLOW_SURFACE,
+        "supported_prompt_schemas": list(SUPPORTED_PROMPT_SCHEMAS),
+        "supported_h3_modes": list(SUPPORTED_H3_MODES),
+    }
+
+
+def _catalog_provenance() -> dict[str, Any]:
+    return {
+        "workflow_identity_source": WORKFLOW_IDENTITY_SOURCE,
+        "workflow_source": SOURCE_PAGE,
+        "prompt_brief_provenance": PROMPT_BRIEF_PROVENANCE,
+        "surface": WORKFLOW_SURFACE,
+        "supported_prompt_schemas": list(SUPPORTED_PROMPT_SCHEMAS),
+        "supported_h3_modes": list(SUPPORTED_H3_MODES),
+        "supported_model_types": list(SUPPORTED_MODEL_TYPES),
     }
 
 
@@ -340,6 +397,9 @@ def parse_official_skills_readme(
     return {
         "source": SOURCE_PAGE,
         "revision": _safe_text(str(revision or ""), limit=80),
+        "source_revision": _safe_text(str(revision or ""), limit=80),
+        "provenance": _catalog_provenance(),
+        "supported_model_types": list(SUPPORTED_MODEL_TYPES),
         "styles": styles,
     }
 
@@ -354,17 +414,181 @@ def _validate_catalog(catalog: Any) -> dict[str, Any]:
     styles = [_normalize_style(style) for style in raw_styles]
     if len({style["id"] for style in styles}) != len(styles):
         raise ValueError("Duplicate cached H3 styles")
-    return {"source": SOURCE_PAGE, "revision": revision, "styles": styles}
+    if catalog.get("provenance") != _catalog_provenance():
+        raise ValueError("Invalid cached H3 catalog provenance")
+    source_revision = catalog.get("source_revision")
+    if source_revision != revision:
+        raise ValueError("Invalid cached H3 source revision")
+    if catalog.get("supported_model_types") != list(SUPPORTED_MODEL_TYPES):
+        raise ValueError("Invalid cached H3 model support")
+    return {
+        "source": SOURCE_PAGE,
+        "revision": revision,
+        "source_revision": revision,
+        "provenance": _catalog_provenance(),
+        "supported_model_types": list(SUPPORTED_MODEL_TYPES),
+        "styles": styles,
+    }
 
 
 def builtin_catalog() -> dict[str, Any]:
     return {
         "source": SOURCE_PAGE,
         "revision": "bundled",
+        "source_revision": "bundled",
         "checked_at": None,
         "update_status": "bundled_fallback",
-        "styles": [dict(style) for style in _BUILTIN_STYLES],
+        "provenance": _catalog_provenance(),
+        "supported_model_types": list(SUPPORTED_MODEL_TYPES),
+        "styles": [_normalize_style(style) for style in _BUILTIN_STYLES],
     }
+
+
+def _workflow_brief_commitment(
+    style_id: str, catalog_revision: str, prompt_brief: str,
+) -> str:
+    payload = json.dumps({
+        "schema_version": WORKFLOW_SELECTION_SCHEMA_VERSION,
+        "id": style_id,
+        "catalog_revision": catalog_revision,
+        "prompt_brief": prompt_brief,
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def resolve_h3_style_workflow(
+    selection: object,
+    catalog: object,
+) -> dict[str, Any] | None:
+    """Resolve one exact public ID; client-authored briefs are never accepted."""
+    if selection in (None, ""):
+        return None
+    if (
+        not isinstance(selection, str)
+        or selection != selection.strip()
+        or _STYLE_ID.fullmatch(selection) is None
+    ):
+        raise ValueError("H3 style workflow must be one exact catalog ID")
+    parsed = _validate_catalog(catalog)
+    style = next(
+        (item for item in parsed["styles"] if item["id"] == selection),
+        None,
+    )
+    if style is None:
+        raise ValueError("Unknown H3 style workflow")
+    revision = parsed["revision"]
+    brief = style["prompt_brief"]
+    return {
+        "schema_version": WORKFLOW_SELECTION_SCHEMA_VERSION,
+        "id": selection,
+        "catalog_revision": revision,
+        "prompt_brief": brief,
+        "brief_commitment": _workflow_brief_commitment(
+            selection, revision, brief,
+        ),
+    }
+
+
+def validate_resolved_h3_style_workflow(value: object) -> dict[str, Any] | None:
+    """Validate one server-resolved selection carried through replay/recovery."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "id", "catalog_revision", "prompt_brief",
+        "brief_commitment",
+    }:
+        raise ValueError("Resolved H3 style workflow is invalid")
+    style_id = value.get("id")
+    revision = value.get("catalog_revision")
+    brief = value.get("prompt_brief")
+    commitment = value.get("brief_commitment")
+    if (
+        value.get("schema_version") != WORKFLOW_SELECTION_SCHEMA_VERSION
+        or not isinstance(style_id, str)
+        or _STYLE_ID.fullmatch(style_id) is None
+        or not isinstance(revision, str)
+        or not revision
+        or len(revision) > 80
+        or revision != _safe_text(revision, limit=80)
+        or not isinstance(brief, str)
+        or brief != _safe_text(brief, limit=400)
+        or len(brief) < 20
+        or not isinstance(commitment, str)
+        or re.fullmatch(r"[0-9a-f]{64}", commitment) is None
+        or commitment != _workflow_brief_commitment(style_id, revision, brief)
+    ):
+        raise ValueError("Resolved H3 style workflow drifted")
+    # Reuse the catalog boundary checks for field/tag separators without
+    # claiming this Maestro-adapted brief is verbatim official prompt text.
+    _normalize_style({
+        "id": style_id,
+        "label": style_id,
+        "description": "Server-resolved MiniMax H3 workflow selection.",
+        "prompt_brief": brief,
+    })
+    return dict(value)
+
+
+def compile_h3_style_workflow(
+    prompt: object,
+    workflow: object,
+) -> tuple[str, str | None]:
+    """Apply guidance inside canonical visual records or explicitly to freeform."""
+    source = str(prompt or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    resolved = validate_resolved_h3_style_workflow(workflow)
+    if resolved is None:
+        return source, None
+    if not source:
+        raise ValueError("H3 style workflow requires a prompt")
+    guidance = (
+        f"H3 workflow guidance [{resolved['id']}]: "
+        f"{resolved['prompt_brief'].rstrip('.')}."
+    )
+    base = re.search(
+        r"(?mi)^\s*integrated_multimodal_description\s*:", source,
+    )
+    ref2va = re.search(r"(?mi)^\s*detailed_description\s*:", source)
+    if base and ref2va:
+        raise ValueError("H3 prompt mixes Base and Ref2VA visual fields")
+    if base or ref2va:
+        visual = base or ref2va
+        assert visual is not None
+        next_field = re.search(
+            r"(?mi)^\s*overall_soundscape\s*:", source[visual.end():],
+        )
+        if next_field is None:
+            raise ValueError("Canonical H3 prompt has no soundscape boundary")
+        body_start = visual.end()
+        body_end = body_start + next_field.start()
+        body = source[body_start:body_end]
+        matches = list(_CANONICAL_RECORD.finditer(body))
+        if not matches:
+            raise ValueError("Canonical H3 visual field has no physical records")
+        existing = _WORKFLOW_GUIDANCE.findall(body)
+        if existing:
+            if len(existing) != len(matches) or any(
+                not match.group("visual").strip().startswith(guidance)
+                for match in matches
+            ):
+                raise ValueError("Canonical H3 workflow guidance drifted")
+            return source, "ref2va_context_ir" if ref2va else "base_context_ir"
+        compiled_body = _CANONICAL_RECORD.sub(
+            lambda match: (
+                match.group("head") + guidance + " "
+                + match.group("visual").strip() + " | "
+                + re.sub(r"^\s*\|\s*", "", match.group("tail"))
+            ),
+            body,
+        )
+        compiled = source[:body_start] + compiled_body + source[body_end:]
+        return compiled, "ref2va_context_ir" if ref2va else "base_context_ir"
+
+    existing = _WORKFLOW_GUIDANCE.search(source)
+    if existing:
+        if source.startswith(guidance + "\n\n"):
+            return source, "freeform"
+        raise ValueError("Freeform H3 workflow guidance drifted")
+    return f"{guidance}\n\n{source}", "freeform"
 
 
 class H3SkillCatalogUpdater:
@@ -412,12 +636,26 @@ class H3SkillCatalogUpdater:
             raise ValueError("Official H3 document exceeds the size limit")
         return decoded.decode("utf-8"), _safe_text(envelope.get("sha", ""), limit=80)
 
-    def _atomic_store(self, catalog: dict[str, Any], checked_at: float) -> None:
+    def _atomic_store(
+        self,
+        catalog: dict[str, Any],
+        checked_at: float,
+        *,
+        refresh_attempted_at: float | None = None,
+        refresh_error: str | None = None,
+    ) -> None:
         payload = {
             "schema": SCHEMA_VERSION,
             "checked_at": checked_at,
             "catalog": _validate_catalog(catalog),
         }
+        if refresh_attempted_at is not None:
+            payload["last_refresh_attempt_at"] = float(refresh_attempted_at)
+        if refresh_error is not None:
+            normalized_error = _safe_text(refresh_error, limit=300)
+            if not normalized_error:
+                raise ValueError("H3 catalog refresh error is invalid")
+            payload["last_refresh_error"] = normalized_error
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(
             prefix=self.cache_path.name + ".",
@@ -451,10 +689,26 @@ class H3SkillCatalogUpdater:
                 if payload.get("schema") != SCHEMA_VERSION:
                     raise ValueError("Unsupported H3 catalog cache schema")
                 parsed = _validate_catalog(payload.get("catalog"))
+                refresh_error = payload.get("last_refresh_error")
+                if refresh_error is not None and (
+                    not isinstance(refresh_error, str)
+                    or not refresh_error
+                    or refresh_error != _safe_text(refresh_error, limit=300)
+                ):
+                    raise ValueError("Invalid H3 catalog refresh status")
+                refresh_attempted_at = payload.get("last_refresh_attempt_at")
+                if refresh_attempted_at is not None:
+                    refresh_attempted_at = float(refresh_attempted_at)
+                    if refresh_attempted_at < 0:
+                        raise ValueError("Invalid H3 catalog refresh timestamp")
                 parsed.update({
                     "checked_at": float(payload.get("checked_at") or 0) or None,
-                    "update_status": "cached",
+                    "update_status": (
+                        "offline_fallback" if refresh_error else "cached"
+                    ),
                 })
+                if refresh_error:
+                    parsed["update_error"] = refresh_error
                 return parsed
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
                 return builtin_catalog()
@@ -520,11 +774,27 @@ class H3SkillCatalogUpdater:
                     template_documents=template_documents,
                 )
                 checked_at = self.now()
-                self._atomic_store(parsed, checked_at)
+                self._atomic_store(
+                    parsed,
+                    checked_at,
+                    refresh_attempted_at=checked_at,
+                )
                 parsed.update({"checked_at": checked_at, "update_status": "updated"})
                 return parsed
             except Exception as error:
                 current = self.load()
-                current["update_status"] = "offline_fallback"
-                current["update_error"] = str(error)[:300]
-                return current
+                attempted_at = self.now()
+                error_text = _safe_text(str(error), limit=300)
+                try:
+                    self._atomic_store(
+                        current,
+                        checked_at,
+                        refresh_attempted_at=attempted_at,
+                        refresh_error=error_text,
+                    )
+                    return self.load()
+                except Exception:
+                    current["update_status"] = "offline_fallback"
+                    current["last_refresh_attempt_at"] = attempted_at
+                    current["update_error"] = error_text
+                    return current

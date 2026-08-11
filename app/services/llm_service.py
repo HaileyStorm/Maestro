@@ -6325,6 +6325,8 @@ def enhance_prompt(
     lora_system_hint: str = "",
     raw_enhancer_mode: bool = False,
     preserve_global_timeline: bool = False,
+    visual_style: Optional[str] = None,
+    h3_style_workflow_present: bool = False,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> str:
@@ -6342,6 +6344,14 @@ def enhance_prompt(
         # The enhance guides are designed for Studio mode (expand brief prompts) and would
         # contradict Director overrides (refine, don't expand).
         system = system_override
+        if mode in ("image", "video", "avatar"):
+            from services.director.policies import (
+                build_visual_style_refinement_block,
+            )
+            system = (
+                f"{system}\n\n"
+                f"{build_visual_style_refinement_block()}"
+            )
         # Inject content guidance
         from services.director.nsfw_guidance import inject_content_guidance
         system = inject_content_guidance(system, nsfw, "enhance")
@@ -6433,10 +6443,11 @@ def enhance_prompt(
         return result.strip() if result else prompt
 
     # Dedicated per-model enhancer (e.g. Sulphur's uncensored enhancer): the
-    # model is trained to enhance directly. Ordinary requests retain raw
-    # passthrough with no system prompt. An explicitly authorized request gets
-    # the same server-owned explicit-authoring context as every other enhancer;
-    # without it, abliterated/uncensored fine-tunes often sanitize the output.
+    # model is trained to enhance directly. Ordinary visual requests receive
+    # only the server-owned baseline visual-style policy. An explicitly
+    # authorized request additionally gets the same explicit-authoring context
+    # as every other enhancer; without it, abliterated/uncensored fine-tunes
+    # often sanitize the output.
     if raw_enhancer_mode:
         # The fine-tuned enhancer (a) doesn't reliably honor a "write N
         # paragraphs" instruction and (b) likes to prepend a bogus "rendered
@@ -6459,10 +6470,22 @@ def enhance_prompt(
                 ),
             )
         raw_system_prompt = ""
+        if mode in ("image", "video", "avatar"):
+            from services.director.policies import (
+                build_visual_style_authority_block,
+                build_visual_style_default_block,
+            )
+            raw_system_prompt = (
+                build_visual_style_default_block(
+                    structured_style_present=h3_style_workflow_present,
+                )
+                + "\n\n"
+                + build_visual_style_authority_block(visual_style)
+            ).strip()
         if nsfw:
             from services.director.nsfw_guidance import inject_content_guidance
             raw_system_prompt = inject_content_guidance(
-                "", True, "enhance",
+                raw_system_prompt, True, "enhance",
             ).strip()
         gen_kw = dict(
             system_prompt=raw_system_prompt, max_new_tokens=raw_max_tokens,
@@ -6635,6 +6658,19 @@ def enhance_prompt(
         if model_specific_dialogue or model_specific_monologue:
             picked = "dialogue" if (tts_enhance_mode in ("dialogue", "dialogue_fast") and tts_voice_count == 2 and model_specific_dialogue) else ("monologue" if model_specific_monologue else "generic")
             print(f"[Enhance] Using model-specific {picked} prompt for {model_type}")
+
+    # Prompt writers use one conditional visual default. The model preserves
+    # authored/reference styles; Maestro does not scan or classify prompt text.
+    if mode in ("image", "video", "avatar"):
+        from services.director.policies import (
+            build_visual_style_authority_block,
+            build_visual_style_default_block,
+        )
+        system = (
+            f"{system}\n\n"
+            f"{build_visual_style_default_block(structured_style_present=h3_style_workflow_present)}\n\n"
+            f"{build_visual_style_authority_block(visual_style)}"
+        ).strip()
 
     # Inject explicit enhance guidance only after the request-local server gate
     # has passed. Uses a SHARED,
@@ -7998,7 +8034,9 @@ def plan_clip_prompts_and_images(
     prompt_type: str = "both",
     existing_image_prompts: Optional[list] = None,
     nsfw: bool = False,
+    visual_style: Optional[str] = None,
     *,
+    h3_style_workflow_present: bool = False,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> list:
@@ -8286,6 +8324,20 @@ def plan_clip_prompts_and_images(
             "Format: '1V. prompt' then '1I. prompt'. Output ONLY numbered prompts."
         )
 
+    # Director V2's phase-two video planner calls this legacy helper directly,
+    # bypassing the structured Director renderers.  Keep it on the same
+    # conditional style policy: authored/reference style remains authoritative,
+    # while an otherwise style-free request defaults to photorealistic realism.
+    from services.director.policies import (
+        build_visual_style_authority_block,
+        build_visual_style_default_block,
+    )
+    system_prompt = (
+        f"{system_prompt}\n\n"
+        f"{build_visual_style_default_block(structured_style_present=h3_style_workflow_present)}\n\n"
+        f"{build_visual_style_authority_block(visual_style)}"
+    )
+
     # Send the reference image with every batch so the LLM can see who's in the scene
     if reference_roles:
         system_prompt += f"\n\nREFERENCE IMAGE ORDER:\n{reference_roles}"
@@ -8521,7 +8573,9 @@ def plan_short_film_prompts(
     prompt_type: str = "both",
     existing_image_prompts: Optional[list] = None,
     nsfw: bool = False,
+    visual_style: Optional[str] = None,
     *,
+    h3_style_workflow_present: bool = False,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> list:
@@ -8729,6 +8783,16 @@ def plan_short_film_prompts(
             "Format: '1V. prompt' then '1I. prompt'. Output ONLY numbered prompts."
         )
 
+    from services.director.policies import (
+        build_visual_style_authority_block,
+        build_visual_style_default_block,
+    )
+    system_prompt = (
+        f"{system_prompt}\n\n"
+        f"{build_visual_style_default_block(structured_style_present=h3_style_workflow_present)}\n\n"
+        f"{build_visual_style_authority_block(visual_style)}"
+    )
+
     if reference_roles:
         system_prompt += f"\n\nREFERENCE IMAGE ORDER:\n{reference_roles}"
 
@@ -8874,7 +8938,9 @@ def plan_short_film_from_story(
     frames_minimum: int = 5,
     max_new_tokens: int = 1024,
     nsfw: bool = False,
+    visual_style: Optional[str] = None,
     *,
+    h3_style_workflow_present: bool = False,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
@@ -9107,6 +9173,16 @@ def plan_short_film_from_story(
         "duration × 2 words of dialogue per scene (e.g. ~20 words for a 10s scene, "
         "~30 for 15s). Don't write throwaway one-liners, but don't overpack either. "
         "The system will adjust if needed."
+    )
+
+    from services.director.policies import (
+        build_visual_style_authority_block,
+        build_visual_style_default_block,
+    )
+    system_prompt = (
+        f"{system_prompt}\n\n"
+        f"{build_visual_style_default_block(structured_style_present=h3_style_workflow_present)}\n\n"
+        f"{build_visual_style_authority_block(visual_style)}"
     )
 
     user_prompt = f"Story Concept: {story_description}"

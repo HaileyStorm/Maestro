@@ -230,15 +230,23 @@ class BlenderLaunchIntegrationTests(unittest.TestCase):
     def test_tools_and_director_reference_ui_both_expose_blender(self):
         tools = (ROOT / "ui/src/components/Sidebar/ToolsPanel.tsx").read_text(encoding="utf-8")
         refs = (ROOT / "ui/src/components/Sidebar/ProjectReferenceLibrary.tsx").read_text(encoding="utf-8")
+        sidebar = (ROOT / "ui/src/components/Sidebar/Sidebar.tsx").read_text(encoding="utf-8")
         component = (ROOT / "ui/src/components/Sidebar/BlenderSceneTool.tsx").read_text(encoding="utf-8")
         self.assertIn("<BlenderSceneTool", tools)
+        self.assertIn("['blender', 'Blender']", tools)
         self.assertIn("<BlenderSceneTool", refs)
         self.assertIn("compact\n", refs)
         self.assertIn('aria-label="Reference creation method"', refs)
+        self.assertIn("Blender Motion Video", refs)
+        self.assertIn("does not remove Blender from Tools", refs)
+        self.assertIn("aria-hidden={!active}", refs)
+        self.assertIn("\n      hidden={!active}", refs)
+        self.assertIn("<ProjectReferenceLibrary active={isReference} />", sidebar)
         self.assertIn("planBlenderScene", component)
         self.assertIn("Run Director review → full video", component)
         self.assertIn("finalizeBlenderScene", component)
-        self.assertIn("Approve reference", component)
+        self.assertIn("Keep motion video", component)
+        self.assertNotIn("Approve reference", component)
         self.assertNotIn("Approve & sample", component)
         self.assertIn("review_frames", component)
         self.assertIn("const endFrame = frameCount - 1", component)
@@ -319,16 +327,29 @@ class BlenderLaunchIntegrationTests(unittest.TestCase):
         library = (ROOT / "ui/src/components/Sidebar/ProjectReferenceLibrary.tsx").read_text(
             encoding="utf-8"
         )
+        apply_start = library.index("  const applyReference = async")
+        apply_end = library.index("\n\n  return (", apply_start)
+        apply_reference = library[apply_start:apply_end]
+        video_apply, _director_apply = apply_reference.split(
+            "} else if (referenceReturnMode === 'director')", 1,
+        )
         for value in (
-            "setSidebarMode('studio')",
+            "if (output.media_type?.startsWith('video/'))",
+            "destination = 'studio'",
             "setGenerationMode('video')",
             "conditioned_prompt",
             "ic_lora_attention_strength",
             "ic_lora_reference_downscale",
             "setGuideVideoFps",
             "setGuideVideoFrameCount",
+            "setSidebarMode(destination)",
         ):
-            self.assertIn(value, library)
+            self.assertIn(value, apply_reference)
+        self.assertNotIn("addCharacterRef", video_apply)
+        self.assertNotIn("addLocationRef", video_apply)
+        self.assertIn(
+            "Apply to Generate: LTX-2.3 control + semantic prompt", library,
+        )
 
 
 class BlenderCandidateTransactionTests(unittest.TestCase):

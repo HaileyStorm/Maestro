@@ -3912,15 +3912,25 @@ def _restore_queue_recovery_on_startup() -> None:
         if _queue_recovery_delivery_pending(job) is None:
             if not project_reference_finalization:
                 try:
-                    _require_job_model_recipe_terms(job)
+                    _require_job_runtime_model_admission(job)
                 except HTTPException:
-                    job["_recovery_reason_code"] = "model_terms_required"
+                    role_mode = _director_image_role_wire_mode(
+                        job.get("params") or {},
+                    ) == "roles"
+                    job["_recovery_reason_code"] = (
+                        "director_role_admission_required"
+                        if role_mode else "model_terms_required"
+                    )
                     _queue_recovery_checkpoint(
                         job,
                         queue_held=True,
                         recovery_state="blocked",
                         reruns_denoise=True,
-                        message="Model terms acceptance is required",
+                        message=(
+                            "Director image role setup changed"
+                            if role_mode
+                            else "Model terms acceptance is required"
+                        ),
                     )
                     continue
         worker = _queue_recovery_worker(job)
@@ -6431,6 +6441,7 @@ def _init_pipeline():
             recovery_submit_child=_director_recovery_submit_child,
             recovery_verify_child=_director_recovery_verified_child,
             recovery_validate_child=_director_recovery_validate_child,
+            runtime_admission=_director_recovery_runtime_admission,
         )
         _pipeline_initialized = True
 
@@ -6608,6 +6619,8 @@ def _require_remote_visible_job_models(job: dict) -> None:
         for value in (
             job.get("model_type"), params.get("model_type"),
             params.get("video_model"), params.get("image_model"),
+            params.get("image_creator_model"),
+            params.get("image_editor_model"),
         )
         if str(value or "").strip()
     }
@@ -6634,6 +6647,7 @@ def _job_model_term_ids(job: dict) -> list[str]:
     for value in (
         job.get("model_type"), params.get("model_type"),
         params.get("video_model"), params.get("image_model"),
+        params.get("image_creator_model"), params.get("image_editor_model"),
         params.get("editor_model_type"),
     ):
         add(value)
@@ -8372,13 +8386,429 @@ def _authorize_generation_media_inputs(
             body[field] = _resolve(body[field], field)
 
 
+_DIRECTOR_IMAGE_ROLE_FIELDS = frozenset({
+    "image_creator_model", "image_editor_model",
+    "image_creator_loras", "image_editor_loras",
+})
+_DIRECTOR_LEGACY_IMAGE_FIELDS = frozenset({"image_model", "image_loras"})
+_DIRECTOR_IMAGE_ROLE_INTERNAL_FIELDS = frozenset({
+    "_director_image_role", "_director_image_role_loras",
+    "_director_image_role_selection", "_director_image_role_base_prompt",
+})
+_DIRECTOR_SAFE_IMAGE_MODEL = "flux2_klein_9b"
+_DIRECTOR_DEFAULT_EDITOR_MODEL = "flux2_klein_9b"
+_DIRECTOR_EXPLICIT_CREATOR_MODELS = (
+    "krea2_moody_mix_v7_fp8",
+    "krea2_moody_cutie_v4_fp8",
+)
+
+
+def _director_image_role_wire_mode(body: dict) -> str:
+    """Classify the image wire by key presence and reject mixed contracts."""
+    role_present = bool(_DIRECTOR_IMAGE_ROLE_FIELDS.intersection(body))
+    legacy_present = bool(_DIRECTOR_LEGACY_IMAGE_FIELDS.intersection(body))
+    if role_present and legacy_present:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Director image role fields cannot be mixed with "
+                "image_model or image_loras"
+            ),
+        )
+    return "roles" if role_present else "legacy"
+
+
+def _reject_client_director_image_role_internals(body: dict) -> None:
+    """Keep role provenance and resolved prompt expansions server-owned."""
+    if _DIRECTOR_IMAGE_ROLE_INTERNAL_FIELDS.intersection(body):
+        raise HTTPException(
+            status_code=400,
+            detail="Director image role internals are server-owned",
+        )
+
+
+def _strip_director_image_role_internals(params: dict) -> dict:
+    """Remove private role admission state from a public metadata copy."""
+    for key in _DIRECTOR_IMAGE_ROLE_INTERNAL_FIELDS:
+        params.pop(key, None)
+    return params
+
+
+def _director_explicit_creator_resolution(*, unrestricted: bool) -> dict:
+    """Resolve only the automatic creator choice; explicit overrides bypass it."""
+    if unrestricted:
+        resolver = globals().get("_project_reference_explicit_generation_model")
+        if callable(resolver):
+            resolution = resolver()
+            candidates = {
+                str(candidate.get("model_type") or ""): candidate
+                for candidate in resolution.get("candidates") or ()
+                if isinstance(candidate, dict)
+            }
+            for selected in _DIRECTOR_EXPLICIT_CREATOR_MODELS:
+                candidate = candidates.get(selected) or {}
+                if all(
+                    candidate.get(key) is True
+                    for key in (
+                        "enabled", "manual_checkpoint_verified",
+                        "terms_accepted", "downloaded", "ready",
+                    )
+                ):
+                    return {
+                        "resolved_model": selected,
+                        "selection_source": "verified_manual_preference",
+                    }
+    return {
+        "resolved_model": _DIRECTOR_SAFE_IMAGE_MODEL,
+        "selection_source": "safe_fallback",
+    }
+
+
+def _director_image_model_enabled(model_type: str) -> bool:
+    """Mirror the catalog's effective enablement for Director image roles."""
+    visibility = _model_visibility_response()
+    if visibility.get("configured"):
+        return model_type in set(visibility.get("enabled_models") or ())
+    return model_type not in _DIRECTOR_EXPLICIT_CREATOR_MODELS
+
+
+def _migrate_director_final_video_postprocess(params: dict) -> None:
+    """Move historical intermediate-image controls to final-video authority."""
+    legacy_to_final = {
+        "image_spatial_upsampling": "video_spatial_upsampling",
+        "image_film_grain_intensity": "video_film_grain_intensity",
+        "image_film_grain_saturation": "video_film_grain_saturation",
+    }
+    for legacy_key, final_key in legacy_to_final.items():
+        if final_key not in params and legacy_key in params:
+            params[final_key] = params[legacy_key]
+        params.pop(legacy_key, None)
+
+
+def _director_role_lora_request(
+    value,
+    *,
+    model_type: str,
+    scope: str,
+) -> list[dict]:
+    """Resolve one role's LoRAs against that model and its linked roots."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 64:
+        raise HTTPException(status_code=400, detail="Invalid Director role LoRA selection")
+    prepared = []
+    seen = set()
+    for item in value:
+        keys = set(item) if isinstance(item, dict) else set()
+        if keys not in (
+            {"id", "multiplier"},
+            {
+                "id", "multiplier", "parameter_schema_digest",
+                "parameter_values",
+            },
+        ):
+            raise HTTPException(status_code=400, detail="Invalid Director role LoRA selection")
+        lora_id = item.get("id")
+        multiplier = item.get("multiplier")
+        if (
+            not isinstance(lora_id, str)
+            or not lora_id
+            or len(lora_id) > 512
+            or os.path.basename(lora_id) != lora_id
+            or lora_id in seen
+            or isinstance(multiplier, bool)
+            or not isinstance(multiplier, (int, float))
+            or not math.isfinite(float(multiplier))
+            or not -10 <= float(multiplier) <= 10
+        ):
+            raise HTTPException(status_code=400, detail="Invalid Director role LoRA selection")
+        seen.add(lora_id)
+        prepared.append({**item, "scope": scope})
+        # A published schema is never silently treated as strength-only.
+        if set(item) == {"id", "multiplier"}:
+            try:
+                path = wgp.resolve_lora_path(model_type, lora_id)
+            except Exception as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Director role LoRA is unavailable for the selected model",
+                ) from error
+            if (
+                not isinstance(path, str)
+                or not path
+                or not os.path.isfile(path)
+                or os.path.islink(path)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Director role LoRA is unavailable for the selected model",
+                )
+            try:
+                schema = _project_reference_lora_parameter_schema(
+                    model_type, os.path.realpath(path),
+                )
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Director role LoRA parameter schema is invalid",
+                ) from error
+            if schema is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Director role LoRA requires its published parameters",
+                )
+    operation_models = {
+        "generation": (model_type,) if scope == "generation" else (),
+        "editing": (model_type,) if scope == "editing" else (),
+    }
+    resolved = _project_reference_resolve_additional_loras(
+        prepared,
+        generation_model=model_type,
+        editor_model=model_type,
+        operation_models=operation_models,
+    )
+    return [
+        {
+            "id": item["id"],
+            "multiplier": item["multiplier"],
+            "parameter_schema_digest": item["parameter_schema_digest"],
+            "parameter_values": list(item["parameter_values"]),
+            "parameter_expansions": list(item["parameter_expansions"]),
+        }
+        for item in resolved
+    ]
+
+
+def _director_model_ready_or_raise(model_type: str, *, image_role: str = "") -> None:
+    """Require compatibility, terms, manual verification, and local weights."""
+    from services.director_model_compat import assess_director_model
+
+    model_def = wgp.get_model_def(model_type)
+    if not isinstance(model_def, dict):
+        raise HTTPException(status_code=409, detail="Director model is unavailable")
+    if image_role:
+        assessment = assess_director_model(
+            model_type,
+            model_def,
+            family=wgp.get_model_family(model_type, for_ui=True),
+            architecture=wgp.get_base_model_type(model_type),
+        )
+        if not assessment["image"][image_role]["compatible"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Director image {image_role} model is incompatible",
+            )
+        if not _director_image_model_enabled(model_type):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Director image {image_role} model is disabled",
+            )
+    _require_model_recipe_terms([model_type])
+    if not _check_model_downloaded(model_type):
+        raise HTTPException(
+            status_code=409,
+            detail="Director model is not ready on this host",
+        )
+
+
+def _resolve_director_image_role_request(
+    request: Request,
+    body: dict,
+) -> str:
+    """Resolve and seal Director's legacy or explicit two-role image wire."""
+    _migrate_director_final_video_postprocess(body)
+    mode = _director_image_role_wire_mode(body)
+    if mode == "legacy":
+        models = [
+            body.get("video_model") or "ltx2_22B_distilled_1_1",
+            body.get("image_model") or _DIRECTOR_SAFE_IMAGE_MODEL,
+        ]
+        _require_remote_visible_models(request, models)
+        for model_type in models:
+            if str(model_type or "").strip():
+                _director_model_ready_or_raise(str(model_type))
+        return mode
+
+    sealed_selection = body.get("_director_image_role_selection")
+    sealed_selection = (
+        sealed_selection if isinstance(sealed_selection, dict) else {}
+    )
+    creator_sealed_source = sealed_selection.get("creator")
+    if creator_sealed_source not in {
+        "explicit_override", "verified_manual_preference", "safe_fallback",
+    }:
+        creator_sealed_source = None
+    editor_sealed_source = sealed_selection.get("editor")
+    if editor_sealed_source not in {"explicit_override", "fixed_default"}:
+        editor_sealed_source = None
+    requested_creator = body.get("image_creator_model")
+    if requested_creator is not None and (
+        not isinstance(requested_creator, str)
+        or not 1 <= len(requested_creator) <= 200
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Director image creator model")
+    if requested_creator:
+        creator_model = requested_creator
+        creator_source = creator_sealed_source or "explicit_override"
+    else:
+        creator = _director_explicit_creator_resolution(
+            unrestricted=body.get("explicit_output") is True,
+        )
+        creator_model = creator["resolved_model"]
+        creator_source = creator["selection_source"]
+    requested_editor = body.get("image_editor_model")
+    if requested_editor is not None and (
+        not isinstance(requested_editor, str)
+        or not 1 <= len(requested_editor) <= 200
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Director image editor model")
+    editor_model = requested_editor or _DIRECTOR_DEFAULT_EDITOR_MODEL
+    editor_source = (
+        editor_sealed_source
+        or ("explicit_override" if requested_editor else "fixed_default")
+    )
+    body["image_creator_model"] = creator_model
+    body["image_editor_model"] = editor_model
+    body["_director_image_role_selection"] = {
+        "creator": creator_source,
+        "editor": editor_source,
+    }
+    models = [body.get("video_model"), creator_model, editor_model]
+    _require_remote_visible_models(request, models)
+    _director_model_ready_or_raise(creator_model, image_role="creator")
+    _director_model_ready_or_raise(editor_model, image_role="editor")
+    if str(body.get("video_model") or "").strip():
+        _director_model_ready_or_raise(str(body["video_model"]))
+    body["_director_image_role_loras"] = {
+        "creator": _director_role_lora_request(
+            body.get("image_creator_loras"),
+            model_type=creator_model,
+            scope="generation",
+        ),
+        "editor": _director_role_lora_request(
+            body.get("image_editor_loras"),
+            model_type=editor_model,
+            scope="editing",
+        ),
+    }
+    return mode
+
+
+def _apply_director_image_role_generation(body: dict) -> str:
+    """Flatten one admitted Director role snapshot into generic image params."""
+    if str(body.get("generation_mode") or "image") != "image":
+        raise HTTPException(
+            status_code=400,
+            detail="Director image role fields require image generation mode",
+        )
+    refs = body.get("image_refs")
+    if refs is None:
+        refs = []
+    if not isinstance(refs, list) or any(
+        not isinstance(item, str) or not item for item in refs
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Director image role previews require an image_refs array",
+        )
+    role = "editor" if refs else "creator"
+    model_key = (
+        "image_editor_model" if role == "editor"
+        else "image_creator_model"
+    )
+    model_type = str(body.get(model_key) or "").strip()
+    if not model_type:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Director image {role} model is unavailable",
+        )
+    from services.director_pipeline import (
+        _director_image_params,
+        _director_image_role_loras,
+        _director_role_prompt,
+        _limit_director_image_refs,
+    )
+
+    refs = _limit_director_image_refs(model_type, refs, pid="preview")
+    loras = _director_image_role_loras(body, role)
+    defaults = _director_image_params(body, model_type)
+    for key, fallback in (
+        ("resolution", "1280x720"),
+        ("num_inference_steps", 8),
+        ("guidance_scale", 1),
+    ):
+        if key not in body:
+            body[key] = defaults.get(key, fallback)
+    base_prompt = body.get("_director_image_role_base_prompt")
+    if base_prompt is None and isinstance(body.get("prompt"), str):
+        base_prompt = body["prompt"]
+        body["_director_image_role_base_prompt"] = base_prompt
+    if isinstance(base_prompt, str):
+        body["prompt"] = _director_role_prompt(
+            base_prompt, loras, role,
+        )
+    body.update({
+        "model_type": model_type,
+        "image_refs": refs,
+        "image_mode": 1,
+        "generation_mode": "image",
+        "video_prompt_type": "KI" if refs else "",
+        "activated_loras": list(loras.get("activated_loras") or ()),
+        "loras_multipliers": str(loras.get("loras_multipliers") or ""),
+        "_director_image_role": role,
+    })
+    return role
+
+
+def _apply_authoritative_generation_prompt(body: dict, prompt: str) -> None:
+    """Replace a prepared prompt without losing Director role idempotence."""
+    body["prompt"] = prompt
+    if isinstance(body.get("_director_image_role_base_prompt"), str):
+        body["_director_image_role_base_prompt"] = prompt
+        _apply_director_image_role_generation(body)
+
+
+def _director_recovery_runtime_admission(
+    params: dict,
+    *,
+    source_remote: bool = False,
+) -> None:
+    """Apply the same model/LoRA gates to startup and direct service recovery."""
+    request = type("DirectorRecoveryRequest", (), {})()
+    request.state = type(
+        "DirectorRecoveryState", (), {"maestro_remote": bool(source_remote)},
+    )()
+    _resolve_director_image_role_request(request, params)
+
+
+def _require_job_runtime_model_admission(job: dict) -> None:
+    """Revalidate generic role snapshots and legacy terms before execution."""
+    params = job.get("params")
+    params = params if isinstance(params, dict) else {}
+    if _director_image_role_wire_mode(params) == "roles":
+        request = type("GenerationRecoveryRequest", (), {})()
+        request.state = type(
+            "GenerationRecoveryState", (), {
+                "maestro_remote": bool(job.get("source_remote", False)),
+            },
+        )()
+        _resolve_director_image_role_request(request, params)
+        _apply_director_image_role_generation(params)
+        job["model_type"] = str(params.get("model_type") or "")
+    else:
+        _require_job_model_recipe_terms(job)
+
+
 def _authorize_director_media_inputs(request: Request, body: dict) -> str:
     """Authorize every Director reference before an LLM/provider sees it."""
     workspace = body.get("workspace") or _get_active_workspace()
     _require_project_access(request, workspace)
     _require_remote_visible_models(
         request,
-        [body.get("video_model"), body.get("image_model")],
+        [
+            body.get("video_model"), body.get("image_model"),
+            body.get("image_creator_model"), body.get("image_editor_model"),
+        ],
     )
     fields = (
         "reference_image_path", "character_ref_paths", "location_ref_paths",
@@ -8455,6 +8885,76 @@ _H3_FL2VA_MODELS = {
 _H3_LONG_STUDIO_MODELS = _H3_FL2VA_MODELS | {_H3_REF2VA_MODEL}
 _MULTI_CLIP_SEPARATOR = "\n---CLIP_BOUNDARY---\n"
 _H3_REF2VA_HANDOFF_FRAMES = 56  # first legal 17*n+5 clip at/above two seconds
+
+
+def _resolve_h3_style_workflow_request(
+    body: dict,
+    *,
+    model_field: str = "model_type",
+) -> dict | None:
+    """Replace one client ID with server-owned, revision-bound guidance."""
+    private_fields = sorted(
+        str(key) for key in body
+        if isinstance(key, str)
+        and key.startswith("h3_style_workflow_")
+    )
+    if private_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "H3 style workflow metadata is server-owned: "
+                + ", ".join(private_fields)
+            ),
+        )
+    selection = body.get("h3_style_workflow")
+    if selection in (None, ""):
+        body.pop("h3_style_workflow", None)
+        return None
+    if str(body.get(model_field) or "") not in _H3_LONG_STUDIO_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail="h3_style_workflow requires a supported MiniMax H3 model",
+        )
+    from services.h3_upstream_skills import resolve_h3_style_workflow
+    try:
+        resolved = resolve_h3_style_workflow(
+            selection,
+            _h3_skill_catalog_updater.load(),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    body["h3_style_workflow"] = resolved
+    return resolved
+
+
+def _apply_h3_style_workflow_to_request(body: dict) -> str | None:
+    """Compile resolved workflow guidance without changing Context-IR shape."""
+    workflow = body.get("h3_style_workflow")
+    if workflow is None:
+        return None
+    if str(body.get("model_type") or "") not in _H3_LONG_STUDIO_MODELS:
+        raise ValueError("Resolved H3 style workflow has a non-H3 model")
+    from services.h3_upstream_skills import compile_h3_style_workflow
+    prompt, schema = compile_h3_style_workflow(body.get("prompt"), workflow)
+    body["prompt"] = prompt
+    return schema
+
+
+def _apply_h3_style_workflow_to_director_clips(
+    clip_plans: list[dict],
+    workflow: dict | None,
+) -> None:
+    """Apply resolved workflow guidance only to rendered H3 video prompts."""
+    if workflow is None:
+        return
+    from services.h3_upstream_skills import compile_h3_style_workflow
+    for clip in clip_plans:
+        if not isinstance(clip, dict):
+            raise ValueError("Director clip plan is invalid")
+        prompt, _schema = compile_h3_style_workflow(
+            clip.get("video_prompt"), workflow,
+        )
+        clip["video_prompt"] = prompt
 
 
 def _validate_h3_sampling_steps(body: dict) -> int | None:
@@ -10276,9 +10776,15 @@ def list_loras(model_type: str):
     try:
         lora_dir = wgp.get_lora_dir(model_type)
     except Exception:
-        return {"loras": [], "guidance_max_phases": md.get("guidance_max_phases", 1)}
-
-    if lora_dir is None or not os.path.isdir(lora_dir):
+        lora_dir = None
+    try:
+        search_dirs = [
+            path for path in wgp.get_lora_search_dirs(model_type)
+            if isinstance(path, str) and os.path.isdir(path)
+        ]
+    except Exception:
+        search_dirs = []
+    if not search_dirs:
         return {"loras": [], "guidance_max_phases": md.get("guidance_max_phases", 1)}
 
     # Merge the primary dir with linked read-only dirs (Linked Model
@@ -10286,7 +10792,7 @@ def list_loras(model_type: str):
     # existing Wan2GP install show up in the Studio selector without
     # copying them.
     names = set()
-    for search_dir in wgp.get_lora_search_dirs(model_type):
+    for search_dir in search_dirs:
         for f in glob.glob(os.path.join(search_dir, "*.safetensors")) + glob.glob(os.path.join(search_dir, "*.sft")):
             names.add(os.path.basename(f))
     loras = sorted(names)
@@ -10306,15 +10812,24 @@ def list_loras_details(model_type: str):
     try:
         lora_dir = wgp.get_lora_dir(model_type)
     except Exception:
+        lora_dir = None
+    try:
+        search_dirs = [
+            path for path in wgp.get_lora_search_dirs(model_type)
+            if isinstance(path, str) and os.path.isdir(path)
+        ]
+    except Exception:
+        search_dirs = []
+    if not search_dirs:
         return {"loras": [], "guidance_max_phases": md.get("guidance_max_phases", 1)}
-    if lora_dir is None or not os.path.isdir(lora_dir):
-        return {"loras": [], "guidance_max_phases": md.get("guidance_max_phases", 1)}
+    if not isinstance(lora_dir, str) or not lora_dir:
+        lora_dir = search_dirs[0]
 
     # Merge across the primary dir and linked read-only dirs (same set as
     # the plain listing endpoint), primary copy wins per filename.
     _seen_names = set()
     files = []
-    for _search_dir in wgp.get_lora_search_dirs(model_type):
+    for _search_dir in search_dirs:
         for f in sorted(
             glob.glob(os.path.join(_search_dir, "*.safetensors"))
             + glob.glob(os.path.join(_search_dir, "*.sft"))
@@ -15735,6 +16250,30 @@ def _project_reference_private_authored_snapshot(variant: dict) -> dict:
     )
     try:
         from services.reference_sheets import reference_pack_authored_settings_seal
+        public_style_keys = {"style_present", "style_commitment"}.intersection(
+            public_authored if isinstance(public_authored, dict) else {}
+        )
+        private_has_style = isinstance(private, dict) and "style" in private
+        if public_style_keys:
+            if (
+                public_style_keys != {"style_present", "style_commitment"}
+                or type(public_authored.get("style_present")) is not bool
+                or not private_has_style
+                or not isinstance(private.get("style"), str)
+                or bool(private["style"]) != public_authored["style_present"]
+            ):
+                raise ValueError("private style contract changed")
+            expected_style_commitment = _project_reference_private_commitment({
+                "kind": "reference_style_v1",
+                "value": private["style"],
+            })
+            if not hmac.compare_digest(
+                expected_style_commitment,
+                str(public_authored.get("style_commitment") or ""),
+            ):
+                raise ValueError("private style commitment changed")
+        elif private_has_style:
+            raise ValueError("private style contract is incomplete")
         for selection in (
             private.get("additional_lora_parameters", [])
             if isinstance(private, dict) else []
@@ -15768,6 +16307,8 @@ def _project_reference_private_authored_snapshot(variant: dict) -> dict:
         "type_fields": copy.deepcopy(private["type_fields"]),
         "detail_callouts": copy.deepcopy(private["detail_callouts"]),
     }
+    if "style" in private:
+        snapshot["style"] = private["style"]
     if "additional_lora_parameters" in private:
         snapshot["additional_lora_parameters"] = copy.deepcopy(
             private["additional_lora_parameters"],
@@ -17143,7 +17684,6 @@ def _project_reference_request_config(
     legacy_type_fields = {
         "poses": {"character", "creature"},
         "outfits": {"character"},
-        "style": {"world"},
         "genre": {"world"},
     }
     if any(
@@ -17438,7 +17978,7 @@ def _project_reference_request_config(
     if managed_layout_assist != "off":
         raise HTTPException(
             status_code=409,
-            detail="No managed Reference Studio layout assist is currently vetted",
+            detail="No managed Reference layout assist is currently vetted",
         )
     additional_loras = _project_reference_resolve_additional_loras(
         body.get("additional_loras"),
@@ -17449,6 +17989,11 @@ def _project_reference_request_config(
         reference_type=asset_type,
         commitment_contexts=commitment_contexts,
     )
+    style = _project_reference_text(body.get("style"), "style", limit=10_000)
+    style_commitment = _project_reference_private_commitment({
+        "kind": "reference_style_v1",
+        "value": style,
+    })
 
     asset_id = body.get("asset_id")
     parent_variant_id = body.get("parent_variant_id")
@@ -17527,7 +18072,8 @@ def _project_reference_request_config(
         "tags": tags,
         "poses": _project_reference_text(body.get("poses"), "poses", limit=10_000),
         "outfits": _project_reference_text(body.get("outfits"), "outfits", limit=10_000),
-        "style": _project_reference_text(body.get("style"), "style", limit=10_000),
+        "style": style,
+        "style_commitment": style_commitment,
         "genre": _project_reference_text(body.get("genre"), "genre", limit=10_000),
         "negative_prompt": _project_reference_text(
             body.get("negative_prompt"), "negative_prompt", limit=50_000,
@@ -17687,7 +18233,7 @@ def _write_project_reference_sidecar(
 
 
 def _cleanup_project_reference_private_source(path, root=None):
-    """Remove one owned generator source and prompt-free sidecar after copying."""
+    """Remove one owned generator source and private sidecar after copying."""
     lexical = os.path.abspath(str(path))
     if root is not None:
         expected_root = os.path.realpath(str(root))
@@ -17997,6 +18543,7 @@ def _project_reference_runtime_intelligence_selection(
 def _project_reference_run_planning(request, parent_job, plan, config):
     """Run and validate the queued structured planning phase when selected."""
     from services import llm_service
+    from services.director.policies import build_visual_style_default_block
     from services.reference_sheets import apply_reference_pack_role_briefs
 
     selection = config["planning"]
@@ -18066,7 +18613,7 @@ def _project_reference_run_planning(request, parent_job, plan, config):
             update_job(
                 parent_job,
                 phase="Planning reference pack",
-                message="Planning sealed Reference Studio deliverables",
+                message="Planning sealed Reference deliverables",
             )
 
     runner = globals().get("_run_llm_with_selection")
@@ -18104,7 +18651,8 @@ def _project_reference_run_planning(request, parent_job, plan, config):
             ),
             system_prompt=(
                 "Return only the strict server-provided Reference Pack schema. "
-                "The server owns all bounds and role ordering."
+                "The server owns all bounds and role ordering.\n\n"
+                + build_visual_style_default_block()
             ),
             max_new_tokens=384,
             temperature=0.2,
@@ -18156,6 +18704,29 @@ def _project_reference_run_planning(request, parent_job, plan, config):
         return plan
 
 
+def _project_reference_authored_prompt_fragment(authored_contract) -> str:
+    """Render only the sealed role-scoped authored facts needed by a callback."""
+    parts = []
+    style = getattr(authored_contract, "style", None)
+    if isinstance(style, str) and style:
+        parts.append(f"Authored style: {style}")
+    for field, items in getattr(authored_contract, "type_fields", ()) or ():
+        labels = [
+            item.label for item in items
+            if isinstance(getattr(item, "label", None), str) and item.label
+        ]
+        if labels:
+            parts.append(f"Authored {field}: {'; '.join(labels)}")
+    callout_labels = [
+        item.label
+        for item in getattr(authored_contract, "detail_callouts", ()) or ()
+        if isinstance(getattr(item, "label", None), str) and item.label
+    ]
+    if callout_labels:
+        parts.append(f"Authored detail callouts: {'; '.join(callout_labels)}")
+    return "\n".join(parts)
+
+
 def _project_reference_selected_reviewer(
     request, parent_job, review_request, config,
 ):
@@ -18190,19 +18761,26 @@ def _project_reference_selected_reviewer(
                 return llm_service.generate(*args, **kwargs)
             finally:
                 llm_service.unload_model()
-    return runner(
+    authored_fragment = _project_reference_authored_prompt_fragment(
+        review_request.authored_contract,
+    )
+    raw = runner(
             runtime,
             operation,
             prompt=(
                 f"{review_request.instruction}\n"
-                f"Creative request:\n{review_request.creative_request}\n"
-                f"Ordered reference roles: {', '.join(review_request.sheet_roles)}"
+                f"Authored request: {review_request.creative_request}\n"
+                f"Question: {review_request.question}\n"
+                f"Target role: {review_request.target_role}\n"
+                "Ordered attachment roles: "
+                f"{json.dumps(list(review_request.sheet_roles))}\n"
+                "Sealed authored role contract:\n"
+                f"{authored_fragment or '(no additional authored fields)'}"
             ),
             system_prompt=(
-                "Compare only the authored request and supplied outputs for the "
-                "exact bounded fidelity schema. Never moderate, decide "
-                "permissibility, classify maturity, analyze refusal, or infer an "
-                "unsupplied prompt or register. Return strict JSON."
+                "Answer only the current sealed fidelity question against the "
+                "supplied outputs and role-scoped authored contract. Return one "
+                "strict JSON Boolean and no other fields."
             ),
             image_paths=[str(path) for path in review_request.sheet_paths],
             max_new_tokens=512,
@@ -18211,6 +18789,14 @@ def _project_reference_selected_reviewer(
             enable_thinking=False,
             json_schema=dict(review_request.response_schema),
         )
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("reference_reviewer_boolean_invalid") from error
+    if type(raw) is not bool:
+        raise RuntimeError("reference_reviewer_boolean_invalid")
+    return raw
 
 
 def _attach_project_reference_result(
@@ -18387,13 +18973,16 @@ def _attach_project_reference_result(
 @api.post("/api/v1/projects/{project}/assets/generate")
 async def generate_project_asset_references(project: str, request: Request):
     """Queue one or more v2 ordered reference packs for a project card."""
+    from services.director.policies import build_visual_style_default_block
     from services.reference_sheets import (
         PackIntelligenceSelection,
         PackLoraSelection,
         PackOperationRoute,
         build_reference_pack_plan,
+        fidelity_rubric_role_applicability,
     )
 
+    visual_style_default = build_visual_style_default_block()
     project_id, workspace_id = _asset_scope(request, project)
     body = await request.json()
     owner_session_id = request.state.maestro_session_id
@@ -18424,7 +19013,7 @@ async def generate_project_asset_references(project: str, request: Request):
         restore_private_fields = any(
             field not in body
             for field in (
-                "type_fields", "detail_callouts", "additional_loras",
+                "type_fields", "detail_callouts", "additional_loras", "style",
             )
         )
         if (
@@ -18458,6 +19047,8 @@ async def generate_project_asset_references(project: str, request: Request):
                         "detail_callouts",
                         private_snapshot["detail_callouts"],
                     )
+                    if "style" in private_snapshot:
+                        body.setdefault("style", private_snapshot["style"])
                     if (
                         "additional_loras" not in body
                         and isinstance(
@@ -18588,6 +19179,8 @@ async def generate_project_asset_references(project: str, request: Request):
         intent=config["intent"],
         depth=config["depth"],
         creative_request=creative_request,
+        style=config["style"],
+        style_commitment=config["style_commitment"],
         generation_model=config["model_type"],
         editor_model=config.get("editor_model_type"),
         preset=config["preset"],
@@ -18646,6 +19239,8 @@ async def generate_project_asset_references(project: str, request: Request):
             intent=config["intent"],
             depth=config["depth"],
             creative_request=creative_request,
+            style=config["style"],
+            style_commitment=config["style_commitment"],
             generation_model=config["model_type"],
             editor_model=config.get("editor_model_type"),
             preset=config["preset"],
@@ -18673,13 +19268,21 @@ async def generate_project_asset_references(project: str, request: Request):
         )
     job_id = uuid.uuid4().hex[:8]
     repair_budget = 0 if config["mode"] == "draft" else config["max_repair_attempts"]
+    review_questions_per_attempt = sum(
+        len(applicable_roles)
+        for _item_id, applicable_roles in fidelity_rubric_role_applicability(
+            plan.reference_type, plan.output_roles,
+        )
+    )
     # One failed canonical anchor regenerates every authored output in the
     # candidate, while other failed roles repair only one output. Reserve the
     # larger bounded path so step/total never moves backward when the reviewer
     # selects the anchor late in execution.
-    operations_per_repair = max(2, len(plan.output_roles) + 1)
+    operations_per_repair = (
+        len(plan.output_roles) + review_questions_per_attempt
+    )
     operations_per_candidate = (
-        len(plan.output_roles) + 2
+        len(plan.output_roles) + review_questions_per_attempt + 1
         + (operations_per_repair * repair_budget)
     )
     total_steps = 1 + operations_per_candidate * config["candidate_count"]
@@ -18691,6 +19294,14 @@ async def generate_project_asset_references(project: str, request: Request):
         "repair_attempts_requested_total": repair_budget * config["candidate_count"],
         "repair_attempts_used": 0,
         "repair_attempts_used_total": 0,
+        "review_questions_per_attempt": review_questions_per_attempt,
+        "review_attempts_requested_per_candidate": repair_budget + 1,
+        "review_questions_requested_total": (
+            review_questions_per_attempt
+            * (repair_budget + 1)
+            * config["candidate_count"]
+        ),
+        "review_questions_used_total": 0,
         "model_schedules": copy.deepcopy(config["model_schedules"]),
         "retry_instruction_present": bool(config["edit_instruction"]),
         "intelligence_recipe": copy.deepcopy(config["intelligence_recipe"]),
@@ -18804,7 +19415,7 @@ async def generate_project_asset_references(project: str, request: Request):
                 update_job(
                     parent_job,
                     phase="Freezing reference resources",
-                    message="Freezing selected Reference Studio resources",
+                    message="Freezing selected Reference resources",
                 )
                 frozen_loras = _project_reference_resolve_additional_loras(
                     body.get("additional_loras"),
@@ -18886,6 +19497,8 @@ async def generate_project_asset_references(project: str, request: Request):
                     intent=config["intent"],
                     depth=config["depth"],
                     creative_request=creative_request,
+                    style=config["style"],
+                    style_commitment=config["style_commitment"],
                     generation_model=config["model_type"],
                     editor_model=config.get("editor_model_type"),
                     preset=config["preset"],
@@ -18971,6 +19584,7 @@ async def generate_project_asset_references(project: str, request: Request):
                     "resource_state": "queued",
                 })
             for candidate_index in range(config["candidate_count"]):
+                candidate_review_progress = {"questions": 0}
                 variant_id = f"{job_id}_pack_{candidate_index + 1}"
                 try:
                     current_asset = _project_asset_store().get_asset(
@@ -19042,21 +19656,31 @@ async def generate_project_asset_references(project: str, request: Request):
                         f"sheet {sheet_request.index + 1}/{sheet_request.sheet_count}"
                     )
                     step = next_step(phase)
+                    authored_fragment = _project_reference_authored_prompt_fragment(
+                        sheet_request.authored_contract,
+                    )
                     if sheet_request.strategy == "canonical_anchor":
                         prompt = (
                             f"Create the canonical {sheet_request.reference_type} reference sheet. "
+                            f"Authored request: {sheet_request.creative_request}. "
                             f"Anchor basis: {sheet_request.anchor_basis}. Role: {sheet_request.label}. "
                             f"Objective: {sheet_request.objective}. This is the single immutable "
                             "visual source for every derivative in this candidate pack. Use a "
                             "deterministic clean reference layout and preserve exact requested "
-                            f"details. Creative request: {sheet_request.creative_request}"
+                            f"details. {visual_style_default}"
                         )
                     else:
                         prompt = (
                             f"Create one Draft compatibility sheet for this {sheet_request.reference_type}. "
+                            f"Authored request: {sheet_request.creative_request}. "
                             f"Role: {sheet_request.label}. Objective: {sheet_request.objective}. "
                             "This Draft is an independent one-shot and does not claim anchored "
-                            f"cross-sheet continuity. Creative request: {sheet_request.creative_request}"
+                            f"cross-sheet continuity. {visual_style_default}"
+                        )
+                    if authored_fragment:
+                        prompt = (
+                            f"{prompt}\nSealed authored role contract:\n"
+                            f"{authored_fragment}"
                         )
                     params = _project_reference_generation_params(
                         config,
@@ -19082,6 +19706,9 @@ async def generate_project_asset_references(project: str, request: Request):
                         f"sheet {sheet_request.index + 1}/{sheet_request.sheet_count}"
                     )
                     step = next_step(phase)
+                    authored_fragment = _project_reference_authored_prompt_fragment(
+                        sheet_request.authored_contract,
+                    )
                     exact_guard = (
                         "Do not invent, reconstruct, or infer absent identity-bearing detail. "
                         if sheet_request.intent == "exact_spec" else ""
@@ -19089,11 +19716,16 @@ async def generate_project_asset_references(project: str, request: Request):
                     prompt = (
                         "Create a new ordered reference sheet guided by the attached primary "
                         "source and full canonical anchor. Preserve identity, geometry, design, "
-                        f"materials, and palette. {exact_guard}Role: {sheet_request.label}. "
+                        f"materials, and palette. Authored request: {sheet_request.creative_request}. "
+                        f"{exact_guard}Role: {sheet_request.label}. "
                         f"Objective: {sheet_request.objective}. Requested detail operation: "
-                        f"{sheet_request.operation or 'enhance'}. Creative request: "
-                        f"{sheet_request.creative_request}"
+                        f"{sheet_request.operation or 'enhance'}. {visual_style_default}"
                     )
+                    if authored_fragment:
+                        prompt = (
+                            f"{prompt}\nSealed authored role contract:\n"
+                            f"{authored_fragment}"
+                        )
                     params = _project_reference_generation_params(
                         config,
                         model_type=sheet_request.model,
@@ -19119,17 +19751,26 @@ async def generate_project_asset_references(project: str, request: Request):
                         f"sheet {repair_request.label}"
                     )
                     step = next_step(phase)
+                    authored_fragment = _project_reference_authored_prompt_fragment(
+                        repair_request.authored_contract,
+                    )
                     exact_guard = (
                         "Do not invent absent identity-bearing detail. "
                         if config["intent"] == "exact_spec" else ""
                     )
                     prompt = (
                         "Create one corrected reference-guided replacement sheet. "
+                        f"Authored request: {repair_request.creative_request}. "
                         f"Role: {repair_request.label}. Objective: {repair_request.objective}. "
                         f"Correction reasons: {', '.join(repair_request.reason_codes)}. "
                         f"{exact_guard}Preserve the immutable canonical anchor, requested "
-                        f"design, and layout. Creative request: {repair_request.creative_request}"
+                        f"design, and layout. {visual_style_default}"
                     )
+                    if authored_fragment:
+                        prompt = (
+                            f"{prompt}\nSealed authored role contract:\n"
+                            f"{authored_fragment}"
+                        )
                     params = _project_reference_generation_params(
                         config,
                         model_type=repair_request.model,
@@ -19149,15 +19790,28 @@ async def generate_project_asset_references(project: str, request: Request):
                     )
 
                 def reviewer(review_request):
+                    candidate_review_progress["questions"] += 1
+                    review_call = candidate_review_progress["questions"]
+                    question_index = (
+                        (review_call - 1) % review_questions_per_attempt
+                    ) + 1
+                    attempt_index = (
+                        (review_call - 1) // review_questions_per_attempt
+                    ) + 1
                     next_step(
-                        f"Reviewing pack {candidate_index + 1}/{config['candidate_count']}"
+                        f"Reviewing pack {candidate_index + 1}/"
+                        f"{config['candidate_count']} fidelity question "
+                        f"{question_index}/{review_questions_per_attempt}, "
+                        f"attempt {attempt_index}/{repair_budget + 1}"
                     )
                     update_job(
                         parent_job,
                         phase="Reviewing fidelity",
                         message=(
                             f"Reviewing pack {candidate_index + 1}/"
-                            f"{config['candidate_count']} fidelity"
+                            f"{config['candidate_count']} fidelity question "
+                            f"{question_index}/{review_questions_per_attempt}, "
+                            f"attempt {attempt_index}/{repair_budget + 1}"
                         ),
                     )
                     if config["review_selection"]["resolved_model"] is None:
@@ -19180,6 +19834,9 @@ async def generate_project_asset_references(project: str, request: Request):
                 )
                 reference_job_params["repair_attempts_used_total"] += (
                     result.repair_attempts_used
+                )
+                reference_job_params["review_questions_used_total"] += (
+                    candidate_review_progress["questions"]
                 )
                 reference_job_params["review"] = {
                     **config["review_selection"],
@@ -24056,6 +24713,10 @@ async def llm_enhance_prompt(request: Request):
     durable_generation_preparation = bool(
         getattr(request.state, "maestro_generation_preparation", False)
     )
+    h3_style_workflow_present = bool(
+        durable_generation_preparation
+        and body.get("h3_style_workflow_present") is True
+    )
     if explicit_guidance:
         explicit_provider = str(
             wgp.server_config.get("services", {}).get("llm_provider")
@@ -24267,6 +24928,8 @@ async def llm_enhance_prompt(request: Request):
                 window_count=body.get("window_count"),
                 window_size_seconds=body.get("window_size_seconds"),
                 preserve_global_timeline=bool(body.get("preserve_global_timeline")),
+                visual_style=body.get("visual_style"),
+                h3_style_workflow_present=h3_style_workflow_present,
                 tts_enhance_mode=body.get("tts_enhance_mode"),
                 tts_voice_count=body.get("tts_voice_count", 2),
                 raw_enhancer_mode=raw_enhancer_mode,
@@ -25358,6 +26021,7 @@ async def director_plan_prompts_and_images(request: Request):
             speaker_mappings=body.get("speaker_mappings"),
             prompt_type=body.get("prompt_type", "both"),
             existing_image_prompts=body.get("existing_image_prompts"),
+            visual_style=body.get("visual_style"),
             explicit_guidance_keyword="nsfw",
         )
         return {"clip_plans": clip_plans}
@@ -25444,6 +26108,7 @@ async def director_plan_short_film_prompts(request: Request):
             characters=body.get("characters"),
             prompt_type=body.get("prompt_type", "both"),
             existing_image_prompts=body.get("existing_image_prompts"),
+            visual_style=body.get("visual_style"),
             explicit_guidance_keyword="nsfw",
         )
         return {"clip_plans": clip_plans}
@@ -25497,6 +26162,7 @@ async def director_plan_short_film_script(request: Request):
             fps=body.get("fps", 24),
             frames_steps=body.get("frames_steps", 4),
             frames_minimum=body.get("frames_minimum", 5),
+            visual_style=body.get("visual_style"),
             explicit_guidance_keyword="nsfw",
         )
         return result
@@ -25806,6 +26472,7 @@ def _public_pipeline_state(state: dict) -> dict:
         snapshot = dict(snapshot)
         snapshot.pop("_maestro_session_id", None)
         snapshot.pop("_maestro_access_policy", None)
+        _strip_director_image_role_internals(snapshot)
         snapshot.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
         public["_params_snapshot"] = snapshot
     return _redact_local_paths(_sanitize_director_public_failures(public))
@@ -25956,6 +26623,189 @@ def _saved_pipeline_live_recovery_overlay(pid: str) -> dict:
         **metadata,
     }
 
+
+def _revalidate_saved_director_runtime(request: Request, state: dict) -> dict:
+    """Re-run model and role-LoRA admission before saved work can restart."""
+    snapshot = state.get("_params_snapshot")
+    if not isinstance(snapshot, dict):
+        raise HTTPException(
+            status_code=409,
+            detail="Director recovery request is unavailable",
+        )
+    snapshot = dict(snapshot)
+    _resolve_director_image_role_request(request, snapshot)
+    state["_params_snapshot"] = snapshot
+    for key in (
+        "image_creator_model", "image_editor_model",
+        "image_creator_loras", "image_editor_loras",
+    ):
+        if key in snapshot:
+            state[key] = snapshot[key]
+    return state
+
+
+_DIRECTOR_READINESS_REASONS = frozenset({
+    "model_unavailable", "director_incompatible", "model_disabled",
+    "model_terms_required", "manual_verification_required",
+    "model_not_downloaded",
+})
+_DIRECTOR_READINESS_ACTIONS = frozenset({
+    "select_model", "enable_model", "accept_terms",
+    "verify_manual_checkpoint", "download_model",
+})
+
+
+def _director_image_candidate_readiness(
+    model_type: str,
+    role: str,
+) -> dict:
+    """Project bounded, content-free readiness for one image role candidate."""
+    from services.director_model_compat import assess_director_model
+    from services.model_terms import (
+        model_availability_policy,
+        model_terms_manifest_valid,
+        model_terms_statuses,
+    )
+
+    reasons = []
+    actions = []
+    model_def = wgp.get_model_def(model_type)
+    compatible = False
+    if not isinstance(model_def, dict) or not model_terms_manifest_valid(
+        model_type, wgp.models_def,
+    ):
+        reasons.append("model_unavailable")
+        actions.append("select_model")
+        downloaded = False
+        enabled = False
+    else:
+        try:
+            assessment = assess_director_model(
+                model_type,
+                model_def,
+                family=wgp.get_model_family(model_type, for_ui=True),
+                architecture=wgp.get_base_model_type(model_type),
+            )
+            compatible = bool(assessment["image"][role]["compatible"])
+        except Exception:
+            compatible = False
+        if not compatible:
+            reasons.append("director_incompatible")
+            actions.append("select_model")
+        enabled = _director_image_model_enabled(model_type)
+        if not enabled:
+            reasons.append("model_disabled")
+            actions.append("enable_model")
+        services = getattr(wgp, "server_config", {}).get("services", {})
+        term_statuses = model_terms_statuses(
+            services, model_type, wgp.models_def,
+        )
+        terms_accepted = all(
+            item.get("accepted") is True for item in term_statuses
+        )
+        if not terms_accepted:
+            reasons.append("model_terms_required")
+            actions.append("accept_terms")
+        manual_required = getattr(
+            wgp, "manual_checkpoint_integrity_required", None,
+        )
+        manual_ready = getattr(
+            wgp, "manual_checkpoint_integrity_ready", None,
+        )
+        verification_required = bool(
+            callable(manual_required)
+            and manual_required(model_type, model_def, wgp.models_def)
+        )
+        verified = bool(
+            not verification_required
+            or (
+                callable(manual_ready)
+                and manual_ready(model_type, model_def, wgp.models_def)
+            )
+        )
+        if not verified:
+            reasons.append("manual_verification_required")
+            actions.append("verify_manual_checkpoint")
+        downloaded = bool(_check_model_downloaded(model_type))
+        if not downloaded:
+            reasons.append("model_not_downloaded")
+            availability = model_availability_policy(
+                model_type, wgp.models_def,
+            )
+            if availability["downloadable"] is True:
+                actions.append("download_model")
+            elif "verify_manual_checkpoint" not in actions:
+                actions.append("verify_manual_checkpoint")
+    return {
+        "model_type": model_type,
+        "compatible": compatible,
+        "ready": not reasons,
+        "reasons": list(dict.fromkeys(reasons)),
+        "actions": list(dict.fromkeys(actions)),
+        "enabled": enabled,
+        "downloaded": downloaded,
+    }
+
+
+@api.get("/api/v1/director/capabilities")
+def director_capabilities(
+    request: Request,
+    explicit_output: bool = False,
+):
+    """Return v1 role defaults and content-free candidate readiness."""
+    creator = _director_explicit_creator_resolution(
+        unrestricted=explicit_output is True,
+    )
+    remote_visible = _remote_visible_model_ids(request)
+    ordered_ids = list(dict.fromkeys([
+        creator["resolved_model"],
+        *_DIRECTOR_EXPLICIT_CREATOR_MODELS,
+        _DIRECTOR_SAFE_IMAGE_MODEL,
+        _DIRECTOR_DEFAULT_EDITOR_MODEL,
+        *list(getattr(wgp, "displayed_model_types", ()) or ()),
+    ]))[:500]
+    if remote_visible is not None:
+        ordered_ids = [
+            model_type for model_type in ordered_ids
+            if model_type in remote_visible
+        ]
+
+    def role_payload(role: str, resolved_model: str, source: str) -> dict:
+        candidates = [
+            _director_image_candidate_readiness(model_type, role)
+            for model_type in ordered_ids
+            if isinstance(wgp.get_model_def(model_type), dict)
+            and bool(wgp.get_model_def(model_type).get("image_outputs"))
+        ]
+        return {
+            "resolved_model": (
+                resolved_model
+                if remote_visible is None or resolved_model in remote_visible
+                else None
+            ),
+            "selection_source": source,
+            "candidates": candidates,
+            "lora_catalog_endpoint": "/api/v1/loras/{model_type}/details",
+        }
+
+    return {
+        "schema_version": 1,
+        "readiness_reason_values": sorted(_DIRECTOR_READINESS_REASONS),
+        "readiness_action_values": sorted(_DIRECTOR_READINESS_ACTIONS),
+        "image_roles": {
+            "creator": role_payload(
+                "creator",
+                creator["resolved_model"],
+                creator["selection_source"],
+            ),
+            "editor": role_payload(
+                "editor",
+                _DIRECTOR_DEFAULT_EDITOR_MODEL,
+                "fixed_default",
+            ),
+        },
+    }
+
 @api.post("/api/v1/director/pipeline/start")
 async def director_pipeline_start(request: Request):
     """Start a Director pipeline (LLM planning → image gen → video gen).
@@ -25969,8 +26819,11 @@ async def director_pipeline_start(request: Request):
     # This private recovery bit is server-owned. start_pipeline recomputes it
     # from the authoritative consent/provider policy and literal request flag.
     body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
+    _reject_client_director_image_role_internals(body)
     workspace = _authorize_director_media_inputs(request, body)
     body["workspace"] = workspace
+    _resolve_director_image_role_request(request, body)
+    _resolve_h3_style_workflow_request(body, model_field="video_model")
     # Only the public, server-validated chain id may link a preparation to a
     # new pipeline. Never honor the internal child-generation field from an
     # untrusted request body.
@@ -26080,6 +26933,7 @@ def director_pipeline_resume(request: Request, pid: str, workspace: str = ""):
         and live.get("recovery_state") == "blocked_remote_reauth"
         and state.get("status") == "paused"
     ):
+        _revalidate_saved_director_runtime(request, state)
         if not reauthorize_paused_pipeline(pid):
             raise HTTPException(
                 status_code=409,
@@ -26174,6 +27028,7 @@ def repair_saved_pipeline(request: Request, pid: str, workspace: str = ""):
         start_pipeline_repair,
     )
     _state, base = _require_saved_pipeline(request, pid, selected_workspace)
+    _revalidate_saved_director_runtime(request, _state)
     _begin_workspace_operation(selected_workspace)
     try:
         result = start_pipeline_repair(base, pid)
@@ -26217,6 +27072,7 @@ async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request)
         rerun_clip_image,
     )
     _state, base = _require_saved_pipeline(request, pid, selected_workspace)
+    _revalidate_saved_director_runtime(request, _state)
     _begin_workspace_operation(selected_workspace)
     try:
         # Image generation can take minutes. Running it directly inside this
@@ -26261,6 +27117,7 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
         rerun_clip_video,
     )
     _state, base = _require_saved_pipeline(request, pid, selected_workspace)
+    _revalidate_saved_director_runtime(request, _state)
     _begin_workspace_operation(selected_workspace)
     try:
         result = await asyncio.to_thread(
@@ -26408,7 +27265,12 @@ async def director_v2_plan(request: Request):
     body = await request.json()
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
+    _reject_client_director_image_role_internals(body)
     _authorize_director_media_inputs(request, body)
+    _resolve_director_image_role_request(request, body)
+    workflow = _resolve_h3_style_workflow_request(
+        body, model_field="video_model",
+    )
     skill_type = body.get("skill_type", body.get("pipeline_type", "music_video"))
 
     # Map legacy pipeline_type to skill_type
@@ -26434,13 +27296,26 @@ async def director_v2_plan(request: Request):
                      "location_ref_paths", "location_ref_labels",
                      "audio_path", "target_duration", "target_scenes", "narrative_mode",
                      "fps", "frames_steps", "frames_minimum",
-                     "concept", "visual_style", "platform", "style", "transcript"]:
+                     "concept", "visual_style", "platform", "style", "transcript",
+                     "video_model", "image_model", "image_creator_model",
+                     "image_editor_model"]:
             if key in body:
                 planner_kwargs_base[key] = body[key]
+        planner_kwargs_base["h3_style_workflow_present"] = workflow is not None
         video_model = body.get("video_model", "")
-        image_model = body.get("image_model", "")
+        image_model = (
+            body.get("image_editor_model")
+            or body.get("image_creator_model")
+            or body.get("image_model", "")
+        )
         video_loras_activated = (body.get("video_loras") or {}).get("activated_loras", [])
-        image_loras_activated = (body.get("image_loras") or {}).get("activated_loras", [])
+        if "_director_image_role_loras" in body:
+            image_loras_activated = [
+                item["id"]
+                for item in body["_director_image_role_loras"].get("editor", [])
+            ]
+        else:
+            image_loras_activated = (body.get("image_loras") or {}).get("activated_loras", [])
         selection = await run_blocking_shielded(
             _resolve_direct_llm_selection, request,
         )
@@ -26490,6 +27365,8 @@ async def director_v2_plan(request: Request):
                 plan,
                 prompt_type=body.get("prompt_type", "both"),
                 has_reference=bool(body.get("reference_image_path")),
+                video_model=video_model,
+                image_model=image_model,
             )
             clip_plans = director.plan_to_clip_plans(rendered)
             if polish_mode == "third_pass" and clip_plans:
@@ -26505,6 +27382,9 @@ async def director_v2_plan(request: Request):
                     image_loras=image_loras_activated,
                     characters=planner_kwargs.get("characters", []) or [],
                 )
+            _apply_h3_style_workflow_to_director_clips(
+                clip_plans, workflow,
+            )
             return {
                 "clip_plans": clip_plans,
                 "production_plan": plan.to_dict(),
@@ -26539,6 +27419,7 @@ def _plan_generation_submission(
 ) -> tuple[dict | None, dict | None]:
     """Apply the authoritative H3 plan and return its bounded estimate."""
     _require_h3_native_boundary_experimental(body)
+    _apply_h3_style_workflow_to_request(body)
     _validate_h3_sampling_steps(body)
     _validate_h3_explicit_multiclip_request(body)
     plan = _prepare_h3_long_studio_request(body)
@@ -26587,6 +27468,7 @@ async def preview_generation_plan(request: Request):
     model_type = str(body.get("model_type") or "")
     if not model_type or wgp.get_model_def(model_type) is None:
         raise HTTPException(status_code=400, detail="A valid model_type is required")
+    _resolve_h3_style_workflow_request(body)
     _normalize_video_prompt_type(body)
     _normalize_image_prompt_type(body)
     try:
@@ -26641,7 +27523,7 @@ def h3_evaluation_catalog():
 
 @api.get("/api/v1/h3/style-workflows")
 def h3_style_workflow_catalog():
-    """Return cached official H3 prepared styles with an offline fallback."""
+    """Return server-resolvable H3 workflow IDs with truthful provenance."""
     return _h3_skill_catalog_updater.load()
 
 
@@ -28361,6 +29243,14 @@ def _generation_enhancement_request(body: dict, workspace: str) -> dict:
     except (TypeError, ValueError):
         duration = 0.0
     model_type = str(body.get("model_type") or "")
+    workflow = body.get("h3_style_workflow")
+    if workflow is not None:
+        if model_type not in _H3_LONG_STUDIO_MODELS:
+            raise ValueError("Resolved H3 style workflow has a non-H3 model")
+        from services.h3_upstream_skills import (
+            validate_resolved_h3_style_workflow,
+        )
+        validate_resolved_h3_style_workflow(workflow)
     window_count = None
     if model_type in _H3_LONG_STUDIO_MODELS and duration > 0:
         window_count = max(1, int(math.ceil(duration / 15.0)))
@@ -28370,6 +29260,9 @@ def _generation_enhancement_request(body: dict, workspace: str) -> dict:
         "prompt": str(body.get("prompt") or ""),
         "mode": mode,
         "model_type": model_type,
+        # The enhancer needs only precedence, never the private server brief.
+        "h3_style_workflow_present": workflow is not None,
+        "visual_style": body.get("visual_style"),
         "image_paths": image_paths or None,
         "duration_seconds": duration or None,
         "window_count": window_count,
@@ -28439,8 +29332,14 @@ def _run_generation_preparation(
                 ),
             ):
                 return
+            enhancement_params = copy.deepcopy(prepared_params)
+            role_base_prompt = prepared_params.get(
+                "_director_image_role_base_prompt",
+            )
+            if isinstance(role_base_prompt, str):
+                enhancement_params["prompt"] = role_base_prompt
             enhance_body = _generation_enhancement_request(
-                prepared_params,
+                enhancement_params,
                 str(job.get("workspace") or "default"),
             )
             result = asyncio.run(
@@ -28449,7 +29348,7 @@ def _run_generation_preparation(
             enhanced = str((result or {}).get("enhanced") or "").strip()
             if not enhanced:
                 raise RuntimeError("Enhancer returned no prepared text")
-            prepared_params["prompt"] = enhanced
+            _apply_authoritative_generation_prompt(prepared_params, enhanced)
             if is_cancel_requested(job):
                 return
 
@@ -28639,17 +29538,28 @@ async def generate(request: Request):
         )
     job_out_dir = _require_project_access(request, workspace)
     is_sfx = body.get("sfx_mode")
-    if not body.get("model_type"):
-        raise HTTPException(status_code=400, detail="model_type is required")
-    # SFX virtual models (mmaudio_*) are frontend-only; skip backend model validation.
-    if not is_sfx and wgp.get_model_def(body["model_type"]) is None:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {body['model_type']}")
-    _require_remote_visible_models(request, [body.get("model_type")])
-    if not is_sfx:
-        _require_model_recipe_terms([body["model_type"]])
+    _reject_client_director_image_role_internals(body)
+    director_role_mode = _director_image_role_wire_mode(body) == "roles"
+    if director_role_mode and is_sfx:
+        raise HTTPException(
+            status_code=400,
+            detail="Director image role fields require image generation mode",
+        )
+    if not director_role_mode:
+        if not body.get("model_type"):
+            raise HTTPException(status_code=400, detail="model_type is required")
+        # SFX virtual models (mmaudio_*) are frontend-only; skip backend model validation.
+        if not is_sfx and wgp.get_model_def(body["model_type"]) is None:
+            raise HTTPException(status_code=400, detail=f"Unknown model: {body['model_type']}")
+        _require_remote_visible_models(request, [body.get("model_type")])
+        if not is_sfx:
+            _require_model_recipe_terms([body["model_type"]])
     _reject_client_h3_internal_state(body)
     _reject_client_h3_turbo_validation_controls(body)
     _authorize_generation_media_inputs(request, body, workspace)
+    if director_role_mode:
+        _resolve_director_image_role_request(request, body)
+        _apply_director_image_role_generation(body)
     _h3_turbo_validation_reference_bytes = (
         _authorize_h3_turbo_benchmark_request(request, body)
     )
@@ -28662,6 +29572,7 @@ async def generate(request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not is_sfx and not body.get("prompt"):
         raise HTTPException(status_code=400, detail="prompt is required")
+    _resolve_h3_style_workflow_request(body)
     durable_generation_preparation = bool(
         enhance_before_generate
         or str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
@@ -43069,13 +43980,20 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
             # verified native bytes and does not load or use a model.
             if _queue_recovery_delivery_pending(job) is None:
                 try:
-                    _require_job_model_recipe_terms(job)
+                    _require_job_runtime_model_admission(job)
                 except HTTPException as error:
+                    role_mode = _director_image_role_wire_mode(
+                        job.get("params") or {},
+                    ) == "roles"
                     finish_job(
                         job,
                         "failed",
                         error=str(error.detail),
-                        message="Model terms acceptance is required",
+                        message=(
+                            "Director image role setup changed"
+                            if role_mode
+                            else "Model terms acceptance is required"
+                        ),
                     )
                     return False
 
@@ -43411,6 +44329,9 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
             # Lanczos/VAE methods keep the inline per-window path (cheap,
             # stateless), and images keep inline upsampling (single frame).
             pp_spatial_upsampling = ""
+            director_final_video_postprocess = (
+                raw_params.pop("_director_final_video_postprocess", 0) == 1
+            )
             pp_delivery_resolution = str(
                 raw_params.pop("delivery_resolution", "") or ""
             ).lower()
@@ -44227,6 +45148,7 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 # continuation evidence, never staging paths or stale requests.
                 sidecar_params.pop("_h3_native_boundary", None)
                 sidecar_params.pop("_h3_native_boundary_request", None)
+                _strip_director_image_role_internals(sidecar_params)
                 # These settings are stripped before generation and applied
                 # afterward, so retain them for pencil-restore metadata.
                 if pp_film_grain_intensity > 0:
@@ -46805,6 +47727,23 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 # BEFORE film grain so grain lands on the upscaled pixels (the
                 # inline path had the same order), and before voice clone so
                 # the audio swap happens on the final video.
+                director_postprocess_files = None
+                if success and director_final_video_postprocess:
+                    director_postprocess_files = (
+                        _authoritative_h3_postprocess_outputs(
+                            new_files,
+                            producer_artifact_roles,
+                            is_multiclip=is_multiclip,
+                            join_output_file=join_output_file,
+                        )
+                    )
+                    if not director_postprocess_files:
+                        message = (
+                            "No authoritative final Director video was "
+                            "available for post-processing"
+                        )
+                        finish_job(job, "failed", error=message, message=message)
+                        return False
                 if success and pp_spatial_upsampling:
                     postprocess_files = (
                         _authoritative_h3_postprocess_outputs(
@@ -46813,7 +47752,8 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                             is_multiclip=is_multiclip,
                             join_output_file=join_output_file,
                         )
-                        if h3_delivery_request else [
+                        if h3_delivery_request else director_postprocess_files
+                        if director_postprocess_files is not None else [
                             name for name in new_files
                             if os.path.splitext(name)[1].lower()
                             in {".mp4", ".webm", ".mkv"}
@@ -46853,6 +47793,8 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                                 delivered_files,
                                 delivery_pending,
                             )
+                            if director_postprocess_files is not None:
+                                director_postprocess_files = list(delivered_files)
                         except InterruptedError:
                             return False
                         except _H3DeliveryFailure as delivery_error:
@@ -46885,7 +47827,12 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 # Post-generation film grain pass (applied to output files, not during inference)
                 if success and pp_film_grain_intensity > 0:
                     video_exts = {".mp4", ".webm", ".mkv"}
-                    for fname in new_files:
+                    film_grain_files = (
+                        director_postprocess_files
+                        if director_postprocess_files is not None
+                        else new_files
+                    )
+                    for fname in film_grain_files:
                         ext = os.path.splitext(fname)[1].lower()
                         if ext not in video_exts:
                             continue
@@ -48017,6 +48964,9 @@ _QUEUE_RECOVERY_REASON_TEXT = {
     "project_missing_or_recreated": "The recovery project is missing or was recreated",
     "worker_start_failed": "The recovery worker could not be started",
     "model_terms_required": "Review and accept this model recipe's terms",
+    "director_role_admission_required": (
+        "Review the Director image role model and LoRA setup"
+    ),
     "h3_generation_recovery_authorization_required": (
         "Authorize calibrated recovery for the unfinished H3 segment"
     ),
@@ -48160,6 +49110,7 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
             "h3_peak_calibration_required",
             "h3_generation_oom_replanned",
             "model_terms_required",
+            "director_role_admission_required",
         }:
             actions = ["retry"]
     return {
@@ -49267,6 +50218,7 @@ def _resume_recovered_job(
                 "h3_peak_calibration_required",
                 "h3_generation_oom_replanned",
                 "model_terms_required",
+                "director_role_admission_required",
             }
         )
         if reason not in allowed_reasons:
@@ -49305,7 +50257,7 @@ def _resume_recovered_job(
                 ),
             )
         if _queue_recovery_delivery_pending(job) is None:
-            _require_job_model_recipe_terms(job)
+            _require_job_runtime_model_admission(job)
         if reason in {
             "h3_generation_recovery_authorization_required",
             "h3_peak_calibration_required",
@@ -49792,7 +50744,7 @@ def start_local_h3_generation_recovery(
                 "Recovery project or input evidence changed."
             )
         if _queue_recovery_delivery_pending(job) is None:
-            _require_job_model_recipe_terms(job)
+            _require_job_runtime_model_admission(job)
         attempt, may_retry = next_recovery_attempt(job)
         if not may_retry:
             raise QueueRecoveryRuntimeError("Recovery attempt limit reached.")
@@ -50799,6 +51751,9 @@ def get_output_metadata(request: Request, name: str, workspace: str = ""):
                     if resolved_seed is not None:
                         params["seed"] = resolved_seed
             response_sidecar = _redact_local_paths(sidecar)
+            response_params = response_sidecar.get("params")
+            if isinstance(response_params, dict):
+                _strip_director_image_role_internals(response_params)
             return {"source": "sidecar", **response_sidecar}
         except HTTPException:
             raise
@@ -50808,7 +51763,10 @@ def get_output_metadata(request: Request, name: str, workspace: str = ""):
     # Strategy 2: Read embedded metadata from media file
     embedded = _read_embedded()
     if embedded:
-        return {"source": "embedded", "params": _redact_local_paths(embedded)}
+        public_embedded = _redact_local_paths(embedded)
+        if isinstance(public_embedded, dict):
+            _strip_director_image_role_internals(public_embedded)
+        return {"source": "embedded", "params": public_embedded}
 
     return {"source": "none", "params": None}
 

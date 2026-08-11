@@ -808,6 +808,13 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertIn("_queue_recovery_register_and_publish(", submit)
         self.assertIn("complete_preparation(", preparation)
         self.assertIn("write_sealed_request_manifest(", preparation)
+        self.assertIn(
+            'enhancement_params["prompt"] = role_base_prompt', preparation,
+        )
+        self.assertIn(
+            "_apply_authoritative_generation_prompt(prepared_params, enhanced)",
+            preparation,
+        )
         self.assertNotIn("generation_slot(", preparation)
         self.assertNotIn("with _gen_lock", preparation)
         self.assertIn("maestro_cpu_text_operation", llm_authority)
@@ -2010,7 +2017,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "try_start": lambda *_args, **_kwargs: True,
                 "_apply_per_job_coefficient": lambda *_args: None,
                 "_queue_recovery_delivery_pending": lambda *_args: None,
-                "_require_job_model_recipe_terms": lambda _job: None,
+                "_require_job_runtime_model_admission": lambda _job: None,
                 "_trusted_h3_prepared_plan": (
                     lambda body, *_args, **_kwargs: body.get("_h3_longform")
                 ),
@@ -3292,7 +3299,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "MAX_RECOVERY_ATTEMPTS": 3,
                 "update_queue_job": lambda *_args, **_kwargs: True,
                 "_queue_recovery_worker": lambda _job: selected_worker["value"],
-                "_require_job_model_recipe_terms": lambda _job: None,
+                "_require_job_runtime_model_admission": lambda _job: None,
                 "threading": types.SimpleNamespace(Thread=FakeThread),
             },
         )
@@ -4780,7 +4787,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     lambda *_args: None
                 ),
                 "_queue_recovery_delivery_pending": lambda _job: None,
-                "_require_job_model_recipe_terms": lambda _job: None,
+                "_require_job_runtime_model_admission": lambda _job: None,
             },
         )
         namespace["_restore_queue_recovery_on_startup"]()

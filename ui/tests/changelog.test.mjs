@@ -38,7 +38,7 @@ test('all-time product themes and the current release delta are exact and separa
   assert.deepEqual(CHANGELOG_MANIFEST.whyContinuum.map(item => item.title), [
     'Project-scoped creation, privacy, and remote access',
     'Curated H3 long-form planning and recovery',
-    'Reference Studio',
+    'Reference',
     'Request-scoped local LLM and Director tools',
     'Queue and recovery visibility',
   ])
@@ -81,7 +81,7 @@ test('Continuum, Maestro base, and WanGP provenance stay distinct', () => {
   assert.deepEqual(continuum.map(release => release.version), [continuumVersion, '0.2.0', '0.1.0'])
   assert.deepEqual(continuum[1].highlights.map(item => item.title), [
     'Project-aware local and remote workspace',
-    'Reference Studio workflow',
+    'Reference workflow',
     'Request-scoped LLM and Director controls',
     'Visible queue and recovery states',
   ])

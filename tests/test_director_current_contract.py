@@ -7,6 +7,7 @@ import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -96,7 +97,12 @@ def _director_plan_namespace(fail_operation):
     namespace = {
         "Request": _Request,
         "HTTPException": _HTTPException,
+        "_reject_client_director_image_role_internals": lambda body: None,
         "_authorize_director_media_inputs": lambda request, body: None,
+        "_resolve_director_image_role_request": lambda request, body: "legacy",
+        "_resolve_h3_style_workflow_request": (
+            lambda body, model_field="video_model": None
+        ),
         "_resolve_direct_llm_selection": lambda request: {},
         "_run_authorized_llm_with_selection": (
             lambda request, selection, operation: fail_operation(operation)
@@ -368,6 +374,16 @@ class TestDirectorModelCatalogContract(unittest.TestCase):
         catalog = {item["model_type"]: item for item in response["models"]}
 
         self.assertTrue(catalog["image"]["director"]["image"]["compatible"])
+        self.assertTrue(
+            catalog["image"]["director"]["image"]["creator"]["compatible"]
+        )
+        self.assertTrue(
+            catalog["image"]["director"]["image"]["editor"]["compatible"]
+        )
+        self.assertEqual(
+            catalog["image"]["director"]["image"]["creator"]["reasons"],
+            [],
+        )
         self.assertEqual(
             catalog["h3"]["director"]["video_strategy"],
             BOUNDED_START_END,
@@ -395,6 +411,147 @@ class TestDirectorModelCatalogContract(unittest.TestCase):
             catalog["ltx"]["director"]["voice_reference_mode"],
             "id_lora",
         )
+
+    def test_capabilities_v1_exposes_bounded_role_readiness_contract(self):
+        registry = _CatalogRegistry({"image": _image_editor()})
+        remote_visibility = [None]
+        namespace = _launch_functions_namespace(
+            ["director_capabilities"],
+            wgp=registry,
+            _director_explicit_creator_resolution=lambda unrestricted: {
+                "resolved_model": "image",
+                "selection_source": (
+                    "verified_manual_preference" if unrestricted
+                    else "safe_fallback"
+                ),
+            },
+            _remote_visible_model_ids=lambda request: remote_visibility[0],
+            _director_image_candidate_readiness=lambda model, role: {
+                "model_type": model,
+                "compatible": True,
+                "ready": True,
+                "reasons": [],
+                "actions": [],
+                "enabled": True,
+                "downloaded": True,
+            },
+            _DIRECTOR_EXPLICIT_CREATOR_MODELS=("image",),
+            _DIRECTOR_SAFE_IMAGE_MODEL="image",
+            _DIRECTOR_DEFAULT_EDITOR_MODEL="image",
+            _DIRECTOR_READINESS_REASONS=frozenset({"model_not_downloaded"}),
+            _DIRECTOR_READINESS_ACTIONS=frozenset({"download_model"}),
+        )
+        response = namespace["director_capabilities"](
+            _Request(), explicit_output=True,
+        )
+        self.assertEqual(response["schema_version"], 1)
+        self.assertEqual(
+            response["readiness_reason_values"], ["model_not_downloaded"],
+        )
+        self.assertEqual(
+            response["readiness_action_values"], ["download_model"],
+        )
+        self.assertEqual(
+            response["image_roles"]["creator"]["selection_source"],
+            "verified_manual_preference",
+        )
+        self.assertEqual(
+            response["image_roles"]["editor"]["selection_source"],
+            "fixed_default",
+        )
+        self.assertEqual(
+            response["image_roles"]["creator"]["lora_catalog_endpoint"],
+            "/api/v1/loras/{model_type}/details",
+        )
+        remote_visibility[0] = frozenset()
+        remote = namespace["director_capabilities"](_Request())
+        self.assertIsNone(remote["image_roles"]["creator"]["resolved_model"])
+        self.assertIsNone(remote["image_roles"]["editor"]["resolved_model"])
+        self.assertEqual(remote["image_roles"]["creator"]["candidates"], [])
+
+    def test_automatic_creator_requires_complete_readiness_in_preference_order(self):
+        candidates = [
+            {
+                "model_type": "moody",
+                "enabled": True,
+                "manual_checkpoint_verified": True,
+                "terms_accepted": True,
+                "downloaded": False,
+                "ready": True,
+            },
+            {
+                "model_type": "cutie",
+                "enabled": True,
+                "manual_checkpoint_verified": True,
+                "terms_accepted": True,
+                "downloaded": True,
+                "ready": True,
+            },
+        ]
+        namespace = _launch_functions_namespace(
+            ["_director_explicit_creator_resolution"],
+            _project_reference_explicit_generation_model=lambda: {
+                "candidates": candidates,
+            },
+            _DIRECTOR_EXPLICIT_CREATOR_MODELS=("moody", "cutie"),
+            _DIRECTOR_SAFE_IMAGE_MODEL="safe",
+        )
+        self.assertEqual(
+            namespace["_director_explicit_creator_resolution"](
+                unrestricted=True,
+            ),
+            {
+                "resolved_model": "cutie",
+                "selection_source": "verified_manual_preference",
+            },
+        )
+
+    def test_role_lora_wire_is_filename_scoped_and_strength_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            weight = Path(directory, "look.safetensors")
+            weight.write_bytes(b"weight")
+
+            class LoraRegistry:
+                @staticmethod
+                def resolve_lora_path(model_type, lora_id):
+                    return str(weight) if lora_id == weight.name else ""
+
+            captured = []
+
+            def resolve(items, **kwargs):
+                captured.append((items, kwargs))
+                return [{
+                    "id": weight.name,
+                    "multiplier": 1.25,
+                    "parameter_schema_digest": None,
+                    "parameter_values": (),
+                    "parameter_expansions": [],
+                }]
+
+            namespace = _launch_functions_namespace(
+                ["_director_role_lora_request"],
+                wgp=LoraRegistry(),
+                os=__import__("os"),
+                math=__import__("math"),
+                _project_reference_lora_parameter_schema=(
+                    lambda model, path: None
+                ),
+                _project_reference_resolve_additional_loras=resolve,
+            )
+            result = namespace["_director_role_lora_request"](
+                [{"id": weight.name, "multiplier": 1.25}],
+                model_type="creator",
+                scope="generation",
+            )
+            self.assertEqual(result[0]["id"], weight.name)
+            self.assertEqual(captured[0][0][0]["scope"], "generation")
+            with self.assertRaises(_HTTPException) as raised:
+                namespace["_director_role_lora_request"](
+                    [{"id": weight.name, "multiplier": 10.01}],
+                    model_type="creator",
+                    scope="generation",
+                )
+            self.assertEqual(raised.exception.status_code, 400)
 
 
 class TestDirectorSavedActionPublicContract(unittest.TestCase):
@@ -441,6 +598,7 @@ class TestDirectorSavedActionPublicContract(unittest.TestCase):
             _request_project_workspace=lambda request, workspace: "project-a",
             _init_pipeline=lambda: None,
             _require_saved_pipeline=lambda request, pid, workspace: ({}, "/tmp"),
+            _revalidate_saved_director_runtime=lambda request, state: state,
             _begin_workspace_operation=lambda workspace: None,
             _end_workspace_operation=lambda workspace: None,
         )
@@ -537,6 +695,313 @@ class TestDirectorBackendCompatibility(unittest.TestCase):
                         video_model="video",
                         pipeline_type="short_film_story",
                     )
+
+    def test_creator_and_editor_roles_are_independent_but_legacy_stays_combined(self):
+        creator_only = {
+            "name": "Creator only",
+            "image_outputs": True,
+        }
+        editor_only = {
+            "name": "Editor only",
+            "image_outputs": True,
+            "one_image_ref_needed": True,
+            "image_ref_choices": {
+                "choices": [("Main plus references", "KI")],
+            },
+        }
+        creator = compat.assess_director_model("creator", creator_only)["image"]
+        editor = compat.assess_director_model("editor", editor_only)["image"]
+        self.assertTrue(creator["creator"]["compatible"])
+        self.assertFalse(creator["editor"]["compatible"])
+        self.assertFalse(creator["compatible"])
+        self.assertFalse(editor["creator"]["compatible"])
+        self.assertTrue(editor["editor"]["compatible"])
+        self.assertFalse(editor["compatible"])
+
+        self._validate(
+            {
+                "creator": creator_only,
+                "editor": editor_only,
+                "video": _ltx_video(),
+            },
+            image_creator_model="creator",
+            image_editor_model="editor",
+            video_model="video",
+            pipeline_type="short_film_story",
+        )
+
+    def test_image_role_and_legacy_request_keys_are_ambiguous(self):
+        namespace = _launch_functions_namespace(
+            ["_director_image_role_wire_mode"],
+            _DIRECTOR_IMAGE_ROLE_FIELDS=frozenset({
+                "image_creator_model", "image_editor_model",
+                "image_creator_loras", "image_editor_loras",
+            }),
+            _DIRECTOR_LEGACY_IMAGE_FIELDS=frozenset({
+                "image_model", "image_loras",
+            }),
+        )
+        classify = namespace["_director_image_role_wire_mode"]
+        self.assertEqual(classify({}), "legacy")
+        self.assertEqual(classify({"image_creator_model": None}), "roles")
+        with self.assertRaises(_HTTPException) as raised:
+            classify({
+                "image_creator_model": None,
+                "image_model": "legacy",
+            })
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_generic_preview_flattens_the_admitted_role_snapshot(self):
+        namespace = _launch_functions_namespace(
+            ["_apply_director_image_role_generation"],
+        )
+        resolved_loras = {
+            "creator": {
+                "activated_loras": ["creator.safetensors"],
+                "loras_multipliers": "0.75",
+                "parameter_expansions": [{
+                    "text": "creator parameter fragment",
+                    "scopes": ["generation"],
+                }],
+            },
+            "editor": {
+                "activated_loras": ["editor.safetensors"],
+                "loras_multipliers": "1.25",
+                "parameter_expansions": [{
+                    "text": "editor parameter fragment",
+                    "scopes": ["editing"],
+                }],
+            },
+        }
+
+        def role_loras(_body, role):
+            return resolved_loras[role]
+
+        def role_prompt(prompt, loras, _role):
+            return ", ".join(
+                [prompt, *(item["text"] for item in loras["parameter_expansions"])]
+            )
+
+        with patch.object(
+            pipeline, "_director_image_role_loras", side_effect=role_loras,
+        ), patch.object(
+            pipeline, "_director_role_prompt", side_effect=role_prompt,
+        ), patch.object(
+            pipeline, "_director_image_params",
+            side_effect=lambda _body, model: {
+                "resolution": "1024x576" if model == "creator" else "768x768",
+                "num_inference_steps": 12,
+                "guidance_scale": 2,
+            },
+        ), patch.object(
+            pipeline, "_limit_director_image_refs",
+            side_effect=lambda _model, refs, **_kwargs: refs[:1],
+        ):
+            creator = {
+                "prompt": "anchor",
+                "image_refs": [],
+                "image_creator_model": "creator",
+                "image_editor_model": "editor",
+                "model_type": "stale-studio-model",
+                "activated_loras": ["stale.safetensors"],
+            }
+            self.assertEqual(
+                namespace["_apply_director_image_role_generation"](creator),
+                "creator",
+            )
+            self.assertEqual(creator["model_type"], "creator")
+            self.assertEqual(creator["activated_loras"], ["creator.safetensors"])
+            self.assertEqual(creator["loras_multipliers"], "0.75")
+            self.assertEqual(creator["resolution"], "1024x576")
+            self.assertEqual(creator["video_prompt_type"], "")
+            self.assertIn("creator parameter fragment", creator["prompt"])
+            creator_prompt = creator["prompt"]
+            namespace["_apply_director_image_role_generation"](creator)
+            self.assertEqual(creator["prompt"], creator_prompt)
+
+            editor = {
+                "prompt": "continuity",
+                "image_refs": ["one.png", "two.png"],
+                "image_creator_model": "creator",
+                "image_editor_model": "editor",
+                "resolution": "1920x1080",
+            }
+            self.assertEqual(
+                namespace["_apply_director_image_role_generation"](editor),
+                "editor",
+            )
+            self.assertEqual(editor["model_type"], "editor")
+            self.assertEqual(editor["image_refs"], ["one.png"])
+            self.assertEqual(editor["activated_loras"], ["editor.safetensors"])
+            self.assertEqual(editor["loras_multipliers"], "1.25")
+            self.assertEqual(editor["resolution"], "1920x1080")
+            self.assertEqual(editor["video_prompt_type"], "KI")
+            self.assertIn("editor parameter fragment", editor["prompt"])
+
+        with self.assertRaises(_HTTPException) as raised:
+            namespace["_apply_director_image_role_generation"]({
+                "prompt": "invalid",
+                "image_refs": "one.png",
+                "image_creator_model": "creator",
+                "image_editor_model": "editor",
+            })
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_generic_role_internals_are_server_owned_and_publicly_stripped(self):
+        internal_fields = frozenset({
+            "_director_image_role", "_director_image_role_loras",
+            "_director_image_role_selection", "_director_image_role_base_prompt",
+        })
+        namespace = _launch_functions_namespace(
+            [
+                "_reject_client_director_image_role_internals",
+                "_strip_director_image_role_internals",
+            ],
+            _DIRECTOR_IMAGE_ROLE_INTERNAL_FIELDS=internal_fields,
+        )
+        reject = namespace["_reject_client_director_image_role_internals"]
+        with self.assertRaises(_HTTPException) as raised:
+            reject({
+                "model_type": "legacy-image",
+                "_director_image_role_selection": {"creator": "forged"},
+            })
+        self.assertEqual(raised.exception.status_code, 400)
+
+        public = {
+            "model_type": "creator",
+            "image_creator_model": "creator",
+            "_director_image_role": "creator",
+            "_director_image_role_loras": {"creator": [{"private": True}]},
+            "_director_image_role_selection": {"creator": "safe_fallback"},
+            "_director_image_role_base_prompt": "private base prompt",
+        }
+        namespace["_strip_director_image_role_internals"](public)
+        self.assertEqual(public, {
+            "model_type": "creator",
+            "image_creator_model": "creator",
+        })
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for function_name in (
+            "generate", "director_pipeline_start", "director_v2_plan",
+        ):
+            function = next(
+                node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == function_name
+            )
+            function_source = ast.get_source_segment(source, function)
+            self.assertIn(
+                "_reject_client_director_image_role_internals(body)",
+                function_source,
+            )
+        public_function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_public_pipeline_state"
+        )
+        self.assertIn(
+            "_strip_director_image_role_internals(snapshot)",
+            ast.get_source_segment(source, public_function),
+        )
+
+    def test_generic_role_recovery_reruns_admission_before_execution(self):
+        events = []
+
+        def resolve(request, params):
+            events.append(("resolve", request.state.maestro_remote))
+            params["image_creator_model"] = "creator"
+            params["image_editor_model"] = "editor"
+
+        def apply(params):
+            events.append(("apply", params["image_creator_model"]))
+            params["model_type"] = "creator"
+
+        namespace = _launch_functions_namespace(
+            ["_require_job_runtime_model_admission"],
+            _director_image_role_wire_mode=lambda params: (
+                "roles" if "image_creator_model" in params else "legacy"
+            ),
+            _resolve_director_image_role_request=resolve,
+            _apply_director_image_role_generation=apply,
+            _require_job_model_recipe_terms=lambda job: events.append(
+                ("legacy_terms", job["id"]),
+            ),
+        )
+        role_job = {
+            "id": "role-preview",
+            "source_remote": True,
+            "params": {"image_creator_model": None},
+        }
+        namespace["_require_job_runtime_model_admission"](role_job)
+        self.assertEqual(events, [
+            ("resolve", True),
+            ("apply", "creator"),
+        ])
+        self.assertEqual(role_job["model_type"], "creator")
+
+        namespace["_require_job_runtime_model_admission"]({
+            "id": "legacy", "params": {"model_type": "legacy-image"},
+        })
+        self.assertEqual(events[-1], ("legacy_terms", "legacy"))
+
+    def test_enhanced_role_prompt_replaces_the_sealed_base_before_reflattening(self):
+        flattened = []
+
+        def apply(body):
+            body["prompt"] = body["_director_image_role_base_prompt"] + ", role-fragment"
+            flattened.append(body["prompt"])
+
+        namespace = _launch_functions_namespace(
+            ["_apply_authoritative_generation_prompt"],
+            _apply_director_image_role_generation=apply,
+        )
+        role_params = {
+            "prompt": "original, role-fragment",
+            "_director_image_role_base_prompt": "original",
+        }
+        namespace["_apply_authoritative_generation_prompt"](
+            role_params, "enhanced original",
+        )
+        self.assertEqual(
+            role_params["_director_image_role_base_prompt"],
+            "enhanced original",
+        )
+        self.assertEqual(
+            role_params["prompt"], "enhanced original, role-fragment",
+        )
+        self.assertEqual(flattened, ["enhanced original, role-fragment"])
+
+        legacy_params = {"prompt": "original"}
+        namespace["_apply_authoritative_generation_prompt"](
+            legacy_params, "enhanced original",
+        )
+        self.assertEqual(legacy_params, {"prompt": "enhanced original"})
+
+    def test_legacy_intermediate_postprocess_keys_migrate_to_final_video_once(self):
+        namespace = _launch_functions_namespace(
+            ["_migrate_director_final_video_postprocess"],
+        )
+        params = {
+            "image_spatial_upsampling": "flashvsr2",
+            "image_film_grain_intensity": 0.2,
+            "image_film_grain_saturation": 0.7,
+        }
+        namespace["_migrate_director_final_video_postprocess"](params)
+        self.assertEqual(params["video_spatial_upsampling"], "flashvsr2")
+        self.assertEqual(params["video_film_grain_intensity"], 0.2)
+        self.assertEqual(params["video_film_grain_saturation"], 0.7)
+        self.assertFalse(any(key.startswith("image_film_grain") for key in params))
+        self.assertNotIn("image_spatial_upsampling", params)
+
+        explicit_final = {
+            "image_spatial_upsampling": "legacy",
+            "video_spatial_upsampling": "flashvsr3",
+        }
+        namespace["_migrate_director_final_video_postprocess"](explicit_final)
+        self.assertEqual(explicit_final, {
+            "video_spatial_upsampling": "flashvsr3",
+        })
 
     def test_voice_reference_rejects_non_ltx_model(self):
         non_ltx = _ltx_video(architecture="wan2.2")

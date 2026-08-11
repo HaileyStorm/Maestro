@@ -560,6 +560,71 @@ class TestDirectorCancellation(unittest.TestCase):
             clip_images,
         )
 
+    def test_role_models_loras_and_defaults_follow_reference_presence(self):
+        pid = "pipe-image-roles"
+        self._add_pipeline(pid, "running")
+        params = {
+            "scene_description": "A singer on a moonlit stage",
+            "image_creator_model": "creator-model",
+            "image_editor_model": "editor-model",
+            "image_creator_loras": [{"id": "creator.safetensors", "multiplier": 0.8}],
+            "image_editor_loras": [{"id": "editor.safetensors", "multiplier": 1.2}],
+            "_director_image_role_loras": {
+                "creator": [{
+                    "id": "creator.safetensors",
+                    "multiplier": 0.8,
+                    "parameter_expansions": [{
+                        "text": "creator trigger",
+                        "scopes": ["generation"],
+                    }],
+                }],
+                "editor": [{
+                    "id": "editor.safetensors",
+                    "multiplier": 1.2,
+                    "parameter_expansions": [{
+                        "text": "editor trigger",
+                        "scopes": ["editing"],
+                    }],
+                }],
+            },
+            "image_params": {"resolution": "960x544"},
+        }
+        pipeline._wgp = SimpleNamespace(
+            save_path=self.temp_dir.name,
+            get_default_settings=lambda model: {
+                "num_inference_steps": 20 if model == "creator-model" else 8,
+                "guidance_scale": 3 if model == "creator-model" else 1,
+            },
+        )
+        submitted = []
+        generated = iter(["anchor.jpg", "shot.jpg"])
+
+        def fake_submit(gen_params, **_kwargs):
+            submitted.append(dict(gen_params))
+            filename = next(generated)
+            self._write_media(filename, b"image")
+            return [filename]
+
+        with patch.object(pipeline, "_submit_and_wait", side_effect=fake_submit):
+            pipeline._run_image_generation(
+                pid,
+                params,
+                [{"image_prompt": "wide portrait"}],
+                out_dir=self.temp_dir.name,
+            )
+
+        self.assertEqual(
+            [request["model_type"] for request in submitted],
+            ["creator-model", "editor-model"],
+        )
+        self.assertEqual(submitted[0]["activated_loras"], ["creator.safetensors"])
+        self.assertEqual(submitted[1]["activated_loras"], ["editor.safetensors"])
+        self.assertEqual(submitted[0]["num_inference_steps"], 20)
+        self.assertEqual(submitted[1]["num_inference_steps"], 8)
+        self.assertEqual(submitted[0]["resolution"], "960x544")
+        self.assertIn("creator trigger", submitted[0]["prompt"])
+        self.assertIn("editor trigger", submitted[1]["prompt"])
+
     def test_generated_anchor_uses_character_refs_and_profiles_not_locations(self):
         pid = "pipe-character-anchor"
         self._add_pipeline(pid, "running")
@@ -963,6 +1028,9 @@ class TestDirectorCancellation(unittest.TestCase):
             ],
         )
         self.assertEqual(submitted[0]["image_prompt_type"], "S")
+        self.assertEqual(
+            submitted[0]["_director_final_video_postprocess"], 1,
+        )
 
     def test_standard_video_uses_first_planned_time_as_audio_origin(self):
         pid = "pipe-video-audio-origin"

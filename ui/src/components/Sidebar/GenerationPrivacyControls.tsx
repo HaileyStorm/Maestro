@@ -36,7 +36,7 @@ export function GenerationPrivacyControls() {
               ? 'border-red-500/50 bg-red-500/15 text-red-300'
               : 'border-border bg-bg-secondary text-text-secondary hover:text-text-primary'
           }`}
-          title="Mark this Studio or Director job as explicit"
+          title="Mark this Generate or Director job as explicit"
         >
           <input
             type="checkbox"

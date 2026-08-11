@@ -203,6 +203,44 @@ _REASON_FOR_CHECK = {
     "violent_register_fidelity": "violent_register_mismatch",
     "detail_register_fidelity": "detail_register_mismatch",
 }
+FIDELITY_ASSESSMENT_VERSION = "fidelity_assessment_v2"
+FIDELITY_RUBRIC_VERSION = "reference-fidelity-rubric-v1"
+FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION = (
+    "reference-fidelity-attempt-acceptance-v1"
+)
+FIDELITY_CORRECTION_TEMPLATE_ID = "reference-residual-correction"
+FIDELITY_CORRECTION_TEMPLATE_VERSION = "v1"
+FIDELITY_GRADES = (
+    "exact", "minor_residual", "material_residual", "not_applicable",
+)
+FIDELITY_RUBRIC_OUTCOMES = (
+    "pass", "fail", "not_applicable", "review_unavailable",
+)
+FIDELITY_DIMENSIONS = (
+    "style", "identity_structure", "details_register", "pose_view_continuity",
+)
+_FIDELITY_GRADE_SEVERITY = MappingProxyType({
+    "exact": 0,
+    "not_applicable": 0,
+    "minor_residual": 1,
+    "material_residual": 2,
+})
+_FIDELITY_ASSESSMENT_CLASS_RANK = MappingProxyType({
+    "exact": 0,
+    "minor_residual": 1,
+    "material_residual": 2,
+})
+_FIDELITY_CORRECTION_CLAUSES = MappingProxyType({
+    "style_language": "follow the authored style and rendering language",
+    "materials_palette": "follow the authored materials, palette, and surface treatment",
+    "identity_anchor": "follow the authored identity and distinguishing features",
+    "structural_proportions": "follow the authored structure and proportions",
+    "authored_details": "follow every authored detail and register",
+    "anatomy_callouts": "follow the authored anatomy and detail callouts",
+    "authored_callouts": "follow every authored detail callout",
+    "pose_view": "follow the authored pose, view, and composition",
+    "cross_sheet_continuity": "preserve continuity across the ordered references",
+})
 PACK_REVIEW_CONTRACTS = frozenset({
     "standard_fidelity_v1",
     "explicit_unrestricted_fidelity_v1",
@@ -481,12 +519,285 @@ class _ReviewedArtifactSeal:
 
 
 @dataclass(frozen=True)
+class FidelityRubricItem:
+    item_id: str
+    dimension: str
+    weight: int
+    reason_code: str
+    question: str
+    applicable_types: frozenset[str] | None = None
+    requires_multiple_roles: bool = False
+    requires_detail_callout: bool = False
+
+
+class _FrozenJsonObject(dict[str, Any]):
+    """An exact JSON object whose ordinary mapping surface cannot be mutated."""
+
+    def __init__(self, value: Mapping[str, Any]):
+        dict.__init__(self, value)
+
+    @staticmethod
+    def _immutable(*_args: object, **_kwargs: object) -> None:
+        raise TypeError("frozen JSON object is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __ior__(self, _other: object):
+        self._immutable()
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, _memo: dict[int, object]):
+        return self
+
+
+@dataclass(frozen=True)
+class FidelityRubricQuestionRequest:
+    rubric_version: str
+    item_id: str
+    reference_type: str
+    instruction: str
+    question: str
+    creative_request: str
+    sheet_paths: tuple[Path, ...]
+    sheet_roles: tuple[str, ...]
+    target_role: str
+    authored_contract: PackAuthoredRequestContract
+    response_schema: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class FidelityRubricObservation:
+    item_id: str
+    outcome: str
+    affected_roles: tuple[str, ...] = ()
+    reviewed_role: str | None = None
+
+
+@dataclass(frozen=True)
+class FidelityDimensionAssessment:
+    dimension: str
+    grade: str
+    affected_roles: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    failed_item_ids: tuple[str, ...]
+    matched_weight: int
+    applicable_weight: int
+
+    @property
+    def score_basis_points(self) -> int | None:
+        if self.applicable_weight == 0:
+            return None
+        return self.matched_weight * 10_000 // self.applicable_weight
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "dimension": self.dimension,
+            "grade": self.grade,
+            "affected_roles": list(self.affected_roles),
+            "reason_codes": list(self.reason_codes),
+            "failed_item_ids": list(self.failed_item_ids),
+            "matched_weight": self.matched_weight,
+            "applicable_weight": self.applicable_weight,
+            "score_basis_points": self.score_basis_points,
+        }
+
+
+@dataclass(frozen=True)
+class FidelityAssessment:
+    version: str
+    rubric_version: str
+    reference_type: str
+    dimensions: tuple[FidelityDimensionAssessment, ...]
+    role_order: tuple[str, ...]
+    observations: tuple[FidelityRubricObservation, ...]
+
+    @property
+    def assessment_class(self) -> str:
+        _validate_fidelity_assessment(self)
+        if self.residual_count == 0:
+            return "exact"
+        score = self.score_basis_points
+        return "minor_residual" if score is not None and score >= 8_000 else "material_residual"
+
+    @property
+    def worst_severity(self) -> str:
+        _validate_fidelity_assessment(self)
+        return max(
+            (item.grade for item in self.dimensions),
+            key=lambda grade: _FIDELITY_GRADE_SEVERITY[grade],
+        )
+
+    @property
+    def residual_count(self) -> int:
+        _validate_fidelity_assessment(self)
+        return sum(
+            observation.outcome == "fail"
+            for observation in self.observations
+        )
+
+    @property
+    def score_basis_points(self) -> int | None:
+        _validate_fidelity_assessment(self)
+        applicable_weight = sum(item.applicable_weight for item in self.dimensions)
+        if applicable_weight == 0:
+            return None
+        return (
+            sum(item.matched_weight for item in self.dimensions)
+            * 10_000 // applicable_weight
+        )
+
+    @property
+    def status(self) -> str:
+        return "pass" if self.residual_count == 0 else "fail"
+
+    def dimension_checks_dict(self) -> dict[str, bool]:
+        _validate_fidelity_assessment(self)
+        return {
+            item.dimension: item.grade in {"exact", "not_applicable"}
+            for item in self.dimensions
+        }
+
+    @property
+    def failed_roles(self) -> tuple[str, ...]:
+        _validate_fidelity_assessment(self)
+        affected = {
+            role
+            for item in self.dimensions
+            for role in item.affected_roles
+        }
+        return tuple(role for role in self.role_order if role in affected)
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        _validate_fidelity_assessment(self)
+        return tuple(dict.fromkeys(
+            code
+            for item in self.dimensions
+            for code in item.reason_codes
+        ))
+
+    def public_metadata(self) -> dict[str, Any]:
+        """Return only the closed v2 assessment; v1 is read compatibility."""
+        _validate_fidelity_assessment(self)
+        return {
+            "version": self.version,
+            "rubric_version": self.rubric_version,
+            "assessment_class": self.assessment_class,
+            "worst_severity": self.worst_severity,
+            "residual_count": self.residual_count,
+            "score_basis_points": self.score_basis_points,
+            "dimensions": [item.public_metadata() for item in self.dimensions],
+            "status": self.status,
+            "dimension_checks": self.dimension_checks_dict(),
+            "failed_roles": list(self.failed_roles),
+            "reason_codes": list(self.reason_codes),
+        }
+
+
+@dataclass(frozen=True)
+class FidelityCorrectionBrief:
+    assessment_version: str
+    rubric_version: str
+    reference_type: str
+    template_id: str
+    template_version: str
+    severity: str
+    affected_roles: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    failed_item_ids: tuple[str, ...]
+    score_basis_points: int
+    rendered_brief: str
+    commitment: str
+
+    def public_metadata(self) -> dict[str, Any]:
+        _validate_fidelity_correction_brief_shape(self)
+        return {
+            "assessment_version": self.assessment_version,
+            "rubric_version": self.rubric_version,
+            "reference_type": self.reference_type,
+            "template_id": self.template_id,
+            "template_version": self.template_version,
+            "severity": self.severity,
+            "affected_roles": list(self.affected_roles),
+            "reason_codes": list(self.reason_codes),
+            "failed_item_ids": list(self.failed_item_ids),
+            "score_basis_points": self.score_basis_points,
+            "rendered_brief": self.rendered_brief,
+            "commitment": self.commitment,
+        }
+
+
+@dataclass(frozen=True)
+class ReferenceCandidateAssessment:
+    candidate_index: int
+    assessment: FidelityAssessment
+    repair_count: int
+
+
+FIDELITY_RUBRIC = (
+    FidelityRubricItem(
+        "style_language", "style", 3, "style_mismatch",
+        "Does the candidate intrinsically match the authored visual style and rendering language?",
+    ),
+    FidelityRubricItem(
+        "materials_palette", "style", 2, "style_mismatch",
+        "Does the candidate intrinsically match the authored materials, palette, and surface treatment?",
+    ),
+    FidelityRubricItem(
+        "identity_anchor", "identity_structure", 4, "identity_mismatch",
+        "Does the candidate intrinsically preserve the authored identity or primary structural anchor?",
+    ),
+    FidelityRubricItem(
+        "structural_proportions", "identity_structure", 3, "identity_mismatch",
+        "Does the candidate intrinsically preserve the authored structure, silhouette, and proportions?",
+    ),
+    FidelityRubricItem(
+        "authored_details", "details_register", 3, "detail_register_mismatch",
+        "Does the candidate intrinsically preserve every applicable authored detail and register?",
+    ),
+    FidelityRubricItem(
+        "anatomy_callouts", "details_register", 2, "detail_register_mismatch",
+        "Does the candidate intrinsically preserve the applicable authored anatomy and detail callouts?",
+        applicable_types=frozenset({"character", "creature"}),
+    ),
+    FidelityRubricItem(
+        "authored_callouts", "details_register", 2, "detail_register_mismatch",
+        "Does the candidate intrinsically preserve every authored detail callout?",
+        requires_detail_callout=True,
+    ),
+    FidelityRubricItem(
+        "pose_view", "pose_view_continuity", 3, "view_mismatch",
+        "Does the candidate intrinsically match the authored pose, view, and composition?",
+    ),
+    FidelityRubricItem(
+        "cross_sheet_continuity", "pose_view_continuity", 2, "view_mismatch",
+        "Does the candidate intrinsically preserve continuity across the ordered references?",
+        requires_multiple_roles=True,
+    ),
+)
+_FIDELITY_RUBRIC_BY_ID = MappingProxyType({
+    item.item_id: item for item in FIDELITY_RUBRIC
+})
+
+
+@dataclass(frozen=True)
 class SemanticReviewResult:
     status: str
     checks: tuple[tuple[str, bool], ...]
     failed_roles: tuple[str, ...]
     reason_codes: tuple[str, ...]
     artifact_seals: tuple[_ReviewedArtifactSeal, ...] = ()
+    fidelity_assessment: FidelityAssessment | None = None
+    fidelity_accepted: bool | None = None
+    fidelity_attempt_index: int | None = None
 
     def checks_dict(self) -> dict[str, bool]:
         return dict(self.checks)
@@ -618,6 +929,20 @@ class PackDetailCallout:
 
 
 @dataclass(frozen=True)
+class PackAuthoredRequestContract:
+    """Private, bounded authored facts sealed for one target role/rubric item."""
+
+    target_role: str
+    rubric_item_id: str | None
+    style: str | None
+    style_commitment: str | None
+    type_fields: tuple[tuple[str, tuple[PackTypeFieldItem, ...]], ...]
+    detail_callouts: tuple[PackDetailCallout, ...]
+    authored_settings_seal: str | None
+    contract_seal: str
+
+
+@dataclass(frozen=True)
 class PackIntelligenceSelection:
     requested_model: str
     resolved_model: str | None
@@ -743,6 +1068,8 @@ class ReferencePackPlan:
     preset: str
     depth: str
     creative_request: str
+    style: str
+    style_commitment: str | None
     generation_model: str
     editor_model: str | None
     sheets: tuple[PackSheetRecipe, ...]
@@ -795,6 +1122,8 @@ class ReferencePackPlan:
                 item.private_metadata() for item in self.detail_callouts
             ],
         }
+        if self.style_commitment is not None:
+            settings["style"] = self.style
         parameterized_loras = [
             {
                 "id": item.lora_id,
@@ -816,7 +1145,7 @@ class ReferencePackPlan:
         return settings
 
     def public_authored_settings(self) -> dict[str, Any]:
-        return {
+        settings = {
             "seal": self.authored_settings_seal,
             "type_fields": [
                 {
@@ -829,6 +1158,12 @@ class ReferencePackPlan:
                 item.public_metadata() for item in self.detail_callouts
             ],
         }
+        if self.style_commitment is not None:
+            settings.update({
+                "style_present": bool(self.style),
+                "style_commitment": self.style_commitment,
+            })
+        return settings
 
     def operation_route(self, operation: str) -> PackOperationRoute:
         return next(item for item in self.operation_routing if item.operation == operation)
@@ -929,6 +1264,7 @@ class PackSheetGenerationRequest:
     strategy: str
     routing_operation: str
     plan_seal: str
+    authored_contract: PackAuthoredRequestContract
     source_role: str | None = None
     source_digest: str | None = None
     normalized_crop: tuple[float, float, float, float] | None = None
@@ -938,6 +1274,8 @@ class PackSheetGenerationRequest:
     detail_kind: str | None = None
     requested_operation: str | None = None
     detail_label_digest: str | None = None
+    correction_brief: str | None = None
+    correction_brief_commitment: str | None = None
 
 
 @dataclass(frozen=True)
@@ -956,16 +1294,9 @@ class PackSheetRepairRequest:
     reason_codes: tuple[str, ...]
     routing_operation: str
     plan_seal: str
-
-
-@dataclass(frozen=True)
-class ReferencePackReviewRequest:
-    instruction: str
-    creative_request: str
-    sheet_paths: tuple[Path, ...]
-    sheet_roles: tuple[str, ...]
-    response_schema: Mapping[str, Any]
-    review_contract: str = "standard_fidelity_v1"
+    authored_contract: PackAuthoredRequestContract
+    correction_brief: str
+    correction_brief_commitment: str
 
 
 @dataclass(frozen=True)
@@ -1016,6 +1347,27 @@ class ReferencePackResult:
             **self.plan.review_selection.public_metadata(),
             "status": self.review.status,
         }
+        if self.review.fidelity_assessment is not None:
+            assessment = _validate_fidelity_assessment(
+                self.review.fidelity_assessment,
+            )
+            expected_accepted = fidelity_attempt_accepted(
+                assessment,
+                attempt_index=self.review.fidelity_attempt_index,
+            )
+            if (
+                self.review.fidelity_accepted is not expected_accepted
+                or self.review.status != ("pass" if expected_accepted else "fail")
+            ):
+                raise ValueError("review fidelity result is invalid")
+            preview["review"].update({
+                "assessment": assessment.public_metadata(),
+                "accepted": expected_accepted,
+                "attempt_index": self.review.fidelity_attempt_index,
+                "acceptance_policy_version": (
+                    FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION
+                ),
+            })
         return {
             **preview,
             "roles": {
@@ -1041,7 +1393,7 @@ PackSheetEditor = Callable[
 PackSheetRepairer = Callable[
     [Path, Path, PackSheetRepairRequest], os.PathLike[str] | str
 ]
-PackReviewer = Callable[[ReferencePackReviewRequest], object]
+PackReviewer = Callable[[FidelityRubricQuestionRequest], object]
 
 
 def _bounded_model(value: object) -> str:
@@ -1533,13 +1885,13 @@ def build_semantic_review_request(
     plan: ReferenceSheetPlan,
     sheet_path: os.PathLike[str] | str,
 ) -> SemanticReviewRequest:
-    """Create a fidelity-only VLM request; it makes no permissibility judgment."""
+    """Create a fidelity-only VLM request for the authored visual contract."""
     plan = _validate_executable_plan(plan)
     instruction = (
         "Review only visual fidelity to the supplied creative request and role recipe. "
         "Check identity, requested details, intended view, accessories, and style. "
-        "Do not perform content moderation, maturity classification, safety analysis, "
-        "policy analysis, or permissibility decisions. Return only the strict JSON object."
+        "Evaluate each check from the rendered artifact itself and return only the "
+        "strict JSON object."
     )
     schema = {
         "type": "object",
@@ -1571,6 +1923,742 @@ def build_semantic_review_request(
     )
 
 
+def _validated_fidelity_contract(
+    allowed_roles: Sequence[str],
+    check_names: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    roles = tuple(allowed_roles)
+    checks = tuple(check_names)
+    if (
+        not roles
+        or len(set(roles)) != len(roles)
+        or any(not isinstance(role, str) or not role for role in roles)
+    ):
+        raise ValueError("unsupported review role contract")
+    if (
+        not checks
+        or len(set(checks)) != len(checks)
+        or any(name not in _REASON_FOR_CHECK for name in checks)
+    ):
+        raise ValueError("unsupported review check contract")
+    return roles, checks
+
+
+def _canonical_fidelity_reference_type(value: object) -> str:
+    if not isinstance(value, str) or value not in PACK_REFERENCE_TYPE_ALIASES:
+        raise ValueError("reference_type is not supported")
+    return PACK_REFERENCE_TYPE_ALIASES[value]
+
+
+_STYLE_AUTHORED_RUBRIC_ITEMS = frozenset({
+    "style_language", "materials_palette",
+})
+_TYPE_FIELD_AUTHORED_RUBRIC_ITEMS = frozenset({
+    "identity_anchor", "structural_proportions", "authored_details",
+    "anatomy_callouts", "pose_view", "cross_sheet_continuity",
+})
+
+
+def _authored_contract_payload(
+    *,
+    target_role: str,
+    rubric_item_id: str | None,
+    style: str | None,
+    style_commitment: str | None,
+    type_fields: Sequence[tuple[str, Sequence[PackTypeFieldItem]]],
+    detail_callouts: Sequence[PackDetailCallout],
+    authored_settings_seal: str | None,
+) -> dict[str, Any]:
+    return {
+        "target_role": target_role,
+        "rubric_item_id": rubric_item_id,
+        "style": style,
+        "style_commitment": style_commitment,
+        "type_fields": [
+            {
+                "field": field,
+                "items": [item.private_metadata() for item in items],
+            }
+            for field, items in type_fields
+        ],
+        "detail_callouts": [
+            item.private_metadata() for item in detail_callouts
+        ],
+        "authored_settings_seal": authored_settings_seal,
+    }
+
+
+def _build_pack_authored_request_contract(
+    *,
+    target_role: str,
+    rubric_item_id: str | None = None,
+    style: str | None = None,
+    style_commitment: str | None = None,
+    type_fields: Sequence[tuple[str, Sequence[PackTypeFieldItem]]] = (),
+    detail_callouts: Sequence[PackDetailCallout] = (),
+    authored_settings_seal: str | None = None,
+) -> PackAuthoredRequestContract:
+    normalized_type_fields = tuple(
+        (field, tuple(items)) for field, items in type_fields
+    )
+    normalized_callouts = tuple(detail_callouts)
+    payload = _authored_contract_payload(
+        target_role=target_role,
+        rubric_item_id=rubric_item_id,
+        style=style,
+        style_commitment=style_commitment,
+        type_fields=normalized_type_fields,
+        detail_callouts=normalized_callouts,
+        authored_settings_seal=authored_settings_seal,
+    )
+    return PackAuthoredRequestContract(
+        target_role=target_role,
+        rubric_item_id=rubric_item_id,
+        style=style,
+        style_commitment=style_commitment,
+        type_fields=normalized_type_fields,
+        detail_callouts=normalized_callouts,
+        authored_settings_seal=authored_settings_seal,
+        contract_seal=_pack_seal(payload),
+    )
+
+
+def _validate_pack_authored_request_contract(
+    contract: object,
+) -> PackAuthoredRequestContract:
+    if not isinstance(contract, PackAuthoredRequestContract):
+        raise ValueError("authored request contract is invalid")
+    if (
+        not isinstance(contract.target_role, str)
+        or not contract.target_role
+        or len(contract.target_role) > 200
+        or (
+            contract.rubric_item_id is not None
+            and contract.rubric_item_id not in _FIDELITY_RUBRIC_BY_ID
+        )
+        or (
+            contract.style is not None
+            and (
+                not isinstance(contract.style, str)
+                or contract.style != contract.style.strip()
+                or len(contract.style) > 10_000
+            )
+        )
+        or ((contract.style is None) != (contract.style_commitment is None))
+        or (
+            contract.style_commitment is not None
+            and re.fullmatch(r"[0-9a-f]{64}", contract.style_commitment) is None
+        )
+        or (
+            contract.authored_settings_seal is not None
+            and re.fullmatch(r"[0-9a-f]{64}", contract.authored_settings_seal) is None
+        )
+        or any(
+            not isinstance(field, str)
+            or not field
+            or not isinstance(items, tuple)
+            or any(not isinstance(item, PackTypeFieldItem) for item in items)
+            for field, items in contract.type_fields
+        )
+        or len({field for field, _items in contract.type_fields})
+        != len(contract.type_fields)
+        or any(
+            not isinstance(item, PackDetailCallout)
+            or item.target_role != contract.target_role
+            for item in contract.detail_callouts
+        )
+        or len(contract.detail_callouts) > 1
+        or (
+            contract.target_role.startswith("detail_callout:")
+            and contract.type_fields
+        )
+        or (
+            contract.rubric_item_id in _STYLE_AUTHORED_RUBRIC_ITEMS
+            and (contract.type_fields or contract.detail_callouts)
+        )
+        or (
+            contract.rubric_item_id in _TYPE_FIELD_AUTHORED_RUBRIC_ITEMS
+            and (contract.style is not None or contract.detail_callouts)
+        )
+        or (
+            contract.rubric_item_id == "authored_callouts"
+            and (contract.style is not None or contract.type_fields)
+        )
+    ):
+        raise ValueError("authored request contract is invalid")
+    try:
+        expected = _build_pack_authored_request_contract(
+            target_role=contract.target_role,
+            rubric_item_id=contract.rubric_item_id,
+            style=contract.style,
+            style_commitment=contract.style_commitment,
+            type_fields=contract.type_fields,
+            detail_callouts=contract.detail_callouts,
+            authored_settings_seal=contract.authored_settings_seal,
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("authored request contract is invalid") from exc
+    if contract != expected:
+        raise ValueError("authored request contract is invalid")
+    return contract
+
+
+def _pack_authored_contract_for_plan(
+    plan: ReferencePackPlan,
+    *,
+    target_role: str,
+    rubric_item_id: str | None = None,
+) -> PackAuthoredRequestContract:
+    if target_role not in plan.output_roles:
+        raise ValueError("authored request target role is invalid")
+    is_base_role = target_role in plan.sheet_roles
+    if rubric_item_id is None:
+        include_style = plan.style_commitment is not None
+        include_type_fields = is_base_role
+        include_callouts = True
+    else:
+        if rubric_item_id not in _FIDELITY_RUBRIC_BY_ID:
+            raise ValueError("authored request rubric item is invalid")
+        include_style = rubric_item_id in _STYLE_AUTHORED_RUBRIC_ITEMS
+        include_type_fields = (
+            is_base_role
+            and rubric_item_id in _TYPE_FIELD_AUTHORED_RUBRIC_ITEMS
+        )
+        include_callouts = rubric_item_id == "authored_callouts"
+    callouts = tuple(
+        item for item in plan.detail_callouts
+        if include_callouts and item.target_role == target_role
+    )
+    return _build_pack_authored_request_contract(
+        target_role=target_role,
+        rubric_item_id=rubric_item_id,
+        style=plan.style if include_style and plan.style_commitment is not None else None,
+        style_commitment=(
+            plan.style_commitment
+            if include_style and plan.style_commitment is not None else None
+        ),
+        type_fields=plan.type_fields if include_type_fields else (),
+        detail_callouts=callouts,
+        authored_settings_seal=plan.authored_settings_seal,
+    )
+
+
+def fidelity_rubric_applicability(
+    reference_type: str,
+    sheet_roles: Sequence[str],
+) -> tuple[tuple[str, bool], ...]:
+    """Return the legacy item-level projection of role-local applicability."""
+    return tuple(
+        (item_id, bool(applicable_roles))
+        for item_id, applicable_roles in fidelity_rubric_role_applicability(
+            reference_type, sheet_roles,
+        )
+    )
+
+
+def fidelity_rubric_role_applicability(
+    reference_type: str,
+    sheet_roles: Sequence[str],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return the exact server-owned role order for every rubric item."""
+    canonical_type = _canonical_fidelity_reference_type(reference_type)
+    roles, _checks = _validated_fidelity_contract(sheet_roles, _CHECK_NAMES)
+    result = []
+    for item in FIDELITY_RUBRIC:
+        item_applies = (
+            (item.applicable_types is None or canonical_type in item.applicable_types)
+            and (not item.requires_multiple_roles or len(roles) > 1)
+        )
+        applicable_roles = tuple(
+            role for role in roles
+            if item_applies
+            and (
+                not item.requires_detail_callout
+                or role.startswith("detail_callout:")
+            )
+        )
+        result.append((item.item_id, applicable_roles))
+    return tuple(result)
+
+
+def build_fidelity_rubric_question(
+    *,
+    item_id: str,
+    reference_type: str,
+    creative_request: str,
+    sheet_paths: Sequence[os.PathLike[str] | str],
+    sheet_roles: Sequence[str],
+    target_role: str,
+    authored_contract: PackAuthoredRequestContract | None = None,
+) -> FidelityRubricQuestionRequest:
+    """Build one isolated binary question with no earlier question/answer history."""
+    roles, _checks = _validated_fidelity_contract(sheet_roles, _CHECK_NAMES)
+    paths = tuple(Path(path) for path in sheet_paths)
+    if len(paths) != len(roles):
+        raise ValueError("sheet paths and roles must have the same length")
+    if (
+        not isinstance(creative_request, str)
+        or not creative_request.strip()
+        or len(creative_request) > 50_000
+    ):
+        raise ValueError("creative_request is invalid")
+    canonical_type = _canonical_fidelity_reference_type(reference_type)
+    item = _FIDELITY_RUBRIC_BY_ID.get(item_id)
+    applicability = dict(fidelity_rubric_role_applicability(
+        canonical_type, roles,
+    ))
+    if item is None or target_role not in applicability.get(item_id, ()):
+        raise ValueError("rubric item is not applicable")
+    if authored_contract is None:
+        authored_contract = _build_pack_authored_request_contract(
+            target_role=target_role,
+            rubric_item_id=item_id,
+        )
+    authored_contract = _validate_pack_authored_request_contract(
+        authored_contract,
+    )
+    if (
+        authored_contract.target_role != target_role
+        or authored_contract.rubric_item_id != item_id
+    ):
+        raise ValueError("authored request contract does not match rubric question")
+    question = f"For the authored role '{target_role}': {item.question}"
+    return FidelityRubricQuestionRequest(
+        rubric_version=FIDELITY_RUBRIC_VERSION,
+        item_id=item.item_id,
+        reference_type=canonical_type,
+        instruction=(
+            "Evaluate only intrinsic visual fidelity to the supplied authored request "
+            "and the item/role-scoped structured authored contract. "
+            f"{question} "
+            "Answer only the JSON boolean true or false."
+        ),
+        question=question,
+        creative_request=creative_request.strip(),
+        sheet_paths=paths,
+        sheet_roles=roles,
+        target_role=target_role,
+        authored_contract=authored_contract,
+        response_schema=_FrozenJsonObject({"type": "boolean"}),
+    )
+
+
+def _validate_fidelity_rubric_question(
+    request: FidelityRubricQuestionRequest,
+) -> FidelityRubricQuestionRequest:
+    if not isinstance(request, FidelityRubricQuestionRequest):
+        raise ValueError("rubric question is invalid")
+    if (
+        type(request.response_schema) is not _FrozenJsonObject
+        or request.response_schema != {"type": "boolean"}
+    ):
+        raise ValueError("rubric question is invalid")
+    try:
+        expected = build_fidelity_rubric_question(
+            item_id=request.item_id,
+            reference_type=request.reference_type,
+            creative_request=request.creative_request,
+            sheet_paths=request.sheet_paths,
+            sheet_roles=request.sheet_roles,
+            target_role=request.target_role,
+            authored_contract=request.authored_contract,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rubric question is invalid") from exc
+    if request != expected:
+        raise ValueError("rubric question is invalid")
+    return request
+
+
+def parse_fidelity_rubric_answer(value: object) -> bool:
+    """Accept one JSON boolean only; prose, grades, and wrapper objects fail closed."""
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            value = json.loads(value)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReferenceSheetReviewError("review_unavailable") from exc
+    if type(value) is not bool:
+        raise ReferenceSheetReviewError("review_unavailable")
+    return value
+
+
+def record_fidelity_rubric_answer(
+    request: FidelityRubricQuestionRequest,
+    value: object,
+) -> FidelityRubricObservation:
+    """Bind one Boolean answer to the exact server-selected item and role."""
+    request = _validate_fidelity_rubric_question(request)
+    passed = parse_fidelity_rubric_answer(value)
+    return FidelityRubricObservation(
+        item_id=request.item_id,
+        outcome="pass" if passed else "fail",
+        affected_roles=() if passed else (request.target_role,),
+        reviewed_role=request.target_role,
+    )
+
+
+def project_fidelity_assessment(
+    observations: Sequence[FidelityRubricObservation],
+    *,
+    reference_type: str,
+    allowed_roles: Sequence[str],
+) -> FidelityAssessment:
+    """Project isolated binary answers through the fixed weighted v2 rubric."""
+    return _project_fidelity_assessment(
+        observations,
+        reference_type=reference_type,
+        allowed_roles=allowed_roles,
+    )
+
+
+def _project_fidelity_assessment(
+    observations: Sequence[FidelityRubricObservation],
+    *,
+    reference_type: str,
+    allowed_roles: Sequence[str],
+) -> FidelityAssessment:
+    canonical_type = _canonical_fidelity_reference_type(reference_type)
+    roles, _checks = _validated_fidelity_contract(allowed_roles, _CHECK_NAMES)
+    applicability = dict(fidelity_rubric_role_applicability(
+        canonical_type, roles,
+    ))
+    expected_pairs = tuple(
+        (item.item_id, role)
+        for item in FIDELITY_RUBRIC
+        for role in applicability[item.item_id]
+    )
+    observed = tuple(observations)
+    if (
+        len(observed) != len(expected_pairs)
+        or any(not isinstance(item, FidelityRubricObservation) for item in observed)
+        or tuple((item.item_id, item.reviewed_role) for item in observed)
+        != expected_pairs
+    ):
+        raise ReferenceSheetReviewError("review_unavailable")
+    normalized: dict[tuple[str, str], FidelityRubricObservation] = {}
+    for expected, observation in zip(expected_pairs, observed):
+        item_id, role = expected
+        if (
+            observation.outcome not in {"pass", "fail"}
+            or observation.affected_roles != (
+                () if observation.outcome == "pass" else (role,)
+            )
+        ):
+            raise ReferenceSheetReviewError("review_unavailable")
+        normalized[(item_id, role)] = observation
+
+    dimensions = []
+    for dimension in FIDELITY_DIMENSIONS:
+        items = tuple(item for item in FIDELITY_RUBRIC if item.dimension == dimension)
+        applicable_pairs = tuple(
+            (item, role)
+            for item in items
+            for role in applicability[item.item_id]
+        )
+        failed_pairs = tuple(
+            (item, role) for item, role in applicable_pairs
+            if normalized[(item.item_id, role)].outcome == "fail"
+        )
+        applicable_weight = sum(item.weight for item, _role in applicable_pairs)
+        failed_weight = sum(item.weight for item, _role in failed_pairs)
+        if applicable_weight == 0:
+            grade = "not_applicable"
+        elif failed_weight == 0:
+            grade = "exact"
+        else:
+            role_grades = []
+            for role in roles:
+                role_pairs = tuple(
+                    (item, candidate_role)
+                    for item, candidate_role in applicable_pairs
+                    if candidate_role == role
+                )
+                if not role_pairs:
+                    continue
+                role_weight = sum(item.weight for item, _role in role_pairs)
+                role_failed_weight = sum(
+                    item.weight for item, candidate_role in role_pairs
+                    if normalized[(item.item_id, candidate_role)].outcome == "fail"
+                )
+                role_grades.append(
+                    "exact"
+                    if role_failed_weight == 0
+                    else "minor_residual"
+                    if role_failed_weight * 2 < role_weight
+                    else "material_residual"
+                )
+            grade = max(
+                role_grades,
+                key=lambda value: _FIDELITY_GRADE_SEVERITY[value],
+            )
+        affected = {
+            role
+            for _item, role in failed_pairs
+        }
+        failed_item_ids = tuple(dict.fromkeys(
+            item.item_id for item, _role in failed_pairs
+        ))
+        dimensions.append(FidelityDimensionAssessment(
+            dimension=dimension,
+            grade=grade,
+            affected_roles=tuple(role for role in roles if role in affected),
+            reason_codes=tuple(dict.fromkeys(
+                item.reason_code for item, _role in failed_pairs
+            )),
+            failed_item_ids=failed_item_ids,
+            matched_weight=applicable_weight - failed_weight,
+            applicable_weight=applicable_weight,
+        ))
+    return FidelityAssessment(
+        version=FIDELITY_ASSESSMENT_VERSION,
+        rubric_version=FIDELITY_RUBRIC_VERSION,
+        reference_type=canonical_type,
+        dimensions=tuple(dimensions),
+        role_order=roles,
+        observations=observed,
+    )
+
+
+def _validate_fidelity_assessment(
+    assessment: FidelityAssessment,
+) -> FidelityAssessment:
+    if not isinstance(assessment, FidelityAssessment):
+        raise ValueError("assessment is invalid")
+    try:
+        expected = _project_fidelity_assessment(
+            assessment.observations,
+            reference_type=assessment.reference_type,
+            allowed_roles=assessment.role_order,
+        )
+    except (ReferenceSheetReviewError, TypeError, ValueError) as exc:
+        raise ValueError("assessment is invalid") from exc
+    if assessment != expected:
+        raise ValueError("assessment is invalid")
+    return assessment
+
+
+def fidelity_attempt_accepted(
+    assessment: FidelityAssessment,
+    *,
+    attempt_index: int,
+    policy_version: str = FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION,
+) -> bool:
+    """Apply acceptance separately: attempt zero is exact-only, later allows minor."""
+    if policy_version != FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION:
+        raise ValueError("acceptance policy is not supported")
+    if type(attempt_index) is not int or attempt_index < 0:
+        raise ValueError("attempt_index must be a non-negative integer")
+    assessment = _validate_fidelity_assessment(assessment)
+    if attempt_index == 0:
+        return (
+            assessment.assessment_class == "exact"
+            and assessment.worst_severity == "exact"
+        )
+    return (
+        assessment.assessment_class in {"exact", "minor_residual"}
+        and assessment.worst_severity in {"exact", "minor_residual"}
+    )
+
+
+def _fidelity_correction_commitment_payload(
+    *,
+    assessment_version: str,
+    rubric_version: str,
+    reference_type: str,
+    template_id: str,
+    template_version: str,
+    severity: str,
+    affected_roles: Sequence[str],
+    reason_codes: Sequence[str],
+    failed_item_ids: Sequence[str],
+    score_basis_points: int,
+    rendered_brief: str,
+) -> dict[str, Any]:
+    return {
+        "assessment_version": assessment_version,
+        "rubric_version": rubric_version,
+        "reference_type": reference_type,
+        "template_id": template_id,
+        "template_version": template_version,
+        "severity": severity,
+        "affected_roles": list(affected_roles),
+        "reason_codes": list(reason_codes),
+        "failed_item_ids": list(failed_item_ids),
+        "score_basis_points": score_basis_points,
+        "rendered_brief": rendered_brief,
+    }
+
+
+def _validate_fidelity_correction_brief_shape(
+    brief: FidelityCorrectionBrief,
+) -> FidelityCorrectionBrief:
+    if (
+        not isinstance(brief, FidelityCorrectionBrief)
+        or not isinstance(brief.affected_roles, tuple)
+        or not isinstance(brief.reason_codes, tuple)
+        or not isinstance(brief.failed_item_ids, tuple)
+        or any(not isinstance(item_id, str) for item_id in brief.failed_item_ids)
+        or any(not isinstance(code, str) for code in brief.reason_codes)
+    ):
+        raise ValueError("correction brief is invalid")
+    failed_items = tuple(_FIDELITY_RUBRIC_BY_ID.get(
+        item_id,
+    ) for item_id in brief.failed_item_ids)
+    expected_ids = tuple(
+        item.item_id for item in FIDELITY_RUBRIC
+        if item.item_id in set(brief.failed_item_ids)
+    )
+    if (
+        brief.assessment_version != FIDELITY_ASSESSMENT_VERSION
+        or brief.rubric_version != FIDELITY_RUBRIC_VERSION
+        or brief.reference_type not in PACK_REFERENCE_TYPES
+        or brief.template_id != FIDELITY_CORRECTION_TEMPLATE_ID
+        or brief.template_version != FIDELITY_CORRECTION_TEMPLATE_VERSION
+        or brief.severity not in {"minor_residual", "material_residual"}
+        or not brief.affected_roles
+        or len(set(brief.affected_roles)) != len(brief.affected_roles)
+        or any(not isinstance(role, str) or not role for role in brief.affected_roles)
+        or not brief.failed_item_ids
+        or brief.failed_item_ids != expected_ids
+        or any(item is None for item in failed_items)
+        or brief.reason_codes != tuple(dict.fromkeys(
+            item.reason_code for item in failed_items if item is not None
+        ))
+        or type(brief.score_basis_points) is not int
+        or not 0 <= brief.score_basis_points < 10_000
+    ):
+        raise ValueError("correction brief is invalid")
+    clauses = tuple(
+        _FIDELITY_CORRECTION_CLAUSES[item_id]
+        for item_id in brief.failed_item_ids
+    )
+    expected_rendered = (
+        f"Residual correction ({brief.severity}) for roles "
+        f"[{', '.join(brief.affected_roles)}]: "
+        + "; ".join(clauses)
+        + "."
+    )
+    payload = _fidelity_correction_commitment_payload(
+        assessment_version=brief.assessment_version,
+        rubric_version=brief.rubric_version,
+        reference_type=brief.reference_type,
+        template_id=brief.template_id,
+        template_version=brief.template_version,
+        severity=brief.severity,
+        affected_roles=brief.affected_roles,
+        reason_codes=brief.reason_codes,
+        failed_item_ids=brief.failed_item_ids,
+        score_basis_points=brief.score_basis_points,
+        rendered_brief=brief.rendered_brief,
+    )
+    expected_commitment = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if (
+        brief.rendered_brief != expected_rendered
+        or brief.commitment != expected_commitment
+    ):
+        raise ValueError("correction brief is invalid")
+    return brief
+
+
+def build_fidelity_correction_brief(
+    assessment: FidelityAssessment,
+) -> FidelityCorrectionBrief | None:
+    """Render bounded server text only from sealed rubric IDs, roles, and severity."""
+    assessment = _validate_fidelity_assessment(assessment)
+    failed_ids = tuple(
+        item.item_id
+        for item in FIDELITY_RUBRIC
+        if any(item.item_id in dimension.failed_item_ids for dimension in assessment.dimensions)
+    )
+    if not failed_ids:
+        return None
+    clauses = tuple(_FIDELITY_CORRECTION_CLAUSES[item_id] for item_id in failed_ids)
+    role_text = ", ".join(assessment.failed_roles)
+    rendered = (
+        f"Residual correction ({assessment.worst_severity}) for roles [{role_text}]: "
+        + "; ".join(clauses)
+        + "."
+    )
+    score = assessment.score_basis_points
+    assert score is not None
+    commitment_payload = _fidelity_correction_commitment_payload(
+        assessment_version=assessment.version,
+        rubric_version=assessment.rubric_version,
+        reference_type=assessment.reference_type,
+        template_id=FIDELITY_CORRECTION_TEMPLATE_ID,
+        template_version=FIDELITY_CORRECTION_TEMPLATE_VERSION,
+        severity=assessment.worst_severity,
+        affected_roles=assessment.failed_roles,
+        reason_codes=assessment.reason_codes,
+        failed_item_ids=failed_ids,
+        score_basis_points=score,
+        rendered_brief=rendered,
+    )
+    commitment = hashlib.sha256(json.dumps(
+        commitment_payload, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return FidelityCorrectionBrief(
+        assessment_version=assessment.version,
+        rubric_version=assessment.rubric_version,
+        reference_type=assessment.reference_type,
+        template_id=FIDELITY_CORRECTION_TEMPLATE_ID,
+        template_version=FIDELITY_CORRECTION_TEMPLATE_VERSION,
+        severity=assessment.worst_severity,
+        affected_roles=assessment.failed_roles,
+        reason_codes=assessment.reason_codes,
+        failed_item_ids=failed_ids,
+        score_basis_points=score,
+        rendered_brief=rendered,
+        commitment=commitment,
+    )
+
+
+def _validate_fidelity_correction_brief(
+    assessment: FidelityAssessment,
+    brief: FidelityCorrectionBrief,
+) -> FidelityCorrectionBrief:
+    assessment = _validate_fidelity_assessment(assessment)
+    brief = _validate_fidelity_correction_brief_shape(brief)
+    expected = build_fidelity_correction_brief(assessment)
+    if expected is None or not isinstance(brief, FidelityCorrectionBrief) or brief != expected:
+        raise ValueError("correction brief is invalid")
+    return brief
+
+
+def reference_candidate_ranking_key(
+    candidate: ReferenceCandidateAssessment,
+) -> tuple[int, int, int, int, int, int]:
+    if (
+        not isinstance(candidate, ReferenceCandidateAssessment)
+        or type(candidate.candidate_index) is not int
+        or candidate.candidate_index < 0
+        or type(candidate.repair_count) is not int
+        or candidate.repair_count < 0
+    ):
+        raise ValueError("candidate assessment is invalid")
+    assessment = _validate_fidelity_assessment(candidate.assessment)
+    score = assessment.score_basis_points
+    return (
+        _FIDELITY_ASSESSMENT_CLASS_RANK[assessment.assessment_class],
+        _FIDELITY_GRADE_SEVERITY[assessment.worst_severity],
+        -(score if score is not None else -1),
+        assessment.residual_count,
+        candidate.repair_count,
+        candidate.candidate_index,
+    )
+
+
+def recommend_reference_candidate(
+    candidates: Sequence[ReferenceCandidateAssessment],
+) -> ReferenceCandidateAssessment:
+    candidates = tuple(candidates)
+    if not candidates or len({item.candidate_index for item in candidates}) != len(candidates):
+        raise ValueError("candidate indices must be unique")
+    return min(candidates, key=reference_candidate_ranking_key)
+
+
 def parse_semantic_review_result(
     value: object,
     *,
@@ -1593,13 +2681,9 @@ def parse_semantic_review_result(
     reason_codes = value.get("reason_codes")
     if status not in {"pass", "fail"}:
         raise ReferenceSheetReviewError("review_unavailable")
-    required_checks = tuple(check_names)
-    if (
-        not required_checks
-        or len(set(required_checks)) != len(required_checks)
-        or any(name not in _REASON_FOR_CHECK for name in required_checks)
-    ):
-        raise ValueError("unsupported review check contract")
+    allowed, required_checks = _validated_fidelity_contract(
+        allowed_roles, check_names,
+    )
     if not isinstance(checks, Mapping) or set(checks) != set(required_checks):
         raise ReferenceSheetReviewError("review_unavailable")
     if any(type(checks[name]) is not bool for name in required_checks):
@@ -1610,7 +2694,6 @@ def parse_semantic_review_result(
         raise ReferenceSheetReviewError("review_unavailable")
     if len(set(failed_roles)) != len(failed_roles) or len(set(reason_codes)) != len(reason_codes):
         raise ReferenceSheetReviewError("review_unavailable")
-    allowed = tuple(allowed_roles)
     if any(role not in allowed for role in failed_roles):
         raise ReferenceSheetReviewError("review_unavailable")
     if any(code not in _REASON_CODES for code in reason_codes):
@@ -2423,9 +3506,9 @@ def _pack_seal(payload: Mapping[str, Any]) -> str:
 
 
 def reference_pack_authored_settings_seal(value: object) -> str:
-    """Validate and seal one private, prompt-free authored-settings snapshot."""
+    """Validate and seal one owner-private authored-settings snapshot."""
     allowed_keys = {
-        "type_fields", "detail_callouts", "additional_lora_parameters",
+        "type_fields", "detail_callouts", "additional_lora_parameters", "style",
     }
     if (
         not isinstance(value, Mapping)
@@ -2436,6 +3519,7 @@ def reference_pack_authored_settings_seal(value: object) -> str:
     type_fields = value.get("type_fields")
     detail_callouts = value.get("detail_callouts")
     parameterized_loras = value.get("additional_lora_parameters", [])
+    style = value.get("style")
     if (
         not isinstance(type_fields, Mapping)
         or any(
@@ -2447,6 +3531,14 @@ def reference_pack_authored_settings_seal(value: object) -> str:
         or any(not isinstance(item, Mapping) for item in detail_callouts)
         or not isinstance(parameterized_loras, list)
         or len(parameterized_loras) > 64
+        or (
+            "style" in value
+            and (
+                not isinstance(style, str)
+                or len(style) > 10_000
+                or style != style.strip()
+            )
+        )
     ):
         raise ValueError("private authored settings are invalid")
     seen_loras = set()
@@ -2541,6 +3633,8 @@ def reference_pack_authored_settings_seal(value: object) -> str:
             "type_fields": dict(type_fields),
             "detail_callouts": list(detail_callouts),
         }
+        if "style" in value:
+            payload["style"] = style
         if "additional_lora_parameters" in value:
             payload["additional_lora_parameters"] = [
                 {
@@ -2710,6 +3804,8 @@ def build_reference_pack_plan(
     creative_request: str,
     generation_model: str,
     editor_model: str | None,
+    style: str = "",
+    style_commitment: str | None = None,
     preset: str | None = None,
     sheet_count: int | None = None,
     sheet_size: Sequence[int] = (1024, 1024),
@@ -2743,6 +3839,16 @@ def build_reference_pack_plan(
         raise ValueError("creative_request must be a non-empty string")
     if len(creative_request) > 50_000:
         raise ValueError("creative_request is too long")
+    if not isinstance(style, str) or len(style) > 10_000:
+        raise ValueError("style must be text of at most 10000 characters")
+    normalized_style = style.strip()
+    if style_commitment is not None and (
+        not isinstance(style_commitment, str)
+        or re.fullmatch(r"[0-9a-f]{64}", style_commitment) is None
+    ):
+        raise ValueError("style_commitment is invalid")
+    if style_commitment is None and normalized_style:
+        raise ValueError("authored style requires a commitment")
     selected_preset = preset or PACK_DEFAULT_PRESETS[canonical_type]
     if selected_preset not in PACK_TYPE_PRESETS[canonical_type]:
         raise ValueError("preset does not match reference_type")
@@ -3000,6 +4106,8 @@ def build_reference_pack_plan(
         },
         "detail_callouts": [item.private_metadata() for item in callouts],
     }
+    if style_commitment is not None:
+        private_authored_settings["style"] = normalized_style
     parameterized_loras = [
         {
             "id": item.lora_id,
@@ -3042,6 +4150,10 @@ def build_reference_pack_plan(
         "managed_layout_assist": managed_layout_assist,
         "user_lora_count": user_lora_count,
         "authored_settings_seal": authored_settings_seal,
+        **(
+            {"style_commitment": style_commitment}
+            if style_commitment is not None else {}
+        ),
         "generation_model": create_model,
         "editor_model": resolved_editor,
         "planning": planning.public_metadata(),
@@ -3123,6 +4235,8 @@ def build_reference_pack_plan(
         preset=selected_preset,
         depth=depth,
         creative_request=creative_request,
+        style=normalized_style,
+        style_commitment=style_commitment,
         generation_model=create_model,
         editor_model=resolved_editor,
         sheets=recipes,
@@ -3164,6 +4278,8 @@ def _validate_reference_pack_plan(plan: object) -> ReferencePackPlan:
             intent=plan.intent,
             depth=plan.depth,
             creative_request=plan.creative_request,
+            style=plan.style,
+            style_commitment=plan.style_commitment,
             generation_model=plan.generation_model,
             editor_model=plan.editor_model,
             preset=plan.preset,
@@ -3206,6 +4322,8 @@ def apply_reference_pack_role_briefs(
         intent=plan.intent,
         depth=plan.depth,
         creative_request=plan.creative_request,
+        style=plan.style,
+        style_commitment=plan.style_commitment,
         generation_model=plan.generation_model,
         editor_model=plan.editor_model,
         preset=plan.preset,
@@ -3243,7 +4361,15 @@ def _pack_generation_request(
     operation: str | None = None,
     normalized_crop: tuple[float, float, float, float] | None = None,
     callout: PackDetailCallout | None = None,
+    correction_assessment: FidelityAssessment | None = None,
+    correction_brief: FidelityCorrectionBrief | None = None,
 ) -> PackSheetGenerationRequest:
+    if (correction_assessment is None) != (correction_brief is None):
+        raise ValueError("correction contract is incomplete")
+    if correction_assessment is not None and correction_brief is not None:
+        correction_brief = _validate_fidelity_correction_brief(
+            correction_assessment, correction_brief,
+        )
     if routing_operation is None:
         routing_operation = (
             "generation"
@@ -3286,7 +4412,11 @@ def _pack_generation_request(
         model=route.resolved_model,
         role=recipe.role,
         label=recipe.label,
-        objective=recipe.objective,
+        objective=(
+            recipe.objective
+            if correction_brief is None
+            else f"{recipe.objective}. {correction_brief.rendered_brief}"
+        ),
         index=index,
         sheet_count=len(plan.output_roles),
         sheet_size=plan.sheet_size,
@@ -3294,6 +4424,9 @@ def _pack_generation_request(
         strategy=strategy,
         routing_operation=routing_operation,
         plan_seal=plan.plan_seal,
+        authored_contract=_pack_authored_contract_for_plan(
+            plan, target_role=recipe.role,
+        ),
         source_role=source_role,
         source_digest=source_digest,
         normalized_crop=crop,
@@ -3305,66 +4438,12 @@ def _pack_generation_request(
             None if callout is None else callout.requested_operation
         ),
         detail_label_digest=None if callout is None else callout.label_digest,
-    )
-
-
-def build_reference_pack_review_request(
-    plan: ReferencePackPlan,
-    artifacts: Sequence[ReferencePackArtifact],
-) -> ReferencePackReviewRequest:
-    plan = _validate_reference_pack_plan(plan)
-    roles = tuple(artifact.role for artifact in artifacts)
-    if roles != plan.output_roles:
-        raise ReferenceSheetStructureError("pack_roles_invalid")
-    unrestricted = plan.review_contract == "explicit_unrestricted_fidelity_v1"
-    check_names = _UNRESTRICTED_CHECK_NAMES if unrestricted else _CHECK_NAMES
-    reason_codes = tuple(_REASON_FOR_CHECK[name] for name in check_names)
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["status", "checks", "failed_roles", "reason_codes"],
-        "properties": {
-            "status": {"enum": ["pass", "fail"]},
-            "checks": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": list(check_names),
-                "properties": {name: {"type": "boolean"} for name in check_names},
-            },
-            "failed_roles": {
-                "type": "array",
-                "items": {"enum": list(roles)},
-                "maxItems": len(roles),
-                "uniqueItems": True,
-            },
-            "reason_codes": {
-                "type": "array",
-                "items": {"enum": list(reason_codes)},
-                "maxItems": len(reason_codes),
-                "uniqueItems": True,
-            },
-        },
-    }
-    return ReferencePackReviewRequest(
-        instruction=(
-            "Review only visual fidelity, completeness, and cross-sheet continuity "
-            "against the supplied authored request and ordered roles. "
-            + (
-                "Also compare whether the outputs preserve any mature, violent, and "
-                "detail register explicitly requested by the author, plus overall "
-                "fidelity. A register absent from the authored request passes without "
-                "inference. "
-                if unrestricted else ""
-            )
-            + "Do not perform content moderation, permissibility decisions, maturity "
-            "classification, refusal analysis, policy or safety analysis, or infer a "
-            "prompt/register the author did not supply. Return only the strict JSON object."
+        correction_brief=(
+            None if correction_brief is None else correction_brief.rendered_brief
         ),
-        creative_request=plan.creative_request,
-        sheet_paths=tuple(artifact.path for artifact in artifacts),
-        sheet_roles=roles,
-        response_schema=schema,
-        review_contract=plan.review_contract,
+        correction_brief_commitment=(
+            None if correction_brief is None else correction_brief.commitment
+        ),
     )
 
 
@@ -3389,10 +4468,17 @@ def review_reference_pack(
     plan: ReferencePackPlan,
     artifacts: Sequence[ReferencePackArtifact],
     reviewer: PackReviewer | None,
+    *,
+    attempt_index: int = 0,
 ) -> SemanticReviewResult:
+    plan = _validate_reference_pack_plan(plan)
+    if type(attempt_index) is not int or attempt_index < 0:
+        raise ValueError("attempt_index must be a non-negative integer")
     if reviewer is None:
         return _review_unavailable()
-    review_request = build_reference_pack_review_request(plan, artifacts)
+    artifact_roles = tuple(artifact.role for artifact in artifacts)
+    if artifact_roles != plan.output_roles:
+        raise ReferenceSheetStructureError("pack_roles_invalid")
     snapshots: list[tuple[Path, _StageSnapshot]] = []
     try:
         for artifact in artifacts:
@@ -3404,27 +4490,68 @@ def review_reference_pack(
             _review_descriptor_path(snapshot)
             for _path, snapshot in snapshots
         )
-        try:
-            if any(path is None for path in review_paths):
-                result = _review_unavailable()
-            else:
-                request = replace(
-                    review_request,
-                    sheet_paths=tuple(review_paths),
+        result = _review_unavailable()
+        if not any(path is None for path in review_paths):
+            observations = []
+            review_failed = False
+            applicability = fidelity_rubric_role_applicability(
+                plan.reference_type, plan.output_roles,
+            )
+            for item_id, applicable_roles in applicability:
+                for target_role in applicable_roles:
+                    request = build_fidelity_rubric_question(
+                        item_id=item_id,
+                        reference_type=plan.reference_type,
+                        creative_request=plan.creative_request,
+                        sheet_paths=review_paths,
+                        sheet_roles=plan.output_roles,
+                        target_role=target_role,
+                        authored_contract=_pack_authored_contract_for_plan(
+                            plan,
+                            target_role=target_role,
+                            rubric_item_id=item_id,
+                        ),
+                    )
+                    try:
+                        raw = reviewer(request)
+                    except Exception:  # noqa: BLE001 - provider boundary
+                        review_failed = True
+                        break
+                    finally:
+                        # A reviewer gets no second inference after changing a
+                        # descriptor-sealed input. Integrity failure remains
+                        # structural and is never normalized to availability.
+                        for path, snapshot in snapshots:
+                            _assert_stage_unchanged(path, snapshot)
+                    try:
+                        observations.append(record_fidelity_rubric_answer(
+                            request, raw,
+                        ))
+                    except Exception:  # noqa: BLE001 - schema/answer boundary
+                        review_failed = True
+                        break
+                if review_failed:
+                    break
+            if not review_failed:
+                assessment = project_fidelity_assessment(
+                    observations,
+                    reference_type=plan.reference_type,
+                    allowed_roles=plan.output_roles,
                 )
-                result = parse_semantic_review_result(
-                    reviewer(request), allowed_roles=plan.output_roles,
-                    check_names=(
-                        _UNRESTRICTED_CHECK_NAMES
-                        if plan.review_contract == "explicit_unrestricted_fidelity_v1"
-                        else _CHECK_NAMES
-                    ),
+                accepted = fidelity_attempt_accepted(
+                    assessment, attempt_index=attempt_index,
                 )
-        except Exception:  # noqa: BLE001 - normalize provider/schema failure
-            result = _review_unavailable()
-        # The route decides whether unavailable review blocks publication.
-        # Provider mutation is always a structural integrity failure and must
-        # never be converted into review_unavailable.
+                result = SemanticReviewResult(
+                    status="pass" if accepted else "fail",
+                    checks=tuple(assessment.dimension_checks_dict().items()),
+                    failed_roles=assessment.failed_roles,
+                    reason_codes=assessment.reason_codes,
+                    fidelity_assessment=assessment,
+                    fidelity_accepted=accepted,
+                    fidelity_attempt_index=attempt_index,
+                )
+        # Provider mutation remains a structural integrity failure even when
+        # descriptor discovery or response validation failed earlier.
         for path, snapshot in snapshots:
             _assert_stage_unchanged(path, snapshot)
         return SemanticReviewResult(
@@ -3443,6 +4570,9 @@ def review_reference_pack(
                 )
                 for artifact, (_path, snapshot) in zip(artifacts, snapshots)
             ),
+            fidelity_assessment=result.fidelity_assessment,
+            fidelity_accepted=result.fidelity_accepted,
+            fidelity_attempt_index=result.fidelity_attempt_index,
         )
     finally:
         for _path, snapshot in snapshots:
@@ -3455,8 +4585,15 @@ def review_reference_pack(
 def _pack_repair_request(
     plan: ReferencePackPlan,
     recipe: PackSheetRecipe,
-    reason_codes: Sequence[str],
+    assessment: FidelityAssessment,
+    correction_brief: FidelityCorrectionBrief,
 ) -> PackSheetRepairRequest:
+    assessment = _validate_fidelity_assessment(assessment)
+    correction_brief = _validate_fidelity_correction_brief(
+        assessment, correction_brief,
+    )
+    if recipe.role not in assessment.failed_roles:
+        raise ValueError("repair role is not affected")
     route = plan.operation_route("repair")
     if route.resolved_model is None:
         raise ValueError("repair routing has no executable model")
@@ -3469,12 +4606,17 @@ def _pack_repair_request(
         model=route.resolved_model,
         role=recipe.role,
         label=recipe.label,
-        objective=recipe.objective,
+        objective=f"{recipe.objective}. {correction_brief.rendered_brief}",
         sheet_size=plan.sheet_size,
         anchor_basis=plan.anchor_basis,
-        reason_codes=tuple(reason_codes),
+        reason_codes=assessment.reason_codes,
         routing_operation="repair",
         plan_seal=plan.plan_seal,
+        authored_contract=_pack_authored_contract_for_plan(
+            plan, target_role=recipe.role,
+        ),
+        correction_brief=correction_brief.rendered_brief,
+        correction_brief_commitment=correction_brief.commitment,
     )
 
 
@@ -3606,6 +4748,8 @@ def create_reference_pack(
         *,
         provenance_strategy: str = "detail_callout",
         reason_codes: Sequence[str] = (),
+        correction_assessment: FidelityAssessment | None = None,
+        correction_brief: FidelityCorrectionBrief | None = None,
     ) -> ReferencePackArtifact:
         base_artifacts = {
             item.role: item
@@ -3653,6 +4797,8 @@ def create_reference_pack(
             operation=operation,
             normalized_crop=normalized_crop,
             callout=callout,
+            correction_assessment=correction_assessment,
+            correction_brief=correction_brief,
         )
         if direct_crop:
             path = editor_primary
@@ -3771,17 +4917,29 @@ def create_reference_pack(
                 anchor_fingerprint,
             ))
 
-        review = review_reference_pack(plan, artifacts, reviewer)
+        review = review_reference_pack(
+            plan, artifacts, reviewer, attempt_index=0,
+        )
         if plan.mode != "draft":
             assert anchor_path is not None and anchor_fingerprint is not None
             while (
-                review.status == "fail"
+                review.fidelity_accepted is False
+                and review.fidelity_assessment is not None
                 and callable(repair_sheet)
                 and len(repaired_roles) < max_repair_attempts
             ):
+                assessment = _validate_fidelity_assessment(
+                    review.fidelity_assessment,
+                )
+                correction_brief = build_fidelity_correction_brief(assessment)
+                if correction_brief is None:
+                    raise ValueError("failed assessment has no correction brief")
+                correction_brief = _validate_fidelity_correction_brief(
+                    assessment, correction_brief,
+                )
                 role = next((
                     candidate for candidate in plan.output_roles
-                    if candidate in set(review.failed_roles)
+                    if candidate in set(assessment.failed_roles)
                 ), None)
                 if role is None:
                     break
@@ -3801,6 +4959,8 @@ def create_reference_pack(
                         0,
                         strategy="canonical_anchor_regeneration",
                         routing_operation="generation",
+                        correction_assessment=assessment,
+                        correction_brief=correction_brief,
                     )
                     regenerated_anchor = _new_distinct_path(
                         generate_sheet(anchor_request), role, paths,
@@ -3813,7 +4973,7 @@ def create_reference_pack(
                             model=anchor_request.model,
                             strategy="canonical_anchor_regeneration",
                             anchor_role=role,
-                            reason_codes=review.reason_codes,
+                            reason_codes=assessment.reason_codes,
                         )
                     ]
                     anchor_path = regenerated_anchor
@@ -3829,6 +4989,8 @@ def create_reference_pack(
                             source_role=role,
                             source_digest=source_digest,
                             operation="enhance",
+                            correction_assessment=assessment,
+                            correction_brief=correction_brief,
                         )
                         regenerated_path = _new_distinct_path(
                             edit_sheet(anchor_path, anchor_path, request),
@@ -3845,7 +5007,7 @@ def create_reference_pack(
                             model=request.model,
                             strategy="reference_guided_regeneration",
                             anchor_role=role,
-                            reason_codes=review.reason_codes,
+                            reason_codes=assessment.reason_codes,
                         ))
                     for callout_index, callout in enumerate(
                         plan.detail_callouts
@@ -3857,7 +5019,9 @@ def create_reference_pack(
                             anchor_path,
                             anchor_fingerprint,
                             provenance_strategy="detail_callout_regeneration",
-                            reason_codes=review.reason_codes,
+                            reason_codes=assessment.reason_codes,
+                            correction_assessment=assessment,
+                            correction_brief=correction_brief,
                         ))
                     for previous_artifact, fingerprint in previous:
                         _assert_preserved(
@@ -3887,7 +5051,7 @@ def create_reference_pack(
                         )
                         strategy = "detail_callout_repair"
                     repair_request = _pack_repair_request(
-                        plan, recipe, review.reason_codes,
+                        plan, recipe, assessment, correction_brief,
                     )
                     repaired = _new_distinct_path(
                         repair_sheet(
@@ -3911,11 +5075,16 @@ def create_reference_pack(
                         model=repair_request.model,
                         strategy=strategy,
                         anchor_role=plan.sheet_roles[0],
-                        reason_codes=review.reason_codes,
+                        reason_codes=assessment.reason_codes,
                         detail_provenance=current.detail_provenance,
                     )
                 repaired_roles.append(role)
-                review = review_reference_pack(plan, artifacts, reviewer)
+                review = review_reference_pack(
+                    plan,
+                    artifacts,
+                    reviewer,
+                    attempt_index=len(repaired_roles),
+                )
         return ReferencePackResult(
             plan=plan,
             artifacts=tuple(artifacts),
@@ -3946,6 +5115,15 @@ def create_reference_pack(
 
 __all__ = [
     "ASSET_TYPES",
+    "FIDELITY_ASSESSMENT_VERSION",
+    "FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION",
+    "FIDELITY_CORRECTION_TEMPLATE_ID",
+    "FIDELITY_CORRECTION_TEMPLATE_VERSION",
+    "FIDELITY_DIMENSIONS",
+    "FIDELITY_GRADES",
+    "FIDELITY_RUBRIC",
+    "FIDELITY_RUBRIC_OUTCOMES",
+    "FIDELITY_RUBRIC_VERSION",
     "MAX_PACK_SHEETS",
     "MODES",
     "PACK_DEFAULT_PRESETS",
@@ -3966,6 +5144,12 @@ __all__ = [
     "ArtifactProvenance",
     "CompositionGeometry",
     "DraftGenerationRequest",
+    "FidelityAssessment",
+    "FidelityCorrectionBrief",
+    "FidelityDimensionAssessment",
+    "FidelityRubricItem",
+    "FidelityRubricObservation",
+    "FidelityRubricQuestionRequest",
     "FailedPanelRepairRequest",
     "PanelFile",
     "PanelGenerationRequest",
@@ -3981,7 +5165,7 @@ __all__ = [
     "ReferencePackArtifact",
     "ReferencePackPlan",
     "ReferencePackResult",
-    "ReferencePackReviewRequest",
+    "ReferenceCandidateAssessment",
     "ReferenceSheetArtifact",
     "ReferenceSheetError",
     "ReferenceSheetPlan",
@@ -3991,15 +5175,24 @@ __all__ = [
     "SemanticReviewRequest",
     "SemanticReviewResult",
     "build_failed_panel_repair_plan",
+    "build_fidelity_correction_brief",
+    "build_fidelity_rubric_question",
     "build_reference_sheet_plan",
     "build_reference_pack_plan",
-    "build_reference_pack_review_request",
     "build_semantic_review_request",
     "compose_reference_sheet",
     "create_reference_sheet",
     "create_reference_pack",
     "normalize_reference_pack_type",
+    "fidelity_attempt_accepted",
+    "fidelity_rubric_applicability",
+    "fidelity_rubric_role_applicability",
+    "parse_fidelity_rubric_answer",
     "parse_semantic_review_result",
+    "project_fidelity_assessment",
+    "record_fidelity_rubric_answer",
+    "recommend_reference_candidate",
+    "reference_candidate_ranking_key",
     "review_reference_sheet",
     "review_reference_pack",
     "validate_panel_files",

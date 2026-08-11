@@ -6,13 +6,214 @@ import { generateLoraGuide, fetchLoraGuide, fetchLoraDetails } from '../../api/c
 import { LoraGuideTooltip, LoraAgeChip, LoraSortToggle } from './LoraSelector'
 import type { LoraDates } from './LoraSelector'
 import { sortLoraNames } from './loraSort'
-import type { LoraRecommendedWeights } from '../../types'
+import type {
+  DirectorImageRole,
+  DirectorImageRoleLoraSelection,
+  LoraInfo,
+  LoraParameterDefinition,
+  LoraParameterValue,
+  LoraRecommendedWeights,
+} from '../../types'
 
 function serializeMultipliers(loras: string[], weights: Record<string, number[]>): string {
   return loras.map(name => {
     const values = weights[name] || [1.0]
     return values.map(value => value.toFixed(2)).join(';')
   }).join(' ')
+}
+
+function directorRoleLabel(role: DirectorImageRole): string {
+  return role === 'creator' ? 'Creator' : 'Editor'
+}
+
+function updateDirectorRoleSelection(
+  selections: readonly DirectorImageRoleLoraSelection[],
+  id: string,
+  update: Partial<DirectorImageRoleLoraSelection>,
+): DirectorImageRoleLoraSelection[] {
+  return selections.map(selection => selection.id === id
+    ? { ...selection, ...update }
+    : selection)
+}
+
+function DirectorRoleLoraParameterField({
+  loraId, parameter, values, onChange, onClear,
+}: {
+  loraId: string
+  parameter: LoraParameterDefinition
+  values: Record<string, LoraParameterValue>
+  onChange: (value: LoraParameterValue) => void
+  onClear: () => void
+}) {
+  const value = api.getLoraParameterValue(parameter, values)
+  const id = `director-${loraId}-${parameter.id}`.replace(/[^a-z0-9_-]/gi, '-')
+  const label = `${parameter.label}${parameter.required ? ' (required)' : ''}`
+  if (parameter.type === 'boolean') {
+    return (
+      <label htmlFor={id} className="block text-[9px] text-text-secondary">
+        {label}
+        <select id={id} value={value === true ? 'true' : value === false ? 'false' : ''} onChange={event => {
+          if (event.target.value === '') onClear()
+          else onChange(event.target.value === 'true')
+        }} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px]">
+          <option value="">Choose…</option>
+          <option value="false">No</option>
+          <option value="true">Yes</option>
+        </select>
+      </label>
+    )
+  }
+  if (parameter.type === 'enum') {
+    const token = value === undefined ? '' : api.getLoraParameterOptionToken(value)
+    return (
+      <label htmlFor={id} className="block text-[9px] text-text-secondary">
+        {label}
+        <select id={id} value={token} onChange={event => {
+          const option = parameter.options?.find(candidate => (
+            api.getLoraParameterOptionToken(candidate.value) === event.target.value
+          ))
+          if (option) onChange(option.value)
+        }} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px]">
+          {value === undefined && <option value="">Choose…</option>}
+          {(parameter.options ?? []).map(option => (
+            <option key={api.getLoraParameterOptionToken(option.value)} value={api.getLoraParameterOptionToken(option.value)}>{option.label}</option>
+          ))}
+        </select>
+      </label>
+    )
+  }
+  if (parameter.type === 'number' || parameter.type === 'integer') {
+    return (
+      <label htmlFor={id} className="block text-[9px] text-text-secondary">
+        {label}
+        <input id={id} type="number" value={typeof value === 'number' ? value : ''} min={parameter.minimum} max={parameter.maximum} step={parameter.step ?? (parameter.type === 'integer' ? 1 : 'any')} onChange={event => {
+          if (Number.isFinite(event.target.valueAsNumber)) onChange(event.target.valueAsNumber)
+        }} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px]" />
+      </label>
+    )
+  }
+  return (
+    <label htmlFor={id} className="block text-[9px] text-text-secondary">
+      {label}
+      <input id={id} type="text" value={typeof value === 'string' ? value : ''} minLength={parameter.min_length} maxLength={parameter.max_length} onChange={event => onChange(event.target.value)} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px]" />
+    </label>
+  )
+}
+
+/** Role-scoped Director LoRAs use the exact model details catalog and wire. */
+export function DirectorImageRoleLoraSelector({
+  role, modelType, selections, onChange,
+}: {
+  role: DirectorImageRole
+  modelType: string
+  selections: DirectorImageRoleLoraSelection[]
+  onChange: (selections: DirectorImageRoleLoraSelection[]) => void
+}) {
+  const openBrowser = useStore(s => s.setLoraBrowserOpen)
+  const [catalog, setCatalog] = useState<LoraInfo[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [search, setSearch] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    queueMicrotask(() => {
+      if (cancelled) return
+      if (!modelType) {
+        setCatalog([])
+        setLoading(false)
+        return
+      }
+      setLoading(true)
+      setError('')
+      void api.fetchLoraDetails(modelType).then(result => {
+        if (!cancelled) setCatalog(result.loras)
+      }).catch(() => {
+        if (!cancelled) {
+          setCatalog([])
+          setError(`${directorRoleLabel(role)} LoRA catalog is unavailable.`)
+        }
+      }).finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    })
+    return () => { cancelled = true }
+  }, [modelType, role])
+
+  const selectedIds = new Set(selections.map(selection => selection.id))
+  const available = catalog.filter(lora => (
+    !selectedIds.has(lora.filename)
+    && lora.filename.toLowerCase().includes(search.trim().toLowerCase())
+  ))
+  const errors = api.validateDirectorImageRoleLoraSelections(selections, catalog)
+
+  const setParameter = (selection: DirectorImageRoleLoraSelection, parameterId: string, value: LoraParameterValue) => {
+    onChange(updateDirectorRoleSelection(selections, selection.id, {
+      parameter_values: { ...(selection.parameter_values ?? {}), [parameterId]: value },
+    }))
+  }
+
+  const clearParameter = (selection: DirectorImageRoleLoraSelection, parameterId: string) => {
+    const next = { ...(selection.parameter_values ?? {}) }
+    delete next[parameterId]
+    onChange(updateDirectorRoleSelection(selections, selection.id, { parameter_values: next }))
+  }
+
+  return (
+    <div className="space-y-2">
+      <p className="text-[9px] leading-relaxed text-text-muted">
+        Only LoRAs found for the selected {role === 'creator' ? 'creator' : 'continuity editor'} model are listed, including read-only linked roots. Published inputs are sealed to their current schema.
+      </p>
+      {loading ? (
+        <div role="status" className="flex items-center gap-1.5 text-[10px] text-text-muted"><Loader2 size={11} className="animate-spin" /> Loading role LoRAs…</div>
+      ) : (
+        <>
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-1.5">
+            <div className="relative">
+              <Search size={11} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-muted" />
+              <input aria-label={`Search ${directorRoleLabel(role)} LoRAs`} value={search} onChange={event => setSearch(event.target.value)} placeholder="Search compatible LoRAs" className="w-full rounded border border-border bg-bg-tertiary py-1 pl-6 pr-2 text-[10px]" />
+            </div>
+            <button type="button" onClick={() => openBrowser(true, modelType)} className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-[9px] text-accent-blue"><Globe size={10} /> Browse</button>
+          </div>
+          <div className="max-h-28 overflow-y-auto rounded border border-border bg-bg-tertiary">
+            {available.slice(0, 100).map(lora => (
+              <button key={lora.filename} type="button" disabled={selections.length >= 64} onClick={() => onChange([...selections, api.createDirectorImageRoleLoraSelection(lora)])} className="flex w-full items-center justify-between gap-2 border-b border-border/40 px-2 py-1 text-left text-[10px] text-text-secondary last:border-b-0 hover:bg-bg-hover disabled:opacity-40">
+                <span className="truncate">{lora.filename.replace(/\.(safetensors|sft)$/i, '')}</span>
+                <span className="shrink-0 text-[8px] text-text-muted">{lora.parameter_schema ? 'Inputs' : 'Strength'}</span>
+              </button>
+            ))}
+            {available.length === 0 && <p className="px-2 py-1.5 text-center text-[9px] text-text-muted">{catalog.length === 0 ? 'No compatible LoRAs found' : 'No matches'}</p>}
+          </div>
+        </>
+      )}
+      {selections.map(selection => {
+        const info = catalog.find(lora => lora.filename === selection.id)
+        const schema = info?.parameter_schema
+        const selectionErrors = errors.filter(message => message.startsWith(`${selection.id}:`))
+        return (
+          <div key={selection.id} className="rounded border border-border bg-bg-tertiary/50 p-2">
+            <div className="grid grid-cols-[minmax(0,1fr)_4.5rem_auto] items-center gap-1.5">
+              <span className="truncate text-[10px] text-text-secondary" title={selection.id}>{selection.id}</span>
+              <input aria-label={`${selection.id} multiplier`} type="number" min={-10} max={10} step={0.05} value={selection.multiplier} onChange={event => {
+                if (Number.isFinite(event.target.valueAsNumber)) onChange(updateDirectorRoleSelection(selections, selection.id, { multiplier: event.target.valueAsNumber }))
+              }} className="w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-right text-[9px]" />
+              <button type="button" aria-label={`Remove ${selection.id}`} onClick={() => onChange(selections.filter(candidate => candidate.id !== selection.id))} className="rounded p-0.5 text-text-muted hover:text-red-300"><X size={11} /></button>
+            </div>
+            {schema && selection.parameter_schema_digest === schema.schema_digest && (
+              <div className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                {schema.parameters.map(parameter => (
+                  <DirectorRoleLoraParameterField key={parameter.id} loraId={selection.id} parameter={parameter} values={selection.parameter_values ?? {}} onChange={value => setParameter(selection, parameter.id, value)} onClear={() => clearParameter(selection, parameter.id)} />
+                ))}
+              </div>
+            )}
+            {selectionErrors.map(message => <p key={message} role="status" className="mt-1 text-[8px] text-red-300">{message.slice(selection.id.length + 2)}</p>)}
+          </div>
+        )
+      })}
+      {error && <p role="status" className="text-[9px] text-red-300">{error}</p>}
+      {selections.length >= 64 && <p role="status" className="text-[9px] text-amber-200">Maximum 64 LoRAs for this role.</p>}
+    </div>
+  )
 }
 
 /**

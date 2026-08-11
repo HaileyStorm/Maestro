@@ -136,6 +136,8 @@ def _native_admission_namespace():
         ),
         "_require_remote_visible_models": lambda request, models: None,
         "_apply_h3_adaptive_checkpoint": lambda body: None,
+        "_resolve_h3_style_workflow_request": lambda body: None,
+        "_apply_h3_style_workflow_to_request": lambda body: None,
         "_normalize_video_prompt_type": lambda body: None,
         "_normalize_image_prompt_type": lambda body: None,
         "_jobs": {},
@@ -154,6 +156,7 @@ def _native_admission_namespace():
             worker_admissions.append(str(job.get("id") or "")) or True
         ),
         "_queue_recovery_delivery_pending": lambda job: None,
+        "_director_image_role_wire_mode": lambda body: "legacy",
         "_require_h3_offload_plan_parity": lambda job: None,
         "_require_job_model_recipe_terms": lambda job: None,
         "_apply_per_job_coefficient": lambda job: None,
@@ -181,6 +184,7 @@ def _native_admission_namespace():
         APP / "launch.py",
         {
             "_trusted_h3_prepared_plan",
+            "_require_job_runtime_model_admission",
             "_require_h3_native_boundary_experimental",
             "_plan_generation_submission",
             "preview_generation_plan",

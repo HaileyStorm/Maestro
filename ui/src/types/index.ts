@@ -7,14 +7,24 @@ export interface ModelFamily {
 export type DirectorPipelineType = 'music_video' | 'short_film_audio' | 'short_film_story'
 export type DirectorShotImageGuidance = 'auto' | 'prompt_only' | 'generate'
 export type DirectorShotImagePolicy = 'generate' | 'prompt_only' | 'direct_references'
+export type DirectorImageRole = 'creator' | 'editor'
 
 export interface DirectorCapabilityResult {
   compatible: boolean
   reason: string
 }
 
+export interface DirectorImageRoleCapabilityResult {
+  compatible: boolean
+  reasons: string[]
+}
+
 export interface DirectorModelCompatibility {
-  image: DirectorCapabilityResult
+  /** Flat fields remain readable for legacy combined-image clients. */
+  image: DirectorCapabilityResult & {
+    creator: DirectorImageRoleCapabilityResult
+    editor: DirectorImageRoleCapabilityResult
+  }
   video: Record<DirectorPipelineType | 'seamless', DirectorCapabilityResult>
   supports_audio_input: boolean
   generates_audio: boolean
@@ -188,6 +198,18 @@ export interface LoraParameterSchema {
   parameters: LoraParameterDefinition[]
 }
 
+/**
+ * Director's new image-role wire is intentionally independent from the
+ * legacy Studio LoRA blob. `id` is the server-catalog filename, and a
+ * schema-backed selection carries the exact current digest plus values.
+ */
+export interface DirectorImageRoleLoraSelection {
+  id: string
+  multiplier: number
+  parameter_schema_digest?: string
+  parameter_values?: Record<string, LoraParameterValue>
+}
+
 export interface ProjectReferenceAdditionalLora {
   id: string
   multiplier: number
@@ -322,6 +344,9 @@ export interface ProjectReferencePackPlan {
   detail_callouts?: ProjectReferencePlannedDetailCallout[]
   authored_settings?: {
     seal: string
+    /** Present on current plans; raw authored style remains owner-private. */
+    style_present?: boolean
+    style_commitment?: string
     type_fields: Array<{
       field: string
       items: Array<Pick<ProjectReferenceTypeFieldItem, 'id' | 'custom' | 'group'>>
@@ -467,6 +492,8 @@ export interface GenerateParams {
   h3_ref2va_terms_accepted?: boolean
   /** One-shot durable server-side preparation before this generation. */
   enhance_before_generate?: boolean
+  /** Exact server-catalog ID; never a client-authored workflow object/brief. */
+  h3_style_workflow?: string
   h3_segment_overrides?: Array<{
     model_type: 'minimax_h3' | 'minimax_h3_pinkcherry_fl2va' | 'minimax_h3_w4a8_fl2va' | 'minimax_h3_ref2va'
     drop_semantic_refs?: boolean
@@ -1645,7 +1672,13 @@ export interface SavedPipelineState extends DirectorRecoveryMetadata {
   reference_image_path: string | null
   auto_mode: boolean
   seamless: boolean
-  image_model: string
+  /** Present only on legacy combined-image checkpoints. */
+  image_model?: string
+  /** New role checkpoints preserve the automatic null sentinel as submitted. */
+  image_creator_model?: string | null
+  image_editor_model?: string | null
+  image_creator_loras?: DirectorImageRoleLoraSelection[]
+  image_editor_loras?: DirectorImageRoleLoraSelection[]
   video_model: string
   /** Effective saved behavior. Missing on legacy projects, which require images. */
   shot_image_policy?: DirectorShotImagePolicy

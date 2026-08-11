@@ -35,7 +35,6 @@ from services.reference_sheets import (
     ReferenceSheetStructureError,
     build_failed_panel_repair_plan,
     build_reference_pack_plan,
-    build_reference_pack_review_request,
     build_reference_sheet_plan,
     build_semantic_review_request,
     compose_reference_sheet,
@@ -115,6 +114,25 @@ class ReferenceSheetTests(unittest.TestCase):
         values.update(updates)
         return build_reference_pack_plan(**values)
 
+    def _pack_artifacts(self, plan, prefix="review"):
+        return tuple(
+            ReferencePackArtifact(
+                path=self._image(
+                    f"{prefix}-{index}.png",
+                    ((index * 37 + 20) % 255, 40, 60),
+                    plan.sheet_size,
+                ),
+                role=role,
+                index=index,
+                model=plan.generation_model,
+                provenance=ArtifactProvenance(
+                    "synthetic", plan.planner_version,
+                ),
+                anchor_role=plan.anchor_role,
+            )
+            for index, role in enumerate(plan.output_roles)
+        )
+
     @staticmethod
     def _pass_review():
         return {
@@ -144,6 +162,23 @@ class ReferenceSheetTests(unittest.TestCase):
             "failed_roles": list(roles),
             "reason_codes": ["identity_mismatch"],
         }
+
+    @staticmethod
+    def _rubric_observations(reference_type, roles, failures=None):
+        failures = failures or {}
+        applicability = dict(reference_sheets.fidelity_rubric_role_applicability(
+            reference_type, roles,
+        ))
+        return tuple(
+            reference_sheets.FidelityRubricObservation(
+                item.item_id,
+                "fail" if role in failures.get(item.item_id, ()) else "pass",
+                (role,) if role in failures.get(item.item_id, ()) else (),
+                role,
+            )
+            for item in reference_sheets.FIDELITY_RUBRIC
+            for role in applicability[item.item_id]
+        )
 
     def test_versioned_modes_and_ordered_role_recipes(self):
         expected = {
@@ -439,7 +474,7 @@ class ReferenceSheetTests(unittest.TestCase):
             plan,
             generate_sheet=generate,
             edit_sheet=edit,
-            reviewer=lambda _request: self._pass_review(),
+            reviewer=lambda _request: True,
         )
         self.assertEqual(len([call for call in calls if call[0] == "generate"]), 1)
         self.assertEqual(calls[0][2], "canonical_anchor")
@@ -483,7 +518,7 @@ class ReferenceSheetTests(unittest.TestCase):
                             reviewed.write_bytes(b"unowned-regular-replacement")
                         else:
                             reviewed.symlink_to(external)
-                    return self._pass_review()
+                    return True
 
                 with self.assertRaisesRegex(
                     ReferenceSheetStructureError, "sheet_stage_modified",
@@ -524,7 +559,7 @@ class ReferenceSheetTests(unittest.TestCase):
             finally:
                 os.replace(anchor, alternate)
                 os.replace(held_original, anchor)
-            return self._pass_review()
+            return True
 
         result = create_reference_pack(
             plan,
@@ -532,7 +567,13 @@ class ReferenceSheetTests(unittest.TestCase):
             edit_sheet=lambda *_args: self.fail("compact cannot edit"),
             reviewer=review,
         )
-        self.assertEqual(reviewed, [original_digest])
+        expected_calls = sum(
+            len(roles) for _item_id, roles in
+            reference_sheets.fidelity_rubric_role_applicability(
+                plan.reference_type, plan.output_roles,
+            )
+        )
+        self.assertEqual(reviewed, [original_digest] * expected_calls)
         self.assertNotEqual(reviewed[0], alternate_digest)
         self.assertEqual(result.review.artifact_seals[0].sha256, reviewed[0])
         self.assertEqual(self._digest(anchor), original_digest)
@@ -544,7 +585,7 @@ class ReferenceSheetTests(unittest.TestCase):
             plan,
             generate_sheet=lambda _request: anchor,
             edit_sheet=lambda *_args: self.fail("compact cannot edit"),
-            reviewer=lambda _request: self._pass_review(),
+            reviewer=lambda _request: True,
         )
         self.assertEqual(len(result.review.artifact_seals), 1)
         seal = result.review.artifact_seals[0]
@@ -598,9 +639,7 @@ class ReferenceSheetTests(unittest.TestCase):
         def review(_request):
             nonlocal review_count
             review_count += 1
-            if review_count == 1:
-                return self._fail_review(plan.anchor_role)
-            return self._pass_review()
+            return review_count != 1
 
         result = create_reference_pack(
             plan,
@@ -635,14 +674,20 @@ class ReferenceSheetTests(unittest.TestCase):
         anchor_digest = self._digest(anchor)
         original_digest = self._digest(original_callout)
         review_count = 0
+        failed_once = False
         repairs = []
 
-        def review(_request):
-            nonlocal review_count
+        def review(request):
+            nonlocal review_count, failed_once
             review_count += 1
-            if review_count == 1:
-                return self._fail_review(plan.detail_callouts[0].target_role)
-            return self._pass_review()
+            if (
+                not failed_once
+                and request.item_id == "authored_callouts"
+                and request.target_role == plan.detail_callouts[0].target_role
+            ):
+                failed_once = True
+                return False
+            return True
 
         def repair(primary, canonical, request):
             repairs.append((primary, canonical, request))
@@ -812,7 +857,7 @@ class ReferenceSheetTests(unittest.TestCase):
             generate_sheet=generate,
             edit_sheet=lambda *_args: self.fail("draft cannot edit"),
             repair_sheet=lambda *_args: self.fail("draft cannot repair"),
-            reviewer=lambda request: self._fail_review(request.sheet_roles[-1]),
+            reviewer=lambda request: request.target_role != request.sheet_roles[-1],
             max_repair_attempts=5,
         )
         self.assertEqual([item.strategy for item in requests], ["draft_one_shot"] * 2)
@@ -857,7 +902,7 @@ class ReferenceSheetTests(unittest.TestCase):
             plan,
             generate_sheet=lambda _request: anchor,
             edit_sheet=edit,
-            reviewer=lambda _request: self._pass_review(),
+            reviewer=lambda _request: True,
         )
         detail = next(item for item in result.artifacts if item.role.startswith(
             "detail_callout:builtin:face"
@@ -919,6 +964,156 @@ class ReferenceSheetTests(unittest.TestCase):
         })
         self.assertNotEqual(plan.plan_seal, relabeled.plan_seal)
 
+    def test_v2_authored_style_is_normalized_private_and_commitment_only_public(self):
+        private_style = "PRIVATE ETCHED INK STYLE"
+        plan = self._pack_plan(
+            style=f"  {private_style}  ",
+            style_commitment="a" * 64,
+        )
+        private = plan.private_authored_settings()
+        public = plan.public_preview()["authored_settings"]
+        self.assertEqual(private["style"], private_style)
+        self.assertTrue(public["style_present"])
+        self.assertEqual(public["style_commitment"], "a" * 64)
+        self.assertNotIn(private_style, json.dumps(public))
+        self.assertEqual(
+            reference_sheets.reference_pack_authored_settings_seal(private),
+            plan.authored_settings_seal,
+        )
+        changed = copy.deepcopy(private)
+        changed["style"] = "PRIVATE DIFFERENT STYLE"
+        self.assertNotEqual(
+            reference_sheets.reference_pack_authored_settings_seal(changed),
+            plan.authored_settings_seal,
+        )
+        with self.assertRaisesRegex(ValueError, "commitment"):
+            self._pack_plan(style=private_style)
+        with self.assertRaisesRegex(ValueError, "style_commitment"):
+            self._pack_plan(
+                style=private_style, style_commitment="not-a-commitment",
+            )
+
+    def test_v2_authored_contract_conditions_generation_repair_and_isolated_review(self):
+        private_style = "PRIVATE ADULT COPPERPLATE NOCTURNE"
+        private_type_label = "PRIVATE INTIMATE INJURY SILHOUETTE"
+        private_callout_label = "PRIVATE GRAPHIC WOUND IRIS FILIGREE"
+        plan = self._pack_plan(
+            depth="standard",
+            style=private_style,
+            style_commitment="b" * 64,
+            type_fields={
+                "poses": [{
+                    "id": "custom:0123456789abcdef",
+                    "label": private_type_label,
+                    "custom": True,
+                    "group": "poses",
+                }],
+            },
+            detail_callouts=[{
+                "custom_id": "custom:abcdef0123456789",
+                "label": private_callout_label,
+                "kind": "custom",
+                "operation": "enhance",
+                "source_role": "canonical_identity",
+            }],
+        )
+        callback_requests = []
+        review_requests = []
+
+        def generate(request):
+            callback_requests.append(request)
+            self.assertEqual(request.authored_contract.style, private_style)
+            return self._image(
+                f"authored-{request.index}.png", (21, 22, 23), plan.sheet_size,
+            )
+
+        def edit(_primary, _canonical, request):
+            callback_requests.append(request)
+            return self._image(
+                f"authored-{request.index}-{len(callback_requests)}.png",
+                (request.index + 30, 31, 32), plan.sheet_size,
+            )
+
+        def reviewer(request):
+            review_requests.append(request)
+            contract = request.authored_contract
+            self.assertRegex(contract.contract_seal, r"^[0-9a-f]{64}$")
+            if request.item_id in {"style_language", "materials_palette"}:
+                return contract.style == private_style
+            self.assertIsNone(contract.style)
+            if request.item_id in {
+                "identity_anchor", "structural_proportions", "authored_details",
+                "anatomy_callouts", "pose_view", "cross_sheet_continuity",
+            } and request.target_role in plan.sheet_roles:
+                return any(
+                    item.label == private_type_label
+                    for _field, items in contract.type_fields for item in items
+                )
+            if request.item_id == "authored_callouts":
+                return (
+                    len(contract.detail_callouts) == 1
+                    and contract.detail_callouts[0].label == private_callout_label
+                )
+            self.assertEqual(contract.type_fields, ())
+            self.assertEqual(contract.detail_callouts, ())
+            return True
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=generate,
+            edit_sheet=edit,
+            reviewer=reviewer,
+        )
+        self.assertEqual(result.review.status, "pass")
+        by_role = {request.role: request for request in callback_requests}
+        base_contract = by_role[plan.sheet_roles[1]].authored_contract
+        self.assertEqual(base_contract.style, private_style)
+        self.assertEqual(
+            base_contract.type_fields[0][1][0].label, private_type_label,
+        )
+        self.assertEqual(base_contract.detail_callouts, ())
+        detail_contract = by_role[plan.detail_callouts[0].target_role].authored_contract
+        self.assertEqual(detail_contract.style, private_style)
+        self.assertEqual(detail_contract.type_fields, ())
+        self.assertEqual(
+            detail_contract.detail_callouts[0].label, private_callout_label,
+        )
+
+        assessment = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", plan.output_roles, {
+                "materials_palette": (plan.sheet_roles[1],),
+            }),
+            reference_type="character",
+            allowed_roles=plan.output_roles,
+        )
+        brief = reference_sheets.build_fidelity_correction_brief(assessment)
+        repair_request = reference_sheets._pack_repair_request(
+            plan, plan.sheets[1], assessment, brief,
+        )
+        self.assertEqual(repair_request.authored_contract, base_contract)
+        forged_item = replace(
+            base_contract.type_fields[0][1][0], label="TAMPERED",
+        )
+        forged_contract = replace(
+            base_contract,
+            type_fields=((base_contract.type_fields[0][0], (forged_item,)),),
+        )
+        with self.assertRaisesRegex(ValueError, "authored request contract is invalid"):
+            reference_sheets._validate_pack_authored_request_contract(
+                forged_contract,
+            )
+        public = json.dumps(result.public_metadata())
+        for secret in (private_style, private_type_label, private_callout_label):
+            self.assertNotIn(secret, public)
+        contract_field_names = " ".join(
+            next(iter(review_requests)).authored_contract.__dataclass_fields__
+        ).casefold()
+        for category_field in (
+            "mature", "violent", "safety", "permissibility", "classification",
+        ):
+            self.assertNotIn(category_field, contract_field_names)
+        self.assertTrue(review_requests)
+
     def test_v2_legacy_type_field_is_one_lossless_item(self):
         authored = "Views: front, profile; Expressions: calm, tense"
         plan = self._pack_plan(
@@ -938,7 +1133,7 @@ class ReferenceSheetTests(unittest.TestCase):
                 "legacy-pack.png", (1, 2, 3), size=plan.sheet_size,
             ),
             edit_sheet=lambda *_args: self.fail("compact pack must not edit"),
-            reviewer=lambda _request: self._pass_review(),
+            reviewer=lambda _request: True,
         )
         self.assertEqual(result.plan.private_authored_settings()["type_fields"], {
             "poses": [item],
@@ -980,7 +1175,7 @@ class ReferenceSheetTests(unittest.TestCase):
             plan,
             generate_sheet=lambda _request: anchor,
             edit_sheet=edit,
-            reviewer=lambda _request: self._pass_review(),
+            reviewer=lambda _request: True,
         )
         self.assertEqual(tuple(item.role for item in result.artifacts), plan.output_roles)
         detail_calls = [call for call in edit_calls if call[0].detail_custom_id]
@@ -1046,7 +1241,7 @@ class ReferenceSheetTests(unittest.TestCase):
             plan,
             generate_sheet=lambda _request: anchor,
             edit_sheet=edit,
-            reviewer=lambda _request: self._pass_review(),
+            reviewer=lambda _request: True,
         )
         public = json.dumps({
             "pack": result.public_metadata(),
@@ -1149,6 +1344,540 @@ class ReferenceSheetTests(unittest.TestCase):
             )
         self.assertFalse((self.outputs / "bad-draft.png").exists())
 
+    def test_v2_rubric_questions_are_isolated_boolean_only_and_history_free(self):
+        roles = ("turnaround", "detail_callout:face")
+        paths = (self.sources / "one.png", self.sources / "two.png")
+        first = reference_sheets.build_fidelity_rubric_question(
+            item_id="style_language",
+            reference_type="character",
+            creative_request="PRIVATE AUTHOR REQUEST",
+            sheet_paths=paths,
+            sheet_roles=roles,
+            target_role=roles[0],
+        )
+        second = reference_sheets.build_fidelity_rubric_question(
+            item_id="authored_callouts",
+            reference_type="character",
+            creative_request="PRIVATE AUTHOR REQUEST",
+            sheet_paths=paths,
+            sheet_roles=roles,
+            target_role=roles[1],
+        )
+        self.assertEqual(first.response_schema, {"type": "boolean"})
+        schema = second.response_schema
+        self.assertIsInstance(schema, dict)
+        self.assertEqual(tuple(schema), ("type",))
+        self.assertEqual(tuple(schema.keys()), ("type",))
+        self.assertEqual(tuple(schema.items()), (("type", "boolean"),))
+        self.assertEqual(tuple(schema.values()), ("boolean",))
+        self.assertEqual(schema["type"], "boolean")
+        self.assertIsNone(schema.get("properties"))
+        with self.assertRaises(KeyError):
+            _ = schema["properties"]
+        self.assertEqual(json.dumps(schema), '{"type": "boolean"}')
+        self.assertIs(copy.copy(schema), schema)
+        self.assertIs(copy.deepcopy(schema), schema)
+        with self.assertRaisesRegex(TypeError, "immutable"):
+            schema["type"] = "object"
+        with self.assertRaisesRegex(TypeError, "immutable"):
+            schema.update({"properties": {}})
+        with self.assertRaisesRegex(TypeError, "immutable"):
+            schema.setdefault("properties", {})
+        with self.assertRaisesRegex(TypeError, "immutable"):
+            schema.pop("type")
+        with self.assertRaisesRegex(TypeError, "immutable"):
+            schema.clear()
+        forged_schema = replace(
+            second,
+            response_schema={
+                "type": "boolean",
+                "properties": {"checks": {"required": ["violent_register_fidelity"]}},
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "rubric question is invalid"):
+            reference_sheets.record_fidelity_rubric_answer(
+                forged_schema, True,
+            )
+        self.assertNotEqual(first.question, second.question)
+        self.assertNotIn(first.question, second.instruction)
+        self.assertNotIn(first.question, second.question)
+        self.assertNotIn("attempt", second.instruction.casefold())
+        self.assertNotIn("tolerance", second.instruction.casefold())
+        for forbidden_field in ("history", "messages", "prior_answer", "grade"):
+            self.assertNotIn(forbidden_field, second.__dataclass_fields__)
+        for value, expected in ((True, True), (False, False), ("true", True)):
+            with self.subTest(value=value):
+                self.assertIs(
+                    reference_sheets.parse_fidelity_rubric_answer(value), expected,
+                )
+        bound = reference_sheets.record_fidelity_rubric_answer(second, False)
+        self.assertEqual(bound.item_id, "authored_callouts")
+        self.assertEqual(bound.outcome, "fail")
+        self.assertEqual(bound.affected_roles, (roles[1],))
+        self.assertEqual(bound.reviewed_role, roles[1])
+        for invalid in (
+            1, "exact", "true\nreview prose", {"answer": True},
+            {"grade": "minor_residual"}, self._pass_review(), None,
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    reference_sheets.ReferenceSheetReviewError,
+                    "review_unavailable",
+                ):
+                    reference_sheets.parse_fidelity_rubric_answer(invalid)
+
+    def test_v2_mapping_answer_fails_once_without_legacy_fanout(self):
+        plan = self._pack_plan(depth="custom", sheet_count=2)
+        artifacts = self._pack_artifacts(plan, "mapping-rejected")
+        requests = []
+
+        def legacy_mapping(request):
+            requests.append(request)
+            return self._pass_review()
+
+        result = reference_sheets.review_reference_pack(
+            plan, artifacts, legacy_mapping,
+        )
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(result.status, "review_unavailable")
+        self.assertIsNone(result.fidelity_assessment)
+        self.assertIsNone(result.fidelity_accepted)
+
+    def test_v2_pack_review_exact_call_matrix_isolated_and_cache_equivalent(self):
+        plan = self._pack_plan(depth="custom", sheet_count=2)
+        artifacts = self._pack_artifacts(plan, "matrix")
+        expected = tuple(
+            (item_id, role)
+            for item_id, roles in
+            reference_sheets.fidelity_rubric_role_applicability(
+                plan.reference_type, plan.output_roles,
+            )
+            for role in roles
+        )
+        direct_requests = []
+        cached_requests = []
+
+        def direct(request):
+            direct_requests.append(request)
+            return True
+
+        cache = {pair: "true" for pair in expected}
+
+        def cached(request):
+            cached_requests.append(request)
+            return cache[(request.item_id, request.target_role)]
+
+        direct_result = reference_sheets.review_reference_pack(
+            plan, artifacts, direct,
+        )
+        cached_result = reference_sheets.review_reference_pack(
+            plan, artifacts, cached,
+        )
+        for requests in (direct_requests, cached_requests):
+            self.assertEqual(
+                tuple((item.item_id, item.target_role) for item in requests),
+                expected,
+            )
+            self.assertEqual(len(requests), len(expected))
+            for request in requests:
+                self.assertEqual(request.response_schema, {"type": "boolean"})
+                self.assertIn(request.target_role, request.question)
+                for forbidden in (
+                    "history", "messages", "prior_answer", "prior_question",
+                ):
+                    self.assertNotIn(forbidden, request.__dataclass_fields__)
+        self.assertEqual(
+            direct_result.fidelity_assessment,
+            cached_result.fidelity_assessment,
+        )
+        self.assertTrue(direct_result.fidelity_accepted)
+        self.assertEqual(direct_result.status, "pass")
+        self.assertIsNotNone(direct_result.fidelity_assessment)
+
+    def test_v2_create_pack_strict_attempt_zero_then_accepts_minor_retry(self):
+        plan = self._pack_plan(depth="custom", sheet_count=2)
+        anchor = self._image("strict-anchor.png", (20, 30, 40))
+        derivative = self._image("strict-derivative.png", (50, 60, 70))
+        repaired = self._image("strict-repaired.png", (80, 90, 100))
+        calls = []
+        repairs = []
+
+        def reviewer(request):
+            calls.append((request.item_id, request.target_role))
+            return not (
+                request.item_id == "materials_palette"
+                and request.target_role == plan.output_roles[1]
+            )
+
+        def repair(primary, canonical, request):
+            repairs.append((primary, canonical, request))
+            return repaired
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=lambda _request: anchor,
+            edit_sheet=lambda *_args: derivative,
+            reviewer=reviewer,
+            repair_sheet=repair,
+            max_repair_attempts=1,
+        )
+        calls_per_attempt = sum(
+            len(roles) for _item_id, roles in
+            reference_sheets.fidelity_rubric_role_applicability(
+                plan.reference_type, plan.output_roles,
+            )
+        )
+        self.assertEqual(len(calls), calls_per_attempt * 2)
+        self.assertEqual(len(repairs), 1)
+        repair_request = repairs[0][2]
+        self.assertRegex(
+            repair_request.correction_brief_commitment, r"^[0-9a-f]{64}$",
+        )
+        self.assertIn(
+            repair_request.correction_brief, repair_request.objective,
+        )
+        self.assertEqual(result.repaired_roles, (plan.output_roles[1],))
+        self.assertEqual(result.review.status, "pass")
+        self.assertTrue(result.review.fidelity_accepted)
+        self.assertEqual(result.review.fidelity_attempt_index, 1)
+        self.assertEqual(
+            result.review.fidelity_assessment.worst_severity,
+            "minor_residual",
+        )
+        self.assertEqual(result.review.fidelity_assessment.status, "fail")
+        public_review = result.public_metadata()["review"]
+        self.assertTrue(public_review["accepted"])
+        self.assertEqual(public_review["attempt_index"], 1)
+        self.assertEqual(
+            public_review["assessment"]["assessment_class"],
+            "minor_residual",
+        )
+
+    def test_v2_all_types_localize_roles_world_composition_and_neutral_path(self):
+        prohibited = (
+            "mature", "violent", "safety", "permissibility", "policy",
+            "moderation", "refusal",
+        )
+        for reference_type in reference_sheets.PACK_REFERENCE_TYPES:
+            with self.subTest(reference_type=reference_type):
+                plan = self._pack_plan(
+                    reference_type=reference_type,
+                    depth="compact",
+                    creative_request=(
+                        "Preserve every authored intimate, injury, and material detail."
+                    ),
+                )
+                artifacts = self._pack_artifacts(plan, f"type-{reference_type}")
+                seen = []
+
+                def reviewer(request):
+                    seen.append(request)
+                    return request.item_id != "authored_details"
+
+                result = reference_sheets.review_reference_pack(
+                    plan, artifacts, reviewer,
+                )
+                neutral_plan = self._pack_plan(
+                    reference_type=reference_type,
+                    depth="compact",
+                    creative_request="Preserve every authored design detail.",
+                )
+                neutral_seen = []
+                neutral_result = reference_sheets.review_reference_pack(
+                    neutral_plan,
+                    self._pack_artifacts(neutral_plan, f"neutral-{reference_type}"),
+                    lambda request: neutral_seen.append(request) or True,
+                )
+                expected = tuple(
+                    (item_id, role)
+                    for item_id, roles in
+                    reference_sheets.fidelity_rubric_role_applicability(
+                        reference_type, plan.output_roles,
+                    )
+                    for role in roles
+                )
+                self.assertEqual(
+                    tuple((item.item_id, item.target_role) for item in seen),
+                    expected,
+                )
+                self.assertEqual(result.failed_roles, plan.output_roles)
+                self.assertEqual(neutral_result.status, "pass")
+                self.assertEqual(
+                    tuple(
+                        (
+                            item.item_id, item.target_role, item.instruction,
+                            item.question, item.authored_contract,
+                            tuple(item.response_schema.items()),
+                        )
+                        for item in seen
+                    ),
+                    tuple(
+                        (
+                            item.item_id, item.target_role, item.instruction,
+                            item.question, item.authored_contract,
+                            tuple(item.response_schema.items()),
+                        )
+                        for item in neutral_seen
+                    ),
+                )
+                active_contract = json.dumps([
+                    {
+                        "instruction": item.instruction,
+                        "question": item.question,
+                        "schema": item.response_schema,
+                    }
+                    for item in seen
+                ]).casefold()
+                for word in prohibited:
+                    self.assertNotIn(word, active_contract)
+                    self.assertNotIn(
+                        word,
+                        " ".join(seen[0].__dataclass_fields__).casefold(),
+                    )
+                if reference_type == "world":
+                    self.assertIn(
+                        ("pose_view", plan.output_roles[0]), expected,
+                    )
+
+    def test_v2_forged_assessment_and_brief_fail_at_consumers(self):
+        roles = ("turnaround", "expressions")
+        assessment = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles, {
+                "materials_palette": (roles[0],),
+            }),
+            reference_type="character",
+            allowed_roles=roles,
+        )
+        forged_dimension = replace(
+            assessment.dimensions[0], matched_weight=999,
+        )
+        forged = replace(
+            assessment,
+            dimensions=(forged_dimension, *assessment.dimensions[1:]),
+        )
+        consumers = (
+            lambda: forged.public_metadata(),
+            lambda: reference_sheets.fidelity_attempt_accepted(
+                forged, attempt_index=1,
+            ),
+            lambda: reference_sheets.build_fidelity_correction_brief(forged),
+            lambda: reference_sheets.reference_candidate_ranking_key(
+                reference_sheets.ReferenceCandidateAssessment(0, forged, 0),
+            ),
+        )
+        for consumer in consumers:
+            with self.subTest(consumer=consumer):
+                with self.assertRaisesRegex(ValueError, "assessment is invalid"):
+                    consumer()
+        brief = reference_sheets.build_fidelity_correction_brief(assessment)
+        forged_brief = replace(brief, commitment="0" * 64)
+        with self.assertRaisesRegex(ValueError, "correction brief is invalid"):
+            forged_brief.public_metadata()
+        with self.assertRaisesRegex(ValueError, "correction brief is invalid"):
+            reference_sheets._validate_fidelity_correction_brief(
+                assessment, forged_brief,
+            )
+
+    def test_v2_server_projection_is_weighted_and_deterministic(self):
+        roles = ("composition_language",)
+        observations = self._rubric_observations("world", roles, {
+            "materials_palette": roles,
+            "authored_details": roles,
+        })
+        first = reference_sheets.project_fidelity_assessment(
+            observations, reference_type="world", allowed_roles=roles,
+        )
+        second = reference_sheets.project_fidelity_assessment(
+            observations, reference_type="world", allowed_roles=roles,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first.version, "fidelity_assessment_v2")
+        self.assertEqual(first.rubric_version, "reference-fidelity-rubric-v1")
+        by_dimension = {item.dimension: item for item in first.dimensions}
+        self.assertEqual(
+            tuple(by_dimension),
+            ("style", "identity_structure", "details_register", "pose_view_continuity"),
+        )
+        self.assertEqual(by_dimension["style"].grade, "minor_residual")
+        self.assertEqual(
+            (by_dimension["style"].matched_weight, by_dimension["style"].applicable_weight),
+            (3, 5),
+        )
+        self.assertEqual(by_dimension["details_register"].grade, "material_residual")
+        self.assertEqual(by_dimension["pose_view_continuity"].grade, "exact")
+        public = first.public_metadata()
+        self.assertEqual(public["status"], "fail")
+        self.assertEqual(public["score_basis_points"], 7222)
+        self.assertEqual(public["dimension_checks"], {
+            "identity_structure": True,
+            "pose_view_continuity": True,
+            "details_register": False,
+            "style": False,
+        })
+        self.assertEqual(public["failed_roles"], list(roles))
+        self.assertEqual(public["reason_codes"], [
+            "style_mismatch", "detail_register_mismatch",
+        ])
+        self.assertNotIn("PRIVATE AUTHOR REQUEST", json.dumps(public))
+        self.assertNotIn("critique", json.dumps(public).casefold())
+
+    def test_v2_projection_rejects_unavailable_or_forged_applicability(self):
+        roles = ("composition_language",)
+        observations = list(self._rubric_observations("world", roles))
+        observations[0] = replace(
+            observations[0], outcome="review_unavailable",
+        )
+        with self.assertRaisesRegex(
+            reference_sheets.ReferenceSheetReviewError, "review_unavailable",
+        ):
+            reference_sheets.project_fidelity_assessment(
+                observations, reference_type="world", allowed_roles=roles,
+            )
+        observations = list(self._rubric_observations("world", roles))
+        observations.append(reference_sheets.FidelityRubricObservation(
+            "authored_callouts", "pass", (), roles[0],
+        ))
+        with self.assertRaisesRegex(
+            reference_sheets.ReferenceSheetReviewError, "review_unavailable",
+        ):
+            reference_sheets.project_fidelity_assessment(
+                observations, reference_type="world", allowed_roles=roles,
+            )
+
+    def test_v2_retry_policy_is_separate_strict_then_bounded(self):
+        roles = ("turnaround", "expressions")
+        exact = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles),
+            reference_type="character", allowed_roles=roles,
+        )
+        minor = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles, {
+                "materials_palette": (roles[0],),
+            }),
+            reference_type="character", allowed_roles=roles,
+        )
+        material = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles, {
+                "style_language": roles,
+            }),
+            reference_type="character", allowed_roles=roles,
+        )
+        self.assertTrue(reference_sheets.fidelity_attempt_accepted(
+            exact, attempt_index=0,
+        ))
+        self.assertFalse(reference_sheets.fidelity_attempt_accepted(
+            minor, attempt_index=0,
+        ))
+        self.assertTrue(reference_sheets.fidelity_attempt_accepted(
+            minor, attempt_index=1,
+        ))
+        self.assertFalse(reference_sheets.fidelity_attempt_accepted(
+            material, attempt_index=5,
+        ))
+
+        cumulative_material = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles, {
+                "materials_palette": roles,
+                "structural_proportions": roles,
+                "anatomy_callouts": roles,
+                "cross_sheet_continuity": roles,
+            }),
+            reference_type="character", allowed_roles=roles,
+        )
+        self.assertEqual(cumulative_material.assessment_class, "material_residual")
+        self.assertEqual(cumulative_material.worst_severity, "minor_residual")
+        self.assertEqual(cumulative_material.score_basis_points, 5909)
+        self.assertFalse(reference_sheets.fidelity_attempt_accepted(
+            cumulative_material, attempt_index=1,
+        ))
+        self.assertFalse(reference_sheets.fidelity_attempt_accepted(
+            cumulative_material, attempt_index=99,
+        ))
+
+    def test_v2_correction_brief_is_closed_committed_and_deterministic(self):
+        roles = ("turnaround", "expressions")
+        assessment = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles, {
+                "materials_palette": (roles[0],),
+                "anatomy_callouts": (roles[1],),
+            }),
+            reference_type="character", allowed_roles=roles,
+        )
+        first = reference_sheets.build_fidelity_correction_brief(assessment)
+        second = reference_sheets.build_fidelity_correction_brief(assessment)
+        self.assertEqual(first, second)
+        self.assertEqual(first.template_id, "reference-residual-correction")
+        self.assertEqual(first.template_version, "v1")
+        self.assertRegex(first.commitment, r"^[0-9a-f]{64}$")
+        self.assertEqual(first.affected_roles, roles)
+        self.assertIn("authored materials", first.rendered_brief)
+        self.assertIn("authored anatomy", first.rendered_brief)
+        self.assertNotIn("reviewer", first.rendered_brief.casefold())
+        exact = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles),
+            reference_type="character", allowed_roles=roles,
+        )
+        self.assertIsNone(reference_sheets.build_fidelity_correction_brief(exact))
+
+    def test_v2_candidate_recommendation_ranking_and_ties_are_deterministic(self):
+        roles = ("turnaround", "expressions")
+        minor_one = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles, {
+                "materials_palette": (roles[0],),
+            }),
+            reference_type="character", allowed_roles=roles,
+        )
+        minor_two = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles, {
+                "materials_palette": (roles[0],),
+                "anatomy_callouts": (roles[1],),
+            }),
+            reference_type="character", allowed_roles=roles,
+        )
+        exact = reference_sheets.project_fidelity_assessment(
+            self._rubric_observations("character", roles),
+            reference_type="character", allowed_roles=roles,
+        )
+        candidates = (
+            reference_sheets.ReferenceCandidateAssessment(8, minor_two, 0),
+            reference_sheets.ReferenceCandidateAssessment(6, minor_one, 2),
+            reference_sheets.ReferenceCandidateAssessment(7, minor_one, 1),
+        )
+        higher_score_key = reference_sheets.reference_candidate_ranking_key(
+            candidates[2],
+        )
+        lower_score_key = reference_sheets.reference_candidate_ranking_key(
+            candidates[0],
+        )
+        self.assertEqual(higher_score_key[:2], lower_score_key[:2])
+        self.assertLess(higher_score_key[2], lower_score_key[2])
+        self.assertEqual(len(higher_score_key), 6)
+        self.assertEqual(
+            reference_sheets.recommend_reference_candidate(tuple(reversed(candidates))).candidate_index,
+            7,
+        )
+        exact_candidates = (
+            reference_sheets.ReferenceCandidateAssessment(4, exact, 1),
+            reference_sheets.ReferenceCandidateAssessment(2, exact, 1),
+        )
+        self.assertEqual(
+            reference_sheets.recommend_reference_candidate(exact_candidates).candidate_index,
+            2,
+        )
+        self.assertEqual(
+            reference_sheets.recommend_reference_candidate(
+                (*candidates, exact_candidates[0]),
+            ).candidate_index,
+            4,
+        )
+        with self.assertRaisesRegex(ValueError, "unique"):
+            reference_sheets.recommend_reference_candidate((
+                candidates[0],
+                reference_sheets.ReferenceCandidateAssessment(
+                    candidates[0].candidate_index, minor_one, 0,
+                ),
+            ))
+
     def test_review_request_and_strict_parser_are_fidelity_only(self):
         plan = self._plan()
         request = build_semantic_review_request(plan, self.outputs / "sheet.png")
@@ -1157,8 +1886,12 @@ class ReferenceSheetTests(unittest.TestCase):
         self.assertIn("view", request.instruction)
         self.assertIn("accessories", request.instruction)
         self.assertIn("style", request.instruction)
-        self.assertIn("Do not perform content moderation", request.instruction)
-        self.assertIn("permissibility", request.instruction)
+        active_instruction = request.instruction.casefold()
+        for obsolete in (
+            "moderation", "maturity", "mature", "violent", "safety",
+            "policy", "permissibility", "classification",
+        ):
+            self.assertNotIn(obsolete, active_instruction)
         parsed = parse_semantic_review_result(
             json.dumps(self._pass_review()), allowed_roles=plan.panel_roles,
         )
@@ -1180,7 +1913,7 @@ class ReferenceSheetTests(unittest.TestCase):
         with self.assertRaises(ReferenceSheetReviewError):
             parse_semantic_review_result(invalid, allowed_roles=plan.panel_roles)
 
-    def test_unrestricted_pack_review_is_bounded_authored_register_fidelity_qa(self):
+    def test_legacy_unrestricted_review_is_read_compatibility_only(self):
         with self.assertRaises(ValueError):
             self._pack_plan(
                 content_capability="unrestricted_local",
@@ -1193,33 +1926,20 @@ class ReferenceSheetTests(unittest.TestCase):
                 "chosen-vlm", "chosen-vlm", "local", "a" * 64,
             ),
         )
-        artifact = ReferencePackArtifact(
-            path=self._image("unrestricted-review.png", (20, 40, 60), plan.sheet_size),
-            role=plan.output_roles[0],
-            index=0,
-            model=plan.generation_model,
-            provenance=ArtifactProvenance("local_generation", plan.planner_version),
-            anchor_role=plan.anchor_role,
-        )
-        request = build_reference_pack_review_request(plan, (artifact,))
-        checks = request.response_schema["properties"]["checks"]["required"]
-        self.assertEqual(checks[-4:], [
+        self.assertFalse(hasattr(
+            reference_sheets, "build_reference_pack_review_request",
+        ))
+        checks = reference_sheets._UNRESTRICTED_CHECK_NAMES
+        self.assertEqual(checks[-4:], (
             "overall_fidelity",
             "mature_register_fidelity",
             "violent_register_fidelity",
             "detail_register_fidelity",
-        ])
-        self.assertIn("explicitly requested by the author", request.instruction)
-        self.assertIn("without inference", request.instruction)
-        for prohibited in (
-            "content moderation", "permissibility decisions",
-            "maturity classification", "refusal analysis",
-        ):
-            self.assertIn(prohibited, request.instruction)
+        ))
         payload = {
             "status": "fail",
             "checks": {name: name != "detail_register_fidelity" for name in checks},
-            "failed_roles": [artifact.role],
+            "failed_roles": [plan.output_roles[0]],
             "reason_codes": ["detail_register_mismatch"],
         }
         parsed = parse_semantic_review_result(
@@ -1227,7 +1947,7 @@ class ReferenceSheetTests(unittest.TestCase):
             allowed_roles=plan.output_roles,
             check_names=checks,
         )
-        self.assertEqual(parsed.failed_roles, (artifact.role,))
+        self.assertEqual(parsed.failed_roles, (plan.output_roles[0],))
         self.assertEqual(parsed.reason_codes, ("detail_register_mismatch",))
         payload["critique"] = "must never cross the strict contract"
         with self.assertRaises(ReferenceSheetReviewError):

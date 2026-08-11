@@ -46,7 +46,7 @@ export function SettingsDrawer() {
       )}
 
       {/* Drawer */}
-      <div className={`fixed top-0 left-0 flex h-[100dvh] w-full flex-col border-r border-border bg-bg-secondary pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)] z-50 transform transition-transform duration-300 ease-in-out md:w-[420px] ${
+      <div className={`fixed top-0 left-0 flex h-[100dvh] w-full flex-col border-r border-border bg-bg-secondary pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)] z-50 transform transition-transform duration-300 ease-in-out md:w-[clamp(460px,24vw,560px)] ${
         settingsOpen ? 'translate-x-0' : '-translate-x-full'
       }`}>
         {/* Header */}

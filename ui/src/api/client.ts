@@ -1,5 +1,6 @@
 import type {
   ArtifactClass,
+  DirectorImageRoleLoraSelection,
   DirectorRecoveryMetadata,
   OutputArtifactScope,
   OutputSearchFilters,
@@ -28,6 +29,7 @@ import type {
   ProjectReferenceTypeFields,
   ProjectReferenceTypeFieldItem,
   ScailResolutionProfile,
+  LoraInfo,
 } from '../types'
 
 export type {
@@ -507,6 +509,40 @@ export async function fetchModelDownloads(): Promise<{ downloads: Record<string,
   return res.json()
 }
 
+export async function waitForModelDownloadTerminal(
+  modelType: string,
+  options: {
+    isCurrent: () => boolean
+    pollIntervalMs?: number
+    wait?: (milliseconds: number) => Promise<void>
+    onStatus?: (status: ModelDownloadStatus) => void
+  },
+): Promise<{ status: 'completed' | 'failed' | 'cancelled'; error: string | null }> {
+  const wait = options.wait ?? (milliseconds => new Promise(resolve => {
+    globalThis.setTimeout(resolve, milliseconds)
+  }))
+  while (options.isCurrent()) {
+    let snapshot: Awaited<ReturnType<typeof fetchModelDownloads>>
+    try {
+      snapshot = await fetchModelDownloads()
+    } catch {
+      if (!options.isCurrent()) return { status: 'cancelled', error: null }
+      await wait(options.pollIntervalMs ?? 1000)
+      continue
+    }
+    if (!options.isCurrent()) return { status: 'cancelled', error: null }
+    const current = snapshot.downloads[modelType]
+    if (current) {
+      options.onStatus?.(current.status)
+      if (current.status === 'completed' || current.status === 'failed') {
+        return { status: current.status, error: current.error }
+      }
+    }
+    await wait(options.pollIntervalMs ?? 1000)
+  }
+  return { status: 'cancelled', error: null }
+}
+
 // --- Resolutions ---
 
 export async function fetchResolutions(): Promise<ApiResolution[]> {
@@ -613,19 +649,43 @@ export async function fetchH3EvaluationCatalog(): Promise<{
   return res.json()
 }
 
-export async function fetchH3StyleWorkflows(): Promise<{
+export interface H3StyleWorkflowProvenance {
+  workflow_identity_source: 'official_minimax_h3_skill'
+  workflow_source: string
+  prompt_brief_provenance: 'maestro_adapted'
+  surface: 'huggingface_hub_canvas'
+  supported_prompt_schemas: string[]
+  supported_h3_modes: string[]
+  supported_model_types: string[]
+}
+
+export interface H3StyleWorkflowCatalogStyle {
+  id: string
+  label: string
+  description: string
+  /** Display-only server metadata. Never submit this client-authored. */
+  prompt_brief: string
+  workflow_identity_source: 'official_minimax_h3_skill'
+  workflow_source: string
+  prompt_brief_provenance: 'maestro_adapted'
+  surface: 'huggingface_hub_canvas'
+  supported_prompt_schemas: string[]
+  supported_h3_modes: string[]
+}
+
+export interface H3StyleWorkflowCatalog {
   source: string
   revision: string
+  source_revision: string
   checked_at: number | null
   update_status: 'updated' | 'cached' | 'bundled_fallback' | 'offline_fallback'
   update_error?: string
-  styles: Array<{
-    id: string
-    label: string
-    description: string
-    prompt_brief: string
-  }>
-}> {
+  supported_model_types: string[]
+  provenance: H3StyleWorkflowProvenance
+  styles: H3StyleWorkflowCatalogStyle[]
+}
+
+export async function fetchH3StyleWorkflows(): Promise<H3StyleWorkflowCatalog> {
   const res = await fetch(`${BASE}/api/v1/h3/style-workflows`)
   if (!res.ok) throw new Error('H3 style catalog is unavailable')
   return res.json()
@@ -951,6 +1011,13 @@ export interface AccessContext {
   share_flow: string
 }
 
+export function getDirectorHostActionAccessState(
+  context: AccessContext | null,
+): 'loading' | 'local' | 'lan' {
+  if (context === null) return 'loading'
+  return context.machine_controls ? 'local' : 'lan'
+}
+
 let accessContextRequest: Promise<AccessContext> | null = null
 
 export async function fetchAccessContext(): Promise<AccessContext> {
@@ -1133,6 +1200,13 @@ const PROJECT_REFERENCE_ASSET_TYPE_ALIASES: Record<string, ProjectReferenceAsset
 
 export function normalizeProjectReferenceAssetType(value: unknown): ProjectReferenceAssetType | null {
   return typeof value === 'string' ? PROJECT_REFERENCE_ASSET_TYPE_ALIASES[value] ?? null : null
+}
+
+export function getDirectorProjectReferenceKind(
+  value: unknown,
+): 'character' | 'location' | null {
+  const normalized = normalizeProjectReferenceAssetType(value)
+  return normalized === 'character' || normalized === 'location' ? normalized : null
 }
 
 const PROJECT_REFERENCE_ANCHOR_PRIVACY_VALUES: readonly ProjectReferenceAnchorPrivacy[] = [
@@ -1324,6 +1398,8 @@ export interface ProjectReferenceGenerationSettings {
   content_capability?: 'standard' | 'unrestricted_local'
   initial_blur?: boolean
   intelligence_policy?: 'standard_auto' | 'uncensored_auto'
+  /** Exact authored style; owner-private replay restores this on Retry/Edit. */
+  style?: string
 }
 
 export interface FreshProjectReferenceGenerationRequest extends ProjectReferenceGenerationSettings {
@@ -1336,7 +1412,6 @@ export interface FreshProjectReferenceGenerationRequest extends ProjectReference
   tags?: string[]
   poses?: string
   outfits?: string
-  style?: string
   genre?: string
 }
 
@@ -1449,6 +1524,8 @@ export interface ProjectReferenceAuthoringSnapshot {
   variant_id: string
   authored_settings: {
     seal: string
+    /** Absent only for legacy snapshots created before exact style replay. */
+    style?: string
     type_fields: ProjectReferenceTypeFields
     detail_callouts: ProjectReferenceDetailCallout[]
   }
@@ -1609,6 +1686,92 @@ export function validateLoraParameterValues(
   return errors
 }
 
+/** Build Director's exact role-specific wire row from one server catalog row. */
+export function createDirectorImageRoleLoraSelection(
+  lora: LoraInfo,
+  multiplier = lora.recommended_weights?.default ?? 1,
+): DirectorImageRoleLoraSelection {
+  const selection: DirectorImageRoleLoraSelection = {
+    id: lora.filename,
+    multiplier: Math.max(-10, Math.min(10, multiplier)),
+  }
+  if (lora.parameter_schema) {
+    selection.parameter_schema_digest = lora.parameter_schema.schema_digest
+    selection.parameter_values = getLoraParameterDefaults(lora.parameter_schema)
+  }
+  return selection
+}
+
+/** Strip client-only or stale object keys before crossing the strict role wire. */
+export function toDirectorImageRoleLoraWire(
+  selections: readonly DirectorImageRoleLoraSelection[],
+): DirectorImageRoleLoraSelection[] {
+  return selections.map(selection => ({
+    id: selection.id,
+    multiplier: selection.multiplier,
+    ...(selection.parameter_schema_digest !== undefined ? {
+      parameter_schema_digest: selection.parameter_schema_digest,
+      parameter_values: { ...(selection.parameter_values ?? {}) },
+    } : {}),
+  }))
+}
+
+/**
+ * Mirror the server's content-free Director LoRA shape checks so invalid or
+ * stale schema selections are caught before a pipeline request is sent.
+ */
+export function validateDirectorImageRoleLoraSelections(
+  selections: readonly DirectorImageRoleLoraSelection[],
+  catalog: readonly LoraInfo[],
+): string[] {
+  const errors: string[] = []
+  if (selections.length > 64) errors.push('Select at most 64 LoRAs for one Director image role.')
+  const byFilename = new Map(catalog.map(lora => [lora.filename, lora]))
+  const seen = new Set<string>()
+  for (const selection of selections) {
+    const prefix = selection.id ? `${selection.id}: ` : ''
+    if (!selection.id || selection.id.length > 512
+      || selection.id !== selection.id.split(/[\\/]/).pop()) {
+      errors.push(`${prefix}LoRA id must be one catalog filename.`)
+      continue
+    }
+    if (seen.has(selection.id)) {
+      errors.push(`${prefix}Select each LoRA only once per image role.`)
+      continue
+    }
+    seen.add(selection.id)
+    if (typeof selection.multiplier !== 'number' || !Number.isFinite(selection.multiplier)
+      || selection.multiplier < -10 || selection.multiplier > 10) {
+      errors.push(`${prefix}Multiplier must be between -10 and 10.`)
+    }
+    const current = byFilename.get(selection.id)
+    if (!current) {
+      errors.push(`${prefix}This LoRA is no longer available for the selected model.`)
+      continue
+    }
+    const schema = current.parameter_schema
+    if (!schema) {
+      if (selection.parameter_schema_digest !== undefined
+        || selection.parameter_values !== undefined) {
+        errors.push(`${prefix}This LoRA no longer publishes a parameter schema.`)
+      }
+      continue
+    }
+    if (!/^[0-9a-f]{64}$/.test(selection.parameter_schema_digest || '')
+      || selection.parameter_schema_digest !== schema.schema_digest) {
+      errors.push(`${prefix}Its published input schema changed. Remove and add it again.`)
+      continue
+    }
+    if (selection.parameter_values === undefined) {
+      errors.push(`${prefix}Published parameter values are required.`)
+      continue
+    }
+    errors.push(...validateLoraParameterValues(schema, selection.parameter_values)
+      .map(error => `${prefix}${error}`))
+  }
+  return errors
+}
+
 export function loraParameterSchemasConflict(
   generationSchema: LoraParameterSchema | undefined,
   editingSchema: LoraParameterSchema | undefined,
@@ -1682,9 +1845,9 @@ const PROJECT_REFERENCE_QUEUE_BLOCKER_COPY: Record<
 > = {
   submitting: 'A reference pack is already being submitted.',
   project_locked: 'Unlock this project before queueing a reference pack.',
-  loading: 'Wait for Reference Studio project data to finish loading.',
+  loading: 'Wait for Reference project data to finish loading.',
   name_missing: 'Enter a reference name.',
-  capabilities_unavailable: 'Reference Studio capabilities are unavailable.',
+  capabilities_unavailable: 'Reference capabilities are unavailable.',
   deliverables_unavailable: 'The authoritative pack layout is unavailable.',
   generation_model_missing: 'Select an available generation model.',
   editor_model_missing: 'Select an available reference-image editor for this mode.',
@@ -1902,6 +2065,7 @@ export interface ProjectReferenceRetrySettings {
   content_capability?: 'standard' | 'unrestricted_local'
   initial_blur?: boolean
   intelligence_policy?: 'standard_auto' | 'uncensored_auto'
+  style?: string
   additional_loras?: ProjectReferenceAdditionalLora[]
   review: boolean
   max_repair_attempts: number
@@ -1961,7 +2125,7 @@ export function getProjectReferenceReviewerSetupCopy(
   contract: ProjectReferenceCapabilities['uncensored_auto_review'] | undefined,
 ): string {
   if (!contract) {
-    return 'The required local fidelity-review setup is unavailable. Refresh Reference Studio and try again.'
+    return 'The required local fidelity-review setup is unavailable. Refresh Reference and try again.'
   }
   switch (contract.setup_state) {
     case 'ready_resident':
@@ -2030,20 +2194,39 @@ export function resolveProjectReferenceRetryReview(
   }
 }
 
-/** Private labels are required to replay any custom public authored identity. */
+/** Private style/labels are required to replay any opaque authored identity. */
 export function projectReferenceRetryNeedsPrivateAuthoring(
   variant: ProjectAssetVariant,
 ): boolean {
   const authored = variant.metadata.reference_pack?.authored_settings
-  return authored?.type_fields.some(field => field.items.some(item => item.custom)) === true
+  return authored?.style_present === true
+    || authored?.type_fields.some(field => field.items.some(item => item.custom)) === true
     || authored?.detail_callouts.some(callout => callout.kind === 'custom') === true
+}
+
+export function isProjectReferenceStyleReplayReady(
+  authored: { style_present?: boolean; style_commitment?: string } | undefined,
+  style: unknown,
+): boolean {
+  const declaresPresence = authored != null
+    && Object.prototype.hasOwnProperty.call(authored, 'style_present')
+  const declaresCommitment = authored != null
+    && Object.prototype.hasOwnProperty.call(authored, 'style_commitment')
+  // Legacy plans declare neither field. A current contract is atomic: partial
+  // summaries fail closed even when they claim the authored style was empty.
+  if (!declaresPresence && !declaresCommitment) return true
+  if (typeof authored?.style_present !== 'boolean'
+    || typeof authored.style_commitment !== 'string'
+    || !/^[0-9a-f]{64}$/.test(authored.style_commitment)) return false
+  return authored.style_present === false
+    || (typeof style === 'string' && style.trim().length > 0)
 }
 
 function resolveProjectReferenceRetryAuthoredSettings(
   packMetadata: ProjectReferencePackVariantMetadata,
   fallback: ProjectReferenceRetrySettings,
   capabilities?: ProjectReferenceCapabilities,
-): Pick<ProjectReferenceRetrySettings, 'type_fields' | 'detail_callouts'> {
+): Pick<ProjectReferenceRetrySettings, 'style' | 'type_fields' | 'detail_callouts'> {
   const summary = packMetadata.authored_settings
   if (!summary) return {}
   const referenceType = packMetadata.reference_type ?? fallback.asset_type
@@ -2102,6 +2285,12 @@ function resolveProjectReferenceRetryAuthoredSettings(
     })
   }
   return {
+    ...(summary.style_present === true
+      && hasExactPrivateSnapshot
+      && typeof fallback.style === 'string'
+      && fallback.style.length > 0
+      ? { style: fallback.style }
+      : summary.style_present === false ? { style: '' } : {}),
     type_fields: resolvedFields as ProjectReferenceTypeFields,
     detail_callouts: resolvedCallouts,
   }
@@ -2169,6 +2358,9 @@ export function getProjectReferenceRetrySettings(
       fallback,
       capabilities,
     )
+    if (authoredSettings.style !== undefined) {
+      settings.style = authoredSettings.style
+    }
     if (authoredSettings.type_fields !== undefined) {
       settings.type_fields = authoredSettings.type_fields
     }
@@ -2225,7 +2417,7 @@ export async function fetchProjectReferenceCapabilities(
   project: string,
 ): Promise<ProjectReferenceCapabilities> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/reference-capabilities`)
-  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to load Reference Studio capabilities')
+  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to load Reference capabilities')
   return res.json()
 }
 
@@ -2990,6 +3182,14 @@ export async function deletePipeline(pid: string, workspace: string): Promise<{ 
 export interface DirectorV2PlanRequest {
   workspace: string
   skill_type: string
+  video_model?: string
+  /** Null is the explicit new-role automatic-creator sentinel. */
+  image_creator_model?: string | null
+  image_editor_model?: string
+  image_creator_loras?: DirectorImageRoleLoraSelection[]
+  image_editor_loras?: DirectorImageRoleLoraSelection[]
+  /** Legacy combined image wire; never mix with the role fields above. */
+  image_model?: string
   explicit_output?: boolean
   scene_description?: string
   story_description?: string
@@ -3012,10 +3212,77 @@ export interface DirectorV2PlanRequest {
   frames_minimum?: number
   concept?: string
   visual_style?: string
+  /** Exact server-catalog ID only; workflow metadata remains server-owned. */
+  h3_style_workflow?: string
   platform?: string
   style?: string
   prompt_type?: string
   director_flags?: Record<string, boolean>
+}
+
+export type DirectorReadinessReason =
+  | 'director_incompatible'
+  | 'manual_verification_required'
+  | 'model_disabled'
+  | 'model_not_downloaded'
+  | 'model_terms_required'
+  | 'model_unavailable'
+
+export type DirectorReadinessAction =
+  | 'accept_terms'
+  | 'download_model'
+  | 'enable_model'
+  | 'select_model'
+  | 'verify_manual_checkpoint'
+
+export interface DirectorImageRoleCandidate {
+  model_type: string
+  compatible: boolean
+  ready: boolean
+  reasons: DirectorReadinessReason[]
+  actions: DirectorReadinessAction[]
+  enabled: boolean
+  downloaded: boolean
+}
+
+export interface DirectorImageRoleCapability {
+  /** Null when a remote allowlist intentionally hides the server default ID. */
+  resolved_model: string | null
+  selection_source:
+    | 'verified_manual_preference'
+    | 'safe_fallback'
+    | 'fixed_default'
+  candidates: DirectorImageRoleCandidate[]
+  lora_catalog_endpoint: '/api/v1/loras/{model_type}/details'
+}
+
+export interface DirectorCapabilities {
+  schema_version: 1
+  readiness_reason_values: DirectorReadinessReason[]
+  readiness_action_values: DirectorReadinessAction[]
+  image_roles: {
+    creator: DirectorImageRoleCapability
+    editor: DirectorImageRoleCapability
+  }
+}
+
+export async function fetchDirectorCapabilities(
+  explicitOutput = false,
+): Promise<DirectorCapabilities> {
+  const query = new URLSearchParams({ explicit_output: String(explicitOutput) })
+  const res = await fetch(`${BASE}/api/v1/director/capabilities?${query}`, {
+    cache: 'no-store',
+    credentials: 'same-origin',
+  })
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({})) as { detail?: unknown }
+    const detail = typeof payload.detail === 'string' ? payload.detail : ''
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(detail || 'Director image capabilities are not authorized for this session.')
+    }
+    throw new Error(detail || 'Director image capabilities are unavailable.')
+  }
+  return res.json()
 }
 
 export interface DirectorV2PlanResponse {
@@ -4708,6 +4975,7 @@ export async function planClipPromptsAndImages(params: {
   workspace: string
   clips: import('../types').PlannedClip[]
   scene_description: string
+  visual_style?: string
   explicit_output?: boolean
   lyrics?: import('../types').LyricSegment[]
   bpm: number
@@ -4750,6 +5018,7 @@ export async function planShortFilmPrompts(params: {
   workspace: string
   clips: import('../types').PlannedClip[]
   scene_description: string
+  visual_style?: string
   explicit_output?: boolean
   lyrics?: import('../types').LyricSegment[]
   reference_image_path?: string | null
@@ -4779,6 +5048,7 @@ export async function getLlmStreamStatus(): Promise<{ text: string; done: boolea
 export async function planShortFilmScript(params: {
   workspace: string
   story_description: string
+  visual_style?: string
   explicit_output?: boolean
   characters?: { name: string; description: string }[]
   reference_image_path?: string | null

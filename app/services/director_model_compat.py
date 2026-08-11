@@ -79,7 +79,7 @@ def _max_image_refs(model_def: Mapping[str, Any]) -> int | None:
     return parsed if parsed > 0 else None
 
 
-def _image_capability(model_def: Mapping[str, Any]) -> dict[str, Any]:
+def _image_creator_capability(model_def: Mapping[str, Any]) -> dict[str, Any]:
     if not model_def.get("image_outputs"):
         return _result(False, "Director needs a still-image generator.")
     if (
@@ -92,17 +92,50 @@ def _image_capability(model_def: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     modes = _reference_modes(model_def)
-    if "KI" not in modes:
-        return _result(
-            False,
-            "Director needs main-image plus reference editing for consistent start frames.",
-        )
-    if "" not in modes:
+    if model_def.get("image_ref_choices") is not None and "" not in modes:
         return _result(
             False,
             "Director needs plain generation when no reference image is supplied.",
         )
     return _result(True)
+
+
+def _image_editor_capability(model_def: Mapping[str, Any]) -> dict[str, Any]:
+    if not model_def.get("image_outputs"):
+        return _result(False, "Director needs a still-image editor.")
+    modes = _reference_modes(model_def)
+    if "KI" not in modes:
+        return _result(
+            False,
+            "Director needs main-image plus reference editing for consistent start frames.",
+        )
+    return _result(True)
+
+
+def _image_capability(model_def: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain the combined legacy bit while exposing independent roles."""
+    creator = _image_creator_capability(model_def)
+    editor = _image_editor_capability(model_def)
+    compatible = bool(creator["compatible"] and editor["compatible"])
+    reason = next(
+        (
+            result["reason"]
+            for result in (creator, editor)
+            if not result["compatible"]
+        ),
+        "",
+    )
+    return {
+        **_result(compatible, reason),
+        "creator": {
+            "compatible": bool(creator["compatible"]),
+            "reasons": [creator["reason"]] if creator["reason"] else [],
+        },
+        "editor": {
+            "compatible": bool(editor["compatible"]),
+            "reasons": [editor["reason"]] if editor["reason"] else [],
+        },
+    }
 
 
 def _base_video_capability(model_def: Mapping[str, Any]) -> dict[str, Any]:
@@ -241,7 +274,17 @@ def assess_director_model(
     if not isinstance(model_def, Mapping):
         unavailable = _result(False, "Model definition is unavailable.")
         return {
-            "image": dict(unavailable),
+            "image": {
+                **dict(unavailable),
+                "creator": {
+                    "compatible": False,
+                    "reasons": [unavailable["reason"]],
+                },
+                "editor": {
+                    "compatible": False,
+                    "reasons": [unavailable["reason"]],
+                },
+            },
             "video": {
                 pipeline_type: dict(unavailable)
                 for pipeline_type in DIRECTOR_PIPELINE_TYPES

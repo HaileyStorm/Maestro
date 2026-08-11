@@ -72,6 +72,13 @@ export function Sidebar() {
   const isContinue = isVideo && imageMode === 3
   const isBlend = isVideo && imageMode === 4
   const isDirector = sidebarMode === 'director'
+  const isReference = sidebarMode === 'reference'
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const workspaces = useStore(s => s.workspaces)
+  const browsingUploads = useStore(s => s.browsingUploads)
+  const referenceLocked = workspaces.some(workspace => (
+    workspace.name === activeWorkspace && workspace.unlocked === false
+  ))
   const isI2vOnly = modelOptions?.i2v_class && !modelOptions?.t2v_class
   const isH3 = isVideo && (
     modelType.startsWith('minimax_h3')
@@ -133,13 +140,24 @@ export function Sidebar() {
   )
 
   const modeToggle = (size: 'sm' | 'md') => (
-    <div className="flex bg-bg-tertiary rounded-lg p-0.5 border border-border">
+    <div role="group" aria-label="Creative workspace" className={`flex bg-bg-tertiary rounded-lg p-0.5 border border-border ${size === 'sm' ? 'w-full' : ''}`}>
+      <button
+        type="button"
+        onClick={() => setSidebarMode('studio')}
+        aria-label="Open Generate"
+        aria-pressed={sidebarMode === 'studio'}
+        className={`${size === 'sm' ? 'flex-1 px-1.5 py-1 text-[10px]' : 'px-2.5 py-1 text-[11px]'} rounded-md transition-all ${
+          sidebarMode === 'studio' ? 'bg-toggle-active shadow-accent-glow text-white' : 'text-text-secondary hover:text-text-primary'
+        }`}
+      >
+        Generate
+      </button>
       <button
         type="button"
         onClick={() => setSidebarMode('director')}
         aria-label="Open Director"
         aria-pressed={isDirector}
-        className={`${size === 'sm' ? 'px-2 py-1 text-[11px]' : 'px-3 py-1 text-xs'} rounded-md transition-all ${
+        className={`${size === 'sm' ? 'flex-1 px-1.5 py-1 text-[10px]' : 'px-2.5 py-1 text-[11px]'} rounded-md transition-all ${
           // bg-toggle-active is flat accent-blue in the default theme
           // (preserves the original blue pill) and a red→orange sunset
           // gradient in Golden Hour. shadow-accent-glow is empty in
@@ -151,19 +169,15 @@ export function Sidebar() {
       </button>
       <button
         type="button"
-        onClick={() => setSidebarMode('studio')}
-        aria-label="Open Studio"
-        aria-pressed={!isDirector}
-        className={`${size === 'sm' ? 'px-2 py-1 text-[11px]' : 'px-3 py-1 text-xs'} rounded-md transition-all ${
-          // Studio active intentionally uses bg-toggle-active too so the
-          // currently-active mode reads with the same prominence in
-          // Golden Hour as the reference render. Default theme: flat
-          // accent-blue (was bg-bg-active dark elevation — small change
-          // that brings the two buttons into visual parity).
-          !isDirector ? 'bg-toggle-active shadow-accent-glow text-white' : 'text-text-secondary hover:text-text-primary'
+        onClick={() => setSidebarMode('reference')}
+        disabled={!activeWorkspace || browsingUploads || referenceLocked}
+        aria-label={referenceLocked ? 'Unlock project to open Reference' : 'Open Reference'}
+        aria-pressed={isReference}
+        className={`${size === 'sm' ? 'flex-1 px-1.5 py-1 text-[10px]' : 'px-2.5 py-1 text-[11px]'} rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-40 ${
+          isReference ? 'bg-toggle-active shadow-accent-glow text-white' : 'text-text-secondary hover:text-text-primary'
         }`}
       >
-        Studio
+        Reference
       </button>
     </div>
   )
@@ -339,7 +353,7 @@ export function Sidebar() {
         {sidebarOpen && (
           <button
             type="button"
-            aria-label="Close Studio and Director menu"
+            aria-label="Close creative workspace menu"
             tabIndex={-1}
             className="fixed inset-0 bg-black/40 z-40"
             onClick={() => setSidebarOpen(false)}
@@ -350,34 +364,32 @@ export function Sidebar() {
           ref={mobileSidebarRef}
           role="dialog"
           aria-modal="true"
-          aria-label="Studio and Director menu"
+          aria-label="Generate, Director, and Reference menu"
           aria-hidden={!sidebarOpen}
           inert={!sidebarOpen}
           className={`fixed top-0 left-0 h-[100dvh] w-[380px] max-w-[85vw] bg-bg-secondary border-r border-border z-[60] flex flex-col overflow-hidden transform transition-transform duration-300 ease-in-out pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}>
           {/* Header */}
-          <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 border-b border-border px-4 py-3">
             {productIdentity}
-            <div className="flex items-center gap-1.5">
-              <ProjectReferenceLibrary header compact />
-              {modeToggle('sm')}
-              <button
-                ref={mobileCloseRef}
-                type="button"
-                onClick={() => setSidebarOpen(false)}
-                className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
-                aria-label="Close Studio and Director menu"
-              >
-                <X size={16} />
-              </button>
-            </div>
+            <button
+              ref={mobileCloseRef}
+              type="button"
+              onClick={() => setSidebarOpen(false)}
+              className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+              aria-label="Close creative workspace menu"
+            >
+              <X size={16} />
+            </button>
+            <div className="col-span-2 min-w-0">{modeToggle('sm')}</div>
           </div>
           <div className={`flex flex-1 min-h-0 flex-col overscroll-contain [-webkit-overflow-scrolling:touch] ${
-            isDirector ? 'overflow-hidden' : 'overflow-y-auto'
+            isDirector || isReference ? 'overflow-hidden' : 'overflow-y-auto'
           }`}>
-            <GenerationPrivacyControls />
-            {isDirector ? <DirectorChat /> : studioControls}
+            {!isReference && <GenerationPrivacyControls />}
+            {!isReference && (isDirector ? <DirectorChat /> : studioControls)}
+            <ProjectReferenceLibrary active={isReference} />
             {machineControls && <HardwareStatusBar />}
           </div>
         </aside>
@@ -387,12 +399,11 @@ export function Sidebar() {
 
   // Desktop: static sidebar
   return (
-    <aside className="w-[420px] h-full bg-bg-secondary border-r border-border flex flex-col shrink-0">
+    <aside className="w-[clamp(460px,24vw,560px)] h-full bg-bg-secondary border-r border-border flex flex-col shrink-0">
       {/* Header */}
       <div className="px-4 py-3 border-b border-border flex items-center justify-between">
         {productIdentity}
         <div className="flex items-center gap-2">
-          <ProjectReferenceLibrary header />
           {modeToggle('md')}
           {machineControls && <button
             type="button"
@@ -405,8 +416,9 @@ export function Sidebar() {
           </button>}
         </div>
       </div>
-      <GenerationPrivacyControls />
-      {isDirector ? <DirectorChat /> : studioControls}
+      {!isReference && <GenerationPrivacyControls />}
+      {!isReference && (isDirector ? <DirectorChat /> : studioControls)}
+      <ProjectReferenceLibrary active={isReference} />
       {machineControls && <HardwareStatusBar />}
     </aside>
   )

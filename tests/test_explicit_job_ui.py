@@ -112,7 +112,7 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn('type="checkbox"', CONTROLS)
         self.assertIn("s.explicitOutput", CONTROLS)
         self.assertIn("s.setExplicitOutput", CONTROLS)
-        self.assertIn("Mark this Studio or Director job as explicit", CONTROLS)
+        self.assertIn("Mark this Generate or Director job as explicit", CONTROLS)
         self.assertNotIn("updateServicesConfig", CONTROLS)
         self.assertNotIn("nsfw_accepted_at", CONTROLS)
         self.assertNotIn("PUBLIC_PROVIDERS", CONTROLS)
@@ -121,7 +121,16 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertNotIn("visible to other authorized project users", CONTROLS)
 
         self.assertGreaterEqual(SIDEBAR.count("<GenerationPrivacyControls />"), 2)
-        self.assertIn("{isDirector ? <DirectorChat /> : studioControls}", SIDEBAR)
+        self.assertEqual(
+            SIDEBAR.count("{!isReference && <GenerationPrivacyControls />}"),
+            2,
+        )
+        self.assertEqual(
+            SIDEBAR.count(
+                "{!isReference && (isDirector ? <DirectorChat /> : studioControls)}"
+            ),
+            2,
+        )
 
     def test_store_intent_is_browser_memory_not_host_config_or_local_storage(self):
         services_state = STORE[
@@ -157,8 +166,25 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
             STORE.count("private_output: state.privateOutput"),
             9,
         )
-        self.assertIn("explicit_output: get().explicitOutput", STORE)
-        self.assertIn("private_output: get().privateOutput", STORE)
+        director_images = STORE[
+            STORE.index("directorGenerateStartImages: async"):
+            STORE.index(
+                "directorApplyToClips:",
+                STORE.index("directorGenerateStartImages: async"),
+            )
+        ]
+        self.assertIn(
+            "const requestExplicitOutput = initialState.explicitOutput",
+            director_images,
+        )
+        self.assertIn(
+            "const requestPrivateOutput = initialState.privateOutput",
+            director_images,
+        )
+        self.assertIn("explicit_output: requestExplicitOutput", director_images)
+        self.assertIn("private_output: requestPrivateOutput", director_images)
+        self.assertNotIn("explicit_output: get().explicitOutput", director_images)
+        self.assertNotIn("private_output: get().privateOutput", director_images)
         self.assertIn("state.explicitOutput", H3_PROFILES)
         self.assertIn("const explicitOutput = useStore(s => s.explicitOutput)", PROJECT_REFS)
         director_music = STORE[
@@ -379,12 +405,17 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
             STORE.index("setSidebarMode: (mode) => {"):
             STORE.index("directorUploadAndAnalyze:", STORE.index("setSidebarMode: (mode) => {"))
         ]
-        self.assertNotIn("explicitOutput: true, privateOutput: true", sidebar_mode)
-        pipeline_restore = STORE[
-            STORE.index("loadDirectorFromPipeline: async"):
-            STORE.index("loraBrowserOpen:", STORE.index("loadDirectorFromPipeline: async"))
+        explicit_private_restore = "explicitOutput: true, privateOutput: true"
+        self.assertNotIn(explicit_private_restore, sidebar_mode)
+        output_restore = STORE[
+            STORE.index("loadSettingsFromOutput: async"):
+            STORE.index(
+                "// Restore image refs as File objects",
+                STORE.index("loadSettingsFromOutput: async"),
+            )
         ]
-        self.assertNotIn("explicitOutput: true, privateOutput: true", pipeline_restore)
+        self.assertEqual(STORE.count(explicit_private_restore), 1)
+        self.assertIn(explicit_private_restore, output_restore)
 
     def test_lora_selection_does_not_wait_for_content_metadata(self):
         for source in (LORAS, DIRECTOR_LORAS):

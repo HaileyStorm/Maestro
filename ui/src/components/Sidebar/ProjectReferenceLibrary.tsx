@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
-import { createPortal } from 'react-dom'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Check, ChevronDown, EyeOff, FileUp, ImagePlus, Library, Loader2, MapPin, Package, Pencil, RotateCcw, Trash2, UserRound, X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import {
@@ -19,6 +18,7 @@ import {
   getProjectReferenceEditorModels,
   getProjectReferenceExplicitConvenienceState,
   getProjectReferenceGenerationModels,
+  getDirectorProjectReferenceKind,
   getProjectReferencePreferredGenerationModel,
   getProjectReferenceModelAvailabilityCopy,
   getProjectReferenceQueueBlockers,
@@ -32,6 +32,7 @@ import {
   getProjectReferenceRetrySettings,
   hasProjectReferenceLoraParameterSummary,
   isProjectReferenceReviewMandatory,
+  isProjectReferenceStyleReplayReady,
   isProjectReferenceReviewerEligible,
   isProjectReferenceExplicitCharacterStateValid,
   isProjectAssetOperationCurrent,
@@ -75,7 +76,6 @@ import { BlenderSceneTool } from './BlenderSceneTool'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 import { hidePrivatePreview, privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../../lib/privatePreview'
 import { POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
-import { installModalFocus } from '../../lib/modalFocus'
 import { confirmReconnectedJob } from '../../lib/referenceQueue'
 import { formatManualInstallationBytes, manualInstallationDestination } from '../../lib/manualInstallation'
 
@@ -277,6 +277,7 @@ interface DetailCalloutSetting {
 }
 
 interface ReferenceAuthoredSnapshot {
+  style: string
   typeFields: ProjectReferenceTypeFields
   detailCallouts: ProjectReferenceDetailCallout[]
 }
@@ -493,8 +494,10 @@ function buildTypeFields(
 function cloneReferenceAuthoredSnapshot(
   typeFields: ProjectReferenceTypeFields | undefined,
   detailCallouts: ProjectReferenceDetailCallout[] | undefined,
+  style: string | undefined,
 ): ReferenceAuthoredSnapshot {
   return {
+    style: style ?? '',
     typeFields: Object.fromEntries(
       Object.entries(typeFields ?? {}).map(([field, items]) => [
         field,
@@ -643,13 +646,7 @@ function ProjectAssetPreview({ project, assetId, output, label }: {
   )
 }
 
-export function ProjectReferenceLibrary({
-  header = false,
-  compact = false,
-}: {
-  header?: boolean
-  compact?: boolean
-}) {
+export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const project = useStore(s => s.activeWorkspace)
   const workspaces = useStore(s => s.workspaces)
   const jobs = useStore(s => s.jobs)
@@ -665,8 +662,8 @@ export function ProjectReferenceLibrary({
   const setGenerationMode = useStore(s => s.setGenerationMode)
   const selectModel = useStore(s => s.selectModel)
   const setParam = useStore(s => s.setParam)
-  const sidebarMode = useStore(s => s.sidebarMode)
   const setSidebarMode = useStore(s => s.setSidebarMode)
+  const referenceReturnMode = useStore(s => s.referenceReturnMode)
   const setGuideVideoFps = useStore(s => s.setGuideVideoFps)
   const setGuideVideoFrameCount = useStore(s => s.setGuideVideoFrameCount)
   const addImageRef = useStore(s => s.addImageRef)
@@ -682,7 +679,7 @@ export function ProjectReferenceLibrary({
   const enabledModels = useStore(s => s.enabledModels)
   const modelsLoaded = useStore(s => s.modelsLoaded)
   const openModelVisibility = useStore(s => s.openModelVisibility)
-  const [open, setOpen] = useState(false)
+  const open = active
   const [assets, setAssets] = useState<ProjectAsset[]>([])
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -741,6 +738,8 @@ export function ProjectReferenceLibrary({
   const [anatomyPrivate, setAnatomyPrivate] = useState(true)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [visualStyle, setVisualStyle] = useState('')
+  const [customVisualStyle, setCustomVisualStyle] = useState('')
   const [candidateCount, setCandidateCount] = useState(1)
   const [columns, setColumns] = useState(2)
   const [paletteSwatches, setPaletteSwatches] = useState(8)
@@ -758,7 +757,6 @@ export function ProjectReferenceLibrary({
   }>>({})
   const [authoringAvailability, setAuthoringAvailability] = useState<Record<string, ReferenceAuthoringAvailability>>({})
   const [privateReplayRetry, setPrivateReplayRetry] = useState(0)
-  const closeModal = useCallback(() => setOpen(false), [])
   const requestSequence = useRef(0)
   const catalogRequestSequence = useRef(0)
   const projectEpoch = useRef(0)
@@ -772,9 +770,6 @@ export function ProjectReferenceLibrary({
   const authoredSettingsSnapshots = useRef(new Map<string, ReferenceAuthoredSnapshot>())
   const loraParameterSnapshots = useRef(new Map<string, ProjectReferenceAdditionalLora[]>())
   const authoringAvailabilityRef = useRef(new Map<string, ReferenceAuthoringAvailability>())
-  const openButtonRef = useRef<HTMLButtonElement>(null)
-  const dialogRef = useRef<HTMLDivElement>(null)
-  const closeButtonRef = useRef<HTMLButtonElement>(null)
   const projectExplicitlyLocked = workspaces.some(workspace => (
     workspace.name === project && workspace.unlocked === false
   ))
@@ -786,6 +781,7 @@ export function ProjectReferenceLibrary({
         ...(packMetadata?.additional_loras?.skipped ?? []),
       ]
       const needsAuthoring = projectReferenceRetryNeedsPrivateAuthoring(variant)
+      const needsStyle = packMetadata?.authored_settings?.style_present === true
       const needsLoraParameters = summarizedLoras.some(hasProjectReferenceLoraParameterSummary)
       if (!needsAuthoring && !needsLoraParameters) return []
       return [{
@@ -794,6 +790,8 @@ export function ProjectReferenceLibrary({
         authoredSeal: packMetadata?.authored_settings?.seal ?? '',
         planSeal: packMetadata?.plan_seal ?? '',
         needsAuthoring,
+        needsStyle,
+        styleCommitment: packMetadata?.authored_settings?.style_commitment ?? '',
         needsLoraParameters,
         parameterRecords: summarizedLoras.flatMap(lora => lora.parameters
           ? [{
@@ -1088,22 +1086,6 @@ export function ProjectReferenceLibrary({
   }, [authoritativeTypeCapabilities, customSheetCount, depth, preset, sectionDefinitions])
 
   useEffect(() => {
-    if (open) return
-    const convenience = getProjectReferenceExplicitConvenienceState(assetType, explicitOutput)
-    setReferenceExplicitOutput(convenience.explicit_output)
-    if (convenience.preset) setPreset(convenience.preset)
-    if (convenience.anatomy_option) {
-      setSections(current => selectCanonicalCharacterAnatomy(
-        current, authoritativeTypeCapabilities,
-      ))
-    }
-    setContentCapability(explicitOutput ? 'unrestricted_local' : 'standard')
-    setInitialBlur(explicitOutput || privateOutput)
-    setIntelligencePolicy(explicitOutput ? 'uncensored_auto' : 'standard_auto')
-    setIntelligenceCustomized(false)
-  }, [assetType, authoritativeTypeCapabilities, explicitOutput, open, privateOutput])
-
-  useEffect(() => {
     if (previousProject.current === project) return
     previousProject.current = project
     projectEpoch.current += 1
@@ -1152,6 +1134,8 @@ export function ProjectReferenceLibrary({
     setAnatomyPrivate(true)
     setName('')
     setDescription('')
+    setVisualStyle('')
+    setCustomVisualStyle('')
     setSubmitting(false)
     setImporting(null)
     pendingSheetActionLocks.current.clear()
@@ -1184,7 +1168,6 @@ export function ProjectReferenceLibrary({
     loraParameterSnapshots.current.clear()
     authoringAvailabilityRef.current.clear()
     setAuthoringAvailability({})
-    setOpen(false)
     setAssets([])
     setCatalogModels([])
     setReferenceCapabilities(null)
@@ -1225,6 +1208,8 @@ export function ProjectReferenceLibrary({
     setAnatomyPrivate(true)
     setName('')
     setDescription('')
+    setVisualStyle('')
+    setCustomVisualStyle('')
     setLoading(false)
     setSubmitting(false)
     setImporting(null)
@@ -1239,6 +1224,10 @@ export function ProjectReferenceLibrary({
     setReviewerActionError('')
     setActionError('')
   }, [projectExplicitlyLocked])
+
+  useEffect(() => {
+    if (active && projectExplicitlyLocked) setSidebarMode(referenceReturnMode)
+  }, [active, projectExplicitlyLocked, referenceReturnMode, setSidebarMode])
 
   useEffect(() => {
     const preferred = getProjectReferencePreferredGenerationModel(
@@ -1347,7 +1336,7 @@ export function ProjectReferenceLibrary({
         )
       ) return
       setCatalogModels([])
-      setModelLoadError('Could not load Reference Studio model choices.')
+      setModelLoadError('Could not load Reference model choices.')
     })
     return () => {
       active = false
@@ -1389,7 +1378,7 @@ export function ProjectReferenceLibrary({
       setReferenceCapabilities(null)
       setCapabilitiesLoadError(projectReferenceSafeErrorMessage(
         reason,
-        'Could not load the authoritative Reference Studio plan.',
+        'Could not load the authoritative Reference plan.',
       ))
     })
     return () => { active = false }
@@ -1419,49 +1408,6 @@ export function ProjectReferenceLibrary({
     })
     return () => { active = false }
   }, [open, project, projectExplicitlyLocked])
-
-  useEffect(() => {
-    if (!open || !dialogRef.current || !closeButtonRef.current) return
-    return installModalFocus({
-      document,
-      dialog: dialogRef.current,
-      initialFocus: closeButtonRef.current,
-      restoreFocus: openButtonRef.current,
-      appRoot: document.getElementById('root'),
-      onClose: closeModal,
-    })
-  }, [closeModal, open])
-
-  const handleDialogKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    // The modal is portalled outside the mobile drawer. Stop Escape/Tab from
-    // reaching Sidebar's document listener and closing the drawer underneath.
-    event.stopPropagation()
-    if (event.key === 'Escape') {
-      event.preventDefault()
-      closeModal()
-      return
-    }
-    if (event.key !== 'Tab') return
-    const focusable = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
-    ) ?? []).filter(element => (
-      element.getAttribute('aria-hidden') !== 'true' && element.getClientRects().length > 0
-    ))
-    if (focusable.length === 0) {
-      event.preventDefault()
-      dialogRef.current?.focus()
-      return
-    }
-    const first = focusable[0]
-    const last = focusable[focusable.length - 1]
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault()
-      last.focus()
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault()
-      first.focus()
-    }
-  }
 
   const refresh = useCallback(async (signal: AbortSignal) => {
     if (!open || browsingUploads || projectExplicitlyLocked) return
@@ -1546,6 +1492,8 @@ export function ProjectReferenceLibrary({
       authoredSeal: string
       planSeal: string
       needsAuthoring: boolean
+      needsStyle: boolean
+      styleCommitment: string
       needsLoraParameters: boolean
       parameterRecords: Array<{
         id: string
@@ -1569,12 +1517,14 @@ export function ProjectReferenceLibrary({
     for (const target of targets) {
       const key = projectAssetVariantOperationKey(project, target.assetId, target.variantId)
       if ((target.needsAuthoring && !target.authoredSeal)
+        || (target.needsStyle && !/^[0-9a-f]{64}$/.test(target.styleCommitment))
         || (target.needsLoraParameters && !target.planSeal)) {
         publish(key, 'unavailable')
         continue
       }
+      const authoredSnapshot = authoredSettingsSnapshots.current.get(target.authoredSeal)
       const authoringReady = !target.needsAuthoring
-        || authoredSettingsSnapshots.current.has(target.authoredSeal)
+        || Boolean(authoredSnapshot && (!target.needsStyle || authoredSnapshot.style.trim().length > 0))
       const loraParametersReady = !target.needsLoraParameters
         || loraParameterSnapshots.current.has(target.planSeal)
       if (authoringReady && loraParametersReady) {
@@ -1597,11 +1547,18 @@ export function ProjectReferenceLibrary({
           return
         }
         if (target.needsAuthoring) {
+          if (target.needsStyle
+            && (typeof response.authored_settings.style !== 'string'
+              || response.authored_settings.style.trim().length === 0)) {
+            publish(key, 'unavailable')
+            return
+          }
           authoredSettingsSnapshots.current.set(
             target.authoredSeal,
             cloneReferenceAuthoredSnapshot(
               response.authored_settings.type_fields,
               response.authored_settings.detail_callouts,
+              response.authored_settings.style,
             ),
           )
         }
@@ -2011,12 +1968,16 @@ export function ProjectReferenceLibrary({
     const submittedProject = project
     setSubmitting(true)
     setQueuedMessage('')
+    const authoredStyle = visualStyle === 'custom'
+      ? customVisualStyle.trim()
+      : visualStyle
     try {
       const response = await generateProjectAssetReferences(project, {
         schema_version: 2,
         name: name.trim(),
         asset_type: assetType,
         description: description.trim(),
+        style: authoredStyle || undefined,
         mode: sheetMode,
         intent,
         depth,
@@ -2050,10 +2011,12 @@ export function ProjectReferenceLibrary({
       })
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       const authoredSeal = response.plan?.authored_settings?.seal
-      if (authoredSeal) {
+      if (authoredSeal && isProjectReferenceStyleReplayReady(
+        response.plan?.authored_settings, authoredStyle,
+      )) {
         authoredSettingsSnapshots.current.set(
           authoredSeal,
-          cloneReferenceAuthoredSnapshot(typeFields, detailCallouts),
+          cloneReferenceAuthoredSnapshot(typeFields, detailCallouts, authoredStyle),
         )
       }
       if (response.plan?.plan_seal) {
@@ -2070,13 +2033,15 @@ export function ProjectReferenceLibrary({
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setName('')
       setDescription('')
+      setVisualStyle('')
+      setCustomVisualStyle('')
       setPendingFreshJobIds(current => [...new Set([...current, response.job_id])])
       const queuedSheets = response.plan?.sheet_count ?? sheetCount
       setQueuedMessage(`Queued ${candidateCount} ${candidateCount === 1 ? 'candidate pack' : 'candidate packs'} with ${queuedSheets} ${queuedSheets === 1 ? 'sheet' : 'sheets'} each (${response.job_id}). They will appear here when complete.`)
       requestRefresh()
-      // Queue success is only confirmed after reconnecting the current
-      // operation. Keep the modal open for every blocker/failure path.
-      setOpen(false)
+      // Navigation is a durable-success effect: every blocker, request error,
+      // or reconnect failure keeps the author in Reference with their state.
+      setSidebarMode(referenceReturnMode)
     } catch (reason) {
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setActionError(projectReferenceSafeErrorMessage(reason, 'Could not queue reference generation.'))
@@ -2094,7 +2059,7 @@ export function ProjectReferenceLibrary({
     const requiresPrivateAuthoring = projectReferenceRetryNeedsPrivateAuthoring(variant)
     if (requiresPrivateAuthoring && (!sourceAuthoredSeal
       || !authoredSettingsSnapshots.current.has(sourceAuthoredSeal))) {
-      setActionError('Exact custom authoring is unavailable for this candidate. Retry and Edit stay disabled so custom fields are never silently dropped; create a new authored pack instead.')
+      setActionError('Exact private authoring is unavailable for this candidate. Retry and Edit stay disabled so style, custom fields, and details are never silently dropped; create a new authored pack instead.')
       return
     }
     const sourceAssetType = normalizeProjectReferenceAssetType(asset.asset_type) ?? assetType
@@ -2110,6 +2075,12 @@ export function ProjectReferenceLibrary({
       ? authoredSettingsSnapshots.current.get(sourceAuthoredSeal)
       : undefined
     const sourcePackMetadata = variant.metadata.reference_pack
+    if (!isProjectReferenceStyleReplayReady(
+      sourcePackMetadata?.authored_settings, sourceAuthoredSnapshot?.style,
+    )) {
+      setActionError('Exact private style is unavailable or its commitment changed. Retry and Edit remain disabled; create a new authored pack instead.')
+      return
+    }
     const sourcePlanSeal = sourcePackMetadata?.plan_seal
     const summarizedParameterizedLoras = [
       ...(sourcePackMetadata?.additional_loras?.applied ?? []),
@@ -2146,6 +2117,7 @@ export function ProjectReferenceLibrary({
       type_fields: sourceAuthoredSnapshot?.typeFields
         ?? (sourceAssetType === assetType ? typeFields : {}),
       authored_settings_seal: sourceAuthoredSnapshot ? sourceAuthoredSeal : undefined,
+      style: sourceAuthoredSnapshot?.style,
       managed_layout_assist: 'off',
       planning_model: planningModel,
       planning_provider: planningModel === 'auto' || planningModel === 'deterministic'
@@ -2259,6 +2231,7 @@ export function ProjectReferenceLibrary({
         anchor_basis: sourceSettings.anchor_basis,
         type_fields: sourceSettings.type_fields,
         detail_callouts: sourceSettings.detail_callouts,
+        style: sourceSettings.style || undefined,
         managed_layout_assist: sourceSettings.managed_layout_assist,
         planning_model: sourceSettings.planning_model,
         planning_provider: sourceSettings.planning_provider,
@@ -2285,12 +2258,15 @@ export function ProjectReferenceLibrary({
       })
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       const authoredSeal = response.plan?.authored_settings?.seal
-      if (authoredSeal) {
+      if (authoredSeal && isProjectReferenceStyleReplayReady(
+        response.plan?.authored_settings, sourceSettings.style,
+      )) {
         authoredSettingsSnapshots.current.set(
           authoredSeal,
           cloneReferenceAuthoredSnapshot(
-            sourceSettings.type_fields,
-            sourceSettings.detail_callouts,
+              sourceSettings.type_fields,
+              sourceSettings.detail_callouts,
+              sourceSettings.style,
           ),
         )
       }
@@ -2390,9 +2366,16 @@ export function ProjectReferenceLibrary({
   const applyReference = async (asset: ProjectAsset, variant: ProjectAsset['variants'][number]) => {
     const epoch = projectEpoch.current
     const submittedProject = project
+    let destination: 'director' | 'studio' = referenceReturnMode
     try {
+      const directorReferenceKind = getDirectorProjectReferenceKind(asset.asset_type)
       const outputs = getProjectAssetApplyOutputs(variant)
       if (outputs.length === 0) throw new Error('This reference candidate has no usable media')
+      if (referenceReturnMode === 'director'
+        && !directorReferenceKind
+        && !outputs[0].media_type?.startsWith('video/')) {
+        throw new Error('Director currently accepts only Character and Location references. Apply this candidate from Generate until expanded Director reference types are available.')
+      }
       const files: Array<{ output: ProjectAssetOutput; file: File }> = []
       for (const output of outputs) {
         const url = getProjectAssetMediaUrl(submittedProject, output.relative_path)
@@ -2417,7 +2400,7 @@ export function ProjectReferenceLibrary({
             : ''
         const uploaded = await uploadImage(file)
         if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
-        setSidebarMode('studio')
+        destination = 'studio'
         setGenerationMode('video')
         const recommendedModel = String(metadata.recommended_model_type || 'ltx2_22B_1_1')
         const controlMode = String(metadata.recommended_video_prompt_type || 'TVG')
@@ -2433,10 +2416,10 @@ export function ProjectReferenceLibrary({
         if (uploaded.frame_count && uploaded.frame_count > 0) {
           setStudioParam('video_length', uploaded.frame_count)
         }
-      } else if (sidebarMode === 'director') {
+      } else if (referenceReturnMode === 'director') {
         if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
         for (const item of files) {
-          if (asset.asset_type === 'character') addCharacterRef(item.file)
+          if (directorReferenceKind === 'character') addCharacterRef(item.file)
           else addLocationRef(item.file)
         }
       } else {
@@ -2449,7 +2432,7 @@ export function ProjectReferenceLibrary({
         }
         for (const item of files) addImageRef(item.file)
       }
-      setOpen(false)
+      setSidebarMode(destination)
     } catch (reason) {
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setActionError(projectReferenceSafeErrorMessage(reason, 'Could not use this reference.'))
@@ -2457,39 +2440,27 @@ export function ProjectReferenceLibrary({
   }
 
   return (
-    <>
-      <button
-        ref={openButtonRef}
-        type="button"
-        onClick={() => { if (!projectExplicitlyLocked) setOpen(true) }}
-        disabled={browsingUploads || !project}
-        aria-label={projectExplicitlyLocked ? 'Unlock project to use Reference Studio' : 'Open Reference Studio'}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-disabled={projectExplicitlyLocked}
-        title={projectExplicitlyLocked ? 'Unlock this project to use Reference Studio' : 'Open Reference Studio'}
-        className={header
-          ? `${compact ? 'p-1.5' : 'px-2.5 py-1.5'} flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-border bg-bg-tertiary text-[11px] text-text-secondary hover:border-accent-blue/50 hover:text-accent-blue disabled:opacity-40`
-          : 'mx-4 my-2 flex items-center justify-center gap-1.5 rounded-lg border border-border bg-bg-tertiary px-3 py-1.5 text-[11px] text-text-secondary hover:border-accent-blue/50 hover:text-accent-blue disabled:opacity-40'}
-      >
-        <Library size={13} aria-hidden="true" />
-        <span className={compact ? 'sr-only' : ''}>{projectExplicitlyLocked ? 'Unlock project to use references (Reference Studio)' : 'Reference Studio'}</span>
-        {projectExplicitlyLocked && <span className="text-[8px] text-amber-200">Locked</span>}
-      </button>
+    <section
+      aria-labelledby="project-reference-title"
+      aria-hidden={!active}
+      hidden={!active}
+      inert={!active ? true : undefined}
+      className="min-h-0 flex-1 overflow-y-auto overscroll-contain [-webkit-overflow-scrolling:touch]"
+    >
+      <div className="sticky top-0 z-20 flex items-center gap-2 border-b border-border bg-bg-secondary px-4 py-3">
+        <Library size={14} className="shrink-0 text-accent-blue" aria-hidden="true" />
+        <div className="min-w-0">
+          <h2 id="project-reference-title" className="text-sm font-semibold text-text-primary">Reference Studio</h2>
+          <p className="truncate text-[10px] text-text-muted">{project || 'Choose a project'} · create and manage reusable reference packs</p>
+        </div>
+      </div>
 
-      {open && !projectExplicitlyLocked && createPortal(
-        <div
-          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 p-3"
-          onClick={event => { if (event.target === event.currentTarget) closeModal() }}
-        >
-          <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="project-reference-title" tabIndex={-1} onKeyDown={handleDialogKeyDown} className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-2xl">
-            <div className="flex items-center justify-between border-b border-border px-4 py-3">
-              <div>
-                <h2 id="project-reference-title" className="text-sm font-semibold text-text-primary">Reference Studio</h2>
-                <p className="text-[10px] text-text-muted">{project} · author, review, and apply project reference packs</p>
-              </div>
-              <button ref={closeButtonRef} type="button" aria-label="Close project references" onClick={() => setOpen(false)} className="text-text-muted hover:text-text-primary"><X size={17} /></button>
-            </div>
+      {projectExplicitlyLocked ? (
+        <div className="m-4 rounded-lg border border-amber-400/30 bg-amber-400/5 p-4 text-xs text-amber-100">
+          Unlock this project to create or manage references.
+        </div>
+      ) : (
+        <>
 
             {actionError && (
               <div role="alert" className="mx-4 mt-3 flex shrink-0 items-start justify-between gap-3 rounded-lg border border-red-500/60 bg-red-500/15 px-3 py-2 text-[11px] leading-relaxed text-red-200 shadow-lg">
@@ -2498,8 +2469,8 @@ export function ProjectReferenceLibrary({
               </div>
             )}
 
-            <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-[320px_1fr] md:overflow-hidden">
-              <div className="overflow-visible border-b border-border p-4 md:overflow-y-auto md:border-b-0 md:border-r">
+            <div className="grid min-h-0 grid-cols-1">
+              <div className="overflow-visible border-b border-border p-4">
                 <h3 className="mb-3 text-xs font-medium text-text-primary">Create reference candidates</h3>
                 <div className="grid grid-cols-2 gap-1.5">
                   {ASSET_TYPES.map(option => {
@@ -2517,11 +2488,30 @@ export function ProjectReferenceLibrary({
                 <label htmlFor="project-reference-description" className="mt-2 block text-[10px] text-text-secondary">Description
                   <textarea id="project-reference-description" aria-label="Reference description" value={description} onChange={event => setDescription(event.target.value)} placeholder="Detailed description / card (optional)" rows={5} className="mt-1 w-full resize-y rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary" />
                 </label>
-                <section aria-label="Reference creation method" className="mt-3 rounded-md border border-accent-blue/30 bg-accent-blue/5 p-2">
-                  <h4 className="text-[10px] font-medium text-text-primary">Creation method</h4>
-                  <p className="mt-0.5 text-[8px] leading-relaxed text-text-muted">Choose the authored image-pack workflow below, or use Blender as a separate structured scene reference. Blender does not add a durable asset type.</p>
-                  <details className="mt-1.5 rounded border border-border/70 px-2 py-1.5">
-                    <summary className="cursor-pointer text-[10px] text-accent-blue">Build / sample a Blender scene guide</summary>
+                <fieldset className="mt-3 rounded-md border border-border bg-bg-tertiary/40 p-2">
+                  <legend className="px-1 text-[10px] font-medium text-text-secondary">Visual style</legend>
+                  <select aria-label="Reference visual style" value={visualStyle} onChange={event => setVisualStyle(event.target.value)} className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-[10px] text-text-primary">
+                    <option value="">Realistic (default)</option>
+                    <option value="cinematic">Cinematic</option>
+                    <option value="stylized 3D animation">Stylized 3D animation</option>
+                    <option value="illustration">Illustration</option>
+                    <option value="anime">Anime</option>
+                    <option value="custom">Custom…</option>
+                  </select>
+                  {visualStyle === 'custom' && <input aria-label="Custom reference visual style" value={customVisualStyle} onChange={event => setCustomVisualStyle(event.target.value)} placeholder="e.g. 1970s editorial watercolor" className="mt-1.5 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-[10px] text-text-primary" />}
+                  <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Realistic is the fallback only. Choose a preset to make it explicit, or use Custom when your own freeform style should be authoritative.</p>
+                </fieldset>
+                <fieldset aria-label="Reference creation method" className="mt-3 rounded-md border border-accent-blue/30 bg-accent-blue/5 p-2">
+                  <legend className="px-1 text-[10px] font-medium text-text-primary">Creation method</legend>
+                  <p className="text-[8px] leading-relaxed text-text-muted">Creation method is separate from the durable Character, Location, Wardrobe, and other semantic types above.</p>
+                  <div className="mt-1.5 grid grid-cols-2 gap-1.5">
+                    <div aria-label="Image Reference Pack creation method" className="rounded border border-accent-blue bg-accent-blue/10 p-2">
+                      <span className="block text-[10px] font-medium text-accent-blue">Image Reference Pack</span>
+                      <span className="mt-0.5 block text-[8px] text-text-muted">Author the selected semantic type using the controls below.</span>
+                    </div>
+                    <details className="rounded border border-border bg-bg-secondary p-2 open:col-span-2">
+                    <summary className="cursor-pointer list-none text-[10px] font-medium text-accent-blue">Blender Motion Video</summary>
+                    <p className="mt-0.5 text-[8px] text-text-muted">Create, preview, Keep, and apply a structured motion/camera reference to Generate. This method does not become an asset type and does not remove Blender from Tools.</p>
                     <BlenderSceneTool
                       compact
                       referenceName={name}
@@ -2529,7 +2519,8 @@ export function ProjectReferenceLibrary({
                       privateOutput={referenceExplicitOutput || privateOutput}
                     />
                   </details>
-                </section>
+                  </div>
+                </fieldset>
                 <fieldset className="mt-3">
                   <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Intent</legend>
                   <div className="grid grid-cols-3 gap-1">
@@ -2567,6 +2558,20 @@ export function ProjectReferenceLibrary({
                     ))}
                   </div>
                 </fieldset>
+                <fieldset className="mt-3">
+                  <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Sheet construction mode</legend>
+                  <div className="space-y-1.5">
+                    {SHEET_MODES.map(option => (
+                      <label key={option.value} className={`block cursor-pointer rounded-md border p-2 ${sheetMode === option.value ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-tertiary/40'}`}>
+                        <span className="flex items-center gap-1.5 text-[10px] font-medium text-text-primary">
+                          <input type="radio" name="reference-sheet-mode" value={option.value} checked={sheetMode === option.value} onChange={() => setSheetMode(option.value)} />
+                          {option.label}
+                        </span>
+                        <span className="mt-0.5 block pl-5 text-[9px] leading-relaxed text-text-muted">{option.description}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
                 <fieldset className="mt-3 rounded-md border border-border bg-bg-tertiary/40 p-2">
                   <legend className="px-1 text-[10px] font-medium text-text-secondary">Output handling</legend>
                   <label className="flex items-center gap-2 text-[9px] text-text-secondary">
@@ -2595,20 +2600,6 @@ export function ProjectReferenceLibrary({
                     </label>
                   </div>
                 </fieldset>
-                <fieldset className="mt-3">
-                  <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Sheet construction mode</legend>
-                  <div className="space-y-1.5">
-                    {SHEET_MODES.map(option => (
-                      <label key={option.value} className={`block cursor-pointer rounded-md border p-2 ${sheetMode === option.value ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-tertiary/40'}`}>
-                        <span className="flex items-center gap-1.5 text-[10px] font-medium text-text-primary">
-                          <input type="radio" name="reference-sheet-mode" value={option.value} checked={sheetMode === option.value} onChange={() => setSheetMode(option.value)} />
-                          {option.label}
-                        </span>
-                        <span className="mt-0.5 block pl-5 text-[9px] leading-relaxed text-text-muted">{option.description}</span>
-                      </label>
-                    ))}
-                  </div>
-                </fieldset>
                 <div className="mt-3 space-y-2" aria-label="Editable reference sections">
                   {sectionDefinitions.map(definition => {
                     const section = sections.find(candidate => candidate.id === definition.id)
@@ -2619,6 +2610,11 @@ export function ProjectReferenceLibrary({
                           {definition.label}
                           {section.pinned && <span className="ml-1 text-accent-blue">Customized · pinned</span>}
                         </legend>
+                        {definition.id === 'details' && (
+                          <p className="mb-1.5 text-[8px] leading-relaxed text-text-muted">
+                            Add up to 8 flexible labels. Use separate view-specific callouts when needed—for example, breasts (front) and breasts (profile). Source Sheet chooses the authored pack sheet to crop from; Operation chooses whether Maestro auto-selects, crops, enhances, or reconstructs that detail. Exact labels remain owner-private and preserve their authored wording.
+                          </p>
+                        )}
                         <div className="flex flex-wrap gap-1">
                           {definition.options.map(option => {
                             const item = sectionOptionItem(authoritativeTypeCapabilities, definition, option)
@@ -2673,8 +2669,8 @@ export function ProjectReferenceLibrary({
                           </div>
                         )}
                         <div className="mt-1.5 flex gap-1">
-                          <input aria-label={`Add custom ${definition.label.toLowerCase()} callout`} disabled={definition.id === 'details' && authoritativeTypeCapabilities?.supports_custom_details !== true} maxLength={500} value={customSectionInputs[definition.id] ?? ''} onChange={event => setCustomSectionInputs(current => ({ ...current, [definition.id]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); addCustomSectionValue(definition.id) } }} placeholder="Add callout" className="min-w-0 flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-primary disabled:opacity-50" />
-                          <button type="button" disabled={definition.id === 'details' && authoritativeTypeCapabilities?.supports_custom_details !== true} onClick={() => addCustomSectionValue(definition.id)} className="rounded border border-border px-2 py-1 text-[9px] text-text-secondary disabled:opacity-50">Add</button>
+                          <input aria-label={`Add custom ${definition.label.toLowerCase()} callout`} disabled={definition.id === 'details' && (authoritativeTypeCapabilities?.supports_custom_details !== true || section.values.length >= 8)} maxLength={500} value={customSectionInputs[definition.id] ?? ''} onChange={event => setCustomSectionInputs(current => ({ ...current, [definition.id]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); addCustomSectionValue(definition.id) } }} placeholder="Add callout" className="min-w-0 flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-primary disabled:opacity-50" />
+                          <button type="button" disabled={definition.id === 'details' && (authoritativeTypeCapabilities?.supports_custom_details !== true || section.values.length >= 8)} onClick={() => addCustomSectionValue(definition.id)} className="rounded border border-border px-2 py-1 text-[9px] text-text-secondary disabled:opacity-50">Add</button>
                           {section.pinned && <button type="button" onClick={() => resetSection(definition)} className="rounded border border-border px-2 py-1 text-[9px] text-text-muted">Reset</button>}
                         </div>
                       </fieldset>
@@ -2710,7 +2706,7 @@ export function ProjectReferenceLibrary({
                   <p className="mt-1 text-[8px] text-text-muted">Depth changes update untouched sections only. Customized sections stay pinned.</p>
                 </section>
                 <label htmlFor="project-reference-generation-model" className="mt-3 block text-[10px] text-text-secondary">Generation model
-                  <select id="project-reference-generation-model" aria-label="Reference Studio generation model" value={referenceModelType} onChange={event => { setReferenceModelCustomized(true); setReferenceModelType(event.target.value) }} disabled={referenceModels.length === 0} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50">
+                  <select id="project-reference-generation-model" aria-label="Reference generation model" value={referenceModelType} onChange={event => { setReferenceModelCustomized(true); setReferenceModelType(event.target.value) }} disabled={referenceModels.length === 0} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50">
                     {!referenceModelType && <option value="">{sheetMode === 'draft' ? 'Fast Draft model unavailable' : 'FLUX.2-dev unavailable'}</option>}
                     {referenceModels.length === 0 && <option value="">No image-output models available</option>}
                     {referenceModels.map(model => <option key={model.model_type} value={model.model_type}>{model.name}{getProjectReferenceModelAvailabilityCopy(model)}</option>)}
@@ -2718,7 +2714,7 @@ export function ProjectReferenceLibrary({
                 </label>
                 {sheetMode !== 'draft' && (
                   <label htmlFor="project-reference-editor-model" className="mt-2 block text-[10px] text-text-secondary">Editor model
-                    <select id="project-reference-editor-model" aria-label="Reference Studio editor model" value={editorModelType} onChange={event => { setEditorModelCustomized(true); setEditorModelType(event.target.value) }} disabled={editorModels.length === 0} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50">
+                    <select id="project-reference-editor-model" aria-label="Reference editor model" value={editorModelType} onChange={event => { setEditorModelCustomized(true); setEditorModelType(event.target.value) }} disabled={editorModels.length === 0} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50">
                       {!editorModelType && <option value="">Qwen-Image-Edit-2511 unavailable</option>}
                       {editorModels.length === 0 && <option value="">No reference-image editors available</option>}
                       {editorModels.map(model => <option key={model.model_type} value={model.model_type}>{model.name}{getProjectReferenceModelAvailabilityCopy(model)}</option>)}
@@ -2779,8 +2775,8 @@ export function ProjectReferenceLibrary({
                 )}
                 {enabledMissingMoodyModels.length > 0 && (
                   <div role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] text-amber-100">
-                    <p>{enabledMissingMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')} {enabledMissingMoodyModels.length === 1 ? 'is' : 'are'} enabled host-wide but missing from this session’s Reference Studio catalog.</p>
-                    <p className="mt-1">Refresh Reference Studio after the host catalog finishes loading. From a LAN session, complete terms, installation, and verification at localhost; host-machine controls are intentionally hidden remotely.</p>
+                    <p>{enabledMissingMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')} {enabledMissingMoodyModels.length === 1 ? 'is' : 'are'} enabled host-wide but missing from this session’s Reference catalog.</p>
+                    <p className="mt-1">Refresh Reference after the host catalog finishes loading. From a LAN session, complete terms, installation, and verification at localhost; host-machine controls are intentionally hidden remotely.</p>
                   </div>
                 )}
                 {modelLoadError && <p role="status" className="mt-2 text-[10px] text-red-300">{modelLoadError}</p>}
@@ -2928,7 +2924,7 @@ export function ProjectReferenceLibrary({
                   </label>
                 </div>
                 <label htmlFor="project-reference-planning-model" className="mt-2 block text-[10px] text-text-secondary">Planning model
-                  <select id="project-reference-planning-model" aria-label="Reference Studio planning model" value={planningModel} onChange={event => setPlanningModel(event.target.value)} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary">
+                  <select id="project-reference-planning-model" aria-label="Reference planning model" value={planningModel} onChange={event => setPlanningModel(event.target.value)} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary">
                     <option value="auto">Auto (local only)</option>
                     <option value="deterministic">Deterministic only</option>
                     {planningModels.map(model => <option key={model.id} value={model.id}>{model.label} · {model.provider ?? 'local'} · loaded</option>)}
@@ -2936,7 +2932,7 @@ export function ProjectReferenceLibrary({
                 </label>
                 {selectedPlanningModel && (selectedPlanningModel.provider ?? 'local') !== 'local' && <p className="mt-1 text-[9px] text-amber-300">Selected remote planning sends the reference text to {selectedPlanningModel.provider}; that provider’s terms and privacy policy apply.</p>}
                 <label htmlFor="project-reference-review-model" className="mt-2 block text-[10px] text-text-secondary">Visual review model
-                  <select id="project-reference-review-model" aria-label="Reference Studio visual review model" value={reviewModel} onChange={event => setReviewModel(event.target.value)} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary">
+                  <select id="project-reference-review-model" aria-label="Reference visual review model" value={reviewModel} onChange={event => setReviewModel(event.target.value)} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary">
                     <option value="auto_local">{intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract ? `Auto local · ${uncensoredReviewContract.resolved_model}` : 'Auto local'}</option>
                     <option value="off" disabled={mandatoryReview}>{mandatoryReview ? 'Off · unavailable for unrestricted / explicit output' : 'Off'}</option>
                     {selectableReviewModels.map(model => <option key={model.id} value={model.id}>{model.label} · {model.provider ?? 'local'} · {intelligencePolicy !== 'uncensored_auto' || uncensoredReviewContract?.setup_state === 'ready_resident' ? 'vision ready' : uncensoredReviewContract?.setup_state === 'ready_unloaded' ? 'installed; auto-loads for review' : 'setup required'}</option>)}
@@ -3022,7 +3018,7 @@ export function ProjectReferenceLibrary({
                 })}
               </div>
 
-              <div className="overflow-visible p-4 md:overflow-y-auto">
+              <div className="overflow-visible p-4">
                 {loadError && <p role="status" className="mb-3 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-[10px] text-red-300">{loadError}</p>}
                 {loading && !assets.length ? (
                   <div className="flex h-48 items-center justify-center"><Loader2 size={20} className="animate-spin text-accent-blue" /></div>
@@ -3075,13 +3071,23 @@ export function ProjectReferenceLibrary({
                             const pendingAction = pendingSheetActions[pendingKey]
                             const requiresPrivateAuthoring = projectReferenceRetryNeedsPrivateAuthoring(variant)
                             const authoredSeal = packMetadata?.authored_settings?.seal
-                            const exactAuthoringReady = !requiresPrivateAuthoring || (
-                              authoringAvailability[pendingKey] === 'ready'
-                              && Boolean(authoredSeal && authoredSettingsSnapshots.current.has(authoredSeal))
+                            const privateAuthoredSnapshot = authoredSeal
+                              ? authoredSettingsSnapshots.current.get(authoredSeal)
+                              : undefined
+                            const exactStyleReady = isProjectReferenceStyleReplayReady(
+                              packMetadata?.authored_settings, privateAuthoredSnapshot?.style,
                             )
-                            const exactAuthoringCopy = authoringAvailability[pendingKey] === 'unavailable'
-                              ? 'Exact custom authoring is unavailable. Retry the owner-private replay; Retry and Edit remain disabled so custom fields and details are never silently dropped.'
-                              : 'Loading the exact private custom authoring needed for safe Retry and Edit…'
+                            const exactAuthoringReady = exactStyleReady && (
+                              !requiresPrivateAuthoring || (
+                                authoringAvailability[pendingKey] === 'ready'
+                                && Boolean(authoredSeal && privateAuthoredSnapshot)
+                              )
+                            )
+                            const exactAuthoringCopy = !exactStyleReady
+                              ? 'The recorded style contract is incomplete or changed. Retry and Edit remain disabled; create a new authored pack instead.'
+                              : authoringAvailability[pendingKey] === 'unavailable'
+                                ? 'Exact private authoring is unavailable. Retry the owner-private replay; Retry and Edit remain disabled so style, custom fields, and details are never silently dropped.'
+                                : 'Loading the exact private authoring needed for safe Retry and Edit…'
                             const summarizedLoras = [
                               ...(packMetadata?.additional_loras?.applied ?? []),
                               ...(packMetadata?.additional_loras?.skipped ?? []),
@@ -3118,13 +3124,17 @@ export function ProjectReferenceLibrary({
                               ? jobs.find(candidate => candidate.id === pendingAction.jobId)
                               : undefined
                             const editing = editVariantId === variant.id
+                            const directorReferenceKind = getDirectorProjectReferenceKind(asset.asset_type)
+                            const directorApplyUnsupported = referenceReturnMode === 'director'
+                              && directorReferenceKind === null
+                              && !applyOutput?.media_type?.startsWith('video/')
                             const applyLabel = applyOutput?.media_type?.startsWith('video/')
-                              ? 'Apply to Studio: LTX-2.3 control + semantic prompt'
+                              ? 'Apply to Generate: LTX-2.3 control + semantic prompt'
                               : variant.variant_type === 'reference_pack'
-                                ? `Use ${applyOutputs.length} ordered pack ${applyOutputs.length === 1 ? 'sheet' : 'sheets'} as ${sidebarMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic refs (auto-select)' : 'Studio references'}`
+                                ? `Use ${applyOutputs.length} ordered pack ${applyOutputs.length === 1 ? 'sheet' : 'sheets'} as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic refs (auto-select)' : 'Generate references'}`
                               : variant.variant_type === 'reference_sheet'
-                                ? `Use complete sheet as ${sidebarMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic ref (auto-select)' : 'Studio reference'}`
-                                : `Use as ${sidebarMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic ref (auto-select)' : 'Studio reference'}`
+                                ? `Use complete sheet as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic ref (auto-select)' : 'Generate reference'}`
+                                : `Use as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic ref (auto-select)' : 'Generate reference'}`
                             return (
                               <div key={variant.id} className={`overflow-hidden rounded-md border ${variant.status === 'kept' ? 'border-accent-green/60' : variant.status === 'rejected' ? 'border-border opacity-60' : 'border-border'}`}>
                                 {applyOutput && (
@@ -3219,7 +3229,7 @@ export function ProjectReferenceLibrary({
                                       </button>
                                     </div>
                                   )}
-                                  {requiresPrivateAuthoring && !exactAuthoringReady && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{exactAuthoringCopy}</p>}
+                                      {(!exactStyleReady || (requiresPrivateAuthoring && !exactAuthoringReady)) && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{exactAuthoringCopy}</p>}
                                   {requiresPrivateLoraInputs && !exactLoraInputsReady && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">Exact private LoRA inputs are loading or unavailable from the owner-private replay record. Retry and Edit are disabled so values are never guessed or silently dropped.</p>}
                                   {authoringAvailability[pendingKey] === 'unavailable'
                                     && ((requiresPrivateAuthoring && !exactAuthoringReady) || (requiresPrivateLoraInputs && !exactLoraInputsReady)) && (
@@ -3227,7 +3237,7 @@ export function ProjectReferenceLibrary({
                                   )}
                                   {!retryReview.ready && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{retryReview.intelligence_policy === 'uncensored_auto' ? `Retry and Edit are waiting for the required local fidelity reviewer. ${reviewerSetupCopy}` : 'Retry and Edit require a loaded local vision reviewer for this source pack. Load and select an eligible reviewer first.'}</p>}
                                   {retryReview.use_current_reviewer && <p role="status" className="mt-1 text-[8px] leading-relaxed text-text-muted">The recorded reviewer is unavailable; Retry or Edit will use the current compatible reviewer.</p>}
-                                  {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry/Edit preserves recorded source mode, resolved model pair, privacy, repair, planning, and review policy. The kept parent remains unchanged.</p>}
+                                  {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry/Edit preserves recorded style, source mode, resolved model pair, privacy, repair, planning, and review policy. The kept parent remains unchanged.</p>}
                                   {editing && (variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && (
                                     <div id={`reference-sheet-edit-${variant.id}`} className="mt-1.5 rounded border border-border p-1.5">
                                       <label htmlFor={`reference-sheet-edit-instruction-${variant.id}`} className="text-[9px] text-text-muted">What should change in the next candidate?</label>
@@ -3245,7 +3255,12 @@ export function ProjectReferenceLibrary({
                                     </div>
                                   )}
                                   {pendingAction && <p role="status" className="mt-1.5 flex items-center gap-1 text-[9px] text-accent-blue"><Loader2 size={9} className="animate-spin" /> {pendingAction.jobId ? `${pendingJob?.phase || 'Queued'}; waiting for the new candidate…` : 'Submitting…'}</p>}
-                                  {variant.status === 'kept' && applyOutput && <button type="button" onClick={() => void applyReference(asset, variant)} className="mt-1.5 w-full rounded border border-accent-blue/40 px-1 py-1 text-[9px] text-accent-blue">{applyLabel}</button>}
+                                  {variant.status === 'kept' && applyOutput && (
+                                    <>
+                                      <button type="button" disabled={directorApplyUnsupported} onClick={() => void applyReference(asset, variant)} className="mt-1.5 w-full rounded border border-accent-blue/40 px-1 py-1 text-[9px] text-accent-blue disabled:cursor-not-allowed disabled:border-border disabled:text-text-muted">{directorApplyUnsupported ? 'Use from Generate' : applyLabel}</button>
+                                      {directorApplyUnsupported && <p className="mt-1 text-[8px] leading-relaxed text-amber-200">Director currently accepts only Character and Location references. Expanded semantic types require the pending Director backend contract; this candidate remains available from Generate.</p>}
+                                    </>
+                                  )}
                                 </div>
                               </div>
                             )
@@ -3257,10 +3272,8 @@ export function ProjectReferenceLibrary({
                 )}
               </div>
             </div>
-          </div>
-        </div>,
-        document.body,
+        </>
       )}
-    </>
+    </section>
   )
 }

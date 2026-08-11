@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ..schema import ShotPlan, ProductionPlan
+from ..policies import resolve_visual_style
 from .base import BaseRenderer
 
 
@@ -33,7 +34,14 @@ class LtxA2VRenderer(BaseRenderer):
         parts = []
 
         # Shot setup
-        setup = [shot.camera_plan.framing]
+        visual_style = resolve_visual_style(
+            shot.visual_style,
+            has_visual_reference=bool(context.get("has_reference", False)),
+        )
+        setup = [
+            value for value in (visual_style, shot.camera_plan.framing)
+            if value
+        ]
         if shot.environment:
             setup.append(shot.environment)
         if shot.lighting:

@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ..schema import ShotPlan, ProductionPlan
+from ..policies import resolve_visual_style
 from .base import BaseRenderer
 
 
@@ -89,8 +90,9 @@ class ImageGenRenderer(BaseRenderer):
 
         # Style and framing
         style_parts = []
-        if shot.visual_style:
-            style_parts.append(shot.visual_style)
+        visual_style = resolve_visual_style(shot.visual_style)
+        if visual_style:
+            style_parts.append(visual_style)
         style_parts.append(shot.camera_plan.framing)
         if shot.camera_plan.angle:
             style_parts.append(shot.camera_plan.angle)

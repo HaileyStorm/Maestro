@@ -314,7 +314,8 @@ class EnhancerPropagationTests(unittest.TestCase):
                 "synthetic request", raw_enhancer_mode=True, nsfw=True,
             )
 
-        self.assertEqual(calls[0]["system_prompt"], "")
+        self.assertIn("VISUAL STYLE DEFAULT", calls[0]["system_prompt"])
+        self.assertNotIn("EXPLICIT CONTENT AUTHORING", calls[0]["system_prompt"])
         self.assertIn("EXPLICIT CONTENT AUTHORING", calls[1]["system_prompt"])
         self.assertIn("brutal attack", calls[1]["system_prompt"])
 
@@ -772,6 +773,7 @@ class DirectorSnapshotTests(unittest.TestCase):
             copy=copy,
             _redact_local_paths=lambda value: value,
             _sanitize_director_public_failures=lambda value: value,
+            _strip_director_image_role_internals=lambda value: value,
         )
         source = {
             "pipeline_id": "synthetic",

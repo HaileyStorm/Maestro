@@ -1,11 +1,14 @@
 import { useState, useCallback, useRef, useMemo, useEffect } from 'react'
-import { Upload, Loader2, Music, RotateCcw, Check, X, ChevronRight, ChevronDown, ImageIcon, Play, Film, Mic, Sparkles, Send, Users, FileText, Clock } from 'lucide-react'
+import { Upload, Loader2, Music, RotateCcw, Check, X, ChevronRight, ChevronDown, ImageIcon, Play, Film, Mic, Sparkles, Send, Users, FileText, Clock, Download, HardDrive, Settings } from 'lucide-react'
 import { useStore, getFamiliesForMode, getModelsForFamily, isDirectorPipelineActive, resolveResolution } from '../../stores/useStore'
-import { estimateH3Performance, fetchDefaults, fetchModelOptions, getFileUrl } from '../../api/client'
-import { DirectorLoraSelector } from '../SettingsDrawer/DirectorLoraSelector'
+import { downloadModel, estimateH3Performance, fetchDefaults, fetchModelOptions, getDirectorHostActionAccessState, getFileUrl, verifyManualCheckpoint, waitForModelDownloadTerminal } from '../../api/client'
+import type { DirectorImageRoleCandidate, DirectorReadinessReason } from '../../api/client'
+import { DirectorImageRoleLoraSelector, DirectorLoraSelector } from '../SettingsDrawer/DirectorLoraSelector'
 import { DirectorSongSetup } from './DirectorSongSetup'
 import { InfoTooltip } from './InfoTooltip'
-import type { DirectorPipelineType, DirectorShotImageGuidance, DirectorSkill, H3SegmentCountEstimate, ModelOptions, ShortFilmCharacter, ShortFilmPath } from '../../types'
+import { H3StyleWorkflowField } from './PromptInput'
+import { formatManualInstallationBytes, manualInstallationDestination } from '../../lib/manualInstallation'
+import type { DirectorImageRole, DirectorPipelineType, DirectorShotImageGuidance, DirectorSkill, H3SegmentCountEstimate, ModelOptions, ShortFilmCharacter, ShortFilmPath } from '../../types'
 
 // AUDIO_ACCEPT lists both audio formats AND video formats. When a video
 // file is uploaded, the backend's /api/v1/upload-audio endpoint extracts
@@ -528,7 +531,7 @@ export function DirectorChat() {
         {/* Welcome message */}
         <SystemBubble>
           <p className="text-xs text-text-secondary">
-            Welcome to Maestro Director. Choose a skill to get started.
+            Welcome to Maestro Director. Choose a Skill below to get started.
           </p>
         </SystemBubble>
 
@@ -1205,7 +1208,10 @@ function SkillSelector({ onSelect }: { onSelect: (skill: DirectorSkill) => void 
   ]
 
   return (
-    <div className="grid grid-cols-2 gap-2">
+    <fieldset aria-label="Director Skills" className="rounded-xl border border-border bg-bg-tertiary/20 p-2">
+      <legend className="px-1 text-[11px] font-medium uppercase tracking-wider text-text-secondary">Skills</legend>
+      <p id="director-skills-guidance" className="mb-2 text-[9px] text-text-muted">Choose the production workflow Director should guide.</p>
+      <div role="group" aria-labelledby="director-skills-guidance" className="grid grid-cols-2 gap-2">
       {skills.map((s) => (
         <button
           key={s.label}
@@ -1227,7 +1233,8 @@ function SkillSelector({ onSelect }: { onSelect: (skill: DirectorSkill) => void 
           )}
         </button>
       ))}
-    </div>
+      </div>
+    </fieldset>
   )
 }
 
@@ -1527,7 +1534,7 @@ function AdditionalRefsSection() {
   const voiceReferenceMode = selectedVideoDefinition?.director?.voice_reference_mode ?? 'none'
   const showVoiceReference = selectedVideoDefinition?.director?.supports_voice_reference === true
     && voiceReferenceEnabled
-  const [expanded, setExpanded] = useState(charRefs.length > 0 || locRefs.length > 0 || voiceRef !== null)
+  const [expanded, setExpanded] = useState(true)
 
   const handleFiles = useCallback((files: FileList | null, type: 'char' | 'loc') => {
     if (!files) return
@@ -1538,18 +1545,35 @@ function AdditionalRefsSection() {
   const totalRefs = charRefs.length + locRefs.length + (showVoiceReference && voiceRef ? 1 : 0)
 
   return (
-    <div className="mt-1">
+    <fieldset className="mt-2 rounded-lg border border-border bg-bg-tertiary/30 p-2">
+      <legend className="px-1 text-[10px] font-medium uppercase tracking-wider text-text-secondary">Additional references</legend>
       <button
+        type="button"
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1 text-[10px] text-text-muted hover:text-text-secondary transition-colors w-full"
+        aria-expanded={expanded}
+        className="flex w-full items-center gap-1 text-[9px] text-text-muted transition-colors hover:text-text-secondary"
       >
         {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
         <Users size={10} />
-        <span>Additional references</span>
+        <span>{expanded ? 'Hide reference choices' : 'Show reference choices'}</span>
         {totalRefs > 0 && <span className="ml-auto bg-accent-blue/20 text-accent-blue px-1.5 rounded-full text-[9px]">{totalRefs}</span>}
       </button>
       {expanded && (
-        <div className="mt-1.5 space-y-2 pl-1">
+        <div className="mt-2 space-y-2">
+          <div className="grid grid-cols-2 gap-1.5" aria-label="Additional reference methods">
+            <label className="cursor-pointer rounded border border-border bg-bg-secondary p-1.5 text-[9px] text-text-secondary hover:border-accent-blue/50">
+              <ImageIcon size={11} className="mb-1 text-accent-blue" />
+              <span className="block font-medium">Character photos</span>
+              <span className="block text-[8px] text-text-muted">Add identity refs</span>
+              <input type="file" accept={IMAGE_ACCEPT} multiple className="sr-only" onChange={event => handleFiles(event.target.files, 'char')} />
+            </label>
+            <label className="cursor-pointer rounded border border-border bg-bg-secondary p-1.5 text-[9px] text-text-secondary hover:border-accent-blue/50">
+              <ImageIcon size={11} className="mb-1 text-accent-blue" />
+              <span className="block font-medium">Scene photos</span>
+              <span className="block text-[8px] text-text-muted">Add setting refs</span>
+              <input type="file" accept={IMAGE_ACCEPT} multiple className="sr-only" onChange={event => handleFiles(event.target.files, 'loc')} />
+            </label>
+          </div>
           {/* Character References */}
           <div>
             <div className="flex items-center justify-between mb-1">
@@ -1633,7 +1657,7 @@ function AdditionalRefsSection() {
           </div>}
         </div>
       )}
-    </div>
+    </fieldset>
   )
 }
 
@@ -1891,7 +1915,7 @@ function StructureView({
 
 /**
  * DirectorAdvancedAccordion — collapsed-by-default panel exposing the
- * post-processing knobs (spatial upsampling, film grain, self refiner)
+ * final-video post-processing knobs (spatial upsampling, film grain, self refiner)
  * that used to live in the Director Parameters settings tab. Sits in
  * the chat sidebar alongside the LoRA accordion so per-shoot tweaks
  * are co-located with the rest of the per-shoot setup.
@@ -1914,14 +1938,6 @@ function DirectorAdvancedAccordion() {
   ))
   const shotImageGuidance = useStore(s => s.directorShotImageGuidance)
   const setShotImageGuidance = useStore(s => s.setDirectorShotImageGuidance)
-  const hasVisualReferences = useStore(s => Boolean(
-    s.directorReferenceImage
-    || s.directorReferenceImagePath
-    || s.directorCharacterRefs.length
-    || s.directorCharacterRefPaths.length
-    || s.directorLocationRefs.length
-    || s.directorLocationRefPaths.length
-  ))
   const videoStepsByModel = useStore(s => s.directorVideoInferenceStepsByModel)
   const setVideoSteps = useStore(s => s.setDirectorVideoInferenceSteps)
   const maxShotFramesByModel = useStore(s => s.directorVideoMaxShotFramesByModel)
@@ -1945,15 +1961,7 @@ function DirectorAdvancedAccordion() {
     + Math.max(s.directorLocationRefs.length, s.directorLocationRefPaths.length)
   ))
 
-  // Image post-processing
-  const imgUpsampling = useStore(s => s.directorImageSpatialUpsampling)
-  const setImgUpsampling = useStore(s => s.setDirectorImageSpatialUpsampling)
-  const imgGrain = useStore(s => s.directorImageFilmGrainIntensity)
-  const setImgGrain = useStore(s => s.setDirectorImageFilmGrainIntensity)
-  const imgGrainSat = useStore(s => s.directorImageFilmGrainSaturation)
-  const setImgGrainSat = useStore(s => s.setDirectorImageFilmGrainSaturation)
-
-  // Video post-processing
+  // New Director jobs have one post-processing authority: final video.
   const vidUpsampling = useStore(s => s.directorVideoSpatialUpsampling)
   const setVidUpsampling = useStore(s => s.setDirectorVideoSpatialUpsampling)
   const vidGrain = useStore(s => s.directorVideoFilmGrainIntensity)
@@ -1986,11 +1994,6 @@ function DirectorAdvancedAccordion() {
 
   const activeVideoOptions = videoOptions?.model_type === videoModel ? videoOptions : null
 
-  const generateShotImages = directorWillGenerateShotImages(
-    videoModelDefinition?.director?.shot_image_support,
-    shotImageGuidance,
-    hasVisualReferences,
-  )
   const defaultSteps = Math.max(1, Math.min(50, Math.round(activeVideoOptions?.default_num_inference_steps || 8)))
   const videoSteps = activeVideoOptions?.lock_inference_steps
     ? defaultSteps
@@ -2139,58 +2142,11 @@ function DirectorAdvancedAccordion() {
             </p>
           </div>
 
-          {/* IMAGE section */}
-          {generateShotImages && <div className="space-y-2">
-            <div className="text-[10px] text-text-muted uppercase tracking-wider">Image</div>
-
-            <div>
-              <label className="text-[11px] text-text-secondary block mb-1">Upsampling</label>
-              <select
-                value={imgUpsampling}
-                onChange={e => setImgUpsampling(e.target.value)}
-                className="w-full bg-bg-tertiary border border-border rounded-lg px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
-              >
-                {upsamplingOptions.map(opt => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-              <p className="text-[10px] text-text-muted mt-0.5">
-                Render then upscale the start image. Adds time per shot.
-              </p>
-            </div>
-
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-[11px] text-text-secondary">Film grain</label>
-                <span className="text-[10px] text-text-muted tabular-nums">{imgGrain.toFixed(2)}</span>
-              </div>
-              <input
-                type="range" min={0} max={1} step={0.01} value={imgGrain}
-                onChange={e => setImgGrain(parseFloat(e.target.value))}
-                className="w-full"
-              />
-              <p className="text-[10px] text-text-muted mt-0.5">
-                Aesthetic film-grain texture. 0 = off.
-              </p>
-              {imgGrain > 0 && (
-                <div className="mt-1.5">
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="text-[10px] text-text-muted">Grain saturation</label>
-                    <span className="text-[10px] text-text-muted tabular-nums">{imgGrainSat.toFixed(2)}</span>
-                  </div>
-                  <input
-                    type="range" min={0} max={1} step={0.01} value={imgGrainSat}
-                    onChange={e => setImgGrainSat(parseFloat(e.target.value))}
-                    className="w-full"
-                  />
-                </div>
-              )}
-            </div>
-          </div>}
-
-          {/* VIDEO section */}
-          <div className="space-y-2 pt-1 border-t border-border">
-            <div className="text-[10px] text-text-muted uppercase tracking-wider pt-2">Video</div>
+          <fieldset className="space-y-2 rounded-lg border border-border bg-bg-tertiary/20 p-2">
+            <legend className="px-1 text-[10px] uppercase tracking-wider text-text-muted">Final video</legend>
+            <p className="text-[9px] leading-relaxed text-text-muted">
+              These settings apply once to the joined final video, not to temporary shot images.
+            </p>
 
             <div>
               <div className="flex items-center justify-between mb-1">
@@ -2250,8 +2206,9 @@ function DirectorAdvancedAccordion() {
             </div>}
 
             <div>
-              <label className="text-[11px] text-text-secondary block mb-1">Upsampling</label>
+              <label htmlFor="director-final-video-upsampling" className="text-[11px] text-text-secondary block mb-1">Upsampling</label>
               <select
+                id="director-final-video-upsampling"
                 value={vidUpsampling}
                 onChange={e => setVidUpsampling(e.target.value)}
                 className="w-full bg-bg-tertiary border border-border rounded-lg px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
@@ -2261,30 +2218,32 @@ function DirectorAdvancedAccordion() {
                 ))}
               </select>
               <p className="text-[10px] text-text-muted mt-0.5">
-                Render then upscale the video. Adds time per shot.
+                Upscale the joined final video once. Adds finalization time.
               </p>
             </div>
 
             <div>
               <div className="flex items-center justify-between mb-1">
-                <label className="text-[11px] text-text-secondary">Film grain</label>
+                <label htmlFor="director-final-video-film-grain" className="text-[11px] text-text-secondary">Film grain</label>
                 <span className="text-[10px] text-text-muted tabular-nums">{vidGrain.toFixed(2)}</span>
               </div>
               <input
+                id="director-final-video-film-grain"
                 type="range" min={0} max={1} step={0.01} value={vidGrain}
                 onChange={e => setVidGrain(parseFloat(e.target.value))}
                 className="w-full"
               />
               <p className="text-[10px] text-text-muted mt-0.5">
-                Aesthetic film-grain texture. 0 = off.
+                Apply one film-grain pass to the joined final video. 0 = off.
               </p>
               {vidGrain > 0 && (
                 <div className="mt-1.5">
                   <div className="flex items-center justify-between mb-1">
-                    <label className="text-[10px] text-text-muted">Grain saturation</label>
+                    <label htmlFor="director-final-video-grain-saturation" className="text-[10px] text-text-muted">Grain saturation</label>
                     <span className="text-[10px] text-text-muted tabular-nums">{vidGrainSat.toFixed(2)}</span>
                   </div>
                   <input
+                    id="director-final-video-grain-saturation"
                     type="range" min={0} max={1} step={0.01} value={vidGrainSat}
                     onChange={e => setVidGrainSat(parseFloat(e.target.value))}
                     className="w-full"
@@ -2313,7 +2272,7 @@ function DirectorAdvancedAccordion() {
                 Re-passes the rendered video through the refiner. May improve detail or introduce artifacts.
               </p>
             </div>}
-          </div>
+          </fieldset>
         </div>
       )}
     </div>
@@ -2324,8 +2283,7 @@ function DirectorAdvancedAccordion() {
  *  ModelSelector (enabledModels), grouped by family.
  *  Changing it updates selectedModelPerMode, which the pipeline submission
  *  reads AND the LoRA accordions below re-fetch from (their modelType prop). */
-function DirectorModelPicker({ mode, value, onChange }: {
-  mode: 'image' | 'video'
+function DirectorModelPicker({ value, onChange }: {
   value: string
   onChange: (modelType: string) => void | Promise<void>
 }) {
@@ -2346,28 +2304,27 @@ function DirectorModelPicker({ mode, value, onChange }: {
     : 'music_video'
 
   const isCompatible = useCallback((model: typeof models[number]) => {
-    if (mode === 'image') return model.director?.image.compatible === true
     return model.director?.video[pipelineType].compatible === true
       && (!seamless || model.director?.video.seamless.compatible === true)
-  }, [mode, pipelineType, seamless])
+  }, [pipelineType, seamless])
 
   useEffect(() => {
-    if (mode !== 'video' || h3SelectedProfile === 'custom') return
+    if (h3SelectedProfile === 'custom') return
     void refreshH3Compatibility('minimax_h3_pinkcherry_fl2va')
-  }, [mode, value, h3SelectedProfile, refreshH3Compatibility])
+  }, [value, h3SelectedProfile, refreshH3Compatibility])
 
   const groups = useMemo(() =>
-    getFamiliesForMode(mode, families).map(family => ({
+    getFamiliesForMode('video', families).map(family => ({
       family,
-      models: getModelsForFamily(family.id, models, mode)
+      models: getModelsForFamily(family.id, models, 'video')
         .filter(m => enabledModels.has(m.model_type))
         .filter(isCompatible),
     })).filter(g => g.models.length > 0),
-  [mode, families, models, enabledModels, isCompatible])
+  [families, models, enabledModels, isCompatible])
 
   const compatibleModels = useMemo(() => groups.flatMap(group => group.models), [groups])
   const known = compatibleModels.some(model => model.model_type === value)
-  const preferredId = mode === 'image' ? 'flux2_klein_9b' : 'ltx2_22B_distilled_1_1'
+  const preferredId = 'ltx2_22B_distilled_1_1'
   const fallbackModel = compatibleModels.find(model => model.model_type === preferredId) || compatibleModels[0]
   const selectedValue = known ? value : (fallbackModel?.model_type || '')
   const currentModel = compatibleModels.find(model => model.model_type === selectedValue)
@@ -2387,16 +2344,14 @@ function DirectorModelPicker({ mode, value, onChange }: {
   )
     ? `${requestedProfileLabel || 'Current profile'} incompatible; selects ${pinkCompatibility.fallbackProfileLabel || pinkCompatibility.fallbackProfileId || 'server fallback'}`
     : ''
-  const pickerTitle = mode === 'image'
-    ? 'Only models that can create an establishing image and edit reference-based start frames are shown.'
-    : pipelineType === 'short_film_story'
+  const pickerTitle = pipelineType === 'short_film_story'
       ? 'Only models that can render Director-planned shots with synchronized native audio are shown.'
       : 'Only models that can follow the uploaded soundtrack or dialogue timeline are shown.'
 
   return (
     <div className="flex items-center gap-1.5">
       <span className="text-[10px] text-text-muted uppercase tracking-wider w-11 shrink-0">
-        {mode === 'image' ? 'Image' : 'Video'}
+        Video
       </span>
       <select
         value={selectedValue}
@@ -2426,67 +2381,273 @@ function DirectorModelPicker({ mode, value, onChange }: {
   )
 }
 
-function DirectorLoraAccordion() {
-  // Resolve Director's per-shoot image and video models from saved
-  // per-mode selections, falling back to the same Director defaults
-  // the pipeline submission uses (useStore.ts:5574). The previous
-  // fallback to `s.params.model_type` was wrong — that field carries
-  // the CURRENTLY-ACTIVE Studio model, which on fresh launch is
-  // whatever Studio happens to be in (usually video). On a fresh
-  // launch, that meant Director's "Image LoRAs" accordion would
-  // fetch the video model's LoRA dir and display LTX loras under
-  // the image header. Falling back to a known image-class default
-  // (flux2_klein_9b) instead of the active Studio model fixes that.
-  const imageModel = useStore(s => s.selectedModelPerMode.image || 'flux2_klein_9b')
-  const videoModel = useStore(s => s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')
-  const videoModelDefinition = useStore(s => s.models.find(
-    model => model.model_type === (s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1'),
+const DIRECTOR_READINESS_COPY: Record<DirectorReadinessReason, string> = {
+  director_incompatible: 'This model cannot perform this Director image role.',
+  manual_verification_required: 'The exact manual checkpoint must be verified on the host.',
+  model_disabled: 'This model is hidden in Enabled Models.',
+  model_not_downloaded: 'The required local model files are not ready.',
+  model_terms_required: 'This host has not accepted every exact model/creator notice.',
+  model_unavailable: 'This model is unavailable in the current catalog.',
+}
+
+function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRoleCandidate }) {
+  const accessContext = useStore(s => s.accessContext)
+  const accessState = getDirectorHostActionAccessState(accessContext)
+  const model = useStore(s => s.models.find(item => item.model_type === candidate.model_type))
+  const machineControls = accessContext?.machine_controls === true
+  const catalogDownloads = accessContext?.catalog_model_downloads === true
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const explicitOutput = useStore(s => s.explicitOutput)
+  const hostTerms = useStore(s => s.hostTerms)
+  const hostTermsLoading = useStore(s => s.hostTermsLoading)
+  const hostTermsError = useStore(s => s.hostTermsError)
+  const acceptHostTerm = useStore(s => s.acceptHostTerm)
+  const loadModels = useStore(s => s.loadModels)
+  const loadCapabilities = useStore(s => s.loadDirectorCapabilities)
+  const openDirectorModelVisibility = useStore(s => s.openDirectorModelVisibility)
+  const [busy, setBusy] = useState<'download' | 'verify' | ''>('')
+  const [actionError, setActionError] = useState('')
+  const actionEpoch = useRef(0)
+  const pendingTerms = (model?.required_host_terms ?? []).filter(requirement => (
+    hostTerms?.[requirement.term]?.accepted !== true
   ))
-  const shotImageGuidance = useStore(s => s.directorShotImageGuidance)
-  const hasVisualReferences = useStore(s => Boolean(
-    s.directorReferenceImage
-    || s.directorReferenceImagePath
-    || s.directorCharacterRefs.length
-    || s.directorCharacterRefPaths.length
-    || s.directorLocationRefs.length
-    || s.directorLocationRefPaths.length
-  ))
-  const selectDirectorImageModel = useStore(s => s.selectDirectorImageModel)
-  const selectDirectorVideoModel = useStore(s => s.selectDirectorVideoModel)
-  const [imageOpen, setImageOpen] = useState(false)
-  const [videoOpen, setVideoOpen] = useState(false)
-  const generateShotImages = directorWillGenerateShotImages(
-    videoModelDefinition?.director?.shot_image_support,
-    shotImageGuidance,
-    hasVisualReferences,
+
+  useEffect(() => {
+    const epoch = ++actionEpoch.current
+    queueMicrotask(() => {
+      if (actionEpoch.current === epoch) {
+        setBusy('')
+        setActionError('')
+      }
+    })
+    return () => { actionEpoch.current += 1 }
+  }, [candidate.model_type, activeWorkspace, explicitOutput])
+
+  const actionIsCurrent = (epoch: number, workspace: string, explicit: boolean) => (
+    actionEpoch.current === epoch
+    && useStore.getState().activeWorkspace === workspace
+    && useStore.getState().explicitOutput === explicit
   )
+
+  const refresh = async (epoch: number, workspace: string, explicit: boolean) => {
+    if (!actionIsCurrent(epoch, workspace, explicit)) return
+    await loadModels()
+    if (!actionIsCurrent(epoch, workspace, explicit)) return
+    await loadCapabilities({ explicitOutput: explicit, force: true })
+  }
+
+  if (candidate.ready) {
+    return <p role="status" className="mt-1 text-[9px] text-indicator-success">Ready on this host.</p>
+  }
+  return (
+    <div role="status" className="mt-1.5 space-y-1.5 rounded border border-amber-500/30 bg-amber-500/10 p-2 text-[9px] leading-relaxed text-amber-100">
+      {candidate.reasons.map(reason => <p key={reason}>{DIRECTOR_READINESS_COPY[reason]}</p>)}
+      {pendingTerms.map(requirement => (
+        <div key={requirement.term}>
+          <p>{requirement.notice}</p>
+          <div className="mt-1 flex flex-wrap gap-2">
+            <a href={requirement.license_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Review exact terms</a>
+            <button type="button" disabled={hostTermsLoading || !hostTerms || !machineControls} onClick={() => {
+              const epoch = ++actionEpoch.current
+              const workspace = activeWorkspace
+              const explicit = explicitOutput
+              void acceptHostTerm(requirement.term)
+                .then(() => refresh(epoch, workspace, explicit))
+                .catch(error => {
+                  if (actionIsCurrent(epoch, workspace, explicit)) setActionError(error instanceof Error ? error.message : 'Terms acceptance failed.')
+                })
+            }} className="rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40">Accept for this host</button>
+          </div>
+        </div>
+      ))}
+      {model?.manual_installation && candidate.actions.includes('verify_manual_checkpoint') && (
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[8px]">
+          <dt>Filename</dt><dd className="break-all font-mono select-all">{model.manual_installation.filename}</dd>
+          <dt>Place in</dt><dd className="break-all font-mono select-all">{manualInstallationDestination(model.manual_installation)}</dd>
+          <dt>Size</dt><dd>{formatManualInstallationBytes(model.manual_installation.size_bytes)}</dd>
+          <dt>SHA-256</dt><dd className="break-all font-mono select-all">{model.manual_installation.sha256}</dd>
+        </dl>
+      )}
+      {model?.manual_installation && (
+        <div className="flex flex-wrap gap-2">
+          <a href={model.manual_installation.source_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Source page</a>
+          <a href={model.manual_installation.download_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Exact manual download</a>
+        </div>
+      )}
+      <div className="flex flex-wrap gap-1.5">
+        {candidate.actions.includes('enable_model') && machineControls && (
+          <button type="button" onClick={openDirectorModelVisibility} className="inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5"><Settings size={9} /> Enable model</button>
+        )}
+        {candidate.actions.includes('download_model') && machineControls && catalogDownloads && (
+          <button type="button" disabled={busy !== ''} onClick={() => {
+            const epoch = ++actionEpoch.current
+            const workspace = activeWorkspace
+            const explicit = explicitOutput
+            setBusy('download'); setActionError('')
+            void (async () => {
+              const started = await downloadModel(candidate.model_type, workspace)
+              if (!actionIsCurrent(epoch, workspace, explicit)) return
+              if (started.status === 'downloading') {
+                const terminal = await waitForModelDownloadTerminal(candidate.model_type, {
+                  isCurrent: () => actionIsCurrent(epoch, workspace, explicit),
+                  onStatus: status => window.dispatchEvent(new CustomEvent('maestro:model-download-status', {
+                    detail: { model_type: candidate.model_type, status },
+                  })),
+                })
+                if (terminal.status === 'cancelled') return
+                if (terminal.status === 'failed') throw new Error('Model download failed. Check the host log and retry.')
+              }
+              await refresh(epoch, workspace, explicit)
+            })().catch(error => {
+              if (actionIsCurrent(epoch, workspace, explicit)) setActionError(error instanceof Error ? error.message : 'Download failed.')
+            }).finally(() => {
+              if (actionIsCurrent(epoch, workspace, explicit)) setBusy('')
+            })
+          }} className="inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40"><Download size={9} /> {busy === 'download' ? 'Downloading…' : 'Download model'}</button>
+        )}
+        {candidate.actions.includes('verify_manual_checkpoint') && machineControls && (
+          <button type="button" disabled={busy !== '' || pendingTerms.length > 0} onClick={() => {
+            const epoch = ++actionEpoch.current
+            const workspace = activeWorkspace
+            const explicit = explicitOutput
+            setBusy('verify'); setActionError('')
+            void verifyManualCheckpoint(candidate.model_type)
+              .then(() => refresh(epoch, workspace, explicit))
+              .catch(error => {
+                if (actionIsCurrent(epoch, workspace, explicit)) setActionError(error instanceof Error ? error.message : 'Verification failed.')
+              }).finally(() => {
+                if (actionIsCurrent(epoch, workspace, explicit)) setBusy('')
+              })
+          }} className="inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40"><HardDrive size={9} /> {busy === 'verify' ? 'Verifying…' : 'Verify checkpoint'}</button>
+        )}
+      </div>
+      {accessState === 'loading' && candidate.actions.length > 0 && <p>Loading host permissions…</p>}
+      {accessState === 'lan' && candidate.actions.length > 0 && <p>Complete these host actions from Maestro at localhost. LAN/remote sessions retain catalog visibility but cannot mutate host models or accept host notices.</p>}
+      {hostTermsError && <p className="text-red-300">{hostTermsError}</p>}
+      {actionError && <p className="text-red-300">{actionError}</p>}
+    </div>
+  )
+}
+
+function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
+  const capabilities = useStore(s => (
+    s.directorCapabilitiesExplicitOutput === s.explicitOutput ? s.directorCapabilities : null
+  ))
+  const models = useStore(s => s.models)
+  const override = useStore(s => role === 'creator'
+    ? s.directorImageCreatorModelOverride : s.directorImageEditorModelOverride)
+  const setRoleModel = useStore(s => s.setDirectorImageRoleModel)
+  const selections = useStore(s => s.directorImageRoleLoras[role])
+  const setSelections = useStore(s => s.setDirectorImageRoleLoras)
+  const explicitOutput = useStore(s => s.explicitOutput)
+  const [lorasOpen, setLorasOpen] = useState(false)
+  const capability = capabilities?.image_roles[role]
+  const effectiveModel = override || capability?.resolved_model || ''
+  const candidate = capability?.candidates.find(item => item.model_type === effectiveModel)
+  const compatibleCandidates = capability?.candidates.filter(item => item.compatible) ?? []
+  const modelName = (modelType: string) => models.find(model => model.model_type === modelType)?.name || modelType
+  const label = role === 'creator' ? 'Image creator' : 'Continuity editor'
+  const description = role === 'creator'
+    ? 'Creates reference-free anchors, keyframes, and shot stills.'
+    : 'Edits from references and handles continuity, reframing, and repair.'
+
+  return (
+    <fieldset className="rounded-lg border border-border bg-bg-tertiary/20 p-2">
+      <legend className="px-1 text-[10px] font-medium text-text-secondary">{label}</legend>
+      <p className="mb-1.5 text-[9px] text-text-muted">{description}</p>
+      <select aria-label={`Director ${label}`} value={override} onChange={event => setRoleModel(role, event.target.value)} disabled={!capability} className="w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] text-text-primary disabled:opacity-50">
+        <option value="">Automatic · {effectiveModel ? modelName(effectiveModel) : 'unavailable in this session'}</option>
+        {override && !candidate && <option value={override}>{modelName(override)} · unavailable in this session</option>}
+        {compatibleCandidates.map(item => <option key={item.model_type} value={item.model_type}>{modelName(item.model_type)}{item.ready ? '' : ' · setup required'}</option>)}
+      </select>
+      <p className="mt-1 text-[8px] text-text-muted">
+        {!effectiveModel
+          ? 'The server default is hidden or unavailable in this session. Select an authorized model or use Maestro locally.'
+          : override
+          ? 'Deliberate override; the server will not substitute another model.'
+          : role === 'creator' && explicitOutput
+            ? capability?.selection_source === 'verified_manual_preference'
+              ? 'Automatic Explicit creator uses the server-authoritative ready Moody preference.'
+              : 'No preferred Moody creator is ready; the server resolved its safe fallback.'
+            : role === 'creator'
+              ? 'Automatic Standard creator uses the server safe fallback.'
+              : 'Automatic editor uses the fixed edit-capable default.'}
+      </p>
+      {candidate && <DirectorCandidateReadiness candidate={candidate} />}
+      {role === 'creator' && explicitOutput && !override && capability?.selection_source === 'safe_fallback' && (
+        <div className="mt-2 space-y-1">
+          <p className="text-[8px] font-medium uppercase tracking-wider text-text-muted">Preferred Moody setup</p>
+          {capability.candidates.filter(item => ['krea2_moody_mix_v7_fp8', 'krea2_moody_cutie_v4_fp8'].includes(item.model_type) && !item.ready).map(item => (
+            <div key={item.model_type} className="rounded border border-border/70 p-1.5">
+              <p className="text-[9px] text-text-secondary">{modelName(item.model_type)}</p>
+              <DirectorCandidateReadiness candidate={item} />
+            </div>
+          ))}
+        </div>
+      )}
+      {effectiveModel && candidate?.ready && (
+        <div className="mt-2 overflow-hidden rounded border border-border">
+          <button type="button" aria-expanded={lorasOpen} onClick={() => setLorasOpen(!lorasOpen)} className="flex w-full items-center justify-between px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover">
+            <span>{role === 'creator' ? 'Creator LoRAs' : 'Editor LoRAs'}{selections.length > 0 ? ` (${selections.length})` : ''}</span>
+            {lorasOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+          </button>
+          {lorasOpen && <div className="border-t border-border p-2"><DirectorImageRoleLoraSelector role={role} modelType={effectiveModel} selections={selections} onChange={next => setSelections(role, next)} /></div>}
+        </div>
+      )}
+    </fieldset>
+  )
+}
+
+function DirectorLoraAccordion() {
+  const videoModel = useStore(s => s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')
+  const selectDirectorVideoModel = useStore(s => s.selectDirectorVideoModel)
+  const capabilities = useStore(s => (
+    s.directorCapabilitiesExplicitOutput === s.explicitOutput ? s.directorCapabilities : null
+  ))
+  const capabilitiesLoading = useStore(s => (
+    s.directorCapabilitiesLoading && s.directorCapabilitiesLoadingExplicitOutput === s.explicitOutput
+  ))
+  const capabilitiesError = useStore(s => s.directorCapabilitiesError)
+  const loadCapabilities = useStore(s => s.loadDirectorCapabilities)
+  const rolesConfigured = useStore(s => s.directorImageRolesConfigured)
+  const legacyImageModel = useStore(s => s.directorLegacyImageModel)
+  const models = useStore(s => s.models)
+  const activateRoles = useStore(s => s.activateDirectorImageRoles)
+  const setRoleModel = useStore(s => s.setDirectorImageRoleModel)
+  const explicitOutput = useStore(s => s.explicitOutput)
+  const [videoOpen, setVideoOpen] = useState(false)
+
+  useEffect(() => {
+    void loadCapabilities({ explicitOutput }).catch(() => {})
+  }, [explicitOutput, loadCapabilities])
+
+  const legacyCreatorCompatible = capabilities?.image_roles.creator.candidates.some(candidate => (
+    candidate.model_type === legacyImageModel && candidate.compatible
+  )) === true
 
   return (
     <div className="space-y-1">
-      {/* Models the pipeline will use — visible + changeable here so the
-          user can verify before starting; LoRA lists below follow. */}
-      <div className="space-y-1 mb-1.5">
-        {generateShotImages && <DirectorModelPicker mode="image" value={imageModel} onChange={selectDirectorImageModel} />}
-        <DirectorModelPicker mode="video" value={videoModel} onChange={selectDirectorVideoModel} />
-      </div>
-      {/* Image LoRAs */}
-      {generateShotImages && imageModel && (
-        <div className="border border-border rounded-lg overflow-hidden">
-          <button
-            onClick={() => setImageOpen(!imageOpen)}
-            className="w-full flex items-center justify-between px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-bg-hover transition-colors"
-          >
-            <span>Image LoRAs</span>
-            {imageOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          </button>
-          {imageOpen && (
-            <div className="px-2.5 pb-2">
-              <DirectorLoraSelector mode="image" modelType={imageModel} />
-            </div>
-          )}
+      {!rolesConfigured && legacyImageModel && (
+        <div role="status" className="rounded border border-border bg-bg-tertiary/60 p-2 text-[9px] text-text-secondary">
+          <p><span className="font-medium">Legacy combined image model:</span> {models.find(model => model.model_type === legacyImageModel)?.name || legacyImageModel}</p>
+          <p className="mt-1 text-text-muted">Older saved settings remain readable. New Director jobs use the separate creator/editor roles below; save the automatic roles or keep this model deliberately as Creator.</p>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            <button type="button" onClick={activateRoles} className="rounded border border-accent-blue/40 px-1.5 py-0.5 text-accent-blue">Use automatic roles</button>
+            {legacyCreatorCompatible && <button type="button" onClick={() => setRoleModel('creator', legacyImageModel)} className="rounded border border-border px-1.5 py-0.5">Keep as Creator override</button>}
+          </div>
         </div>
       )}
-      {/* Video LoRAs */}
+      {capabilitiesLoading && !capabilities && <div role="status" className="flex items-center gap-1.5 rounded border border-border p-2 text-[10px] text-text-muted"><Loader2 size={11} className="animate-spin" /> Loading Director image roles…</div>}
+      {capabilitiesError && <div role="alert" className="rounded border border-red-500/30 bg-red-500/10 p-2 text-[9px] text-red-300">{capabilitiesError}<button type="button" onClick={() => { void loadCapabilities({ explicitOutput, force: true }).catch(() => {}) }} className="ml-2 underline">Retry</button></div>}
+      {capabilities && (
+        <div className="grid grid-cols-1 gap-2" aria-label="Director image roles">
+          <DirectorImageRoleControl role="creator" />
+          <DirectorImageRoleControl role="editor" />
+        </div>
+      )}
+      <div className="mt-1.5 space-y-1">
+        <DirectorModelPicker value={videoModel} onChange={selectDirectorVideoModel} />
+      </div>
       {videoModel && (
         <div className="border border-border rounded-lg overflow-hidden">
           <button
@@ -2519,6 +2680,12 @@ function StyleForm({
   isShortFilm?: boolean
   isStoryPath?: boolean
 }) {
+  const visualStyle = useStore(s => s.directorVisualStyle)
+  const customVisualStyle = useStore(s => s.directorCustomVisualStyle)
+  const setVisualStyle = useStore(s => s.setDirectorVisualStyle)
+  const setCustomVisualStyle = useStore(s => s.setDirectorCustomVisualStyle)
+  const effectiveVideoModel = useStore(s => s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')
+
   if (!isActive) {
     return (
       <div className="space-y-2">
@@ -2540,6 +2707,22 @@ function StyleForm({
             ? 'Describe the story setting, mood, and visual style for your short film.'
             : 'Describe the scene, characters, and visual style.'}
       </p>
+
+      <fieldset className="rounded-lg border border-border bg-bg-tertiary/50 p-2">
+        <legend className="px-1 text-[10px] font-medium text-text-secondary">Visual style</legend>
+        <select aria-label="Director visual style" value={visualStyle} onChange={event => setVisualStyle(event.target.value)} className="w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary">
+          <option value="">Realistic (default)</option>
+          <option value="cinematic">Cinematic</option>
+          <option value="stylized 3D animation">Stylized 3D animation</option>
+          <option value="illustration">Illustration</option>
+          <option value="anime">Anime</option>
+          <option value="custom">Custom…</option>
+        </select>
+        {visualStyle === 'custom' && <input aria-label="Custom Director visual style" value={customVisualStyle} onChange={event => setCustomVisualStyle(event.target.value)} placeholder="e.g. hand-painted stop motion" className="mt-1.5 w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary" />}
+        <p className="mt-1 text-[9px] leading-relaxed text-text-muted">Realistic is the fallback only. Choose a preset to make it explicit, or use Custom when your own freeform style should be authoritative.</p>
+      </fieldset>
+
+      <H3StyleWorkflowField effectiveVideoModel={effectiveVideoModel} surface="Director" />
 
       {/* Speaker Mapping — hidden for story path (no audio = no detected speakers) */}
       {!isStoryPath && speakers.length >= 1 && (

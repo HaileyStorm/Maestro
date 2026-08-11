@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ..schema import ShotPlan, ProductionPlan
+from ..policies import resolve_visual_style
 from .base import BaseRenderer
 
 
@@ -30,8 +31,12 @@ class LtxT2VRenderer(BaseRenderer):
 
         # Style and shot type
         style_shot = []
-        if shot.visual_style:
-            style_shot.append(shot.visual_style)
+        visual_style = resolve_visual_style(
+            shot.visual_style,
+            has_visual_reference=bool(context.get("has_reference", False)),
+        )
+        if visual_style:
+            style_shot.append(visual_style)
         style_shot.append(shot.camera_plan.framing)
         if shot.camera_plan.angle:
             style_shot.append(shot.camera_plan.angle)

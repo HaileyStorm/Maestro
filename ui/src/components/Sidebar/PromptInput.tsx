@@ -3,6 +3,7 @@ import { Sparkles, Loader2, ChevronUp, Brain, PenLine } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry, globalTimelineEndSeconds, hasGlobalTimeline, usesStudioSegments } from '../../lib/timelinePrompt'
+import { h3StyleWorkflowCatalogStateLabel, h3StyleWorkflowSupportsModel } from '../../lib/h3StyleWorkflows'
 
 const placeholders: Record<string, string> = {
   image: 'Describe your image...',
@@ -11,26 +12,76 @@ const placeholders: Record<string, string> = {
   avatar: 'Describe your avatar animation...',
 }
 
-const H3_STYLE_PREF_KEY = 'maestro:h3-prepared-style'
-const H3_STYLE_PREFIX_RE = /^H3 prepared style \[[^\]]+\]:[^\n]*(?:\n\n)?/
-type H3PreparedStyle = { id: string; label: string; brief: string; description?: string }
-const H3_PREPARED_STYLES: H3PreparedStyle[] = [
-  { id: '', label: 'Unstyled · preserve my prompt', brief: '' },
-  { id: 'papercraft-stop-motion-explainer', label: 'Papercraft stop-motion explainer', description: 'Tactile handmade paper explainers with layered sets, props, visual metaphors, motion, transitions, and sound.', brief: 'Tactile cut paper, layered diorama sets, handmade props, readable visual metaphors, staged stop-motion, and paper-like sound.' },
-  { id: 'paper-collage-explainer-generator', label: 'Paper-collage explainer', description: 'Tactile halftone collage explainers built from approved stills and stop-motion clips.', brief: 'Halftone paper collage, tactile cutouts, abstract visual metaphors, stop-motion movement, and collage sound effects.' },
-  { id: '3d-animation-short-generator', label: 'Stylized 3D animation short', description: 'Narrative 3D shorts with character, environment, shot, continuity, performance, camera, and audio planning.', brief: 'Stylized 3D narrative animation with consistent character cards, environments, performances, camera language, continuity, and sound.' },
-  { id: 'minimalist-product-ad-generator', label: 'Minimalist product ad', description: 'Clean premium product shorts with concise copy, beat-synced typography, and polished camera language.', brief: 'Premium clean product film, concise on-screen copy, controlled typography, polished camera motion, and clear selling-point beats.' },
-  { id: 'brand-promo-video-generator', label: 'Brand / product promo', description: 'Fact-grounded promotional shorts for products, sites, apps, shops, and personal projects.', brief: 'Fact-grounded promotional short with a clear narrative direction, capability and use-case beats, authorized assets, and a call to action.' },
-  { id: 'music-video-subtitle-generator', label: 'Music video + lyric typography', description: 'Beat-aware connected music-video shots with lyric typography and long-work stitching guidance.', brief: 'Beat-reactive connected shots, spatial lyric typography, stable character and scene references, and audio-timed transitions.' },
-  { id: 'co-op-game-intro-generator', label: 'Co-op game menu intro', description: 'Two-player character-led menu or opening animations with coordinated UI and interaction motion.', brief: 'Two-character game-menu opening with stable identity cues, coordinated player cards, UI copy, icons, and timed menu interaction.' },
-  { id: 'handdrawn-live-video-generator', label: 'Hand-drawn + live-action fusion', description: 'Surreal shorts combining rough glowing hand-drawn animation with live-action spaces.', brief: 'Rough glowing hand-drawn animation interacting physically with live-action space, continuous morphing, and delayed handheld camera response.' },
-]
-
 function compactBytes(value: number): string {
   if (value < 1024) return `${value} B`
   if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`
   if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MiB`
   return `${(value / 1024 ** 3).toFixed(1)} GiB`
+}
+
+export function H3StyleWorkflowField({
+  effectiveVideoModel,
+  surface,
+}: {
+  effectiveVideoModel: string
+  surface: 'Generate' | 'Director'
+}) {
+  const catalog = useStore(state => state.h3StyleWorkflowCatalog)
+  const loading = useStore(state => state.h3StyleWorkflowCatalogLoading)
+  const error = useStore(state => state.h3StyleWorkflowCatalogError)
+  const selection = useStore(state => state.h3StyleWorkflow)
+  const setSelection = useStore(state => state.setH3StyleWorkflow)
+  const loadCatalog = useStore(state => state.loadH3StyleWorkflowCatalog)
+
+  useEffect(() => {
+    if (effectiveVideoModel) void loadCatalog()
+  }, [effectiveVideoModel, loadCatalog])
+
+  const supported = h3StyleWorkflowSupportsModel(catalog, effectiveVideoModel)
+  if (!supported) {
+    if (!error || loading) return null
+    return (
+      <div className="rounded border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-[9px] leading-relaxed text-amber-200">
+        <p role="status">{error}</p>
+        <button type="button" onClick={() => void loadCatalog(true)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5 text-[8px]">Retry H3 catalog</button>
+      </div>
+    )
+  }
+
+  const selected = catalog?.styles.find(style => style.id === selection)
+  const sourceRevision = catalog?.source_revision || catalog?.revision || 'unknown'
+  const provenance = catalog?.provenance
+  return (
+    <fieldset aria-label={`${surface} H3 workflow`} className="rounded-lg border border-border bg-bg-tertiary/50 p-2">
+      <legend className="px-1 text-[10px] font-medium text-text-secondary">H3 workflow</legend>
+      <select
+        aria-label={`${surface} H3 style workflow`}
+        value={selection}
+        disabled={loading}
+        onChange={event => setSelection(event.target.value)}
+        className="w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50"
+      >
+        <option value="">No H3 workflow</option>
+        {catalog?.styles.map(style => <option key={style.id} value={style.id}>{style.label}</option>)}
+      </select>
+      {selected && <p className="mt-1 text-[9px] leading-relaxed text-text-muted">{selected.description}</p>}
+      <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+        Official MiniMax H3 Hub/canvas workflow metadata, adapted by Maestro as server-owned guidance. This does not reproduce the complete upstream workflow, and it stays separate from Visual style.
+      </p>
+      <p className="mt-1 text-[8px] leading-relaxed text-text-muted">
+        {catalog && <><a href={catalog.source} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Official source</a> · </>}
+        {catalog ? h3StyleWorkflowCatalogStateLabel(catalog) : 'Loading server catalog'} · source revision {sourceRevision}
+        {provenance?.prompt_brief_provenance === 'maestro_adapted' ? ' · Maestro-adapted brief' : ''}
+        {catalog?.update_error ? ' · last refresh unavailable' : ''}
+      </p>
+      {error && (
+        <div className="mt-1 text-[8px] leading-relaxed text-amber-200">
+          <p role="status">{error}</p>
+          <button type="button" onClick={() => void loadCatalog(true)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5">Retry H3 catalog</button>
+        </div>
+      )}
+    </fieldset>
+  )
 }
 
 function useEnhanceStatus(
@@ -143,12 +194,15 @@ export function PromptInput() {
   const systemConfig = useStore(s => s.systemConfig)
   const llmModels = useStore(s => s.llmModels)
   const imageMode = useStore(s => s.params.image_mode)
+  const effectiveVideoModel = useStore(s => s.params.model_type)
+  const h3StyleWorkflowCatalog = useStore(s => s.h3StyleWorkflowCatalog)
+  const migrateLegacyH3StylePrompt = useStore(s => s.migrateLegacyH3StylePrompt)
   const [ttsMenuOpen, setTtsMenuOpen] = useState(false)
-  const [h3PreparedStyle, setH3PreparedStyle] = useState(() => {
-    try { return localStorage.getItem(H3_STYLE_PREF_KEY) || '' } catch { return '' }
-  })
-  const [availableH3Styles, setAvailableH3Styles] = useState<H3PreparedStyle[]>(H3_PREPARED_STYLES)
   const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    migrateLegacyH3StylePrompt()
+  }, [migrateLegacyH3StylePrompt])
 
   const isAudioOnly = modelOptions?.audio_only
   const voiceCount = useStore(s => s.ttsVoiceCount)
@@ -198,25 +252,8 @@ export function PromptInput() {
     3: 'Qwen3.5 4B Abliterated',
     4: 'Qwen3.5 9B Abliterated',
   }
-  const needsH3Guide = (generationMode === 'video' || generationMode === 'avatar')
-    && String(modelOptions?.model_type || '').toLowerCase().startsWith('minimax_h3')
-  useEffect(() => {
-    if (!needsH3Guide) return
-    let active = true
-    api.fetchH3StyleWorkflows().then(catalog => {
-      if (!active || !Array.isArray(catalog.styles) || catalog.styles.length === 0) return
-      setAvailableH3Styles([
-        H3_PREPARED_STYLES[0],
-        ...catalog.styles.map(style => ({
-          id: style.id,
-          label: style.label,
-          brief: style.prompt_brief,
-          description: style.description,
-        })),
-      ])
-    }).catch(() => { /* bundled catalog remains available offline */ })
-    return () => { active = false }
-  }, [needsH3Guide])
+  const needsH3Guide = generationMode === 'video'
+    && h3StyleWorkflowSupportsModel(h3StyleWorkflowCatalog, effectiveVideoModel)
   const wangpEnhancerMode = Number(systemConfig?.enhancer_enabled || 0)
   const dedicatedEnhancerId = modelOptions?.prompt_enhancer_model || servicesConfig?.enhance_llm_model_id || ''
   const configuredEnhancerId = dedicatedEnhancerId || servicesConfig?.llm_model_id || ''
@@ -232,14 +269,6 @@ export function PromptInput() {
     tracksEnhancerLlm,
   )
   const enhancerFooter = !isAudioOnly
-  const preparedStyle = availableH3Styles.find(style => style.id === h3PreparedStyle) || availableH3Styles[0]
-  const applyPreparedStyle = () => {
-    const authored = prompt.replace(H3_STYLE_PREFIX_RE, '').trimStart()
-    const next = preparedStyle.id
-      ? `H3 prepared style [${preparedStyle.label}]: ${preparedStyle.brief}\n\n${authored}`
-      : authored
-    setParam('prompt', next)
-  }
   const modePlaceholder = generationMode === 'avatar' && editSubMode === 'recast'
     ? 'Describe the finished video and replacement characters...'
     : generationMode === 'avatar' && editSubMode === 'restyle'
@@ -262,33 +291,7 @@ export function PromptInput() {
   // (which made it overflow and overlap the section below).
   return (
     <div className="relative grow shrink-0 flex flex-col">
-      {needsH3Guide && generationMode === 'video' && (
-        <div className="mb-1.5 rounded-lg border border-border bg-bg-tertiary/60 p-2">
-          <div className="flex items-center gap-1.5">
-            <select
-              value={preparedStyle.id}
-              onChange={event => {
-                const value = event.target.value
-                setH3PreparedStyle(value)
-                try { localStorage.setItem(H3_STYLE_PREF_KEY, value) } catch { /* local preference only */ }
-              }}
-              className="min-w-0 flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-[10px] text-text-primary"
-              aria-label="H3 prepared style workflow"
-            >
-              {availableH3Styles.map(style => <option key={style.id || 'none'} value={style.id}>{style.label}</option>)}
-            </select>
-            <button type="button" onClick={applyPreparedStyle} className="rounded border border-accent-blue/40 px-2 py-1 text-[10px] text-accent-blue hover:bg-accent-blue/10">
-              {preparedStyle.id ? 'Apply' : 'Remove'}
-            </button>
-          </div>
-          <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-            {preparedStyle.id
-              ? preparedStyle.description || 'Official prepared visual workflow.'
-              : 'No prepared workflow is added; your complete Studio prompt stays unchanged.'}{' '}
-            <a href="https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills" target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Official H3 workflows</a>
-          </p>
-        </div>
-      )}
+      {generationMode === 'video' && <div className="mb-1.5"><H3StyleWorkflowField effectiveVideoModel={effectiveVideoModel} surface="Generate" /></div>}
       {/* Enhance status indicator */}
       {isEnhancing && enhanceStatus.phase !== 'idle' && (
         <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-text-muted bg-bg-tertiary/80 rounded-t-lg border border-b-0 border-border">

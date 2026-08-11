@@ -5,6 +5,6 @@ export async function confirmReconnectedJob(
 ): Promise<void> {
   await reconnect()
   if (!jobId || !getJobs().some(job => job.id === jobId)) {
-    throw new Error('Queued Reference Studio job could not be confirmed after reconnect.')
+    throw new Error('Queued Reference job could not be confirmed after reconnect.')
   }
 }

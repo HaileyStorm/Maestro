@@ -55,6 +55,7 @@ _recovery_remove_parent = None
 _recovery_submit_child = None
 _recovery_verify_child = None
 _recovery_validate_child = None
+_runtime_admission = None
 
 _pipelines: dict = {}
 _pipeline_lock = threading.Lock()
@@ -232,6 +233,81 @@ def _saved_pipeline_shot_image_policy(state: dict) -> str:
     return SHOT_IMAGE_GENERATE
 
 
+def _director_uses_image_roles(params: dict) -> bool:
+    return any(
+        key in params
+        for key in (
+            "image_creator_model", "image_editor_model",
+            "image_creator_loras", "image_editor_loras",
+        )
+    )
+
+
+def _director_image_role_model(params: dict, role: str) -> str:
+    if not _director_uses_image_roles(params):
+        return params.get("image_model") or "flux2_klein_9b"
+    key = "image_creator_model" if role == "creator" else "image_editor_model"
+    value = str(params.get(key) or "").strip()
+    if not value:
+        raise DirectorModelCompatibilityError(
+            f"Director image {role} model is unavailable."
+        )
+    return value
+
+
+def _director_image_role_loras(params: dict, role: str) -> dict:
+    if not _director_uses_image_roles(params):
+        return dict(params.get("image_loras") or {})
+    resolved = params.get("_director_image_role_loras")
+    selections = (
+        resolved.get(role, []) if isinstance(resolved, dict) else []
+    )
+    return {
+        "activated_loras": [
+            item["id"] for item in selections if isinstance(item, dict)
+        ],
+        "loras_multipliers": " ".join(
+            str(item["multiplier"])
+            for item in selections if isinstance(item, dict)
+        ),
+        "parameter_expansions": [
+            expansion
+            for item in selections if isinstance(item, dict)
+            for expansion in item.get("parameter_expansions", [])
+            if isinstance(expansion, dict)
+        ],
+    }
+
+
+def _director_role_prompt(prompt: str, loras: dict, role: str) -> str:
+    """Append server-resolved LoRA fragments for exactly one image role."""
+    scope = "generation" if role == "creator" else "editing"
+    fragments = [
+        str(item.get("text") or "").strip()
+        for item in loras.get("parameter_expansions", [])
+        if scope in (item.get("scopes") or ())
+        and str(item.get("text") or "").strip()
+    ]
+    if not fragments:
+        return prompt
+    return ", ".join([prompt, *fragments])
+
+
+def _director_image_params(params: dict, model_type: str) -> dict:
+    """Use each role model's defaults, then deliberate shared overrides."""
+    defaults = {}
+    getter = getattr(_wgp, "get_default_settings", None)
+    if _director_uses_image_roles(params) and callable(getter):
+        try:
+            loaded = getter(model_type)
+            if isinstance(loaded, dict):
+                defaults = dict(loaded)
+        except Exception:
+            defaults = {}
+    defaults.update(dict(params.get("image_params") or {}))
+    return defaults
+
+
 def _validate_director_models(
     params: dict,
     *,
@@ -251,17 +327,31 @@ def _validate_director_models(
         "video" not in stages or shot_images_required(effective_policy)
     )
     if validate_image_stage:
-        image_model = params.get("image_model") or "flux2_klein_9b"
-        resolved = _director_model_assessment(image_model)
-        if resolved is not None:
-            model_def, assessment = resolved
-            capability = assessment["image"]
-            if not capability["compatible"]:
-                name = model_def.get("name", image_model)
-                raise DirectorModelCompatibilityError(
-                    f"{name} cannot be used as Director's image model: "
-                    f"{capability['reason']} Choose a reference-editing image model.",
+        roles = (
+            ("creator", "editor")
+            if _director_uses_image_roles(params) else ("legacy",)
+        )
+        for role in roles:
+            image_model = _director_image_role_model(
+                params, "creator" if role == "legacy" else role,
+            )
+            resolved = _director_model_assessment(image_model)
+            if resolved is not None:
+                model_def, assessment = resolved
+                capability = (
+                    assessment["image"]
+                    if role == "legacy" else assessment["image"][role]
                 )
+                if not capability["compatible"]:
+                    name = model_def.get("name", image_model)
+                    reason = (
+                        capability.get("reason")
+                        or "; ".join(capability.get("reasons") or ())
+                    )
+                    raise DirectorModelCompatibilityError(
+                        f"{name} cannot be used as Director's image {role}: "
+                        f"{reason} Choose a compatible image model.",
+                    )
 
     if "video" not in stages:
         return
@@ -313,7 +403,12 @@ def _validate_director_models(
 def _director_params_from_saved_state(state: dict) -> dict:
     """Reconstruct compatibility-relevant params from a saved pipeline."""
     params = dict(state.get("_params_snapshot") or {})
-    for key in ("pipeline_type", "seamless", "image_model", "video_model"):
+    for key in (
+        "pipeline_type", "seamless", "image_model", "video_model",
+        "image_creator_model", "image_editor_model",
+        "image_creator_loras", "image_editor_loras",
+        "_director_image_role_loras", "_director_image_role_selection",
+    ):
         if state.get(key) is not None:
             params[key] = state[key]
     params["_director_shot_image_policy"] = _saved_pipeline_shot_image_policy(state)
@@ -724,9 +819,16 @@ def _write_initial_pipeline_state(pid: str, pipeline: dict) -> tuple[dict, dict]
         "location_ref_paths": params.get("location_ref_paths", []),
         "auto_mode": params.get("auto_mode", True),
         "seamless": params.get("seamless", True),
-        "image_model": params.get("image_model", ""),
         "video_model": params.get("video_model", ""),
-        "image_loras": params.get("image_loras", {}),
+        **({
+            "image_creator_model": params.get("image_creator_model"),
+            "image_editor_model": params.get("image_editor_model"),
+            "image_creator_loras": params.get("image_creator_loras", []),
+            "image_editor_loras": params.get("image_editor_loras", []),
+        } if _director_uses_image_roles(params) else {
+            "image_model": params.get("image_model", ""),
+            "image_loras": params.get("image_loras", {}),
+        }),
         "video_loras": params.get("video_loras", {}),
         "image_params": params.get("image_params", {}),
         "video_params": params.get("video_params", {}),
@@ -842,9 +944,16 @@ def _save_pipeline_state_locked(pid: str) -> bool:
         "location_ref_paths": params.get("location_ref_paths", []),
         "auto_mode": params.get("auto_mode", True),
         "seamless": params.get("seamless", True),
-        "image_model": params.get("image_model", ""),
         "video_model": params.get("video_model", ""),
-        "image_loras": params.get("image_loras", {}),
+        **({
+            "image_creator_model": params.get("image_creator_model"),
+            "image_editor_model": params.get("image_editor_model"),
+            "image_creator_loras": params.get("image_creator_loras", []),
+            "image_editor_loras": params.get("image_editor_loras", []),
+        } if _director_uses_image_roles(params) else {
+            "image_model": params.get("image_model", ""),
+            "image_loras": params.get("image_loras", {}),
+        }),
         "video_loras": params.get("video_loras", {}),
         "image_params": params.get("image_params", {}),
         "video_params": params.get("video_params", {}),
@@ -1452,12 +1561,7 @@ def _rerun_clip_image_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     _style_prefix = _style_prefix_for((state.get("_params_snapshot") or {}).get("_reference_style") or "")
     if _style_prefix and not prompt.lower().startswith("maintain the same"):
         prompt = _style_prefix + prompt
-    # Get image gen params from the saved pipeline state
-    image_model = state.get("image_model") or "flux2_klein_9b"
-    image_loras = state.get("image_loras") or {}
-    image_params = state.get("image_params") or {}
     validation_params = _director_params_from_saved_state(state)
-    validation_params["image_model"] = image_model
     _validate_director_models(validation_params, stages=("image",))
 
     # Determine the output directory before resolving the generated anchor:
@@ -1510,7 +1614,12 @@ def _rerun_clip_image_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
         if lp and os.path.isfile(lp) and resolved not in seen_refs:
             seen_refs.add(resolved)
             all_refs.append(lp)
+    role = "editor" if all_refs else "creator"
+    image_model = _director_image_role_model(validation_params, role)
+    image_loras = _director_image_role_loras(validation_params, role)
+    image_params = _director_image_params(validation_params, image_model)
     all_refs = _limit_director_image_refs(image_model, all_refs, pid=pid)
+    prompt = _director_role_prompt(prompt, image_loras, role)
 
     gen_params = {
         "model_type": image_model,
@@ -2626,6 +2735,7 @@ def init(
     recovery_submit_child=None,
     recovery_verify_child=None,
     recovery_validate_child=None,
+    runtime_admission=None,
 ):
     """Called by launch.py to wire up shared references."""
     global _jobs, _run_generation, _wgp, _gen_lock, _active_gen_states
@@ -2633,7 +2743,7 @@ def init(
     global _recovery_checkpoint_parent, _recovery_prepare_parent_delete
     global _recovery_remove_parent
     global _recovery_submit_child, _recovery_verify_child
-    global _recovery_validate_child
+    global _recovery_validate_child, _runtime_admission
     _jobs = jobs_dict
     _run_generation = run_gen_fn
     _wgp = wgp_module
@@ -2647,6 +2757,7 @@ def init(
     _recovery_submit_child = recovery_submit_child
     _recovery_verify_child = recovery_verify_child
     _recovery_validate_child = recovery_validate_child
+    _runtime_admission = runtime_admission
 
 
 class _DirectorOutputs(list):
@@ -3501,6 +3612,8 @@ def start_pipeline(params: dict) -> str:
             services.get("llm_provider") or "local"
         ).strip().lower()
     params["_director_shot_image_policy"] = _resolve_fresh_shot_image_policy(params)
+    if callable(_runtime_admission):
+        _runtime_admission(params, source_remote=False)
     _validate_director_models(params)
     pid = uuid.uuid4().hex[:8]
 
@@ -3603,6 +3716,11 @@ def continue_pipeline(pid: str, updates: Optional[dict] = None):
         p = _pipelines.get(pid)
         if not p or p["status"] != "paused":
             return False
+        if callable(_runtime_admission):
+            _runtime_admission(
+                p.get("params") or {},
+                source_remote=bool(p.get("source_remote", False)),
+            )
         rollback = {
             "clip_plans": p.get("clip_plans"),
             "status": p.get("status"),
@@ -3745,17 +3863,25 @@ def _resume_pipeline_reserved(
     if data.get("pipeline_id") != pid:
         return False, "Saved pipeline identity is invalid."
 
+    saved_status = str(data.get("status") or "").casefold()
+    if saved_status in {"completed", "failed", "cancelled", "canceled"}:
+        return False, "Terminal pipelines cannot be resumed; use repair."
+    if saved_status == "paused":
+        return False, "Paused pipelines must be continued explicitly."
     if not isinstance(data.get("_params_snapshot"), dict):
         return False, (
             "This pipeline was created before resume support and can't be "
             "resumed — start a new generation."
         )
     params = _director_params_from_saved_state(data)
-    saved_status = str(data.get("status") or "").casefold()
-    if saved_status in {"completed", "failed", "cancelled", "canceled"}:
-        return False, "Terminal pipelines cannot be resumed; use repair."
-    if saved_status == "paused":
-        return False, "Paused pipelines must be continued explicitly."
+    if callable(_runtime_admission):
+        try:
+            _runtime_admission(
+                params,
+                source_remote=bool(data.get("source_remote", False)),
+            )
+        except Exception:
+            return False, "Saved Director models or LoRAs are not ready."
     try:
         _validate_director_models(params, stages=("video",))
     except DirectorModelCompatibilityError as exc:
@@ -3841,6 +3967,18 @@ def restore_registered_pipeline(
     if not isinstance(raw_params, dict):
         raise ValueError("Director recovery request is unavailable")
     params = _normalize_explicit_guidance_snapshot(dict(raw_params))
+    saved_status = str(data.get("status") or "queued")
+    terminal = saved_status in {"completed", "failed", "cancelled"}
+    paused = saved_status == "paused"
+    blocked_manual = bool(blocked_reason) and not terminal
+    can_start_worker = not (
+        terminal or paused or blocked_remote or blocked_manual
+    )
+    if can_start_worker and callable(_runtime_admission):
+        _runtime_admission(
+            params,
+            source_remote=bool(data.get("source_remote", False)),
+        )
     saved_clips = data.get("clips", []) or []
     clip_plans = [{
         "image_prompt": clip.get("image_prompt", ""),
@@ -3852,10 +3990,6 @@ def restore_registered_pipeline(
         "window_count": clip.get("window_count", 1),
         "_h3_shot": clip.get("_h3_shot"),
     } for clip in saved_clips]
-    saved_status = str(data.get("status") or "queued")
-    terminal = saved_status in {"completed", "failed", "cancelled"}
-    paused = saved_status == "paused"
-    blocked_manual = bool(blocked_reason) and not terminal
     runtime_status = (
         saved_status if terminal
         else "blocked" if blocked_remote or blocked_manual
@@ -4075,6 +4209,17 @@ def start_restored_pipeline(pid: str) -> bool:
             or not pipeline.pop("_recovered_without_worker", False)
         ):
             return False
+        params = pipeline.get("params")
+        source_remote = bool(pipeline.get("source_remote", False))
+    if callable(_runtime_admission):
+        try:
+            _runtime_admission(params, source_remote=source_remote)
+        except Exception:
+            block_pipeline_recovery(
+                pid,
+                "Recovery models or LoRAs are not ready.",
+            )
+            return False
     _start_pipeline_worker(pid, resume=True)
     return True
 
@@ -4249,7 +4394,7 @@ def _run_pipeline(pid: str, resume: bool = False):
                 )
                 nsfw = _explicit_guidance_from_snapshot(params)
                 video_model = params.get("video_model", "")
-                image_model = params.get("image_model", "")
+                image_model = _director_image_role_model(params, "editor")
                 polish_video_prompts = should_polish_director_video_prompts(
                     video_model,
                 )
@@ -4277,7 +4422,9 @@ def _run_pipeline(pid: str, resume: bool = False):
                         _polish_mode_used="h3_native_preflight",
                     )
                 video_loras = (params.get("video_loras") or {}).get("activated_loras", [])
-                image_loras = (params.get("image_loras") or {}).get("activated_loras", [])
+                image_loras = _director_image_role_loras(
+                    params, "editor",
+                ).get("activated_loras", [])
                 ref_paths = []
                 rip = params.get("reference_image_path")
                 if rip:
@@ -4792,6 +4939,20 @@ def _run_planning(pid: str, params: dict, pipeline_type: str):
         return _run_planning_legacy(pid, params, pipeline_type)
 
 
+def _director_h3_style_workflow_present(params: dict) -> bool:
+    """Validate the sealed workflow before using it as a planning signal."""
+    from services.h3_upstream_skills import validate_resolved_h3_style_workflow
+
+    workflow = validate_resolved_h3_style_workflow(
+        params.get("h3_style_workflow"),
+    )
+    if workflow is None:
+        return False
+    if str(params.get("video_model") or "") not in _H3_VIDEO_MODELS:
+        raise ValueError("Resolved H3 style workflow has a non-H3 Director model")
+    return True
+
+
 def _run_planning_v2(pid: str, params: dict, pipeline_type: str):
     """New architecture: DirectorOrchestrator with planners + renderers."""
     from services import llm_service
@@ -4872,7 +5033,9 @@ def _run_planning_v2(pid: str, params: dict, pipeline_type: str):
         "nsfw": nsfw,
         "seamless": seamless,
         "video_model": params.get("video_model", ""),
-        "image_model": params.get("image_model", ""),
+        "image_model": _director_image_role_model(params, "editor"),
+        "visual_style": params.get("visual_style", ""),
+        "h3_style_workflow_present": _director_h3_style_workflow_present(params),
         "multishot_lora_mode": multishot_lora_mode,
     }
 
@@ -4899,10 +5062,9 @@ def _run_planning_v2(pid: str, params: dict, pipeline_type: str):
             "transcript": params.get("lyrics"),
             "audio_path": params.get("audio_path"),
             "concept": scene_description,
-            "visual_style": params.get("visual_style", ""),
             "target_duration": params.get("target_duration", 30),
             "platform": params.get("platform", "general"),
-            "style": params.get("style", "cinematic"),
+            "style": params.get("style") or "",
         })
     else:
         # Music video
@@ -4924,9 +5086,11 @@ def _run_planning_v2(pid: str, params: dict, pipeline_type: str):
         from services.director.prompt_polish import build_polish_block
         guide_mode = "full" if polish_mode == "full_guide" else "light"
         video_model = params.get("video_model", "")
-        image_model = params.get("image_model", "")
+        image_model = _director_image_role_model(params, "editor")
         video_loras = (params.get("video_loras") or {}).get("activated_loras", [])
-        image_loras = (params.get("image_loras") or {}).get("activated_loras", [])
+        image_loras = _director_image_role_loras(
+            params, "editor",
+        ).get("activated_loras", [])
         polish_block = build_polish_block(video_model, image_model, guide_mode,
                                           video_loras=video_loras, image_loras=image_loras)
         if polish_block:
@@ -5030,6 +5194,8 @@ def _run_planning_legacy(pid: str, params: dict, pipeline_type: str):
             fps=fps,
             frames_steps=frames_steps,
             frames_minimum=frames_minimum,
+            visual_style=params.get("visual_style"),
+            h3_style_workflow_present=_director_h3_style_workflow_present(params),
             nsfw=explicit_guidance,
             allow_response_assist=False,
         )
@@ -5048,6 +5214,8 @@ def _run_planning_legacy(pid: str, params: dict, pipeline_type: str):
             speaker_mappings=speaker_mappings,
             characters=characters,
             prompt_type="both",
+            visual_style=params.get("visual_style"),
+            h3_style_workflow_present=_director_h3_style_workflow_present(params),
             nsfw=explicit_guidance,
             allow_response_assist=False,
         )
@@ -5065,6 +5233,8 @@ def _run_planning_legacy(pid: str, params: dict, pipeline_type: str):
             reference_image_path=reference_image_path,
             speaker_mappings=speaker_mappings,
             prompt_type="both",
+            visual_style=params.get("visual_style"),
+            h3_style_workflow_present=_director_h3_style_workflow_present(params),
             nsfw=explicit_guidance,
             allow_response_assist=False,
         )
@@ -5091,21 +5261,20 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
     ref_image_path = params.get("reference_image_path")
     character_ref_paths = params.get("character_ref_paths", []) or []
     location_ref_paths = params.get("location_ref_paths", []) or []
-    image_model = params.get("image_model", "flux2_klein_9b")
-    image_params = params.get("image_params", {})
-    image_loras = params.get("image_loras", {})
+    legacy_image_model = params.get("image_model", "flux2_klein_9b")
+    legacy_image_loras = params.get("image_loras", {})
     video_model = params.get("video_model") or "ltx2_22B_distilled_1_1"
     supports_frame_injection = _director_supports_frame_injection(video_model)
 
     # Diagnostic-only log: report what the frontend sent so a future
     # "I selected N LoRAs but only K were applied" report has data we
     # can correlate against the [LoRA] Loading line wgp prints.
-    _activated_in = list(image_loras.get("activated_loras", []) or [])
-    _mults_in = image_loras.get("loras_multipliers", "") or ""
+    _activated_in = list(legacy_image_loras.get("activated_loras", []) or [])
+    _mults_in = legacy_image_loras.get("loras_multipliers", "") or ""
     if _activated_in:
         print(
             f"[Pipeline {pid}] Image LoRAs received: {len(_activated_in)} | "
-            f"model={image_model} | "
+            f"model={legacy_image_model} | "
             f"names={[os.path.basename(n) for n in _activated_in]} | "
             f"multipliers={_mults_in!r}"
         )
@@ -5124,9 +5293,9 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
     # directory? If not, drop it with a clear warning so the user knows
     # to re-select their image LoRAs for the active model.
     try:
-        if _activated_in:
+        if _activated_in and not _director_uses_image_roles(params):
             try:
-                _lora_dir = _wgp.get_lora_dir(image_model)
+                _lora_dir = _wgp.get_lora_dir(legacy_image_model)
             except Exception:
                 _lora_dir = ""
             if _lora_dir and os.path.isdir(_lora_dir):
@@ -5152,7 +5321,7 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
                         f"{os.path.basename(_lora_dir)}/: {_skipped}. These were "
                         f"likely activated when a different image model was selected, "
                         f"and the saved selection persisted across sessions. Re-select "
-                        f"the LoRAs you want for {image_model} in the Director image "
+                        f"the LoRAs you want for {legacy_image_model} in the Director image "
                         f"LoRA panel to clear the stale entries."
                     )
                     print(f"[Pipeline {pid}] {_warn}")
@@ -5160,7 +5329,7 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
                     _update_pipeline(pid, lora_warnings=[*_existing_warnings, _warn])
                 _activated_in = _kept
                 _mults_in = " ".join(_kept_mults)
-                image_loras = {
+                legacy_image_loras = {
                     "activated_loras": _activated_in,
                     "loras_multipliers": _mults_in,
                 }
@@ -5170,13 +5339,6 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
                 )
     except Exception as _e:
         print(f"[Pipeline {pid}] LoRA file-existence filter skipped: {_e}")
-
-    resolution = image_params.get("resolution", "1280x720")
-    steps = image_params.get("num_inference_steps", 8)
-    guidance = image_params.get("guidance_scale", 1)
-    spatial_upsampling = params.get("image_spatial_upsampling", "")
-    film_grain_intensity = params.get("image_film_grain_intensity", 0)
-    film_grain_saturation = params.get("image_film_grain_saturation", 0.5)
 
     if not out_dir:
         out_dir = _wgp.save_path
@@ -5264,12 +5426,24 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
                 continue
             seen_refs.add(resolved)
             all_refs.append(candidate)
+        role = "editor" if all_refs else "creator"
+        image_model = _director_image_role_model(params, role)
+        image_loras = (
+            _director_image_role_loras(params, role)
+            if _director_uses_image_roles(params)
+            else legacy_image_loras
+        )
+        image_params = _director_image_params(params, image_model)
+        resolution = image_params.get("resolution", "1280x720")
+        steps = image_params.get("num_inference_steps", 8)
+        guidance = image_params.get("guidance_scale", 1)
         all_refs = _limit_director_image_refs(
             image_model,
             all_refs,
             pid=pid,
         )
         print(f"[Pipeline {pid}] _gen_image: {len(all_refs)} refs: {[os.path.basename(r) for r in all_refs]}")
+        prompt = _director_role_prompt(prompt, image_loras, role)
         gen_params: dict = {
             "model_type": image_model,
             "prompt": prompt,
@@ -5296,12 +5470,6 @@ def _run_image_generation(pid: str, params: dict, clip_plans: list[dict], out_di
                 "index": recovery_index,
             },
         }
-        if spatial_upsampling:
-            gen_params["spatial_upsampling"] = spatial_upsampling
-        if film_grain_intensity > 0:
-            gen_params["film_grain_intensity"] = film_grain_intensity
-            gen_params["film_grain_saturation"] = film_grain_saturation
-
         output_files = _submit_and_wait(gen_params, timeout_s=600, workspace=workspace, out_dir=out_dir)
         if not output_files or not output_files[0]:
             raise RuntimeError(
@@ -6226,8 +6394,26 @@ def _canonicalize_director_h3_shot_plan(
     shot_plan: dict,
     *,
     published_frames: list[int] | None = None,
+    h3_style_workflow: dict | None = None,
 ) -> list[str]:
     """Canonicalize and validate every persistent Director child prompt."""
+    from services.h3_upstream_skills import (
+        compile_h3_style_workflow,
+        validate_resolved_h3_style_workflow,
+    )
+
+    saved_workflow = shot_plan.get("h3_style_workflow")
+    if h3_style_workflow is None:
+        workflow = validate_resolved_h3_style_workflow(saved_workflow)
+    else:
+        workflow = validate_resolved_h3_style_workflow(h3_style_workflow)
+        if saved_workflow is not None and saved_workflow != workflow:
+            raise ValueError("Saved Director H3 style workflow disagrees")
+
+    def compile_workflow(prompt: str) -> str:
+        compiled, _schema = compile_h3_style_workflow(prompt, workflow)
+        return compiled
+
     prompts = list(shot_plan.get("clip_prompts") or [])
     published = list(
         published_frames
@@ -6375,10 +6561,10 @@ def _canonicalize_director_h3_shot_plan(
             semantic_duration = sum(
                 int(published[position]) for position in normalized_positions
             ) / fps
-            compiled = _director_h3_canonical_prompt(
+            compiled = compile_workflow(_director_h3_canonical_prompt(
                 semantic_prompt,
                 duration_seconds=semantic_duration,
-            )
+            ))
             contract["semantic_prompt"] = compiled
             contract["prompt_rewrite_for_physical_split"] = False
             for position in normalized_positions:
@@ -6490,26 +6676,45 @@ def _canonicalize_director_h3_shot_plan(
         # Compatibility for committed v1 plans whose child prompts were
         # physically rebased before the semantic/physical contract existed.
         canonical = [
-            _director_h3_canonical_prompt(
+            compile_workflow(_director_h3_canonical_prompt(
                 prompt,
                 duration_seconds=int(frames) / fps,
-            )
+            ))
             for prompt, frames in zip(prompts, published)
         ]
+    if workflow is not None:
+        shot_plan["h3_style_workflow"] = dict(workflow)
     shot_plan["clip_prompts"] = canonical
     for index, prompt in enumerate(canonical):
         shots[index]["prompt"] = prompt
     return canonical
 
 
-def _rehydrate_director_h3_longform(gen_params: dict, plan: dict) -> bool:
+def _rehydrate_director_h3_longform(
+    gen_params: dict,
+    plan: dict,
+    *,
+    h3_style_workflow: dict | None = None,
+) -> bool:
     """Restore a committed Director H3 plan without invoking planning."""
     import copy
+    from services.h3_upstream_skills import validate_resolved_h3_style_workflow
 
     plan = copy.deepcopy(plan)
     shot_plan = plan.get("shot_plan")
     if not isinstance(shot_plan, dict) or int(shot_plan.get("version") or 0) != 1:
         return False
+    expected_workflow = validate_resolved_h3_style_workflow(
+        h3_style_workflow,
+    )
+    saved_workflow = validate_resolved_h3_style_workflow(
+        plan.get("h3_style_workflow"),
+    )
+    shot_workflow = validate_resolved_h3_style_workflow(
+        shot_plan.get("h3_style_workflow"),
+    )
+    if saved_workflow != expected_workflow or shot_workflow != saved_workflow:
+        raise ValueError("Saved Director H3 style workflow drifted")
     root_frames = plan.get("clip_frames")
     shot_frames = shot_plan.get("clip_frames")
     frames = list(root_frames or shot_frames or [])
@@ -6581,7 +6786,9 @@ def _rehydrate_director_h3_longform(gen_params: dict, plan: dict) -> bool:
     shot_plan["clip_trim_tail_frames"] = list(trims)
     shot_plan["published_frames"] = requested_total
     prompts = _canonicalize_director_h3_shot_plan(
-        shot_plan, published_frames=published,
+        shot_plan,
+        published_frames=published,
+        h3_style_workflow=saved_workflow,
     )
     if len(prompts) != len(frames):
         raise ValueError("Saved Director H3 shot plan is incomplete")
@@ -6660,6 +6867,8 @@ def _rehydrate_director_h3_longform(gen_params: dict, plan: dict) -> bool:
         "h3_native_boundary_conditioning": native,
         "_h3_longform": copy.deepcopy(plan),
     })
+    if saved_workflow is not None:
+        gen_params["h3_style_workflow"] = dict(saved_workflow)
     if plan.get("continuation") == "semantic_references" and not native:
         gen_params.pop("image_start", None)
         gen_params.pop("image_end", None)
@@ -6690,6 +6899,10 @@ def _prepare_director_h3_longform(
     selected = str(gen_params.get("model_type") or "")
     if selected not in _H3_VIDEO_MODELS:
         return None
+    from services.h3_upstream_skills import validate_resolved_h3_style_workflow
+    h3_style_workflow = validate_resolved_h3_style_workflow(
+        params.get("h3_style_workflow"),
+    )
 
     # Director's frame-position KFI representation is not accepted by H3.
     # Normalize it before either fresh planning or committed-plan replay so a
@@ -6698,7 +6911,11 @@ def _prepare_director_h3_longform(
 
     persisted = params.get("_h3_longform")
     if isinstance(persisted, dict):
-        if not _rehydrate_director_h3_longform(gen_params, persisted):
+        if not _rehydrate_director_h3_longform(
+            gen_params,
+            persisted,
+            h3_style_workflow=h3_style_workflow,
+        ):
             raise ValueError("Saved Director H3 plan version is unsupported")
         restored_plan = gen_params["_h3_longform"]
         restored_models = [
@@ -6984,7 +7201,10 @@ def _prepare_director_h3_longform(
         segment_frames_maximum=segment_maximum,
         segment_policy=segment_policy,
     )
-    segment_prompts = _canonicalize_director_h3_shot_plan(shot_plan)
+    segment_prompts = _canonicalize_director_h3_shot_plan(
+        shot_plan,
+        h3_style_workflow=h3_style_workflow,
+    )
     segment_boundaries = list(shot_plan["clip_boundaries"])
     clip_published_frames = list(shot_plan["clip_published_frames"])
     clip_trim_tail_frames = list(shot_plan["clip_trim_tail_frames"])
@@ -7034,6 +7254,8 @@ def _prepare_director_h3_longform(
             gen_params["h3_ref2va_terms_accepted"] = True
         if effective != selected:
             gen_params["model_type"] = effective
+        if h3_style_workflow is not None:
+            gen_params["h3_style_workflow"] = dict(h3_style_workflow)
         gen_params["prompt"] = segment_prompts[0]
         gen_params["per_clip_prompts"] = list(segment_prompts)
         if (
@@ -7145,6 +7367,10 @@ def _prepare_director_h3_longform(
         ),
         "_h3_longform": {
             "model_type": selected,
+            **(
+                {"h3_style_workflow": dict(h3_style_workflow)}
+                if h3_style_workflow is not None else {}
+            ),
             "requested_frames": requested_frames,
             "planned_frames": planned_frames,
             "published_frames": requested_frames,
@@ -7182,6 +7408,8 @@ def _prepare_director_h3_longform(
             "original_image_end": last_anchor,
         },
     })
+    if h3_style_workflow is not None:
+        gen_params["h3_style_workflow"] = dict(h3_style_workflow)
     gen_params["image_prompt_type"] = (
         "SE" if first_anchor and last_anchor
         else "S" if first_anchor
@@ -7515,6 +7743,7 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
             "negative_prompt": "",
             "self_refiner_setting": self_refiner,
             "_director_pipeline_id": pid,
+            "_director_final_video_postprocess": 1,
             **lora_params,
             **audio_params,
         }
@@ -7563,6 +7792,7 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
             "negative_prompt": "",
             "self_refiner_setting": self_refiner,
             "_director_pipeline_id": pid,
+            "_director_final_video_postprocess": 1,
             **lora_params,
             **audio_params,
         }

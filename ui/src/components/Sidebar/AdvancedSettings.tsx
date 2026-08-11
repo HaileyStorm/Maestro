@@ -327,7 +327,7 @@ export function AdvancedSettings() {
       <div
         ref={panelRef}
         className={`fixed top-0 h-full bg-bg-secondary border-r border-border z-50 flex flex-col shadow-2xl overflow-hidden transition-transform duration-200
-          left-0 w-full md:left-[420px] md:w-[380px] md:max-w-[90vw] ${
+          left-0 w-full md:left-[clamp(460px,24vw,560px)] md:w-[min(380px,calc(100vw-clamp(460px,24vw,560px)))] md:max-w-[90vw] ${
           open ? 'translate-x-0' : '-translate-x-full md:-translate-x-[800px] pointer-events-none'
         }`}
         style={{ maxHeight: '100vh' }}

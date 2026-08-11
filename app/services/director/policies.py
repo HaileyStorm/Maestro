@@ -192,6 +192,175 @@ def format_action_sequence(shot: ShotPlan) -> str:
 
 # ── Environment & Style Block ────────────────────────────────────────
 
+DEFAULT_VISUAL_STYLE = "photorealistic realism"
+
+
+def build_visual_style_default_block(
+    *,
+    structured_style_present: bool = False,
+) -> str:
+    """Return the shared visual-style precedence rule for prompt writers.
+
+    This is model guidance, not a server-side prompt classifier. Structured
+    style fields and visual references stay authoritative; only an otherwise
+    unspecified visual medium receives the product default.
+    """
+    fallback = (
+        "- A separate structured model workflow already supplies the visual "
+        "medium/style. Do not apply the product photorealism default or invent "
+        "a competing generic style; leave generic visual_style empty unless "
+        "the user's request explicitly authored one.\n"
+        if structured_style_present else
+        f"- Only when neither source specifies a visual style, use {DEFAULT_VISUAL_STYLE} "
+        "with natural materials, believable lighting, and physically plausible detail.\n"
+    )
+    return (
+        "VISUAL STYLE DEFAULT:\n"
+        "- Preserve any visual medium or style explicitly authored by the user.\n"
+        "- When a supplied visual reference defines the medium or style, preserve "
+        "that reference style unless the user explicitly requests a change.\n"
+        + fallback
+        + "- Never replace an authored stylized medium with photorealism."
+    )
+
+
+def build_visual_style_refinement_block() -> str:
+    """Lock an upstream-resolved style during a refinement-only pass."""
+    return (
+        f"{build_visual_style_default_block()}\n\n"
+        "REFINEMENT STYLE LOCK:\n"
+        "- The upstream Director has already resolved this prompt's visual style.\n"
+        "- Preserve every supplied VISUAL STYLE anchor exactly.\n"
+        "- If no style anchor is present, the prompt is reference-defined or "
+        "style-neutral; do not introduce, replace, or infer a style during this "
+        "refinement pass."
+    )
+
+
+def build_visual_style_authority_block(resolved_style: object) -> str:
+    """Render a binding structured style selected before an LLM call."""
+    if not isinstance(resolved_style, str) or not resolved_style.strip():
+        return ""
+    return (
+        "AUTHORITATIVE VISUAL STYLE:\n"
+        f"- Use exactly this visual medium/style: {resolved_style}\n"
+        "- Do not replace it with an aesthetic proposed by the planner output."
+    )
+
+
+def build_visual_style_provenance_block() -> str:
+    """Tell structured planners how to label their visual-style decision."""
+    return (
+        "VISUAL STYLE PROVENANCE:\n"
+        "- Set visual_style_source to authored_request only when visual_style "
+        "comes from an explicit style or style-change request in the user's "
+        "freeform concept/story.\n"
+        "- Otherwise set visual_style_source to planner_default. Never label a "
+        "planner-invented aesthetic as authored_request."
+    )
+
+
+def resolve_visual_style(
+    authored_style: object,
+    *,
+    has_visual_reference: bool = False,
+    structured_style_present: bool = False,
+) -> str:
+    """Resolve a structured style without inspecting free-form prompt text."""
+    if isinstance(authored_style, str) and authored_style.strip():
+        return authored_style
+    if structured_style_present:
+        return ""
+    return "" if has_visual_reference else DEFAULT_VISUAL_STYLE
+
+
+def resolve_planned_visual_style(
+    authored_style: object,
+    planned_style: object,
+    *,
+    has_visual_reference: bool = False,
+    planned_style_source: object = "",
+    structured_style_present: bool = False,
+) -> str:
+    """Resolve planner output using structured provenance, not prompt scanning.
+
+    A structured choice and a visual reference are locks. Otherwise the
+    planner may carry a style authored in freeform scene/story text into its
+    structured output; photorealism is only the final missing-value fallback.
+    """
+    if isinstance(authored_style, str) and authored_style.strip():
+        return authored_style
+    if has_visual_reference:
+        if (
+            planned_style_source == "authored_request"
+            and isinstance(planned_style, str)
+            and planned_style.strip()
+        ):
+            return planned_style
+        return ""
+    if structured_style_present:
+        if (
+            planned_style_source == "authored_request"
+            and isinstance(planned_style, str)
+            and planned_style.strip()
+        ):
+            return planned_style
+        return ""
+    if isinstance(planned_style, str) and planned_style.strip():
+        return planned_style
+    return DEFAULT_VISUAL_STYLE
+
+
+def anchor_visual_prompt(
+    prompt: str,
+    authored_style: object,
+    *,
+    has_visual_reference: bool = False,
+) -> str:
+    """Attach one structural style anchor without inspecting prompt content.
+
+    The anchor is a suffix so model dialects with a mandatory first token (for
+    example Qwen image edit's ``create new scene``) remain valid.
+    """
+    style = resolve_visual_style(
+        authored_style,
+        has_visual_reference=has_visual_reference,
+    )
+    if not style:
+        return prompt
+    return f"{prompt} VISUAL STYLE: {style}."
+
+
+def anchor_reference_edit_visual_style(
+    prompt: str,
+    authored_style: object,
+) -> str:
+    """Carry an explicit style through a reference-edit prompt dialect.
+
+    Qwen-style edit prompts keep their required opening token. When the
+    standard closer would also preserve the reference art style, replace only
+    that conflicting clause while retaining the identity/body fidelity lock.
+    """
+    if not isinstance(authored_style, str) or not authored_style.strip():
+        return prompt
+    reference_style_closer = (
+        "Preserve character identity, attire, body attributes, and the art "
+        "style of the reference image."
+    )
+    identity_closer = (
+        "Preserve character identity, attire, and body attributes from the "
+        "reference image."
+    )
+    base = prompt.rstrip()
+    if base.endswith(reference_style_closer):
+        base = base[:-len(reference_style_closer)].rstrip()
+        return (
+            f"{base} Apply the authored visual style: {authored_style}. "
+            f"{identity_closer}"
+        )
+    return f"{base} Apply the authored visual style: {authored_style}."
+
+
 def format_scene_setting(shot: ShotPlan) -> str:
     """Build environment + lighting + mood + style text."""
     parts = []
@@ -381,7 +550,17 @@ def build_video_rules_block() -> str:
     return load_guide("video_prompt_rules.md") or "VIDEO PROMPT RULES:\n- One flowing paragraph, present tense."
 
 
-def build_camera_style_block() -> str:
+def build_camera_style_block(
+    *,
+    structured_style_present: bool = False,
+) -> str:
     """Build the adaptive camera style guidance."""
     from .guide_loader import load_guide
-    return load_guide("camera_style_guidance.md") or "CAMERA STYLE:\n- Match complexity to content."
+    camera = (
+        load_guide("camera_style_guidance.md")
+        or "CAMERA STYLE:\n- Match complexity to content."
+    )
+    return (
+        f"{build_visual_style_default_block(structured_style_present=structured_style_present)}"
+        f"\n\n{camera}"
+    )

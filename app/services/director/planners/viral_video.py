@@ -14,7 +14,13 @@ from ..schema import (
     ProductionPlan, ShotPlan, CharacterProfile, ReferenceAssets,
     AssetRef, SubjectRef, DialogueBeat, CameraPlan, AudioPlan,
 )
-from ..policies import build_character_rules_block, build_camera_style_block
+from ..policies import (
+    build_character_rules_block,
+    build_camera_style_block,
+    build_visual_style_authority_block,
+    build_visual_style_provenance_block,
+    resolve_planned_visual_style,
+)
 from .base import BasePlanner
 
 
@@ -27,6 +33,7 @@ _PLATFORM_DURATIONS = {
 }
 
 _VIRAL_STYLES = {
+    "realistic": "photorealistic realism, natural materials, believable light",
     "meme": "bold text overlays, exaggerated reactions, jump cuts between setups",
     "ugc": "casual handheld, natural lighting, authentic feel, direct address",
     "cinematic": "polished visuals, dramatic lighting, fast-paced storytelling",
@@ -47,7 +54,7 @@ class ViralVideoPlanner(BasePlanner):
         characters: Optional[list[dict]] = None,
         target_duration: int = 30,
         platform: str = "general",
-        style: str = "cinematic",
+        style: str = "",
         **kwargs,
     ) -> ProductionPlan:
         """Create a ProductionPlan for a viral video.
@@ -59,9 +66,17 @@ class ViralVideoPlanner(BasePlanner):
             characters: Character descriptions.
             target_duration: Target duration in seconds.
             platform: Target platform (tiktok, reels, shorts, general).
-            style: Visual style (meme, ugc, cinematic, direct_address, reaction, tutorial).
+            style: Optional visual style (realistic, meme, ugc, cinematic,
+                direct_address, reaction, tutorial, or custom text).
         """
         has_reference = bool(reference_image_path)
+        # `visual_style` is the current public field; `style` is retained for
+        # legacy callers. The current field wins when both are supplied.
+        authored_style = kwargs.get("visual_style") or style
+        style = authored_style
+        structured_style_present = bool(
+            kwargs.get("h3_style_workflow_present")
+        )
 
         # Clamp duration to platform norms
         max_dur = _PLATFORM_DURATIONS.get(platform, 30)
@@ -86,10 +101,14 @@ class ViralVideoPlanner(BasePlanner):
         # Plan number of shots — viral videos use more cuts
         target_scenes = max(3, min(12, target_duration // 5))
 
-        style_desc = _VIRAL_STYLES.get(style, _VIRAL_STYLES["cinematic"])
+        style_desc = _VIRAL_STYLES.get(style, style)
 
         char_rules = build_character_rules_block(has_reference, char_profiles if char_profiles else None)
-        camera_block = build_camera_style_block()
+        camera_block = build_camera_style_block(
+            structured_style_present=structured_style_present,
+        )
+        style_block = build_visual_style_authority_block(authored_style)
+        style_provenance_block = build_visual_style_provenance_block()
 
         system_prompt = f"""You are a viral video director creating content optimized for {platform}.
 
@@ -111,6 +130,10 @@ VIRAL VIDEO RULES:
 
 {camera_block}
 
+{style_block}
+
+{style_provenance_block}
+
 OUTPUT FORMAT — respond with ONLY a JSON array:
 [
   {{
@@ -121,6 +144,7 @@ OUTPUT FORMAT — respond with ONLY a JSON array:
     "spatial_setup": "tight center frame",
     "environment": "urban street",
     "visual_style": "{style}",
+    "visual_style_source": "authored_request|planner_default",
     "lighting": "natural daylight",
     "mood": "energetic",
     "action_beats": ["person turns to camera with surprised expression"],
@@ -187,7 +211,16 @@ Create {target_scenes} short, punchy shots. Hook first! Go:"""
                 subjects_on_screen=subjects,
                 spatial_setup=raw.get("spatial_setup", ""),
                 environment=raw.get("environment", ""),
-                visual_style=raw.get("visual_style", style),
+                # Style precedence is resolved before the LLM call. Planner
+                # prose may elaborate the scene, but cannot replace the
+                # authored/default/reference style contract.
+                visual_style=resolve_planned_visual_style(
+                    authored_style,
+                    raw.get("visual_style", ""),
+                    has_visual_reference=has_reference,
+                    planned_style_source=raw.get("visual_style_source", ""),
+                    structured_style_present=structured_style_present,
+                ),
                 lighting=raw.get("lighting", ""),
                 mood=raw.get("mood", "energetic"),
                 action_beats=raw.get("action_beats", []),

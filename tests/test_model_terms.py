@@ -1243,8 +1243,8 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
             self.launch_module, self.launch_source, "_run_generation",
         )
         self.assertIn("_queue_recovery_delivery_pending(job) is None", runtime)
-        self.assertLess(runtime.index("try_start("), runtime.index("_require_job_model_recipe_terms("))
-        self.assertLess(runtime.index("_require_job_model_recipe_terms("), runtime.index("_apply_per_job_coefficient("))
+        self.assertLess(runtime.index("try_start("), runtime.index("_require_job_runtime_model_admission("))
+        self.assertLess(runtime.index("_require_job_runtime_model_admission("), runtime.index("_apply_per_job_coefficient("))
 
     def test_recovery_admission_rechecks_before_queue_or_thread_mutation(self):
         startup = self._function_source(
@@ -1257,7 +1257,7 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
             resumable_loop,
         )
         self.assertLess(
-            resumable_loop.index("_require_job_model_recipe_terms("),
+            resumable_loop.index("_require_job_runtime_model_admission("),
             resumable_loop.index("threading.Thread("),
         )
 
@@ -1269,11 +1269,11 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
             resume,
         )
         self.assertLess(
-            resume.index("_require_job_model_recipe_terms("),
+            resume.index("_require_job_runtime_model_admission("),
             resume.index("next_recovery_attempt("),
         )
         self.assertLess(
-            resume.index("_require_job_model_recipe_terms("),
+            resume.index("_require_job_runtime_model_admission("),
             resume.index("threading.Thread("),
         )
 
@@ -1286,11 +1286,11 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
             local,
         )
         self.assertLess(
-            local.index("_require_job_model_recipe_terms("),
+            local.index("_require_job_runtime_model_admission("),
             local.index("next_recovery_attempt("),
         )
         self.assertLess(
-            local.index("_require_job_model_recipe_terms("),
+            local.index("_require_job_runtime_model_admission("),
             local.index("threading.Thread("),
         )
 

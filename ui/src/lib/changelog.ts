@@ -30,12 +30,12 @@ const whyContinuumHighlights = [
   {
     id: 'h3-long-form',
     title: 'Curated H3 long-form planning and recovery',
-    summary: 'Continuum carries the bundled Maestro 1.6.5 H3 contract through Studio and Director: server-authored profiles, one authored timeline, deterministic native-shot plans, and supported recovery controls.',
+    summary: 'Continuum carries the bundled Maestro 1.6.5 H3 contract through Generate and Director: server-authored profiles, one authored timeline, deterministic native-shot plans, and supported recovery controls.',
   },
   {
     id: 'reference-studio',
-    title: 'Reference Studio',
-    summary: 'Build reusable character, setting, item, and style cards, compare generated candidates, and carry approved references into Studio or Director.',
+    title: 'Reference',
+    summary: 'Build reusable character, setting, item, and style cards, compare generated candidates, and carry approved references into Generate or Director.',
   },
   {
     id: 'local-intelligence',
@@ -53,7 +53,7 @@ const continuum030Highlights = [
   {
     id: 'continuum-030-reference-pack-v2',
     title: 'Adaptive, sealed Reference Pack v2',
-    summary: 'Reference Studio preserves authored sheet order in sealed v2 plans, carries exact generation and editor model choices, and keeps optional LoRAs explicitly scoped instead of enabling them automatically.',
+    summary: 'Reference preserves authored sheet order in sealed v2 plans, carries exact generation and editor model choices, and keeps optional LoRAs explicitly scoped instead of enabling them automatically.',
   },
   {
     id: 'continuum-030-host-model-controls',
@@ -80,8 +80,8 @@ const continuum020Highlights = [
   },
   {
     id: 'continuum-020-reference-studio',
-    title: 'Reference Studio workflow',
-    summary: 'Create reusable character, setting, item, and style cards, compare candidates, and send approved references into Studio or Director.',
+    title: 'Reference workflow',
+    summary: 'Create reusable character, setting, item, and style cards, compare candidates, and send approved references into Generate or Director.',
   },
   {
     id: 'continuum-020-local-intelligence',
@@ -114,7 +114,7 @@ export const CHANGELOG_MANIFEST = {
       lineage: 'continuum',
       version: '0.2.0',
       label: 'Continuum project-authoring expansion',
-      summary: 'Continuum 0.2 expands its project-aware authoring layer with Reference Studio, request-scoped local intelligence, and visible queue recovery.',
+      summary: 'Continuum 0.2 expands its project-aware authoring layer with Reference, request-scoped local intelligence, and visible queue recovery.',
       provenance: { kind: 'continuum-build' },
       highlights: continuum020Highlights,
     },

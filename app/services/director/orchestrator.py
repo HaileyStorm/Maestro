@@ -23,6 +23,10 @@ from .renderers import (
     LtxRetakeRenderer, LtxExtendRenderer, ImageGenRenderer,
 )
 from .validators import validate_shot_plan, validate_prompt_for_mode, compress_prompt
+from .policies import (
+    anchor_reference_edit_visual_style,
+    anchor_visual_prompt,
+)
 
 
 # ── Feature Flags ────────────────────────────────────────────────────
@@ -108,6 +112,7 @@ class DirectorOrchestrator:
         self._generate = llm_generate
         self._generate_streaming = llm_generate_streaming
         self.flags = flags or DEFAULT_FLAGS
+        self._video_model = ""
 
         # Build the refine function for pass 2
         # Use streaming for refinement — Qwen3.5 with --jinja always uses
@@ -145,6 +150,7 @@ class DirectorOrchestrator:
         if not planner_cls:
             raise ValueError(f"Unknown skill type: {skill_type}. Available: {list(_PLANNER_MAP.keys())}")
 
+        self._video_model = str(kwargs.get("video_model") or "")
         planner = planner_cls(
             llm_generate=self._generate,
             llm_generate_streaming=self._generate_streaming,
@@ -272,9 +278,38 @@ class DirectorOrchestrator:
 
         # Prefer LLM-generated prompts from the planner (single-pass, full context)
         if mode == "image_gen" and shot.image_prompt:
-            prompt = shot.image_prompt
+            if bool(context.get("has_reference", False)):
+                # Keep the Qwen-style opener while carrying any explicit
+                # structured style into the flattened runtime prompt. The
+                # helper also removes the contradictory reference-art-style
+                # clause but retains identity/body fidelity.
+                prompt = anchor_reference_edit_visual_style(
+                    shot.image_prompt,
+                    shot.visual_style,
+                )
+            else:
+                prompt = anchor_visual_prompt(
+                    shot.image_prompt,
+                    shot.visual_style,
+                )
         elif mode != "image_gen" and shot.video_prompt:
-            prompt = shot.video_prompt
+            video_model = str(
+                context.get("video_model") or self._video_model or ""
+            ).casefold()
+            if video_model.startswith("minimax_h3"):
+                # Canonical H3 Context-IR is a closed top-level grammar whose
+                # first field must remain subject_definitions:. Its planner has
+                # already received the shared style policy; never wrap the
+                # canonical result with generic prose here.
+                prompt = shot.video_prompt
+            else:
+                prompt = anchor_visual_prompt(
+                    shot.video_prompt,
+                    shot.visual_style,
+                    has_visual_reference=bool(
+                        context.get("has_reference", False)
+                    ),
+                )
             print(f"[Director] Shot {shot.shot_id} video_prompt ({len(prompt)} chars): {prompt[:80]}...")
         else:
             # Fallback: deterministic render from structured fields

@@ -83,6 +83,7 @@ def _load_route_symbols(namespace):
         "_run_project_reference_image_job",
         "_project_reference_runtime_intelligence_selection",
         "_project_reference_run_planning",
+        "_project_reference_authored_prompt_fragment",
         "_project_reference_selected_reviewer",
         "_attach_project_reference_result",
         "_project_reference_publication_recovery_requested",
@@ -419,13 +420,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
 
     @staticmethod
     def _passing_review(request):
-        required_checks = request.response_schema["properties"]["checks"]["required"]
-        return {
-            "status": "pass",
-            "checks": {name: True for name in required_checks},
-            "failed_roles": [],
-            "reason_codes": [],
-        }
+        return True
 
     @staticmethod
     def _intelligence_selection(
@@ -1586,16 +1581,10 @@ class ProjectReferenceRouteTests(unittest.TestCase):
 
         def failing_review(request):
             review_count["value"] += 1
-            checks = {
-                name: name != "violent_register_fidelity"
-                for name in request.response_schema["properties"]["checks"]["required"]
-            }
-            return {
-                "status": "fail",
-                "checks": checks,
-                "failed_roles": ["turnaround"],
-                "reason_codes": ["violent_register_mismatch"],
-            }
+            return not (
+                request.item_id == "authored_details"
+                and request.target_role == "turnaround"
+            )
 
         self.review = failing_review
         response = self._run(self._body(
@@ -1603,33 +1592,34 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             max_repair_attempts=1,
         ))
         job = self.jobs[response["job_id"]]
-        self.assertEqual(review_count["value"], 2)
+        self.assertEqual(
+            review_count["value"],
+            job["params"]["reference_pack"]["review_questions_used_total"],
+        )
         self.assertEqual(
             [call["role"] for call in self.calls].count("turnaround"), 2,
         )
         self.assertEqual(job["status"], "failed")
         self.assertEqual(self._assets(), [])
         failure = job["params"]["reference_pack"]["quality_failure"]
-        self.assertEqual(failure["reason_codes"], ["violent_register_mismatch"])
+        self.assertEqual(failure["reason_codes"], ["detail_register_mismatch"])
         self.assertEqual(failure["failed_roles"], ["turnaround"])
 
     def test_failed_detail_callout_uses_bounded_repair_route(self):
         reviews = 0
+        failed_once = False
 
         def review(request):
-            nonlocal reviews
+            nonlocal reviews, failed_once
             reviews += 1
-            if reviews == 1:
-                return {
-                    "status": "fail",
-                    "checks": {
-                        name: name != "detail_register_fidelity"
-                        for name in request.response_schema["properties"]["checks"]["required"]
-                    },
-                    "failed_roles": ["detail_callout:builtin:face"],
-                    "reason_codes": ["detail_register_mismatch"],
-                }
-            return self._passing_review(request)
+            if (
+                not failed_once
+                and request.item_id == "authored_callouts"
+                and request.target_role == "detail_callout:builtin:face"
+            ):
+                failed_once = True
+                return False
+            return True
 
         self.review = review
         self._run(self._explicit_body(
@@ -1652,26 +1642,130 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "detail_callout_repair",
         )
 
+    def test_authored_contract_projects_role_scoped_generation_and_repair_prompts(self):
+        creative_sentinel = "PRIVATE CLOCKWORK TRAVELER REQUEST"
+        private_style = "PRIVATE COPPERPLATE NOCTURNE"
+        private_type = "PRIVATE ASYMMETRIC SILHOUETTE"
+        private_detail = "PRIVATE IRIS FILIGREE"
+        failed_once = {"value": False}
+
+        def review(request):
+            if (
+                not failed_once["value"]
+                and request.item_id == "authored_callouts"
+                and request.target_role == "detail_callout:custom:abcdef0123456789"
+            ):
+                failed_once["value"] = True
+                return False
+            return True
+
+        self.review = review
+        response = self._run(self._body(
+            description=creative_sentinel,
+            style=private_style,
+            type_fields={"poses": [{
+                "id": "custom:0123456789abcdef",
+                "label": private_type,
+                "custom": True,
+                "group": "poses",
+            }]},
+            detail_callouts=[{
+                "custom_id": "custom:abcdef0123456789",
+                "label": private_detail,
+                "kind": "custom",
+                "operation": "enhance",
+                "source_role": "canonical_identity",
+            }],
+            max_repair_attempts=1,
+        ))
+
+        base_prompts = [
+            call["prompt"] for call in self.calls
+            if call["role"] in {"canonical_identity", "turnaround", "expressions"}
+        ]
+        detail_prompts = [
+            call["prompt"] for call in self.calls
+            if call["role"] == "detail_callout:custom:abcdef0123456789"
+        ]
+        self.assertTrue(base_prompts)
+        self.assertTrue(all(creative_sentinel in prompt for prompt in base_prompts))
+        self.assertTrue(all(private_style in prompt for prompt in base_prompts))
+        self.assertTrue(all(prompt.count(private_type) >= 2 for prompt in base_prompts))
+        self.assertTrue(all(prompt.count(private_detail) == 1 for prompt in base_prompts))
+        self.assertEqual(len(detail_prompts), 2)
+        self.assertTrue(all(creative_sentinel in prompt for prompt in detail_prompts))
+        self.assertTrue(all(private_style in prompt for prompt in detail_prompts))
+        self.assertTrue(all(prompt.count(private_detail) >= 2 for prompt in detail_prompts))
+        self.assertTrue(all(prompt.count(private_type) == 1 for prompt in detail_prompts))
+        public = json.dumps(response)
+        for private_value in (private_style, private_type, private_detail):
+            self.assertNotIn(private_value, public)
+
+    def test_selected_reviewer_consumes_one_boolean_authored_question_only(self):
+        captured_requests = []
+        anatomy_label = "nude anatomy"
+
+        def review(request):
+            captured_requests.append(request)
+            return True
+
+        self.review = review
+        self._run(self._explicit_body())
+        review_request = next(
+            request for request in captured_requests
+            if request.item_id == "anatomy_callouts"
+            and request.target_role == "canonical_identity"
+        )
+        captured_runner = {}
+
+        def runner(*args, **kwargs):
+            captured_runner.update(kwargs)
+            return "true"
+
+        self.ns["_project_reference_runtime_intelligence_selection"] = (
+            lambda *_args, **_kwargs: {"provider": "test"}
+        )
+        self.ns["_run_llm_with_selection"] = runner
+        result = self.real_selected_reviewer(
+            _Request({}), {"id": "review-job"}, review_request,
+            {"review_selection": {}},
+        )
+        self.assertIs(result, True)
+        self.assertEqual(captured_runner["json_schema"], {"type": "boolean"})
+        self.assertIn(anatomy_label, captured_runner["prompt"])
+        self.assertIn(review_request.creative_request, captured_runner["prompt"])
+        self.assertIn(
+            "Ordered attachment roles: "
+            + json.dumps(list(review_request.sheet_roles)),
+            captured_runner["prompt"],
+        )
+        self.assertNotIn("prior question", captured_runner["prompt"].casefold())
+        self.assertNotIn("prior answer", captured_runner["prompt"].casefold())
+        combined = (
+            captured_runner["prompt"] + " "
+            + captured_runner["system_prompt"]
+        ).casefold()
+        for forbidden in (
+            "moderation", "safety", "category", "permissibility",
+            "maturity", "violence", "classifier",
+        ):
+            self.assertNotIn(forbidden, combined)
+
     def test_canonical_failure_regenerates_the_full_candidate_once(self):
         reviews = {"count": 0}
+        failed_once = {"value": False}
         progress = []
 
         def review(request):
             reviews["count"] += 1
-            if reviews["count"] == 1:
-                return {
-                    "status": "fail",
-                    "checks": {
-                        "identity": False,
-                        "request": True,
-                        "view": True,
-                        "accessory": True,
-                        "style": True,
-                    },
-                    "failed_roles": [request.sheet_roles[0], request.sheet_roles[1]],
-                    "reason_codes": ["identity_mismatch"],
-                }
-            return self._passing_review(request)
+            if (
+                not failed_once["value"]
+                and request.item_id == "identity_anchor"
+                and request.target_role == "canonical_identity"
+            ):
+                failed_once["value"] = True
+                return False
+            return True
 
         self.review = review
         real_update = self.ns["update_job"]
@@ -1698,24 +1792,24 @@ class ProjectReferenceRouteTests(unittest.TestCase):
 
     def test_max_repair_budget_drives_loop_progress_and_persisted_models(self):
         def review(request):
-            return {
-                "status": "fail",
-                "checks": {
-                    "identity": False,
-                    "request": True,
-                    "view": True,
-                    "accessory": True,
-                    "style": True,
-                },
-                "failed_roles": [request.sheet_roles[1]],
-                "reason_codes": ["identity_mismatch"],
-            }
+            return not (
+                request.item_id == "identity_anchor"
+                and request.target_role == "turnaround"
+            )
 
         self.review = review
         response = self._run(self._body(max_repair_attempts=5))
         job = self.jobs[response["job_id"]]
-        self.assertEqual(job["total_steps"], 26)
-        self.assertEqual(job["step"], 26)
+        from services.reference_sheets import fidelity_rubric_role_applicability
+        question_count = sum(
+            len(roles) for _item, roles in fidelity_rubric_role_applicability(
+                "character", (
+                    "canonical_identity", "turnaround", "expressions",
+                ),
+            )
+        )
+        self.assertEqual(job["total_steps"], 1 + 4 + question_count + 5 * (3 + question_count))
+        self.assertEqual(job["step"], job["total_steps"])
         self.assertEqual(job["progress"], 100)
         self.assertEqual(len(self.calls), 8)
         self.assertEqual(
@@ -1733,26 +1827,73 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(reference["generation_model"], "flux2_klein_9b")
         self.assertEqual(metadata["job"]["generation_model"], "flux2_klein_9b")
 
+    def test_boolean_rubric_progress_counts_every_question_and_attempt(self):
+        from services.reference_sheets import fidelity_rubric_role_applicability
+
+        output_roles = (
+            "canonical_identity", "turnaround", "expressions",
+        )
+        questions_per_attempt = sum(
+            len(roles) for _item, roles in fidelity_rubric_role_applicability(
+                "character", output_roles,
+            )
+        )
+        reviews = {"count": 0}
+        progress = []
+
+        def review(_request):
+            reviews["count"] += 1
+            return reviews["count"] > questions_per_attempt
+
+        real_update = self.ns["update_job"]
+
+        def track_update(job, **updates):
+            if "step" in updates:
+                progress.append((
+                    updates["step"], updates["progress"],
+                    updates.get("message", ""),
+                ))
+            return real_update(job, **updates)
+
+        self.review = review
+        self.ns["update_job"] = track_update
+        response = self._run(self._body(max_repair_attempts=1))
+        job = self.jobs[response["job_id"]]
+        expected_total = 1 + 4 + questions_per_attempt + (
+            len(output_roles) + questions_per_attempt
+        )
+
+        self.assertEqual(reviews["count"], questions_per_attempt * 2)
+        self.assertEqual(job["total_steps"], expected_total)
+        self.assertEqual(job["step"], expected_total)
+        self.assertEqual(job["progress"], 100)
+        self.assertTrue(all(
+            step <= expected_total and percent <= 100
+            for step, percent, _message in progress
+        ))
+        self.assertEqual(
+            job["params"]["reference_pack"]["review_questions_used_total"],
+            questions_per_attempt * 2,
+        )
+        messages = [message for _step, _percent, message in progress]
+        self.assertTrue(any("question 1/" in message for message in messages))
+        self.assertTrue(any("attempt 2/2" in message for message in messages))
+
     def test_hybrid_persists_generation_and_editor_models(self):
         editor = "qwen_image_edit_2511_20B_fp8_lightning_4step"
         reviews = {"count": 0}
+        failed_once = {"value": False}
 
         def review(request):
             reviews["count"] += 1
-            if reviews["count"] == 1:
-                return {
-                    "status": "fail",
-                    "checks": {
-                        "identity": False,
-                        "request": True,
-                        "view": True,
-                        "accessory": True,
-                        "style": True,
-                    },
-                    "failed_roles": [request.sheet_roles[1]],
-                    "reason_codes": ["identity_mismatch"],
-                }
-            return self._passing_review(request)
+            if (
+                not failed_once["value"]
+                and request.item_id == "identity_anchor"
+                and request.target_role == "turnaround"
+            ):
+                failed_once["value"] = True
+                return False
+            return True
 
         self.review = review
         self._run(self._body(mode="hybrid", editor_model_type=editor))
@@ -1793,23 +1934,17 @@ class ProjectReferenceRouteTests(unittest.TestCase):
 
     def test_multi_candidate_repair_counters_distinguish_per_candidate_and_total(self):
         reviews = {"count": 0}
+        marker_reviews = {"count": 0}
 
         def review(request):
             reviews["count"] += 1
-            if reviews["count"] % 2:
-                return {
-                    "status": "fail",
-                    "checks": {
-                        "identity": False,
-                        "request": True,
-                        "view": True,
-                        "accessory": True,
-                        "style": True,
-                    },
-                        "failed_roles": [request.sheet_roles[1]],
-                    "reason_codes": ["identity_mismatch"],
-                }
-            return self._passing_review(request)
+            if (
+                request.item_id == "identity_anchor"
+                and request.target_role == "turnaround"
+            ):
+                marker_reviews["count"] += 1
+                return marker_reviews["count"] % 2 == 0
+            return True
 
         self.review = review
         response = self._run(self._body(
@@ -2334,6 +2469,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         expected_private = {
             "type_fields": type_fields,
             "detail_callouts": callouts,
+            "style": "",
         }
         self.assertEqual(
             first_variant["metadata"]["private_authored_settings"],
@@ -2398,6 +2534,139 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertNotIn("private_authored_settings", public)
         self.assertNotIn("PRIVATE_RETRY_EXPRESSION", public)
         self.assertNotIn("PRIVATE_RETRY_DETAIL", public)
+
+    def test_v2_style_is_private_committed_and_exactly_replayed_or_overridden(self):
+        private_style = "PRIVATE PAINTERLY NOIR STYLE"
+        first = self._run(self._body(style=f"  {private_style}  "))
+        first_variant = self._assets()[0]["variants"][0]
+        authored = first["plan"]["authored_settings"]
+        self.assertTrue(authored["style_present"])
+        self.assertRegex(authored["style_commitment"], r"^[0-9a-f]{64}$")
+        self.assertNotEqual(
+            authored["style_commitment"],
+            hashlib.sha256(private_style.encode()).hexdigest(),
+        )
+        self.assertNotIn(private_style, json.dumps(first["plan"]))
+        self.assertNotIn(
+            private_style,
+            json.dumps(self.ns["list_project_assets"]("project", _Request({}))),
+        )
+        self.assertEqual(
+            first_variant["metadata"]["private_authored_settings"]["style"],
+            private_style,
+        )
+        owner = self.ns["get_project_reference_authoring"](
+            "project", first["asset"]["id"], first_variant["id"], _Request({}),
+        )
+        self.assertEqual(owner["authored_settings"]["style"], private_style)
+
+        for mutation in ("drift", "missing", "commitment"):
+            corrupted = copy.deepcopy(first_variant)
+            if mutation == "drift":
+                corrupted["metadata"]["private_authored_settings"]["style"] = (
+                    "PRIVATE DIFFERENT STYLE"
+                )
+            elif mutation == "missing":
+                corrupted["metadata"]["private_authored_settings"].pop("style")
+            else:
+                corrupted["metadata"]["reference_pack"]["authored_settings"][
+                    "style_commitment"
+                ] = "0" * 64
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(HTTPException) as unavailable:
+                    self.ns["_project_reference_private_authored_snapshot"](
+                        corrupted,
+                    )
+                self.assertEqual(unavailable.exception.status_code, 409)
+
+        retry = self._run(self._body(
+            asset_id=first["asset"]["id"],
+            parent_variant_id=first_variant["id"],
+        ))
+        self.assertEqual(
+            retry["plan"]["authored_settings"],
+            first["plan"]["authored_settings"],
+        )
+        self.assertEqual(
+            self.jobs[retry["job_id"]]["params"]["reference_pack"]
+            ["private_authored_settings"]["style"],
+            private_style,
+        )
+
+        override = self._run(self._body(
+            asset_id=first["asset"]["id"],
+            parent_variant_id=first_variant["id"],
+            style="PRIVATE WATERCOLOR OVERRIDE",
+        ))
+        self.assertNotEqual(
+            override["plan"]["authored_settings"]["style_commitment"],
+            authored["style_commitment"],
+        )
+        self.assertEqual(
+            self.jobs[override["job_id"]]["params"]["reference_pack"]
+            ["private_authored_settings"]["style"],
+            "PRIVATE WATERCOLOR OVERRIDE",
+        )
+
+    def test_v2_omitted_style_retry_fails_409_when_parent_style_is_missing(self):
+        first = self._run(self._body(style="PRIVATE SEALED STYLE"))
+        asset = self._assets()[0]
+        variant = asset["variants"][0]
+        with self.store._lock:
+            manifest = self.store._load_manifest("project")
+            stored_asset = self.store._find_asset(manifest, "main", asset["id"])
+            stored_variant = self.store._find_variant(
+                stored_asset, variant["id"],
+            )
+            stored_variant["metadata"]["private_authored_settings"].pop(
+                "style",
+            )
+            self.store._write_manifest("project", manifest)
+        before_jobs = set(self.jobs)
+        with self.assertRaises(HTTPException) as unavailable:
+            self._run(self._body(
+                asset_id=asset["id"], parent_variant_id=variant["id"],
+            ))
+        self.assertEqual(unavailable.exception.status_code, 409)
+        self.assertEqual(set(self.jobs), before_jobs)
+
+    def test_v2_legacy_snapshot_without_style_contract_retries_as_no_style(self):
+        from services.reference_sheets import reference_pack_authored_settings_seal
+
+        first = self._run(self._body())
+        asset = self._assets()[0]
+        variant = asset["variants"][0]
+        with self.store._lock:
+            manifest = self.store._load_manifest("project")
+            stored_asset = self.store._find_asset(manifest, "main", asset["id"])
+            stored_variant = self.store._find_variant(
+                stored_asset, variant["id"],
+            )
+            private = stored_variant["metadata"]["private_authored_settings"]
+            private.pop("style")
+            authored = stored_variant["metadata"]["reference_pack"][
+                "authored_settings"
+            ]
+            authored.pop("style_present")
+            authored.pop("style_commitment")
+            authored["seal"] = reference_pack_authored_settings_seal(private)
+            self.store._write_manifest("project", manifest)
+
+        owner = self.ns["get_project_reference_authoring"](
+            "project", asset["id"], variant["id"], _Request({}),
+        )
+        self.assertNotIn("style", owner["authored_settings"])
+        retry = self._run(self._body(
+            asset_id=asset["id"], parent_variant_id=variant["id"],
+        ))
+        self.assertFalse(
+            retry["plan"]["authored_settings"]["style_present"],
+        )
+        self.assertEqual(
+            self.jobs[retry["job_id"]]["params"]["reference_pack"]
+            ["private_authored_settings"]["style"],
+            "",
+        )
 
     def test_v2_reload_retry_fails_closed_when_private_snapshot_is_missing(self):
         first = self._run(self._body())
@@ -2648,29 +2917,18 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             lambda model_types: term_calls.append(tuple(model_types))
         )
         reviews = {"count": 0}
+        failed_once = {"value": False}
 
         def review(request):
             reviews["count"] += 1
-            if reviews["count"] == 1:
-                return {
-                    "status": "fail",
-                    "checks": {
-                        "identity": True,
-                        "request": False,
-                        "view": True,
-                        "accessory": True,
-                        "style": True,
-                        "overall_fidelity": False,
-                        "mature_register_fidelity": True,
-                        "violent_register_fidelity": True,
-                        "detail_register_fidelity": True,
-                    },
-                    "failed_roles": ["turnaround"],
-                    "reason_codes": [
-                        "request_mismatch", "overall_fidelity_mismatch",
-                    ],
-                }
-            return self._passing_review(request)
+            if (
+                not failed_once["value"]
+                and request.item_id == "authored_details"
+                and request.target_role == "turnaround"
+            ):
+                failed_once["value"] = True
+                return False
+            return True
 
         self.review = review
         response = self._run(self._body(
@@ -3228,9 +3486,16 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         review_request = types.SimpleNamespace(
             instruction="bounded fidelity review",
             creative_request="synthetic authored request",
+            question="Does the output preserve the authored identity?",
+            target_role="canonical_identity",
             sheet_roles=("canonical_identity",),
             sheet_paths=(self.root / "synthetic.png",),
-            response_schema={"type": "object"},
+            response_schema={"type": "boolean"},
+            authored_contract=types.SimpleNamespace(
+                style="synthetic style",
+                type_fields=(),
+                detail_callouts=(),
+            ),
         )
         with mock.patch.object(llm_service, "get_status", return_value={
             "loaded": True,
@@ -3253,13 +3518,16 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "provider": "local",
             "vision_available": True,
         }), mock.patch.object(
-            llm_service, "generate", return_value='{"status":"pass"}',
+            llm_service, "generate", return_value="true",
         ) as generate, mock.patch.object(llm_service, "unload_model") as unload:
             result = self.real_selected_reviewer(
                 _Request({}), {}, review_request, config,
             )
-        self.assertEqual(result, '{"status":"pass"}')
+        self.assertIs(result, True)
         generate.assert_called_once()
+        self.assertEqual(
+            generate.call_args.kwargs["json_schema"], {"type": "boolean"},
+        )
         unload.assert_called_once_with()
 
     def test_v2_selected_planner_runs_and_validates_bounded_schema_in_worker(self):
@@ -3328,6 +3596,8 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "validated",
         )
         self.assertEqual(captured["json_schema"]["type"], "object")
+        self.assertIn("VISUAL STYLE DEFAULT", captured["system_prompt"])
+        self.assertIn("photorealistic realism", captured["system_prompt"])
         self.assertEqual(
             planned.sheets[0].objective,
             "Validated execution brief for canonical_identity",
@@ -3382,6 +3652,11 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         response = self._run(self._body())
         self.assertIn("SERVER_VALIDATED_CANONICAL_IDENTITY_BRIEF", self.calls[0]["prompt"])
         self.assertIn("SERVER_VALIDATED_TURNAROUND_BRIEF", self.calls[1]["prompt"])
+        self.assertTrue(all(
+            "VISUAL STYLE DEFAULT" in call["prompt"]
+            and "photorealistic realism" in call["prompt"]
+            for call in self.calls
+        ))
         job_pack = self.jobs[response["job_id"]]["params"]["reference_pack"]
         variant_pack = self._assets()[0]["variants"][0]["metadata"]["reference_pack"]
         self.assertEqual(job_pack["planning_status"], "validated")

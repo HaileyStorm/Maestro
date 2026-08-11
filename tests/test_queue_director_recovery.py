@@ -100,6 +100,7 @@ class DirectorRecoveryTests(unittest.TestCase):
             "submit": director._recovery_submit_child,
             "verify": director._recovery_verify_child,
             "validate": director._recovery_validate_child,
+            "runtime_admission": director._runtime_admission,
         }
         director._jobs = {}
         director._run_generation = lambda _job_id: None
@@ -115,6 +116,7 @@ class DirectorRecoveryTests(unittest.TestCase):
         director._recovery_submit_child = None
         director._recovery_verify_child = None
         director._recovery_validate_child = None
+        director._runtime_admission = None
 
     def tearDown(self):
         director._jobs = self.originals["jobs"]
@@ -133,6 +135,7 @@ class DirectorRecoveryTests(unittest.TestCase):
         director._recovery_submit_child = self.originals["submit"]
         director._recovery_verify_child = self.originals["verify"]
         director._recovery_validate_child = self.originals["validate"]
+        director._runtime_admission = self.originals["runtime_admission"]
         self.temporary.cleanup()
 
     def _params(self):
@@ -661,6 +664,59 @@ class DirectorRecoveryTests(unittest.TestCase):
         self.assertIn("blocked", message.lower())
         worker.assert_not_called()
 
+    def test_runtime_admission_skips_terminal_history_and_rechecks_continue(self):
+        calls = []
+        director._runtime_admission = lambda params, **kwargs: calls.append(
+            (dict(params), dict(kwargs))
+        )
+
+        terminal_pid = "terminal-history"
+        terminal_path = self.root / director.pipeline_state_filename(terminal_pid)
+        terminal = {
+            "pipeline_id": terminal_pid,
+            "status": "completed",
+            "_params_snapshot": self._params(),
+            "clips": [],
+        }
+        terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
+        with patch.object(director, "_start_pipeline_worker") as worker:
+            restored = director.restore_registered_pipeline(
+                terminal, str(terminal_path), {"id": "parent"},
+            )
+        self.assertEqual(restored["status"], "completed")
+        self.assertEqual(calls, [])
+        worker.assert_not_called()
+        director._runtime_admission = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(RuntimeError("must not admit history"))
+        )
+        ok, message = director.resume_pipeline(terminal_pid, str(self.root))
+        self.assertFalse(ok)
+        self.assertIn("Terminal", message)
+
+        paused_pid = "paused-admission"
+        paused_path = self.root / director.pipeline_state_filename(paused_pid)
+        paused = {
+            "pipeline_id": paused_pid,
+            "status": "paused",
+            "pause_reason": "review_prompts",
+            "source_remote": True,
+            "_params_snapshot": self._params(),
+            "clips": [],
+        }
+        paused_path.write_text(json.dumps(paused), encoding="utf-8")
+        director._runtime_admission = lambda params, **kwargs: calls.append(
+            (dict(params), dict(kwargs))
+        )
+        director.restore_registered_pipeline(
+            paused, str(paused_path), {"id": "parent"}, defer_worker=True,
+        )
+        self.assertEqual(calls, [])
+        with patch.object(director, "_start_pipeline_worker") as worker:
+            self.assertTrue(director.continue_pipeline(paused_pid))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1]["source_remote"])
+        worker.assert_called_once_with(paused_pid, resume=True)
+
     def test_completed_child_evidence_is_reused_without_submission(self):
         pid = "reuse1"
         unit = {"kind": "image_start", "variant": 0, "index": 2}
@@ -1048,8 +1104,15 @@ class DirectorRecoveryTests(unittest.TestCase):
             "Request": object,
             "HTTPException": HTTPError,
             "_init_pipeline": lambda: None,
+            "_reject_client_director_image_role_internals": lambda _body: None,
             "_authorize_director_media_inputs": (
                 lambda _request, _body: "project-a"
+            ),
+            "_resolve_director_image_role_request": (
+                lambda _request, _body: "legacy"
+            ),
+            "_resolve_h3_style_workflow_request": (
+                lambda _body, model_field="model_type": None
             ),
             "_require_director_preparation": (
                 lambda _request, candidate, workspace: (

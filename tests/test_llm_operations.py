@@ -517,7 +517,17 @@ class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
             "wgp": types.SimpleNamespace(server_config={"services": {
                 "director_prompt_polish": "off",
             }}, transformer_type="", wan_model=None, offloadobj=None),
+            "_reject_client_director_image_role_internals": lambda _body: None,
             "_authorize_director_media_inputs": lambda *_args: None,
+            "_resolve_director_image_role_request": (
+                lambda _request, _body: "legacy"
+            ),
+            "_resolve_h3_style_workflow_request": (
+                lambda _body, *, model_field="video_model": None
+            ),
+            "_apply_h3_style_workflow_to_director_clips": (
+                lambda _clips, _workflow: None
+            ),
             "_llm_chat_request_is_external": lambda _request: False,
             "_resolve_direct_llm_selection": lambda _request: dict(selection),
             "_explicit_llm_guidance_allowed": lambda _body: True,

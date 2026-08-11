@@ -46,11 +46,13 @@ separate adjustable model surface. The server validates the exact model, assets,
 and compatibility matrix and remains authoritative over stale client settings. Maestro does
 not expose First Block Cache as a public H3 control.
 
-The H3 prepared-style selector includes official MiniMax workflows such as papercraft
-stop-motion, paper collage, product ads, music-video typography, and stylized 3D shorts.
-Maestro checks the official H3 skills catalog daily, parses only bounded metadata (never
-executes repository instructions), caches its revision, and retains an offline bundled
-catalog.
+The H3 visual-style workflow selector includes official MiniMax workflow identities such as
+papercraft stop-motion, paper collage, product ads, music-video typography, and stylized 3D
+shorts. Generate and Director send only an exact workflow ID; Maestro resolves its
+revision-bound adapted brief server-side and compiles the guidance inside the legal H3 prompt
+schema. Maestro checks the official H3 skills catalog daily, parses only bounded metadata
+(never executes repository instructions), caches its revision and refresh status, and retains
+an offline bundled catalog.
 
 ### 🤖 LLM Chat and prompting — built in
 The **Chat** tab serves Maestro's local GGUF catalog to local and authorized
@@ -104,10 +106,10 @@ Multiple isolated output directories with a quick switcher in the sidebar. Usefu
 
 - Cloudflare access is enabled by default. Remote visitors see project names, then unlock only the project they know the password for; counts, prompts, assets, jobs, and media stay hidden until unlock.
 - Remote visitors cannot change machine settings, start/stop services, browse storage/model folders, or import arbitrary Hugging Face/CivitAI URLs. Curated model weights may still download when their generation needs them.
-- After unlocking a project, remote visitors can browse and apply Maestro's bundled Recipes in Studio. Host-global user recipes are never listed remotely; saving, importing, deleting, and installing recipe LoRAs remain local host-owner actions.
+- After unlocking a project, remote visitors can browse and apply Maestro's bundled Recipes in Generate. Host-global user recipes are never listed remotely; saving, importing, deleting, and installing recipe LoRAs remain local host-owner actions.
 - Project passwords protect access through Maestro and its remote-sharing flow.
-- **Reference Studio** is a header-level peer to Studio and Director. It opens as a modal without changing the current sidebar destination; project name/description are first-class fields, and Queue closes the modal only after the queue submission and job reconnect are confirmed. Locked projects keep the action visible with an unlock diagnostic.
-- Reference Studio makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Studio semantic-reference workflows. The catalog includes explicit Moody Krea 2 quick-select cards when a recipe is enabled and present; disabled, missing, and manual-install states remain visible and are never auto-enabled or auto-selected.
+- **Reference** is a persistent sidebar peer to Generate and Director. Its create/manage workspace stays mounted while inactive so authored state survives navigation; Queue leaves Reference only after the submission and job reconnect are durably confirmed. Locked projects disable entry, and a newly locked active project returns to the prior workspace after clearing private Reference state.
+- Reference makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Generate semantic-reference workflows. The catalog includes explicit Moody Krea 2 quick-select cards when a recipe is enabled and present; disabled, missing, and manual-install states remain visible and are never auto-enabled or auto-selected.
 - Gallery selection supports bulk move, privacy, and deletion. Finals are shown by default; All, Components, Windows, and Temporary views expose intermediate artifacts when needed. Deleting a final can atomically include its linked parts.
 - Read-only single-output share links work for local owners and through the same Cloudflare URL, and are revoked when the output is moved, changed, deleted, or its project is removed.
 
@@ -120,9 +122,9 @@ the prompt preview, current segment/window versus overall progress, checkpoint/t
 failure details, a bounded event log, and ETA for the owner's running job. Queued work can be
 held and resumed.
 
-### 🧊 Blender scene guides
+### 🧊 Blender Motion Video
 
-The Tools area and Reference Studio creation-method surface include a structured Blender scene tool. It creates primitives/materials, animates the full requested frame range, inspects the scene, and samples multiple frames into protected project references. Blender uses a separate reference name/privacy contract and does not add a durable asset type; Reference Studio's image-pack description remains on the authored pack. Pinokio installs a pinned portable Blender runtime plus the official Blender Lab MCP extension, then starts its localhost-only bridge with Maestro. Remote project users can invoke the same hosted tool through Maestro's project-scoped API; they never receive filesystem or machine-control access. Maestro never exposes the upstream arbitrary-Python surface.
+Blender Motion Video is a first-class Reference creation method as well as an existing Tools surface. It creates primitives/materials, animates the full requested frame range, inspects and previews the scene, and can Keep the rendered motion/camera guide as a protected project candidate for Generate control. The method stays orthogonal to durable semantic asset types and uses its own reference-name/privacy contract; the image-pack description remains on the authored pack. Pinokio installs a pinned portable Blender runtime plus the official Blender Lab MCP extension, then starts its localhost-only bridge with Maestro. Remote project users can invoke the same hosted tool through Maestro's project-scoped API; they never receive filesystem or machine-control access. Maestro never exposes the upstream arbitrary-Python surface.
 
 ### 🔒 Explicit guidance + experimental gate
 - **Explicit prompt guidance** is an opt-in authoring aid with a disclaimer step. It never hides models, LoRAs, recipes, prompts, or locally processed outputs, and it does not moderate local content.
@@ -145,7 +147,7 @@ Maestro Continuum has its own product release version, separate from the bundled
 - H3 has no public First Block Cache control; acceleration is expressed only through the validated profile surface.
 
 **H3 resolutions and long-video planning**
-- Studio and Director keep one coherent global H3 prompt instead of asking an LLM to write a separate prompt for every continuation window.
+- Generate and Director keep one coherent global H3 prompt instead of asking an LLM to write a separate prompt for every continuation window.
 - Authored timestamps are authoritative; untimed prompts use a deterministic native-shot planner that can choose unequal shot lengths from action/dialogue density.
 - The resulting native-shot plan is persisted as reproducible execution metadata while the user's global prompt remains the prompt authority.
 
@@ -566,8 +568,8 @@ Click **Reset** to wipe the install and start over. Removes `app/env/`, `ui/node
 
 After clicking **Start**, the launcher shows an **Open Web UI** button once the server is up.
 
-- **Sidebar** — mode toggle (Studio / Director), model picker, prompt, LoRAs, advanced settings
-- **Recipes** — open the bundled preset library from the empty Gallery or Studio sidebar; applying a recipe deliberately returns to Studio with editable settings and prompt
+- **Sidebar** — peer workspaces (Generate / Director / Reference), model picker, prompt, LoRAs, and advanced settings
+- **Recipes** — open the bundled preset library from the empty Gallery or Generate sidebar; applying a recipe deliberately returns to Generate with editable settings and prompt
 - **Main feed** — generated outputs, dashboard, Director pipeline status
 - **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, mature prompt guidance, theme)
 - **Pinokio menu** — Update, Reset, Install Inpaint Support, LoRA folder shortcuts
@@ -582,7 +584,7 @@ For a reusable address without buying a domain, Maestro includes a minimal Cloud
 
 Remote access is deliberately not an administration surface. It exposes the app but denies Classic UI, system/storage/model-source settings, arbitrary model links/paths, and service load/unload. New remote projects require a password. A browser may keep several projects unlocked at once. An explicit `device` unlock is cached server-side across ordinary reloads and Maestro restarts for at most 30 days locally (7 days idle) or 7 days remotely (24 hours idle); `session` grants are shorter and process-local. Deliberate project selection and authorized project mutations slide the idle deadline without moving its absolute cap. Read-only listing, media, gallery, queue, job, and status polls validate grants but never extend them, so a tab left polling cannot stay unlocked forever. Relocking, password changes/removal, project deletion/recreation, expiry, or invalid grant data revokes access. The owner-only cache contains HMAC identities and expiry metadata, never passwords, raw session cookies, or bearer credentials. LAN binding remains disabled by default.
 
-Lawful-use, separately licensed Ref2VA, and applicable BFL/Krea model-license notices are versioned once per Maestro host, not per browser, project, or device. Any current local project user or password-unlocked remote project user may record the exact displayed version; doing so grants no project or machine-control capability. A notice version change requires a fresh acceptance, and any required manual-review commitment is user-confirmed before the selected model or paired recipe can run. Mature prompt guidance is a separate host setting and is applied only when the current Studio or Director job is explicitly marked **Explicit**. Maestro does not inspect local prompts or outputs to make that choice. External LLM providers remain separately disclosed and subject to their own terms and privacy policies.
+Lawful-use, separately licensed Ref2VA, and applicable BFL/Krea model-license notices are versioned once per Maestro host, not per browser, project, or device. Any current local project user or password-unlocked remote project user may record the exact displayed version; doing so grants no project or machine-control capability. A notice version change requires a fresh acceptance, and any required manual-review commitment is user-confirmed before the selected model or paired recipe can run. Mature prompt guidance is a separate host setting and is applied only when the current Generate or Director job is explicitly marked **Explicit**. Maestro does not inspect local prompts or outputs to make that choice. External LLM providers remain separately disclosed and subject to their own terms and privacy policies.
 
 Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to `false` (in the per-app or global ENVIRONMENT file) to bind the server to loopback only; set to `true` for LAN access. Pinokio's own daemon proxy is a separate concern that may also need to honor the variable depending on your setup.
 

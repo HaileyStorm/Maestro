@@ -170,7 +170,7 @@ function App() {
             type="button"
             onClick={toggleSidebar}
             className="p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
-            aria-label={sidebarOpen ? 'Close Studio and Director menu' : 'Open Studio and Director menu'}
+            aria-label={sidebarOpen ? 'Close creative workspace menu' : 'Open Generate, Director, and Reference menu'}
             aria-expanded={sidebarOpen}
             aria-controls="maestro-mobile-sidebar"
           >

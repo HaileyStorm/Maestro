@@ -1,12 +1,22 @@
 import { create } from 'zustand'
 import type { StoreApi } from 'zustand'
-import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping } from '../types'
+import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
 import { applyH3SegmentCeilingPolicy, hasManualH3SegmentCeiling } from '../lib/h3Submission'
 import { alignStudioTotalFrames, alignTotalFrames, controlFpsTotalFrames, effectiveSlidingWindowGeometry, hasGlobalTimeline, usesStudioSegments } from '../lib/timelinePrompt'
 import { hidePrivatePreviewsForWorkspace } from '../lib/privatePreview'
+import { resolveSidebarNavigation, type ReferenceReturnMode, type SidebarMode } from '../lib/sidebarNavigation'
+import {
+  H3_STYLE_PREFIX_MIGRATION_KEY,
+  H3_STYLE_WORKFLOW_PREF_KEY,
+  captureH3StyleWorkflowRequest,
+  h3StyleWorkflowSelectionIsCurrent,
+  h3StyleWorkflowSupportsModel,
+  resolveH3StyleWorkflowRequest,
+  stripLegacyH3StylePrefix,
+} from '../lib/h3StyleWorkflows'
 
 const CIVIT_DOWNLOAD_POLL_MS = 2000
 const CIVIT_DOWNLOAD_COMPLETED_VISIBLE_MS = 30_000
@@ -78,6 +88,43 @@ const _civitRefreshedCheckpointDownloads = new Set<string>()
 const DIRECTOR_REPAIR_POLL_MS = 2000
 const DIRECTOR_REPAIR_ACTIVE = new Set(['queued', 'running', 'cancelling'])
 const DIRECTOR_PREPARATION_STORAGE_KEY = 'maestro:director-preparation-v1'
+const DIRECTOR_IMAGE_ROLES_STORAGE_KEY = 'maestro:director-image-roles-v1'
+
+interface PersistedDirectorImageRoles {
+  schema_version: 1
+  creator_model_override: string
+  editor_model_override: string
+  creator_loras: DirectorImageRoleLoraSelection[]
+  editor_loras: DirectorImageRoleLoraSelection[]
+}
+
+function _loadDirectorImageRoles(): PersistedDirectorImageRoles | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(DIRECTOR_IMAGE_ROLES_STORAGE_KEY) || 'null')
+    if (!parsed || parsed.schema_version !== 1) return null
+    return {
+      schema_version: 1,
+      creator_model_override: typeof parsed.creator_model_override === 'string'
+        ? parsed.creator_model_override : '',
+      editor_model_override: typeof parsed.editor_model_override === 'string'
+        ? parsed.editor_model_override : '',
+      creator_loras: Array.isArray(parsed.creator_loras) ? parsed.creator_loras : [],
+      editor_loras: Array.isArray(parsed.editor_loras) ? parsed.editor_loras : [],
+    }
+  } catch {
+    return null
+  }
+}
+
+function _saveDirectorImageRoles(settings: PersistedDirectorImageRoles): void {
+  try {
+    localStorage.setItem(DIRECTOR_IMAGE_ROLES_STORAGE_KEY, JSON.stringify(settings))
+  } catch {
+    // Current-session state remains authoritative when storage is unavailable.
+  }
+}
+
+const _initialDirectorImageRoles = _loadDirectorImageRoles()
 const DIRECTOR_PIPELINE_ACTIVE_PHASES = new Set<api.PipelineStatus['phase']>([
   'registered',
   'planning',
@@ -105,6 +152,19 @@ const _directorRepairDiscoveries = new Map<string, object>()
 const _recoveryJobPolls = new Map<string, ActiveJobPoll>()
 const _terminalJobWaiters = new Map<string, TerminalJobWaiter>()
 let _directorPreparationPoll: ReturnType<typeof setInterval> | null = null
+type DirectorCapabilitiesKey = 'standard' | 'explicit'
+const _directorCapabilitiesSeq: Record<DirectorCapabilitiesKey, number> = {
+  standard: 0,
+  explicit: 0,
+}
+const _directorCapabilitiesInFlight: Partial<Record<DirectorCapabilitiesKey, {
+  token: symbol
+  promise: Promise<api.DirectorCapabilities>
+}>> = {}
+
+function _directorCapabilitiesKey(explicitOutput: boolean): DirectorCapabilitiesKey {
+  return explicitOutput ? 'explicit' : 'standard'
+}
 let _dashboardPipelineLoadToken = 0
 let _dashboardPipelineListLoadToken = 0
 let _enhanceLlmRequestToken: symbol | null = null
@@ -1196,6 +1256,32 @@ let _recipesLoadSeq = 0
 let _h3EstimateSeq = 0
 let _h3ProfileApplySeq = 0
 let _h3CompatibilitySeq = 0
+let _h3StyleWorkflowCatalogSeq = 0
+let _legacyH3StylePrefixMigrationComplete = false
+
+function _storedH3StyleWorkflow(): string {
+  try { return localStorage.getItem(H3_STYLE_WORKFLOW_PREF_KEY) || '' } catch { return '' }
+}
+
+function _storeH3StyleWorkflow(value: string): void {
+  try {
+    if (value) localStorage.setItem(H3_STYLE_WORKFLOW_PREF_KEY, value)
+    else localStorage.removeItem(H3_STYLE_WORKFLOW_PREF_KEY)
+  } catch { /* local preference remains optional */ }
+}
+
+function _legacyH3StylePrefixMigrationWasCompleted(): boolean {
+  if (_legacyH3StylePrefixMigrationComplete) return true
+  try {
+    _legacyH3StylePrefixMigrationComplete = localStorage.getItem(H3_STYLE_PREFIX_MIGRATION_KEY) === '1'
+  } catch { /* this session still receives one bounded migration attempt */ }
+  return _legacyH3StylePrefixMigrationComplete
+}
+
+function _completeLegacyH3StylePrefixMigration(): void {
+  _legacyH3StylePrefixMigrationComplete = true
+  try { localStorage.setItem(H3_STYLE_PREFIX_MIGRATION_KEY, '1') } catch { /* session marker remains */ }
+}
 
 export interface H3ModelProfileCompatibility {
   requestedProfileId: H3PerformanceProfileId
@@ -1867,6 +1953,13 @@ interface AppState {
   setParam: <K extends keyof GenerateParams>(key: K, value: GenerateParams[K]) => void
   setParams: (partial: Partial<GenerateParams>) => void
   setH3NativeResolution: (resolution: string) => void
+  h3StyleWorkflow: string
+  h3StyleWorkflowCatalog: api.H3StyleWorkflowCatalog | null
+  h3StyleWorkflowCatalogLoading: boolean
+  h3StyleWorkflowCatalogError: string | null
+  setH3StyleWorkflow: (id: string) => void
+  loadH3StyleWorkflowCatalog: (force?: boolean) => Promise<void>
+  migrateLegacyH3StylePrompt: () => void
 
   // UI state
   settingsOpen: boolean
@@ -1911,7 +2004,6 @@ interface AppState {
   rejoinPipelineClips: (pid: string) => Promise<unknown>
   resumePipeline: (pid: string) => Promise<void>
   deletePipeline: (pid: string) => Promise<void>
-  loadDirectorFromPipeline: (pid: string) => Promise<void>
 
   // Recipes (one-click Studio presets)
   recipesOpen: boolean
@@ -1958,6 +2050,7 @@ interface AppState {
   // ModelSelector "+N more" hint → open Settings and expand Enabled Models.
   modelVisibilityFocus: GenerationMode | null
   openModelVisibility: (mode: GenerationMode) => void
+  openDirectorModelVisibility: () => void
   clearModelVisibilityFocus: () => void
 
   // Resolution helpers
@@ -2052,13 +2145,7 @@ interface AppState {
    *  setup before running (e.g. revoice needs voice references), and switch to it. */
   sendClipToTools: (name: string, url: string | null, tool: 'upscale' | 'revoice') => void
 
-  // Director-mode post-processing (separate image/video)
-  directorImageSpatialUpsampling: string
-  setDirectorImageSpatialUpsampling: (v: string) => void
-  directorImageFilmGrainIntensity: number
-  setDirectorImageFilmGrainIntensity: (v: number) => void
-  directorImageFilmGrainSaturation: number
-  setDirectorImageFilmGrainSaturation: (v: number) => void
+  // Director final-video post-processing controls.
   directorVideoSpatialUpsampling: string
   setDirectorVideoSpatialUpsampling: (v: string) => void
   directorVideoFilmGrainIntensity: number
@@ -2298,7 +2385,9 @@ interface AppState {
   enhancePrompt: (ttsMode?: string) => Promise<boolean>
 
   // Director (Music Video Director)
-  sidebarMode: 'director' | 'studio'
+  sidebarMode: SidebarMode
+  /** Workspace to resume after Reference finishes a durable queue/apply action. */
+  referenceReturnMode: ReferenceReturnMode
   directorStep: 'upload' | 'analyze' | 'structure' | 'style' | 'plan' | 'review' | 'generate_images' | 'plan_video' | 'review_video'
   directorAudioFile: File | null
   directorAudioPath: string | null
@@ -2307,6 +2396,9 @@ interface AppState {
   directorEnergyBias: number
   directorClipPlans: ClipPlan[]
   directorSceneDescription: string
+  /** Empty means the Realistic product default unless freeform copy defines a style. */
+  directorVisualStyle: string
+  directorCustomVisualStyle: string
   directorLoading: boolean
   /** Sub-status for the current loading phase (e.g. "Loading
    *  transcription model (first use downloads ~300MB)..."). Set by
@@ -2340,6 +2432,18 @@ interface AppState {
   directorSkill: DirectorSkill | null
   directorResolution: ResolutionPreset
   directorAspectRatio: AspectRatio
+  directorCapabilities: api.DirectorCapabilities | null
+  directorCapabilitiesExplicitOutput: boolean | null
+  directorCapabilitiesLoading: boolean
+  directorCapabilitiesLoadingExplicitOutput: boolean | null
+  directorCapabilitiesError: string | null
+  directorModelVisibilityRefreshPending: boolean
+  /** False only while a pre-role combined image preference remains visible. */
+  directorImageRolesConfigured: boolean
+  directorLegacyImageModel: string
+  directorImageCreatorModelOverride: string
+  directorImageEditorModelOverride: string
+  directorImageRoleLoras: Record<DirectorImageRole, DirectorImageRoleLoraSelection[]>
   setDirectorAutoMode: (v: boolean) => void
   setDirectorSeamless: (v: boolean) => void
   setDirectorShotImageGuidance: (v: DirectorShotImageGuidance) => void
@@ -2348,10 +2452,16 @@ interface AppState {
   setDirectorSkill: (skill: DirectorSkill) => void
   setDirectorResolution: (preset: ResolutionPreset) => void
   setDirectorAspectRatio: (ratio: AspectRatio) => void
-  selectDirectorImageModel: (modelType: string) => void
+  loadDirectorCapabilities: (options?: {
+    explicitOutput?: boolean
+    force?: boolean
+  }) => Promise<api.DirectorCapabilities>
+  activateDirectorImageRoles: () => void
+  setDirectorImageRoleModel: (role: DirectorImageRole, modelType: string) => void
+  setDirectorImageRoleLoras: (role: DirectorImageRole, selections: DirectorImageRoleLoraSelection[]) => void
   selectDirectorVideoModel: (modelType: string) => Promise<void>
   directorSetLora: (mode: 'image' | 'video', activated_loras: string[], loras_multipliers: string, loraWeights: Record<string, number[]>, availableLoras: string[]) => void
-  setSidebarMode: (mode: 'director' | 'studio') => void
+  setSidebarMode: (mode: SidebarMode) => void
   directorSetSpeakerMapping: (speakerId: string, name: string, role: SpeakerMapping['role']) => void
   directorInsertSpeakerMention: (speakerId: string) => void
   directorUploadAndAnalyze: (file: File) => Promise<void>
@@ -2379,6 +2489,8 @@ interface AppState {
   directorSetEnergyBias: (bias: number) => Promise<void>
   directorConfirmStructure: () => void
   directorSetSceneDescription: (prompt: string) => void
+  setDirectorVisualStyle: (style: string) => void
+  setDirectorCustomVisualStyle: (style: string) => void
   directorSetReferenceImage: (file: File | null) => void
   directorAddCharacterRef: (file: File) => void
   directorRemoveCharacterRef: (index: number) => void
@@ -2741,6 +2853,99 @@ function computeFilteredOutputs(outputs: OutputFile[], mediaFilter: MediaFilter)
     _foCachedResult = outputs
   }
   return _foCachedResult
+}
+
+async function _ensureSelectedH3StyleWorkflowReady(getState: () => AppState): Promise<void> {
+  const selected = getState().h3StyleWorkflow
+  if (!selected) return
+  if (!getState().h3StyleWorkflowCatalog && !getState().h3StyleWorkflowCatalogLoading) {
+    await getState().loadH3StyleWorkflowCatalog()
+  }
+  const state = getState()
+  if (!state.h3StyleWorkflowCatalog) {
+    throw new Error('The selected H3 workflow could not be verified against the server catalog.')
+  }
+  if (!state.h3StyleWorkflow) {
+    throw new Error(state.h3StyleWorkflowCatalogError || 'The saved H3 workflow is no longer available.')
+  }
+  const modelType = state.selectedModelPerMode.video
+  if (h3StyleWorkflowSupportsModel(state.h3StyleWorkflowCatalog, modelType)
+    && !h3StyleWorkflowSelectionIsCurrent(state.h3StyleWorkflowCatalog, state.h3StyleWorkflow)) {
+    state.setH3StyleWorkflow('')
+    throw new Error('The selected H3 workflow is no longer in the server catalog.')
+  }
+}
+
+interface DirectorImageRoleRequestCapture {
+  wire: Pick<api.DirectorV2PlanRequest, 'image_creator_model'>
+    & Partial<Pick<api.DirectorV2PlanRequest,
+      'image_editor_model' | 'image_creator_loras' | 'image_editor_loras'>>
+  effective_creator_model: string
+  effective_editor_model: string
+}
+
+const _initialLegacyDirectorImageModel = _initialDirectorImageRoles === null
+  ? _loadSettings()?.selectedModelPerMode.image || ''
+  : ''
+
+async function _captureDirectorImageRoleRequest(
+  getState: () => AppState,
+  explicitOutput: boolean,
+): Promise<DirectorImageRoleRequestCapture> {
+  // A fresh server snapshot binds automatic resolution to the current literal
+  // Explicit choice and current remote authorization/catalog visibility.
+  const capabilities = await getState().loadDirectorCapabilities({
+    explicitOutput,
+    force: true,
+  })
+  const state = getState()
+  const creatorOverride = state.directorImageCreatorModelOverride.trim()
+  const editorOverride = state.directorImageEditorModelOverride.trim()
+  const effectiveCreator = creatorOverride || capabilities.image_roles.creator.resolved_model
+  const effectiveEditor = editorOverride || capabilities.image_roles.editor.resolved_model
+  if (!effectiveCreator || !effectiveEditor) {
+    throw new Error('A Director image role default is unavailable in this session. Select an authorized model or use Maestro locally.')
+  }
+  const roleModels = [
+    ['creator', effectiveCreator, capabilities.image_roles.creator.candidates] as const,
+    ['editor', effectiveEditor, capabilities.image_roles.editor.candidates] as const,
+  ]
+  for (const [role, modelType, candidates] of roleModels) {
+    const candidate = candidates.find(item => item.model_type === modelType)
+    if (!candidate) throw new Error(`The selected Director image ${role} is not visible in this session.`)
+    if (!candidate.compatible || !candidate.ready) {
+      throw new Error(`The selected Director image ${role} is not ready: ${candidate.reasons.join(', ') || 'unavailable'}.`)
+    }
+  }
+  const creatorLoras = state.directorImageRoleLoras.creator
+  const editorLoras = state.directorImageRoleLoras.editor
+  for (const [role, modelType, selections] of [
+    ['creator', effectiveCreator, creatorLoras] as const,
+    ['editor', effectiveEditor, editorLoras] as const,
+  ]) {
+    if (selections.length === 0) continue
+    const catalog = await api.fetchLoraDetails(modelType)
+    const errors = api.validateDirectorImageRoleLoraSelections(selections, catalog.loras)
+    if (errors.length > 0) {
+      throw new Error(`Director ${role} LoRAs need attention: ${errors.join(' ')}`)
+    }
+  }
+  return {
+    wire: {
+      // Null is the exact new-role automatic-creator sentinel. Omitting all
+      // role keys would intentionally select the legacy combined-image wire.
+      image_creator_model: creatorOverride || null,
+      ...(editorOverride ? { image_editor_model: editorOverride } : {}),
+      ...(creatorLoras.length > 0 ? {
+        image_creator_loras: api.toDirectorImageRoleLoraWire(creatorLoras),
+      } : {}),
+      ...(editorLoras.length > 0 ? {
+        image_editor_loras: api.toDirectorImageRoleLoraWire(editorLoras),
+      } : {}),
+    },
+    effective_creator_model: effectiveCreator,
+    effective_editor_model: effectiveEditor,
+  }
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -3161,6 +3366,86 @@ export const useStore = create<AppState>((set, get) => ({
   savedLoraPerMode: {},
   savedParamsPerMode: {},
   savedPromptPerMode: {} as Partial<Record<string, string>>,
+  h3StyleWorkflow: _storedH3StyleWorkflow(),
+  h3StyleWorkflowCatalog: null,
+  h3StyleWorkflowCatalogLoading: false,
+  h3StyleWorkflowCatalogError: null,
+
+  setH3StyleWorkflow: (id) => {
+    const catalog = get().h3StyleWorkflowCatalog
+    if (id && !h3StyleWorkflowSelectionIsCurrent(catalog, id)) {
+      _storeH3StyleWorkflow('')
+      set({
+        h3StyleWorkflow: '',
+        h3StyleWorkflowCatalogError: 'That H3 workflow is no longer in the server catalog. Choose another workflow.',
+      })
+      return
+    }
+    _storeH3StyleWorkflow(id)
+    set({ h3StyleWorkflow: id, h3StyleWorkflowCatalogError: null })
+  },
+
+  loadH3StyleWorkflowCatalog: async (force = false) => {
+    const current = get()
+    if (!force && (current.h3StyleWorkflowCatalog || current.h3StyleWorkflowCatalogLoading)) return
+    const seq = ++_h3StyleWorkflowCatalogSeq
+    set({ h3StyleWorkflowCatalogLoading: true, h3StyleWorkflowCatalogError: null })
+    try {
+      const catalog = await api.fetchH3StyleWorkflows()
+      if (seq !== _h3StyleWorkflowCatalogSeq) return
+      const selected = get().h3StyleWorkflow
+      const selectionCurrent = h3StyleWorkflowSelectionIsCurrent(catalog, selected)
+      if (!selectionCurrent) _storeH3StyleWorkflow('')
+      set({
+        h3StyleWorkflowCatalog: catalog,
+        h3StyleWorkflowCatalogLoading: false,
+        h3StyleWorkflow: selectionCurrent ? selected : '',
+        h3StyleWorkflowCatalogError: selectionCurrent
+          ? null
+          : 'Your saved H3 workflow is no longer in the server catalog and was cleared.',
+      })
+    } catch {
+      if (seq !== _h3StyleWorkflowCatalogSeq) return
+      _storeH3StyleWorkflow('')
+      set({
+        h3StyleWorkflowCatalog: null,
+        h3StyleWorkflowCatalogLoading: false,
+        h3StyleWorkflow: '',
+        h3StyleWorkflowCatalogError: 'The server H3 workflow catalog is unavailable. No workflow was selected.',
+      })
+    }
+  },
+
+  migrateLegacyH3StylePrompt: () => {
+    if (_legacyH3StylePrefixMigrationWasCompleted()) return
+    const current = get()
+    const prompt = stripLegacyH3StylePrefix(current.params.prompt)
+    const savedPromptPerMode = Object.fromEntries(
+      Object.entries(current.savedPromptPerMode).map(([mode, saved]) => [
+        mode,
+        typeof saved === 'string' ? stripLegacyH3StylePrefix(saved) : saved,
+      ]),
+    )
+    const changed = prompt !== current.params.prompt
+      || Object.entries(savedPromptPerMode).some(([mode, saved]) => (
+        current.savedPromptPerMode[mode] !== saved
+      ))
+    if (changed) {
+      set(state => ({
+        params: { ...state.params, prompt },
+        savedPromptPerMode,
+      }))
+      const migrated = get()
+      _saveSettings({
+        generationMode: migrated.generationMode,
+        selectedModelPerMode: migrated.selectedModelPerMode,
+        savedParamsPerMode: migrated.savedParamsPerMode,
+        savedLoraPerMode: migrated.savedLoraPerMode,
+        savedPromptPerMode: migrated.savedPromptPerMode,
+      }, migrated.loraIdByFilename)
+    }
+    _completeLegacyH3StylePrefixMigration()
+  },
 
   setGenerationMode: (mode) => {
     if (mode !== get().generationMode) {
@@ -3498,8 +3783,20 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   settingsOpen: false,
-  toggleSettings: () => set(s => ({ settingsOpen: !s.settingsOpen })),
-  setSettingsOpen: (open) => set({ settingsOpen: open }),
+  toggleSettings: () => get().setSettingsOpen(!get().settingsOpen),
+  setSettingsOpen: (open) => {
+    const refreshDirector = !open && get().directorModelVisibilityRefreshPending
+    set({
+      settingsOpen: open,
+      ...(refreshDirector ? { directorModelVisibilityRefreshPending: false } : {}),
+    })
+    if (refreshDirector) {
+      const explicitOutput = get().explicitOutput
+      void _modelVisibilitySaveTask.then(() => (
+        get().loadDirectorCapabilities({ explicitOutput, force: true })
+      )).catch(() => { /* the Director readiness card retains its retry action */ })
+    }
+  },
   sidebarOpen: false,
   toggleSidebar: () => set(s => ({ sidebarOpen: !s.sidebarOpen })),
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
@@ -4061,36 +4358,6 @@ export const useStore = create<AppState>((set, get) => ({
     })
     get().pollCivitAIDownloads()
   },
-  loadDirectorFromPipeline: async (pid) => {
-    try {
-      const pipeline = await api.fetchSavedPipeline(pid, get().activeWorkspace)
-      set({
-        sidebarMode: 'director' as const,
-        directorSceneDescription: pipeline.scene_description || '',
-        directorClipPlans: pipeline.clips.map(c => ({
-          video_prompt: c.video_prompt || '',
-          image_prompt: c.image_prompt || '',
-        })),
-        directorClipImages: pipeline.clips
-          .filter(c => c.start_image_filename)
-          .map((c, i) => ({
-            clipIndex: i,
-            prompt: c.image_prompt || '',
-            file: null as unknown as File,
-            filename: c.start_image_filename!,
-          })),
-        directorStep: 'review_video',
-        directorAutoMode: pipeline.auto_mode,
-        directorSeamless: pipeline.seamless,
-        directorShotImageGuidance: pipeline.shot_image_guidance || 'auto',
-        dashboardOpen: true,
-        dashboardSelectedPipeline: pipeline,
-      })
-    } catch (e) {
-      console.error('Failed to load Director pipeline:', e)
-    }
-  },
-
   loraBrowserOpen: false,
   loraBrowserArch: null,
   loraBrowserDefaultDir: null,
@@ -4288,6 +4555,12 @@ export const useStore = create<AppState>((set, get) => ({
     settingsOpen: true,
     settingsTab: 'performance',
     modelVisibilityFocus: mode,
+  }),
+  openDirectorModelVisibility: () => set({
+    settingsOpen: true,
+    settingsTab: 'performance',
+    modelVisibilityFocus: 'image',
+    directorModelVisibilityRefreshPending: true,
   }),
   clearModelVisibilityFocus: () => set({ modelVisibilityFocus: null }),
   loadModels: async () => {
@@ -4819,12 +5092,6 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // Director-mode post-processing (separate image/video)
-  directorImageSpatialUpsampling: '',
-  setDirectorImageSpatialUpsampling: (v) => set({ directorImageSpatialUpsampling: v }),
-  directorImageFilmGrainIntensity: 0,
-  setDirectorImageFilmGrainIntensity: (v) => set({ directorImageFilmGrainIntensity: v }),
-  directorImageFilmGrainSaturation: 0.5,
-  setDirectorImageFilmGrainSaturation: (v) => set({ directorImageFilmGrainSaturation: v }),
   directorVideoSpatialUpsampling: '',
   setDirectorVideoSpatialUpsampling: (v) => set({ directorVideoSpatialUpsampling: v }),
   directorVideoFilmGrainIntensity: 0,
@@ -5186,13 +5453,34 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   startGeneration: async () => {
-    const state = get()
+    let state = get()
     const submissionWorkspace = state.activeWorkspace
     // Model changes update params.model_type immediately and load capabilities
     // asynchronously. Never submit against the previous model's limits or
     // conditioning contract during that short hand-off window.
     if (state.modelOptionsLoading) {
       window.alert('Model settings are still loading. Please wait a moment before generating.')
+      return
+    }
+    if (state.h3StyleWorkflow
+      && !state.h3StyleWorkflowCatalog
+      && !state.h3StyleWorkflowCatalogLoading) {
+      await state.loadH3StyleWorkflowCatalog()
+      state = get()
+    }
+    if (state.h3StyleWorkflow && state.h3StyleWorkflowCatalogLoading) {
+      window.alert('The H3 workflow catalog is still loading. Please wait a moment before generating.')
+      return
+    }
+    if (state.h3StyleWorkflow && !state.h3StyleWorkflowCatalog) {
+      window.alert('The selected H3 workflow could not be verified against the server catalog and was not submitted.')
+      return
+    }
+    if (state.h3StyleWorkflow
+      && h3StyleWorkflowSupportsModel(state.h3StyleWorkflowCatalog, state.params.model_type)
+      && !h3StyleWorkflowSelectionIsCurrent(state.h3StyleWorkflowCatalog, state.h3StyleWorkflow)) {
+      state.setH3StyleWorkflow('')
+      window.alert('The selected H3 workflow is no longer in the server catalog. Choose another workflow before generating.')
       return
     }
     const h3StudioModel = H3_STUDIO_MODELS.has(state.params.model_type)
@@ -5752,6 +6040,15 @@ export const useStore = create<AppState>((set, get) => ({
       explicit_output: state.explicitOutput,
       h3_ref2va_terms_accepted: h3Ref2VATermsAccepted(),
     }
+    // The prompt remains browser-authored. Only the exact catalog ID crosses
+    // this boundary; the server resolves and compiles revision-bound guidance.
+    delete params.h3_style_workflow
+    const h3StyleWorkflow = resolveH3StyleWorkflowRequest(
+      state.h3StyleWorkflowCatalog,
+      state.params.model_type,
+      state.h3StyleWorkflow,
+    )
+    if (h3StyleWorkflow) params.h3_style_workflow = h3StyleWorkflow
 
     // STG (Spatio-Temporal Guidance) wiring. The backend only runs STG when
     // perturbation_switch === 2 (skip-self-attention) — stg_scale alone is
@@ -7442,8 +7739,17 @@ export const useStore = create<AppState>((set, get) => ({
   explicitOutput: false,
   setExplicitOutput: (enabled) => {
     ++_h3CompatibilitySeq
+    ++_directorCapabilitiesSeq.standard
+    ++_directorCapabilitiesSeq.explicit
+    delete _directorCapabilitiesInFlight.standard
+    delete _directorCapabilitiesInFlight.explicit
     set({
       explicitOutput: enabled,
+      directorCapabilities: null,
+      directorCapabilitiesExplicitOutput: null,
+      directorCapabilitiesLoading: false,
+      directorCapabilitiesLoadingExplicitOutput: null,
+      directorCapabilitiesError: null,
       // A deliberate Private-off after this remains honored. Only the
       // transition into explicit intent applies the safe default.
       ...(enabled ? { privateOutput: true } : {}),
@@ -7686,6 +7992,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Director (Music Video Director)
   sidebarMode: 'studio' as const,
+  referenceReturnMode: 'studio' as const,
   directorStep: 'upload',
   directorAudioFile: null,
   directorAudioPath: null,
@@ -7694,6 +8001,8 @@ export const useStore = create<AppState>((set, get) => ({
   directorEnergyBias: 0,
   directorClipPlans: [],
   directorSceneDescription: '',
+  directorVisualStyle: '',
+  directorCustomVisualStyle: '',
   directorLoading: false,
   directorLoadingMessage: null,
   directorError: null,
@@ -7769,6 +8078,20 @@ export const useStore = create<AppState>((set, get) => ({
   },
   directorResolution: '720p' as ResolutionPreset,
   directorAspectRatio: '16:9' as AspectRatio,
+  directorCapabilities: null,
+  directorCapabilitiesExplicitOutput: null,
+  directorCapabilitiesLoading: false,
+  directorCapabilitiesLoadingExplicitOutput: null,
+  directorCapabilitiesError: null,
+  directorModelVisibilityRefreshPending: false,
+  directorImageRolesConfigured: _initialDirectorImageRoles !== null,
+  directorLegacyImageModel: _initialLegacyDirectorImageModel,
+  directorImageCreatorModelOverride: _initialDirectorImageRoles?.creator_model_override || '',
+  directorImageEditorModelOverride: _initialDirectorImageRoles?.editor_model_override || '',
+  directorImageRoleLoras: {
+    creator: _initialDirectorImageRoles?.creator_loras || [],
+    editor: _initialDirectorImageRoles?.editor_loras || [],
+  },
   directorVideoInferenceStepsByModel: {},
   directorVideoMaxShotFramesByModel: {},
   shortFilmCharacters: [],
@@ -7816,18 +8139,88 @@ export const useStore = create<AppState>((set, get) => ({
     return { directorVideoMaxShotFramesByModel: next }
   }),
 
-  selectDirectorImageModel: (modelType) => {
+  loadDirectorCapabilities: async (options = {}) => {
+    const current = get()
+    const explicitOutput = options.explicitOutput ?? current.explicitOutput
+    const key = _directorCapabilitiesKey(explicitOutput)
+    if (!options.force
+      && current.directorCapabilities
+      && current.directorCapabilitiesExplicitOutput === explicitOutput) {
+      return current.directorCapabilities
+    }
+    if (!options.force && _directorCapabilitiesInFlight[key]) {
+      return _directorCapabilitiesInFlight[key].promise
+    }
+    const seq = ++_directorCapabilitiesSeq[key]
+    if (get().explicitOutput === explicitOutput) {
+      set({
+        directorCapabilitiesLoading: true,
+        directorCapabilitiesLoadingExplicitOutput: explicitOutput,
+        directorCapabilitiesError: null,
+      })
+    }
+    const request = api.fetchDirectorCapabilities(explicitOutput)
+    const token = Symbol('director-capabilities-request')
+    const promise = (async () => {
+      try {
+        const capabilities = await request
+        if (seq === _directorCapabilitiesSeq[key] && get().explicitOutput === explicitOutput) {
+          set({
+            directorCapabilities: capabilities,
+            directorCapabilitiesExplicitOutput: explicitOutput,
+            directorCapabilitiesLoading: false,
+            directorCapabilitiesLoadingExplicitOutput: null,
+            directorCapabilitiesError: null,
+          })
+        }
+        return capabilities
+      } catch (error) {
+        if (seq === _directorCapabilitiesSeq[key] && get().explicitOutput === explicitOutput) {
+          set({
+            directorCapabilities: null,
+            directorCapabilitiesExplicitOutput: null,
+            directorCapabilitiesLoading: false,
+            directorCapabilitiesLoadingExplicitOutput: null,
+            directorCapabilitiesError: error instanceof Error
+              ? error.message : 'Director image capabilities are unavailable.',
+          })
+        }
+        throw error
+      } finally {
+        if (_directorCapabilitiesInFlight[key]?.token === token) {
+          delete _directorCapabilitiesInFlight[key]
+        }
+      }
+    })()
+    _directorCapabilitiesInFlight[key] = { token, promise }
+    return promise
+  },
+
+  activateDirectorImageRoles: () => {
+    const current = get()
+    const persisted: PersistedDirectorImageRoles = {
+      schema_version: 1,
+      creator_model_override: current.directorImageCreatorModelOverride,
+      editor_model_override: current.directorImageEditorModelOverride,
+      creator_loras: current.directorImageRoleLoras.creator,
+      editor_loras: current.directorImageRoleLoras.editor,
+    }
+    _saveDirectorImageRoles(persisted)
+    set({ directorImageRolesConfigured: true, directorLegacyImageModel: '' })
+  },
+
+  setDirectorImageRoleModel: (role, modelType) => {
+    set(role === 'creator'
+      ? { directorImageCreatorModelOverride: modelType }
+      : { directorImageEditorModelOverride: modelType })
+    get().activateDirectorImageRoles()
+  },
+
+  setDirectorImageRoleLoras: (role, selections) => {
     set(s => ({
-      selectedModelPerMode: { ...s.selectedModelPerMode, image: modelType },
+      directorImageRoleLoras: { ...s.directorImageRoleLoras, [role]: selections },
     }))
-    const s = get()
-    _saveSettings({
-      generationMode: s.generationMode,
-      selectedModelPerMode: s.selectedModelPerMode,
-      savedParamsPerMode: s.savedParamsPerMode,
-      savedLoraPerMode: s.savedLoraPerMode,
-      savedPromptPerMode: s.savedPromptPerMode,
-    }, s.loraIdByFilename)
+    get().activateDirectorImageRoles()
   },
 
   selectDirectorVideoModel: async (modelType) => {
@@ -7882,17 +8275,35 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setSidebarMode: (mode) => {
+    const current = get()
+    const transition = resolveSidebarNavigation(current, mode)
     if (mode === 'director') {
-      const { sidebarMode, directorAudioFile } = get()
-      if (sidebarMode !== 'director') {
-        if (!directorAudioFile) {
-          set({ sidebarMode: 'director', directorStep: 'upload', directorError: null })
+      if (current.sidebarMode !== 'director') {
+        if (!current.directorAudioFile && !transition.preserveDirectorState) {
+          set({
+            sidebarMode: transition.sidebarMode,
+            referenceReturnMode: transition.referenceReturnMode,
+            directorStep: 'upload',
+            directorError: null,
+          })
         } else {
-          set({ sidebarMode: 'director' })
+          set({
+            sidebarMode: transition.sidebarMode,
+            referenceReturnMode: transition.referenceReturnMode,
+          })
         }
       }
+    } else if (mode === 'reference') {
+      if (current.sidebarMode === 'reference') return
+      set({
+        sidebarMode: transition.sidebarMode,
+        referenceReturnMode: transition.referenceReturnMode,
+      })
     } else {
-      set({ sidebarMode: 'studio' })
+      set({
+        sidebarMode: transition.sidebarMode,
+        referenceReturnMode: transition.referenceReturnMode,
+      })
     }
   },
 
@@ -8291,6 +8702,8 @@ export const useStore = create<AppState>((set, get) => ({
   }),
 
   directorSetSceneDescription: (prompt) => set({ directorSceneDescription: prompt }),
+  setDirectorVisualStyle: (style) => set({ directorVisualStyle: style }),
+  setDirectorCustomVisualStyle: (style) => set({ directorCustomVisualStyle: style }),
 
   // Helper: upload all Director reference images (main + characters + locations)
   _uploadDirectorRefs: async (lifecycle) => {
@@ -8341,6 +8754,7 @@ export const useStore = create<AppState>((set, get) => ({
     const requestExplicitOutput = get().explicitOutput
     set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
+      await _ensureSelectedH3StyleWorkflowReady(get)
       // Upload all reference images
       const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
@@ -8365,13 +8779,24 @@ export const useStore = create<AppState>((set, get) => ({
       let plans: Array<{ video_prompt: string; image_prompt: string }>
 
       if (useV2) {
+        const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
         // Director v2: structured planning → rendering → validation
         const result = await api.directorV2Plan({
           workspace: activeWorkspace,
           skill_type: 'music_video',
+          video_model: get().selectedModelPerMode.video,
+          ...imageRoleRequest.wire,
+          h3_style_workflow: resolveH3StyleWorkflowRequest(
+            get().h3StyleWorkflowCatalog,
+            get().selectedModelPerMode.video,
+            get().h3StyleWorkflow,
+          ),
           explicit_output: requestExplicitOutput,
           clips: directorPlannedClips,
           scene_description: directorSceneDescription,
+          visual_style: get().directorVisualStyle === 'custom'
+            ? get().directorCustomVisualStyle.trim() || undefined
+            : get().directorVisualStyle || undefined,
           lyrics: directorAnalysis?.lyrics ?? undefined,
           bpm: directorAnalysis?.bpm ?? 120,
           reference_image_path: refImagePath ?? undefined,
@@ -8389,6 +8814,9 @@ export const useStore = create<AppState>((set, get) => ({
           workspace: activeWorkspace,
           clips: directorPlannedClips,
           scene_description: directorSceneDescription,
+          visual_style: get().directorVisualStyle === 'custom'
+            ? get().directorCustomVisualStyle.trim() || undefined
+            : get().directorVisualStyle || undefined,
           explicit_output: requestExplicitOutput,
           lyrics: directorAnalysis?.lyrics ?? undefined,
           bpm: directorAnalysis?.bpm ?? 120,
@@ -8448,6 +8876,9 @@ export const useStore = create<AppState>((set, get) => ({
         workspace: activeWorkspace,
         clips: directorPlannedClips,
         scene_description: directorSceneDescription,
+        visual_style: get().directorVisualStyle === 'custom'
+          ? get().directorCustomVisualStyle.trim() || undefined
+          : get().directorVisualStyle || undefined,
         explicit_output: requestExplicitOutput,
         lyrics: directorAnalysis?.lyrics ?? undefined,
         bpm: directorAnalysis?.bpm ?? 120,
@@ -8495,72 +8926,45 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   directorGenerateStartImages: async () => {
-    const { directorClipPlans, directorPlannedClips, params, selectedModelPerMode, savedParamsPerMode, savedLoraPerMode, directorResolution, directorAspectRatio, directorSceneDescription } = get()
+    const initialState = get()
+    const {
+      directorClipPlans, directorPlannedClips, directorResolution,
+      directorAspectRatio, directorSceneDescription,
+    } = initialState
     if (!directorClipPlans.length) return
 
-    // Use saved image-mode settings if available, otherwise fall back to defaults
-    const imageModel = selectedModelPerMode.image || 'flux2_klein_9b'
-    const [imageDefaults, imageOptions] = await Promise.all([
-      api.fetchDefaults(imageModel).catch(() => ({})),
-      api.fetchModelOptions(imageModel).catch(() => null),
-    ])
-    const directorRes = resolveResolution(imageOptions, directorResolution, directorAspectRatio)
-    const savedImageParams = savedParamsPerMode.image || {}
-    const matchingImageParams = savedImageParams.model_type === imageModel ? savedImageParams : {}
-    const imageParams = {
-      ...imageDefaults,
-      ...matchingImageParams,
-      num_inference_steps: Number(
-        matchingImageParams.num_inference_steps
-        ?? (imageDefaults as Record<string, unknown>).num_inference_steps
-        ?? 4,
-      ),
-      guidance_scale: Number(
-        matchingImageParams.guidance_scale
-        ?? (imageDefaults as Record<string, unknown>).guidance_scale
-        ?? 1,
-      ),
-      resolution: directorRes,
-    }
-    const imageLora = savedLoraPerMode.image
-
-    const buildImgPostProc = (): Record<string, unknown> => {
-      const pp: Record<string, unknown> = {}
-      const imgSpatial = get().directorImageSpatialUpsampling
-      if (imgSpatial) pp.spatial_upsampling = imgSpatial
-      const imgGrainIntensity = get().directorImageFilmGrainIntensity
-      if (imgGrainIntensity > 0) {
-        pp.film_grain_intensity = imgGrainIntensity
-        pp.film_grain_saturation = get().directorImageFilmGrainSaturation
-      }
-      return pp
-    }
+    // Seal one request-local role snapshot for the entire preview sequence.
+    // The server selects Creator for reference-free anchors and Editor when
+    // authorized references are present, then derives role-specific defaults.
+    const requestWorkspace = initialState.activeWorkspace
+    const requestExplicitOutput = initialState.explicitOutput
+    const requestPrivateOutput = initialState.privateOutput
+    const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
+    const directorRes = resolveResolution(null, directorResolution, directorAspectRatio)
 
     // Submit one image generation through the shared queue-aware job tracker,
     // then download the terminal result as a File.
     const genImage = async (prompt: string, refs: string[], label: string): Promise<{ file: File; filename: string }> => {
+      const effectiveModel = refs.length > 0
+        ? imageRoleRequest.effective_editor_model
+        : imageRoleRequest.effective_creator_model
       const genParams = {
-        model_type: imageModel,
+        ...imageRoleRequest.wire,
         prompt,
         image_refs: refs,
         image_mode: 1,
-        num_inference_steps: imageParams.num_inference_steps,
-        guidance_scale: imageParams.guidance_scale,
         // 'KI' carries an image reference; plain T2I (the anchor) needs no ref flag.
         video_prompt_type: refs.length ? 'KI' : '',
-        resolution: imageParams.resolution,
+        resolution: directorRes,
         seed: -1,
         settings_version: 2.52,
         generation_mode: 'image',
-        workspace: get().activeWorkspace,
-        private_output: get().privateOutput,
-        explicit_output: get().explicitOutput,
+        workspace: requestWorkspace,
+        private_output: requestPrivateOutput,
+        explicit_output: requestExplicitOutput,
         repeat_generation: 1,
         negative_prompt: '',
         video_length: 1,
-        activated_loras: imageLora?.activated_loras || params.activated_loras || [],
-        loras_multipliers: imageLora?.loras_multipliers || params.loras_multipliers || '',
-        ...buildImgPostProc(),
       }
       const { job_id } = await api.submitGeneration(genParams)
       const directorJob: GenerationJob = {
@@ -8575,9 +8979,9 @@ export const useStore = create<AppState>((set, get) => ({
         error: null,
         oomInfo: null,
         promptPreview: prompt,
-        modelType: imageModel,
+        modelType: effectiveModel,
         generationMode: 'image',
-        workspace: get().activeWorkspace,
+        workspace: requestWorkspace,
       }
       set(s => ({
         jobs: s.jobs.some(job => job.id === job_id)
@@ -8873,6 +9277,8 @@ export const useStore = create<AppState>((set, get) => ({
       directorEnergyBias: 0,
       directorClipPlans: [],
       directorSceneDescription: '',
+      directorVisualStyle: '',
+      directorCustomVisualStyle: '',
       directorLoading: false,
       directorError: null,
       directorReferenceImage: null,
@@ -9045,6 +9451,7 @@ export const useStore = create<AppState>((set, get) => ({
     const requestExplicitOutput = get().explicitOutput
     set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
+      await _ensureSelectedH3StyleWorkflowReady(get)
       // Upload all reference images
       const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
@@ -9069,12 +9476,23 @@ export const useStore = create<AppState>((set, get) => ({
       let plans: Array<{ video_prompt: string; image_prompt: string }>
 
       if (useV2) {
+        const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
         const result = await api.directorV2Plan({
           workspace: activeWorkspace,
           skill_type: 'short_film',
+          video_model: get().selectedModelPerMode.video,
+          ...imageRoleRequest.wire,
+          h3_style_workflow: resolveH3StyleWorkflowRequest(
+            get().h3StyleWorkflowCatalog,
+            get().selectedModelPerMode.video,
+            get().h3StyleWorkflow,
+          ),
           explicit_output: requestExplicitOutput,
           clips: directorPlannedClips,
           scene_description: directorSceneDescription,
+          visual_style: get().directorVisualStyle === 'custom'
+            ? get().directorCustomVisualStyle.trim() || undefined
+            : get().directorVisualStyle || undefined,
           lyrics: directorAnalysis?.lyrics ?? undefined,
           reference_image_path: refImagePath ?? undefined,
           ...extraRefs,
@@ -9091,6 +9509,9 @@ export const useStore = create<AppState>((set, get) => ({
           workspace: activeWorkspace,
           clips: directorPlannedClips,
           scene_description: directorSceneDescription,
+          visual_style: get().directorVisualStyle === 'custom'
+            ? get().directorCustomVisualStyle.trim() || undefined
+            : get().directorVisualStyle || undefined,
           explicit_output: requestExplicitOutput,
           lyrics: directorAnalysis?.lyrics ?? undefined,
           reference_image_path: refImagePath,
@@ -9151,6 +9572,9 @@ export const useStore = create<AppState>((set, get) => ({
         workspace: activeWorkspace,
         clips: directorPlannedClips,
         scene_description: directorSceneDescription,
+        visual_style: get().directorVisualStyle === 'custom'
+          ? get().directorCustomVisualStyle.trim() || undefined
+          : get().directorVisualStyle || undefined,
         explicit_output: requestExplicitOutput,
         lyrics: directorAnalysis?.lyrics ?? undefined,
         reference_image_path: directorReferenceImagePath,
@@ -9193,6 +9617,7 @@ export const useStore = create<AppState>((set, get) => ({
     const requestExplicitOutput = get().explicitOutput
     set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
+      await _ensureSelectedH3StyleWorkflowReady(get)
       // Upload all reference images
       const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
@@ -9209,12 +9634,23 @@ export const useStore = create<AppState>((set, get) => ({
       let storyClips: PlannedClip[] | undefined
 
       if (useV2) {
+        const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
         const result = await api.directorV2Plan({
           workspace: activeWorkspace,
           skill_type: 'short_film',
+          video_model: get().selectedModelPerMode.video,
+          ...imageRoleRequest.wire,
+          h3_style_workflow: resolveH3StyleWorkflowRequest(
+            get().h3StyleWorkflowCatalog,
+            get().selectedModelPerMode.video,
+            get().h3StyleWorkflow,
+          ),
           explicit_output: requestExplicitOutput,
           scene_description: directorSceneDescription,
           story_description: directorSceneDescription,
+          visual_style: get().directorVisualStyle === 'custom'
+            ? get().directorCustomVisualStyle.trim() || undefined
+            : get().directorVisualStyle || undefined,
           characters: shortFilmCharacters.length > 0 ? shortFilmCharacters : undefined,
           reference_image_path: refImagePath ?? undefined,
           ...extraRefs,
@@ -9256,6 +9692,9 @@ export const useStore = create<AppState>((set, get) => ({
         const result = await api.planShortFilmScript({
           workspace: activeWorkspace,
           story_description: directorSceneDescription,
+          visual_style: get().directorVisualStyle === 'custom'
+            ? get().directorCustomVisualStyle.trim() || undefined
+            : get().directorVisualStyle || undefined,
           explicit_output: requestExplicitOutput,
           characters: shortFilmCharacters.length > 0 ? shortFilmCharacters : undefined,
           reference_image_path: refImagePath ?? undefined,
@@ -11087,31 +11526,34 @@ export const useStore = create<AppState>((set, get) => ({
             directorAutoMode, directorSeamless, directorResolution, directorAspectRatio,
             directorShotImageGuidance, directorVideoInferenceStepsByModel,
             directorVideoMaxShotFramesByModel,
-            selectedModelPerMode, savedParamsPerMode, savedLoraPerMode,
-            directorSpeakerMappings, directorImageSpatialUpsampling,
-            directorImageFilmGrainIntensity, directorImageFilmGrainSaturation,
-            directorVideoSpatialUpsampling, directorVideoFilmGrainIntensity,
+            savedParamsPerMode, savedLoraPerMode,
+            directorSpeakerMappings, directorVideoSpatialUpsampling, directorVideoFilmGrainIntensity,
             directorVideoFilmGrainSaturation, directorVideoSelfRefiner,
             shortFilmPath, shortFilmCharacters, shortFilmTargetDuration,
             shortFilmNarrative } = state
 
     const lifecycle = _beginDirectorPipelineLifecycle(requestWorkspace)
     try {
-    const selectedImageModel = selectedModelPerMode.image || 'flux2_klein_9b'
-    const selectedVideoModel = selectedModelPerMode.video || 'ltx2_22B_distilled_1_1'
-    const [imageModelDefaults, videoModelDefaults, imageModelOptions, videoModelOptions] = await Promise.all([
-      api.fetchDefaults(selectedImageModel).catch(() => ({})),
+    await _ensureSelectedH3StyleWorkflowReady(get)
+    const imageRoleRequest = await _captureDirectorImageRoleRequest(get, state.explicitOutput)
+    const selectedImageCreatorModel = imageRoleRequest.effective_creator_model
+    const workflowRequestState = get()
+    const h3WorkflowRequest = captureH3StyleWorkflowRequest(
+      workflowRequestState.h3StyleWorkflowCatalog,
+      workflowRequestState.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1',
+      workflowRequestState.h3StyleWorkflow,
+    )
+    const selectedVideoModel = h3WorkflowRequest.video_model
+    const [videoModelDefaults, imageCreatorModelOptions, videoModelOptions] = await Promise.all([
       api.fetchDefaults(selectedVideoModel).catch(() => ({})),
-      api.fetchModelOptions(selectedImageModel).catch(() => null),
+      api.fetchModelOptions(selectedImageCreatorModel).catch(() => null),
       api.fetchModelOptions(selectedVideoModel).catch(() => null),
     ])
     if (!lifecycle.ownsWorkspace()) return
-    const directorImageResolution = resolveResolution(imageModelOptions, directorResolution, directorAspectRatio)
+    const directorImageResolution = resolveResolution(imageCreatorModelOptions, directorResolution, directorAspectRatio)
     const directorVideoResolution = resolveResolution(videoModelOptions, directorResolution, directorAspectRatio)
     const fps = videoModelOptions?.fps ?? 16
-    const savedImageParams = savedParamsPerMode.image || {}
     const savedVideoParams = savedParamsPerMode.video || {}
-    const matchingImageParams = savedImageParams.model_type === selectedImageModel ? savedImageParams : {}
     const matchingVideoParams = savedVideoParams.model_type === selectedVideoModel ? savedVideoParams : {}
     const rawDefaultVideoSteps = (
       videoModelOptions?.default_num_inference_steps
@@ -11230,6 +11672,10 @@ export const useStore = create<AppState>((set, get) => ({
       private_output: state.privateOutput,
       explicit_output: state.explicitOutput,
       scene_description: directorSceneDescription,
+      visual_style: state.directorVisualStyle === 'custom'
+        ? state.directorCustomVisualStyle.trim() || undefined
+        : state.directorVisualStyle || undefined,
+      h3_style_workflow: h3WorkflowRequest.h3_style_workflow,
       audio_path: directorAudioPath,
       reference_image_path: refImagePath,
       character_ref_paths: charPaths.length > 0 ? charPaths : undefined,
@@ -11262,22 +11708,14 @@ export const useStore = create<AppState>((set, get) => ({
       target_duration: shortFilmTargetDuration,
       narrative_mode: shortFilmNarrative,
 
-      // Image gen settings
-      image_model: selectedImageModel,
-      // Default image steps = 4 to match the Director image_model
-      // fallback (flux2_klein_9b is step-distilled to 4). User overrides
-      // via Studio image-mode settings still win — they live in
-      // savedParamsPerMode.image and replace the fallback dict entirely.
+      // New Director image roles. Null is the exact automatic-creator
+      // sentinel; the server resolves and seals each role independently.
+      ...imageRoleRequest.wire,
+      // Only deliberate common overrides cross this boundary. Each role's
+      // model-specific steps/guidance come from authoritative server defaults.
       image_params: {
-        ...imageModelDefaults,
-        ...matchingImageParams,
         resolution: directorImageResolution,
       },
-      image_loras: savedLoraPerMode.image || {},
-      image_spatial_upsampling: directorImageSpatialUpsampling,
-      image_film_grain_intensity: directorImageFilmGrainIntensity,
-      image_film_grain_saturation: directorImageFilmGrainSaturation,
-
       // Video gen settings
       video_model: selectedVideoModel,
       video_params: directorVideoParams,
@@ -11302,6 +11740,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (!lifecycle.ownsWorkspace()) return
       const { pipeline_id } = await api.startPipeline(pipelineParams)
       if (!lifecycle.ownsWorkspace()) return
+      get().activateDirectorImageRoles()
       _stopDirectorPreparationPoll()
       _storeDirectorPreparation(null, null)
       set({

@@ -17,7 +17,13 @@ from ..schema import (
     AssetRef, SubjectRef, DialogueBeat, CameraPlan, AudioPlan,
     SpeakerMapEntry,
 )
-from ..policies import build_character_rules_block, build_camera_style_block
+from ..policies import (
+    build_character_rules_block,
+    build_camera_style_block,
+    build_visual_style_authority_block,
+    build_visual_style_provenance_block,
+    resolve_planned_visual_style,
+)
 from .base import BasePlanner
 
 
@@ -90,6 +96,10 @@ _MUSIC_SHOT_PROPERTIES = {
     "spatial_setup": {"type": "string"},
     "environment": {"type": "string"},
     "visual_style": {"type": "string"},
+    "visual_style_source": {
+        "type": "string",
+        "enum": ["authored_request", "planner_default"],
+    },
     "lighting": {"type": "string"},
     "mood": {"type": "string"},
     "action_beats": {"type": "array", "items": {"type": "string"}},
@@ -127,6 +137,7 @@ def _music_shot_schema(count: int, *, include_image_fields: bool) -> dict:
         "subjects_on_screen",
         "environment",
         "visual_style",
+        "visual_style_source",
         "lighting",
         "mood",
         "action_beats",
@@ -234,6 +245,12 @@ class MusicVideoPlanner(BasePlanner):
             characters: List of character dicts [{name, description}].
         """
         has_reference = bool(reference_image_path)
+        self._authored_visual_style = (
+            kwargs.get("visual_style") or kwargs.get("style") or ""
+        )
+        self._structured_visual_style_present = bool(
+            kwargs.get("h3_style_workflow_present")
+        )
         video_model = str(kwargs.get("video_model") or "")
         shot_image_policy = str(kwargs.get("shot_image_policy") or "")
         self._uses_generated_shot_images = shot_image_policy not in {
@@ -496,7 +513,15 @@ class MusicVideoPlanner(BasePlanner):
             char_profiles if char_profiles else None,
             preserve_names=preserve_names,
         )
-        camera_block = build_camera_style_block()
+        camera_block = build_camera_style_block(
+            structured_style_present=getattr(
+                self, "_structured_visual_style_present", False,
+            ),
+        )
+        style_block = build_visual_style_authority_block(
+            getattr(self, "_authored_visual_style", ""),
+        )
+        style_provenance_block = build_visual_style_provenance_block()
         # video_guide now merged into ltx2_music_video_rules.md — no separate load needed
 
         image_prompt_rules = ""
@@ -579,6 +604,10 @@ No visual reference was provided. Invent one consistent performer and setting th
 
 {camera_block}
 
+{style_block}
+
+{style_provenance_block}
+
 {reference_aesthetic_rules}
 
 MUSIC VIDEO RULES:
@@ -601,6 +630,7 @@ OUTPUT — respond with ONLY a JSON array:
     "subjects_on_screen": [{{"visual_description": "the woman in red", "position_or_relation": "center frame"}}],
     "environment": "Setting details",
     "visual_style": "Style",
+    "visual_style_source": "authored_request|planner_default",
     "lighting": "Lighting",
     "mood": "Tone",
     "action_beats": ["Action 1", "Action 2"],
@@ -752,7 +782,15 @@ Write {len(clips)} structured shot plans. Go:"""
                 subjects_on_screen=subjects,
                 spatial_setup=raw.get("spatial_setup", ""),
                 environment=raw.get("environment", ""),
-                visual_style=raw.get("visual_style", ""),
+                visual_style=resolve_planned_visual_style(
+                    getattr(self, "_authored_visual_style", ""),
+                    raw.get("visual_style", ""),
+                    has_visual_reference=has_reference,
+                    planned_style_source=raw.get("visual_style_source", ""),
+                    structured_style_present=getattr(
+                        self, "_structured_visual_style_present", False,
+                    ),
+                ),
                 lighting=raw.get("lighting", ""),
                 mood=raw.get("mood", strategy["energy"]),
                 action_beats=raw.get("action_beats", []),

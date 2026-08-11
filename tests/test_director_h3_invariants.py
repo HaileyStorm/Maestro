@@ -21,6 +21,10 @@ from services import llm_service  # noqa: E402
 from services.director.h3_dialogue import (  # noqa: E402
     validate_h3_context_ir_records,
 )
+from services.h3_upstream_skills import (  # noqa: E402
+    builtin_catalog,
+    resolve_h3_style_workflow,
+)
 
 
 class _H3Wgp:
@@ -128,6 +132,122 @@ non_diegetic_music: N/A"""
             "video_length": 480,
             "sliding_window_size": 480,
         }
+
+    @staticmethod
+    def _style_workflow() -> dict:
+        catalog = builtin_catalog()
+        return resolve_h3_style_workflow(
+            catalog["styles"][0]["id"], catalog,
+        )
+
+    def test_style_workflow_is_inside_canonical_base_and_sealed_for_recovery(self):
+        clips, planned = self._scene(20.0)
+        body = self._base_generation_params()
+        workflow = self._style_workflow()
+        params = {
+            "h3_ref2va_terms_accepted": True,
+            "h3_style_workflow": workflow,
+        }
+        plan = pipeline._prepare_director_h3_longform(
+            body,
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        self.assertEqual(plan["h3_style_workflow"], workflow)
+        self.assertEqual(plan["shot_plan"]["h3_style_workflow"], workflow)
+        self.assertEqual(body["h3_style_workflow"], workflow)
+        marker = f"H3 workflow guidance [{workflow['id']}]:"
+        for prompt in body["per_clip_prompts"]:
+            visual = prompt.split(
+                "integrated_multimodal_description:", 1,
+            )[1].split("overall_soundscape:", 1)[0]
+            self.assertIn(marker, visual)
+            self.assertEqual(
+                validate_h3_context_ir_records(
+                    prompt, mode="t2va", duration_seconds=20,
+                ),
+                [],
+            )
+
+        restored_body = self._base_generation_params()
+        restored_params = {
+            "h3_ref2va_terms_accepted": True,
+            "h3_style_workflow": copy.deepcopy(workflow),
+            "_h3_longform": copy.deepcopy(plan),
+        }
+        restored = pipeline._prepare_director_h3_longform(
+            restored_body,
+            params=restored_params,
+            clip_plans=[],
+            planned_clips=[],
+            fps=24,
+        )
+        self.assertEqual(restored_body["per_clip_prompts"], body["per_clip_prompts"])
+        self.assertEqual(restored_body["h3_style_workflow"], workflow)
+
+        drifted = copy.deepcopy(plan)
+        drifted["h3_style_workflow"]["brief_commitment"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "drifted"):
+            pipeline._prepare_director_h3_longform(
+                self._base_generation_params(),
+                params={
+                    "h3_ref2va_terms_accepted": True,
+                    "h3_style_workflow": workflow,
+                    "_h3_longform": drifted,
+                },
+                clip_plans=[],
+                planned_clips=[],
+                fps=24,
+            )
+
+    def test_style_workflow_is_inside_ref2va_detailed_description(self):
+        clips, planned = self._ref_scene(20.0)
+        body = self._base_generation_params()
+        body.pop("image_start")
+        body["image_prompt_type"] = ""
+        workflow = self._style_workflow()
+        plan = pipeline._prepare_director_h3_longform(
+            body,
+            params={
+                "h3_ref2va_terms_accepted": True,
+                "h3_style_workflow": workflow,
+            },
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        self.assertIsNotNone(plan)
+        marker = f"H3 workflow guidance [{workflow['id']}]:"
+        for prompt in body["per_clip_prompts"]:
+            visual = prompt.split("detailed_description:", 1)[1].split(
+                "overall_soundscape:", 1,
+            )[0]
+            self.assertIn(marker, visual)
+            self.assertEqual(
+                validate_h3_context_ir_records(
+                    prompt, mode="ref2va", duration_seconds=20,
+                ),
+                [],
+            )
+
+    def test_style_workflow_is_validated_as_director_planning_style_presence(self):
+        workflow = self._style_workflow()
+        for visual_style in ("", "hand-painted gouache"):
+            with self.subTest(visual_style=visual_style):
+                self.assertTrue(
+                    pipeline._director_h3_style_workflow_present({
+                        "video_model": pipeline._H3_BASE_FL2VA_MODEL,
+                        "visual_style": visual_style,
+                        "h3_style_workflow": copy.deepcopy(workflow),
+                    })
+                )
+        with self.assertRaisesRegex(ValueError, "non-H3"):
+            pipeline._director_h3_style_workflow_present({
+                "video_model": "other",
+                "h3_style_workflow": workflow,
+            })
 
     def test_long_director_scenes_are_split_on_the_h3_grid(self):
         for duration, minimum_segments in ((20.0, 2), (32.0, 3)):

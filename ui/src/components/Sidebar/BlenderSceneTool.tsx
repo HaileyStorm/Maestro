@@ -310,13 +310,13 @@ export function BlenderSceneTool({
   return (
     <div className={`space-y-3 ${compact ? 'mt-2 rounded-lg border border-border bg-bg-tertiary/40 p-2' : ''}`}>
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-text-muted"><Box size={12} /> Structured Blender scene</div>
+        <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-text-muted"><Box size={12} /> Blender Motion Video</div>
         <span className={`text-[9px] ${ready ? 'text-accent-green' : 'text-amber-400'}`}>{installed == null ? 'checking' : ready ? 'ready' : installed ? 'not connected' : 'setup needed'}</span>
       </div>
-      <p className="text-[9px] leading-relaxed text-text-muted">Blender runs on the Maestro host. Previews stay in the selected project and follow its access permissions; only approved scene operations are available.</p>
+      <p className="text-[9px] leading-relaxed text-text-muted">Build a structured scene, preview its motion and camera work, then Keep the full video as a project candidate. Blender runs on the Maestro host; previews stay in the selected project and follow its access permissions.</p>
       <p className="rounded border border-border/70 bg-bg-secondary/40 px-2 py-1 text-[8px] leading-relaxed text-text-muted">
         Blender uses a separate reference contract: <span className="text-text-secondary">{resolvedReferenceName}</span> · {privateOutput ? 'private output' : 'project-visible output'}.
-        {referenceDescription?.trim() ? ' The Reference Studio description remains on the authored pack; Blender uses its own scene metadata.' : ' Reference Studio description is kept on the authored pack.'}
+        {referenceDescription?.trim() ? ' The Reference description remains on the authored pack; Blender uses its own scene metadata.' : ' The Reference description is kept on the authored pack.'}
       </p>
       {readiness && (
         <div className="grid grid-cols-3 gap-1 text-center text-[8px] uppercase tracking-wide text-text-muted">
@@ -391,7 +391,7 @@ export function BlenderSceneTool({
           <p className="text-[10px] text-accent-green">Director approved after {directorFinal.director_reviews.length} batched review pass{directorFinal.director_reviews.length === 1 ? '' : 'es'} · {directorFinal.director_model}</p>
           <video src={directorFinal.video.url} controls className="aspect-video w-full rounded bg-media-canvas object-contain" />
           <div className="flex gap-1.5">
-            <button disabled={!!busy} onClick={() => void setFinalStatus('kept')} className="flex flex-1 items-center justify-center gap-1 rounded bg-accent-green/20 px-2 py-1.5 text-[10px] text-accent-green"><Check size={10} />Approve reference</button>
+            <button disabled={!!busy} onClick={() => void setFinalStatus('kept')} className="flex flex-1 items-center justify-center gap-1 rounded bg-accent-green/20 px-2 py-1.5 text-[10px] text-accent-green"><Check size={10} />Keep motion video</button>
             <button disabled={!!busy} onClick={() => void setFinalStatus('rejected')} className="flex items-center justify-center gap-1 rounded border border-border px-2 py-1.5 text-[10px] text-text-muted"><X size={10} />Reject</button>
           </div>
           <textarea value={editPrompt} onChange={event => setEditPrompt(event.target.value)} rows={2} placeholder="Describe the edits Director should make, then it will re-review batched frames and render a new full video…" className="w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />

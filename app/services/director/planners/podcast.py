@@ -15,7 +15,11 @@ from ..schema import (
     AssetRef, SubjectRef, DialogueBeat, CameraPlan, AudioPlan,
     SpeakerMapEntry,
 )
-from ..policies import build_character_rules_block, build_camera_style_block
+from ..policies import (
+    build_character_rules_block,
+    build_camera_style_block,
+    resolve_visual_style,
+)
 from .base import BasePlanner
 
 
@@ -29,7 +33,7 @@ class PodcastPlanner(BasePlanner):
         reference_image_path: Optional[str] = None,
         speaker_mappings: Optional[dict] = None,
         characters: Optional[list[dict]] = None,
-        visual_style: str = "clean, professional studio lighting",
+        visual_style: Optional[str] = None,
         target_duration: Optional[float] = None,
         clips: Optional[list[dict]] = None,
         **kwargs,
@@ -47,6 +51,14 @@ class PodcastPlanner(BasePlanner):
             clips: Pre-segmented clips (if available from audio analysis).
         """
         has_reference = bool(reference_image_path)
+        structured_style_present = bool(
+            kwargs.get("h3_style_workflow_present")
+        )
+        visual_style = resolve_visual_style(
+            visual_style,
+            has_visual_reference=has_reference,
+            structured_style_present=structured_style_present,
+        )
 
         # Normalize speaker_mappings: frontend sends list, we need dict
         if isinstance(speaker_mappings, list):
@@ -101,6 +113,7 @@ class PodcastPlanner(BasePlanner):
                 has_reference=has_reference,
                 reference_image_path=reference_image_path,
                 visual_style=visual_style,
+                structured_style_present=structured_style_present,
             )
         else:
             shots = self._plan_from_transcript(
@@ -111,6 +124,7 @@ class PodcastPlanner(BasePlanner):
                 reference_image_path=reference_image_path,
                 visual_style=visual_style,
                 target_duration=target_duration,
+                structured_style_present=structured_style_present,
             )
 
         total_dur = sum(s.duration_sec for s in shots) if shots else target_duration
@@ -140,6 +154,7 @@ class PodcastPlanner(BasePlanner):
         has_reference: bool,
         reference_image_path: Optional[str],
         visual_style: str,
+        structured_style_present: bool = False,
     ) -> list[ShotPlan]:
         """Plan shots from pre-segmented clips (similar to audio-driven short film)."""
         speaker_names = {sid: info.get("name", sid) for sid, info in (speaker_mappings or {}).items()}
@@ -174,7 +189,9 @@ class PodcastPlanner(BasePlanner):
             clip_contexts.append(ctx)
 
         char_rules = build_character_rules_block(has_reference, char_profiles if char_profiles else None)
-        camera_block = build_camera_style_block()
+        camera_block = build_camera_style_block(
+            structured_style_present=structured_style_present,
+        )
 
         system_prompt = f"""You are a podcast visual director creating a structured shot plan.
 
@@ -272,7 +289,9 @@ Write {len(clips)} structured shot plans. Go:"""
                 subjects_on_screen=subjects,
                 spatial_setup=raw.get("spatial_setup", ""),
                 environment=raw.get("environment", "podcast studio"),
-                visual_style=raw.get("visual_style", visual_style),
+                # Keep the request/reference style authoritative even when a
+                # planner response proposes a different aesthetic.
+                visual_style=visual_style,
                 lighting=raw.get("lighting", "studio lighting"),
                 mood=raw.get("mood", "conversational"),
                 action_beats=raw.get("action_beats", []),
@@ -294,6 +313,7 @@ Write {len(clips)} structured shot plans. Go:"""
         reference_image_path: Optional[str],
         visual_style: str,
         target_duration: Optional[float],
+        structured_style_present: bool = False,
     ) -> list[ShotPlan]:
         """Segment transcript into clips and plan — stub for auto-segmentation."""
         # For now, create one shot per ~15s chunk of transcript
@@ -319,4 +339,5 @@ Write {len(clips)} structured shot plans. Go:"""
             has_reference=has_reference,
             reference_image_path=reference_image_path,
             visual_style=visual_style,
+            structured_style_present=structured_style_present,
         )

@@ -322,8 +322,12 @@ class RecipeUiSourceHarnessTests(unittest.TestCase):
 
         self.assertIn("setSidebarMode('director')", sidebar)
         self.assertIn("setSidebarMode('studio')", sidebar)
+        self.assertIn("setSidebarMode('reference')", sidebar)
+        self.assertIn("aria-pressed={sidebarMode === 'studio'}", sidebar)
         self.assertIn("aria-pressed={isDirector}", sidebar)
-        self.assertIn("aria-pressed={!isDirector}", sidebar)
+        self.assertIn("aria-pressed={isReference}", sidebar)
+        self.assertIn('aria-label="Generate, Director, and Reference menu"', sidebar)
+        self.assertIn("<ProjectReferenceLibrary active={isReference} />", sidebar)
         self.assertIn('h-[100dvh]', sidebar)
         self.assertIn('role="dialog"', sidebar)
         self.assertIn("event.key === 'Escape'", sidebar)
