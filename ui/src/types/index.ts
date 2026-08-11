@@ -250,7 +250,32 @@ export interface ProjectReferenceLoraParameterSummary {
   expansion_digest: string
 }
 
-export interface ProjectReferencePlannedDetailCallout {
+export type ProjectReferenceCharacterGender = 'woman' | 'man' | 'non_binary' | 'unspecified'
+export type ProjectReferenceCharacterAnatomy = 'breasts' | 'vulva' | 'penis'
+
+/** Owner-authored Character facts. Server-only sealing state is never exposed here. */
+export interface ProjectReferenceCharacterProfileInput {
+  gender: ProjectReferenceCharacterGender
+  age?: number | null
+  explicit_anatomy: ProjectReferenceCharacterAnatomy[]
+}
+
+export interface ProjectReferencePublicCharacterProfile {
+  schema_version: 1
+  gender: { present: boolean; commitment: string | null }
+  age: { present: boolean; commitment: string | null }
+  explicit_anatomy: { count: number; commitments: string[] }
+}
+
+export interface ProjectReferencePublicManagedCharacterCallouts {
+  schema_version: 1
+  active_count: number
+  tombstone_count: number
+  rename_count: number
+  commitments: string[]
+}
+
+export interface ProjectReferenceAuthoredDetailCalloutSummary {
   custom_id: string
   kind: ProjectReferenceDetailKind
   requested_operation: ProjectReferenceDetailOperation
@@ -258,6 +283,15 @@ export interface ProjectReferencePlannedDetailCallout {
   target_role: string
   label_digest: string
 }
+
+export interface ProjectReferenceManagedDetailCalloutSummary {
+  managed: true
+  requested_operation: ProjectReferenceDetailOperation
+}
+
+export type ProjectReferencePlannedDetailCallout =
+  | ProjectReferenceAuthoredDetailCalloutSummary
+  | ProjectReferenceManagedDetailCalloutSummary
 
 export interface ProjectReferenceResolvedModel {
   requested_model: string
@@ -337,6 +371,7 @@ export interface ProjectReferencePackPlan {
   user_loras?: { count: number; preserved: boolean }
   additional_loras?: ProjectReferenceAdditionalLoraSummary
   explicit_output?: boolean
+  explicit_convenience?: boolean
   content_capability?: 'standard' | 'unrestricted_local'
   initial_blur?: boolean
   intelligence_policy?: 'standard_auto' | 'uncensored_auto'
@@ -352,9 +387,27 @@ export interface ProjectReferencePackPlan {
       items: Array<Pick<ProjectReferenceTypeFieldItem, 'id' | 'custom' | 'group'>>
     }>
     detail_callouts: ProjectReferencePlannedDetailCallout[]
+    character_profile?: ProjectReferencePublicCharacterProfile
+    managed_character_callouts?: ProjectReferencePublicManagedCharacterCallouts
   }
   planning?: ProjectReferenceResolvedModel
-  review?: ProjectReferenceResolvedModel & { status?: string }
+  review?: ProjectReferenceResolvedModel & {
+    status?: string
+    final_correction?: {
+      assessment_version: string
+      rubric_version: string
+      reference_type: ProjectReferenceAssetType
+      template_id: 'reference-residual-correction'
+      template_version: string
+      severity: 'minor_residual' | 'material_residual'
+      affected_roles: string[]
+      reason_codes: string[]
+      failed_item_ids: string[]
+      score_basis_points: number
+      rendered_brief: string
+      commitment: string | null
+    }
+  }
   managed_layout_assist: ProjectReferenceManagedLayoutAssist
   plan_seal: string
 }
@@ -606,6 +659,151 @@ export interface OomInfo {
   actions?: string[]
 }
 
+export type LogicalJobKind = 'reference_pack_parent' | 'reference_pack_child'
+
+export type AccountRole = 'owner' | 'user'
+
+export interface AccountSummary {
+  id: string
+  username: string
+  role: AccountRole
+  disabled: boolean
+  created_at: number
+  has_email: boolean
+  passkey_credentials: number
+  passkey_authentication_available: boolean
+}
+
+export interface AccountContext {
+  enabled: boolean
+  authenticated: boolean
+  account: AccountSummary | null
+  capabilities: string[]
+  reauthenticated: boolean
+  passkey_authentication_available: boolean
+  /** Present only on the dedicated account-context response. */
+  bootstrap_available?: boolean
+}
+
+export interface AccountSession {
+  id: string
+  device_label: string
+  remote_created: boolean
+  created_at: number
+  last_seen_at: number
+  expires_at: number
+  current: boolean
+}
+
+export type AccountNoncePurpose =
+  | 'bootstrap'
+  | 'login'
+  | 'reauth'
+  | 'recover'
+  | 'change_password'
+  | 'rotate_recovery_codes'
+  | 'create_account'
+  | 'disable_account'
+  | 'revoke_session'
+  | 'revoke_all_sessions'
+
+export interface AccountAuthResult {
+  account: AccountSummary
+  recovery_codes?: string[]
+}
+
+export type SupportProviderState = 'disabled' | 'unconfigured' | 'available'
+
+export interface SupportProvider {
+  provider_id: string
+  display_name: string
+  funding_modes: string[]
+  description: string
+  enabled: boolean
+  configured: boolean
+  state: SupportProviderState
+  support_url: string | null
+}
+
+export interface SupportPriorityExclusion {
+  capability_id: string
+  support_priority_eligible: boolean
+  marker: string
+  creator_term?: string
+}
+
+export interface SupportPriorityPolicy {
+  scheduler_enforcement_enabled: boolean
+  effective_priority_boost: boolean
+  state: string
+  exclusions: SupportPriorityExclusion[]
+  notice: string
+}
+
+export interface SupportPublicProjection {
+  schema_version: number
+  provider_catalog: {
+    schema_version: number
+    provider_neutral: boolean
+    providers: SupportProvider[]
+  }
+  benefit_availability: {
+    scheduler_enforcement_enabled: boolean
+    effective_benefits: string[]
+    state: string
+  }
+  support_priority: SupportPriorityPolicy
+}
+
+export interface ResponsibleUseNotice {
+  document_id: string
+  version: number
+  content_sha256: string
+  digest_algorithm: 'sha256'
+  title: string
+  paragraphs: string[]
+}
+
+export interface ResponsibleUseStatus {
+  document_id: string
+  document_version: number
+  content_sha256: string
+  accepted: boolean
+  accepted_at: string | null
+  state: string
+}
+
+export interface ResponsibleUseProjection {
+  notice: ResponsibleUseNotice
+  status: ResponsibleUseStatus
+}
+
+/** Deliberately excludes raw contribution totals, subjects, and audit events. */
+export interface SupportAccountSummary {
+  event_count: number
+  one_time_tier: string | null
+  recurring_tier: string | null
+  active_recurring_count: number
+  benefits: {
+    state: string
+    scheduler_enforcement_enabled: boolean
+    effective_benefits: string[]
+    recorded_eligibility: string[]
+  }
+}
+
+export interface SupportSelfProjection {
+  public: SupportPublicProjection
+  account: SupportAccountSummary
+  responsible_use: ResponsibleUseProjection
+}
+
+export interface SupportAdminProjection {
+  account: SupportAccountSummary
+  responsible_use: ResponsibleUseStatus
+  support_priority: SupportPriorityPolicy
+}
+
 export interface GenerationJob {
   id: string
   /** Server creation time in epoch seconds when known. */
@@ -648,6 +846,8 @@ export interface GenerationJob {
   resourceDescriptor?: import('../api/client').ResourceDescriptor | null
   /** Owner-scoped live relation for an internal child generation. */
   parentJobId?: string | null
+  /** Exact server-authored logical queue role; absent for legacy and non-Reference jobs. */
+  logicalJobKind?: LogicalJobKind
   h3SegmentPlan?: H3SegmentPlan | null
   planReviewRequired?: boolean
   planReviewTermsRequired?: boolean

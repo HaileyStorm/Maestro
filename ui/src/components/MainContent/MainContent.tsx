@@ -16,6 +16,8 @@ import {
 } from '../../lib/privatePreview'
 import { boundedBackoffDelay, POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
 import { copyTextToClipboard } from '../../lib/clipboard'
+import { subscribeQueueView } from '../../lib/mainViewNavigation'
+import { isActiveLogicalQueueJob, projectLogicalQueue } from '../../lib/queueProjection'
 
 const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
@@ -916,6 +918,7 @@ function stripTimeSuffix(msg: string): string {
 
 function JobPlaceholder({
   job,
+  referenceQuality = null,
   onStop,
   onDismiss,
   onToggleLog,
@@ -926,6 +929,7 @@ function JobPlaceholder({
   logError = null,
 }: {
   job: GenerationJob
+  referenceQuality?: api.ProjectReferenceJobQualitySummary | null
   onStop: () => void
   onDismiss: () => void
   onToggleLog?: () => void
@@ -1060,7 +1064,9 @@ function JobPlaceholder({
                     : recoveryState === 'interrupted' || job.recoveryInterrupted
                       ? 'Generation Interrupted — Recovery Preserved'
                       : recoveryState === 'retrying'
-                        ? 'Recovery Queued'
+                      ? 'Recovery Queued'
+                        : job.status === 'completed'
+                          ? job.logicalJobKind === 'reference_pack_parent' ? 'Reference packs ready' : 'Generation complete'
                         : job.status === 'preparing'
                           ? job.phase === 'planning_generation' ? 'Planning generation' : 'Enhancing prompt'
                           : job.status === 'waiting_for_plan_approval'
@@ -1070,6 +1076,20 @@ function JobPlaceholder({
             {api.isBackendJobId(job.id) && (
               <div className="mt-1.5 flex justify-center">
                 <CopyableJobId jobId={job.id} />
+              </div>
+            )}
+            {referenceQuality && (
+              <div className={`mx-auto mt-1.5 max-w-sm rounded border px-2 py-1 text-[9px] leading-relaxed ${referenceQuality.presentation.tone === 'pass' ? 'border-accent-green/30 bg-accent-green/10 text-accent-green' : referenceQuality.presentation.tone === 'residual' ? 'border-amber-400/30 bg-amber-400/10 text-amber-200' : 'border-border bg-bg-secondary/70 text-text-muted'}`} data-reference-fidelity={referenceQuality.presentation.tone}>
+                <p className="font-medium">
+                  Recommended · {referenceQuality.presentation.stateLabel}
+                  {referenceQuality.presentation.gradeLabel ? ` · ${referenceQuality.presentation.gradeLabel}` : ''}
+                  {referenceQuality.presentation.scoreLabel ? ` · ${referenceQuality.presentation.scoreLabel}` : ''}
+                </p>
+                {referenceQuality.presentation.preliminary && <p>Preliminary recommendation · ungraded</p>}
+                {referenceQuality.presentation.residualSummary && <p>{referenceQuality.presentation.residualSummary}</p>}
+                {referenceQuality.presentation.correctionAvailable && <p>Structured correction guidance is available.</p>}
+                {referenceQuality.presentation.notice && <p>{referenceQuality.presentation.notice}</p>}
+                {referenceQuality.candidateCount > 1 && <p>{referenceQuality.candidateCount} candidates remain available in Reference.</p>}
               </div>
             )}
             {!isFailed && (queueWaitLabel || phase) && (
@@ -1114,7 +1134,7 @@ function JobPlaceholder({
                 </p>
               </>
             )}
-            {!isFailed && !recoveryBlocked && (
+            {!isFailed && !recoveryBlocked && job.status !== 'completed' && (
               <p className="mt-1 text-[10px] text-text-secondary">
                 {queuedH3Runtime != null
                   ? job.h3SegmentPlan?.segments.length
@@ -1366,6 +1386,7 @@ function queueSummaryLabel(summary: api.QueueState['summary']): string {
 
 function queuePositionLabel(position: number | null, waiting: number): string {
   if (position == null) return 'Registering with the scheduler'
+  if (waiting < 1 || position > waiting) return 'Waiting in queue'
   if (position === 1) return waiting > 1 ? `Next in line · 1 of ${waiting}` : 'Next in line'
   const ahead = position - 1
   return `${ahead} ${ahead === 1 ? 'job' : 'jobs'} ahead · ${position} of ${waiting}`
@@ -1397,50 +1418,48 @@ function QueuePanel({
   const [logEvents, setLogEvents] = useState<api.JobLogEvent[]>([])
   const [logError, setLogError] = useState<string | null>(null)
 
-  const queueInfo = useMemo(
-    () => new Map((queue?.jobs || []).map(item => [item.job_id, item])),
-    [queue],
+  const projection = useMemo(
+    () => projectLogicalQueue(jobs, queue?.jobs),
+    [jobs, queue?.jobs],
   )
-  const projectedChildByParent = useMemo(() => {
-    const jobsById = new Map(jobs.map(job => [job.id, job]))
-    const projected = new Map<string, GenerationJob>()
-    const liveStatuses = new Set<GenerationJob['status']>([
-      'preparing', 'waiting_for_plan_approval', 'queued', 'running',
-    ])
-    for (const child of jobs) {
-      if (!child.parentJobId || child.parentJobId === child.id) continue
-      const parent = jobsById.get(child.parentJobId)
-      const childInfo = queueInfo.get(child.id)
-      const descriptor = childInfo?.resource_descriptor ?? child.resourceDescriptor
-      if (!parent || !childInfo || !liveStatuses.has(parent.status) || !liveStatuses.has(child.status)) continue
-      if (childInfo.held || childInfo.hold_after_output || descriptor?.state === 'blocked') continue
-      const recoveryStates = [child.recoveryState, childInfo.recovery_state]
-      if (child.recoveryBlocked || child.recoveryActionable || child.recoveryInterrupted
-        || childInfo.recovery_blocked || childInfo.recovery_actionable || childInfo.recovery_interrupted
-        || recoveryStates.some(state => state === 'interrupted' || state?.startsWith('blocked'))
-        || (child.recoveryActions?.length ?? 0) > 0
-        || (childInfo.recovery_actions?.length ?? 0) > 0) continue
-      projected.set(parent.id, child)
-    }
-    return projected
-  }, [jobs, queueInfo])
-  const visibleJobs = useMemo(() => {
-    const projectedChildIds = new Set(
-      [...projectedChildByParent.values()].map(child => child.id),
-    )
-    const correlatedFailedChildIds = new Set<string>()
-    const jobsById = new Map(jobs.map(job => [job.id, job]))
-    for (const parent of jobs) {
-      if (parent.status !== 'failed' || !parent.failedChildJobId) continue
-      const child = jobsById.get(parent.failedChildJobId)
-      if (!child || child.parentJobId !== parent.id) continue
-      if (child.status !== 'failed' && child.status !== 'cancelled') continue
-      if (child.recoveryActionable || child.recoveryBlocked || child.recoveryInterrupted
-        || (child.recoveryActions?.length ?? 0) > 0) continue
-      correlatedFailedChildIds.add(child.id)
-    }
-    return jobs.filter(job => !projectedChildIds.has(job.id) && !correlatedFailedChildIds.has(job.id))
-  }, [jobs, projectedChildByParent])
+  const { visibleJobs } = projection
+  const referenceQualityTargetKey = JSON.stringify(visibleJobs.flatMap(job => (
+    job.logicalJobKind === 'reference_pack_parent'
+      && job.status === 'completed'
+      && job.workspace
+      ? [{ jobId: job.id, project: job.workspace }]
+      : []
+  )).sort((left, right) => left.jobId.localeCompare(right.jobId)))
+  const [referenceQualityByJobId, setReferenceQualityByJobId] = useState<
+    Record<string, api.ProjectReferenceJobQualitySummary>
+  >({})
+
+  useEffect(() => {
+    const targets = JSON.parse(referenceQualityTargetKey) as Array<{ jobId: string; project: string }>
+    if (targets.length === 0) return
+    let current = true
+    const projects = [...new Set(targets.map(target => target.project))]
+    void Promise.all(projects.map(async project => {
+      try {
+        return [project, await api.fetchProjectAssets(project)] as const
+      } catch {
+        return [project, [] as api.ProjectAsset[]] as const
+      }
+    })).then(results => {
+      if (!current) return
+      const assetsByProject = new Map(results)
+      const next: Record<string, api.ProjectReferenceJobQualitySummary> = {}
+      for (const target of targets) {
+        const summary = api.projectReferenceJobQualitySummary(
+          assetsByProject.get(target.project) ?? [],
+          target.jobId,
+        )
+        if (summary) next[target.jobId] = summary
+      }
+      setReferenceQualityByJobId(next)
+    })
+    return () => { current = false }
+  }, [referenceQualityTargetKey])
 
   const act = async (action: () => Promise<unknown>) => {
     try {
@@ -1506,8 +1525,8 @@ function QueuePanel({
             <p className="text-[10px] text-text-muted">
               {queue?.paused ? 'Paused — queued jobs will not start.' : queue?.pause_after_current ? 'Will pause after the current output.' : 'Running in priority order.'}
             </p>
-            {queue?.summary && (
-              <p className="mt-0.5 text-[10px] text-text-secondary">{queueSummaryLabel(queue.summary)}</p>
+            {queue && (
+              <p className="mt-0.5 text-[10px] text-text-secondary">{queueSummaryLabel(projection.summary)}</p>
             )}
             <details className="group mt-1.5 max-w-2xl text-[10px] text-text-muted">
               <summary className="cursor-pointer text-text-secondary hover:text-text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent-blue">
@@ -1537,16 +1556,14 @@ function QueuePanel({
         <PipelinePlaceholder />
         {visibleJobs.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-text-muted">
-            {queue?.summary.active_total
-              ? `No jobs from this session. ${queue.summary.active_total} active globally.`
-              : 'No queued, running, or failed generations.'}
+            No queued, running, or failed generations.
           </div>
         ) : visibleJobs.map((job, index) => {
-          const projectedChild = projectedChildByParent.get(job.id)
-          const effectiveJob = projectedChild ?? job
-          const schedulerJobId = effectiveJob.id
-          const info = queueInfo.get(schedulerJobId)
-          const effectiveResourceDescriptor = projectedChild
+          const target = projection.schedulerTargetByPublicJobId.get(job.id)
+          const effectiveJob = target?.schedulerJob ?? job
+          const schedulerJobId = target?.schedulerJobId ?? job.id
+          const info = target?.queueJob
+          const effectiveResourceDescriptor = schedulerJobId !== job.id
             ? info?.resource_descriptor ?? effectiveJob.resourceDescriptor
             : effectiveJob.resourceDescriptor ?? info?.resource_descriptor
           const queueRowLabel = info?.status === 'running'
@@ -1557,7 +1574,7 @@ function QueuePanel({
                 ? 'Awaiting plan review'
             : info?.held
               ? 'Held'
-              : queuePositionLabel(info?.position ?? null, queue?.summary.waiting ?? 0)
+              : queuePositionLabel(info?.position ?? null, projection.summary.waiting)
           const waitDetail = info?.wait_reason === 'queue_paused'
             ? 'Queue paused'
             : info?.wait_reason === 'waiting_for_plan_terms'
@@ -1653,6 +1670,7 @@ function QueuePanel({
               )}
               <JobPlaceholder
                 job={job}
+                referenceQuality={referenceQualityByJobId[job.id]}
                 onStop={() => onStop(job.id)}
                 onDismiss={() => onDismiss(job.id)}
                 onToggleLog={() => void toggleLog(effectiveJob)}
@@ -1905,6 +1923,11 @@ export function MainContent() {
   }, [])
 
   useEffect(() => {
+    const openQueue = () => setMainView('queue')
+    return subscribeQueueView(openQueue)
+  }, [])
+
+  useEffect(() => {
     const newActiveJob = jobs.some(job => (
       !!job.id
       && !seenJobIds.current.has(job.id)
@@ -1948,14 +1971,12 @@ export function MainContent() {
     return () => window.removeEventListener(QUEUE_REFRESH_EVENT, refresh)
   }, [refreshQueue])
 
-  const activeQueueJobs = jobs.filter(job => (
-    job.status === 'preparing'
-    || job.status === 'waiting_for_plan_approval'
-    || job.status === 'queued'
-    || job.status === 'running'
-  ))
-  const queueActiveTotal = queueTabState?.summary.active_total ?? 0
-  const queueActivity = activeQueueJobs.length > 0 || queueActiveTotal > 0
+  const logicalQueue = useMemo(
+    () => projectLogicalQueue(jobs, queueTabState?.jobs),
+    [jobs, queueTabState?.jobs],
+  )
+  const activeQueueJobs = logicalQueue.visibleJobs.filter(isActiveLogicalQueueJob)
+  const queueActivity = logicalQueue.activeCount > 0
 
   useVisibilityPolling(
     refreshQueue,
@@ -1991,36 +2012,42 @@ export function MainContent() {
     { enabled: accessContextPending, immediate: false },
   )
 
-  const currentJob = activeQueueJobs.find(job => job.status === 'running')
-  const queueStateLabel = (queueTabState?.summary.running ?? (currentJob ? 1 : 0)) > 0
+  const currentTarget = activeQueueJobs
+    .map(job => logicalQueue.schedulerTargetByPublicJobId.get(job.id))
+    .find(target => target?.queueJob?.status === 'running' || target?.schedulerJob?.status === 'running')
+  const currentJob = currentTarget?.schedulerJob ?? currentTarget?.publicJob
+  const currentEtaSeconds = currentTarget?.queueJob?.eta_seconds ?? currentJob?.etaSeconds
+  const currentSubtaskEtaSeconds = currentTarget?.queueJob?.subtask_eta_seconds ?? currentJob?.subtaskEtaSeconds
+  const queueSummary = logicalQueue.summary
+  const queueStateLabel = queueSummary.running > 0
     ? (queueTabState?.pause_after_current ? 'running · pause next' : 'running')
-    : (queueTabState?.summary.approval_waiting ?? 0) > 0
+    : queueSummary.approval_waiting > 0
       ? 'review needed'
-      : (queueTabState?.summary.preparing ?? 0) > 0
+      : queueSummary.preparing > 0
         ? 'preparing'
     : queueTabState?.paused
       ? 'paused'
-      : (queueTabState?.summary.held ?? 0) > 0
-        && (queueTabState?.summary.waiting ?? 0) === 0
-        && (queueTabState?.summary.registering ?? 0) === 0
+      : queueSummary.held > 0
+        && queueSummary.waiting === 0
+        && queueSummary.registering === 0
         ? 'held'
-        : queueActiveTotal > 0
+        : logicalQueue.activeCount > 0
           ? 'waiting'
-          : jobs.some(job => job.status === 'failed')
+          : logicalQueue.visibleJobs.some(job => job.status === 'failed')
             ? 'attention'
             : 'idle'
-  const queueStateColor = (queueTabState?.summary.running ?? (currentJob ? 1 : 0)) > 0
+  const queueStateColor = queueSummary.running > 0
     ? 'bg-accent-green'
-    : (queueTabState?.summary.approval_waiting ?? 0) > 0 || queueTabState?.paused || (queueTabState?.summary.held ?? 0) > 0
+    : queueSummary.approval_waiting > 0 || queueTabState?.paused || queueSummary.held > 0
       ? 'bg-amber-400'
-      : jobs.some(job => job.status === 'failed')
+      : logicalQueue.visibleJobs.some(job => job.status === 'failed')
         ? 'bg-red-400'
-        : queueActiveTotal > 0 ? 'bg-accent-blue' : 'bg-text-muted'
+        : logicalQueue.activeCount > 0 ? 'bg-accent-blue' : 'bg-text-muted'
   const queueTooltip = queueTabState
-    ? `Queue: ${queueTabState.summary.active_total} active · ${queueSummaryLabel(queueTabState.summary)}${queueTabState.paused ? ' · paused' : queueTabState.pause_after_current ? ' · pauses after current output' : ''}`
+    ? `Queue: ${logicalQueue.activeCount} active · ${queueSummaryLabel(queueSummary)}${queueTabState.paused ? ' · paused' : queueTabState.pause_after_current ? ' · pauses after current output' : ''}`
     : 'Queue status loading'
   const ownedJobEtaTooltip = currentJob
-    ? ` · Your job: overall ETA ${compactEta(currentJob.etaSeconds)}${currentJob.subtaskEtaSeconds != null ? ` · current task ${compactEta(currentJob.subtaskEtaSeconds)}` : ''}`
+    ? ` · Your job: overall ETA ${compactEta(currentEtaSeconds)}${currentSubtaskEtaSeconds != null ? ` · current task ${compactEta(currentSubtaskEtaSeconds)}` : ''}`
     : ''
 
   const feedRef = useRef<HTMLDivElement>(null)
@@ -2383,12 +2410,12 @@ export function MainContent() {
             >
               <span className={`h-1.5 w-1.5 rounded-full ${queueStateColor}`} />
               <span>Queue</span>
-              {queueActiveTotal > 0 && <span className="rounded-full bg-bg-primary/70 px-1 text-[9px]">{queueActiveTotal}</span>}
+              {logicalQueue.activeCount > 0 && <span className="rounded-full bg-bg-primary/70 px-1 text-[9px]">{logicalQueue.activeCount}</span>}
               <span className="hidden lg:inline text-[9px]">{queueStateLabel}</span>
               {currentJob && (
                 <span className="hidden xl:inline text-[9px]">
-                  · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {compactEta(currentJob.etaSeconds)}
-                  {currentJob.subtaskEtaSeconds != null ? ` · task ${compactEta(currentJob.subtaskEtaSeconds)}` : ''}
+                  · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {compactEta(currentEtaSeconds)}
+                  {currentSubtaskEtaSeconds != null ? ` · task ${compactEta(currentSubtaskEtaSeconds)}` : ''}
                 </span>
               )}
             </button>

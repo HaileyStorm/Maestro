@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import ts from 'typescript'
 import { resolveSidebarNavigation } from '../src/lib/sidebarNavigation.ts'
 
 import {
   addProjectAssetVariant,
   createProjectAsset,
+  createProjectReferenceRequestId,
   deleteProjectAssetVariant,
   directorV2Plan,
   fetchProjectAssets,
@@ -17,7 +19,6 @@ import {
   getProjectAssetApplyOutputs,
   getProjectAssetComponentOutputs,
   getProjectReferenceEditorModels,
-  getProjectReferenceExplicitConvenienceState,
   getProjectReferenceGenerationModels,
   getProjectReferencePreferredGenerationModel,
   getProjectReferenceQueueBlockers,
@@ -30,9 +31,9 @@ import {
   getProjectReferenceReviewerSetupCopy,
   getProjectReferenceRetrySettings,
   isProjectReferenceReviewMandatory,
+  isProjectReferenceCharacterReplayReady,
   isProjectReferenceStyleReplayReady,
   isProjectReferenceReviewerEligible,
-  isProjectReferenceExplicitCharacterStateValid,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
   loadLlm,
@@ -40,15 +41,22 @@ import {
   normalizeProjectReferenceAssetType,
   normalizeProjectReferenceAnchorPrivacy,
   ProjectAssetRequestError,
+  PROJECT_REFERENCE_REQUEST_ID_PATTERN,
   projectAssetOutputNeedsInitialBlur,
   projectAssetVariantOperationKey,
+  projectReferenceJobQualitySummary,
+  projectReferenceQualityPresentation,
+  projectReferenceRequestIdFromRandomBytes,
   projectReferenceRetryNeedsPrivateAuthoring,
   projectReferenceSafeErrorMessage,
   resolveProjectReferenceRetryReview,
   selectProjectReferenceModel,
+  serializeProjectReferenceCharacterProfile,
   selectProjectAssetApplyOutput,
   setProjectAssetVariantStatus,
   validateLoraParameterValues,
+  PROJECT_REFERENCE_CHARACTER_AGE_BLOCKER,
+  PROJECT_REFERENCE_EXPLICIT_CONVENIENCE_AGE_BLOCKER,
 } from '../src/api/client.ts'
 
 const componentUrl = new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url)
@@ -59,6 +67,7 @@ const modelSelectorUrl = new URL('../src/components/Sidebar/ModelSelector.tsx', 
 const blenderUrl = new URL('../src/components/Sidebar/BlenderSceneTool.tsx', import.meta.url)
 const storeUrl = new URL('../src/stores/useStore.ts', import.meta.url)
 const referenceQueueUrl = new URL('../src/lib/referenceQueue.ts', import.meta.url)
+const mainViewNavigationUrl = new URL('../src/lib/mainViewNavigation.ts', import.meta.url)
 const manualInstallationUrl = new URL('../src/lib/manualInstallation.ts', import.meta.url)
 const clientUrl = new URL('../src/api/client.ts', import.meta.url)
 const typesUrl = new URL('../src/types/index.ts', import.meta.url)
@@ -422,6 +431,92 @@ test('v2 retry never fabricates unavailable private custom labels after refresh'
   assert.equal(projectReferenceRetryNeedsPrivateAuthoring(source), false)
 })
 
+test('Character Retry and Edit replay semantic profile data without server-managed identities', () => {
+  const source = variant([output('identity')], 'reference_pack')
+  const publicProfile = {
+    schema_version: 1,
+    gender: { present: true, commitment: '1'.repeat(64) },
+    age: { present: true, commitment: '2'.repeat(64) },
+    explicit_anatomy: { count: 2, commitments: ['3'.repeat(64), '4'.repeat(64)] },
+  }
+  const publicManaged = {
+    schema_version: 1,
+    active_count: 2,
+    tombstone_count: 1,
+    rename_count: 1,
+    commitments: ['5'.repeat(64), '6'.repeat(64), '7'.repeat(64)],
+  }
+  source.metadata.reference_pack = {
+    schema_version: 2,
+    planner_version: 'reference-pack-v2',
+    reference_type: 'character',
+    mode: 'production',
+    explicit_output: true,
+    explicit_convenience: true,
+    authored_settings: {
+      seal: 'profile-seal',
+      type_fields: [],
+      detail_callouts: [
+        { managed: true, requested_operation: 'auto' },
+        { managed: true, requested_operation: 'enhance' },
+        {
+          custom_id: 'custom:mnopqrstuvwx', kind: 'custom', requested_operation: 'crop',
+          source_role: 'canonical_identity', target_role: 'detail_callout:custom:mnopqrstuvwx',
+          label_digest: 'private-digest',
+        },
+      ],
+      character_profile: publicProfile,
+      managed_character_callouts: publicManaged,
+    },
+  }
+  const characterProfile = {
+    gender: 'non_binary',
+    age: 29,
+    explicit_anatomy: ['breasts', 'penis'],
+  }
+  const privateDetailCallouts = [{
+    custom_id: 'custom:mnopqrstuvwx', label: 'Owner wording', kind: 'custom',
+    operation: 'crop', source_role: 'canonical_identity',
+  }]
+  const snapshot = {
+    character_profile: characterProfile,
+    explicit_convenience: true,
+  }
+  assert.equal(projectReferenceRetryNeedsPrivateAuthoring(source), true)
+  assert.equal(isProjectReferenceCharacterReplayReady(source.metadata.reference_pack, snapshot), true)
+  assert.equal(isProjectReferenceCharacterReplayReady(source.metadata.reference_pack, {
+    character_profile: characterProfile,
+    explicit_convenience: false,
+  }), false, 'private semantic convenience must match the public contract')
+  assert.equal(isProjectReferenceCharacterReplayReady(source.metadata.reference_pack, {
+    character_profile: { ...characterProfile, commitment_nonce: '8'.repeat(64) },
+    explicit_convenience: true,
+  }), false, 'server-only sealing fields never enter the client replay snapshot')
+  assert.equal(isProjectReferenceCharacterReplayReady(source.metadata.reference_pack, {
+    character_profile: { ...characterProfile, explicit_anatomy: ['penis', 'breasts'] },
+    explicit_convenience: true,
+  }), false, 'semantic anatomy order must stay canonical')
+  const driftedSource = structuredClone(source)
+  driftedSource.metadata.reference_pack.authored_settings.managed_character_callouts.active_count = 3
+  assert.equal(isProjectReferenceCharacterReplayReady(driftedSource.metadata.reference_pack, snapshot), false)
+  delete driftedSource.metadata.reference_pack.explicit_convenience
+  assert.equal(isProjectReferenceCharacterReplayReady(driftedSource.metadata.reference_pack, snapshot), false)
+
+  const replay = getProjectReferenceRetrySettings(source, {
+    mode: 'production', model_type: 'generator', editor_model_type: 'editor',
+    private_output: true, explicit_output: false, review: true, max_repair_attempts: 1,
+    schema_version: 2, asset_type: 'character', authored_settings_seal: 'profile-seal',
+    type_fields: {}, detail_callouts: privateDetailCallouts,
+    character_profile: characterProfile,
+    explicit_convenience: true,
+  }, { reference_types: [{ id: 'character', type_fields: [], detail_kinds: [] }] })
+  assert.equal(replay.explicit_output, true)
+  assert.equal(replay.explicit_convenience, true)
+  assert.deepEqual(replay.character_profile, characterProfile)
+  assert.equal('managed_character_callouts' in replay, false)
+  assert.deepEqual(replay.detail_callouts, privateDetailCallouts)
+})
+
 test('project operation adoption requires both project and lifecycle epoch', () => {
   assert.equal(isProjectAssetOperationCurrent('one', 3, 'one', 3), true)
   assert.equal(isProjectAssetOperationCurrent('one', 3, 'two', 3), false)
@@ -446,63 +541,45 @@ test('Reference Studio model helpers filter the server catalog and preserve loca
   assert.equal(selectProjectReferenceModel([], 'missing'), '')
 })
 
-test('Explicit convenience owns one atomic Character Anatomy contract only', () => {
-  const canonicalCharacter = getProjectReferenceExplicitConvenienceState('character', true)
-  assert.deepEqual(canonicalCharacter, {
-    explicit_output: true,
-    preset: 'anatomy',
-    anatomy_option: 'nude anatomy',
-    content_capability: 'unrestricted_local',
-    initial_blur: true,
-    intelligence_policy: 'uncensored_auto',
+test('Character profile serialization keeps gender age anatomy and output handling independent', () => {
+  const blank = serializeProjectReferenceCharacterProfile({
+    gender: 'unspecified', ageInput: '', explicitAnatomy: [],
+  }, false)
+  assert.deepEqual(blank, { age: null, blocker: null })
+
+  const authored = serializeProjectReferenceCharacterProfile({
+    gender: 'non_binary', ageInput: '18', explicitAnatomy: ['penis', 'breasts', 'vulva'],
+  }, true)
+  assert.deepEqual(authored, {
+    age: 18,
+    blocker: null,
+    profile: {
+      gender: 'non_binary',
+      age: 18,
+      explicit_anatomy: ['breasts', 'vulva', 'penis'],
+    },
   })
-  for (const transition of ['initial state', 'external sync', 'depth change', 'custom sheet count']) {
-    assert.equal(isProjectReferenceExplicitCharacterStateValid(
-      'character',
-      canonicalCharacter.explicit_output,
-      canonicalCharacter.preset,
-      [{
-        id: 'anatomy:nude-anatomy', label: canonicalCharacter.anatomy_option,
-        custom: false, group: 'anatomy',
-      }],
-    ), true, `${transition} retains the canonical nude Anatomy state`)
-  }
-  assert.equal(isProjectReferenceExplicitCharacterStateValid(
-    'character', true, 'identity', [],
-  ), false)
-  assert.equal(isProjectReferenceExplicitCharacterStateValid(
-    'character', true, 'anatomy', [{
-      id: 'anatomy:anatomy', label: 'anatomy', custom: false, group: 'anatomy',
-    }],
-  ), false, 'generic anatomy is not the canonical nude convenience selection')
-  assert.equal(isProjectReferenceExplicitCharacterStateValid(
-    'character', true, 'anatomy', [{
-      id: 'custom:abcdefghijkl', label: 'nude anatomy', custom: true, group: 'anatomy',
-    }],
-  ), false, 'a custom lookalike label cannot satisfy the canonical section guard')
-  assert.equal(isProjectReferenceExplicitCharacterStateValid(
-    'creature', true, 'behavior', [],
-  ), true, 'non-character authored state is outside the Character-only guard')
-  for (const assetType of ['location', 'prop', 'vehicle', 'creature', 'wardrobe', 'world']) {
-    const state = getProjectReferenceExplicitConvenienceState(assetType, true)
-    assert.equal(state.explicit_output, true)
-    assert.equal(state.preset, undefined, `${assetType} keeps its native preset`)
-    assert.equal(state.anatomy_option, undefined, `${assetType} keeps its native anchor`)
-    assert.equal(state.content_capability, 'unrestricted_local')
-  }
-  assert.deepEqual(getProjectReferenceExplicitConvenienceState('character', false), {
-    explicit_output: false,
+  assert.equal('explicit_output' in authored, false)
+
+  const omittedAge = serializeProjectReferenceCharacterProfile({
+    gender: 'woman', ageInput: '  ', explicitAnatomy: ['vulva'],
+  }, true)
+  assert.deepEqual(omittedAge.profile, {
+    gender: 'woman', explicit_anatomy: ['vulva'],
   })
-  assert.deepEqual(
-    getProjectReferenceExplicitConvenienceState('character', true, 'underlayers'),
-    { explicit_output: false },
-    'a later deliberate Character preset change exits convenience instead of snapping back',
-  )
-  assert.equal(
-    getProjectReferenceExplicitConvenienceState('creature', true, 'behavior').explicit_output,
-    true,
-    'native creature preset changes do not acquire Character-only semantics',
-  )
+  assert.equal(omittedAge.age, null, 'blank age is not inferred as adult')
+
+  for (const ageInput of ['-1', '1000', '18.0', 'adult', '1e2']) {
+    assert.equal(serializeProjectReferenceCharacterProfile({
+      gender: 'unspecified', ageInput, explicitAnatomy: [],
+    }, false).blocker, PROJECT_REFERENCE_CHARACTER_AGE_BLOCKER)
+  }
+  assert.equal(serializeProjectReferenceCharacterProfile({
+    gender: 'man', ageInput: '17', explicitAnatomy: ['penis'],
+  }, true).blocker, PROJECT_REFERENCE_EXPLICIT_CONVENIENCE_AGE_BLOCKER)
+  assert.equal(serializeProjectReferenceCharacterProfile({
+    gender: 'man', ageInput: '17', explicitAnatomy: ['penis'],
+  }, false).blocker, null, 'the narrow gate belongs only to convenience')
 })
 
 test('Moody Krea 2 recipes are generation-selectable but never presented as editors', () => {
@@ -745,7 +822,9 @@ test('ambiguous JSON-equivalent enum choices block Queue while distinct numeric 
     generation_model_missing: false, editor_model_missing: false, terms_pending: false,
     manual_verification_pending: false, incompatible_lora: false,
     invalid_lora_multiplier: false, invalid_lora_parameters: ambiguousErrors.length > 0,
-    invalid_authored_settings: false, review_unavailable: false,
+    invalid_authored_settings: false, invalid_character_age: false,
+    explicit_convenience_age: false, too_many_detail_callouts: false,
+    review_unavailable: false,
   })
   assert.deepEqual(blockers.map(blocker => blocker.id), ['invalid_lora_parameters'])
 
@@ -793,7 +872,9 @@ test('Queue blockers are the executable source of every disabled reason', () => 
     generation_model_missing: false, editor_model_missing: false, terms_pending: false,
     manual_verification_pending: false, incompatible_lora: false,
     invalid_lora_multiplier: false, invalid_lora_parameters: false,
-    invalid_authored_settings: false, review_unavailable: false,
+    invalid_authored_settings: false, invalid_character_age: false,
+    explicit_convenience_age: false, too_many_detail_callouts: false,
+    review_unavailable: false,
   }
   assert.deepEqual(getProjectReferenceQueueBlockers(clear), [])
   const all = getProjectReferenceQueueBlockers(Object.fromEntries(
@@ -958,6 +1039,290 @@ test('generation helper preserves fresh modes and retry/edit lineage payloads ex
     mode: 'hybrid',
     candidate_count: 1,
   })
+})
+
+test('fresh Character profile and convenience serialize independently without managed identities', async t => {
+  const originalFetch = globalThis.fetch
+  const bodies = []
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)))
+    return new Response(JSON.stringify({ job_id: `profile-${bodies.length}`, asset: {} }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  await generateProjectAssetReferences('project', {
+    name: 'Character', asset_type: 'character', mode: 'production',
+    explicit_output: true,
+    explicit_convenience: true,
+    character_profile: {
+      gender: 'non_binary', age: 24, explicit_anatomy: ['breasts', 'penis'],
+    },
+  })
+  await generateProjectAssetReferences('project', {
+    name: 'Location', asset_type: 'location', mode: 'production', explicit_output: true,
+  })
+
+  assert.equal(bodies[0].explicit_output, true)
+  assert.equal(bodies[0].explicit_convenience, true)
+  assert.deepEqual(bodies[0].character_profile, {
+    gender: 'non_binary', age: 24, explicit_anatomy: ['breasts', 'penis'],
+  })
+  assert.equal('managed_character_callouts' in bodies[0], false)
+  for (const key of ['character_profile', 'explicit_convenience', 'managed_character_callouts']) {
+    assert.equal(key in bodies[1], false, `non-Character request omits ${key}`)
+  }
+})
+
+test('Reference submission idempotency retries only ambiguous transport with one exact body and parent', async t => {
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  const deterministic = projectReferenceRequestIdFromRandomBytes(
+    Uint8Array.from({ length: 18 }, (_, index) => index),
+  )
+  assert.equal(deterministic, 'ref_ABCDEFGHIJKLMNOPQR')
+  assert.match(deterministic, PROJECT_REFERENCE_REQUEST_ID_PATTERN)
+  const deliberateFreshId = createProjectReferenceRequestId()
+  const deliberateRetryId = createProjectReferenceRequestId()
+  assert.match(deliberateFreshId, PROJECT_REFERENCE_REQUEST_ID_PATTERN)
+  assert.match(deliberateRetryId, PROJECT_REFERENCE_REQUEST_ID_PATTERN)
+  assert.notEqual(deliberateFreshId, deliberateRetryId, 'separate deliberate submissions mint separate random IDs')
+
+  const postedBodies = []
+  const serializedParents = new Map()
+  globalThis.fetch = async (_url, init) => {
+    const encodedBody = String(init?.body)
+    const body = JSON.parse(encodedBody)
+    postedBodies.push(encodedBody)
+    if (!serializedParents.has(body.request_id)) {
+      serializedParents.set(body.request_id, `parent-${serializedParents.size + 1}`)
+    }
+    if (postedBodies.length === 1) throw new TypeError('response connection was lost after acceptance')
+    return new Response(JSON.stringify({
+      job_id: serializedParents.get(body.request_id),
+      asset: {},
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+
+  const accepted = await generateProjectAssetReferences('project', {
+    request_id: deliberateFreshId,
+    name: 'Same visible name is not an idempotency key',
+    asset_type: 'character',
+    mode: 'production',
+  })
+  assert.equal(accepted.job_id, 'parent-1')
+  assert.equal(postedBodies.length, 2)
+  assert.equal(postedBodies[0], postedBodies[1], 'ambiguous retry reuses the byte-exact body and request ID')
+  assert.equal(serializedParents.size, 1, 'lost response plus retry serializes one logical parent')
+
+  const separateClick = await generateProjectAssetReferences('project', {
+    request_id: deliberateRetryId,
+    name: 'Same visible name is not an idempotency key',
+    asset_type: 'character',
+    mode: 'production',
+  })
+  assert.equal(separateClick.job_id, 'parent-2')
+  assert.equal(serializedParents.size, 2, 'a separate deliberate ID creates a separate parent even with the same name')
+  assert.equal('logical_job_kind' in JSON.parse(postedBodies[2]), false, 'logical kind is server-authored, not an operation marker')
+
+  let conflictCalls = 0
+  globalThis.fetch = async () => {
+    conflictCalls += 1
+    return new Response(JSON.stringify({ detail: 'request_id body mismatch' }), {
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  await assert.rejects(
+    generateProjectAssetReferences('project', {
+      request_id: deliberateFreshId,
+      asset_id: 'asset-1',
+      parent_variant_id: 'candidate-1',
+      edit_instruction: 'retry with a changed body',
+    }),
+    error => error instanceof ProjectAssetRequestError && error.status === 409,
+  )
+  assert.equal(conflictCalls, 1, 'HTTP 409 mismatch is terminal and never transport-retried')
+
+  let legacyCalls = 0
+  globalThis.fetch = async () => {
+    legacyCalls += 1
+    throw new TypeError('ambiguous legacy transport')
+  }
+  await assert.rejects(generateProjectAssetReferences('project', {
+    name: 'Legacy request',
+    asset_type: 'character',
+  }))
+  assert.equal(legacyCalls, 1, 'legacy requests without an idempotency key are never automatically replayed')
+
+  let invalidCalls = 0
+  globalThis.fetch = async () => {
+    invalidCalls += 1
+    throw new Error('must not fetch')
+  }
+  await assert.rejects(generateProjectAssetReferences('project', {
+    request_id: 'short',
+    name: 'Invalid ID',
+    asset_type: 'character',
+  }), /Invalid Reference request ID/)
+  assert.equal(invalidCalls, 0)
+})
+
+test('public Reference fidelity presentation is compact, advisory, and legacy-safe', () => {
+  const pass = projectReferenceQualityPresentation({
+    schema_version: 2,
+    planner_version: 'reference-pack-v2',
+    quality: {
+      status: 'pass',
+      warning: null,
+      review_deferred: false,
+      assessment: {
+        version: 'fidelity_assessment_v2',
+        assessment_class: 'exact',
+        worst_severity: 'exact',
+        residual_count: 0,
+        score_basis_points: 10000,
+        status: 'pass',
+        dimension_checks: { style: true },
+        failed_roles: [],
+        reason_codes: [],
+      },
+      recommended: true,
+      recommendation_basis: 'accepted_assessment',
+    },
+  })
+  assert.deepEqual(pass, {
+    stateLabel: 'Fidelity passed',
+    gradeLabel: 'Exact',
+    scoreLabel: '100%',
+    residualSummary: null,
+    correctionAvailable: false,
+    recommended: true,
+    preliminary: false,
+    notice: null,
+    tone: 'pass',
+  })
+
+  const residualMetadata = {
+    schema_version: 2,
+    planner_version: 'reference-pack-v2',
+    review: {
+      requested_model: 'local-reviewer',
+      resolved_model: 'local-reviewer',
+      resolved_provider: 'local',
+      final_correction: {
+        template_id: 'reference-residual-correction',
+        severity: 'minor_residual',
+        affected_roles: ['turnaround'],
+        reason_codes: ['style_mismatch'],
+        score_basis_points: 8345,
+      },
+    },
+    quality: {
+      status: 'residual',
+      warning: 'PRIVATE_FREE_FORM_REVIEW_MUST_NOT_RENDER',
+      review_deferred: false,
+      assessment: {
+        version: 'fidelity_assessment_v2',
+        assessment_class: 'minor_residual',
+        worst_severity: 'minor_residual',
+        residual_count: 2,
+        score_basis_points: 8345,
+        status: 'fail',
+        dimension_checks: { style: false },
+        failed_roles: ['turnaround'],
+        reason_codes: ['style_mismatch', 'PRIVATE_REASON_MUST_NOT_RENDER'],
+      },
+      recommended: true,
+      recommendation_basis: 'residual_assessment',
+    },
+  }
+  const residual = projectReferenceQualityPresentation(residualMetadata)
+  assert.equal(residual?.stateLabel, 'Fidelity reviewed')
+  assert.equal(residual?.gradeLabel, 'Minor residuals')
+  assert.equal(residual?.scoreLabel, '83.5%')
+  assert.equal(residual?.residualSummary, 'Differences: style')
+  assert.equal(residual?.correctionAvailable, true)
+  assert.doesNotMatch(JSON.stringify(residual), /PRIVATE|commitment|rendered_brief/)
+
+  const deferredMetadata = {
+    schema_version: 2,
+    planner_version: 'reference-pack-v2',
+    quality: {
+      status: 'review_unavailable',
+      warning: 'PRIVATE_PROVIDER_FAILURE',
+      review_deferred: true,
+      assessment: null,
+      recommended: true,
+      recommendation_basis: 'preliminary_ungraded',
+    },
+  }
+  const deferred = projectReferenceQualityPresentation(deferredMetadata)
+  assert.equal(deferred?.stateLabel, 'Fidelity review deferred')
+  assert.equal(deferred?.gradeLabel, 'Ungraded')
+  assert.equal(deferred?.preliminary, true)
+  assert.match(deferred?.notice ?? '', /remains usable/)
+  assert.doesNotMatch(JSON.stringify(deferred), /PRIVATE_PROVIDER_FAILURE/)
+  assert.equal(projectReferenceQualityPresentation({
+    schema_version: 2,
+    planner_version: 'reference-pack-v2',
+  }), null, 'legacy records omit the new presentation cleanly')
+
+  const makeCandidate = (id, label, metadata) => ({
+    id,
+    variant_type: 'reference_pack',
+    label,
+    status: 'candidate',
+    outputs: [],
+    metadata: { reference_pack: metadata, job: { id: 'job-1' } },
+  })
+  const assets = [{
+    id: 'asset', asset_type: 'character', name: 'Character', description: '', tags: [], metadata: {},
+    variants: [
+      makeCandidate('candidate-1', 'Candidate 1', { ...residualMetadata, quality: { ...residualMetadata.quality, recommended: false, recommendation_basis: null } }),
+      makeCandidate('candidate-2', 'Candidate 2', deferredMetadata),
+    ],
+  }]
+  assert.deepEqual(projectReferenceJobQualitySummary(assets, 'job-1'), {
+    candidateCount: 2,
+    variantLabel: 'Candidate 2',
+    presentation: deferred,
+  })
+  assert.equal(projectReferenceJobQualitySummary(assets, 'missing-job'), null)
+  const duplicateRecommendation = structuredClone(assets)
+  duplicateRecommendation[0].variants[0].metadata.reference_pack.quality.recommended = true
+  duplicateRecommendation[0].variants[0].metadata.reference_pack.quality.recommendation_basis = 'residual_assessment'
+  assert.equal(projectReferenceJobQualitySummary(duplicateRecommendation, 'job-1'), null,
+    'an invalid multiple-recommendation set fails closed')
+})
+
+test('Reference candidate cards consume only the closed public fidelity projection', async () => {
+  const [source, clientSource, referenceTypes] = await Promise.all([
+    readFile(componentUrl, 'utf8'),
+    readFile(clientUrl, 'utf8'),
+    readFile(typesUrl, 'utf8'),
+  ])
+  assert.match(clientSource, /quality\?: ProjectReferencePublicQuality/)
+  assert.match(clientSource, /status: ProjectReferenceQualityStatus/)
+  assert.match(clientSource, /recommendation_basis: ProjectReferenceRecommendationBasis \| null/)
+  assert.match(referenceTypes, /final_correction\?: \{/)
+  assert.match(source, /const qualityPresentation = projectReferenceQualityPresentation\(packMetadata\)/)
+  assert.match(source, />Recommended<\/span>/)
+  assert.match(source, /Preliminary recommendation · ungraded/)
+  assert.match(source, /Structured correction guidance is available for Retry or Edit\./)
+  assert.match(clientSource, /This candidate remains usable/)
+  assert.doesNotMatch(source, /quality\.warning|rendered_brief|private_authored_settings/)
+  const actions = source.slice(
+    source.indexOf("onClick={() => void updateStatus(asset.id, variant.id, 'kept')"),
+    source.indexOf("{(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack')", source.indexOf("onClick={() => void updateStatus(asset.id, variant.id, 'kept')")),
+  )
+  assert.match(actions, /Keep/)
+  assert.match(actions, /Reject/)
+  assert.match(actions, /Delete candidate and copied media/)
+  assert.doesNotMatch(actions, /qualityPresentation/)
 })
 
 test('v2 generation keeps pack candidates separate from custom sheet deliverables', async t => {
@@ -1331,6 +1696,10 @@ test('private authored settings use the exact owner route and no-store request',
         custom_id: 'custom:mnopqrstuvwx', label: 'Private ring detail', kind: 'custom',
         operation: 'enhance', source_role: 'canonical_identity',
       }],
+      character_profile: {
+        gender: 'non_binary', age: 31, explicit_anatomy: ['breasts'],
+      },
+      explicit_convenience: true,
     },
     additional_loras: [{
       id: 'shape.safetensors', multiplier: 0.8, scope: 'generation',
@@ -1442,6 +1811,9 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /id="project-reference-title"[^>]*>Reference Studio<\/h2>/)
 
   assert.match(referenceTypes, /'private_blurred' \| 'private_visible' \| 'project_blurred' \| 'project_visible'/)
+  assert.match(referenceTypes, /LogicalJobKind = 'reference_pack_parent' \| 'reference_pack_child'/)
+  assert.match(referenceTypes, /logicalJobKind\?: LogicalJobKind/)
+  assert.equal(clientSource.match(/logical_job_kind\?: LogicalJobKind/g)?.length, 2)
   assert.match(referenceTypes, /ProjectReferenceLegacyAnchorPrivacy = ProjectReferenceAnchorPrivacy \| 'standard'/)
   assert.doesNotMatch(referenceTypes, /anchor_privacy: 'private_blurred' \| 'standard'/)
   assert.match(referenceTypes, /operation_routing: ProjectReferenceOperationRouting/)
@@ -1452,7 +1824,10 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(referenceTypes, /ProjectReferenceTypeFieldItem\[\]/)
   assert.match(referenceTypes, /detail_callout_count: number/)
   assert.match(referenceTypes, /ordered_output_roles: string\[\]/)
-  assert.match(clientSource, /detail\?: \{[\s\S]*?custom_id: string[\s\S]*?source_digest: string[\s\S]*?normalized_crop: \[number, number, number, number\][\s\S]*?label_digest: string[\s\S]*?seal: string/)
+  assert.match(referenceTypes, /ProjectReferenceCharacterGender = 'woman' \| 'man' \| 'non_binary' \| 'unspecified'/)
+  assert.match(referenceTypes, /ProjectReferenceCharacterAnatomy = 'breasts' \| 'vulva' \| 'penis'/)
+  assert.match(referenceTypes, /ProjectReferenceManagedDetailCalloutSummary[\s\S]*?managed: true/)
+  assert.match(clientSource, /detail\?: \{[\s\S]*?managed: true[\s\S]*?\} \| \{[\s\S]*?custom_id: string[\s\S]*?label_digest: string[\s\S]*?seal: string/)
   assert.doesNotMatch(clientSource, /detail_kind\?: ProjectReferenceDetailKind/)
 
   for (const copy of [
@@ -1466,8 +1841,9 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
     'Subject and content LoRAs are never enabled automatically',
     'Wardrobe & underlayers',
     'Explicit convenience',
-    'nude anatomy anchor',
-    'choosing another Character preset turns this convenience off',
+    'Anatomy / Nude anchor',
+    'Gender never selects anatomy or establishes age',
+    'does not scan or infer age from text, appearance, or gender',
     'Uncensored-capable Auto',
     'Auto never sends data remotely',
   ]) assert.match(source, new RegExp(copy))
@@ -1480,7 +1856,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /isProjectAssetOperationCurrent\(submittedProject, epoch, currentProject\.current, projectEpoch\.current\)/)
   assert.match(source, /setPendingSheetActions\(\{\}\)/)
   assert.match(source, /setPendingFreshJobIds\(\[\]\)/)
-  assert.match(source, /await confirmReconnectedJob\(/)
+  assert.match(source, /jobId => confirmReconnectedJob\(/)
   assert.doesNotMatch(source, /setInterval/)
   assert.match(source, /workspace\.name === project && workspace\.unlocked === false/)
   assert.match(source, /enabled: open && !browsingUploads && !projectExplicitlyLocked/)
@@ -1500,6 +1876,16 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
     assert.match(source, new RegExp(`htmlFor="${id}"[^>]*>${label}`))
     assert.match(source, new RegExp(`id="${id}"`))
   }
+  assert.match(source, /assetType === 'character' && \([\s\S]*?Character profile · optional/)
+  assert.match(source, /id="project-reference-character-gender"/)
+  assert.match(source, /id="project-reference-character-age"[\s\S]*?type="number"[\s\S]*?min=\{0\}[\s\S]*?max=\{999\}[\s\S]*?step=\{1\}/)
+  assert.match(source, /aria-describedby="project-reference-character-profile-help"/)
+  assert.match(source, /grid grid-cols-1 gap-2 sm:grid-cols-2/)
+  assert.match(source, /grid grid-cols-1 gap-1 sm:grid-cols-3/)
+  assert.match(source, /Breasts · front \+ profile/)
+  assert.match(source, /\['vulva', 'Vulva'\]/)
+  assert.match(source, /\['penis', 'Penis'\]/)
+  assert.doesNotMatch(source, /cpref000000|breasts_front|breasts_profile|commitment_nonce|tombstoned/)
   assert.match(source, /aria-label="Editable reference sections"/)
   assert.match(source, /Customized · pinned/)
   assert.match(source, /section\.values\.some\(value => value\.id === item\.id\)/)
@@ -1575,17 +1961,22 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /model\.vision_capable === true && model\.vision_available === true/)
   assert.match(source, /referenceCapabilities\?\.uncensored_auto_review/)
   assert.match(source, /getProjectReferencePreferredGenerationModel\(/)
-  assert.match(source, /getProjectReferenceExplicitConvenienceState\(/)
-  assert.match(source, /initialExplicitConvenience\.preset \?\? 'identity'/)
-  assert.doesNotMatch(source, /if \(open\) return[\s\S]*?getProjectReferenceExplicitConvenienceState\(\s*assetType, explicitOutput/)
-  assert.equal(source.match(/const resetConvenience = getProjectReferenceExplicitConvenienceState/g)?.length, 2)
-  assert.match(source, /const changeDepth[\s\S]*?convenience\.anatomy_option[\s\S]*?selectCanonicalCharacterAnatomy/)
-  assert.match(source, /const changeCustomSheetCount[\s\S]*?convenience\.anatomy_option[\s\S]*?selectCanonicalCharacterAnatomy/)
+  assert.doesNotMatch(source, /getProjectReferenceExplicitConvenienceState|initialExplicitConvenience/)
+  assert.match(source, /const \[referenceExplicitOutput, setReferenceExplicitOutput\]/)
+  assert.match(source, /const \[explicitConvenience, setExplicitConvenience\] = useState\(false\)/)
+  assert.match(source, /const \[characterGender, setCharacterGender\]/)
+  assert.match(source, /const \[characterAge, setCharacterAge\] = useState\(''\)/)
+  assert.match(source, /const \[characterExplicitAnatomy, setCharacterExplicitAnatomy\]/)
+  assert.match(source, /const applyExplicitConvenience[\s\S]*?setReferenceExplicitOutput\(true\)/)
+  assert.match(source, /setReferenceExplicitOutput\(enabled\)[\s\S]*?if \(!enabled\) setExplicitConvenience\(false\)/)
+  assert.match(source, /const changeDepth[\s\S]*?assetType === 'character' && explicitConvenience[\s\S]*?selectCanonicalCharacterAnatomy/)
+  assert.match(source, /const changeCustomSheetCount[\s\S]*?assetType === 'character' && explicitConvenience[\s\S]*?selectCanonicalCharacterAnatomy/)
   assert.match(source, /selectCanonicalCharacterAnatomy\(/)
-  assert.match(source, /isProjectReferenceExplicitCharacterStateValid\(/)
-  assert.match(source, /invalid_authored_settings: hasInvalidAuthoredSettings \|\| !explicitCharacterStateValid/)
-  assert.match(source, /Character Explicit convenience requires the Anatomy \/ Nude preset and nude anatomy selection/)
-  assert.match(source, /setReferenceExplicitOutput\(false\)/)
+  assert.match(source, /serializeProjectReferenceCharacterProfile\(/)
+  assert.match(source, /invalid_character_age:/)
+  assert.match(source, /explicit_convenience_age:/)
+  assert.match(source, /too_many_detail_callouts:/)
+  assert.match(source, /setExplicitConvenience\(false\)/)
   assert.match(source, /referenceModelCustomized\) return selectProjectReferenceModel\(referenceModels, current\)/)
   assert.match(source, /referenceCapabilities\?\.review_policy/)
   assert.match(source, /isProjectReferenceReviewMandatory\(/)
@@ -1613,8 +2004,9 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /Could not install or load the required reviewer/)
   assert.match(source, /intelligencePolicy === 'standard_auto' && selectedReviewModel/)
   assert.match(source, /const queueBlockers = getProjectReferenceQueueBlockers\(/)
+  assert.match(source, /const visibleQueueBlockers = queueBlockers\.filter\(blocker => blocker\.id !== 'submitting'\)/)
   assert.match(source, /disabled=\{queueBlockers\.length > 0\}/)
-  assert.match(source, /aria-describedby=\{queueBlockers\.length > 0 \? 'project-reference-queue-blockers'/)
+  assert.match(source, /aria-describedby=\{visibleQueueBlockers\.length > 0 \? 'project-reference-queue-blockers'/)
   assert.match(source, />Queue blocked by</)
   assert.match(source, /Automatic · unavailable/)
   assert.match(source, /content_capability: contentCapability/)
@@ -1622,6 +2014,10 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /initial_blur: initialBlur/)
   assert.match(source, /intelligence_policy: intelligencePolicy/)
   assert.match(source, /additional_loras: additionalLoras/)
+  assert.match(source, /character_profile: assetType === 'character'[\s\S]*?characterProfileSerialization\.profile/)
+  assert.match(source, /explicit_convenience: assetType === 'character'[\s\S]*?explicitConvenience/)
+  const freshRequest = source.slice(source.indexOf('const generate = async'), source.indexOf('const generateFromVariant = async'))
+  assert.doesNotMatch(freshRequest, /managed_character_callouts:/)
   assert.match(source, /normalizeProjectReferenceAnchorPrivacy\(/)
   assert.match(source, /Anchor privacy:/)
   assert.match(source, /Operation routing:/)
@@ -1654,18 +2050,25 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /projectReferenceRetryNeedsPrivateAuthoring\(variant\)/)
   assert.match(source, /fetchProjectReferenceAuthoring\(/)
   assert.match(source, /response\.authored_settings\.seal !== target\.authoredSeal/)
+  assert.match(source, /isProjectReferenceCharacterReplayReady\(/)
+  assert.match(source, /response\.authored_settings\.character_profile/)
+  assert.match(source, /response\.authored_settings\.explicit_convenience/)
+  assert.doesNotMatch(source, /response\.authored_settings\.managed_character_callouts/)
   assert.match(source, /Exact private authoring is unavailable for this candidate/)
   assert.match(source, /disabled=\{Boolean\(pendingAction\) \|\| !exactRetryReady\}/)
   assert.match(source, /resolveProjectReferenceRetryReview\(/)
   assert.match(source, /if \(!retryReview\.ready\)/)
   assert.match(source, /The recorded reviewer is unavailable; Retry or Edit will use the current compatible reviewer/)
-  assert.match(source, /style, custom fields, and details are never silently dropped/)
+  assert.match(source, /style, profile, custom fields, and details are never silently dropped/)
   assert.match(source, /const sourcePreset = sourceAssetType === assetType/)
   assert.match(source, /asset_type: sourceSettings\.asset_type/)
   assert.match(source, /mode: sourceSettings\.mode/)
   assert.match(source, /max_repair_attempts: sourceSettings\.max_repair_attempts/)
   assert.match(source, /sourceSettings\.schema_version === 2[\s\S]*?sourceSettings\.mode !== 'draft'/)
   assert.match(source, /private_output: sourceSettings\.private_output/)
+  assert.match(source, /character_profile: sourceSettings\.character_profile/)
+  assert.doesNotMatch(source, /managed_character_callouts: sourceSettings\.managed_character_callouts/)
+  assert.match(source, /explicit_convenience: sourceSettings\.explicit_convenience/)
   assert.match(source, /provenance: 'imported'/)
   assert.match(source, /max_repair_attempts: effectiveMaxRepairAttempts/)
   assert.match(source, /id="project-reference-max-repairs" aria-label="Maximum panel repair attempts" type="number" min=\{1\} max=\{5\}/)
@@ -1697,7 +2100,10 @@ test('Reference peer, catalog races, Moody cards, manifests, and Blender contrac
     readFile(manualInstallationUrl, 'utf8'),
   ])
 
-  assert.equal(sidebar.match(/<ProjectReferenceLibrary active=\{isReference\} \/>/g)?.length, 2)
+  assert.equal(sidebar.match(/<ProjectReferenceLibrary active=\{isReference && sidebarOpen\} \/>/g)?.length, 1)
+  assert.equal(sidebar.match(/<ProjectReferenceLibrary active=\{isReference\} \/>/g)?.length, 1)
+  assert.doesNotMatch(sidebar, /sidebarOpen && <ProjectReferenceLibrary/)
+  assert.match(source, /const open = active/)
   for (const label of ['Generate', 'Director', 'Reference']) {
     assert.match(sidebar, new RegExp(`>\\s*${label}\\s*<`))
   }
@@ -1726,9 +2132,40 @@ test('Reference peer, catalog races, Moody cards, manifests, and Blender contrac
   assert.match(source, /getProjectReferencePreferredGenerationModel\(/)
   assert.match(source, /referenceExplicitOutput, contentCapability, referenceCapabilities/)
 
-  const reconnectIndex = source.indexOf('await confirmReconnectedJob(')
-  const navigateAfterReconnect = source.indexOf('setSidebarMode(referenceReturnMode)', reconnectIndex)
-  assert.ok(reconnectIndex >= 0 && navigateAfterReconnect > reconnectIndex, 'successful Queue navigates only after durable reconnect')
+  const freshGenerationStart = source.indexOf('const generate = async () =>')
+  const retryGenerationStart = source.indexOf('const generateFromVariant = async (')
+  const freshGeneration = source.slice(freshGenerationStart, retryGenerationStart)
+  const retryGeneration = source.slice(retryGenerationStart, source.indexOf('const importVariant = async (', retryGenerationStart))
+  for (const [label, flow] of [['fresh generation', freshGeneration], ['Retry/Edit', retryGeneration]]) {
+    const postIndex = flow.indexOf('const response = await generateProjectAssetReferences(')
+    const queueViewIndex = flow.indexOf('requestQueueView()', postIndex)
+    const reconnectIndex = flow.indexOf('await confirmAcceptedProjectReferenceJob(')
+    const acceptedRefreshIndex = flow.indexOf('requestRefresh()', queueViewIndex)
+    assert.ok(postIndex >= 0 && queueViewIndex > postIndex && acceptedRefreshIndex > queueViewIndex && reconnectIndex > acceptedRefreshIndex,
+      `${label} must open Queue and publish accepted state before read-only confirmation`)
+    assert.equal(flow.match(/requestQueueView\(\)/g)?.length, 1, `${label} must request Queue exactly once`)
+    assert.doesNotMatch(flow, /setSidebarMode\(/, `${label} must keep the Reference peer mounted`)
+  }
+  const freshAccepted = freshGeneration.slice(
+    freshGeneration.indexOf('requestQueueView()'),
+    freshGeneration.indexOf('await confirmAcceptedProjectReferenceJob('),
+  )
+  assert.match(freshAccepted, /setName\(''\)/)
+  assert.match(freshAccepted, /setDescription\(''\)/)
+  for (const retainedSetter of [
+    'setVisualStyle', 'setCustomVisualStyle', 'setCandidateKind', 'setAssetType',
+    'setSheetMode', 'setIntent', 'setDepth', 'setCustomSheetCount', 'setPreset',
+    'setSections', 'setPlanningModel', 'setReviewModel', 'setReferenceExplicitOutput',
+    'setExplicitConvenience', 'setCharacterGender', 'setCharacterAge', 'setCharacterExplicitAnatomy',
+    'setContentCapability', 'setInitialBlur', 'setIntelligencePolicy',
+    'setGenerationLoras', 'setEditingLoras', 'setAdditionalLoras',
+    'setAnatomyPrivate', 'setCandidateCount', 'setColumns', 'setPaletteSwatches',
+    'setMaxRepairAttempts', 'setReferenceModelType', 'setEditorModelType',
+  ]) {
+    assert.doesNotMatch(freshAccepted, new RegExp(`${retainedSetter}\\(`), `${retainedSetter} must remain the next-run default`)
+  }
+  assert.doesNotMatch(retryGeneration, /setName\(|setDescription\(|setVisualStyle\(|setCustomVisualStyle\(/)
+  assert.match(source, /import \{ requestQueueView \} from '\.\.\/\.\.\/lib\/mainViewNavigation'/)
   assert.match(source, /manualInstallationDestination\(model\.manual_installation\)/)
   assert.match(selector, /manualInstallationDestination\(currentModel\.manual_installation\)/)
   assert.match(manualInstallation, /formatManualInstallationBytes/)
@@ -1755,6 +2192,242 @@ test('Reference peer, catalog races, Moody cards, manifests, and Blender contrac
   assert.match(blender, /workspaceRef\.current === operation\.workspace/)
   assert.match(blender, /separate reference contract/)
   assert.match(blender, /Keep motion video/)
+})
+
+test('Reference reviewer readiness auto-refresh is bounded, exact, and lifecycle-fenced', async () => {
+  const source = await readFile(componentUrl, 'utf8')
+  const helperStart = source.indexOf('interface ProjectReferenceReviewerAutoRefreshInput')
+  const helperEnd = source.indexOf('\nconst REVIEWER_AUTO_REFRESH_DELAYS_MS', helperStart)
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, 'reviewer auto-refresh helper must remain extractable')
+  const compiledHelper = ts.transpileModule(`${source.slice(helperStart, helperEnd)}\nexport { shouldAutoRefreshProjectReferenceReviewer }`, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const helperModule = await import(`data:text/javascript;base64,${Buffer.from(compiledHelper).toString('base64')}`)
+  const shouldRefresh = helperModule.shouldAutoRefreshProjectReferenceReviewer
+  const loading = { setup_state: 'loading', queue_ready: false }
+  const loadedWithoutVision = { setup_state: 'loaded_without_vision', queue_ready: false }
+  const base = {
+    active: true,
+    pageVisible: true,
+    projectLocked: false,
+    intelligencePolicy: 'uncensored_auto',
+    reviewerAction: null,
+    contract: loading,
+  }
+  assert.equal(shouldRefresh(base), true)
+  assert.equal(shouldRefresh({ ...base, contract: loadedWithoutVision }), true)
+  assert.equal(shouldRefresh({ ...base, active: false }), false)
+  assert.equal(shouldRefresh({ ...base, pageVisible: false }), false)
+  assert.equal(shouldRefresh({ ...base, projectLocked: true }), false)
+  assert.equal(shouldRefresh({ ...base, intelligencePolicy: 'standard_auto' }), false)
+  assert.equal(shouldRefresh({ ...base, reviewerAction: 'loading' }), false)
+  assert.equal(shouldRefresh({ ...base, contract: undefined }), false)
+  for (const setup_state of ['missing_model', 'missing_projector', 'ready_unloaded', 'ready_resident']) {
+    assert.equal(shouldRefresh({ ...base, contract: { setup_state, queue_ready: setup_state.startsWith('ready_') } }), false)
+  }
+
+  assert.match(source, /const REVIEWER_AUTO_REFRESH_DELAYS_MS = \[750, 1_500, 3_000, 6_000, 12_000\] as const/)
+  assert.match(source, /document\.visibilityState !== 'hidden'/)
+  assert.match(source, /document\.addEventListener\('visibilitychange', syncVisibility\)/)
+  assert.match(source, /document\.removeEventListener\('visibilitychange', syncVisibility\)/)
+  const effectStart = source.indexOf('if (!reviewerNeedsAutomaticRefresh) return')
+  const effectEnd = source.indexOf('}, [project, reviewerNeedsAutomaticRefresh])', effectStart)
+  const effect = source.slice(effectStart, effectEnd)
+  assert.match(effect, /fetchLlmModels\(submittedProject\)/)
+  assert.match(effect, /fetchProjectReferenceCapabilities\(submittedProject\)/)
+  assert.match(effect, /sequence === reviewerAutoRefreshSequence\.current/)
+  assert.match(effect, /isProjectAssetOperationCurrent\([\s\S]*?submittedProject, epoch, currentProject\.current, projectEpoch\.current/)
+  assert.match(effect, /attempt >= REVIEWER_AUTO_REFRESH_DELAYS_MS\.length/)
+  assert.match(effect, /missing_model[\s\S]*?missing_projector[\s\S]*?ready_unloaded[\s\S]*?ready_resident/)
+  assert.match(effect, /clearTimeout\(timeoutId\)/)
+  assert.doesNotMatch(effect, /setReviewerAction\(|setReviewerActionError\(/)
+  assert.match(source, /Refresh reviewer status/)
+})
+
+test('accepted Reference submissions retry read-only confirmation without duplicate POSTs or red busy copy', async () => {
+  const source = await readFile(componentUrl, 'utf8')
+  const previousWindow = globalThis.window
+  const navigationTarget = new EventTarget()
+  globalThis.window = navigationTarget
+  try {
+    const { OPEN_QUEUE_VIEW_EVENT, requestQueueView } = await import(mainViewNavigationUrl.href)
+    let queueRequests = 0
+    navigationTarget.addEventListener(OPEN_QUEUE_VIEW_EVENT, event => {
+      queueRequests += 1
+      assert.equal(event.constructor, Event, 'Queue navigation stays fixed and payload-free')
+    })
+    requestQueueView()
+    assert.equal(queueRequests, 1)
+  } finally {
+    globalThis.window = previousWindow
+  }
+  const helperStart = source.indexOf('const PROJECT_REFERENCE_CONFIRMATION_DELAYS_MS')
+  const helperEnd = source.indexOf('\nconst REFERENCE_TYPE_DEFINITIONS', helperStart)
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, 'accepted-job confirmation helper must remain extractable')
+  const compiledHelper = ts.transpileModule(`${source.slice(helperStart, helperEnd)}\nexport { confirmAcceptedProjectReferenceJob }`, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const helperModule = await import(`data:text/javascript;base64,${Buffer.from(compiledHelper).toString('base64')}`)
+  const confirmAccepted = helperModule.confirmAcceptedProjectReferenceJob
+
+  let attempts = 0
+  const waits = []
+  assert.equal(await confirmAccepted(
+    'accepted-job',
+    async jobId => {
+      assert.equal(jobId, 'accepted-job')
+      attempts += 1
+      if (attempts < 3) throw new Error('Queue has not caught up yet')
+    },
+    async delayMs => { waits.push(delayMs) },
+  ), true)
+  assert.equal(attempts, 3)
+  assert.deepEqual(waits, [250, 750])
+
+  attempts = 0
+  waits.length = 0
+  assert.equal(await confirmAccepted(
+    'accepted-but-confirming',
+    async () => {
+      attempts += 1
+      throw new Error('still reconnecting')
+    },
+    async delayMs => { waits.push(delayMs) },
+  ), false)
+  assert.equal(attempts, 4)
+  assert.deepEqual(waits, [250, 750, 1_500])
+
+  attempts = 0
+  assert.equal(await confirmAccepted(
+    'accepted-with-hung-reconnect',
+    async () => {
+      attempts += 1
+      return new Promise(() => {})
+    },
+    async () => {},
+    1,
+  ), false)
+  assert.equal(attempts, 4, 'a hung reconnect remains attempt- and wall-clock-bounded')
+
+  const freshStart = source.indexOf('const generate = async () =>')
+  const retryStart = source.indexOf('const generateFromVariant = async (', freshStart)
+  const retryEnd = source.indexOf('const importVariant = async (', retryStart)
+  const freshFlow = source.slice(freshStart, retryStart)
+  const retryFlow = source.slice(retryStart, retryEnd)
+  for (const [label, flow] of [['fresh generation', freshFlow], ['Retry/Edit', retryFlow]]) {
+    const requestIdIndex = flow.indexOf('const requestId = createProjectReferenceRequestId()')
+    const postIndex = flow.indexOf('const response = await generateProjectAssetReferences(')
+    assert.ok(requestIdIndex >= 0 && postIndex > requestIdIndex, `${label} must mint one request ID per deliberate submission`)
+    assert.equal(flow.match(/createProjectReferenceRequestId\(\)/g)?.length, 1)
+    assert.match(flow, /request_id: requestId/)
+    assert.equal(flow.match(/generateProjectAssetReferences\(/g)?.length, 1, `${label} must POST exactly once`)
+    assert.equal(flow.match(/confirmAcceptedProjectReferenceJob\(/g)?.length, 1, `${label} must use one bounded confirmation loop`)
+    assert.match(flow, /jobId => confirmReconnectedJob\(/)
+    assert.match(flow, /Queue confirmation is still catching up/)
+  }
+  assert.match(source, /const PROJECT_REFERENCE_CONFIRMATION_ATTEMPT_TIMEOUT_MS = 1_500/)
+  assert.match(source, /Promise\.race\(\[/)
+  assert.match(source, /if \(timeoutId !== null\) clearTimeout\(timeoutId\)/)
+  assert.doesNotMatch(source, /A reference pack is already being submitted\./)
+  assert.match(source, /visibleQueueBlockers\.map\(blocker => <li/)
+  assert.match(source, /disabled=\{queueBlockers\.length > 0\}/)
+  assert.match(source, /\{submitting \? <Loader2/)
+})
+
+test('Reference creation methods are reversible across every semantic type and sheet mode', async () => {
+  const source = await readFile(componentUrl, 'utf8')
+  const helperStart = source.indexOf('type ProjectReferenceCreationMethod')
+  const helperEnd = source.indexOf('\nconst REFERENCE_TYPE_DEFINITIONS', helperStart)
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, 'creation transition helper must remain extractable')
+  const compiledHelper = ts.transpileModule(`${source.slice(helperStart, helperEnd)}\nexport { getProjectReferenceCreationTransition, getProjectReferenceCreationPanelStates }`, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const helperModule = await import(`data:text/javascript;base64,${Buffer.from(compiledHelper).toString('base64')}`)
+  const transition = helperModule.getProjectReferenceCreationTransition
+  const panelStates = helperModule.getProjectReferenceCreationPanelStates
+  assert.equal(typeof transition, 'function')
+  assert.deepEqual(panelStates('image_pack'), {
+    image_pack: { hidden: false, inert: undefined },
+    blender_motion: { hidden: true, inert: true },
+  })
+  assert.deepEqual(panelStates('blender_motion'), {
+    image_pack: { hidden: true, inert: true },
+    blender_motion: { hidden: false, inert: undefined },
+  })
+
+  const assetTypes = ['character', 'location', 'prop', 'vehicle', 'creature', 'wardrobe', 'world']
+  const sheetModes = ['production', 'hybrid', 'draft']
+  for (const [assetIndex, assetType] of assetTypes.entries()) {
+    for (const sheetMode of sheetModes) {
+      const authoredState = {
+        candidateKind: 'image_pack',
+        assetType,
+        sheetMode,
+        preset: `authored-${assetType}`,
+        sections: [{ id: 'custom', values: [`${assetType}-${sheetMode}`] }],
+        name: `${assetType} reference`,
+        description: `${sheetMode} authored description`,
+        visualStyle: 'cinematic',
+      }
+      const apply = (state, event) => ({
+        ...state,
+        ...transition(
+          { candidateKind: state.candidateKind, assetType: state.assetType },
+          event,
+        ),
+      })
+
+      const blender = apply(authoredState, { kind: 'select_method', candidateKind: 'blender_motion' })
+      assert.equal(blender.candidateKind, 'blender_motion')
+      assert.equal(blender.assetType, assetType)
+      for (const field of ['sheetMode', 'preset', 'sections', 'name', 'description', 'visualStyle']) {
+        assert.deepEqual(blender[field], authoredState[field], `${assetType}/${sheetMode} preserves ${field}`)
+      }
+
+      const sameTypeReturnsToImages = apply(blender, { kind: 'select_asset_type', assetType })
+      assert.equal(sameTypeReturnsToImages.candidateKind, 'image_pack')
+      assert.equal(sameTypeReturnsToImages.assetTypeChanged, false)
+      assert.equal(sameTypeReturnsToImages.assetType, assetType)
+
+      const backToBlender = apply(sameTypeReturnsToImages, { kind: 'select_method', candidateKind: 'blender_motion' })
+      const differentType = assetTypes[(assetIndex + 1) % assetTypes.length]
+      const changedType = apply(backToBlender, { kind: 'select_asset_type', assetType: differentType })
+      assert.equal(changedType.candidateKind, 'image_pack')
+      assert.equal(changedType.assetTypeChanged, true)
+      assert.equal(changedType.assetType, differentType)
+
+      const imageAgain = apply(sameTypeReturnsToImages, { kind: 'select_method', candidateKind: 'image_pack' })
+      assert.equal(imageAgain.candidateKind, 'image_pack')
+      assert.equal(imageAgain.assetTypeChanged, false)
+      assert.deepEqual(authoredState, { ...authoredState }, 'leaving and returning without a reset preserves authored state')
+    }
+  }
+
+  const methodFieldStart = source.indexOf('<fieldset aria-label="Reference creation method"')
+  const methodFieldEnd = source.indexOf('</fieldset>', methodFieldStart)
+  const methodField = source.slice(methodFieldStart, methodFieldEnd)
+  assert.doesNotMatch(methodField, /<details|<summary/)
+  assert.equal(methodField.match(/type="button"/g)?.length, 2)
+  assert.match(methodField, /aria-pressed=\{candidateKind === 'image_pack'\}/)
+  assert.match(methodField, /aria-pressed=\{candidateKind === 'blender_motion'\}/)
+  assert.match(source, /id="project-reference-blender-motion-method"[\s\S]*?hidden=\{creationPanelStates\.blender_motion\.hidden\}[\s\S]*?inert=\{creationPanelStates\.blender_motion\.inert\}/)
+  assert.match(source, /id="project-reference-image-pack-method"[\s\S]*?hidden=\{creationPanelStates\.image_pack\.hidden\}[\s\S]*?inert=\{creationPanelStates\.image_pack\.inert\}/)
+  assert.doesNotMatch(source, /candidateKind === 'blender_motion' \? \(/)
+  assert.equal(source.match(/<BlenderSceneTool/g)?.length, 1)
+  assert.match(source, /setCandidateKind\('image_pack'\)[\s\S]*?setAssetType\('character'\)/)
+  assert.equal(source.match(/setCandidateKind\('image_pack'\)/g)?.length, 2, 'only project and lock resets canonicalize the method')
+  assert.match(source, /setCandidateKind\(transition\.candidateKind\)\s+if \(!transition\.assetTypeChanged\) return/)
+  assert.match(source, /The visual fidelity reviewer checks identity, anatomy, layout, style adherence, and retry quality\./)
+  assert.match(source, /It does not classify or censor content or decide whether a request is allowed\./)
 })
 
 test('Reference and Director expose style, skill, flow, and truthful Blender choices', async () => {

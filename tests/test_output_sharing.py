@@ -136,9 +136,20 @@ class OutputShareRouteContractTests(unittest.TestCase):
         self.assertIn("_require_authorized_output(\n                request, workspace, name,", self.source)
         self.assertIn("with _reserve_workspace_operations(workspace):", self.source)
         self.assertIn("with _output_lineage_mutation_guard(out_dir):", self.source)
-        self.assertIn('request.url.path.startswith("/share/")', self.source)
-        self.assertIn('request.state.maestro_session_id = ""', self.source)
-        self.assertIn("return await call_next(request)", self.source)
+        capability_start = self.source.index("    capability_read = ")
+        capability_read = self.source[
+            capability_start:self.source.index(
+                "    secret = _session_secret()", capability_start,
+            )
+        ]
+        self.assertIn('request.url.path.startswith("/share/")', capability_read)
+        self.assertIn('request.state.maestro_session_id = ""', capability_read)
+        self.assertIn('request.state.maestro_account_session_id = ""', capability_read)
+        self.assertIn(
+            "return await _call_next_with_recovery_no_store(request, call_next)",
+            capability_read,
+        )
+        self.assertNotIn("_set_maestro_session_cookie", capability_read)
 
     def test_bearer_has_dedicated_read_only_routes_and_no_metadata_endpoint(self):
         self.assertIn('@api.get("/share/{token}"', self.source)

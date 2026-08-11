@@ -7,6 +7,9 @@ import { build } from 'esbuild'
 const uiRoot = new URL('..', import.meta.url)
 const storeUrl = new URL('../src/stores/useStore.ts', import.meta.url)
 const mainUrl = new URL('../src/components/MainContent/MainContent.tsx', import.meta.url)
+const generateButtonUrl = new URL('../src/components/Sidebar/GenerateButton.tsx', import.meta.url)
+const navigationUrl = new URL('../src/lib/mainViewNavigation.ts', import.meta.url)
+const queueProjectionUrl = new URL('../src/lib/queueProjection.ts', import.meta.url)
 
 function asDataModule(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
@@ -60,7 +63,7 @@ async function loadJobPlaceholder() {
           if (args.path === 'react') {
             return { contents: `
               export const useCallback = callback => callback
-              export const useEffect = () => {}
+              export const useEffect = callback => globalThis.__resourceWaitEffects?.push(callback)
               export const useId = () => 'resource-wait-id'
               export const useLayoutEffect = () => {}
               export const useMemo = callback => callback()
@@ -97,6 +100,8 @@ async function loadJobPlaceholder() {
               const record = (name, ...args) => globalThis.__resourceWaitApiCalls?.push([name, ...args])
               export const isBackendJobId = jobId => /^[0-9a-f]{8}$/i.test(jobId)
               export const fetchJobLog = async () => ({ events: [] })
+              export const fetchProjectAssets = async project => globalThis.__resourceWaitFetchProjectAssets?.(project) ?? []
+              export const projectReferenceJobQualitySummary = (assets, jobId) => globalThis.__resourceWaitSummarizeQuality?.(assets, jobId) ?? null
               export const resumeQueue = async () => record('resumeQueue'), pauseQueueAfterOutput = async value => record('pauseQueueAfterOutput', value), setQueueOutputCount = async (id, value) => record('setQueueOutputCount', id, value), startQueueJobNext = async id => record('startQueueJobNext', id), setQueuePriority = async (id, value) => record('setQueuePriority', id, value), resumeQueueJob = async id => record('resumeQueueJob', id), holdQueueJob = async id => record('holdQueueJob', id)
             ` }
           }
@@ -118,6 +123,50 @@ async function loadJobPlaceholder() {
         })
       },
     }],
+  })
+  return import(asDataModule(result.outputFiles[0].text))
+}
+
+async function loadGenerateButton() {
+  const result = await build({
+    entryPoints: [generateButtonUrl.pathname],
+    bundle: true,
+    format: 'esm',
+    jsx: 'automatic',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+    plugins: [{
+      name: 'generate-button-runtime',
+      setup(bundle) {
+        bundle.onResolve({ filter: /^react$/ }, () => ({ path: 'react', namespace: 'generate-button' }))
+        bundle.onResolve({ filter: /^react\/jsx-runtime$/ }, () => ({ path: 'jsx-runtime', namespace: 'generate-button' }))
+        bundle.onResolve({ filter: /^lucide-react$/ }, () => ({ path: 'lucide', namespace: 'generate-button' }))
+        bundle.onResolve({ filter: /stores\/useStore$/ }, () => ({ path: 'store', namespace: 'generate-button' }))
+        bundle.onResolve({ filter: /H3PerformanceProfiles$/ }, () => ({ path: 'h3', namespace: 'generate-button' }))
+        bundle.onLoad({ filter: /.*/, namespace: 'generate-button' }, args => {
+          if (args.path === 'react') return { contents: 'export const useEffect = () => {}; export const useState = initial => [initial, () => {}]' }
+          if (args.path === 'jsx-runtime') return { contents: 'export const jsx = (type, props, key) => ({ type, key, props: props || {} }); export const jsxs = jsx' }
+          if (args.path === 'lucide') return { contents: "export const Play = 'Play', AlertTriangle = 'AlertTriangle'" }
+          if (args.path === 'h3') return { contents: 'export const H3EstimateBadge = () => null' }
+          return { contents: 'export const useStore = selector => selector(globalThis.__resourceWaitStore)' }
+        })
+      },
+    }],
+  })
+  return import(asDataModule(result.outputFiles[0].text))
+}
+
+async function loadMainViewNavigation() {
+  const result = await build({
+    entryPoints: [navigationUrl.pathname],
+    bundle: true,
+    format: 'esm',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
   })
   return import(asDataModule(result.outputFiles[0].text))
 }
@@ -325,25 +374,31 @@ test('status, jobs, and queue mappings preserve plan-terms wait and owner child 
     queue_wait_reason: 'waiting_for_plan_terms',
     plan_review_terms_required: true,
     parent_job_id: 'reference-parent',
+    logical_job_kind: 'reference_pack_child',
   })
   const fromQueue = _queueJobDetails({
     status: 'waiting_for_plan_approval',
     wait_reason: 'waiting_for_plan_terms',
     plan_review_terms_required: true,
     parent_job_id: 'reference-parent',
+    logical_job_kind: 'reference_pack_child',
   })
 
   assert.equal(fromStatusOrJobs.queueWaitReason, 'waiting_for_plan_terms')
   assert.equal(fromStatusOrJobs.planReviewTermsRequired, true)
   assert.equal(fromStatusOrJobs.parentJobId, 'reference-parent')
+  assert.equal(fromStatusOrJobs.logicalJobKind, 'reference_pack_child')
   assert.equal(fromQueue.queueWaitReason, 'waiting_for_plan_terms')
   assert.equal(fromQueue.planReviewTermsRequired, true)
   assert.equal(fromQueue.parentJobId, 'reference-parent')
+  assert.equal(fromQueue.logicalJobKind, 'reference_pack_child')
 
   const legacyStatus = _jobStatusDetails({ status: 'queued', queue_wait_reason: 'waiting_for_turn' })
   const legacyQueue = _queueJobDetails({ status: 'queued', wait_reason: 'waiting_for_turn' })
   assert.equal(Object.hasOwn(legacyStatus, 'parentJobId'), false)
   assert.equal(Object.hasOwn(legacyQueue, 'parentJobId'), false)
+  assert.equal(Object.hasOwn(legacyStatus, 'logicalJobKind'), false)
+  assert.equal(Object.hasOwn(legacyQueue, 'logicalJobKind'), false)
 })
 
 test('status mappings preserve terminal Reference child correlation and allowlist failure details', async () => {
@@ -478,6 +533,182 @@ test('backend job cards expose a compact accessible copy control for the Job ID'
   const copiedTree = copyable.type(copyable.props)
   assert.match(elementText(copiedTree), /Job IDfaceb00cCopied/)
   assert.match(elementText(copiedTree), /Job ID faceb00c copied/)
+})
+
+test('Reference queue card presents recommended fidelity without exposing private reviewer text', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const tree = JobPlaceholder({
+    job: {
+      id: 'faceb00c',
+      status: 'completed',
+      progress: 1,
+      step: 1,
+      totalSteps: 1,
+      phase: '',
+      message: 'Reference packs ready',
+      outputFiles: ['opaque-output'],
+      error: null,
+      logicalJobKind: 'reference_pack_parent',
+      workspace: 'project',
+    },
+    referenceQuality: {
+      candidateCount: 2,
+      variantLabel: 'Candidate 2',
+      presentation: {
+        stateLabel: 'Fidelity review deferred',
+        gradeLabel: 'Ungraded',
+        scoreLabel: null,
+        residualSummary: null,
+        correctionAvailable: false,
+        recommended: true,
+        preliminary: true,
+        notice: 'This candidate remains usable; compare it yourself until fidelity review is available.',
+        tone: 'deferred',
+      },
+    },
+    onStop() {},
+    onDismiss() {},
+  })
+  const text = elementText(tree)
+  assert.match(text, /Reference packs ready/)
+  assert.doesNotMatch(text, /Overall ETA/)
+  assert.match(text, /Recommended · Fidelity review deferred · Ungraded/)
+  assert.match(text, /Preliminary recommendation · ungraded/)
+  assert.match(text, /remains usable/)
+  assert.match(text, /2 candidates remain available in Reference/)
+  assert.doesNotMatch(text, /provider|exception|private|commitment/i)
+
+  const residualTree = JobPlaceholder({
+    job: {
+      id: 'faceb00d', status: 'completed', progress: 1, step: 1, totalSteps: 1,
+      phase: '', message: 'Reference packs ready', outputFiles: ['opaque-output'], error: null,
+      logicalJobKind: 'reference_pack_parent', workspace: 'project',
+    },
+    referenceQuality: {
+      candidateCount: 1,
+      variantLabel: 'Candidate 1',
+      presentation: {
+        stateLabel: 'Fidelity reviewed',
+        gradeLabel: 'Minor residuals',
+        scoreLabel: '83.5%',
+        residualSummary: 'Differences: style, identity',
+        correctionAvailable: true,
+        recommended: true,
+        preliminary: false,
+        notice: 'This candidate remains usable; review the noted differences before keeping it.',
+        tone: 'residual',
+      },
+    },
+    onStop() {},
+    onDismiss() {},
+  })
+  const residualText = elementText(residualTree)
+  assert.match(residualText, /Recommended · Fidelity reviewed · Minor residuals · 83\.5%/)
+  assert.match(residualText, /Differences: style, identity/)
+  assert.match(residualText, /Structured correction guidance is available/)
+  assert.match(residualText, /remains usable/)
+
+  const source = await readFile(mainUrl, 'utf8')
+  assert.match(source, /job\.logicalJobKind === 'reference_pack_parent'[\s\S]*?job\.status === 'completed'/)
+  assert.match(source, /api\.fetchProjectAssets\(project\)/)
+  assert.match(source, /api\.projectReferenceJobQualitySummary\(/)
+  assert.doesNotMatch(source, /quality\.warning|rendered_brief|private_authored_settings/)
+})
+
+test('Reference queue quality lookup is terminal-only, project-deduplicated, fenced, and nonfatal', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  const previousEffects = globalThis.__resourceWaitEffects
+  const previousUpdates = globalThis.__resourceWaitStateUpdates
+  const previousFetch = globalThis.__resourceWaitFetchProjectAssets
+  const previousSummarize = globalThis.__resourceWaitSummarizeQuality
+  t.after(() => {
+    globalThis.__resourceWaitStore = previousStore
+    globalThis.__resourceWaitEffects = previousEffects
+    globalThis.__resourceWaitStateUpdates = previousUpdates
+    globalThis.__resourceWaitFetchProjectAssets = previousFetch
+    globalThis.__resourceWaitSummarizeQuality = previousSummarize
+  })
+
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    resumeJobRecovery() {},
+    retryJobRecovery() {},
+    openH3PlanReview() {},
+    h3PlanReviewError: null,
+  }
+  const deferred = () => {
+    let resolve
+    let reject
+    const promise = new Promise((accept, decline) => { resolve = accept; reject = decline })
+    return { promise, resolve, reject }
+  }
+  const makeQueueCardJob = (id, status, logicalJobKind, workspace) => ({
+    id, status, logicalJobKind, workspace,
+    progress: status === 'completed' ? 1 : 0,
+    step: 0, totalSteps: 0, phase: '', message: '', outputFiles: [], error: null,
+  })
+  const jobs = [
+    makeQueueCardJob('complete-a1', 'completed', 'reference_pack_parent', 'project-a'),
+    makeQueueCardJob('complete-a2', 'completed', 'reference_pack_parent', 'project-a'),
+    makeQueueCardJob('complete-b1', 'completed', 'reference_pack_parent', 'project-b'),
+    makeQueueCardJob('running-a', 'running', 'reference_pack_parent', 'project-a'),
+    makeQueueCardJob('ordinary-a', 'completed', undefined, 'project-a'),
+  ]
+  const fetches = []
+  const firstA = deferred()
+  const firstB = deferred()
+  globalThis.__resourceWaitFetchProjectAssets = project => {
+    fetches.push(project)
+    return project === 'project-a' ? firstA.promise : firstB.promise
+  }
+  globalThis.__resourceWaitSummarizeQuality = (assets, jobId) => assets.length > 0
+    ? { candidateCount: 1, variantLabel: jobId, presentation: { tone: 'pass' } }
+    : null
+  globalThis.__resourceWaitEffects = []
+  globalThis.__resourceWaitStateUpdates = []
+
+  const { QueuePanel } = await loadJobPlaceholder()
+  QueuePanel({ jobs, onStop() {}, onDismiss() {}, queue: null, queueError: null, async refreshQueue() {} })
+  assert.equal(globalThis.__resourceWaitEffects.length, 1)
+  const staleCleanup = globalThis.__resourceWaitEffects[0]()
+  assert.deepEqual(fetches, ['project-a', 'project-b'], 'two jobs in one project share one authorized asset fetch')
+  assert.equal(fetches.includes('running-a'), false)
+  staleCleanup()
+  firstA.resolve([{ project: 'a' }])
+  firstB.resolve([{ project: 'b' }])
+  await Promise.all([firstA.promise, firstB.promise])
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(globalThis.__resourceWaitStateUpdates, [], 'cleanup fences every late result')
+
+  const secondA = deferred()
+  const secondB = deferred()
+  fetches.length = 0
+  globalThis.__resourceWaitFetchProjectAssets = project => {
+    fetches.push(project)
+    return project === 'project-a' ? secondA.promise : secondB.promise
+  }
+  globalThis.__resourceWaitEffects = []
+  globalThis.__resourceWaitStateUpdates = []
+  QueuePanel({ jobs, onStop() {}, onDismiss() {}, queue: null, queueError: null, async refreshQueue() {} })
+  const currentCleanup = globalThis.__resourceWaitEffects[0]()
+  secondA.resolve([{ project: 'a' }])
+  secondB.reject(new Error('PRIVATE_ASSET_FETCH_FAILURE'))
+  await Promise.allSettled([secondA.promise, secondB.promise])
+  await Promise.resolve()
+  await Promise.resolve()
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(globalThis.__resourceWaitStateUpdates.length, 1)
+  assert.deepEqual(Object.keys(globalThis.__resourceWaitStateUpdates[0]).sort(), ['complete-a1', 'complete-a2'])
+  assert.deepEqual(fetches, ['project-a', 'project-b'])
+  currentCleanup()
 })
 
 test('Reference parent failure renders only allowlisted child diagnostics', async t => {
@@ -941,7 +1172,7 @@ test('owner queue row renders the exact plan-terms wait reason', async t => {
   assert.match(elementText(tree), /Awaiting plan review · Waiting for required model terms/)
 })
 
-test('Reference parent projects only an ordinary live child and scheduler controls keep exact targets', async t => {
+test('Reference logical queue folds physical children while controls retain exact scheduler and cancel targets', async t => {
   const previousStore = globalThis.__resourceWaitStore
   const previousCalls = globalThis.__resourceWaitApiCalls
   const calls = []
@@ -996,12 +1227,12 @@ test('Reference parent projects only an ordinary live child and scheduler contro
     pause_after_current: false,
     summary: {
       running: 0,
-      waiting: 2,
+      waiting: 37,
       held: 0,
       registering: 0,
       preparing: 0,
       approval_waiting: 0,
-      active_total: 2,
+      active_total: 37,
     },
   }
   const render = (jobs, queueJobs) => QueuePanel({
@@ -1020,20 +1251,47 @@ test('Reference parent projects only an ordinary live child and scheduler contro
     intent: 'text',
   }
   const parent = makeJob('reference-parent', undefined, {
-    message: 'Orchestrating reference pack',
+    message: 'Public parent label that does not match its child',
     resourceDescriptor: parentDescriptor,
+    logicalJobKind: 'reference_pack_parent',
   })
-  const child = makeJob('reference-child', parent.id, { resourceDescriptor: parentDescriptor })
-  const parentQueue = makeQueueJob(parent.id, { resource_descriptor: parentDescriptor })
-  const childQueue = makeQueueJob(child.id)
-  const projectedTree = render([parent, child], [parentQueue, childQueue])
+  const child = makeJob('reference-child', parent.id, {
+    message: 'Unrelated internal scheduler label',
+    resourceDescriptor: descriptor,
+    logicalJobKind: 'reference_pack_child',
+  })
+  const parentQueue = makeQueueJob(parent.id, {
+    resource_descriptor: parentDescriptor,
+    logical_job_kind: 'reference_pack_parent',
+  })
+  const childQueue = makeQueueJob(child.id, {
+    parent_job_id: parent.id,
+    logical_job_kind: 'reference_pack_child',
+  })
+  // The backend public jobs response suppresses this ordinary child, while
+  // the authorized queue response retains it as the scheduler target.
+  const projectedTree = render([parent], [parentQueue, childQueue])
   const projectedElements = flattenElements(projectedTree)
   const duplicateSuppressed = projectedElements.filter(element => element.type === JobPlaceholder)
   assert.equal(duplicateSuppressed.length, 1)
   assert.equal(duplicateSuppressed[0].props.job.id, parent.id)
-  assert.equal(duplicateSuppressed[0].props.job.message, 'Orchestrating reference pack')
+  assert.equal(duplicateSuppressed[0].props.job.message, 'Public parent label that does not match its child')
   assert.match(elementText(projectedTree), /GPU generation queued/)
   assert.match(elementText(projectedTree), /ETA 2m · current task 30s/)
+  assert.match(elementText(projectedTree), /0 running · 0 preparing · 0 awaiting review · 1 waiting/)
+  assert.doesNotMatch(elementText(projectedTree), /37 waiting|37 active/)
+  assert.match(elementText(projectedTree), /Waiting in queue/)
+  assert.doesNotMatch(elementText(projectedTree), /2 of 1|1 job ahead/)
+  const mainSource = await readFile(mainUrl, 'utf8')
+  assert.match(mainSource, /ETA \{compactEta\(currentEtaSeconds\)\}/)
+  assert.match(mainSource, /currentSubtaskEtaSeconds != null \? ` · task \$\{compactEta\(currentSubtaskEtaSeconds\)\}`/)
+  assert.doesNotMatch(mainSource, /ETA \{compactEta\(currentJob\.etaSeconds\)\}/)
+
+  assert.equal(
+    renderCards([parent, child], [parentQueue, childQueue]).length,
+    1,
+    'a reconnect response that still includes the marked child must project identically',
+  )
 
   projectedElements.find(element => element.props?.title === 'Raise priority')?.props.onClick()
   projectedElements.find(element => elementText(element) === 'Hold')?.props.onClick()
@@ -1044,22 +1302,44 @@ test('Reference parent projects only an ordinary live child and scheduler contro
     ['stop', parent.id],
   ])
 
-  const visibleCases = [
+  const foldedCases = [
     ['held', parent, child, { ...childQueue, held: true }],
     ['hold-after-output', parent, child, { ...childQueue, hold_after_output: true }],
-    ['resource-blocked-live-row', parent, child, { ...childQueue, resource_descriptor: { ...descriptor, state: 'blocked' } }],
-    ['recovery-actionable', parent, makeJob(child.id, parent.id, { recoveryActionable: true }), { ...childQueue, recovery_actionable: true }],
-    ['recovery-state-blocked', parent, makeJob(child.id, parent.id, { recoveryState: 'blocked_preparation' }), { ...childQueue, recovery_state: 'blocked_preparation' }],
-    ['recovery-interrupted', parent, makeJob(child.id, parent.id, { recoveryState: 'interrupted', recoveryInterrupted: true }), { ...childQueue, recovery_state: 'interrupted', recovery_interrupted: true }],
-    ['recovery-actions-live-row', parent, child, { ...childQueue, recovery_actions: ['retry'] }],
-    ['terminal-parent', makeJob(parent.id, undefined, { status: 'completed' }), child, childQueue],
-    ['terminal-child', parent, makeJob(child.id, parent.id, { status: 'completed' }), childQueue],
+    ['terminal-parent', { ...parent, status: 'completed' }, child, childQueue],
+    ['terminal-child', parent, { ...child, status: 'completed' }, childQueue],
   ]
-  for (const [label, candidateParent, candidateChild, candidateQueue] of visibleCases) {
+  for (const [label, candidateParent, candidateChild, candidateQueue] of foldedCases) {
     assert.equal(
       renderCards([candidateParent, candidateChild], [parentQueue, candidateQueue]).length,
+      1,
+      `${label} child remains an internal projection`,
+    )
+  }
+
+  const cancelledChild = { ...child, status: 'cancelled' }
+  assert.equal(
+    renderCards([parent, cancelledChild], [parentQueue]).length,
+    1,
+    'a terminal child omitted from the live queue must not reappear during the cancel race',
+  )
+  assert.equal(
+    renderCards([{ ...parent, status: 'cancelled' }, child], [childQueue]).length,
+    1,
+    'a cancelled public parent remains the monotonic card even while its child row is briefly live',
+  )
+
+  const actionableCases = [
+    ['resource-blocked-live-row', child, { ...childQueue, resource_descriptor: { ...descriptor, state: 'blocked' } }],
+    ['recovery-actionable', { ...child, recoveryActionable: true }, { ...childQueue, recovery_actionable: true }],
+    ['recovery-state-blocked', { ...child, recoveryState: 'blocked_preparation' }, { ...childQueue, recovery_state: 'blocked_preparation' }],
+    ['recovery-interrupted', { ...child, recoveryState: 'interrupted', recoveryInterrupted: true }, { ...childQueue, recovery_state: 'interrupted', recovery_interrupted: true }],
+    ['recovery-actions-live-row', child, { ...childQueue, recovery_actions: ['retry'] }],
+  ]
+  for (const [label, candidateChild, candidateQueue] of actionableCases) {
+    assert.equal(
+      renderCards([parent, candidateChild], [parentQueue, candidateQueue]).length,
       2,
-      `${label} child must retain its own actionable card`,
+      `${label} child requires its own actionable card`,
     )
   }
 
@@ -1069,7 +1349,7 @@ test('Reference parent projects only an ordinary live child and scheduler contro
     failedChildStatus: 'failed',
     failedChildReason: 'reference_child_failed',
   })
-  const failedChild = makeJob(child.id, parent.id, { status: 'failed' })
+  const failedChild = { ...child, status: 'failed' }
   const correlatedCards = renderCards(
     [correlatedFailedParent, failedChild],
     [parentQueue, childQueue],
@@ -1077,11 +1357,23 @@ test('Reference parent projects only an ordinary live child and scheduler contro
   assert.equal(correlatedCards.length, 1, 'correlated terminal child should not create a duplicate failed card')
   assert.equal(correlatedCards[0].props.job.id, parent.id)
 
-  const actionableFailedChild = makeJob(child.id, parent.id, {
+  const uncorrelatedFailedParent = {
+    ...parent,
+    status: 'failed',
+    failedChildJobId: 'different-child',
+  }
+  assert.equal(
+    renderCards([uncorrelatedFailedParent, failedChild], [parentQueue]).length,
+    2,
+    'a failed child remains visible unless the parent carries its exact reverse correlation',
+  )
+
+  const actionableFailedChild = {
+    ...failedChild,
     status: 'failed',
     recoveryActionable: true,
     recoveryActions: ['retry'],
-  })
+  }
   assert.equal(
     renderCards([correlatedFailedParent, actionableFailedChild], [parentQueue, childQueue]).length,
     2,
@@ -1095,9 +1387,127 @@ test('Reference parent projects only an ordinary live child and scheduler contro
   const legacyVisible = renderCards([makeJob('legacy-child')], [makeQueueJob('legacy-child')])
   assert.equal(legacyVisible.length, 1)
 
+  const legacyParent = makeJob('legacy-parent', undefined, { resourceDescriptor: parentDescriptor })
+  const legacyChild = makeJob('legacy-child-with-parent', legacyParent.id, { resourceDescriptor: descriptor })
+  assert.equal(
+    renderCards(
+      [legacyParent, legacyChild],
+      [makeQueueJob(legacyParent.id), makeQueueJob(legacyChild.id, { parent_job_id: legacyParent.id })],
+    ).length,
+    2,
+    'legacy text/non-text resource hints are not exact enough to fold an unmarked relation',
+  )
+
+  const legacyFailedParent = makeJob('legacy-failed-parent', undefined, {
+    status: 'failed',
+    failedChildJobId: 'legacy-failed-child',
+  })
+  const legacyFailedChild = makeJob('legacy-failed-child', legacyFailedParent.id, { status: 'failed' })
+  assert.equal(
+    renderCards([legacyFailedParent, legacyFailedChild], []).length,
+    1,
+    'legacy terminal reverse correlation remains exact evidence for folding the child',
+  )
+
+  assert.equal(
+    renderCards(
+      [parent, child],
+      [parentQueue, { ...childQueue, logical_job_kind: 'reference_pack_parent' }],
+    ).length,
+    2,
+    'conflicting public and queue markers fail closed instead of folding',
+  )
+
   const unrelatedParentVisible = renderCards(
     [makeJob('other-parent'), child],
     [makeQueueJob('other-parent'), childQueue],
   )
   assert.equal(unrelatedParentVisible.length, 2)
+
+  const projectionSource = await readFile(queueProjectionUrl, 'utf8')
+  assert.doesNotMatch(projectionSource, /resourceIntent|intent === 'text'|intent !== 'text'/)
+  assert.match(projectionSource, /publicKind !== undefined && queueKind !== undefined && publicKind !== queueKind/)
+})
+
+test('Generate count uses the same logical Reference projection as queue cards', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+  const textDescriptor = { ...descriptor, intent: 'text' }
+  globalThis.__resourceWaitStore = {
+    jobs: [{
+      id: 'reference-parent',
+      status: 'queued',
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: '',
+      message: 'First visible label',
+      outputFiles: [],
+      error: null,
+      resourceDescriptor: textDescriptor,
+      logicalJobKind: 'reference_pack_parent',
+    }, {
+      id: 'reference-child',
+      parentJobId: 'reference-parent',
+      status: 'running',
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: '',
+      message: 'Different physical label',
+      outputFiles: [],
+      error: null,
+      resourceDescriptor: descriptor,
+      logicalJobKind: 'reference_pack_child',
+    }],
+    startGeneration() {},
+    setSidebarOpen() {},
+    modelOptionsLoading: false,
+    activeWorkspace: 'project',
+    models: [],
+    params: { model_type: 'model', custom_settings: {} },
+    hostTerms: {},
+    generationMode: 'video',
+    modelOptions: null,
+    h3CurrentEstimate: null,
+    h3EstimateLoading: false,
+    h3PerformanceProfiles: [],
+    startImage: null,
+    editSubMode: null,
+    editVideoPath: null,
+    outpaintVideoBox: { x: 0, y: 0, w: 1, h: 1 },
+  }
+
+  const { GenerateButton } = await loadGenerateButton()
+  assert.match(elementText(GenerateButton()), /Go \(1\)/)
+  assert.doesNotMatch(elementText(GenerateButton()), /Go \(2\)/)
+})
+
+test('Reference queue navigation uses one payload-free event with exact cleanup', async t => {
+  const previousWindow = globalThis.window
+  const testWindow = new EventTarget()
+  globalThis.window = testWindow
+  t.after(() => { globalThis.window = previousWindow })
+
+  const { OPEN_QUEUE_VIEW_EVENT, requestQueueView, subscribeQueueView } = await loadMainViewNavigation()
+  const seen = []
+  const listener = event => seen.push(event)
+  const cleanupFirst = subscribeQueueView(listener)
+  const cleanupDuplicate = subscribeQueueView(listener)
+
+  requestQueueView()
+  requestQueueView()
+  assert.equal(seen.length, 2, 'the browser de-duplicates the identical listener registration')
+  assert.ok(seen.every(event => event.type === OPEN_QUEUE_VIEW_EVENT))
+  assert.ok(seen.every(event => !('detail' in event)), 'the navigation event carries no job or content payload')
+
+  cleanupFirst()
+  requestQueueView()
+  assert.equal(seen.length, 2, 'cleanup removes the exact registered listener')
+  cleanupDuplicate()
+
+  const mainSource = await readFile(mainUrl, 'utf8')
+  assert.match(mainSource, /const openQueue = \(\) => setMainView\('queue'\)/)
+  assert.match(mainSource, /return subscribeQueueView\(openQueue\)/)
+  assert.match(mainSource, /if \(newActiveJob && openQueueAfterSubmit\) setMainView\('queue'\)/)
 })

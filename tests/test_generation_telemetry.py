@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
 from types import SimpleNamespace
 import unittest
 
@@ -273,9 +274,14 @@ class GenerationTelemetryTests(unittest.TestCase):
             main.index("function JobPlaceholder"):
             main.index("function queueSummaryLabel")
         ]
+        eta_guard = re.search(
+            r"\{\s*!isFailed\s*&&\s*!recoveryBlocked\s*&&\s*"
+            r"job\.status\s*!==\s*['\"]completed['\"]\s*&&\s*\(",
+            placeholder,
+        )
+        self.assertIsNotNone(eta_guard)
         eta_render = placeholder[
-            placeholder.index("{!isFailed && !recoveryBlocked && ("):
-            placeholder.index("{recoveryBlocked && (")
+            eta_guard.start():placeholder.index("{recoveryBlocked && (")
         ]
         status_mapper = store[
             store.index("function _jobStatusDetails"):
@@ -305,6 +311,7 @@ class GenerationTelemetryTests(unittest.TestCase):
             "Estimated time ${compactEta(queuedH3Runtime)} after start",
             eta_render,
         )
+        self.assertIn("job.status !== 'completed'", eta_render)
         self.assertIn(
             "Planned time ${compactEta(queuedH3Runtime)} after start",
             eta_render,

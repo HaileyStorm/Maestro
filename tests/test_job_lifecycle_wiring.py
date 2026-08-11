@@ -785,16 +785,36 @@ class TestJobLifecycleWiring(unittest.TestCase):
         self.assertEqual(remote["queue_residency_bypass_count"], 1)
         self.assertEqual(remote["queue_residency_bypassed_waiters"], 1)
 
-    def test_queue_endpoint_returns_global_counts_but_only_owner_rows(self):
+    def test_queue_endpoint_counts_only_authorized_logical_rows(self):
+        import sys
+        app_dir = os.path.join(_ROOT, "app")
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        from services import job_lifecycle as lifecycle
+
         owner_job = {
             "id": "owner-job", "status": "queued", "session_id": "owner",
             "queue_priority": 0, "output_files": [],
+            "resource_intent": "text",
+            "logical_job_kind": "reference_pack_parent",
+            "params": {"reference_pack": {"schema_version": 2}},
+        }
+        child_job = {
+            "id": "owner-child", "status": "queued", "session_id": "owner",
+            "queue_priority": 0, "output_files": [],
+            "resource_intent": "generation",
+            "logical_job_kind": "reference_pack_child",
+            "parent_job_id": "owner-job",
         }
         other_job = {
             "id": "other-job", "status": "running", "session_id": "other",
             "queue_priority": 0, "output_files": [],
         }
-        states = {id(owner_job): dict(owner_job), id(other_job): dict(other_job)}
+        states = {
+            id(owner_job): dict(owner_job),
+            id(child_job): dict(child_job),
+            id(other_job): dict(other_job),
+        }
         summary = {
             "running": 1, "waiting": 1, "held": 0, "registering": 0,
             "active_total": 2,
@@ -803,10 +823,12 @@ class TestJobLifecycleWiring(unittest.TestCase):
             "paused": False,
             "pause_after_current": False,
             "summary": summary,
-            "positions": {id(owner_job): 1},
+            # Global ordinal gaps must be renumbered after owner fencing.
+            "positions": {id(other_job): 1, id(child_job): 8},
             "states": states,
             "wait_reasons": {
                 id(owner_job): "waiting_for_other_user",
+                id(child_job): "waiting_for_other_user",
                 id(other_job): "running",
             },
         }
@@ -824,18 +846,31 @@ class TestJobLifecycleWiring(unittest.TestCase):
                 "api": fake_api,
                 "Request": object,
                 "Response": object,
-                "_jobs": {"owner-job": owner_job, "other-job": other_job},
+                "_jobs": {
+                    "owner-job": owner_job,
+                    "owner-child": child_job,
+                    "other-job": other_job,
+                },
                 "_require_remote_queue_project": require_remote_project,
                 "queue_scheduler_snapshot": scheduler_snapshot,
                 "_job_owned_by_request": lambda job, request: (
                     job.get("session_id") == request.state.maestro_session_id
                 ),
                 "_job_eta_values": lambda _job: (None, None),
+                "_queue_wait_reason_for_job": lambda _job: (
+                    "waiting_for_other_user"
+                ),
                 "_queue_recovery_is_blocked": lambda _job: False,
                 "_public_queue_residency_metadata": lambda *_args, **_kwargs: {},
                 "_public_queue_recovery_metadata": lambda *_args, **_kwargs: {},
                 "_public_resource_metadata": lambda *_args, **_kwargs: {},
                 "_public_parent_job_id": lambda _job: None,
+                "_public_logical_job_kind": lambda job: job.get(
+                    "logical_job_kind"
+                ),
+                "authorized_logical_queue_projection": (
+                    lifecycle.authorized_logical_queue_projection
+                ),
                 "_set_recovery_no_store": lambda response: (
                     response.headers.update({
                         "Cache-Control": "private, no-store",
@@ -854,19 +889,33 @@ class TestJobLifecycleWiring(unittest.TestCase):
         self.assertEqual(call_order, ["gate", "snapshot"])
         require_remote_project.assert_called_once()
         self.assertEqual(response["summary"], {
-            **summary,
+            "running": 0,
+            "waiting": 1,
+            "held": 0,
+            "registering": 0,
+            "preparing": 0,
+            "approval_waiting": 0,
+            "active_total": 1,
             "cpu_text_running": 0,
-            "cpu_text_waiting": 0,
+            "cpu_text_waiting": 1,
         })
         self.assertEqual(response["summary"]["active_total"], sum(
             response["summary"][name]
             for name in ("running", "waiting", "held", "registering")
         ))
-        self.assertEqual([job["job_id"] for job in response["jobs"]], ["owner-job"])
+        self.assertEqual(
+            {job["job_id"] for job in response["jobs"]},
+            {"owner-job", "owner-child"},
+        )
+        self.assertEqual(response["total"], 1)
         self.assertEqual(
             response_headers.headers["Cache-Control"], "private, no-store",
         )
-        self.assertEqual(response["jobs"][0]["position"], 1)
+        child_row = next(
+            item for item in response["jobs"]
+            if item["job_id"] == "owner-child"
+        )
+        self.assertEqual(child_row["position"], 1)
         self.assertGreaterEqual(
             response["summary"]["waiting"],
             max(job["position"] for job in response["jobs"] if job["position"]),
@@ -900,6 +949,279 @@ class TestJobLifecycleWiring(unittest.TestCase):
             )
         snapshot.assert_not_called()
 
+    def test_jobs_endpoint_folds_children_before_count_and_pagination(self):
+        import sys
+        app_dir = os.path.join(_ROOT, "app")
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        from services import job_lifecycle as lifecycle
+
+        def make_job(job_id, status, created_at, **updates):
+            value = {
+                "id": job_id, "status": status, "created_at": created_at,
+                "session_id": "owner", "progress": 0,
+                "message": status, "output_files": [], "error": None,
+                "params": {},
+            }
+            value.update(updates)
+            return value
+
+        parent = make_job(
+            "reference-parent", "running", 1,
+            logical_job_kind="reference_pack_parent",
+            resource_intent="text",
+            params={"reference_pack": {"schema_version": 2}},
+        )
+        live_child = make_job(
+            "reference-live-child", "queued", 2,
+            logical_job_kind="reference_pack_child",
+            resource_intent="generation", parent_job_id=parent["id"],
+        )
+        cancelled_child = make_job(
+            "reference-cancelled-child", "cancelled", 3,
+            logical_job_kind="reference_pack_child",
+            resource_intent="generation", parent_job_id=parent["id"],
+        )
+        blocked_child = make_job(
+            "reference-blocked-child", "queued", 4,
+            logical_job_kind="reference_pack_child",
+            resource_intent="generation", resource_state="blocked",
+            parent_job_id=parent["id"],
+        )
+        orphan = make_job(
+            "reference-orphan", "cancelled", 5,
+            logical_job_kind="reference_pack_child",
+            resource_intent="generation", parent_job_id="missing-parent",
+        )
+        unauthorized = make_job(
+            "other-session-job", "running", 6, session_id="other",
+        )
+        physical = [
+            parent, live_child, cancelled_child, blocked_child, orphan,
+            unauthorized,
+        ]
+        scheduler = {
+            "states": {id(item): dict(item) for item in physical},
+            "positions": {id(unauthorized): 1, id(live_child): 8},
+        }
+        fake_api = SimpleNamespace(
+            get=lambda *_args, **_kwargs: lambda function: function,
+        )
+        endpoint = _load_isolated_function(
+            "app/launch.py", "list_jobs",
+            {
+                "api": fake_api, "Request": object, "Response": object,
+                "HTTPException": RuntimeError, "math": math,
+                "_jobs": {item["id"]: item for item in physical},
+                "_set_recovery_no_store": lambda _response: None,
+                "queue_scheduler_snapshot": lambda _jobs: scheduler,
+                "_job_owned_by_request": lambda item, request: (
+                    item.get("session_id") == request.state.maestro_session_id
+                ),
+                "authorized_logical_queue_projection": (
+                    lifecycle.authorized_logical_queue_projection
+                ),
+                "snapshot_job": lambda item: dict(item),
+                "_queue_recovery_is_blocked": lambda _item: False,
+                "_job_eta_values": lambda _item: (None, None),
+                "_public_job_prompt_fields": lambda _item: {
+                    "prompt_preview": "", "active_window_prompt": "",
+                },
+                "_public_job_created_at": lambda item: float(item["created_at"]),
+                "public_h3_offload_plan": lambda _value: None,
+                "_public_h3_boundary": lambda _value: None,
+                "queue_position": lambda _item: None,
+                "_queue_wait_reason_for_job": lambda item: (
+                    f"wait:{item['id']}"
+                ),
+                "_public_parent_job_id": lambda item: item.get("parent_job_id"),
+                "_public_logical_job_kind": lambda item: item.get(
+                    "logical_job_kind"
+                ),
+                "_public_failed_child_metadata": lambda *_args: {
+                    "failed_child_job_id": None,
+                    "failed_child_status": None,
+                    "failed_child_reason": None,
+                },
+                "_public_resource_metadata": lambda _item: {},
+                "_public_queue_residency_metadata": lambda *_args, **_kwargs: {},
+                "_public_progress_telemetry": lambda _item: {},
+                "_public_queue_recovery_metadata": lambda _item: {},
+                "job_events": lambda *_args: [],
+                "queue_control_state": lambda: {},
+            },
+        )
+        result = endpoint(
+            SimpleNamespace(state=SimpleNamespace(
+                maestro_session_id="owner", maestro_remote=False,
+            )),
+            SimpleNamespace(headers={}),
+            limit=2,
+            offset=1,
+        )
+
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(
+            [item["job_id"] for item in result["jobs"]],
+            ["reference-blocked-child", "reference-orphan"],
+        )
+        self.assertEqual(result["summary"]["active_total"], 2)
+        self.assertNotIn(
+            "other-session-job",
+            {item["job_id"] for item in result["jobs"]},
+        )
+        full = endpoint(
+            SimpleNamespace(state=SimpleNamespace(
+                maestro_session_id="owner", maestro_remote=False,
+            )),
+            SimpleNamespace(headers={}),
+        )
+        parent_row = next(
+            item for item in full["jobs"]
+            if item["job_id"] == parent["id"]
+        )
+        self.assertEqual(parent_row["queue_position"], 1)
+        self.assertEqual(
+            parent_row["queue_wait_reason"], "wait:reference-live-child",
+        )
+        self.assertNotIn(
+            "reference-live-child",
+            {item["job_id"] for item in full["jobs"]},
+        )
+
+    def test_authorized_reference_child_folds_into_one_logical_queue_root(self):
+        import sys
+        app_dir = os.path.join(_ROOT, "app")
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        from services import job_lifecycle as lifecycle
+
+        parent = {
+            "id": "reference-parent", "status": "running",
+            "session_id": "owner", "resource_intent": "text",
+            "logical_job_kind": "reference_pack_parent",
+            "params": {"reference_pack": {"schema_version": 2}},
+        }
+        child = {
+            "id": "reference-child", "status": "queued",
+            "session_id": "owner", "resource_intent": "generation",
+            "logical_job_kind": "reference_pack_child",
+            "parent_job_id": parent["id"], "queue_held": False,
+        }
+        scheduler = {
+            "states": {id(parent): dict(parent), id(child): dict(child)},
+            "positions": {id(child): 4},
+            # This must never influence the owner-visible summary.
+            "summary": {"running": 99, "waiting": 99, "active_total": 198},
+        }
+        projected = lifecycle.authorized_logical_queue_projection(
+            [parent, child], scheduler,
+        )
+        self.assertEqual(
+            [job["id"] for job in projected["logical_jobs"]],
+            [parent["id"]],
+        )
+        self.assertEqual(
+            projected["representative_job_ids"],
+            {parent["id"]: child["id"]},
+        )
+        self.assertEqual(projected["summary"], {
+            "running": 0, "waiting": 1, "held": 0, "registering": 0,
+            "preparing": 0, "approval_waiting": 0, "active_total": 1,
+        })
+
+        child.update({"status": "cancelled", "cancel_requested": True})
+        scheduler["states"][id(child)] = dict(child)
+        cancelled = lifecycle.authorized_logical_queue_projection(
+            [parent, child], scheduler,
+        )
+        self.assertEqual(cancelled["summary"]["active_total"], 1)
+        self.assertEqual(cancelled["summary"]["running"], 1)
+        self.assertEqual(cancelled["folded_child_ids"], {child["id"]})
+
+    def test_authorized_queue_projection_retains_actionable_and_orphan_children(self):
+        import sys
+        app_dir = os.path.join(_ROOT, "app")
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        from services import job_lifecycle as lifecycle
+
+        parent = {
+            "id": "reference-parent", "status": "running",
+            "session_id": "owner", "resource_intent": "text",
+            "logical_job_kind": "reference_pack_parent",
+            "params": {"reference_pack": {"schema_version": 2}},
+        }
+        actionable = {
+            "id": "reference-child", "status": "queued",
+            "session_id": "owner", "resource_intent": "generation",
+            "logical_job_kind": "reference_pack_child",
+            "parent_job_id": parent["id"], "resource_state": "blocked",
+            "recovery_state": "blocked_preparation", "queue_held": True,
+        }
+        orphan = {
+            "id": "orphan-child", "status": "queued",
+            "session_id": "owner", "resource_intent": "generation",
+            "logical_job_kind": "reference_pack_child",
+            "parent_job_id": "missing-parent", "queue_held": False,
+        }
+        other_session = {
+            "id": "other-session-job", "status": "running",
+            "session_id": "other", "resource_intent": "generation",
+        }
+        authorized = [parent, actionable, orphan]
+        scheduler = {
+            "states": {
+                id(job): dict(job)
+                for job in (*authorized, other_session)
+            },
+            "positions": {id(orphan): 8},
+            "summary": {"running": 2, "waiting": 8, "active_total": 10},
+        }
+        projected = lifecycle.authorized_logical_queue_projection(
+            authorized, scheduler,
+        )
+        self.assertEqual(
+            [job["id"] for job in projected["logical_jobs"]],
+            [parent["id"], actionable["id"], orphan["id"]],
+        )
+        self.assertEqual(projected["folded_child_ids"], set())
+        self.assertEqual(projected["summary"], {
+            "running": 1, "waiting": 1, "held": 1, "registering": 0,
+            "preparing": 0, "approval_waiting": 0, "active_total": 3,
+        })
+
+    def test_logical_projection_never_infers_reference_from_text_or_names(self):
+        import sys
+        app_dir = os.path.join(_ROOT, "app")
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        from services import job_lifecycle as lifecycle
+
+        parent = {
+            "id": "reference-looking-parent", "status": "running",
+            "session_id": "owner", "resource_intent": "text",
+            "message": "Reference pack planning",
+            "params": {"reference_pack": {"schema_version": 2}},
+        }
+        child = {
+            "id": "reference-looking-child", "status": "queued",
+            "session_id": "owner", "resource_intent": "generation",
+            "parent_job_id": parent["id"], "message": "Reference child",
+        }
+        scheduler = {
+            "states": {id(parent): dict(parent), id(child): dict(child)},
+            "positions": {id(child): 1},
+        }
+        projection = lifecycle.authorized_logical_queue_projection(
+            [parent, child], scheduler,
+        )
+        self.assertEqual(
+            [job["id"] for job in projection["logical_jobs"]],
+            [parent["id"], child["id"]],
+        )
+        self.assertEqual(projection["summary"]["active_total"], 2)
+
     def test_queue_ui_explains_residency_reordering_without_keys(self):
         paths = {
             "client": "ui/src/api/client.ts",
@@ -921,10 +1243,10 @@ class TestJobLifecycleWiring(unittest.TestCase):
         self.assertIn("Waiting for another generation on this host", source["main"])
         for field in ("running", "waiting", "held", "registering", "active_total"):
             self.assertIn(f"{field}: number", source["client"])
-        self.assertIn("queueSummaryLabel(queueTabState.summary)", source["main"])
+        self.assertIn("queueSummaryLabel(projection.summary)", source["main"])
         self.assertIn("Next in line", source["main"])
         self.assertIn("ahead · ${position} of ${waiting}", source["main"])
-        self.assertIn("queueActiveTotal", source["main"])
+        self.assertIn("logicalQueue.activeCount", source["main"])
         self.assertIn("queuePollSequence", source["main"])
         self.assertIn("queuePollAbort.current?.abort()", source["main"])
         self.assertIn("setQueueTabState(null)", source["main"])

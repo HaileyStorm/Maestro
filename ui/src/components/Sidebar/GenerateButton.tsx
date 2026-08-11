@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { Play, AlertTriangle } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { H3EstimateBadge } from './H3PerformanceProfiles'
+import { projectLogicalQueue } from '../../lib/queueProjection'
 
 export function GenerateButton() {
   const jobs = useStore(s => s.jobs)
@@ -78,7 +79,7 @@ export function GenerateButton() {
     setSidebarOpen(false)
   }
 
-  const queueCount = jobs.filter(job =>
+  const queueCount = projectLogicalQueue(jobs).visibleJobs.filter(job =>
     job.status === 'queued' || job.status === 'running'
   ).length
 

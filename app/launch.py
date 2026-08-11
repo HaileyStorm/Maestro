@@ -182,6 +182,33 @@ import uvicorn
 import stat
 
 from services.access_log_filter import install_quiet_access_filter
+from services.account_auth import (
+    ACCOUNT_NONCE_PURPOSES,
+    ACCOUNT_SESSION_COOKIE_NAME,
+    AccountAuthError,
+    AccountAuthStore,
+    AccountStoreCorruptError,
+    decode_account_session_cookie,
+    encode_account_session_cookie,
+    resolve_account_capabilities,
+)
+from services.entitlements import (
+    ContributionLedger,
+    EntitlementError,
+    LedgerIntegrityError,
+)
+from services.responsible_use import (
+    ResponsibleUseError,
+    StaleResponsibleUseNoticeError,
+)
+from services.support_catalog import SupportCatalogError, load_support_catalog
+from services.support_portal import (
+    ResponsibleUseAcceptanceStore,
+    ResponsibleUseStoreIntegrityError,
+    SupportAuthorizationError,
+    SupportPortal,
+    SupportPortalError,
+)
 
 # The shared filter deliberately keeps bearer/security traffic visible:
 # "/share/", "/api/v1/output-shares/"
@@ -210,6 +237,10 @@ from services.output_access import (
 
 _session_secret_lock = threading.Lock()
 _session_secret_value = None
+_account_auth_lock = threading.Lock()
+_account_auth_value = None
+_support_portal_lock = threading.Lock()
+_support_portal_value = None
 _output_share_manager_lock = threading.Lock()
 _output_share_manager_value = None
 _project_unlock_limiter = ProjectUnlockRateLimiter()
@@ -259,11 +290,212 @@ def _env_flag_enabled(name: str) -> bool:
     return str(os.environ.get(name) or "").strip().lower() in _TRUE_ENV_VALUES
 
 
+def _accounts_enabled() -> bool:
+    """Accounts are an explicit host opt-in; anonymous local use stays default."""
+    return _env_flag_enabled("MAESTRO_ACCOUNTS_ENABLED")
+
+
+def _account_bootstrap_enabled() -> bool:
+    return _accounts_enabled() and _env_flag_enabled(
+        "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"
+    )
+
+
+def _account_auth_store() -> AccountAuthStore | None:
+    global _account_auth_value
+    if not _accounts_enabled():
+        return None
+    if _account_auth_value is None:
+        with _account_auth_lock:
+            if _account_auth_value is None:
+                configured = str(
+                    os.environ.get("MAESTRO_ACCOUNT_STORE_PATH") or ""
+                ).strip()
+                if configured:
+                    path = (
+                        configured
+                        if os.path.isabs(configured)
+                        else os.path.join(_app_dir, configured)
+                    )
+                else:
+                    path = os.path.join(_app_dir, "storage", "account-auth.json")
+                _account_auth_value = AccountAuthStore(
+                    path, _session_secret(),
+                )
+    return _account_auth_value
+
+
+def _support_domain_key(purpose: str) -> bytes:
+    """Derive isolated Support integrity/identity keys from host identity."""
+    return hmac.new(
+        _session_secret(),
+        f"maestro-support-{purpose}-v1".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+
+
+def _support_catalog_config_path() -> str | None:
+    configured = str(
+        os.environ.get("MAESTRO_SUPPORT_CATALOG_PATH") or ""
+    ).strip()
+    if not configured:
+        return None
+    return (
+        configured
+        if os.path.isabs(configured)
+        else os.path.join(_app_dir, configured)
+    )
+
+
+class _PublicSupportCatalogProjectionAdapter:
+    """Expose only the frozen facade's account-independent projection."""
+
+    __slots__ = ("_catalog",)
+
+    def __init__(self, catalog) -> None:
+        self._catalog = catalog
+
+    @staticmethod
+    def _priority_policy() -> dict:
+        return SupportPortal._priority_policy()
+
+    def project(self) -> dict:
+        return SupportPortal.public_catalog_projection(self)
+
+
+def _load_server_support_catalog():
+    catalog_path = _support_catalog_config_path()
+    try:
+        return (
+            load_support_catalog()
+            if catalog_path is None
+            else load_support_catalog(local_config_path=catalog_path)
+        )
+    except SupportCatalogError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
+        raise SupportCatalogError(
+            "Support catalog configuration is unavailable"
+        ) from error
+
+
+def _public_support_catalog_projection() -> dict:
+    """Load public settings without initializing account-bound stores."""
+    return _PublicSupportCatalogProjectionAdapter(
+        _load_server_support_catalog(),
+    ).project()
+
+
+def _support_portal() -> SupportPortal | None:
+    """Return the process-local facade over sealed, process-safe stores."""
+    global _support_portal_value
+    account_store = _account_auth_store()
+    if account_store is None:
+        return None
+    if _support_portal_value is None:
+        with _support_portal_lock:
+            if _support_portal_value is None:
+                _support_portal_value = SupportPortal(
+                    account_store=account_store,
+                    ledger=ContributionLedger(
+                        integrity_key=_support_domain_key("ledger"),
+                    ),
+                    acceptance_store=ResponsibleUseAcceptanceStore(
+                        integrity_key=_support_domain_key("responsible-use"),
+                    ),
+                    identity_key=_support_domain_key("account-identity"),
+                    catalog=_load_server_support_catalog(),
+                )
+    return _support_portal_value
+
+
+def _attach_account_request_state(
+    request: Request,
+    session_id: str,
+    *,
+    remote: bool,
+) -> None:
+    principal = None
+    account_error = ""
+    store = _account_auth_store()
+    if store is not None and session_id:
+        try:
+            principal = store.resolve_session(session_id)
+        except AccountStoreCorruptError as error:
+            account_error = error.code
+    request.state.maestro_account_principal = principal
+    request.state.maestro_account_error = account_error
+    request.state.maestro_account_capabilities = resolve_account_capabilities(
+        principal, remote=remote,
+    )
+
+
+def _set_maestro_session_cookie(
+    response: Response,
+    request: Request,
+    session_id: str,
+) -> None:
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        encode_session_cookie(session_id, _session_secret()),
+        httponly=True,
+        samesite="strict",
+        secure=_request_is_https(request),
+        max_age=60 * 60 * 24 * 365,
+        path="/",
+    )
+
+
+def _set_maestro_account_session_cookie(
+    response: Response,
+    request: Request,
+    account_session_id: str,
+) -> None:
+    response.set_cookie(
+        ACCOUNT_SESSION_COOKIE_NAME,
+        encode_account_session_cookie(account_session_id, _session_secret()),
+        httponly=True,
+        samesite="strict",
+        secure=_request_is_https(request),
+        max_age=60 * 60 * 24 * 30,
+        path="/",
+    )
+
+
+def _clear_maestro_account_session_cookie(
+    response: Response,
+    request: Request,
+) -> None:
+    response.delete_cookie(
+        ACCOUNT_SESSION_COOKIE_NAME,
+        path="/",
+        secure=_request_is_https(request),
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def _server_bind_is_widened() -> bool:
+    pinokio_share = (os.environ.get("PINOKIO_SHARE_LOCAL") or "").strip().lower()
+    if pinokio_share == "true":
+        return True
+    if pinokio_share == "false":
+        return False
+    configured = str(os.environ.get("SERVER_NAME") or "127.0.0.1").strip()
+    if not configured:
+        return False
+    try:
+        return not ipaddress.ip_address(configured).is_loopback
+    except ValueError:
+        return configured.casefold() != "localhost"
+
+
 def _remote_sharing_enabled() -> bool:
     """Whether Maestro is deliberately reachable beyond loopback."""
+    widened = globals().get("_server_bind_is_widened")
     return _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE") or _env_flag_enabled(
         "PINOKIO_SHARE_LOCAL"
-    )
+    ) or bool(callable(widened) and widened())
 
 
 _runtime_share_url_lock = threading.Lock()
@@ -338,8 +570,6 @@ def _request_is_cloudflare_remote(request: Request) -> bool:
     machine-owner capabilities.
     """
     cloudflare = _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE")
-    if not (cloudflare or _env_flag_enabled("PINOKIO_SHARE_LOCAL")):
-        return False
     # Cloudflare adds CF-Ray to origin requests and CF-Connecting-IP only on
     # edge-to-origin traffic. Treat either marker as remote even if a tunnel
     # or origin rule rewrites Host/X-Forwarded-Host to loopback. A direct
@@ -351,6 +581,13 @@ def _request_is_cloudflare_remote(request: Request) -> bool:
         return True
     if not _is_loopback_request_client(request):
         return True
+    widened = globals().get("_server_bind_is_widened")
+    if not (
+        cloudflare
+        or _env_flag_enabled("PINOKIO_SHARE_LOCAL")
+        or bool(callable(widened) and widened())
+    ):
+        return False
     for origin in _request_external_origins(request):
         if not _approved_local_origin(origin):
             return True
@@ -385,6 +622,28 @@ _REMOTE_LOCAL_ONLY_EXACT = frozenset({
     ("POST", "/api/v1/queue/pause-after-output"),
     ("POST", "/api/v1/queue/resume"),
 })
+_REMOTE_OWNER_REAUTH_ALLOWED_EXACT = frozenset({
+    ("PUT", "/api/v1/model-visibility"),
+    ("POST", "/api/v1/models/reload"),
+    ("POST", "/api/v1/llm/unload"),
+    ("POST", "/api/v1/queue/pause-after-output"),
+    ("POST", "/api/v1/queue/resume"),
+})
+
+
+def _request_has_account_capability(request: Request, capability: str) -> bool:
+    capabilities = getattr(
+        request.state, "maestro_account_capabilities", frozenset(),
+    )
+    return capability in capabilities
+
+
+def _request_has_recent_account_reauth(request: Request) -> bool:
+    principal = getattr(request.state, "maestro_account_principal", None)
+    return bool(
+        isinstance(principal, dict)
+        and principal.get("recently_reauthenticated") is True
+    )
 
 
 def _remote_local_only_denial(request: Request) -> JSONResponse | None:
@@ -393,6 +652,19 @@ def _remote_local_only_denial(request: Request) -> JSONResponse | None:
         return None
     method = request.method.upper()
     path = request.url.path
+    remote_owner_exact = globals().get(
+        "_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", frozenset(),
+    )
+    has_capability = globals().get("_request_has_account_capability")
+    has_reauth = globals().get("_request_has_recent_account_reauth")
+    if (
+        (method, path) in remote_owner_exact
+        and callable(has_capability)
+        and callable(has_reauth)
+        and has_capability(request, "owner.remote_parity")
+        and has_reauth(request)
+    ):
+        return None
     if (method, path) in _REMOTE_LOCAL_ONLY_EXACT:
         return JSONResponse(
             {"detail": "This machine-wide control is available locally only"},
@@ -525,6 +797,75 @@ def _approved_local_origin(origin: str) -> bool:
     )
 
 
+def _configured_app_origins() -> frozenset[str]:
+    """Return exact operator- or runtime-derived origins for this app.
+
+    Literal local-interface addresses are safe to derive for LAN binding;
+    arbitrary Host values and arbitrary localhost ports are never admitted.
+    Additional reverse-proxy names require explicit MAESTRO_ALLOWED_ORIGINS.
+    """
+    try:
+        port = int(os.environ.get("SERVER_PORT", "7860"))
+    except (TypeError, ValueError):
+        port = 7860
+    if not 1 <= port <= 65535:
+        port = 7860
+    suffix = "" if port == 80 else f":{port}"
+    origins = {
+        f"http://127.0.0.1{suffix}",
+        f"http://localhost{suffix}",
+        f"http://[::1]{suffix}",
+        f"http://{port}.localhost",
+    }
+    bind_name = str(os.environ.get("SERVER_NAME") or "127.0.0.1").strip()
+    if bind_name and bind_name not in {"0.0.0.0", "::"}:
+        rendered = f"[{bind_name}]" if ":" in bind_name else bind_name
+        candidate = _canonical_http_origin(f"http://{rendered}:{port}")
+        if candidate:
+            origins.add(candidate)
+    if _server_bind_is_widened():
+        try:
+            addresses = {
+                item[4][0]
+                for item in socket.getaddrinfo(socket.gethostname(), None)
+            }
+        except OSError:
+            addresses = set()
+        for address in addresses:
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if parsed.is_unspecified or parsed.is_multicast:
+                continue
+            rendered = f"[{parsed.compressed}]" if parsed.version == 6 else parsed.compressed
+            origins.add(f"http://{rendered}:{port}")
+    for raw in str(os.environ.get("MAESTRO_ALLOWED_ORIGINS") or "").split(","):
+        candidate = _canonical_http_origin(raw.strip())
+        if candidate:
+            origins.add(candidate)
+    share, quick, verified = _runtime_share_registration()
+    if quick and _is_quick_tunnel_origin(quick):
+        origins.add(quick)
+    if verified and share:
+        origins.add(share)
+    return frozenset(origins)
+
+
+def _account_exact_origin_allowed(request: Request) -> bool:
+    """Bind credentialed account traffic to this app's exact origin."""
+    supplied = _canonical_http_origin(
+        str(request.headers.get("origin") or ""), allow_path=False,
+    )
+    if supplied is None:
+        return False
+    request_origins = _request_external_origins(request)
+    approved = _configured_app_origins()
+    if supplied in approved and supplied in request_origins:
+        return True
+    return _matches_verified_stable_redirect_origin(supplied, request_origins)
+
+
 def _request_external_origins(request: Request) -> set[str]:
     """Return the direct and proxy-advertised exact origins for a request."""
     origins = set()
@@ -581,6 +922,27 @@ def _reject_cross_origin_mutation(request: Request) -> JSONResponse | None:
     """Reject browser CSRF while preserving local headerless API clients."""
     if request.method.upper() not in _STATE_CHANGING_METHODS:
         return None
+    account_mutation = (
+        request.url.path == "/api/v1/account"
+        or request.url.path.startswith("/api/v1/account/")
+    )
+    support_mutation = (
+        request.url.path == "/api/v1/support"
+        or request.url.path.startswith("/api/v1/support/")
+    )
+    if account_mutation or support_mutation:
+        if not _account_exact_origin_allowed(request):
+            return JSONResponse(
+                {
+                    "detail": (
+                        "Account changes require this app's exact origin"
+                        if account_mutation
+                        else "Support changes require this app's exact origin"
+                    ),
+                },
+                status_code=403,
+            )
+        return None
     supplied = (
         ("origin", request.headers.get("origin"), False),
         ("referer", request.headers.get("referer"), True),
@@ -615,9 +977,13 @@ def _reject_cross_origin_mutation(request: Request) -> JSONResponse | None:
 
 
 def _recovery_response_requires_no_store(path: str) -> bool:
-    """Match only queue/job recovery reads and actions, never media routes."""
+    """Match private control/status responses, never media routes."""
     return (
-        path == "/api/v1/research"
+        path == "/api/v1/account"
+        or path.startswith("/api/v1/account/")
+        or path == "/api/v1/support"
+        or path.startswith("/api/v1/support/")
+        or path == "/api/v1/research"
         or path.startswith("/api/v1/research/")
         or path == "/api/v1/local-recovery"
         or path.startswith("/api/v1/local-recovery/")
@@ -652,10 +1018,9 @@ async def _call_next_with_recovery_no_store(request: Request, call_next):
 # Add CORS before the session middleware so Starlette wraps CORS inside the
 # local-control/no-store boundary. Research OPTIONS responses cannot bypass
 # remote denial or cache stamping.
-_cors_origin_regex = (
-    r"^https?://(?:127\.0\.0\.1|localhost|\[::1\]|"
-    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.localhost)(?::\d{1,5})?$"
-)
+_cors_origin_regex = "^(?:" + "|".join(
+    re.escape(origin) for origin in sorted(_configured_app_origins())
+) + ")$"
 api.add_middleware(
     CORSMiddleware,
     allow_origin_regex=_cors_origin_regex,
@@ -686,21 +1051,33 @@ async def _maestro_session_middleware(request: Request, call_next):
     rejected = _reject_cross_origin_mutation(request)
     if rejected is not None:
         return _stamp_recovery_no_store_response(request, rejected)
-    remote_denial = _remote_local_only_denial(request)
-    if remote_denial is not None:
-        return _stamp_recovery_no_store_response(request, remote_denial)
+    # Most host-control denials do not admit an account override and retain
+    # the historical pre-session fast path. Only the small explicit owner
+    # parity allowlist needs the authenticated principal resolved first.
+    remote_owner_candidate = (
+        request.method.upper(), request.url.path,
+    ) in globals().get("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", frozenset())
+    if not remote_owner_candidate:
+        remote_denial = _remote_local_only_denial(request)
+        if remote_denial is not None:
+            return _stamp_recovery_no_store_response(request, remote_denial)
     # Capability readers are deliberately separate from a Maestro browser
     # session. Visiting a shared output must not create a cookie, unlock a
     # project, or gain any other API authority.
     capability_read = request.method.upper() == "GET" and (
         request.url.path == "/health"
+        or request.url.path == "/api/v1/support/catalog"
         or request.url.path.startswith("/share/")
         or request.url.path.startswith("/api/v1/output-shares/")
     )
     if capability_read:
         request.state.maestro_session_id = ""
+        request.state.maestro_account_session_id = ""
         request.state.maestro_remote = _request_is_cloudflare_remote(request)
-        return await call_next(request)
+        request.state.maestro_account_principal = None
+        request.state.maestro_account_error = ""
+        request.state.maestro_account_capabilities = frozenset()
+        return await _call_next_with_recovery_no_store(request, call_next)
     secret = _session_secret()
     session_id = decode_session_cookie(
         request.cookies.get(SESSION_COOKIE_NAME), secret,
@@ -710,6 +1087,25 @@ async def _maestro_session_middleware(request: Request, call_next):
         session_id = uuid.uuid4().hex
     request.state.maestro_session_id = session_id
     request.state.maestro_remote = _request_is_cloudflare_remote(request)
+    account_cookie = request.cookies.get(ACCOUNT_SESSION_COOKIE_NAME)
+    account_session_id = decode_account_session_cookie(account_cookie, secret)
+    request.state.maestro_account_session_id = account_session_id or ""
+    request.state.maestro_account_session_cookie_id = ""
+    request.state.maestro_clear_account_session_cookie = bool(
+        account_cookie and account_session_id is None
+    )
+    _attach_account_request_state(
+        request, account_session_id or "",
+        remote=bool(request.state.maestro_remote),
+    )
+    if account_session_id and request.state.maestro_account_principal is None:
+        request.state.maestro_clear_account_session_cookie = True
+    # Remote owner parity is capability-bound and recent-reauth-bound, so it
+    # is evaluated only after the signed browser session has been resolved.
+    if remote_owner_candidate:
+        remote_denial = _remote_local_only_denial(request)
+        if remote_denial is not None:
+            return _stamp_recovery_no_store_response(request, remote_denial)
     token = _request_session_id.set(session_id)
     remote_token = _request_remote.set(bool(request.state.maestro_remote))
     try:
@@ -720,15 +1116,16 @@ async def _maestro_session_middleware(request: Request, call_next):
         _request_remote.reset(remote_token)
         _request_session_id.reset(token)
     if created:
-        response.set_cookie(
-            SESSION_COOKIE_NAME,
-            encode_session_cookie(session_id, secret),
-            httponly=True,
-            samesite="strict",
-            secure=_request_is_https(request),
-            max_age=60 * 60 * 24 * 365,
-            path="/",
+        _set_maestro_session_cookie(response, request, session_id)
+    account_cookie_session_id = str(getattr(
+        request.state, "maestro_account_session_cookie_id", "",
+    ) or "")
+    if account_cookie_session_id:
+        _set_maestro_account_session_cookie(
+            response, request, account_cookie_session_id,
         )
+    elif bool(getattr(request.state, "maestro_clear_account_session_cookie", False)):
+        _clear_maestro_account_session_cookie(response, request)
     return response
 
 # Upload size caps — enforced in upload handlers. Tuned for real-world
@@ -765,6 +1162,7 @@ def _safe_join(base: str, *parts: str) -> str | None:
 
 # --- Generation job tracking ---
 from services.job_lifecycle import (
+    authorized_logical_queue_projection,
     arm_prepared_job_plan_review,
     approve_prepared_job,
     block_generation_recovery,
@@ -833,6 +1231,15 @@ from services.queue_recovery_adapter import (
     ensure_project_instance_marker,
     owner_principal_digest,
     project_instance_digest,
+)
+from services.reference_admission import (
+    ReferenceAdmissionCapacityError,
+    ReferenceAdmissionCorruptionError,
+    ReferenceAdmissionMismatchError,
+    ReferenceAdmissionPersistenceError,
+    ReferenceAdmissionStore,
+    ReferenceAdmissionValidationError,
+    normalize_request_id,
 )
 from services.queue_recovery_runtime import (
     MANIFEST_DIRECTORY as _QUEUE_RECOVERY_MANIFEST_DIRECTORY,
@@ -1739,6 +2146,7 @@ def _project_reference_validate_committed_variant(
     candidate_count,
     plan_seal,
     mandatory_review,
+    explicit_output,
 ):
     """Validate one live/restart replay against the same sealed contract."""
     metadata = variant.get("metadata") if isinstance(variant, dict) else None
@@ -1746,13 +2154,20 @@ def _project_reference_validate_committed_variant(
         metadata.get("reference_pack") if isinstance(metadata, dict) else None
     )
     job_metadata = metadata.get("job") if isinstance(metadata, dict) else None
+    variant_policy = (
+        metadata.get("policy") if isinstance(metadata, dict) else None
+    )
     variant_outputs = variant.get("outputs") if isinstance(variant, dict) else None
     if (
         not isinstance(variant, dict)
         or variant.get("variant_type") != "reference_pack"
         or not isinstance(reference, dict)
         or reference.get("plan_seal") != plan_seal
-        or (mandatory_review and reference.get("review_status") != "pass")
+        or reference.get("publication_eligible") is not True
+        or type(explicit_output) is not bool
+        or not isinstance(variant_policy, dict)
+        or type(variant_policy.get("explicit")) is not bool
+        or variant_policy.get("explicit") is not explicit_output
         or not isinstance(job_metadata, dict)
         or job_metadata.get("id") != job_id
         or job_metadata.get("candidate_index") != candidate_index
@@ -1761,14 +2176,99 @@ def _project_reference_validate_committed_variant(
         or not variant_outputs
     ):
         raise ValueError("committed publication metadata changed")
+    quality = reference.get("quality")
+    if not isinstance(quality, dict) or set(quality) != {
+        "status", "warning", "review_deferred", "assessment",
+        "recommended", "recommendation_basis",
+    }:
+        raise ValueError("committed publication quality metadata changed")
+    quality_status = quality.get("status")
+    assessment = quality.get("assessment")
+    if (
+        quality_status not in {"pass", "residual", "review_unavailable"}
+        or type(quality.get("recommended")) is not bool
+        or type(quality.get("review_deferred")) is not bool
+        or (
+            quality.get("recommended")
+            and quality.get("recommendation_basis") not in {
+                "accepted_assessment", "preliminary_ungraded",
+                "residual_assessment",
+            }
+        )
+        or (
+            not quality.get("recommended")
+            and quality.get("recommendation_basis") is not None
+        )
+    ):
+        raise ValueError("committed publication quality metadata changed")
+    if quality_status == "review_unavailable":
+        if (
+            assessment is not None
+            or quality.get("review_deferred") is not True
+            or not isinstance(quality.get("warning"), str)
+        ):
+            raise ValueError("committed publication quality metadata changed")
+    elif (
+        not isinstance(assessment, dict)
+        or set(assessment) != {
+            "version", "assessment_class", "worst_severity",
+            "residual_count", "score_basis_points", "status",
+            "dimension_checks", "failed_roles", "reason_codes",
+        }
+        or type(assessment.get("residual_count")) is not int
+        or assessment["residual_count"] < 0
+        or quality.get("review_deferred") is not False
+        or (
+            quality_status == "pass"
+            and (
+                assessment["residual_count"] != 0
+                or quality.get("warning") is not None
+            )
+        )
+        or (
+            quality_status == "residual"
+            and (
+                assessment["residual_count"] == 0
+                or not isinstance(quality.get("warning"), str)
+            )
+        )
+    ):
+        raise ValueError("committed publication quality metadata changed")
     try:
-        _project_reference_private_authored_snapshot(variant)
+        private_snapshot = _project_reference_private_authored_snapshot(
+            variant,
+        )
     except Exception:
         raise ValueError("committed publication metadata changed") from None
+    has_private_request = "private_reference_request" in metadata
+    has_public_explicit = "explicit_output" in reference
+    has_public_convenience = "explicit_convenience" in reference
+    if has_private_request and (
+        not has_public_explicit
+        or not has_public_convenience
+        or type(reference.get("explicit_output")) is not bool
+        or reference.get("explicit_output") is not explicit_output
+        or type(reference.get("explicit_convenience")) is not bool
+        or reference.get("explicit_convenience")
+            is not private_snapshot["explicit_convenience"]
+    ):
+        raise ValueError("committed publication metadata changed")
+    if not has_private_request and (
+        has_public_explicit or has_public_convenience
+    ):
+        raise ValueError("committed publication metadata changed")
     outputs = []
     for output in variant_outputs:
         relative = output.get("relative_path") if isinstance(output, dict) else None
-        if not isinstance(relative, str):
+        output_policy = (
+            output.get("metadata") if isinstance(output, dict) else None
+        )
+        if (
+            not isinstance(relative, str)
+            or not isinstance(output_policy, dict)
+            or type(output_policy.get("explicit")) is not bool
+            or output_policy.get("explicit") is not explicit_output
+        ):
             raise ValueError("committed publication output changed")
         resolved = store.resolve_output_path(
             project_id, workspace_id, relative,
@@ -1777,6 +2277,15 @@ def _project_reference_validate_committed_variant(
             raise ValueError("committed publication output changed")
         outputs.append(relative)
     return outputs
+
+
+def _project_reference_variant_is_recommended(variant: dict) -> bool:
+    metadata = variant.get("metadata") if isinstance(variant, dict) else None
+    reference = (
+        metadata.get("reference_pack") if isinstance(metadata, dict) else None
+    )
+    quality = reference.get("quality") if isinstance(reference, dict) else None
+    return bool(isinstance(quality, dict) and quality.get("recommended") is True)
 
 
 def _recover_project_reference_publication(job_id: str) -> None:
@@ -1818,12 +2327,16 @@ def _recover_project_reference_publication(job_id: str) -> None:
             raise ValueError("invalid publication recovery unit")
         store = _project_asset_store()
         project_id = str(job.get("workspace") or "")
+        explicit_output = job.get("explicit")
+        if type(explicit_output) is not bool:
+            raise ValueError("invalid publication recovery policy")
         asset = store.get_asset(project_id, workspace_id, asset_id)
         by_id = {
             item.get("id"): item for item in asset.get("variants") or []
             if isinstance(item, dict)
         }
         outputs = []
+        recommended_count = 0
         for index, variant_id in enumerate(variant_ids, 1):
             variant = by_id.get(variant_id)
             outputs.extend(_project_reference_validate_committed_variant(
@@ -1836,7 +2349,13 @@ def _recover_project_reference_publication(job_id: str) -> None:
                 candidate_count=candidate_count,
                 plan_seal=plan_seal,
                 mandatory_review=mandatory_review,
+                explicit_output=explicit_output,
             ))
+            recommended_count += int(
+                _project_reference_variant_is_recommended(variant)
+            )
+        if recommended_count != 1:
+            raise ValueError("invalid Reference recommendation set")
         finish_job(
             job,
             "completed",
@@ -7518,6 +8037,32 @@ def _project_reference_private_commitment(value) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")
     return hmac.new(_session_secret(), encoded, hashlib.sha256).hexdigest()
+
+
+def _project_reference_private_character_state(
+    character_profile, *, explicit_convenience,
+) -> dict:
+    """Seal the private convenience bit to the exact authored profile."""
+    if type(explicit_convenience) is not bool:
+        raise ValueError("invalid private character request")
+    if character_profile is None:
+        private_profile = None
+    elif isinstance(character_profile, dict):
+        private_profile = copy.deepcopy(character_profile)
+    else:
+        private_metadata = getattr(character_profile, "private_metadata", None)
+        if not callable(private_metadata):
+            raise ValueError("invalid private character request")
+        private_profile = private_metadata()
+    return {
+        "schema_version": 1,
+        "explicit_convenience": explicit_convenience,
+        "commitment": _project_reference_private_commitment({
+            "kind": "reference_character_request_v1",
+            "character_profile": private_profile,
+            "explicit_convenience": explicit_convenience,
+        }),
+    }
 
 
 def _project_reference_snapshot_commitment(context, kind, value) -> str:
@@ -15432,21 +15977,652 @@ async def accept_host_terms(request: Request):
     return {"status": "ok", "terms": terms}
 
 
+def _raise_account_http_error(error: AccountAuthError) -> None:
+    statuses = {
+        "account_store_unavailable": 503,
+        "account_store_capacity": 507,
+        "authentication_required": 401,
+        "invalid_credentials": 401,
+        "invalid_recovery": 401,
+        "owner_required": 403,
+        "reauth_required": 403,
+        "rate_limited": 429,
+        "bootstrap_complete": 409,
+        "invalid_nonce": 409,
+        "account_not_found": 404,
+        "session_not_found": 404,
+    }
+    headers = (
+        {"Retry-After": str(error.retry_after)} if error.retry_after else None
+    )
+    raise HTTPException(
+        status_code=statuses.get(error.code, 400),
+        detail={"code": error.code, "message": str(error)},
+        headers=headers,
+    ) from error
+
+
+def _require_account_store(request: Request) -> AccountAuthStore:
+    if not _accounts_enabled():
+        raise HTTPException(status_code=404, detail="Accounts are not enabled")
+    if getattr(request.state, "maestro_account_error", ""):
+        _raise_account_http_error(AccountStoreCorruptError())
+    store = _account_auth_store()
+    if store is None:
+        raise HTTPException(status_code=404, detail="Accounts are not enabled")
+    return store
+
+
+def _require_account_principal(request: Request) -> dict:
+    principal = getattr(request.state, "maestro_account_principal", None)
+    account_session_id = getattr(request.state, "maestro_account_session_id", "")
+    if not isinstance(principal, dict) or not account_session_id:
+        _raise_account_http_error(AccountAuthError(
+            "Authentication is required.", code="authentication_required",
+        ))
+    return principal
+
+
+async def _account_request_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Expected a JSON object") from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+    return body
+
+
+def _account_local_bootstrap_allowed(request: Request) -> bool:
+    """Require direct loopback and an independently approved exact app origin."""
+    if _request_is_cloudflare_remote(request) or not _is_loopback_request_client(request):
+        return False
+    return _account_exact_origin_allowed(request)
+
+
+def _account_request_source(request: Request) -> str:
+    """Return the socket peer only; never trust caller-controlled forwarding."""
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", "") or "").strip()
+    return host[:256]
+
+
+def _rotate_account_session(request: Request, account_session_id: str) -> None:
+    """Rotate account authority without changing the browser/project principal."""
+    request.state.maestro_account_session_cookie_id = account_session_id
+    request.state.maestro_clear_account_session_cookie = False
+    request.state.maestro_account_session_id = account_session_id
+    _attach_account_request_state(
+        request, account_session_id,
+        remote=bool(getattr(request.state, "maestro_remote", False)),
+    )
+
+
+def _clear_account_session(request: Request) -> None:
+    request.state.maestro_account_session_cookie_id = ""
+    request.state.maestro_clear_account_session_cookie = True
+    request.state.maestro_account_session_id = ""
+    _attach_account_request_state(
+        request, "",
+        remote=bool(getattr(request.state, "maestro_remote", False)),
+    )
+
+
+def _public_account_context(request: Request) -> dict:
+    principal = getattr(request.state, "maestro_account_principal", None)
+    account = None
+    if isinstance(principal, dict):
+        account = {
+            key: principal[key]
+            for key in (
+                "id", "username", "role", "disabled", "created_at",
+                "has_email", "passkey_credentials",
+                "passkey_authentication_available",
+            )
+            if key in principal
+        }
+    capabilities = sorted(getattr(
+        request.state, "maestro_account_capabilities", frozenset(),
+    ))
+    return {
+        "enabled": _accounts_enabled(),
+        "authenticated": account is not None,
+        "account": account,
+        "capabilities": capabilities,
+        "reauthenticated": _request_has_recent_account_reauth(request),
+        "passkey_authentication_available": False,
+    }
+
+
+@api.get("/api/v1/account/context")
+def get_account_context(request: Request):
+    context = _public_account_context(request)
+    bootstrap_available = False
+    if _account_bootstrap_enabled() and _account_local_bootstrap_allowed(request):
+        store = _require_account_store(request)
+        try:
+            bootstrap_available = not store.has_accounts()
+        except AccountAuthError as error:
+            _raise_account_http_error(error)
+    return {**context, "bootstrap_available": bootstrap_available}
+
+
+@api.post("/api/v1/account/nonce")
+async def issue_account_nonce(request: Request):
+    store = _require_account_store(request)
+    body = await _account_request_body(request)
+    purpose = body.get("purpose")
+    if purpose not in ACCOUNT_NONCE_PURPOSES:
+        raise HTTPException(status_code=400, detail="Invalid nonce purpose")
+    if purpose == "bootstrap":
+        if not _account_bootstrap_enabled():
+            raise HTTPException(status_code=404, detail="Account bootstrap is not enabled")
+        if not _account_local_bootstrap_allowed(request):
+            raise HTTPException(status_code=403, detail="Account bootstrap requires direct loopback")
+    elif purpose not in {"login", "recover"}:
+        _require_account_principal(request)
+    nonce_session_id = (
+        request.state.maestro_session_id
+        if purpose in {"bootstrap", "login", "recover"}
+        else request.state.maestro_account_session_id
+    )
+    try:
+        return store.issue_nonce(nonce_session_id, purpose)
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+
+
+@api.post("/api/v1/account/bootstrap")
+async def bootstrap_account_owner(request: Request):
+    if not _account_bootstrap_enabled():
+        raise HTTPException(status_code=404, detail="Account bootstrap is not enabled")
+    if not _account_local_bootstrap_allowed(request):
+        raise HTTPException(status_code=403, detail="Account bootstrap requires direct loopback")
+    store = _require_account_store(request)
+    body = await _account_request_body(request)
+    try:
+        result = await asyncio.to_thread(
+            store.bootstrap_owner,
+            username=body.get("username"),
+            password=body.get("password"),
+            email=body.get("email", ""),
+            device_label=body.get("device_label", "Browser"),
+            nonce_session_id=request.state.maestro_session_id,
+            nonce=body.get("nonce"),
+            remote=False,
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    _rotate_account_session(request, result.pop("account_session_id"))
+    return result
+
+
+@api.post("/api/v1/account/login")
+async def login_account(request: Request):
+    store = _require_account_store(request)
+    body = await _account_request_body(request)
+    try:
+        result = await asyncio.to_thread(
+            store.login,
+            username=body.get("username"),
+            password=body.get("password"),
+            device_label=body.get("device_label", "Browser"),
+            nonce_session_id=request.state.maestro_session_id,
+            presented_account_session_id=(
+                request.state.maestro_account_session_id or None
+            ),
+            nonce=body.get("nonce"),
+            remote=bool(request.state.maestro_remote),
+            source_id=_account_request_source(request),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    _rotate_account_session(request, result.pop("account_session_id"))
+    return result
+
+
+@api.post("/api/v1/account/logout")
+async def logout_account(request: Request):
+    store = _require_account_store(request)
+    principal = _require_account_principal(request)
+    body = await _account_request_body(request)
+    try:
+        store.revoke_session(
+            actor_session_id=request.state.maestro_account_session_id,
+            target_handle=principal["session_handle"],
+            nonce=body.get("nonce"),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    _clear_account_session(request)
+    return {"status": "logged_out"}
+
+
+@api.post("/api/v1/account/reauth")
+async def reauthenticate_account(request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    body = await _account_request_body(request)
+    try:
+        result = await asyncio.to_thread(
+            store.reauthenticate,
+            account_session_id=request.state.maestro_account_session_id,
+            password=body.get("password"),
+            nonce=body.get("nonce"),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    _rotate_account_session(request, result.pop("account_session_id"))
+    return result
+
+
+@api.post("/api/v1/account/recover")
+async def recover_account(request: Request):
+    store = _require_account_store(request)
+    body = await _account_request_body(request)
+    try:
+        result = await asyncio.to_thread(
+            store.recover,
+            username=body.get("username"),
+            recovery_code=body.get("recovery_code"),
+            new_password=body.get("new_password"),
+            device_label=body.get("device_label", "Browser"),
+            nonce_session_id=request.state.maestro_session_id,
+            nonce=body.get("nonce"),
+            remote=bool(request.state.maestro_remote),
+            presented_account_session_id=(
+                request.state.maestro_account_session_id or None
+            ),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    _rotate_account_session(request, result.pop("account_session_id"))
+    return result
+
+
+@api.put("/api/v1/account/password")
+async def change_account_password(request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    body = await _account_request_body(request)
+    try:
+        await asyncio.to_thread(
+            store.change_password,
+            session_id=request.state.maestro_account_session_id,
+            new_password=body.get("new_password"),
+            nonce=body.get("nonce"),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    return {"status": "password_changed", "other_sessions_revoked": True}
+
+
+@api.post("/api/v1/account/recovery-codes")
+async def rotate_account_recovery_codes(request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    body = await _account_request_body(request)
+    try:
+        codes = store.rotate_recovery_codes(
+            session_id=request.state.maestro_account_session_id,
+            nonce=body.get("nonce"),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    return {"recovery_codes": codes}
+
+
+@api.get("/api/v1/account/sessions")
+def list_account_sessions(request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    try:
+        sessions = store.list_sessions(request.state.maestro_account_session_id)
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    return {"sessions": sessions}
+
+
+@api.delete("/api/v1/account/sessions/{session_handle}")
+async def revoke_account_session(session_handle: str, request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    body = await _account_request_body(request)
+    try:
+        result = store.revoke_session(
+            actor_session_id=request.state.maestro_account_session_id,
+            target_handle=session_handle,
+            nonce=body.get("nonce"),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    if result["current"]:
+        _clear_account_session(request)
+    return result
+
+
+@api.post("/api/v1/account/sessions/revoke-all")
+async def revoke_all_account_sessions(request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    body = await _account_request_body(request)
+    retain_current = body.get("retain_current", True)
+    if type(retain_current) is not bool:
+        raise HTTPException(status_code=400, detail="retain_current must be boolean")
+    try:
+        result = store.revoke_all_sessions(
+            actor_session_id=request.state.maestro_account_session_id,
+            nonce=body.get("nonce"),
+            retain_current=retain_current,
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    if result["current_revoked"]:
+        _clear_account_session(request)
+    return result
+
+
+@api.get("/api/v1/account/users")
+def list_server_accounts(request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    try:
+        accounts = store.list_accounts(request.state.maestro_account_session_id)
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    return {"accounts": accounts}
+
+
+@api.post("/api/v1/account/users")
+async def create_server_account(request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    body = await _account_request_body(request)
+    try:
+        return await asyncio.to_thread(
+            store.create_account,
+            actor_session_id=request.state.maestro_account_session_id,
+            nonce=body.get("nonce"),
+            username=body.get("username"),
+            password=body.get("password"),
+            email=body.get("email", ""),
+            role=body.get("role", "user"),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+
+
+@api.put("/api/v1/account/users/{account_id}")
+async def update_server_account(account_id: str, request: Request):
+    store = _require_account_store(request)
+    _require_account_principal(request)
+    body = await _account_request_body(request)
+    if set(body) - {"disabled", "nonce"}:
+        raise HTTPException(status_code=400, detail="Only disabled state may be changed")
+    try:
+        store.set_account_disabled(
+            actor_session_id=request.state.maestro_account_session_id,
+            account_id=account_id,
+            disabled=body.get("disabled"),
+            nonce=body.get("nonce"),
+        )
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    return {"status": "updated"}
+
+
+def _raise_support_http_error(error: Exception) -> None:
+    if isinstance(error, AccountAuthError):
+        _raise_account_http_error(error)
+    if isinstance(error, SupportAuthorizationError):
+        message = str(error)
+        if "target account" in message.lower():
+            status, code, public = 404, "account_not_found", "Account was not found."
+        elif "recent" in message.lower():
+            status, code, public = 403, "reauth_required", (
+                "Recent account authentication is required."
+            )
+        elif "owner" in message.lower():
+            status, code, public = 403, "owner_required", "Owner access is required."
+        else:
+            status, code, public = 401, "authentication_required", (
+                "Authentication is required."
+            )
+        raise HTTPException(
+            status_code=status,
+            detail={"code": code, "message": public},
+        ) from error
+    if isinstance(error, StaleResponsibleUseNoticeError):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "responsible_use_notice_changed",
+                "message": "Review the current responsible-use notice.",
+            },
+        ) from error
+    if isinstance(error, (ResponsibleUseStoreIntegrityError, LedgerIntegrityError)):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "support_store_unavailable",
+                "message": "Support account records are temporarily unavailable.",
+            },
+        ) from error
+    if isinstance(error, ResponsibleUseError):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_responsible_use_acceptance",
+                "message": "Responsible-use acceptance is invalid.",
+            },
+        ) from error
+    if isinstance(error, (SupportCatalogError, EntitlementError)):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "support_unavailable",
+                "message": "Support information is temporarily unavailable.",
+            },
+        ) from error
+    if isinstance(error, SupportPortalError):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_support_request",
+                "message": "Support request is invalid.",
+            },
+        ) from error
+    raise error
+
+
+def _require_support_portal(request: Request) -> SupportPortal:
+    _require_account_store(request)
+    try:
+        portal = _support_portal()
+    except (
+        AccountAuthError,
+        EntitlementError,
+        ResponsibleUseError,
+        SupportCatalogError,
+        SupportPortalError,
+    ) as error:
+        _raise_support_http_error(error)
+    if portal is None:
+        raise HTTPException(status_code=404, detail="Accounts are not enabled")
+    return portal
+
+
+def _support_request_context(request: Request) -> tuple[str, bool]:
+    _require_account_principal(request)
+    return (
+        request.state.maestro_account_session_id,
+        bool(request.state.maestro_remote),
+    )
+
+
+@api.get("/api/v1/support/catalog")
+def get_support_catalog():
+    try:
+        return _public_support_catalog_projection()
+    except (SupportCatalogError, SupportPortalError) as error:
+        _raise_support_http_error(error)
+
+
+@api.get("/api/v1/support/self")
+def get_account_support(request: Request):
+    portal = _require_support_portal(request)
+    account_session_id, remote = _support_request_context(request)
+    try:
+        return portal.self_projection(account_session_id, remote=remote)
+    except (AccountAuthError, EntitlementError, ResponsibleUseError,
+            SupportCatalogError, SupportPortalError) as error:
+        _raise_support_http_error(error)
+
+
+@api.get("/api/v1/support/responsible-use")
+def get_account_responsible_use(request: Request):
+    projection = get_account_support(request)
+    return projection["responsible_use"]
+
+
+@api.post("/api/v1/support/responsible-use/accept")
+async def accept_account_responsible_use(request: Request):
+    portal = _require_support_portal(request)
+    account_session_id, remote = _support_request_context(request)
+    body = await _account_request_body(request)
+    if set(body) != {"document_version", "content_sha256"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Expected document_version and content_sha256 only",
+        )
+    try:
+        status = await asyncio.to_thread(
+            portal.accept_responsible_use,
+            account_session_id,
+            remote=remote,
+            document_version=body["document_version"],
+            content_sha256=body["content_sha256"],
+        )
+    except (AccountAuthError, EntitlementError, ResponsibleUseError,
+            SupportCatalogError, SupportPortalError) as error:
+        _raise_support_http_error(error)
+    return {"status": status}
+
+
+@api.get("/api/v1/support/admin/accounts/{account_id}")
+def get_admin_account_support(account_id: str, request: Request):
+    portal = _require_support_portal(request)
+    actor_session_id, remote = _support_request_context(request)
+    try:
+        return portal.owner_admin_projection(
+            actor_session_id,
+            remote=remote,
+            target_account_id=account_id,
+        )
+    except (AccountAuthError, EntitlementError, ResponsibleUseError,
+            SupportCatalogError, SupportPortalError) as error:
+        _raise_support_http_error(error)
+
+
 @api.get("/api/v1/access-context")
 def get_access_context(request: Request):
     """Expose non-sensitive UI capabilities for local vs tunnel clients."""
     remote = bool(getattr(request.state, "maestro_remote", False))
+    account_context_resolver = globals().get("_public_account_context")
+    account_context = (
+        account_context_resolver(request)
+        if callable(account_context_resolver)
+        else {
+            "enabled": False,
+            "authenticated": False,
+            "account": None,
+            "capabilities": [],
+            "reauthenticated": False,
+            "passkey_authentication_available": False,
+        }
+    )
+    has_capability = globals().get("_request_has_account_capability")
+    has_reauth = globals().get("_request_has_recent_account_reauth")
+    remote_owner = (
+        remote
+        and callable(has_capability)
+        and callable(has_reauth)
+        and has_capability(request, "owner.remote_parity")
+        and has_reauth(request)
+    )
+    remote_owner_exact = globals().get(
+        "_REMOTE_OWNER_REAUTH_ALLOWED_EXACT", frozenset(),
+    )
+    remote_owner_routes = [
+        {"method": method, "path": path}
+        for method, path in sorted(remote_owner_exact)
+    ]
     return {
         "remote": remote,
         "project_password_required": remote,
         "project_names_visible": True,
+        # Complete host controls remain local. Remote owner parity is bounded
+        # to the exact, recently reauthenticated routes enumerated here.
         "machine_controls": not remote,
+        "remote_owner_controls": {
+            "enabled": bool(remote_owner),
+            "requires_recent_reauthentication": True,
+            "available_routes": remote_owner_routes,
+            "safe_remote_reads": [
+                {
+                    "method": "GET",
+                    "path": "/api/v1/queue",
+                    "authorization": "Project and session authorization still applies.",
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/v1/jobs",
+                    "authorization": "Project and session authorization still applies.",
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/v1/status/{job_id}",
+                    "authorization": "Job ownership and project authorization still apply.",
+                },
+            ],
+            "unavailable": [
+                {
+                    "control": "filesystem_and_storage",
+                    "reason": "Host filesystem and destructive storage controls remain local-only.",
+                },
+                {
+                    "control": "custom_model_sources",
+                    "reason": "Custom-source installation and credential-bearing provider controls remain local-only.",
+                },
+                {
+                    "control": "services_configuration",
+                    "reason": "Service URLs, provider selection, and API-key settings remain local-only.",
+                },
+                {
+                    "control": "llm_loading",
+                    "reason": "Loading caller-selected local or remote model identifiers remains local-only.",
+                },
+                {
+                    "control": "research_and_recovery",
+                    "reason": "Research and break-glass recovery surfaces require direct local-machine access.",
+                },
+                {
+                    "control": "global_queue_ordering",
+                    "reason": "Priority and force-start controls are not yet account-authorized remotely.",
+                },
+                {
+                    "control": "host_telemetry",
+                    "reason": "Machine-wide hardware and storage telemetry remains local-only.",
+                },
+            ],
+        },
         "custom_model_sources": not remote,
         "catalog_model_downloads": True,
         "classic_ui": not remote,
         "cloudflare_enabled": _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE"),
         "share_url": _public_share_url() if not remote else "",
         "share_flow": "Select a project name, then enter that project's password",
+        "accounts": account_context,
     }
 
 
@@ -16037,6 +17213,8 @@ def delete_workspace(name: str, request: Request):
 
 _project_asset_store_instance = None
 _project_asset_store_lock = threading.Lock()
+_reference_admission_store_instance = None
+_reference_admission_store_lock = threading.Lock()
 _blender_candidate_status_lock = threading.RLock()
 
 
@@ -16100,6 +17278,21 @@ def _project_asset_store():
                     allowed_source_roots=[save_root, uploads_root],
                 )
     return _project_asset_store_instance
+
+
+def _reference_admission_store():
+    """Return the content-free durable Reference admission ledger."""
+    global _reference_admission_store_instance
+    if _reference_admission_store_instance is None:
+        with _reference_admission_store_lock:
+            if _reference_admission_store_instance is None:
+                _reference_admission_store_instance = ReferenceAdmissionStore(
+                    os.path.join(
+                        os.getcwd(), "storage", "reference-admission",
+                    ),
+                    _session_secret(),
+                )
+    return _reference_admission_store_instance
 
 
 def _project_asset_error(error):
@@ -16178,6 +17371,7 @@ def _public_authorized_project_assets(assets: list[dict], session_id: str) -> li
             variant_metadata = variant.get("metadata")
             if isinstance(variant_metadata, dict):
                 variant_metadata.pop("private_authored_settings", None)
+                variant_metadata.pop("private_reference_request", None)
             review_private = (
                 variant.get("variant_type") == "blender_video"
                 and variant.get("status") != "kept"
@@ -16242,6 +17436,10 @@ def _project_reference_private_authored_snapshot(variant: dict) -> dict:
     metadata = variant.get("metadata")
     reference = metadata.get("reference_pack") if isinstance(metadata, dict) else None
     private = metadata.get("private_authored_settings") if isinstance(metadata, dict) else None
+    private_request = (
+        metadata.get("private_reference_request")
+        if isinstance(metadata, dict) else None
+    )
     public_authored = (
         reference.get("authored_settings") if isinstance(reference, dict) else None
     )
@@ -16249,7 +17447,12 @@ def _project_reference_private_authored_snapshot(variant: dict) -> dict:
         public_authored.get("seal") if isinstance(public_authored, dict) else None
     )
     try:
-        from services.reference_sheets import reference_pack_authored_settings_seal
+        from services.reference_sheets import (
+            CHARACTER_PROFILE_SCHEMA_VERSION,
+            _normalize_character_managed_callout_state,
+            normalize_character_profile,
+            reference_pack_authored_settings_seal,
+        )
         public_style_keys = {"style_present", "style_commitment"}.intersection(
             public_authored if isinstance(public_authored, dict) else {}
         )
@@ -16274,6 +17477,47 @@ def _project_reference_private_authored_snapshot(variant: dict) -> dict:
                 raise ValueError("private style commitment changed")
         elif private_has_style:
             raise ValueError("private style contract is incomplete")
+        private_profile = (
+            private.get("character_profile")
+            if isinstance(private, dict) else None
+        )
+        normalized_profile = normalize_character_profile(private_profile)
+        private_managed = (
+            private.get("managed_character_callouts")
+            if isinstance(private, dict) else None
+        )
+        normalized_managed = _normalize_character_managed_callout_state(
+            private_managed,
+        )
+        public_profile = (
+            public_authored.get("character_profile")
+            if isinstance(public_authored, dict) else None
+        )
+        public_managed = (
+            public_authored.get("managed_character_callouts")
+            if isinstance(public_authored, dict) else None
+        )
+        if normalized_profile is None:
+            if (
+                private_managed is not None
+                or public_profile is not None
+                or public_managed is not None
+            ):
+                raise ValueError("private character contract changed")
+        elif (
+            public_profile != normalized_profile.public_metadata()
+            or public_managed != (
+                normalized_managed.public_metadata(normalized_profile)
+                if normalized_managed is not None else {
+                    "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+                    "active_count": 0,
+                    "tombstone_count": 0,
+                    "rename_count": 0,
+                    "commitments": [],
+                }
+            )
+        ):
+            raise ValueError("private character contract changed")
         for selection in (
             private.get("additional_lora_parameters", [])
             if isinstance(private, dict) else []
@@ -16313,6 +17557,52 @@ def _project_reference_private_authored_snapshot(variant: dict) -> dict:
         snapshot["additional_lora_parameters"] = copy.deepcopy(
             private["additional_lora_parameters"],
         )
+    if "character_profile" in private:
+        snapshot["character_profile"] = copy.deepcopy(
+            private["character_profile"],
+        )
+    if "managed_character_callouts" in private:
+        snapshot["managed_character_callouts"] = copy.deepcopy(
+            private["managed_character_callouts"],
+        )
+    if private_request is None:
+        # V2 records created before the profile feature remain retryable and
+        # never acquire inferred character facts or convenience behavior.
+        snapshot["explicit_convenience"] = False
+    else:
+        if not isinstance(private_request, dict) or set(private_request) != {
+            "schema_version", "explicit_convenience", "commitment",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="Reference authoring snapshot unavailable",
+            )
+        try:
+            expected_private_request = _project_reference_private_character_state(
+                private.get("character_profile"),
+                explicit_convenience=private_request.get(
+                    "explicit_convenience"
+                ),
+            )
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=409,
+                detail="Reference authoring snapshot unavailable",
+            ) from None
+        if (
+            private_request.get("schema_version") != 1
+            or not hmac.compare_digest(
+                str(private_request.get("commitment") or ""),
+                expected_private_request["commitment"],
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Reference authoring snapshot unavailable",
+            )
+        snapshot["explicit_convenience"] = private_request[
+            "explicit_convenience"
+        ]
     return snapshot
 
 
@@ -16342,8 +17632,33 @@ def get_project_reference_authoring(
         authored_settings = {
             key: copy.deepcopy(value)
             for key, value in private_snapshot.items()
-            if key != "additional_lora_parameters"
+            if key not in {
+                "additional_lora_parameters", "managed_character_callouts",
+                "character_profile",
+            }
         }
+        managed_state = private_snapshot.get("managed_character_callouts")
+        if isinstance(managed_state, dict):
+            managed_ids = {
+                item.get("managed_id")
+                for item in managed_state.get("entries") or []
+                if isinstance(item, dict)
+            }
+            authored_settings["detail_callouts"] = [
+                copy.deepcopy(item)
+                for item in private_snapshot["detail_callouts"]
+                if not isinstance(item, dict)
+                or item.get("custom_id") not in managed_ids
+            ]
+        character_profile = private_snapshot.get("character_profile")
+        if isinstance(character_profile, dict):
+            authored_settings["character_profile"] = {
+                "gender": character_profile["gender"],
+                "age": character_profile["age"],
+                "explicit_anatomy": list(
+                    character_profile["explicit_anatomy"]
+                ),
+            }
         response = {
             "schema_version": 2,
             "asset_id": asset_id,
@@ -16614,6 +17929,7 @@ def serve_project_asset_media(project: str, relative_path: str, request: Request
 _PROJECT_REFERENCE_BODY_FIELDS = frozenset({
     "schema_version", "intent", "depth", "sheet_count", "preset",
     "anchor_basis", "type_fields", "detail_callouts",
+    "character_profile", "explicit_convenience",
     "asset_id", "parent_variant_id", "edit_instruction", "name",
     "asset_type", "description", "tags", "poses", "outfits", "style",
     "genre", "candidate_count", "mode", "model_type", "editor_model_type",
@@ -16624,7 +17940,7 @@ _PROJECT_REFERENCE_BODY_FIELDS = frozenset({
     "review_model", "review_provider",
     "content_capability", "initial_blur", "intelligence_policy",
     "additional_loras",
-    "private_output", "explicit_output",
+    "private_output", "explicit_output", "request_id",
 })
 _PROJECT_REFERENCE_DEFAULT_CREATE_MODEL = "flux2_dev"
 _PROJECT_REFERENCE_EXPLICIT_CREATE_MODELS = (
@@ -17488,6 +18804,9 @@ def _project_reference_explicit_generation_model():
 
 def _project_reference_capabilities():
     from services.reference_sheets import (
+        CHARACTER_EXPLICIT_ANATOMY,
+        CHARACTER_GENDERS,
+        CHARACTER_PROFILE_SCHEMA_VERSION,
         MAX_PACK_SHEETS,
         PACK_TYPE_PRESETS,
         reference_pack_detail_kind_capabilities,
@@ -17541,6 +18860,16 @@ def _project_reference_capabilities():
             )
         ],
         "detail_operations": ["auto", "crop", "enhance", "reconstruct"],
+        "character_profile": {
+            "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+            "genders": list(CHARACTER_GENDERS),
+            "age": {"optional": True, "minimum": 0, "maximum": 999},
+            "explicit_anatomy": list(CHARACTER_EXPLICIT_ANATOMY),
+            "explicit_convenience": {
+                "supported": True,
+                "requires_explicit_output": True,
+            },
+        },
         "lora_scopes": ["auto", "generation", "editing"],
         "content_capabilities": ["standard", "unrestricted_local"],
         "intelligence_policies": ["standard_auto", "uncensored_auto"],
@@ -17587,12 +18916,14 @@ def get_project_reference_capabilities(project: str, request: Request):
 
 def _project_reference_request_config(
     body, request, *, existing_asset_type=None, commitment_contexts=None,
+    managed_character_callouts=None,
 ):
     """Validate one v2 pack request before any asset or job can be created."""
     from services.reference_sheets import (
         PACK_TYPE_FIELDS,
         PACK_TYPE_PRESETS,
         _normalize_pack_callouts,
+        normalize_character_profile,
         normalize_reference_pack_type,
         normalize_reference_pack_type_fields,
         reference_pack_ordered_roles,
@@ -17624,6 +18955,46 @@ def _project_reference_request_config(
         asset_type = normalize_reference_pack_type(requested_asset_type)
     except ValueError as error:
         raise HTTPException(status_code=400, detail="Unsupported reference asset type") from error
+    explicit_output_value = body.get("explicit_output")
+    if explicit_output_value is not None and type(explicit_output_value) is not bool:
+        raise HTTPException(status_code=400, detail="explicit_output must be a boolean")
+    explicit_output = explicit_output_value is True
+    explicit_convenience = body.get("explicit_convenience", False)
+    if type(explicit_convenience) is not bool:
+        raise HTTPException(
+            status_code=400,
+            detail="explicit_convenience must be a boolean",
+        )
+    raw_character_profile = body.get("character_profile")
+    if asset_type != "character" and (
+        raw_character_profile is not None
+        or managed_character_callouts is not None
+        or explicit_convenience
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Character profile fields require a character reference",
+        )
+    if explicit_convenience and not explicit_output:
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit convenience requires explicit output authorization",
+        )
+    try:
+        character_profile = normalize_character_profile(
+            raw_character_profile,
+            explicit_convenience=explicit_convenience,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid character profile or explicit convenience",
+        ) from error
+    normalized_character_profile = (
+        None if character_profile is None
+        else character_profile.private_metadata()
+    )
+
     preset = body.get("preset") or {
         "character": "identity", "location": "spatial", "prop": "product",
         "vehicle": "exterior", "creature": "identity", "wardrobe": "look",
@@ -17661,7 +19032,6 @@ def _project_reference_request_config(
         field: [item.private_metadata() for item in items]
         for field, items in sealed_type_fields
     }
-    explicit_convenience = body.get("explicit_output") is True
     if asset_type == "character" and explicit_convenience:
         nude_anatomy = {
             "id": "anatomy:nude-anatomy",
@@ -17709,7 +19079,8 @@ def _project_reference_request_config(
     if content_capability is None:
         content_capability = (
             "unrestricted_local"
-            if explicit_convenience or anchor_basis == "anatomy" else "standard"
+            if explicit_output or explicit_convenience or anchor_basis == "anatomy"
+            else "standard"
         )
     if content_capability not in {"standard", "unrestricted_local"}:
         raise HTTPException(status_code=400, detail="Invalid content_capability")
@@ -17718,7 +19089,9 @@ def _project_reference_request_config(
     if requested_model_type:
         model_type = requested_model_type
     elif mode != "draft" and (
-        explicit_convenience or content_capability == "unrestricted_local"
+        explicit_output
+        or explicit_convenience
+        or content_capability == "unrestricted_local"
     ):
         model_type = _project_reference_explicit_generation_model()[
             "resolved_model"
@@ -17811,7 +19184,9 @@ def _project_reference_request_config(
         raise HTTPException(status_code=400, detail="review must be a boolean")
 
     mandatory_review = bool(
-        content_capability == "unrestricted_local" or explicit_convenience
+        content_capability == "unrestricted_local"
+        or explicit_output
+        or explicit_convenience
     )
     review_contract = (
         _PROJECT_REFERENCE_UNRESTRICTED_REVIEW
@@ -17819,14 +19194,16 @@ def _project_reference_request_config(
     )
     initial_blur = body.get("initial_blur")
     if initial_blur is None:
-        initial_blur = explicit_convenience or anchor_basis == "anatomy"
+        initial_blur = (
+            explicit_output or explicit_convenience or anchor_basis == "anatomy"
+        )
     if type(initial_blur) is not bool:
         raise HTTPException(status_code=400, detail="initial_blur must be a boolean")
     intelligence_policy = body.get("intelligence_policy")
     if intelligence_policy is None:
         intelligence_policy = (
             "uncensored_auto"
-            if explicit_convenience or anchor_basis == "anatomy"
+            if explicit_output or explicit_convenience or anchor_basis == "anatomy"
             else "standard_auto"
         )
     if intelligence_policy not in {"standard_auto", "uncensored_auto"}:
@@ -18041,6 +19418,11 @@ def _project_reference_request_config(
         "candidate_count": candidate_count,
         "type_fields": normalized_type_fields,
         "detail_callouts": normalized_callouts,
+        "character_profile": normalized_character_profile,
+        "managed_character_callouts": copy.deepcopy(
+            managed_character_callouts,
+        ),
+        "explicit_convenience": explicit_convenience,
         "managed_layout_assist": managed_layout_assist,
         "content_capability": content_capability,
         "initial_blur": initial_blur,
@@ -18206,6 +19588,15 @@ def _write_project_reference_sidecar(
         )
         if isinstance(authored, dict):
             sidecar_metadata["private_authored_settings"] = copy.deepcopy(authored)
+        private_request = (
+            ((parent_job.get("params") or {}).get("reference_pack") or {}).get(
+                "private_reference_request"
+            )
+        )
+        if isinstance(private_request, dict):
+            sidecar_metadata["private_reference_request"] = copy.deepcopy(
+                private_request,
+            )
     sidecar = {
         "params": {metadata_key: sidecar_metadata},
         "generation_mode": "image",
@@ -18385,6 +19776,7 @@ def _run_project_reference_image_job(
         "resource_state": "queued",
         "execution_attempt": 1,
         "parent_job_id": str(parent_job.get("id") or ""),
+        "logical_job_kind": "reference_pack_child",
         "requested_outputs": 1,
         "queue_priority": int(parent_job.get("queue_priority", 0) or 0),
         "queue_held": bool(parent_job.get("queue_held", False)),
@@ -18724,6 +20116,24 @@ def _project_reference_authored_prompt_fragment(authored_contract) -> str:
     ]
     if callout_labels:
         parts.append(f"Authored detail callouts: {'; '.join(callout_labels)}")
+    character_facts = getattr(authored_contract, "character_facts", None)
+    gender = getattr(character_facts, "gender", None)
+    if isinstance(gender, str) and gender:
+        parts.append(f"Authored character gender: {gender}")
+    age = getattr(character_facts, "age", None)
+    if type(age) is int:
+        parts.append(f"Authored character age in years: {age}")
+    anatomy = tuple(
+        item
+        for item in (
+            getattr(character_facts, "explicit_anatomy", ()) or ()
+        )
+        if isinstance(item, str) and item
+    )
+    if anatomy:
+        parts.append(
+            f"Authored role-local anatomy: {'; '.join(anatomy)}"
+        )
     return "\n".join(parts)
 
 
@@ -18799,9 +20209,76 @@ def _project_reference_selected_reviewer(
     return raw
 
 
+def _project_reference_public_quality(
+    result, *, recommended: bool, recommendation_basis: str | None,
+) -> dict:
+    """Return a compact, closed publication assessment for one candidate."""
+    review = getattr(result, "review", None)
+    assessment = getattr(review, "fidelity_assessment", None)
+    if assessment is None:
+        return {
+            "status": "review_unavailable",
+            "warning": "Fidelity review was unavailable; this result is ungraded.",
+            "review_deferred": True,
+            "assessment": None,
+            "recommended": bool(recommended),
+            "recommendation_basis": recommendation_basis,
+        }
+    public = assessment.public_metadata()
+    residual_count = public["residual_count"]
+    return {
+        "status": "pass" if residual_count == 0 else "residual",
+        "warning": (
+            None if residual_count == 0 else
+            "Fidelity review found residual differences in this result."
+        ),
+        "review_deferred": False,
+        "assessment": {
+            key: public[key] for key in (
+                "version", "assessment_class", "worst_severity",
+                "residual_count", "score_basis_points", "status",
+                "dimension_checks", "failed_roles", "reason_codes",
+            )
+        },
+        "recommended": bool(recommended),
+        "recommendation_basis": recommendation_basis,
+    }
+
+
+def _project_reference_source_identity(path) -> dict:
+    """Seal one generated source independently of reviewer availability."""
+    try:
+        before = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_nlink != 1
+        ):
+            raise OSError("unsafe Reference artifact")
+        size, digest = _recovery_sha256_file(path)
+        after = os.lstat(path)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or stat.S_ISLNK(after.st_mode)
+            or after.st_nlink != 1
+            or (before.st_dev, before.st_ino, before.st_size)
+                != (after.st_dev, after.st_ino, after.st_size)
+            or size != after.st_size
+        ):
+            raise OSError("Reference artifact changed")
+    except OSError as error:
+        raise RuntimeError("reference_pack_artifact_integrity_failed") from error
+    return {
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "size": size,
+        "sha256": digest,
+    }
+
+
 def _attach_project_reference_result(
     *, asset_id, result, parent_job, candidate_index, candidate_count,
-    parent_variant_id,
+    parent_variant_id, recommended=False, recommendation_basis=None,
 ):
     if is_cancel_requested(parent_job):
         raise RuntimeError("reference_job_cancelled")
@@ -18839,8 +20316,17 @@ def _attach_project_reference_result(
     reference_metadata = {
         **result.public_metadata(),
         **model_metadata,
+        "explicit_output": bool(policy.get("explicit")),
+        "explicit_convenience": bool(
+            getattr(result.plan, "explicit_convenience", False)
+        ),
         "planning_status": str(
             reference_request.get("planning_status") or "deterministic"
+        ),
+        "quality": _project_reference_public_quality(
+            result,
+            recommended=bool(recommended),
+            recommendation_basis=recommendation_basis,
         ),
     }
     review = getattr(result, "review", None)
@@ -18858,12 +20344,6 @@ def _attach_project_reference_result(
         )
     ):
         raise RuntimeError("reference_pack_review_seal_invalid")
-    if (
-        getattr(result.plan, "review_contract", None)
-        == _PROJECT_REFERENCE_UNRESTRICTED_REVIEW
-        and len(seal_by_index) != len(artifacts)
-    ):
-        raise RuntimeError("reference_pack_review_seal_missing")
     outputs = []
     for artifact in artifacts:
         artifact_metadata = artifact.public_metadata()
@@ -18903,6 +20383,10 @@ def _attach_project_reference_result(
                 "size": approved.size,
                 "sha256": approved.sha256,
             }
+        else:
+            output["expected_source_identity"] = (
+                _project_reference_source_identity(str(artifact.path))
+            )
         outputs.append(output)
         _write_project_reference_sidecar(
             str(artifact.path),
@@ -18932,6 +20416,14 @@ def _attach_project_reference_result(
             "reference_pack": reference_metadata,
             "private_authored_settings": copy.deepcopy(
                 result.plan.private_authored_settings()
+            ),
+            "private_reference_request": (
+                _project_reference_private_character_state(
+                    getattr(result.plan, "character_profile", None),
+                    explicit_convenience=bool(
+                        getattr(result.plan, "explicit_convenience", False)
+                    ),
+                )
             ),
             "job": {
                 "id": str(parent_job.get("id") or ""),
@@ -18978,17 +20470,38 @@ async def generate_project_asset_references(project: str, request: Request):
         PackIntelligenceSelection,
         PackLoraSelection,
         PackOperationRoute,
+        ReferenceCandidateAssessment,
         build_reference_pack_plan,
+        fidelity_attempt_accepted,
         fidelity_rubric_role_applicability,
+        recommend_reference_candidate,
     )
 
     visual_style_default = build_visual_style_default_block()
     project_id, workspace_id = _asset_scope(request, project)
     body = await request.json()
+    if isinstance(body, dict):
+        fresh_profile = body.get("character_profile")
+        if (
+            not body.get("parent_variant_id")
+            and isinstance(fresh_profile, dict)
+            and "commitment_nonce" in fresh_profile
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Private Reference authoring state requires Retry or Edit",
+            )
+    try:
+        request_id = normalize_request_id(
+            body.get("request_id") if isinstance(body, dict) else None
+        )
+    except ReferenceAdmissionValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     owner_session_id = request.state.maestro_session_id
     existing_asset = None
     existing_asset_type = None
     restored_lora_commitment_contexts = None
+    restored_managed_character_callouts = None
     if isinstance(body, dict):
         requested_asset_id = body.get("asset_id")
         if (
@@ -19010,15 +20523,8 @@ async def generate_project_asset_references(project: str, request: Request):
             except Exception as error:
                 raise _project_asset_error(error) from error
         parent_variant_id = body.get("parent_variant_id")
-        restore_private_fields = any(
-            field not in body
-            for field in (
-                "type_fields", "detail_callouts", "additional_loras", "style",
-            )
-        )
         if (
-            restore_private_fields
-            and existing_asset is not None
+            existing_asset is not None
             and isinstance(parent_variant_id, str)
             and parent_variant_id
             and len(parent_variant_id) <= 128
@@ -19043,12 +20549,114 @@ async def generate_project_asset_references(project: str, request: Request):
                     body.setdefault(
                         "type_fields", private_snapshot["type_fields"],
                     )
-                    body.setdefault(
-                        "detail_callouts",
-                        private_snapshot["detail_callouts"],
-                    )
+                    client_supplied_callouts = "detail_callouts" in body
+                    if not client_supplied_callouts:
+                        body["detail_callouts"] = copy.deepcopy(
+                            private_snapshot["detail_callouts"],
+                        )
                     if "style" in private_snapshot:
                         body.setdefault("style", private_snapshot["style"])
+                    parent_profile = private_snapshot.get("character_profile")
+                    parent_convenience = private_snapshot.get(
+                        "explicit_convenience", False,
+                    )
+                    if (
+                        "explicit_convenience" in body
+                        and body.get("explicit_convenience")
+                        != parent_convenience
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Reference explicit convenience cannot change "
+                                "on retry"
+                            ),
+                        )
+                    body.setdefault(
+                        "explicit_convenience", parent_convenience,
+                    )
+                    if "character_profile" in body:
+                        supplied_profile = body.get("character_profile")
+                        if supplied_profile is None:
+                            supplied_semantic_profile = None
+                        else:
+                            from services.reference_sheets import (
+                                normalize_character_profile,
+                            )
+                            supplied = normalize_character_profile(
+                                supplied_profile,
+                                explicit_convenience=parent_convenience,
+                            )
+                            supplied_semantic_profile = {
+                                "gender": supplied.gender,
+                                "age": supplied.age,
+                                "explicit_anatomy": list(
+                                    supplied.explicit_anatomy
+                                ),
+                            }
+                        parent_semantic_profile = (
+                            None if parent_profile is None else {
+                                "gender": parent_profile["gender"],
+                                "age": parent_profile["age"],
+                                "explicit_anatomy": list(
+                                    parent_profile["explicit_anatomy"]
+                                ),
+                            }
+                        )
+                        if supplied_semantic_profile != parent_semantic_profile:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Reference character profile cannot "
+                                    "change on retry"
+                                ),
+                            )
+                    if parent_profile is not None:
+                        body["character_profile"] = copy.deepcopy(
+                            parent_profile,
+                        )
+                    else:
+                        body.pop("character_profile", None)
+                    restored_managed_character_callouts = copy.deepcopy(
+                        private_snapshot.get("managed_character_callouts"),
+                    )
+                    if (
+                        client_supplied_callouts
+                        and isinstance(body.get("detail_callouts"), list)
+                        and isinstance(
+                            restored_managed_character_callouts, dict,
+                        )
+                    ):
+                        managed_entries = (
+                            restored_managed_character_callouts.get("entries")
+                            or []
+                        )
+                        managed_ids = {
+                            entry.get("managed_id")
+                            for entry in managed_entries
+                            if isinstance(entry, dict)
+                        }
+                        if any(
+                            isinstance(item, dict)
+                            and item.get("custom_id") in managed_ids
+                            for item in body["detail_callouts"]
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Managed character callouts are server-owned",
+                            )
+                        for entry in managed_entries:
+                            if (
+                                isinstance(entry, dict)
+                                and entry.get("status") == "active"
+                            ):
+                                body["detail_callouts"].append({
+                                    "custom_id": entry["managed_id"],
+                                    "label": entry["label"],
+                                    "kind": "custom",
+                                    "operation": entry["operation"],
+                                    "source_role": entry["source_role"],
+                                })
                     if (
                         "additional_loras" not in body
                         and isinstance(
@@ -19091,6 +20699,7 @@ async def generate_project_asset_references(project: str, request: Request):
         request,
         existing_asset_type=existing_asset_type,
         commitment_contexts=restored_lora_commitment_contexts,
+        managed_character_callouts=restored_managed_character_callouts,
     )
     _require_remote_visible_models(
         request,
@@ -19191,6 +20800,9 @@ async def generate_project_asset_references(project: str, request: Request):
         user_lora_count=len(config["activated_loras"]),
         type_fields=config["type_fields"],
         detail_callouts=config["detail_callouts"],
+        character_profile=config["character_profile"],
+        managed_character_callouts=config["managed_character_callouts"],
+        explicit_convenience=config["explicit_convenience"],
         planning=PackIntelligenceSelection(**config["planning"]),
         review_selection=PackIntelligenceSelection(**config["review_selection"]),
         generation_schedule=config["model_schedules"][config["model_type"]],
@@ -19251,6 +20863,9 @@ async def generate_project_asset_references(project: str, request: Request):
             user_lora_count=len(config["activated_loras"]),
             type_fields=config["type_fields"],
             detail_callouts=config["detail_callouts"],
+            character_profile=config["character_profile"],
+            managed_character_callouts=config["managed_character_callouts"],
+            explicit_convenience=config["explicit_convenience"],
             planning=PackIntelligenceSelection(**config["planning"]),
             review_selection=PackIntelligenceSelection(**config["review_selection"]),
             generation_schedule=config["model_schedules"][config["model_type"]],
@@ -19266,7 +20881,149 @@ async def generate_project_asset_references(project: str, request: Request):
             operation_routing=sealed_operation_routing,
             additional_loras=tuple(sealed_loras),
         )
-    job_id = uuid.uuid4().hex[:8]
+
+    admission = None
+    admission_scope = None
+    if request_id is not None:
+        operation = (
+            "reference.edit.v1"
+            if config["asset_id"] and config["edit_instruction"]
+            else "reference.retry.v1"
+            if config["asset_id"]
+            else "reference.fresh.v1"
+        )
+        admission_scope = {
+            "owner_principal": owner_principal_digest(
+                _session_secret(), owner_session_id,
+            ),
+            "project_instance": _queue_recovery_project_identity(
+                workspace, job_out_dir,
+            ),
+            "operation": operation,
+            "payload": {
+                key: value for key, value in body.items()
+                if key != "request_id"
+            },
+        }
+        admission_store = _reference_admission_store()
+        try:
+            admission = admission_store.begin(
+                request_id,
+                **admission_scope,
+                proposed_job_id=uuid.uuid4().hex,
+                proposed_asset_id=asset_id or uuid.uuid4().hex,
+            )
+            if admission.disposition == "pending":
+                deadline = time.monotonic() + min(
+                    3.0, admission_store.lease_seconds,
+                )
+                while admission.disposition == "pending" and (
+                    time.monotonic() < deadline
+                ):
+                    await asyncio.sleep(0.05)
+                    admission = admission_store.inspect(
+                        request_id, **admission_scope,
+                    )
+                    if admission is None:
+                        raise ReferenceAdmissionPersistenceError(
+                            "Reference admission reservation disappeared."
+                        )
+            if admission.disposition == "failed":
+                raise ReferenceAdmissionPersistenceError(
+                    "The prior Reference admission failed closed."
+                )
+            if admission.disposition == "pending":
+                raise ReferenceAdmissionPersistenceError(
+                    "Reference admission is still being committed."
+                )
+        except ReferenceAdmissionMismatchError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ReferenceAdmissionValidationError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except (
+            ReferenceAdmissionCapacityError,
+            ReferenceAdmissionCorruptionError,
+            ReferenceAdmissionPersistenceError,
+        ) as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        asset_id = admission.asset_id
+        if config["asset_id"] and asset_id != config["asset_id"]:
+            raise HTTPException(
+                status_code=503,
+                detail="Reference admission identity is unavailable.",
+            )
+        asset["id"] = asset_id
+        # An idempotent acceptance is intentionally a stable, minimal asset
+        # envelope.  It never changes when the admitted worker later appends
+        # variants, so a lost-response replay is byte-for-byte equivalent.
+        response_asset = {
+            "id": asset_id,
+            "name": "",
+            "asset_type": config["asset_type"],
+            "description": "",
+            "tags": [],
+            "provenance": {"kind": "generated", "details": {}},
+            "metadata": {},
+            "variants": [],
+            "pending": True,
+        }
+    job_id = admission.job_id if admission is not None else uuid.uuid4().hex[:8]
+
+    def admission_response():
+        response = {
+            "job_id": job_id,
+            "asset": copy.deepcopy(response_asset),
+        }
+        if request_id is None:
+            response["plan"] = plan.public_preview(
+                candidate_count=config["candidate_count"],
+            )
+        return response
+
+    if admission is not None and admission.disposition == "replay":
+        # The integrity-checked accepted ledger is the durable authority. A
+        # terminal job may already have been compacted from queue recovery;
+        # the canonical idempotent response contains only its reserved opaque
+        # identities and therefore remains reconstructable for the ledger TTL.
+        return admission_response()
+
+    if admission is not None and admission.disposition == "resume":
+        admitted_job = _jobs.get(job_id)
+        admitted_params = (
+            admitted_job.get("params", {}).get("reference_pack", {})
+            if isinstance(admitted_job, dict) else {}
+        )
+        recovery_unit = (
+            admitted_job.get("recovery_unit")
+            if isinstance(admitted_job, dict) else None
+        )
+        admitted_job_matches = bool(
+            _job_owned_by_request(admitted_job, request)
+            and admitted_job.get("workspace") == workspace
+            and admitted_job.get("logical_job_kind")
+                == "reference_pack_parent"
+            and (
+                admitted_params.get("asset_id") == asset_id
+                or isinstance(recovery_unit, dict)
+                and recovery_unit.get("asset_id") == asset_id
+            )
+        )
+        if admitted_job_matches:
+            try:
+                admission_store.accept(
+                    request_id,
+                    **admission_scope,
+                    lease_token=admission.lease_token,
+                )
+            except (
+                ReferenceAdmissionMismatchError,
+                ReferenceAdmissionValidationError,
+                ReferenceAdmissionCorruptionError,
+                ReferenceAdmissionPersistenceError,
+            ) as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            return admission_response()
+
     repair_budget = 0 if config["mode"] == "draft" else config["max_repair_attempts"]
     review_questions_per_attempt = sum(
         len(applicable_roles)
@@ -19288,6 +21045,7 @@ async def generate_project_asset_references(project: str, request: Request):
     total_steps = 1 + operations_per_candidate * config["candidate_count"]
     reference_params = {
         **plan.public_preview(candidate_count=config["candidate_count"]),
+        "asset_id": asset_id,
         "review_requested": config["review_selection"]["requested_model"] != "off",
         "max_repair_attempts": repair_budget,
         "max_repair_attempts_per_candidate": repair_budget,
@@ -19327,6 +21085,10 @@ async def generate_project_asset_references(project: str, request: Request):
             for item in sealed_loras
         ],
         "private_authored_settings": plan.private_authored_settings(),
+        "private_reference_request": _project_reference_private_character_state(
+            plan.character_profile,
+            explicit_convenience=plan.explicit_convenience,
+        ),
     }
     job = {
         "id": job_id,
@@ -19354,6 +21116,7 @@ async def generate_project_asset_references(project: str, request: Request):
         "resource_execution": "standard",
         "preemption_mode": "none",
         "resource_state": "queued",
+        "logical_job_kind": "reference_pack_parent",
         "execution_attempt": 1,
         "requested_outputs": len(plan.output_roles) * config["candidate_count"],
     }
@@ -19512,6 +21275,11 @@ async def generate_project_asset_references(project: str, request: Request):
                     user_lora_count=len(config["activated_loras"]),
                     type_fields=config["type_fields"],
                     detail_callouts=config["detail_callouts"],
+                    character_profile=config["character_profile"],
+                    managed_character_callouts=config[
+                        "managed_character_callouts"
+                    ],
+                    explicit_convenience=config["explicit_convenience"],
                     planning=PackIntelligenceSelection(**config["planning"]),
                     review_selection=PackIntelligenceSelection(
                         **config["review_selection"]
@@ -19608,6 +21376,7 @@ async def generate_project_asset_references(project: str, request: Request):
                             candidate_count=config["candidate_count"],
                             plan_seal=plan.plan_seal,
                             mandatory_review=config["mandatory_review"],
+                            explicit_output=config["policy"]["explicit"],
                         )
                     except Exception:
                         raise RuntimeError("reference_pack_variant_collision")
@@ -19746,9 +21515,20 @@ async def generate_project_asset_references(project: str, request: Request):
                     )
 
                 def repair_sheet(original_path, anchor_path, repair_request):
+                    repair_role_index = plan.output_roles.index(
+                        repair_request.role
+                    )
+                    public_repair_role = plan.public_output_roles[
+                        repair_role_index
+                    ]
+                    repair_label = (
+                        "managed character detail"
+                        if public_repair_role != repair_request.role
+                        else repair_request.label
+                    )
                     phase = (
                         f"Repairing pack {candidate_index + 1}/{config['candidate_count']} "
-                        f"sheet {repair_request.label}"
+                        f"sheet {repair_label}"
                     )
                     step = next_step(phase)
                     authored_fragment = _project_reference_authored_prompt_fragment(
@@ -19842,18 +21622,10 @@ async def generate_project_asset_references(project: str, request: Request):
                     **config["review_selection"],
                     "status": result.review.status,
                 }
-                # All modes stage candidate specs before one manifest commit.
-                # Mandatory review failure therefore has no visibility window,
-                # while standard/off retains its existing review semantics.
+                # Every structurally valid candidate remains publishable. A
+                # residual or unavailable review is public assessment data,
+                # never a terminal generation failure.
                 staged_results.append((candidate_index, result))
-                if config["mandatory_review"] and result.review.status != "pass":
-                    reference_job_params["quality_failure"] = {
-                        "status": result.review.status,
-                        "failed_roles": list(result.review.failed_roles),
-                        "reason_codes": list(result.review.reason_codes),
-                        "review_contract": config["review_contract"],
-                    }
-                    raise RuntimeError(_PROJECT_REFERENCE_QUALITY_FAILURE)
                 next_step(
                     f"Staging pack {candidate_index + 1}/"
                     f"{config['candidate_count']}"
@@ -19868,6 +21640,63 @@ async def generate_project_asset_references(project: str, request: Request):
                 phase="Publishing reference packs",
                 message="Publishing prepared reference packs",
             )
+            replayed_recommendations = [
+                variant for variant in replayed_variants
+                if _project_reference_variant_is_recommended(variant)
+            ]
+            if len(replayed_recommendations) > 1:
+                raise RuntimeError("reference_pack_recommendation_invalid")
+            recommended_candidate_index = None
+            recommendation_basis = None
+            if replayed_recommendations:
+                replayed = replayed_recommendations[0]
+                recommended_candidate_index = int(
+                    replayed["metadata"]["job"]["candidate_index"]
+                ) - 1
+                recommendation_basis = replayed["metadata"][
+                    "reference_pack"
+                ]["quality"]["recommendation_basis"]
+
+            assessed_candidates = []
+            accepted_candidates = []
+            ungraded_candidate_indices = []
+            for candidate_index, result in staged_results:
+                assessment = result.review.fidelity_assessment
+                if assessment is None:
+                    ungraded_candidate_indices.append(candidate_index)
+                    continue
+                candidate = ReferenceCandidateAssessment(
+                    candidate_index=candidate_index,
+                    assessment=assessment,
+                    repair_count=result.review.fidelity_attempt_index,
+                )
+                assessed_candidates.append(candidate)
+                if fidelity_attempt_accepted(
+                    assessment,
+                    attempt_index=result.review.fidelity_attempt_index,
+                ):
+                    accepted_candidates.append(candidate)
+            if recommended_candidate_index is not None:
+                pass
+            elif accepted_candidates:
+                recommended_candidate_index = (
+                    recommend_reference_candidate(
+                        accepted_candidates,
+                    ).candidate_index
+                )
+                recommendation_basis = "accepted_assessment"
+            elif ungraded_candidate_indices:
+                recommended_candidate_index = min(ungraded_candidate_indices)
+                recommendation_basis = "preliminary_ungraded"
+            elif assessed_candidates:
+                recommended_candidate_index = (
+                    recommend_reference_candidate(
+                        assessed_candidates,
+                    ).candidate_index
+                )
+                recommendation_basis = "residual_assessment"
+            elif staged_results:
+                raise RuntimeError("reference_pack_candidate_set_invalid")
             prepared_variants = []
             for candidate_index, result in staged_results:
                 prepared_variants.append(_attach_project_reference_result(
@@ -19877,6 +21706,14 @@ async def generate_project_asset_references(project: str, request: Request):
                     candidate_index=candidate_index,
                     candidate_count=config["candidate_count"],
                     parent_variant_id=config["parent_variant_id"],
+                    recommended=(
+                        candidate_index == recommended_candidate_index
+                    ),
+                    recommendation_basis=(
+                        recommendation_basis
+                        if candidate_index == recommended_candidate_index
+                        else None
+                    ),
                 ))
 
             from services import job_lifecycle as _job_lifecycle
@@ -19953,6 +21790,7 @@ async def generate_project_asset_references(project: str, request: Request):
                     }
                     if set(committed_by_id) != set(expected_variant_ids):
                         raise RuntimeError("reference_pack_publication_incomplete")
+                    committed_recommendations = 0
                     for candidate_index, variant_id in enumerate(
                         expected_variant_ids, start=1,
                     ):
@@ -19966,6 +21804,16 @@ async def generate_project_asset_references(project: str, request: Request):
                             candidate_count=config["candidate_count"],
                             plan_seal=plan.plan_seal,
                             mandatory_review=config["mandatory_review"],
+                            explicit_output=config["policy"]["explicit"],
+                        )
+                        committed_recommendations += int(
+                            _project_reference_variant_is_recommended(
+                                committed_by_id[variant_id],
+                            )
+                        )
+                    if committed_recommendations != 1:
+                        raise RuntimeError(
+                            "reference_pack_recommendation_incomplete"
                         )
                     published_variant_ids.extend(expected_variant_ids)
                     for variant_id in expected_variant_ids:
@@ -20044,11 +21892,9 @@ async def generate_project_asset_references(project: str, request: Request):
             ):
                 block_resource_admission_failure(parent_job)
                 return
-            quality_failed = str(error) == _PROJECT_REFERENCE_QUALITY_FAILURE
             child_failure = {}
             if (
-                not quality_failed
-                and _public_parent_job_id({
+                _public_parent_job_id({
                     "parent_job_id": parent_job.get("failed_child_job_id"),
                 }) is not None
             ):
@@ -20056,14 +21902,8 @@ async def generate_project_asset_references(project: str, request: Request):
                     parent_job,
                 )
             terminal_failure = {
-                "message": (
-                    "Reference-pack fidelity quality review failed"
-                    if quality_failed else "Reference-pack generation failed"
-                ),
-                "error": (
-                    "Reference-pack fidelity quality review failed"
-                    if quality_failed else "Reference-pack generation failed"
-                ),
+                "message": "Reference-pack generation failed",
+                "error": "Reference-pack generation failed",
             }
             terminal_failure.update(child_failure)
             finish_job(
@@ -20090,12 +21930,45 @@ async def generate_project_asset_references(project: str, request: Request):
         )
     except Exception as error:
         _end_workspace_operation(project_id)
+        if (
+            admission is not None
+            and admission.owns_lease
+            and _jobs.get(job_id) is job
+        ):
+            try:
+                admission_store.accept(
+                    request_id,
+                    **admission_scope,
+                    lease_token=admission.lease_token,
+                )
+            except Exception as admission_error:
+                raise _project_asset_error(admission_error) from admission_error
+            return admission_response()
+        if admission is not None and admission.owns_lease:
+            try:
+                admission_store.fail(
+                    request_id,
+                    **admission_scope,
+                    lease_token=admission.lease_token,
+                )
+            except Exception:
+                pass
         raise _project_asset_error(error) from error
-    return {
-        "job_id": job_id,
-        "asset": response_asset,
-        "plan": plan.public_preview(candidate_count=config["candidate_count"]),
-    }
+    if admission is not None and admission.owns_lease:
+        try:
+            admission_store.accept(
+                request_id,
+                **admission_scope,
+                lease_token=admission.lease_token,
+            )
+        except (
+            ReferenceAdmissionMismatchError,
+            ReferenceAdmissionValidationError,
+            ReferenceAdmissionCorruptionError,
+            ReferenceAdmissionPersistenceError,
+        ) as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+    return admission_response()
 
 
 # ============================================================================
@@ -22252,9 +24125,19 @@ def _promote_external_llm_request(request: Request) -> None:
 
 
 def _require_local_llm_control(request: Request) -> None:
-    """Deny machine-wide LLM controls to every external transport."""
+    """Require local authority or a recently reauthenticated remote owner."""
     _promote_external_llm_request(request)
-    if bool(getattr(request.state, "maestro_remote", False)):
+    remote = bool(getattr(request.state, "maestro_remote", False))
+    has_capability = globals().get("_request_has_account_capability")
+    has_reauth = globals().get("_request_has_recent_account_reauth")
+    remote_owner = (
+        remote
+        and callable(has_capability)
+        and callable(has_reauth)
+        and has_capability(request, "owner.remote_parity")
+        and has_reauth(request)
+    )
+    if remote and not remote_owner:
         raise HTTPException(
             status_code=403,
             detail="This machine-wide control is available locally only",
@@ -49147,6 +51030,22 @@ def _public_parent_job_id(job: dict) -> str | None:
     return None
 
 
+def _public_logical_job_kind(job: dict) -> str | None:
+    """Expose only server-authored Reference relation markers."""
+    kind = job.get("logical_job_kind")
+    if kind == "reference_pack_parent":
+        reference = (job.get("params") or {}).get("reference_pack")
+        if isinstance(reference, dict) and _public_parent_job_id(job) is None:
+            return kind
+    elif kind == "reference_pack_child":
+        if (
+            _public_parent_job_id(job) is not None
+            and job.get("resource_intent") == "generation"
+        ):
+            return kind
+    return None
+
+
 def _public_failed_child_metadata(job: dict, request: Request) -> dict:
     """Project one owner-fenced reverse child relation using closed tokens."""
     empty = {
@@ -49342,6 +51241,10 @@ def get_status(job_id: str, request: Request, response: Response):
         ),
         "parent_job_id": _public_parent_job_id(j),
         **(
+            {"logical_job_kind": _public_logical_job_kind(j)}
+            if _public_logical_job_kind(j) is not None else {}
+        ),
+        **(
             _public_failed_child_metadata(j, request)
             if callable(globals().get("_public_failed_child_metadata"))
             else {
@@ -49421,14 +51324,47 @@ def cancel_job(job_id: str, request: Request, response: Response):
 
 
 @api.get("/api/v1/jobs")
-def list_jobs(request: Request, response: Response):
+def list_jobs(
+    request: Request,
+    response: Response,
+    limit: int | None = None,
+    offset: int = 0,
+):
     """List all active/recent jobs for reconnection after browser refresh."""
     _set_recovery_no_store(response)
+    if (
+        isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or not 0 <= offset <= 10_000
+        or limit is not None
+        and (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1_000
+        )
+    ):
+        raise HTTPException(status_code=400, detail="Invalid jobs pagination")
+    physical_jobs = list(_jobs.values())
+    scheduler = queue_scheduler_snapshot(physical_jobs)
+    authorized_jobs = []
+    for job in physical_jobs:
+        snapshot = scheduler["states"].get(id(job))
+        if snapshot and _job_owned_by_request(snapshot, request):
+            authorized_jobs.append(job)
+    projection = authorized_logical_queue_projection(
+        authorized_jobs, scheduler,
+    )
+    authorized_by_id = {
+        str((scheduler["states"].get(id(job)) or {}).get("id") or ""): job
+        for job in authorized_jobs
+    }
     active = []
-    for job in list(_jobs.values()):
-        if not _job_owned_by_request(job, request):
-            continue
-        j = snapshot_job(job)
+    for job in projection["logical_jobs"]:
+        j = scheduler["states"].get(id(job)) or snapshot_job(job)
+        representative_job = authorized_by_id.get(
+            projection["representative_job_ids"].get(str(j.get("id") or "")),
+            job,
+        )
         if j["status"] in (
             "preparing", "waiting_for_plan_approval",
             "queued", "running", "failed", "cancelled",
@@ -49491,12 +51427,18 @@ def list_jobs(request: Request, response: Response):
                 "queue_held": bool(j.get("queue_held", False)),
                 "hold_after_output": bool(j.get("hold_after_output", False)),
                 "queue_position": (
-                    None if recovery_blocked else queue_position(job)
+                    None if recovery_blocked else
+                    projection["public_positions"].get(id(representative_job))
                 ),
                 "queue_wait_reason": (
-                    None if recovery_blocked else _queue_wait_reason_for_job(job)
+                    None if recovery_blocked else
+                    _queue_wait_reason_for_job(representative_job)
                 ),
                 "parent_job_id": _public_parent_job_id(j),
+                **(
+                    {"logical_job_kind": _public_logical_job_kind(j)}
+                    if _public_logical_job_kind(j) is not None else {}
+                ),
                 **(
                     _public_failed_child_metadata(j, request)
                     if callable(globals().get("_public_failed_child_metadata"))
@@ -49528,7 +51470,14 @@ def list_jobs(request: Request, response: Response):
                 **_public_queue_recovery_metadata(j),
             })
     active.sort(key=lambda x: x["created_at"])
-    return {"jobs": active, "queue": queue_control_state()}
+    total = len(active)
+    page = active[offset:] if limit is None else active[offset:offset + limit]
+    return {
+        "jobs": page,
+        "total": total,
+        "summary": projection["summary"],
+        "queue": queue_control_state(),
+    }
 
 
 def _require_owned_job(job_id: str, request: Request) -> dict:
@@ -50049,10 +51998,22 @@ def get_queue_state(request: Request, response: Response):
     _require_remote_queue_project(request)
     active_jobs = list(_jobs.values())
     scheduler = queue_scheduler_snapshot(active_jobs)
+    authorized_jobs = [
+        job for job in active_jobs
+        if (
+            scheduler["states"].get(id(job))
+            and _job_owned_by_request(
+                scheduler["states"][id(job)], request,
+            )
+        )
+    ]
+    projection = authorized_logical_queue_projection(
+        authorized_jobs, scheduler,
+    )
     jobs = []
-    for job in active_jobs:
+    for job in projection["physical_jobs"]:
         snapshot = scheduler["states"].get(id(job))
-        if not snapshot or not _job_owned_by_request(snapshot, request):
+        if not snapshot:
             continue
         if snapshot.get("status") not in (
             "preparing", "waiting_for_plan_approval", "queued", "running",
@@ -50086,7 +52047,7 @@ def get_queue_state(request: Request, response: Response):
             ),
             "position": (
                 None if recovery_blocked or pre_gpu
-                else scheduler["positions"].get(id(job))
+                else projection["public_positions"].get(id(job))
             ),
             "wait_reason": (
                 None if recovery_blocked
@@ -50097,6 +52058,10 @@ def get_queue_state(request: Request, response: Response):
                 )
             ),
             "parent_job_id": _public_parent_job_id(snapshot),
+            **(
+                {"logical_job_kind": _public_logical_job_kind(snapshot)}
+                if _public_logical_job_kind(snapshot) is not None else {}
+            ),
             **_public_resource_metadata(snapshot),
             **_public_queue_residency_metadata(
                 snapshot,
@@ -50120,18 +52085,35 @@ def get_queue_state(request: Request, response: Response):
         item["position"] is None,
         item["position"] or 0,
     ))
+    logical_summary = dict(projection["summary"])
+    logical_summary.update({
+        "cpu_text_running": sum(
+            1 for job in authorized_jobs
+            if (
+                (scheduler["states"].get(id(job)) or {}).get("status")
+                    == "running"
+                and (scheduler["states"].get(id(job)) or {}).get(
+                    "resource_intent"
+                ) == "text"
+            )
+        ),
+        "cpu_text_waiting": sum(
+            1 for job in authorized_jobs
+            if (
+                (scheduler["states"].get(id(job)) or {}).get("status")
+                    == "queued"
+                and (scheduler["states"].get(id(job)) or {}).get(
+                    "resource_intent"
+                ) == "text"
+            )
+        ),
+    })
     return {
         "jobs": jobs,
+        "total": logical_summary["active_total"],
         "paused": scheduler["paused"],
         "pause_after_current": scheduler["pause_after_current"],
-        "summary": {
-            **scheduler["summary"],
-            **(
-                globals()["_cpu_text_lane"].aggregate_snapshot()
-                if "_cpu_text_lane" in globals()
-                else {"cpu_text_running": 0, "cpu_text_waiting": 0}
-            ),
-        },
+        "summary": logical_summary,
     }
 
 
@@ -53347,6 +55329,9 @@ if __name__ == "__main__":
             flush=True,
         )
         port = resolved_port
+    # Origin authorization is evaluated per request from SERVER_PORT. Keep it
+    # aligned with the actual listener if startup had to fall forward.
+    os.environ["SERVER_PORT"] = str(port)
 
     # Browsers can't navigate to 0.0.0.0 (it's a non-routable bind
     # address), so when binding wider we still SURFACE the loopback

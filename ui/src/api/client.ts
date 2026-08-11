@@ -10,6 +10,9 @@ import type {
   ProjectReferencePrivateAdditionalLora,
   ProjectReferenceAdditionalLoraSummary,
   ProjectReferenceAssetType,
+  ProjectReferenceCharacterAnatomy,
+  ProjectReferenceCharacterGender,
+  ProjectReferenceCharacterProfileInput,
   ProjectReferenceDepth,
   ProjectReferenceDetailCallout,
   ProjectReferenceDetailKind,
@@ -30,10 +33,25 @@ import type {
   ProjectReferenceTypeFieldItem,
   ScailResolutionProfile,
   LoraInfo,
+  LogicalJobKind,
+  AccountAuthResult,
+  AccountContext,
+  AccountNoncePurpose,
+  AccountSession,
+  AccountSummary,
+  ResponsibleUseProjection,
+  ResponsibleUseStatus,
+  SupportAccountSummary,
+  SupportAdminProjection,
+  SupportPublicProjection,
+  SupportSelfProjection,
 } from '../types'
 
 export type {
   ProjectReferenceAssetType,
+  ProjectReferenceCharacterAnatomy,
+  ProjectReferenceCharacterGender,
+  ProjectReferenceCharacterProfileInput,
   ProjectReferenceAnchorBasis,
   ProjectReferenceAnchorPrivacy,
   ProjectReferenceAdditionalLora,
@@ -221,6 +239,7 @@ export interface ApiJobStatus extends QueueRecoveryMetadata {
   queue_wait_reason: QueueWaitReason | null
   resource_descriptor?: ResourceDescriptor | null
   parent_job_id?: string | null
+  logical_job_kind?: LogicalJobKind
   queue_reorder_reason: QueueReorderReason | null
   queue_residency_bypass_count: number
   queue_residency_bypassed_waiters: number
@@ -252,6 +271,7 @@ export interface QueueJobState extends QueueRecoveryMetadata {
   wait_reason: QueueWaitReason | null
   resource_descriptor?: ResourceDescriptor | null
   parent_job_id?: string | null
+  logical_job_kind?: LogicalJobKind
   plan_review_terms_required?: boolean
   /** Server-authored absolute Unix epoch seconds; null outside plan review. */
   plan_review_deadline?: number | null
@@ -1009,6 +1029,8 @@ export interface AccessContext {
   cloudflare_enabled: boolean
   share_url: string
   share_flow: string
+  /** Optional for compatibility with hosts predating the account layer. */
+  accounts?: AccountContext
 }
 
 export function getDirectorHostActionAccessState(
@@ -1037,6 +1059,280 @@ export async function fetchAccessContext(): Promise<AccessContext> {
     return await pending
   } finally {
     if (accessContextRequest === pending) accessContextRequest = null
+  }
+}
+
+// --- Optional account authority ---
+
+export class AccountApiError extends Error {
+  readonly code: string
+  readonly status: number
+  readonly retryAfter: number
+
+  constructor(message: string, { code = 'account_request_failed', status = 0, retryAfter = 0 } = {}) {
+    super(message)
+    this.name = 'AccountApiError'
+    this.code = code
+    this.status = status
+    this.retryAfter = retryAfter
+  }
+}
+
+async function accountRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers)
+  headers.set('Accept', 'application/json')
+  if (init.body !== undefined) headers.set('Content-Type', 'application/json')
+  const response = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers,
+    credentials: 'same-origin',
+    cache: 'no-store',
+  })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as {
+      detail?: string | { code?: unknown; message?: unknown }
+    }
+    const detail = payload.detail
+    const message = typeof detail === 'string'
+      ? detail
+      : typeof detail?.message === 'string'
+        ? detail.message
+        : 'The account request could not be completed.'
+    const code = typeof detail === 'object' && typeof detail?.code === 'string'
+      ? detail.code
+      : 'account_request_failed'
+    const retryAfter = Number.parseInt(response.headers.get('Retry-After') || '0', 10)
+    throw new AccountApiError(message, {
+      code,
+      status: response.status,
+      retryAfter: Number.isFinite(retryAfter) ? retryAfter : 0,
+    })
+  }
+  return response.json() as Promise<T>
+}
+
+export async function fetchAccountContext(): Promise<AccountContext> {
+  return accountRequest<AccountContext>('/api/v1/account/context')
+}
+
+export async function issueAccountNonce(purpose: AccountNoncePurpose): Promise<string> {
+  const result = await accountRequest<{ nonce: string; purpose: AccountNoncePurpose; expires_in: number }>(
+    '/api/v1/account/nonce',
+    { method: 'POST', body: JSON.stringify({ purpose }) },
+  )
+  return result.nonce
+}
+
+async function accountNonceMutation<T>(
+  purpose: AccountNoncePurpose,
+  path: string,
+  body: Record<string, unknown>,
+  method: 'POST' | 'PUT' | 'DELETE' = 'POST',
+): Promise<T> {
+  const nonce = await issueAccountNonce(purpose)
+  return accountRequest<T>(path, {
+    method,
+    body: JSON.stringify({ ...body, nonce }),
+  })
+}
+
+export async function bootstrapAccount(input: {
+  username: string
+  password: string
+  email?: string
+  deviceLabel?: string
+}): Promise<AccountAuthResult> {
+  return accountNonceMutation<AccountAuthResult>('bootstrap', '/api/v1/account/bootstrap', {
+    username: input.username,
+    password: input.password,
+    email: input.email || '',
+    device_label: input.deviceLabel || 'Browser',
+  })
+}
+
+export async function loginAccount(input: {
+  username: string
+  password: string
+  deviceLabel?: string
+}): Promise<AccountAuthResult> {
+  return accountNonceMutation<AccountAuthResult>('login', '/api/v1/account/login', {
+    username: input.username,
+    password: input.password,
+    device_label: input.deviceLabel || 'Browser',
+  })
+}
+
+export async function logoutAccount(): Promise<{ status: 'logged_out' }> {
+  return accountNonceMutation('revoke_session', '/api/v1/account/logout', {})
+}
+
+export async function reauthenticateAccount(password: string): Promise<{
+  account: AccountSummary
+  reauthenticated_until: number
+}> {
+  return accountNonceMutation('reauth', '/api/v1/account/reauth', { password })
+}
+
+export async function recoverAccount(input: {
+  username: string
+  recoveryCode: string
+  newPassword: string
+  deviceLabel?: string
+}): Promise<AccountAuthResult> {
+  return accountNonceMutation<AccountAuthResult>('recover', '/api/v1/account/recover', {
+    username: input.username,
+    recovery_code: input.recoveryCode,
+    new_password: input.newPassword,
+    device_label: input.deviceLabel || 'Browser',
+  })
+}
+
+export async function changeAccountPassword(newPassword: string): Promise<{
+  status: 'password_changed'
+  other_sessions_revoked: true
+}> {
+  return accountNonceMutation(
+    'change_password', '/api/v1/account/password', { new_password: newPassword }, 'PUT',
+  )
+}
+
+export async function rotateAccountRecoveryCodes(): Promise<{ recovery_codes: string[] }> {
+  return accountNonceMutation('rotate_recovery_codes', '/api/v1/account/recovery-codes', {})
+}
+
+export async function fetchAccountSessions(): Promise<{ sessions: AccountSession[] }> {
+  return accountRequest('/api/v1/account/sessions')
+}
+
+export async function revokeAccountSession(sessionHandle: string): Promise<{
+  revoked: true
+  current: boolean
+}> {
+  return accountNonceMutation(
+    'revoke_session',
+    `/api/v1/account/sessions/${encodeURIComponent(sessionHandle)}`,
+    {},
+    'DELETE',
+  )
+}
+
+export async function revokeAllAccountSessions(retainCurrent: boolean): Promise<{
+  revoked: number
+  current_revoked: boolean
+}> {
+  return accountNonceMutation(
+    'revoke_all_sessions',
+    '/api/v1/account/sessions/revoke-all',
+    { retain_current: retainCurrent },
+  )
+}
+
+export async function fetchServerAccounts(): Promise<{ accounts: AccountSummary[] }> {
+  return accountRequest('/api/v1/account/users')
+}
+
+export async function createServerAccount(input: {
+  username: string
+  password: string
+  email?: string
+}): Promise<AccountAuthResult> {
+  return accountNonceMutation<AccountAuthResult>('create_account', '/api/v1/account/users', {
+    username: input.username,
+    password: input.password,
+    email: input.email || '',
+    role: 'user',
+  })
+}
+
+export async function setServerAccountDisabled(accountId: string, disabled: boolean): Promise<{
+  status: 'updated'
+}> {
+  return accountNonceMutation(
+    'disable_account',
+    `/api/v1/account/users/${encodeURIComponent(accountId)}`,
+    { disabled },
+    'PUT',
+  )
+}
+
+// --- Provider-neutral Support ---
+
+interface RawSupportAccountProjection {
+  recorded?: Record<string, unknown>
+  benefits?: Record<string, unknown>
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function supportAccountSummary(value: RawSupportAccountProjection | undefined): SupportAccountSummary {
+  const recorded = value?.recorded || {}
+  const benefits = value?.benefits || {}
+  return {
+    event_count: typeof recorded.event_count === 'number' ? recorded.event_count : 0,
+    one_time_tier: typeof recorded.one_time_tier === 'string' ? recorded.one_time_tier : null,
+    recurring_tier: typeof recorded.recurring_tier === 'string' ? recorded.recurring_tier : null,
+    active_recurring_count: typeof recorded.active_recurring_count === 'number'
+      ? recorded.active_recurring_count
+      : 0,
+    benefits: {
+      state: typeof benefits.state === 'string' ? benefits.state : 'recorded_not_enforced',
+      scheduler_enforcement_enabled: benefits.scheduler_enforcement_enabled === true,
+      effective_benefits: stringList(benefits.effective_benefits),
+      recorded_eligibility: stringList(benefits.recorded_eligibility),
+    },
+  }
+}
+
+export async function fetchSupportCatalog(): Promise<SupportPublicProjection> {
+  return accountRequest<SupportPublicProjection>('/api/v1/support/catalog')
+}
+
+export async function fetchSupportSelf(): Promise<SupportSelfProjection> {
+  const raw = await accountRequest<SupportPublicProjection & {
+    account_support?: RawSupportAccountProjection
+    responsible_use: ResponsibleUseProjection
+  }>('/api/v1/support/self')
+  return {
+    public: {
+      schema_version: raw.schema_version,
+      provider_catalog: raw.provider_catalog,
+      benefit_availability: raw.benefit_availability,
+      support_priority: raw.support_priority,
+    },
+    account: supportAccountSummary(raw.account_support),
+    responsible_use: raw.responsible_use,
+  }
+}
+
+export async function fetchResponsibleUse(): Promise<ResponsibleUseProjection> {
+  return accountRequest<ResponsibleUseProjection>('/api/v1/support/responsible-use')
+}
+
+export async function acceptResponsibleUse(input: {
+  documentVersion: number
+  contentSha256: string
+}): Promise<{ status: ResponsibleUseStatus }> {
+  return accountRequest('/api/v1/support/responsible-use/accept', {
+    method: 'POST',
+    body: JSON.stringify({
+      document_version: input.documentVersion,
+      content_sha256: input.contentSha256,
+    }),
+  })
+}
+
+export async function fetchAdminAccountSupport(accountId: string): Promise<SupportAdminProjection> {
+  const raw = await accountRequest<{
+    account_support?: RawSupportAccountProjection
+    responsible_use: ResponsibleUseStatus
+    support_priority: SupportAdminProjection['support_priority']
+  }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}`)
+  return {
+    account: supportAccountSummary(raw.account_support),
+    responsible_use: raw.responsible_use,
+    support_priority: raw.support_priority,
   }
 }
 
@@ -1246,6 +1542,14 @@ export interface ProjectReferencePackArtifactMetadata {
   private_output?: boolean
   anchor_privacy?: ProjectReferenceAnchorPrivacy
   detail?: {
+    managed: true
+    source_digest?: string
+    normalized_crop?: [number, number, number, number]
+    requested_operation?: ProjectReferenceDetailOperation
+    resolved_operation?: ProjectReferenceDetailOperation
+    editor_model?: string | null
+    commitment?: string
+  } | {
     custom_id: string
     kind: ProjectReferenceDetailKind
     source_role: string
@@ -1298,6 +1602,47 @@ export interface ProjectReferenceSheetVariantMetadata {
   anchor_privacy?: ProjectReferenceLegacyAnchorPrivacy
 }
 
+export type ProjectReferenceQualityStatus = 'pass' | 'residual' | 'review_unavailable'
+export type ProjectReferenceAssessmentClass = 'exact' | 'minor_residual' | 'material_residual'
+export type ProjectReferenceAssessmentSeverity = ProjectReferenceAssessmentClass | 'not_applicable'
+export type ProjectReferenceRecommendationBasis =
+  | 'accepted_assessment'
+  | 'preliminary_ungraded'
+  | 'residual_assessment'
+
+export interface ProjectReferenceFidelityAssessment {
+  version: 'fidelity_assessment_v2' | string
+  assessment_class: ProjectReferenceAssessmentClass
+  worst_severity: ProjectReferenceAssessmentSeverity
+  residual_count: number
+  score_basis_points: number | null
+  status: 'pass' | 'fail'
+  dimension_checks: Record<string, boolean>
+  failed_roles: string[]
+  reason_codes: string[]
+}
+
+export interface ProjectReferencePublicQuality {
+  status: ProjectReferenceQualityStatus
+  warning: string | null
+  review_deferred: boolean
+  assessment: ProjectReferenceFidelityAssessment | null
+  recommended: boolean
+  recommendation_basis: ProjectReferenceRecommendationBasis | null
+}
+
+export interface ProjectReferenceQualityPresentation {
+  stateLabel: string
+  gradeLabel: string | null
+  scoreLabel: string | null
+  residualSummary: string | null
+  correctionAvailable: boolean
+  recommended: boolean
+  preliminary: boolean
+  notice: string | null
+  tone: 'pass' | 'residual' | 'deferred'
+}
+
 export interface ProjectReferencePackVariantMetadata extends Partial<ProjectReferencePackPlan> {
   schema_version: 2
   planner_version: string
@@ -1313,10 +1658,103 @@ export interface ProjectReferencePackVariantMetadata extends Partial<ProjectRefe
   review_status?: ProjectReferenceReviewStatus
   max_repair_attempts?: number
   repair_attempts_used?: number
+  quality?: ProjectReferencePublicQuality
   roles?: {
     sheets?: string[]
     repaired?: string[]
   }
+}
+
+const PROJECT_REFERENCE_RESIDUAL_LABELS: Readonly<Record<string, string>> = {
+  identity_mismatch: 'identity',
+  request_mismatch: 'authored request',
+  view_mismatch: 'view or pose',
+  accessory_mismatch: 'accessories',
+  style_mismatch: 'style',
+  overall_fidelity_mismatch: 'overall fidelity',
+  mature_register_mismatch: 'anatomy or mature register',
+  violent_register_mismatch: 'violent register',
+  detail_register_mismatch: 'authored details',
+}
+
+const PROJECT_REFERENCE_GRADE_LABELS: Readonly<Record<ProjectReferenceAssessmentClass, string>> = {
+  exact: 'Exact',
+  minor_residual: 'Minor residuals',
+  material_residual: 'Material residuals',
+}
+
+export function projectReferenceQualityPresentation(
+  metadata: ProjectReferencePackVariantMetadata | null | undefined,
+): ProjectReferenceQualityPresentation | null {
+  const quality = metadata?.quality
+  if (!quality) return null
+  if (quality.status === 'review_unavailable') {
+    return {
+      stateLabel: 'Fidelity review deferred',
+      gradeLabel: 'Ungraded',
+      scoreLabel: null,
+      residualSummary: null,
+      correctionAvailable: false,
+      recommended: quality.recommended,
+      preliminary: quality.recommended && quality.recommendation_basis === 'preliminary_ungraded',
+      notice: 'This candidate remains usable; compare it yourself until fidelity review is available.',
+      tone: 'deferred',
+    }
+  }
+  const assessment = quality.assessment
+  if (!assessment) return null
+  const reasonLabels = [...new Set(assessment.reason_codes.flatMap(code => {
+    const label = PROJECT_REFERENCE_RESIDUAL_LABELS[code]
+    return label ? [label] : []
+  }))]
+  const residualSummary = quality.status === 'residual'
+    ? reasonLabels.length > 0
+      ? `Differences: ${reasonLabels.slice(0, 3).join(', ')}${reasonLabels.length > 3 ? ` +${reasonLabels.length - 3}` : ''}`
+      : 'Residual differences were recorded.'
+    : null
+  return {
+    stateLabel: quality.status === 'pass' ? 'Fidelity passed' : 'Fidelity reviewed',
+    gradeLabel: PROJECT_REFERENCE_GRADE_LABELS[assessment.assessment_class],
+    scoreLabel: assessment.score_basis_points == null
+      ? null
+      : `${(assessment.score_basis_points / 100).toFixed(assessment.score_basis_points % 100 === 0 ? 0 : 1)}%`,
+    residualSummary,
+    correctionAvailable: quality.status === 'residual'
+      && metadata.review?.final_correction?.template_id === 'reference-residual-correction',
+    recommended: quality.recommended,
+    preliminary: false,
+    notice: quality.status === 'residual'
+      ? 'This candidate remains usable; review the noted differences before keeping it.'
+      : null,
+    tone: quality.status,
+  }
+}
+
+export interface ProjectReferenceJobQualitySummary {
+  candidateCount: number
+  variantLabel: string
+  presentation: ProjectReferenceQualityPresentation
+}
+
+export function projectReferenceJobQualitySummary(
+  assets: readonly ProjectAsset[],
+  jobId: string,
+): ProjectReferenceJobQualitySummary | null {
+  const candidates = assets.flatMap(asset => asset.variants).filter(variant => (
+    variant.variant_type === 'reference_pack' && variant.metadata.job?.id === jobId
+  ))
+  const recommended = candidates.filter(variant => (
+    variant.metadata.reference_pack?.quality?.recommended === true
+  ))
+  if (recommended.length !== 1) return null
+  const presentation = projectReferenceQualityPresentation(
+    recommended[0].metadata.reference_pack,
+  )
+  return presentation ? {
+    candidateCount: candidates.length,
+    variantLabel: recommended[0].label,
+    presentation,
+  } : null
 }
 
 export interface ProjectAssetVariant {
@@ -1361,6 +1799,8 @@ export interface ProjectAsset {
 }
 
 export interface ProjectReferenceGenerationSettings {
+  /** URL-safe idempotency key. Optional only for legacy callers/hosts. */
+  request_id?: string
   schema_version?: 2
   mode?: ProjectReferenceSheetMode
   intent?: ProjectReferenceIntent
@@ -1395,6 +1835,8 @@ export interface ProjectReferenceGenerationSettings {
   additional_loras?: ProjectReferenceAdditionalLora[]
   private_output?: boolean
   explicit_output?: boolean
+  /** Character-only server-managed callout convenience; independent of output handling. */
+  explicit_convenience?: boolean
   content_capability?: 'standard' | 'unrestricted_local'
   initial_blur?: boolean
   intelligence_policy?: 'standard_auto' | 'uncensored_auto'
@@ -1406,6 +1848,7 @@ export interface FreshProjectReferenceGenerationRequest extends ProjectReference
   asset_id?: never
   parent_variant_id?: never
   edit_instruction?: never
+  character_profile?: ProjectReferenceCharacterProfileInput
   name: string
   asset_type: ProjectReferenceAssetType
   description?: string
@@ -1420,6 +1863,7 @@ export interface ExistingProjectReferenceGenerationRequest extends ProjectRefere
   parent_variant_id?: string
   edit_instruction?: string
   asset_type?: ProjectReferenceAssetType
+  character_profile?: ProjectReferenceCharacterProfileInput
 }
 
 export type ProjectReferenceGenerationRequest =
@@ -1510,6 +1954,16 @@ export interface ProjectReferenceCapabilities {
     off_allowed_for_content_capabilities: Array<'standard'>
     mandatory_contract: 'explicit_unrestricted_fidelity_v1'
   }
+  character_profile: {
+    schema_version: 1
+    genders: ProjectReferenceCharacterGender[]
+    age: { optional: true; minimum: 0; maximum: 999 }
+    explicit_anatomy: ProjectReferenceCharacterAnatomy[]
+    explicit_convenience: {
+      supported: boolean
+      requires_explicit_output: boolean
+    }
+  }
   max_candidate_count: number
   max_repair_attempts: number
   default_models: {
@@ -1528,6 +1982,8 @@ export interface ProjectReferenceAuthoringSnapshot {
     style?: string
     type_fields: ProjectReferenceTypeFields
     detail_callouts: ProjectReferenceDetailCallout[]
+    character_profile?: ProjectReferenceCharacterProfileInput
+    explicit_convenience: boolean
   }
   /** Owner-private, no-store replay values. Public pack metadata contains digests only. */
   additional_loras?: ProjectReferencePrivateAdditionalLora[]
@@ -1545,48 +2001,55 @@ export interface ProjectReferenceModelCatalogEntry {
   manual_installation?: ModelManualInstallation
 }
 
-export interface ProjectReferenceExplicitConvenienceState {
-  explicit_output: boolean
-  preset?: 'anatomy'
-  anatomy_option?: 'nude anatomy'
-  content_capability?: 'unrestricted_local'
-  initial_blur?: true
-  intelligence_policy?: 'uncensored_auto'
+export const PROJECT_REFERENCE_EXPLICIT_CONVENIENCE_AGE_BLOCKER =
+  'Explicit convenience requires an omitted age or an authored age of at least 18.'
+export const PROJECT_REFERENCE_CHARACTER_AGE_BLOCKER =
+  'Character age must be blank or a whole number from 0 through 999.'
+
+const PROJECT_REFERENCE_CHARACTER_ANATOMY_ORDER: readonly ProjectReferenceCharacterAnatomy[] = [
+  'breasts', 'vulva', 'penis',
+]
+
+export interface ProjectReferenceCharacterProfileDraft {
+  gender: ProjectReferenceCharacterGender
+  ageInput: string
+  explicitAnatomy: readonly ProjectReferenceCharacterAnatomy[]
 }
 
-/** Return only state intentionally owned by the Explicit convenience action. */
-export function getProjectReferenceExplicitConvenienceState(
-  assetType: ProjectReferenceAssetType,
-  enabled: boolean,
-  deliberatePreset?: ProjectReferencePreset,
-): ProjectReferenceExplicitConvenienceState {
-  if (!enabled) return { explicit_output: false }
-  if (assetType === 'character' && deliberatePreset !== undefined
-    && deliberatePreset !== 'anatomy') return { explicit_output: false }
-  return {
-    explicit_output: true,
-    ...(assetType === 'character' ? {
-      preset: 'anatomy' as const,
-      anatomy_option: 'nude anatomy' as const,
-    } : {}),
-    content_capability: 'unrestricted_local',
-    initial_blur: true,
-    intelligence_policy: 'uncensored_auto',
+export interface ProjectReferenceCharacterProfileSerialization {
+  profile?: ProjectReferenceCharacterProfileInput
+  age: number | null
+  blocker: string | null
+}
+
+/** Serialize only explicitly authored Character facts; blank/default state stays absent. */
+export function serializeProjectReferenceCharacterProfile(
+  draft: ProjectReferenceCharacterProfileDraft,
+  explicitConvenience: boolean,
+): ProjectReferenceCharacterProfileSerialization {
+  const trimmedAge = draft.ageInput.trim()
+  const age = trimmedAge === '' ? null : Number(trimmedAge)
+  if (trimmedAge !== '' && (!/^\d{1,3}$/.test(trimmedAge)
+    || age === null || !Number.isInteger(age) || age < 0 || age > 999)) {
+    return { age: null, blocker: PROJECT_REFERENCE_CHARACTER_AGE_BLOCKER }
   }
-}
-
-export function isProjectReferenceExplicitCharacterStateValid(
-  assetType: ProjectReferenceAssetType,
-  explicitOutput: boolean,
-  preset: ProjectReferencePreset,
-  anatomyOptions: Array<Pick<ProjectReferenceTypeFieldItem, 'id' | 'label' | 'custom' | 'group'>>,
-): boolean {
-  if (assetType !== 'character' || !explicitOutput) return true
-  return preset === 'anatomy'
-    && anatomyOptions.some(option => option.id === 'anatomy:nude-anatomy'
-      && option.label.toLowerCase() === 'nude anatomy'
-      && option.custom === false
-      && option.group === 'anatomy')
+  if (explicitConvenience && age !== null && age < 18) {
+    return { age, blocker: PROJECT_REFERENCE_EXPLICIT_CONVENIENCE_AGE_BLOCKER }
+  }
+  const selected = new Set(draft.explicitAnatomy)
+  const explicitAnatomy = PROJECT_REFERENCE_CHARACTER_ANATOMY_ORDER.filter(item => selected.has(item))
+  const hasAuthoredFacts = draft.gender !== 'unspecified' || age !== null || explicitAnatomy.length > 0
+  return {
+    age,
+    blocker: null,
+    ...(hasAuthoredFacts ? {
+      profile: {
+        gender: draft.gender,
+        ...(age !== null ? { age } : {}),
+        explicit_anatomy: explicitAnatomy,
+      },
+    } : {}),
+  }
 }
 
 export function getLoraParameterDefaults(
@@ -1831,6 +2294,9 @@ export interface ProjectReferenceQueueBlockerState {
   invalid_lora_multiplier: boolean
   invalid_lora_parameters: boolean
   invalid_authored_settings: boolean
+  invalid_character_age: boolean
+  explicit_convenience_age: boolean
+  too_many_detail_callouts: boolean
   review_unavailable: boolean
 }
 
@@ -1857,6 +2323,9 @@ const PROJECT_REFERENCE_QUEUE_BLOCKER_COPY: Record<
   invalid_lora_multiplier: 'Set every LoRA multiplier between -10 and 10.',
   invalid_lora_parameters: 'Complete every required LoRA parameter with a valid published value.',
   invalid_authored_settings: 'Fix invalid or unavailable authored reference details.',
+  invalid_character_age: PROJECT_REFERENCE_CHARACTER_AGE_BLOCKER,
+  explicit_convenience_age: PROJECT_REFERENCE_EXPLICIT_CONVENIENCE_AGE_BLOCKER,
+  too_many_detail_callouts: 'Select at most eight combined authored and managed detail callouts.',
   review_unavailable: 'Prepare the required local fidelity reviewer and MMProj shown above.',
 }
 
@@ -2062,6 +2531,8 @@ export interface ProjectReferenceRetrySettings {
   editor_model_type?: string
   private_output: boolean
   explicit_output: boolean
+  explicit_convenience?: boolean
+  character_profile?: ProjectReferenceCharacterProfileInput
   content_capability?: 'standard' | 'unrestricted_local'
   initial_blur?: boolean
   intelligence_policy?: 'standard_auto' | 'uncensored_auto'
@@ -2201,7 +2672,9 @@ export function projectReferenceRetryNeedsPrivateAuthoring(
   const authored = variant.metadata.reference_pack?.authored_settings
   return authored?.style_present === true
     || authored?.type_fields.some(field => field.items.some(item => item.custom)) === true
-    || authored?.detail_callouts.some(callout => callout.kind === 'custom') === true
+    || authored?.detail_callouts.some(callout => 'kind' in callout && callout.kind === 'custom') === true
+    || authored?.character_profile !== undefined
+    || authored?.managed_character_callouts !== undefined
 }
 
 export function isProjectReferenceStyleReplayReady(
@@ -2222,11 +2695,69 @@ export function isProjectReferenceStyleReplayReady(
     || (typeof style === 'string' && style.trim().length > 0)
 }
 
+function hasCommitment(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
+}
+
+/**
+ * The no-store authoring route validates the full authored-settings seal. This
+ * additional shape/count check prevents a partial or stale private snapshot
+ * from being replayed when a public Character summary is present.
+ */
+export function isProjectReferenceCharacterReplayReady(
+  packMetadata: Pick<ProjectReferencePackPlan,
+    'authored_settings' | 'explicit_convenience'> | undefined,
+  snapshot: Pick<ProjectReferenceAuthoringSnapshot['authored_settings'],
+    'character_profile' | 'explicit_convenience'> | undefined,
+): boolean {
+  const authored = packMetadata?.authored_settings
+  const publicProfile = authored?.character_profile
+  const publicManaged = authored?.managed_character_callouts
+  if (!publicProfile && !publicManaged) {
+    return snapshot?.character_profile === undefined
+  }
+  if (!publicProfile || !publicManaged
+    || typeof packMetadata?.explicit_convenience !== 'boolean'
+    || snapshot?.explicit_convenience !== packMetadata.explicit_convenience) return false
+  const profile = snapshot?.character_profile
+  if (!profile
+    || Object.keys(profile).some(key => !['gender', 'age', 'explicit_anatomy'].includes(key))
+    || !['woman', 'man', 'non_binary', 'unspecified'].includes(profile.gender)
+    || !Array.isArray(profile.explicit_anatomy)
+    || new Set(profile.explicit_anatomy).size !== profile.explicit_anatomy.length
+    || profile.explicit_anatomy.some(item => !PROJECT_REFERENCE_CHARACTER_ANATOMY_ORDER.includes(item))
+    || profile.explicit_anatomy.some((item, index) => (
+      PROJECT_REFERENCE_CHARACTER_ANATOMY_ORDER.filter(candidate => (
+        profile.explicit_anatomy.includes(candidate)
+      ))[index] !== item
+    ))) return false
+  const agePresent = profile.age !== undefined && profile.age !== null
+  if (agePresent && (!Number.isInteger(profile.age) || Number(profile.age) < 0 || Number(profile.age) > 999)) return false
+  if (publicProfile.schema_version !== 1
+    || publicProfile.gender.present !== (profile.gender !== 'unspecified')
+    || publicProfile.age.present !== agePresent
+    || publicProfile.explicit_anatomy.count !== profile.explicit_anatomy.length
+    || publicProfile.explicit_anatomy.commitments.length !== profile.explicit_anatomy.length
+    || (publicProfile.gender.present ? !hasCommitment(publicProfile.gender.commitment) : publicProfile.gender.commitment !== null)
+    || (publicProfile.age.present ? !hasCommitment(publicProfile.age.commitment) : publicProfile.age.commitment !== null)
+    || publicProfile.explicit_anatomy.commitments.some(commitment => !hasCommitment(commitment))) return false
+  const expectedManagedCount = publicManaged.active_count + publicManaged.tombstone_count
+  if (publicManaged.schema_version !== 1
+    || !Number.isInteger(publicManaged.active_count) || publicManaged.active_count < 0
+    || !Number.isInteger(publicManaged.tombstone_count) || publicManaged.tombstone_count < 0
+    || !Number.isInteger(publicManaged.rename_count) || publicManaged.rename_count < 0
+    || publicManaged.rename_count > publicManaged.active_count
+    || publicManaged.commitments.length !== expectedManagedCount
+    || publicManaged.commitments.some(commitment => !hasCommitment(commitment))) return false
+  return true
+}
+
 function resolveProjectReferenceRetryAuthoredSettings(
   packMetadata: ProjectReferencePackVariantMetadata,
   fallback: ProjectReferenceRetrySettings,
   capabilities?: ProjectReferenceCapabilities,
-): Pick<ProjectReferenceRetrySettings, 'style' | 'type_fields' | 'detail_callouts'> {
+): Pick<ProjectReferenceRetrySettings,
+  'style' | 'type_fields' | 'detail_callouts' | 'character_profile' | 'explicit_convenience'> {
   const summary = packMetadata.authored_settings
   if (!summary) return {}
   const referenceType = packMetadata.reference_type ?? fallback.asset_type
@@ -2259,9 +2790,23 @@ function resolveProjectReferenceRetryAuthoredSettings(
   }
 
   const fallbackCallouts = fallback.detail_callouts ?? []
+  const characterReplayReady = isProjectReferenceCharacterReplayReady(
+    packMetadata,
+    hasExactPrivateSnapshot && typeof fallback.explicit_convenience === 'boolean'
+      ? {
+          character_profile: fallback.character_profile,
+          explicit_convenience: fallback.explicit_convenience,
+        }
+      : undefined,
+  )
+  if ((summary.character_profile || summary.managed_character_callouts) && !characterReplayReady) return {}
+  const publicAuthoredCallouts = summary.detail_callouts.flatMap(
+    callout => 'managed' in callout ? [] : [callout],
+  )
+  if (hasExactPrivateSnapshot && fallbackCallouts.length !== publicAuthoredCallouts.length) return {}
   const resolvedCallouts: ProjectReferenceDetailCallout[] = []
-  for (const publicCallout of summary.detail_callouts) {
-    const localCallout = hasExactPrivateSnapshot && publicCallout.kind === 'custom'
+  for (const publicCallout of publicAuthoredCallouts) {
+    const localCallout = hasExactPrivateSnapshot
       ? fallbackCallouts.find(item => item.custom_id === publicCallout.custom_id)
       : undefined
     if (localCallout) {
@@ -2293,6 +2838,10 @@ function resolveProjectReferenceRetryAuthoredSettings(
       : summary.style_present === false ? { style: '' } : {}),
     type_fields: resolvedFields as ProjectReferenceTypeFields,
     detail_callouts: resolvedCallouts,
+    ...(summary.character_profile ? {
+      character_profile: fallback.character_profile,
+    } : {}),
+    explicit_convenience: fallback.explicit_convenience ?? false,
   }
 }
 
@@ -2370,6 +2919,12 @@ export function getProjectReferenceRetrySettings(
     if (authoredSettings.detail_callouts !== undefined) {
       settings.detail_callouts = authoredSettings.detail_callouts
     }
+    if (authoredSettings.character_profile !== undefined) {
+      settings.character_profile = authoredSettings.character_profile
+    }
+    if (authoredSettings.explicit_convenience !== undefined) {
+      settings.explicit_convenience = authoredSettings.explicit_convenience
+    }
     settings.content_capability = packMetadata.content_capability ?? fallback.content_capability
     settings.initial_blur = packMetadata.initial_blur ?? fallback.initial_blur
     settings.intelligence_policy = packMetadata.intelligence_policy ?? fallback.intelligence_policy
@@ -2443,15 +2998,70 @@ export async function createProjectAsset(project: string, body: Record<string, u
   return res.json()
 }
 
+export const PROJECT_REFERENCE_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~-]{7,127}$/
+const PROJECT_REFERENCE_REQUEST_RANDOM_BYTES = 18
+const PROJECT_REFERENCE_REQUEST_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-'
+const PROJECT_REFERENCE_AMBIGUOUS_TRANSPORT_ATTEMPTS = 2
+
+export function projectReferenceRequestIdFromRandomBytes(bytes: Uint8Array): string {
+  if (bytes.length !== PROJECT_REFERENCE_REQUEST_RANDOM_BYTES) {
+    throw new Error(`Reference request IDs require ${PROJECT_REFERENCE_REQUEST_RANDOM_BYTES} random bytes.`)
+  }
+  return `ref_${Array.from(bytes, byte => PROJECT_REFERENCE_REQUEST_ALPHABET[byte & 63]).join('')}`
+}
+
+export function createProjectReferenceRequestId(): string {
+  return projectReferenceRequestIdFromRandomBytes(
+    globalThis.crypto.getRandomValues(new Uint8Array(PROJECT_REFERENCE_REQUEST_RANDOM_BYTES)),
+  )
+}
+
+class ProjectReferenceAmbiguousTransportError extends Error {
+  constructor() {
+    super('Reference submission transport ended before acceptance could be confirmed.')
+    this.name = 'ProjectReferenceAmbiguousTransportError'
+  }
+}
+
+async function postProjectAssetReferences(
+  project: string,
+  encodedBody: string,
+): Promise<ProjectReferenceGenerationResponse> {
+  let response: Response
+  try {
+    response = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/generate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: encodedBody,
+    })
+  } catch {
+    throw new ProjectReferenceAmbiguousTransportError()
+  }
+  if (!response.ok) {
+    throw projectAssetRequestError(response.status, 'Failed to start reference generation')
+  }
+  try {
+    return await response.json()
+  } catch {
+    throw new ProjectReferenceAmbiguousTransportError()
+  }
+}
+
 export async function generateProjectAssetReferences(
   project: string,
   body: ProjectReferenceGenerationRequest,
 ): Promise<ProjectReferenceGenerationResponse> {
-  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/generate`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  })
-  if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to start reference generation')
-  return res.json()
+  if (body.request_id !== undefined && !PROJECT_REFERENCE_REQUEST_ID_PATTERN.test(body.request_id)) {
+    throw new Error('Invalid Reference request ID.')
+  }
+  const encodedBody = JSON.stringify(body)
+  const attempts = body.request_id === undefined ? 1 : PROJECT_REFERENCE_AMBIGUOUS_TRANSPORT_ATTEMPTS
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await postProjectAssetReferences(project, encodedBody)
+    } catch (reason) {
+      if (!(reason instanceof ProjectReferenceAmbiguousTransportError) || attempt + 1 >= attempts) throw reason
+    }
+  }
+  throw new ProjectReferenceAmbiguousTransportError()
 }
 
 export async function addProjectAssetVariant(

@@ -8,21 +8,22 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
 import types
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit
 from unittest import mock
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from fastapi import HTTPException
 from PIL import Image
-
 from services import job_lifecycle as lifecycle
 from services.output_access import (
     can_access_output,
@@ -34,7 +35,24 @@ from services.project_assets import (
     ProjectAssetPersistenceError,
     ProjectAssetStore,
 )
-
+from services.queue_recovery_adapter import owner_principal_digest
+from services.queue_recovery_runtime import sha256_file
+from services.reference_admission import (
+    ReferenceAdmissionCapacityError,
+    ReferenceAdmissionCorruptionError,
+    ReferenceAdmissionMismatchError,
+    ReferenceAdmissionPersistenceError,
+    ReferenceAdmissionStore,
+    ReferenceAdmissionValidationError,
+    normalize_request_id,
+)
+from services.search_index import (
+    ArtifactScope,
+    artifact_matches_scope,
+    classify_gallery_artifacts,
+    linked_component_names,
+    load_media_sidecars,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCH = ROOT / "app" / "launch.py"
@@ -44,6 +62,7 @@ def _load_route_symbols(namespace):
     wanted = {
         "_project_asset_error",
         "_project_asset_provenance",
+        "_require_authorized_output",
         "_can_access_project_asset_variant",
         "_public_authorized_project_assets",
         "_recovery_response_requires_no_store",
@@ -55,6 +74,7 @@ def _load_route_symbols(namespace):
         "_project_reference_model_schedule",
         "_project_reference_operation_routing",
         "_project_reference_private_commitment",
+        "_project_reference_private_character_state",
         "_project_reference_snapshot_commitment",
         "_project_reference_lora_schema_sidecars",
         "_project_reference_lora_schema_scopes",
@@ -85,9 +105,12 @@ def _load_route_symbols(namespace):
         "_project_reference_run_planning",
         "_project_reference_authored_prompt_fragment",
         "_project_reference_selected_reviewer",
+        "_project_reference_public_quality",
+        "_project_reference_source_identity",
         "_attach_project_reference_result",
         "_project_reference_publication_recovery_requested",
         "_project_reference_validate_committed_variant",
+        "_project_reference_variant_is_recommended",
         "_recover_project_reference_publication",
         "_queue_recovery_worker",
         "_public_model_availability",
@@ -96,6 +119,9 @@ def _load_route_symbols(namespace):
         "list_loras_details",
         "list_models",
         "list_project_assets",
+        "list_outputs",
+        "serve_file",
+        "serve_project_asset_media",
         "get_project_reference_authoring",
         "get_project_reference_capabilities",
         "update_project_asset",
@@ -103,6 +129,7 @@ def _load_route_symbols(namespace):
         "generate_project_asset_references",
         "_job_model_term_ids",
         "_public_parent_job_id",
+        "_public_logical_job_kind",
         "_public_failed_child_metadata",
         "_public_job_prompt_fields",
         "_public_job_created_at",
@@ -294,6 +321,11 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             self.root / "storage",
             allowed_source_roots=[self.root / "outputs"],
         )
+        self.admission_store = ReferenceAdmissionStore(
+            self.root / "reference-admission",
+            b"reference-route-test-secret",
+            lease_seconds=1.0,
+        )
         self.jobs = {}
         self.calls = []
         self.visibility_calls = []
@@ -314,20 +346,56 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "math": math,
             "os": os,
             "re": re,
+            "stat": stat,
+            "quote": quote,
             "parse_qsl": parse_qsl,
             "urlsplit": urlsplit,
             "time": time,
             "types": types,
             "uuid": uuid,
+            "asyncio": asyncio,
+            "_recovery_sha256_file": sha256_file,
+            "normalize_request_id": normalize_request_id,
+            "ReferenceAdmissionStore": ReferenceAdmissionStore,
+            "ReferenceAdmissionCapacityError": ReferenceAdmissionCapacityError,
+            "ReferenceAdmissionCorruptionError": ReferenceAdmissionCorruptionError,
+            "ReferenceAdmissionMismatchError": ReferenceAdmissionMismatchError,
+            "ReferenceAdmissionPersistenceError": ReferenceAdmissionPersistenceError,
+            "ReferenceAdmissionValidationError": ReferenceAdmissionValidationError,
             "wgp": _ModelRegistry,
             "public_output_policy": public_output_policy,
             "can_access_output": can_access_output,
             "stamp_sidecar_policy": stamp_sidecar_policy,
+            "ArtifactScope": ArtifactScope,
+            "artifact_matches_scope": artifact_matches_scope,
+            "classify_gallery_artifacts": classify_gallery_artifacts,
+            "linked_component_names": linked_component_names,
+            "load_media_sidecars": load_media_sidecars,
+            "_GALLERY_MEDIA_EXTENSIONS": {
+                ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
+                ".mp4", ".webm", ".mkv", ".mov", ".gif",
+                ".wav", ".mp3", ".flac", ".ogg",
+            },
+            "_request_project_workspace": (
+                lambda _request, workspace: workspace or "project"
+            ),
+            "_load_favorites": lambda _workspace: set(),
+            "_output_revision": lambda *_args, **_kwargs: "test-revision",
             "_jobs": self.jobs,
             "_gen_lock": object(),
             "_active_gen_states": {},
             "_request_remote": ContextVar("route_test_remote", default=False),
             "_session_secret": lambda: b"reference-route-test-secret",
+            "owner_principal_digest": owner_principal_digest,
+            "_queue_recovery_project_identity": (
+                lambda _workspace, _directory: "project-instance-test"
+            ),
+            "_reference_admission_store": lambda: self.admission_store,
+            "_job_owned_by_request": lambda job, request: bool(
+                isinstance(job, dict)
+                and job.get("session_id")
+                    == request.state.maestro_session_id
+            ),
             "_project_asset_store": lambda: self.store,
             "_asset_scope": self._asset_scope,
             "_require_project_access": lambda request, project: str(self.output),
@@ -481,10 +549,11 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         }
 
     def _register(self, job, *, worker=None, **kwargs):
-        job.setdefault("access_policy", {
-            "private": bool(job.pop("private", False)),
-            "explicit": bool(job.pop("explicit", False)),
-        })
+        if "access_policy" not in job:
+            job["access_policy"] = {
+                "private": bool(job.get("private", False)),
+                "explicit": bool(job.get("explicit", False)),
+            }
         self.jobs[job["id"]] = job
         if worker is not None:
             worker(job["id"])
@@ -568,6 +637,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 "group": "anatomy",
             }]},
             explicit_output=True,
+            explicit_convenience=True,
         )
         body.update(updates)
         return body
@@ -660,6 +730,8 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             )
             for role, index in artifact_order
         )
+        for artifact in artifacts:
+            Image.new("RGB", (8, 8), (24, 48, 72)).save(artifact.path)
         return types.SimpleNamespace(
             plan=plan,
             artifacts=artifacts,
@@ -937,7 +1009,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(self.jobs, {})
 
-    def test_mandatory_review_unavailable_is_terminal_and_never_publishes(self):
+    def test_mandatory_review_unavailable_publishes_ungraded_artifacts(self):
         self.review = lambda _request: (_ for _ in ()).throw(
             RuntimeError("PRIVATE_PROVIDER_FAILURE"),
         )
@@ -945,19 +1017,20 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             content_capability="unrestricted_local",
         ))
         job = self.jobs[response["job_id"]]
-        self.assertEqual(job["status"], "failed")
-        self.assertEqual(job["error"], "Reference-pack fidelity quality review failed")
-        self.assertEqual(self._assets(), [])
-        failure = job["params"]["reference_pack"]["quality_failure"]
-        self.assertEqual(failure, {
-            "status": "review_unavailable",
-            "failed_roles": [],
-            "reason_codes": ["review_unavailable"],
-            "review_contract": "explicit_unrestricted_fidelity_v1",
-        })
+        self.assertEqual(job["status"], "completed")
+        quality = self._assets()[0]["variants"][0]["metadata"][
+            "reference_pack"
+        ]["quality"]
+        self.assertEqual(quality["status"], "review_unavailable")
+        self.assertTrue(quality["review_deferred"])
+        self.assertTrue(quality["recommended"])
+        self.assertEqual(
+            quality["recommendation_basis"], "preliminary_ungraded",
+        )
+        self.assertNotIn("quality_failure", job["params"]["reference_pack"])
         self.assertNotIn("PRIVATE_PROVIDER_FAILURE", json.dumps(job))
 
-    def test_mandatory_review_without_stable_descriptor_path_never_invokes_vlm(self):
+    def test_missing_stable_review_descriptor_publishes_ungraded(self):
         from services import reference_sheets
 
         self.review = lambda _request: self.fail(
@@ -970,17 +1043,15 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 content_capability="unrestricted_local",
             ))
         job = self.jobs[response["job_id"]]
-        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["status"], "completed")
         self.assertEqual(
-            job["error"], "Reference-pack fidelity quality review failed",
-        )
-        self.assertEqual(self._assets(), [])
-        self.assertEqual(
-            job["params"]["reference_pack"]["quality_failure"]["status"],
+            self._assets()[0]["variants"][0]["metadata"][
+                "reference_pack"
+            ]["quality"]["status"],
             "review_unavailable",
         )
 
-    def test_mandatory_malformed_review_is_terminal_and_never_publishes(self):
+    def test_mandatory_malformed_review_publishes_without_private_leakage(self):
         def malformed(request):
             result = self._passing_review(request)
             result["critique"] = "PRIVATE_FREE_FORM_REVIEW"
@@ -989,21 +1060,23 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.review = malformed
         response = self._run(self._explicit_body())
         job = self.jobs[response["job_id"]]
-        self.assertEqual(job["status"], "failed")
-        self.assertEqual(self._assets(), [])
-        failure = job["params"]["reference_pack"]["quality_failure"]
-        self.assertEqual(failure["status"], "review_unavailable")
-        self.assertEqual(failure["reason_codes"], ["review_unavailable"])
+        self.assertEqual(job["status"], "completed")
+        quality = self._assets()[0]["variants"][0]["metadata"][
+            "reference_pack"
+        ]["quality"]
+        self.assertEqual(quality["status"], "review_unavailable")
+        self.assertIsNone(quality["assessment"])
         self.assertNotIn("PRIVATE_FREE_FORM_REVIEW", json.dumps(job))
+        self.assertNotIn("PRIVATE_FREE_FORM_REVIEW", json.dumps(self._assets()))
 
-    def test_later_mandatory_review_failure_never_publishes_prior_candidate(self):
+    def test_candidate_review_failure_does_not_block_valid_peer_publication(self):
         reviews = {"count": 0}
 
         def second_malformed(request):
             reviews["count"] += 1
             self.assertEqual(
                 self._assets(), [],
-                "mandatory candidates must remain private until all reviews pass",
+                "candidates publish atomically after every candidate finishes",
             )
             result = self._passing_review(request)
             if reviews["count"] == 2:
@@ -1015,9 +1088,18 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             content_capability="unrestricted_local",
             candidate_count=2,
         ))
-        self.assertEqual(self.jobs[response["job_id"]]["status"], "failed")
-        self.assertEqual(reviews["count"], 2)
-        self.assertEqual(self._assets(), [])
+        self.assertEqual(self.jobs[response["job_id"]]["status"], "completed")
+        self.assertGreaterEqual(reviews["count"], 2)
+        variants = self._assets()[0]["variants"]
+        self.assertEqual(len(variants), 2)
+        self.assertEqual(
+            sum(
+                item["metadata"]["reference_pack"]["quality"]["recommended"]
+                for item in variants
+            ),
+            1,
+        )
+        self.assertNotIn("malformed second candidate", json.dumps(variants))
 
     def test_mandatory_second_publication_failure_is_atomic_without_deletion(self):
         real_copy = self.store._copy_outputs
@@ -1287,7 +1369,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         current = self.store.get_asset("project", "main", asset["id"])
         self.assertEqual([item["id"] for item in current["variants"]], [first_id])
 
-    def test_live_replay_rejects_changed_review_status_and_missing_media(self):
+    def test_live_replay_rejects_changed_quality_status_and_missing_media(self):
         for index, corruption in enumerate(("review", "media"), start=3):
             with self.subTest(corruption=corruption):
                 asset = self.store.create_asset(
@@ -1319,7 +1401,9 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                         stored = self.store._find_variant(
                             stored_asset, variant["id"],
                         )
-                        stored["metadata"]["reference_pack"]["review_status"] = "fail"
+                        stored["metadata"]["reference_pack"]["quality"][
+                            "status"
+                        ] = "residual"
                         self.store._write_manifest("project", manifest)
                 else:
                     output = variant["outputs"][0]["relative_path"]
@@ -1522,6 +1606,52 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         finally:
             lifecycle._reset_queue_state_for_tests()
 
+    def test_recovery_finalizes_residual_and_ungraded_publications(self):
+        cases = (
+            ("residual", lambda _request: False),
+            (
+                "review_unavailable",
+                lambda _request: (_ for _ in ()).throw(
+                    RuntimeError("PRIVATE_RECOVERY_REVIEW_FAILURE"),
+                ),
+            ),
+        )
+        for index, (quality_status, reviewer) in enumerate(cases):
+            with self.subTest(quality_status=quality_status):
+                self.review = reviewer
+                response = self._run(self._body(
+                    name=f"Recovery {index}",
+                    request_id=f"recovery-request-{index:04d}",
+                    mode="draft",
+                    max_repair_attempts=0,
+                ))
+                job = self.jobs[response["job_id"]]
+                asset = next(
+                    item for item in self._assets()
+                    if item["id"] == response["asset"]["id"]
+                )
+                self.assertEqual(
+                    asset["variants"][0]["metadata"]["reference_pack"][
+                        "quality"
+                    ]["status"],
+                    quality_status,
+                )
+                generation_calls = len(self.calls)
+                job.update({
+                    "status": "queued",
+                    "queue_held": False,
+                    "message": "Recovering committed publication",
+                })
+                self.ns["_recover_project_reference_publication"](
+                    response["job_id"],
+                )
+                self.assertEqual(job["status"], "completed")
+                self.assertEqual(len(self.calls), generation_calls)
+        self.assertNotIn(
+            "PRIVATE_RECOVERY_REVIEW_FAILURE",
+            json.dumps({"jobs": self.jobs, "assets": self._assets()}),
+        )
+
     def test_standard_remote_review_also_requires_explicit_provider_disclosure(self):
         self.ns["_project_reference_intelligence_selection"] = (
             lambda request, *, requested_model, requested_provider, purpose, intent: {
@@ -1576,7 +1706,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(config["review_selection"]["resolved_provider"], "openai")
         self.assertTrue(config["mandatory_review"])
 
-    def test_mandatory_review_repairs_then_blocks_final_register_mismatch(self):
+    def test_mandatory_review_repairs_then_publishes_residual_assessment(self):
         review_count = {"value": 0}
 
         def failing_review(request):
@@ -1599,11 +1729,16 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(
             [call["role"] for call in self.calls].count("turnaround"), 2,
         )
-        self.assertEqual(job["status"], "failed")
-        self.assertEqual(self._assets(), [])
-        failure = job["params"]["reference_pack"]["quality_failure"]
-        self.assertEqual(failure["reason_codes"], ["detail_register_mismatch"])
-        self.assertEqual(failure["failed_roles"], ["turnaround"])
+        self.assertEqual(job["status"], "completed")
+        quality = self._assets()[0]["variants"][0]["metadata"][
+            "reference_pack"
+        ]["quality"]
+        self.assertEqual(quality["status"], "residual")
+        self.assertIn(
+            "detail_register_mismatch",
+            quality["assessment"]["reason_codes"],
+        )
+        self.assertIn("turnaround", quality["assessment"]["failed_roles"])
 
     def test_failed_detail_callout_uses_bounded_repair_route(self):
         reviews = 0
@@ -1700,6 +1835,314 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         public = json.dumps(response)
         for private_value in (private_style, private_type, private_detail):
             self.assertNotIn(private_value, public)
+
+    def test_character_profile_facts_are_role_local_in_generation_and_review(self):
+        review_fragments = []
+
+        def review(request):
+            review_fragments.append((
+                request.target_role,
+                request.item_id,
+                self.ns["_project_reference_authored_prompt_fragment"](
+                    request.authored_contract,
+                ),
+            ))
+            return True
+
+        self.review = review
+        response = self._run(self._body(character_profile={
+            "gender": "non_binary",
+            "age": 42,
+            "explicit_anatomy": ["vulva"],
+        }))
+        prompts = {call["role"]: call["prompt"] for call in self.calls}
+        for role in ("canonical_identity", "turnaround", "expressions"):
+            self.assertIn("Authored character gender: non_binary", prompts[role])
+            self.assertIn("Authored character age in years: 42", prompts[role])
+        self.assertIn(
+            "Authored role-local anatomy: vulva",
+            prompts["canonical_identity"],
+        )
+        self.assertIn(
+            "Authored role-local anatomy: vulva", prompts["turnaround"],
+        )
+        self.assertNotIn("role-local anatomy", prompts["expressions"])
+        self.assertTrue(any(
+            role == "canonical_identity"
+            and "Authored character gender: non_binary" in fragment
+            for role, _item, fragment in review_fragments
+        ))
+        self.assertTrue(any(
+            role == "canonical_identity"
+            and item == "anatomy_callouts"
+            and "Authored role-local anatomy: vulva" in fragment
+            for role, item, fragment in review_fragments
+        ))
+
+        asset = self._assets()[0]
+        variant = asset["variants"][0]
+        private_profile = variant["metadata"]["private_authored_settings"][
+            "character_profile"
+        ]
+        self.assertEqual(private_profile["gender"], "non_binary")
+        self.assertEqual(private_profile["age"], 42)
+        self.assertRegex(private_profile["commitment_nonce"], r"^[0-9a-f]{64}$")
+        authoring = self.ns["get_project_reference_authoring"](
+            "project", response["asset"]["id"], variant["id"], _Request({}),
+        )["authored_settings"]
+        self.assertEqual(authoring["character_profile"], {
+            "gender": "non_binary",
+            "age": 42,
+            "explicit_anatomy": ["vulva"],
+        })
+        self.assertFalse(authoring["explicit_convenience"])
+        self.assertNotIn("commitment_nonce", json.dumps(authoring))
+        public = json.dumps(
+            self.ns["list_project_assets"]("project", _Request({})),
+        )
+        self.assertNotIn("private_reference_request", public)
+        self.assertNotIn("non_binary", public)
+        self.assertNotIn('"vulva"', public)
+
+    def test_explicit_convenience_manages_callouts_and_retry_needs_no_ids(self):
+        profile = {
+            "gender": "man",
+            "age": 24,
+            "explicit_anatomy": ["breasts", "penis"],
+        }
+        first = self._run(self._explicit_body(character_profile=profile))
+        asset = self._assets()[0]
+        first_variant = asset["variants"][0]
+        first_private = first_variant["metadata"]["private_authored_settings"]
+        entries = first_private["managed_character_callouts"]["entries"]
+        active = [entry for entry in entries if entry["status"] == "active"]
+        self.assertEqual(
+            [entry["key"] for entry in active],
+            ["breasts_front", "breasts_profile", "penis"],
+        )
+        self.assertEqual(
+            [entry["source_role"] for entry in active],
+            ["canonical_identity", "turnaround", "canonical_identity"],
+        )
+        self.assertTrue(first["plan"]["authored_settings"][
+            "character_profile"
+        ]["age"]["present"])
+        self.assertEqual(
+            first["plan"]["authored_settings"]["managed_character_callouts"]
+            ["active_count"],
+            3,
+        )
+        reference_metadata = first_variant["metadata"]["reference_pack"]
+        self.assertTrue(reference_metadata["explicit_output"])
+        self.assertTrue(reference_metadata["explicit_convenience"])
+
+        authoring = self.ns["get_project_reference_authoring"](
+            "project", first["asset"]["id"], first_variant["id"],
+            _Request({}),
+        )["authored_settings"]
+        self.assertEqual(authoring["character_profile"], profile)
+        self.assertTrue(authoring["explicit_convenience"])
+        self.assertEqual(authoring["detail_callouts"], [])
+        self.assertNotIn("managed_character_callouts", authoring)
+        self.assertNotIn("commitment_nonce", json.dumps(authoring))
+
+        retry = self._run(self._explicit_body(
+            asset_id=first["asset"]["id"],
+            parent_variant_id=first_variant["id"],
+            character_profile=profile,
+            detail_callouts=[],
+        ))
+        retry_private = self.jobs[retry["job_id"]]["params"][
+            "reference_pack"
+        ]["private_authored_settings"]
+        retry_entries = retry_private["managed_character_callouts"]["entries"]
+        self.assertEqual(retry_entries, entries)
+        self.assertEqual(
+            len([
+                item for item in retry_private["detail_callouts"]
+                if item["custom_id"].startswith("custom:cpref")
+            ]),
+            3,
+        )
+
+        with self.assertRaises(HTTPException) as profile_drift:
+            self._run(self._explicit_body(
+                asset_id=first["asset"]["id"],
+                parent_variant_id=first_variant["id"],
+                character_profile={**profile, "age": 25},
+            ))
+        self.assertEqual(profile_drift.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as convenience_drift:
+            self._run(self._explicit_body(
+                asset_id=first["asset"]["id"],
+                parent_variant_id=first_variant["id"],
+                character_profile=profile,
+                explicit_convenience=False,
+            ))
+        self.assertEqual(convenience_drift.exception.status_code, 409)
+
+        public = json.dumps(
+            self.ns["list_project_assets"]("project", _Request({})),
+        )
+        self.assertNotIn("custom:cpref", public)
+        self.assertNotIn("breasts (front)", public)
+        self.assertNotIn('"penis"', public)
+
+    def test_private_character_state_is_never_accepted_from_a_fresh_client(self):
+        profile = {
+            "schema_version": 1,
+            "gender": "unspecified",
+            "age": None,
+            "explicit_anatomy": [],
+            "commitment_nonce": "a" * 64,
+        }
+        for body in (
+            self._body(character_profile=profile),
+            self._body(managed_character_callouts={
+                "schema_version": 1,
+                "entries": [],
+            }),
+        ):
+            with self.subTest(body=body), self.assertRaises(HTTPException) as error:
+                self._run(body)
+            self.assertEqual(error.exception.status_code, 400)
+        self.assertEqual(self.visibility_calls, [])
+        self.assertEqual(self.jobs, {})
+        self.assertEqual(self._assets(), [])
+
+    def test_endpoint_keeps_output_policy_separate_and_blocks_age_early(self):
+        profile = {
+            "gender": "woman",
+            "age": 30,
+            "explicit_anatomy": ["breasts"],
+        }
+        response = self._run(self._body(
+            explicit_output=True,
+            character_profile=profile,
+        ))
+        variant = self._assets()[0]["variants"][0]
+        reference = variant["metadata"]["reference_pack"]
+        private = variant["metadata"]["private_authored_settings"]
+        self.assertTrue(reference["explicit_output"])
+        self.assertFalse(reference["explicit_convenience"])
+        self.assertEqual(
+            reference["authored_settings"]["managed_character_callouts"]
+            ["active_count"],
+            0,
+        )
+        self.assertNotIn("managed_character_callouts", private)
+        self.assertEqual(response["plan"]["detail_callout_count"], 0)
+
+        visibility_count = len(self.visibility_calls)
+        job_ids = set(self.jobs)
+        asset_ids = {asset["id"] for asset in self._assets()}
+        with self.assertRaises(HTTPException) as blocked:
+            self._run(self._body(
+                name="Blocked before work",
+                explicit_output=True,
+                explicit_convenience=True,
+                character_profile={**profile, "age": 17},
+            ))
+        self.assertEqual(blocked.exception.status_code, 400)
+        self.assertEqual(
+            blocked.exception.detail,
+            "Invalid character profile or explicit convenience",
+        )
+        self.assertEqual(len(self.visibility_calls), visibility_count)
+        self.assertEqual(set(self.jobs), job_ids)
+        self.assertEqual(
+            {asset["id"] for asset in self._assets()}, asset_ids,
+        )
+
+    def test_managed_crop_guard_blocks_gallery_until_atomic_asset_publication(self):
+        from services.reference_sheets import _create_unpublished_media_guard
+
+        staged = self.output / "reference-detail-route-proof.png"
+        guard, _guard_identity = _create_unpublished_media_guard(staged)
+        Image.new("RGB", (32, 32), (12, 34, 56)).save(staged)
+        self.assertTrue(staged.is_file())
+        self.assertTrue(guard.is_file())
+
+        listing = self.ns["list_outputs"](
+            _Request({}), workspace="project",
+        )
+        self.assertEqual(listing, {"outputs": [], "total": 0})
+        with self.assertRaises(HTTPException) as hidden:
+            self.ns["serve_file"](
+                _Request({}), staged.name, workspace="project",
+            )
+        self.assertEqual(hidden.exception.status_code, 404)
+
+        asset = self.store.create_asset(
+            "project", "main",
+            name="Guarded crop",
+            asset_type="character",
+            provenance="generated",
+            asset_id="guarded-crop-asset",
+        )
+        published = self.store.add_variants_atomic(
+            "project", "main", asset["id"],
+            [{
+                "id": "guarded-crop-variant",
+                "variant_type": "reference_pack",
+                "label": "Candidate 1",
+                "outputs": [{
+                    "source_path": str(staged),
+                    "label": "Managed character detail",
+                    "metadata": {"private": True, "explicit": True},
+                }],
+                "provenance": "generated",
+                "status": "candidate",
+                "metadata": {"reference_pack": {"schema_version": 2}},
+            }],
+        )[0]
+        relative_path = published["outputs"][0]["relative_path"]
+        response = self.ns["serve_project_asset_media"](
+            "project", relative_path, _Request({}),
+        )
+        published_path = Path(response.path)
+        self.assertTrue(published_path.is_file())
+        self.assertNotEqual(published_path, staged)
+
+        self.assertTrue(
+            self.ns["_cleanup_project_reference_private_source"](
+                staged, self.output,
+            ),
+        )
+        self.assertFalse(staged.exists())
+        self.assertFalse(guard.exists())
+        self.assertTrue(published_path.is_file())
+        replay = self.ns["serve_project_asset_media"](
+            "project", relative_path, _Request({}),
+        )
+        self.assertEqual(Path(replay.path), published_path)
+
+    def test_draft_retains_profile_without_deriving_managed_callouts(self):
+        response = self._run(self._explicit_body(
+            mode="draft",
+            character_profile={
+                "gender": "woman",
+                "age": 38,
+                "explicit_anatomy": ["breasts", "vulva"],
+            },
+        ))
+        reference = self.jobs[response["job_id"]]["params"]["reference_pack"]
+        private = reference["private_authored_settings"]
+        self.assertEqual(private["character_profile"]["gender"], "woman")
+        self.assertEqual(private["character_profile"]["age"], 38)
+        self.assertNotIn("managed_character_callouts", private)
+        self.assertEqual(response["plan"]["detail_callout_count"], 0)
+        self.assertEqual(
+            len(self.calls), len(response["plan"]["ordered_sheet_roles"]),
+        )
+        self.assertTrue(all(
+            "Authored character gender: woman" in call["prompt"]
+            and "Authored character age in years: 38" in call["prompt"]
+            for call in self.calls
+        ))
+        self.assertNotIn(
+            "managed", json.dumps(response["plan"]["ordered_output_roles"]),
+        )
 
     def test_selected_reviewer_consumes_one_boolean_authored_question_only(self):
         captured_requests = []
@@ -1931,6 +2374,181 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(self.calls), 6)
+
+    def test_request_id_replays_same_acceptance_and_rejects_payload_mismatch(self):
+        body = self._body(request_id="fresh-request-0001")
+        first = self._run(body)
+        first_call_count = len(self.calls)
+        first_assets = copy.deepcopy(self._assets())
+
+        replay = self._run(copy.deepcopy(body))
+
+        self.assertEqual(replay, first)
+        self.assertEqual(len(self.calls), first_call_count)
+        self.assertEqual(self._assets(), first_assets)
+        self.assertEqual(len(self.jobs), 1)
+        with self.assertRaises(HTTPException) as raised:
+            self._run({**body, "name": "A different private label"})
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(len(self.jobs), 1)
+
+    def test_request_id_is_not_keyed_by_name_and_survives_store_restart(self):
+        first = self._run(self._body(
+            request_id="fresh-request-0002",
+            name="Repeated display name",
+        ))
+        second = self._run(self._body(
+            request_id="fresh-request-0003",
+            name="Repeated display name",
+        ))
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        self.assertNotEqual(first["asset"]["id"], second["asset"]["id"])
+
+        self.admission_store = ReferenceAdmissionStore(
+            self.root / "reference-admission",
+            b"reference-route-test-secret",
+            lease_seconds=1.0,
+        )
+        # Terminal queue compaction may remove the accepted job entirely;
+        # the accepted ledger must still replay for its full TTL.
+        self.jobs.clear()
+        replay = self._run(self._body(
+            request_id="fresh-request-0002",
+            name="Repeated display name",
+        ))
+        self.assertEqual(replay, first)
+        self.assertEqual(self.jobs, {})
+        self.admission_store = ReferenceAdmissionStore(
+            self.root / "reference-admission",
+            b"reference-route-test-secret",
+            lease_seconds=1.0,
+        )
+        self.assertEqual(self._run(self._body(
+            request_id="fresh-request-0002",
+            name="Repeated display name",
+        )), first)
+        self.assertEqual(self.jobs, {})
+
+    def test_retry_and_edit_operations_each_replay_their_request_id(self):
+        created = self._run(self._body())
+        asset_id = created["asset"]["id"]
+        parent_variant_id = self._assets()[0]["variants"][0]["id"]
+
+        retry_body = self._body(
+            asset_id=asset_id,
+            request_id="retry-request-0001",
+        )
+        retry = self._run(retry_body)
+        calls_after_retry = len(self.calls)
+        self.assertEqual(self._run(copy.deepcopy(retry_body)), retry)
+        self.assertEqual(len(self.calls), calls_after_retry)
+
+        edit_body = self._body(
+            asset_id=asset_id,
+            parent_variant_id=parent_variant_id,
+            edit_instruction="Preserve identity and refine the turnaround.",
+            request_id="edit-request-00001",
+        )
+        edited = self._run(edit_body)
+        calls_after_edit = len(self.calls)
+        self.assertEqual(self._run(copy.deepcopy(edit_body)), edited)
+        self.assertEqual(len(self.calls), calls_after_edit)
+
+    def test_three_concurrent_jobs_share_reviewer_failure_without_leakage(self):
+        self.review = lambda _request: (_ for _ in ()).throw(
+            RuntimeError("PRIVATE_SHARED_REVIEWER_FAILURE"),
+        )
+        bodies = [
+            self._body(
+                request_id=f"concurrent-request-{index:04d}",
+                name=f"Concurrent {index}",
+            )
+            for index in range(3)
+        ]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            responses = list(pool.map(self._run, bodies))
+
+        self.assertEqual(len({item["job_id"] for item in responses}), 3)
+        self.assertEqual(len(self._assets()), 3)
+        for response in responses:
+            self.assertEqual(self.jobs[response["job_id"]]["status"], "completed")
+        for asset in self._assets():
+            quality = asset["variants"][0]["metadata"][
+                "reference_pack"
+            ]["quality"]
+            self.assertEqual(quality["status"], "review_unavailable")
+            self.assertTrue(quality["recommended"])
+        self.assertNotIn(
+            "PRIVATE_SHARED_REVIEWER_FAILURE",
+            json.dumps({"jobs": self.jobs, "assets": self._assets()}),
+        )
+
+    def test_recommendation_prefers_accepted_over_ungraded_and_material(self):
+        def mixed_review(request):
+            first_name = Path(
+                os.path.realpath(request.sheet_paths[0])
+            ).name
+            number = int(re.search(r"synthetic_(\d+)_", first_name).group(1))
+            candidate_index = (number - 1) // 3
+            if candidate_index == 0:
+                return False
+            if candidate_index == 1:
+                raise RuntimeError("PRIVATE_UNGRADED_CANDIDATE")
+            return True
+
+        self.review = mixed_review
+        self._run(self._body(
+            candidate_count=3,
+            mode="draft",
+            max_repair_attempts=0,
+        ))
+        variants = self._assets()[0]["variants"]
+        qualities = [
+            item["metadata"]["reference_pack"]["quality"]
+            for item in variants
+        ]
+        self.assertEqual(
+            [item["status"] for item in qualities],
+            ["residual", "review_unavailable", "pass"],
+        )
+        self.assertEqual(
+            [item["recommended"] for item in qualities],
+            [False, False, True],
+        )
+        self.assertEqual(
+            qualities[2]["recommendation_basis"], "accepted_assessment",
+        )
+        self.assertNotIn("PRIVATE_UNGRADED_CANDIDATE", json.dumps(variants))
+
+    def test_preliminary_ungraded_precedes_material_residual(self):
+        def mixed_review(request):
+            first_name = Path(
+                os.path.realpath(request.sheet_paths[0])
+            ).name
+            number = int(re.search(r"synthetic_(\d+)_", first_name).group(1))
+            if (number - 1) // 3 == 0:
+                return False
+            raise RuntimeError("PRIVATE_DEFERRED_REVIEW")
+
+        self.review = mixed_review
+        self._run(self._body(
+            candidate_count=2,
+            mode="draft",
+            max_repair_attempts=0,
+        ))
+        qualities = [
+            item["metadata"]["reference_pack"]["quality"]
+            for item in self._assets()[0]["variants"]
+        ]
+        self.assertEqual(
+            [item["recommended"] for item in qualities], [False, True],
+        )
+        self.assertEqual(
+            qualities[1]["recommendation_basis"], "preliminary_ungraded",
+        )
+        self.assertNotIn(
+            "PRIVATE_DEFERRED_REVIEW", json.dumps(self._assets()),
+        )
 
     def test_multi_candidate_repair_counters_distinguish_per_candidate_and_total(self):
         reviews = {"count": 0}
@@ -2427,6 +3045,11 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             },
             "params": {"reference_pack": {
                 "private_authored_settings": private,
+                "private_reference_request": (
+                    self.ns["_project_reference_private_character_state"](
+                        None, explicit_convenience=False,
+                    )
+                ),
             }},
         }
         self.ns["_write_project_reference_sidecar"](
@@ -2442,6 +3065,12 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(
             sidecar["params"]["reference_pack"]["private_authored_settings"],
             private,
+        )
+        self.assertEqual(
+            sidecar["params"]["reference_pack"]["private_reference_request"],
+            parent_job["params"]["reference_pack"][
+                "private_reference_request"
+            ],
         )
         serialized = json.dumps(sidecar)
         self.assertNotIn("NEVER_PERSIST_OWNER", serialized)
@@ -2486,6 +3115,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             {
                 "seal": first["plan"]["authored_settings"]["seal"],
                 **expected_private,
+                "explicit_convenience": False,
             },
         )
         corrupted = copy.deepcopy(first_variant)
@@ -2534,6 +3164,104 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertNotIn("private_authored_settings", public)
         self.assertNotIn("PRIVATE_RETRY_EXPRESSION", public)
         self.assertNotIn("PRIVATE_RETRY_DETAIL", public)
+
+    def test_character_private_state_detects_corruption_and_legacy_absence(self):
+        self._run(self._body(character_profile={
+            "gender": "woman",
+            "age": 31,
+            "explicit_anatomy": ["breasts"],
+        }))
+        variant = self._assets()[0]["variants"][0]
+        private_request = variant["metadata"]["private_reference_request"]
+        self.assertEqual(set(private_request), {
+            "schema_version", "explicit_convenience", "commitment",
+        })
+        self.assertFalse(private_request["explicit_convenience"])
+        self.assertRegex(private_request["commitment"], r"^[0-9a-f]{64}$")
+
+        corrupted_request = copy.deepcopy(variant)
+        corrupted_request["metadata"]["private_reference_request"][
+            "commitment"
+        ] = "0" * 64
+        with self.assertRaises(HTTPException) as request_error:
+            self.ns["_project_reference_private_authored_snapshot"](
+                corrupted_request,
+            )
+        self.assertEqual(request_error.exception.status_code, 409)
+
+        corrupted_public = copy.deepcopy(variant)
+        corrupted_public["metadata"]["reference_pack"]["authored_settings"][
+            "character_profile"
+        ]["age"]["commitment"] = "0" * 64
+        with self.assertRaises(HTTPException) as public_error:
+            self.ns["_project_reference_private_authored_snapshot"](
+                corrupted_public,
+            )
+        self.assertEqual(public_error.exception.status_code, 409)
+
+        legacy = copy.deepcopy(variant)
+        legacy["metadata"].pop("private_reference_request")
+        snapshot = self.ns["_project_reference_private_authored_snapshot"](
+            legacy,
+        )
+        self.assertFalse(snapshot["explicit_convenience"])
+        self.assertEqual(snapshot["character_profile"]["age"], 31)
+
+        public = self.ns["list_project_assets"]("project", _Request({}))
+        self.assertNotIn("private_reference_request", json.dumps(public))
+
+    def test_committed_recovery_rejects_character_policy_projection_drift(self):
+        response = self._run(self._explicit_body(character_profile={
+            "gender": "unspecified",
+            "age": None,
+            "explicit_anatomy": ["vulva"],
+        }))
+        variant = self._assets()[0]["variants"][0]
+        reference = variant["metadata"]["reference_pack"]
+        validate = self.ns["_project_reference_validate_committed_variant"]
+        arguments = {
+            "job_id": response["job_id"],
+            "candidate_index": 1,
+            "candidate_count": 1,
+            "plan_seal": reference["plan_seal"],
+            "mandatory_review": True,
+            "explicit_output": True,
+        }
+        validate(
+            self.store, "project", "main", variant,
+            **arguments,
+        )
+        paths = (
+            ("metadata", "reference_pack", "explicit_output"),
+            ("metadata", "reference_pack", "explicit_convenience"),
+            ("metadata", "policy", "explicit"),
+            ("outputs", 0, "metadata", "explicit"),
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                tampered = copy.deepcopy(variant)
+                target = tampered
+                for part in path[:-1]:
+                    target = target[part]
+                target[path[-1]] = False
+                with self.assertRaisesRegex(
+                    ValueError, "committed publication",
+                ):
+                    validate(
+                        self.store, "project", "main", tampered,
+                        **arguments,
+                    )
+        for field in ("explicit_output", "explicit_convenience"):
+            with self.subTest(missing=field):
+                missing = copy.deepcopy(variant)
+                missing["metadata"]["reference_pack"].pop(field)
+                with self.assertRaisesRegex(
+                    ValueError, "committed publication",
+                ):
+                    validate(
+                        self.store, "project", "main", missing,
+                        **arguments,
+                    )
 
     def test_v2_style_is_private_committed_and_exactly_replayed_or_overridden(self):
         private_style = "PRIVATE PAINTERLY NOIR STYLE"
@@ -3146,6 +3874,70 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             explicit_output=True,
         ), _Request({}))
         self.assertEqual(creature["anchor_basis"], "primary_outfit")
+
+    def test_character_profile_is_age_neutral_and_separate_from_output_policy(self):
+        validate = self.ns["_project_reference_request_config"]
+        capabilities = self.ns["_project_reference_capabilities"]()
+        self.assertEqual(
+            capabilities["character_profile"],
+            {
+                "schema_version": 1,
+                "genders": ["woman", "man", "non_binary", "unspecified"],
+                "age": {"optional": True, "minimum": 0, "maximum": 999},
+                "explicit_anatomy": ["breasts", "vulva", "penis"],
+                "explicit_convenience": {
+                    "supported": True,
+                    "requires_explicit_output": True,
+                },
+            },
+        )
+        for gender in ("woman", "man", "non_binary", "unspecified"):
+            with self.subTest(gender=gender):
+                config = validate(self._body(character_profile={
+                    "gender": gender,
+                    "explicit_anatomy": [],
+                }), _Request({}))
+                self.assertEqual(config["character_profile"]["gender"], gender)
+                self.assertIsNone(config["character_profile"]["age"])
+                self.assertFalse(config["explicit_convenience"])
+                self.assertFalse(config["policy"]["explicit"])
+
+        explicit_policy_only = validate(self._body(
+            explicit_output=True,
+            content_capability="standard",
+            initial_blur=False,
+            intelligence_policy="standard_auto",
+        ), _Request({}))
+        self.assertFalse(explicit_policy_only["explicit_convenience"])
+        self.assertIsNone(explicit_policy_only["character_profile"])
+        self.assertTrue(explicit_policy_only["mandatory_review"])
+
+        invalid_profiles = (
+            self._body(
+                explicit_convenience=True,
+                explicit_output=False,
+                character_profile={
+                    "gender": "woman", "age": 30,
+                    "explicit_anatomy": ["breasts"],
+                },
+            ),
+            self._explicit_body(character_profile={
+                "gender": "man", "age": 17,
+                "explicit_anatomy": ["penis"],
+            }),
+            self._body(
+                asset_type="location",
+                character_profile={
+                    "gender": "unspecified", "age": None,
+                    "explicit_anatomy": [],
+                },
+            ),
+        )
+        for invalid in invalid_profiles:
+            before_visibility = len(self.visibility_calls)
+            with self.subTest(invalid=invalid), self.assertRaises(HTTPException):
+                validate(invalid, _Request({}))
+            self.assertEqual(len(self.visibility_calls), before_visibility)
 
     def test_v2_uncensored_auto_uses_only_its_exact_local_visual_reviewer(self):
         recipe = self.ns["_PROJECT_REFERENCE_ABLITERATED_RECIPE"]
@@ -5434,6 +6226,13 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "_public_progress_telemetry": lambda _job: {},
             "job_events": lambda *_args: [],
             "queue_control_state": lambda: {},
+            "queue_scheduler_snapshot": lambda jobs: {
+                "states": {id(job): dict(job) for job in jobs},
+                "positions": {},
+            },
+            "authorized_logical_queue_projection": (
+                lifecycle.authorized_logical_queue_projection
+            ),
             "_public_queue_recovery_metadata": lambda _job: {},
         }
         with mock.patch.dict(self.ns, endpoint_stubs):

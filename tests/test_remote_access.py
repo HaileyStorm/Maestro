@@ -1048,15 +1048,29 @@ class LaunchSecurityContractTests(unittest.TestCase):
         queue = self._function_source("get_queue_state")
         self.assertIn("_require_remote_queue_project(request)", queue)
         self.assertIn("queue_scheduler_snapshot(active_jobs)", queue)
-        self.assertIn('**scheduler["summary"]', queue)
-        self.assertIn("aggregate_snapshot()", queue)
+        self.assertIn("authorized_jobs = [", queue)
+        self.assertIn(
+            "authorized_logical_queue_projection(\n"
+            "        authorized_jobs, scheduler,",
+            queue,
+        )
+        self.assertIn('logical_summary = dict(projection["summary"])', queue)
+        self.assertNotIn('**scheduler["summary"]', queue)
+        self.assertIn('"cpu_text_running": sum(', queue)
+        self.assertIn('"cpu_text_waiting": sum(', queue)
+        self.assertEqual(queue.count("for job in authorized_jobs"), 2)
+        self.assertNotIn("aggregate_snapshot()", queue)
         self.assertLess(
             queue.index("_require_remote_queue_project(request)"),
             queue.index("queue_scheduler_snapshot(active_jobs)"),
         )
         self.assertLess(
             queue.index("queue_scheduler_snapshot(active_jobs)"),
-            queue.index("_job_owned_by_request(snapshot, request)"),
+            queue.index("_job_owned_by_request("),
+        )
+        self.assertLess(
+            queue.index("_job_owned_by_request("),
+            queue.index("authorized_logical_queue_projection("),
         )
 
         gate = self._function_source("_require_remote_queue_project")

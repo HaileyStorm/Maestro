@@ -1,6 +1,8 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import { X, Save, Trash2, FolderOpen, SlidersHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import { installModalFocus } from '../../lib/modalFocus'
 import { PostProcessing } from './PostProcessing'
 import { ControlVideoSection } from './ControlVideoSection'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
@@ -207,6 +209,7 @@ function useAdvancedActiveItems(): string[] {
 
 export function AdvancedSettings() {
   const [open, setOpen] = useState(false)
+  const closeDrawer = useCallback(() => setOpen(false), [])
   const params = useStore(s => s.params)
   const setParam = useStore(s => s.setParam)
   const modelOptions = useStore(s => s.modelOptions)
@@ -260,7 +263,9 @@ export function AdvancedSettings() {
   const durationSeconds = useStore(s => s.durationSeconds)
   const setDurationSeconds = useStore(s => s.setDurationSeconds)
   const selectModel = useStore(s => s.selectModel)
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
+  const closeRef = useRef<HTMLButtonElement>(null)
   const advancedItems = useAdvancedActiveItems()
   const advancedCount = advancedItems.length
   const isH3 = ['minimax_h3', 'minimax_h3_ref2va'].includes(
@@ -293,19 +298,42 @@ export function AdvancedSettings() {
     return () => { current = false }
   }, [open, isH3])
 
-  // Close on escape
+  // The drawer is portalled outside #root so the shared modal controller can
+  // inert the rest of the app without also disabling the open drawer. Native
+  // form controls are already browser tab stops; explicitly annotating them
+  // lets the shared selector include the drawer's inputs, selects, and textareas
+  // when it determines the first and last stops for focus wrapping.
   useEffect(() => {
-    if (!open) return
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
-  }, [open])
+    if (!open || !panelRef.current || !closeRef.current) return
+    const nativeControls = Array.from(panelRef.current.querySelectorAll<HTMLElement>(
+      'input:not([disabled]), select:not([disabled]), textarea:not([disabled])',
+    ))
+    const annotatedControls = nativeControls.filter(control => !control.hasAttribute('tabindex'))
+    for (const control of annotatedControls) control.setAttribute('tabindex', '0')
+    const uninstall = installModalFocus({
+      document,
+      dialog: panelRef.current,
+      initialFocus: closeRef.current,
+      restoreFocus: triggerRef.current,
+      appRoot: document.getElementById('root'),
+      onClose: closeDrawer,
+    })
+    return () => {
+      for (const control of annotatedControls) control.removeAttribute('tabindex')
+      uninstall()
+    }
+  }, [closeDrawer, open])
 
   return (
     <>
       {/* Trigger button */}
       <button
-        onClick={() => setOpen(!open)}
+        ref={triggerRef}
+        type="button"
+        aria-controls="advanced-settings-drawer"
+        aria-expanded={open}
+        aria-label={open ? 'Close Advanced Settings' : 'Open Advanced Settings'}
+        onClick={() => setOpen(current => !current)}
         className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-colors border ${
           open ? 'border-accent-blue text-accent-blue' : 'border-border text-text-secondary hover:text-text-primary hover:border-border-light'
         }`}
@@ -323,19 +351,41 @@ export function AdvancedSettings() {
       </button>
 
       {/* Popup overlay — always mounted to preserve state (frames injection, etc.) */}
-      {open && <div className="fixed inset-0 bg-black/30 z-50" onClick={() => setOpen(false)} />}
-      <div
-        ref={panelRef}
-        className={`fixed top-0 h-full bg-bg-secondary border-r border-border z-50 flex flex-col shadow-2xl overflow-hidden transition-transform duration-200
-          left-0 w-full md:left-[clamp(460px,24vw,560px)] md:w-[min(380px,calc(100vw-clamp(460px,24vw,560px)))] md:max-w-[90vw] ${
-          open ? 'translate-x-0' : '-translate-x-full md:-translate-x-[800px] pointer-events-none'
-        }`}
-        style={{ maxHeight: '100vh' }}
-      >
+      {createPortal(
+        <>
+          {open && (
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-label="Close Advanced Settings"
+              className="fixed inset-0 z-50 appearance-none border-0 bg-black/30 p-0"
+              onClick={closeDrawer}
+            />
+          )}
+          <div
+            id="advanced-settings-drawer"
+            ref={panelRef}
+            role="dialog"
+            aria-modal={open ? true : undefined}
+            aria-labelledby="advanced-settings-title"
+            aria-hidden={!open}
+            inert={!open}
+            className={`fixed top-0 h-full bg-bg-secondary border-r border-border z-50 flex flex-col shadow-2xl overflow-hidden transition-transform duration-200
+              left-0 w-full md:left-[clamp(460px,24vw,560px)] md:w-[min(380px,calc(100vw-clamp(460px,24vw,560px)))] md:max-w-[90vw] ${
+              open ? 'translate-x-0' : '-translate-x-full md:-translate-x-[100vw] pointer-events-none'
+            }`}
+            style={{ maxHeight: '100vh' }}
+          >
             {/* Header */}
             <div className="px-4 py-3 border-b border-border flex items-center justify-between shrink-0">
-              <span className="text-sm font-semibold text-text-primary">Advanced Settings</span>
-              <button onClick={() => setOpen(false)} className="p-1 rounded-lg hover:bg-bg-hover text-text-secondary">
+              <span id="advanced-settings-title" className="text-sm font-semibold text-text-primary">Advanced Settings</span>
+              <button
+                ref={closeRef}
+                type="button"
+                aria-label="Close Advanced Settings"
+                onClick={closeDrawer}
+                className="p-1 rounded-lg hover:bg-bg-hover text-text-secondary"
+              >
                 <X size={16} />
               </button>
             </div>
@@ -1099,6 +1149,9 @@ export function AdvancedSettings() {
               </label>
             </div>
           </div>
+        </>,
+        document.body,
+      )}
     </>
   )
 }

@@ -63,6 +63,7 @@ _JOB_FIELDS = frozenset({
     "plan_review_terms_required",
     "resource_intent", "resource_execution", "preemption_mode",
     "resource_state", "execution_attempt", "parent_job_id",
+    "logical_job_kind",
     "failure_details", "oom_info", "failed_child_job_id", "failed_child_status",
     "failed_child_reason",
     "queue_residency_bypass_count", "queue_residency_bypassed_waiters",
@@ -93,6 +94,9 @@ _RESOURCE_STATES = frozenset({
     "released",
 })
 _FAILED_CHILD_STATUSES = frozenset({"failed", "cancelled", "blocked"})
+_LOGICAL_JOB_KINDS = frozenset({
+    "reference_pack_parent", "reference_pack_child",
+})
 _MAX_EXECUTION_ATTEMPT = 1_000_000
 
 
@@ -633,6 +637,12 @@ def serialize_job(
                     "job.parent_job_id is invalid."
                 )
             result[key] = value
+        elif key == "logical_job_kind":
+            if value not in _LOGICAL_JOB_KINDS:
+                raise QueueRecoveryAdapterError(
+                    "job.logical_job_kind is invalid."
+                )
+            result[key] = value
         elif key == "failure_details":
             if not isinstance(value, Mapping):
                 raise QueueRecoveryAdapterError(
@@ -678,6 +688,20 @@ def serialize_job(
         "failed_child_job_id", "failed_child_status", "failed_child_reason",
     }
     present_child_fields = child_fields.intersection(result)
+    logical_kind = result.get("logical_job_kind")
+    if (
+        logical_kind == "reference_pack_parent"
+        and "parent_job_id" in result
+    ) or (
+        logical_kind == "reference_pack_child"
+        and (
+            "parent_job_id" not in result
+            or result["parent_job_id"] == result["id"]
+        )
+    ):
+        raise QueueRecoveryAdapterError(
+            "job logical Reference relation is invalid."
+        )
     if present_child_fields and (
         present_child_fields != child_fields or result.get("status") != "failed"
     ):

@@ -1098,6 +1098,156 @@ def queue_scheduler_snapshot(
         }
 
 
+_PUBLIC_ACTIVE_STATUSES = frozenset({
+    "preparing", "waiting_for_plan_approval", "queued", "running",
+})
+
+
+def _reference_child_needs_public_row(
+    child: Mapping[str, Any], parent: Mapping[str, Any],
+) -> bool:
+    """Keep exceptional children explicit; ordinary internal work is folded."""
+    state = str(child.get("recovery_state") or "")
+    actions = child.get("recovery_actions")
+    if (
+        child.get("status") == "waiting_for_plan_approval"
+        or child.get("resource_state") == "blocked"
+        or state == "interrupted"
+        or state.startswith("blocked")
+        or child.get("recovery_actionable") is True
+        or (isinstance(actions, (list, tuple)) and bool(actions))
+    ):
+        return True
+    if child.get("status") == "failed":
+        # A failed child is safely represented by its strict reverse relation
+        # on the parent.  Otherwise retain the row as an actionable orphan.
+        return str(parent.get("failed_child_job_id") or "") != str(
+            child.get("id") or ""
+        )
+    return False
+
+
+def authorized_logical_queue_projection(
+    jobs: Iterable[MutableMapping[str, Any]],
+    scheduler: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fold internal Reference children after caller authorization.
+
+    ``jobs`` must already contain only rows authorized for one requester.  The
+    returned summary is derived solely from those logical roots, never from the
+    scheduler's host-global summary.  Physical rows remain available to the
+    caller so queue controls and recovery can target an authoritative child.
+    """
+    physical = list(jobs)
+    scheduler_states = scheduler.get("states")
+    if not isinstance(scheduler_states, Mapping):
+        scheduler_states = {}
+    states: dict[int, dict[str, Any]] = {}
+    by_public_id: dict[str, MutableMapping[str, Any]] = {}
+    for job in physical:
+        snapshot = scheduler_states.get(id(job))
+        state = dict(snapshot) if isinstance(snapshot, Mapping) else dict(job)
+        states[id(job)] = state
+        job_id = state.get("id")
+        if isinstance(job_id, str) and job_id:
+            by_public_id[job_id] = job
+
+    folded_child_ids: set[str] = set()
+    representative_by_parent: dict[str, MutableMapping[str, Any]] = {}
+    for child in physical:
+        child_state = states[id(child)]
+        parent_id = child_state.get("parent_job_id")
+        child_id = child_state.get("id")
+        if (
+            not isinstance(parent_id, str)
+            or not parent_id
+            or not isinstance(child_id, str)
+            or not child_id
+            or parent_id == child_id
+        ):
+            continue
+        parent = by_public_id.get(parent_id)
+        if parent is None:
+            continue
+        parent_state = states[id(parent)]
+        if (
+            parent_state.get("logical_job_kind") != "reference_pack_parent"
+            or child_state.get("logical_job_kind") != "reference_pack_child"
+            or child_state.get("resource_intent") != RESOURCE_INTENT_GENERATION
+            or parent_state.get("session_id") != child_state.get("session_id")
+            or _reference_child_needs_public_row(child_state, parent_state)
+        ):
+            continue
+        folded_child_ids.add(child_id)
+        if child_state.get("status") in _PUBLIC_ACTIVE_STATUSES:
+            representative_by_parent[parent_id] = child
+
+    logical_roots = [
+        job for job in physical
+        if str(states[id(job)].get("id") or "") not in folded_child_ids
+    ]
+    positions = scheduler.get("positions")
+    if not isinstance(positions, Mapping):
+        positions = {}
+    public_positions = {
+        id(job): index
+        for index, job in enumerate(
+            sorted(
+                (
+                    job for job in physical
+                    if id(job) in positions
+                ),
+                key=lambda job: positions[id(job)],
+            ),
+            start=1,
+        )
+    }
+    summary = {
+        "running": 0,
+        "waiting": 0,
+        "held": 0,
+        "registering": 0,
+        "preparing": 0,
+        "approval_waiting": 0,
+        "active_total": 0,
+    }
+    representative_job_ids: dict[str, str] = {}
+    for root in logical_roots:
+        root_state = states[id(root)]
+        root_id = str(root_state.get("id") or "")
+        representative = representative_by_parent.get(root_id, root)
+        state = states[id(representative)]
+        representative_id = str(state.get("id") or root_id)
+        representative_job_ids[root_id] = representative_id
+        status = state.get("status")
+        if status not in _PUBLIC_ACTIVE_STATUSES:
+            continue
+        if status == "queued" and state.get("cancel_requested", False):
+            continue
+        summary["active_total"] += 1
+        if status == "running":
+            summary["running"] += 1
+        elif status == "preparing":
+            summary["preparing"] += 1
+        elif status == "waiting_for_plan_approval":
+            summary["approval_waiting"] += 1
+        elif state.get("queue_held", False):
+            summary["held"] += 1
+        elif id(representative) not in positions:
+            summary["registering"] += 1
+        else:
+            summary["waiting"] += 1
+
+    return {
+        "physical_jobs": physical,
+        "logical_jobs": logical_roots,
+        "folded_child_ids": frozenset(folded_child_ids),
+        "representative_job_ids": representative_job_ids,
+        "public_positions": public_positions,
+        "summary": summary,
+    }
+
+
 def queue_position(job: MutableMapping[str, Any]) -> int | None:
     """Return the one-based admission position among eligible waiters."""
     with _queue_condition:

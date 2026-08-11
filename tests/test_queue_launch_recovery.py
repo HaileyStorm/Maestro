@@ -61,9 +61,22 @@ from services.h3_offload_plan import (
     validate_h3_offload_plan,
 )
 from services.output_access import stamp_sidecar_policy
+from services.job_lifecycle import authorized_logical_queue_projection
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _synthetic_scheduler_snapshot(jobs):
+    jobs = list(jobs)
+    return {
+        "paused": False,
+        "pause_after_current": False,
+        "summary": {},
+        "positions": {},
+        "states": {id(job): dict(job) for job in jobs},
+        "wait_reasons": {},
+    }
 
 
 def _tree(relative: str) -> ast.Module:
@@ -3598,6 +3611,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 }),
                 "_job_owned_by_request": lambda *_args: True,
                 "snapshot_job": lambda value: dict(value),
+                "queue_scheduler_snapshot": _synthetic_scheduler_snapshot,
+                "authorized_logical_queue_projection": (
+                    authorized_logical_queue_projection
+                ),
                 "_queue_recovery_is_blocked": lambda value: (
                     value.get("recovery_state") == "blocked"
                 ),
@@ -3609,6 +3626,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     "resource_descriptor": None,
                 },
                 "_public_parent_job_id": lambda _value: None,
+                "_public_logical_job_kind": lambda _value: None,
                 "_public_progress_telemetry": lambda _value: {},
                 "public_h3_offload_plan": lambda _value: None,
                 "math": __import__("math"),
@@ -3776,6 +3794,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 self.launch,
                 (
                     "_job_owned_by_request", "_public_parent_job_id",
+                    "_public_logical_job_kind",
                     "_public_failed_child_metadata", "_public_job_prompt_fields",
                     "_public_job_created_at", "get_status", "list_jobs",
                 ),
@@ -3794,6 +3813,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
                         lambda *_args: True
                     ),
                     "snapshot_job": lambda value: dict(value),
+                    "queue_scheduler_snapshot": _synthetic_scheduler_snapshot,
+                    "authorized_logical_queue_projection": (
+                        authorized_logical_queue_projection
+                    ),
                     "_set_recovery_no_store": lambda response: None,
                     "_queue_recovery_is_blocked": lambda _job: False,
                     "_job_eta_values": lambda _job: (None, None),

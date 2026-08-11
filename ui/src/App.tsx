@@ -14,6 +14,7 @@ import { WelcomeModal } from './components/WelcomeModal'
 import { H3GenerationPlanDialog } from './components/H3GenerationPlanDialog'
 import { RecipesOverlay } from './components/Recipes/RecipesOverlay'
 import { WhatsNewButton } from './components/WhatsNewDialog'
+import { AccountSupportButton, AccountSupportDrawer } from './components/AccountSupport/AccountSupportDrawer'
 import { useStore } from './stores/useStore'
 import { useIsMobile } from './lib/useIsMobile'
 import { POLL_INTERVAL_MS, useVisibilityPolling } from './lib/useVisibilityPolling'
@@ -41,6 +42,7 @@ function bootstrapWithin<T>(promise: Promise<T>, message: string): Promise<T> {
 function App() {
   const loadModels = useStore(s => s.loadModels)
   const loadAccessContext = useStore(s => s.loadAccessContext)
+  const loadAccountContext = useStore(s => s.loadAccountContext)
   const loadOutputs = useStore(s => s.loadOutputs)
   const reconnectJobs = useStore(s => s.reconnectJobs)
   const loadSystemConfig = useStore(s => s.loadSystemConfig)
@@ -82,6 +84,9 @@ function App() {
         gallerySelectionMode: false,
       })
       loadModels()
+      if (context.accounts?.enabled === true) {
+        void loadAccountContext().catch(() => undefined)
+      }
       loadServicesConfig()
       loadLlmStatus()
       reconnectJobs()
@@ -100,7 +105,7 @@ function App() {
       setBootstrapState('error')
     })
     return () => { cancelled = true }
-  }, [bootstrapAttempt, loadAccessContext, loadModels, loadOutputs, loadSystemConfig, loadServicesConfig, loadLlmStatus, loadLlmModels, loadPipelineList, reconnectJobs])
+  }, [bootstrapAttempt, loadAccessContext, loadAccountContext, loadModels, loadOutputs, loadSystemConfig, loadServicesConfig, loadLlmStatus, loadLlmModels, loadPipelineList, reconnectJobs])
 
   // Backend-driven load/enhance transitions stay responsive; steady state is
   // a low-rate safety refresh. Hidden tabs make no baseline LLM requests.
@@ -187,16 +192,19 @@ function App() {
             </div>
             <WhatsNewButton compact />
           </div>
-          {machineControls ? (
-            <button
-              type="button"
-              onClick={() => { setSidebarOpen(false); toggleSettings() }}
-              className="p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
-              aria-label="Open machine settings"
-            >
-              <Settings size={20} />
-            </button>
-          ) : <span className="w-9" aria-hidden="true" />}
+          <div className="flex items-center gap-1">
+            <AccountSupportButton compact />
+            {machineControls ? (
+              <button
+                type="button"
+                onClick={() => { setSidebarOpen(false); toggleSettings() }}
+                className="p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+                aria-label="Open machine settings"
+              >
+                <Settings size={20} />
+              </button>
+            ) : <span className="w-9" aria-hidden="true" />}
+          </div>
         </header>
       )}
 
@@ -209,6 +217,12 @@ function App() {
       <RecipesOverlay />
       <RetakeDialog />
       <H3GenerationPlanDialog />
+      {!isMobile && (
+        <div className="fixed right-3 top-3 z-40">
+          <AccountSupportButton />
+        </div>
+      )}
+      <AccountSupportDrawer />
       {/* OomRecoveryBanner is a fixed-position overlay — renders nothing
           unless the latest job/pipeline failure has oom_info attached.
           Lives at the App root so it floats above whichever screen the

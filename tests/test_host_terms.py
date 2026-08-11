@@ -407,10 +407,18 @@ class HostTermsRouteContractTests(unittest.TestCase):
         return namespace[name]
 
     def test_status_and_acceptance_require_existing_project_authority(self):
-        routes = self.source[
-            self.source.index("def _require_host_terms_project_access"):
-            self.source.index('@api.get("/api/v1/access-context")')
-        ]
+        routes = "\n".join(
+            ast.get_source_segment(self.source, next(
+                item for item in self.module.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == name
+            )) or ""
+            for name in (
+                "_require_host_terms_project_access",
+                "get_host_terms",
+                "accept_host_terms",
+            )
+        )
         self.assertEqual(routes.count("_require_project_access("), 1)
         self.assertIn("existing_only=True", routes)
         self.assertNotIn("_existing_workspace_dir(", routes)

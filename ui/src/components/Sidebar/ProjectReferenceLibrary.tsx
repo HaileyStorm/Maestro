@@ -6,6 +6,7 @@ import {
   fetchProjectReferenceAuthoring,
   fetchProjectReferenceCapabilities,
   addProjectAssetVariant,
+  createProjectReferenceRequestId,
   deleteProjectAssetVariant,
   generateProjectAssetReferences,
   fetchModels,
@@ -16,7 +17,6 @@ import {
   getProjectAssetComponentOutputs,
   getProjectAssetMediaUrl,
   getProjectReferenceEditorModels,
-  getProjectReferenceExplicitConvenienceState,
   getProjectReferenceGenerationModels,
   getDirectorProjectReferenceKind,
   getProjectReferencePreferredGenerationModel,
@@ -32,9 +32,9 @@ import {
   getProjectReferenceRetrySettings,
   hasProjectReferenceLoraParameterSummary,
   isProjectReferenceReviewMandatory,
+  isProjectReferenceCharacterReplayReady,
   isProjectReferenceStyleReplayReady,
   isProjectReferenceReviewerEligible,
-  isProjectReferenceExplicitCharacterStateValid,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
   loadLlm,
@@ -42,12 +42,16 @@ import {
   projectAssetRequestError,
   projectAssetOutputNeedsInitialBlur,
   projectAssetVariantOperationKey,
+  projectReferenceQualityPresentation,
   projectReferenceRetryNeedsPrivateAuthoring,
   projectReferenceSafeErrorMessage,
+  PROJECT_REFERENCE_CHARACTER_AGE_BLOCKER,
+  PROJECT_REFERENCE_EXPLICIT_CONVENIENCE_AGE_BLOCKER,
   resolveProjectReferenceRetryReview,
   normalizeProjectReferenceAssetType,
   normalizeProjectReferenceAnchorPrivacy,
   selectProjectReferenceModel,
+  serializeProjectReferenceCharacterProfile,
   setProjectAssetVariantStatus,
   uploadImage,
   validateLoraParameterValues,
@@ -57,6 +61,9 @@ import {
   type ProjectAssetOutput,
   type ProjectAssetVariant,
   type ProjectReferenceAssetType,
+  type ProjectReferenceCharacterAnatomy,
+  type ProjectReferenceCharacterGender,
+  type ProjectReferenceCharacterProfileInput,
   type ProjectReferenceAdditionalLora,
   type ProjectReferenceAnchorBasis,
   type ProjectReferenceDepth,
@@ -78,6 +85,7 @@ import { hidePrivatePreview, privatePreviewIdentity, privatePreviewWasRevealed, 
 import { POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
 import { confirmReconnectedJob } from '../../lib/referenceQueue'
 import { formatManualInstallationBytes, manualInstallationDestination } from '../../lib/manualInstallation'
+import { requestQueueView } from '../../lib/mainViewNavigation'
 
 const ASSET_TYPES = [
   { value: 'character', label: 'Character', icon: UserRound },
@@ -280,6 +288,8 @@ interface ReferenceAuthoredSnapshot {
   style: string
   typeFields: ProjectReferenceTypeFields
   detailCallouts: ProjectReferenceDetailCallout[]
+  characterProfile?: ProjectReferenceCharacterProfileInput
+  explicitConvenience: boolean
 }
 
 type ReferenceAuthoringAvailability = 'loading' | 'ready' | 'unavailable'
@@ -288,6 +298,120 @@ interface ReferenceTypeDefinition {
   defaultPreset: ProjectReferencePreset
   presets: Array<{ value: ProjectReferencePreset; label: string }>
   sections: ReferenceSectionDefinition[]
+}
+
+type ProjectReferenceCreationMethod = 'image_pack' | 'blender_motion'
+
+interface ProjectReferenceCreationSelection {
+  candidateKind: ProjectReferenceCreationMethod
+  assetType: ProjectReferenceAssetType
+}
+
+type ProjectReferenceCreationEvent =
+  | { kind: 'select_method'; candidateKind: ProjectReferenceCreationMethod }
+  | { kind: 'select_asset_type'; assetType: ProjectReferenceAssetType }
+
+interface ProjectReferenceCreationTransition extends ProjectReferenceCreationSelection {
+  assetTypeChanged: boolean
+}
+
+interface ProjectReferenceCreationPanelState {
+  hidden: boolean
+  inert: true | undefined
+}
+
+function getProjectReferenceCreationTransition(
+  current: ProjectReferenceCreationSelection,
+  event: ProjectReferenceCreationEvent,
+): ProjectReferenceCreationTransition {
+  if (event.kind === 'select_method') {
+    return {
+      ...current,
+      candidateKind: event.candidateKind,
+      assetTypeChanged: false,
+    }
+  }
+  return {
+    candidateKind: 'image_pack',
+    assetType: event.assetType,
+    assetTypeChanged: current.assetType !== event.assetType,
+  }
+}
+
+function getProjectReferenceCreationPanelStates(
+  candidateKind: ProjectReferenceCreationMethod,
+): Record<ProjectReferenceCreationMethod, ProjectReferenceCreationPanelState> {
+  const imagePackHidden = candidateKind !== 'image_pack'
+  const blenderMotionHidden = candidateKind !== 'blender_motion'
+  return {
+    image_pack: { hidden: imagePackHidden, inert: imagePackHidden ? true : undefined },
+    blender_motion: { hidden: blenderMotionHidden, inert: blenderMotionHidden ? true : undefined },
+  }
+}
+
+interface ProjectReferenceReviewerAutoRefreshInput {
+  active: boolean
+  pageVisible: boolean
+  projectLocked: boolean
+  intelligencePolicy: 'standard_auto' | 'uncensored_auto'
+  reviewerAction: 'refreshing' | 'loading' | null
+  contract: ProjectReferenceCapabilities['uncensored_auto_review'] | undefined
+}
+
+function shouldAutoRefreshProjectReferenceReviewer({
+  active,
+  pageVisible,
+  projectLocked,
+  intelligencePolicy,
+  reviewerAction,
+  contract,
+}: ProjectReferenceReviewerAutoRefreshInput): boolean {
+  if (!active || !pageVisible || projectLocked
+    || intelligencePolicy !== 'uncensored_auto' || reviewerAction !== null) {
+    return false
+  }
+  if (!contract || contract.queue_ready) return false
+  return contract.setup_state === 'loading' || contract.setup_state === 'loaded_without_vision'
+}
+
+const REVIEWER_AUTO_REFRESH_DELAYS_MS = [750, 1_500, 3_000, 6_000, 12_000] as const
+
+const PROJECT_REFERENCE_CONFIRMATION_DELAYS_MS = [250, 750, 1_500] as const
+const PROJECT_REFERENCE_CONFIRMATION_ATTEMPT_TIMEOUT_MS = 1_500
+
+async function confirmProjectReferenceJobAttempt(
+  jobId: string,
+  confirm: (jobId: string) => Promise<void>,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      confirm(jobId).then(() => true, () => false),
+      new Promise<boolean>(resolve => {
+        timeoutId = setTimeout(() => resolve(false), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId)
+  }
+}
+
+async function confirmAcceptedProjectReferenceJob(
+  jobId: string,
+  confirm: (jobId: string) => Promise<void>,
+  wait: (delayMs: number) => Promise<void> = delayMs => new Promise(resolve => {
+    window.setTimeout(resolve, delayMs)
+  }),
+  attemptTimeoutMs = PROJECT_REFERENCE_CONFIRMATION_ATTEMPT_TIMEOUT_MS,
+): Promise<boolean> {
+  for (let attempt = 0; attempt <= PROJECT_REFERENCE_CONFIRMATION_DELAYS_MS.length; attempt += 1) {
+    if (await confirmProjectReferenceJobAttempt(jobId, confirm, attemptTimeoutMs)) return true
+    const delayMs = PROJECT_REFERENCE_CONFIRMATION_DELAYS_MS[attempt]
+    if (delayMs === undefined) return false
+    await wait(delayMs)
+  }
+  return false
 }
 
 const REFERENCE_TYPE_DEFINITIONS: Record<ProjectReferenceAssetType, ReferenceTypeDefinition> = {
@@ -495,6 +619,8 @@ function cloneReferenceAuthoredSnapshot(
   typeFields: ProjectReferenceTypeFields | undefined,
   detailCallouts: ProjectReferenceDetailCallout[] | undefined,
   style: string | undefined,
+  characterProfile?: ProjectReferenceCharacterProfileInput,
+  explicitConvenience = false,
 ): ReferenceAuthoredSnapshot {
   return {
     style: style ?? '',
@@ -505,6 +631,13 @@ function cloneReferenceAuthoredSnapshot(
       ]),
     ) as ProjectReferenceTypeFields,
     detailCallouts: (detailCallouts ?? []).map(callout => ({ ...callout })),
+    explicitConvenience,
+    ...(characterProfile ? {
+      characterProfile: {
+        ...characterProfile,
+        explicit_anatomy: [...characterProfile.explicit_anatomy],
+      },
+    } : {}),
   }
 }
 
@@ -543,6 +676,7 @@ function referenceSheetStatus(variant: ProjectAssetVariant): {
   const metadata = variant.variant_type === 'reference_pack'
     ? variant.metadata.reference_pack
     : variant.metadata.reference_sheet
+  if (variant.variant_type === 'reference_pack' && variant.metadata.reference_pack?.quality) return null
   const repaired = Array.isArray(metadata?.roles?.repaired)
     ? metadata.roles.repaired.filter(role => typeof role === 'string')
     : []
@@ -653,9 +787,6 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const browsingUploads = useStore(s => s.browsingUploads)
   const privateOutput = useStore(s => s.privateOutput)
   const explicitOutput = useStore(s => s.explicitOutput)
-  const initialExplicitConvenience = getProjectReferenceExplicitConvenienceState(
-    'character', explicitOutput,
-  )
   const explicitOutputRef = useRef(explicitOutput)
   const privateOutputRef = useRef(privateOutput)
   const generationMode = useStore(s => s.generationMode)
@@ -687,6 +818,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const [modelLoadError, setModelLoadError] = useState('')
   const [reviewerAction, setReviewerAction] = useState<'refreshing' | 'loading' | null>(null)
   const [reviewerActionError, setReviewerActionError] = useState('')
+  const [reviewerPageVisible, setReviewerPageVisible] = useState(() => (
+    typeof document === 'undefined' || document.visibilityState !== 'hidden'
+  ))
   const [verifyingManualModel, setVerifyingManualModel] = useState('')
   const [actionError, setActionError] = useState('')
   const [catalogModels, setCatalogModels] = useState<ApiModel[]>([])
@@ -698,19 +832,14 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const [referenceModelCustomized, setReferenceModelCustomized] = useState(false)
   const [editorModelCustomized, setEditorModelCustomized] = useState(false)
   const [assetType, setAssetType] = useState<ProjectReferenceAssetType>('character')
+  const [candidateKind, setCandidateKind] = useState<ProjectReferenceCreationMethod>('image_pack')
   const [sheetMode, setSheetMode] = useState<ProjectReferenceSheetMode>('production')
   const [intent, setIntent] = useState<ProjectReferenceIntent>('generic')
   const [depth, setDepth] = useState<ProjectReferenceDepth>('standard')
   const [customSheetCount, setCustomSheetCount] = useState(3)
-  const [preset, setPreset] = useState<ProjectReferencePreset>(
-    initialExplicitConvenience.preset ?? 'identity',
-  )
+  const [preset, setPreset] = useState<ProjectReferencePreset>('identity')
   const [sections, setSections] = useState<ReferenceSectionState[]>(() => (
-    initialExplicitConvenience.anatomy_option
-      ? selectCanonicalCharacterAnatomy(
-        createSectionState('character', 'standard', 3), undefined,
-      )
-      : createSectionState('character', 'standard', 3)
+    createSectionState('character', 'standard', 3)
   ))
   const [customSectionInputs, setCustomSectionInputs] = useState<Partial<Record<ReferenceSectionId, string>>>({})
   const [authoringStatus, setAuthoringStatus] = useState('')
@@ -718,6 +847,10 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const [planningModel, setPlanningModel] = useState('auto')
   const [reviewModel, setReviewModel] = useState('auto_local')
   const [referenceExplicitOutput, setReferenceExplicitOutput] = useState(explicitOutput)
+  const [explicitConvenience, setExplicitConvenience] = useState(false)
+  const [characterGender, setCharacterGender] = useState<ProjectReferenceCharacterGender>('unspecified')
+  const [characterAge, setCharacterAge] = useState('')
+  const [characterExplicitAnatomy, setCharacterExplicitAnatomy] = useState<ProjectReferenceCharacterAnatomy[]>([])
   const [contentCapability, setContentCapability] = useState<'standard' | 'unrestricted_local'>(
     explicitOutput ? 'unrestricted_local' : 'standard',
   )
@@ -759,6 +892,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const [privateReplayRetry, setPrivateReplayRetry] = useState(0)
   const requestSequence = useRef(0)
   const catalogRequestSequence = useRef(0)
+  const reviewerAutoRefreshSequence = useRef(0)
   const projectEpoch = useRef(0)
   const previousProject = useRef(project)
   const currentProject = useRef(project)
@@ -792,6 +926,13 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         needsAuthoring,
         needsStyle,
         styleCommitment: packMetadata?.authored_settings?.style_commitment ?? '',
+        characterReplayContract: {
+          explicit_convenience: packMetadata?.explicit_convenience,
+          authored_settings: {
+            character_profile: packMetadata?.authored_settings?.character_profile,
+            managed_character_callouts: packMetadata?.authored_settings?.managed_character_callouts,
+          },
+        },
         needsLoraParameters,
         parameterRecords: summarizedLoras.flatMap(lora => lora.parameters
           ? [{
@@ -877,12 +1018,17 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     }]
   }, [authoritativeTypeCapabilities, typeDefinition.sections])
   const anchorBasis = resolveAnchorBasis(assetType, preset, sections)
-  const explicitCharacterStateValid = isProjectReferenceExplicitCharacterStateValid(
-    assetType,
-    referenceExplicitOutput,
-    preset,
-    sections.find(section => section.id === 'anatomy')?.values ?? [],
+  const characterProfileSerialization = serializeProjectReferenceCharacterProfile(
+    {
+      gender: characterGender,
+      ageInput: characterAge,
+      explicitAnatomy: characterExplicitAnatomy,
+    },
+    explicitConvenience,
   )
+  const managedCharacterCalloutCount = explicitConvenience && sheetMode !== 'draft'
+    ? characterExplicitAnatomy.reduce((total, item) => total + (item === 'breasts' ? 2 : 1), 0)
+    : 0
   const typeFields = useMemo(
     () => buildTypeFields(sections, sectionDefinitions),
     [sectionDefinitions, sections],
@@ -972,6 +1118,14 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const reviewerSetupAction = getProjectReferenceReviewerAction(
     uncensoredReviewContract?.setup_state,
   )
+  const reviewerNeedsAutomaticRefresh = shouldAutoRefreshProjectReferenceReviewer({
+    active: open,
+    pageVisible: reviewerPageVisible,
+    projectLocked: projectExplicitlyLocked,
+    intelligencePolicy,
+    reviewerAction,
+    contract: uncensoredReviewContract,
+  })
   explicitOutputRef.current = explicitOutput
   privateOutputRef.current = privateOutput
   const availablePendingLoras = useMemo(() => {
@@ -1047,9 +1201,17 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     incompatible_lora: hasInvalidExplicitLora,
     invalid_lora_multiplier: hasInvalidLoraMultiplier,
     invalid_lora_parameters: hasInvalidLoraParameters,
-    invalid_authored_settings: hasInvalidAuthoredSettings || !explicitCharacterStateValid,
+    invalid_authored_settings: hasInvalidAuthoredSettings,
+    invalid_character_age: assetType === 'character'
+      && characterProfileSerialization.blocker === PROJECT_REFERENCE_CHARACTER_AGE_BLOCKER,
+    explicit_convenience_age: assetType === 'character'
+      && characterProfileSerialization.blocker === PROJECT_REFERENCE_EXPLICIT_CONVENIENCE_AGE_BLOCKER,
+    too_many_detail_callouts: assetType === 'character'
+      && selectedDetailItems.length + managedCharacterCalloutCount > 8,
     review_unavailable: reviewSelectionUnavailable,
   })
+  const visibleQueueBlockers = queueBlockers.filter(blocker => blocker.id !== 'submitting')
+  const creationPanelStates = getProjectReferenceCreationPanelStates(candidateKind)
   currentProject.current = project
 
   useEffect(() => {
@@ -1090,9 +1252,6 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     previousProject.current = project
     projectEpoch.current += 1
     requestSequence.current += 1
-    const resetConvenience = getProjectReferenceExplicitConvenienceState(
-      'character', explicitOutputRef.current,
-    )
     const resetSections = createSectionState('character', 'standard', 3)
     setAssets([])
     setCatalogModels([])
@@ -1103,21 +1262,24 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setEditorModelType('')
     setReferenceModelCustomized(false)
     setEditorModelCustomized(false)
+    setCandidateKind('image_pack')
     setAssetType('character')
     setSheetMode('production')
     setIntent('generic')
     setDepth('standard')
     setCustomSheetCount(3)
-    setPreset(resetConvenience.preset ?? 'identity')
-    setSections(resetConvenience.anatomy_option
-      ? selectCanonicalCharacterAnatomy(resetSections, undefined)
-      : resetSections)
+    setPreset('identity')
+    setSections(resetSections)
     setCustomSectionInputs({})
     setAuthoringStatus('')
     setDetailSettings({})
     setPlanningModel('auto')
     setReviewModel('auto_local')
     setReferenceExplicitOutput(explicitOutputRef.current)
+    setExplicitConvenience(false)
+    setCharacterGender('unspecified')
+    setCharacterAge('')
+    setCharacterExplicitAnatomy([])
     setContentCapability(explicitOutputRef.current ? 'unrestricted_local' : 'standard')
     setInitialBlur(explicitOutputRef.current || privateOutputRef.current)
     setIntelligencePolicy(explicitOutputRef.current ? 'uncensored_auto' : 'standard_auto')
@@ -1159,9 +1321,6 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     if (!projectExplicitlyLocked) return
     projectEpoch.current += 1
     requestSequence.current += 1
-    const resetConvenience = getProjectReferenceExplicitConvenienceState(
-      'character', explicitOutputRef.current,
-    )
     const resetSections = createSectionState('character', 'standard', 3)
     pendingSheetActionLocks.current.clear()
     authoredSettingsSnapshots.current.clear()
@@ -1177,21 +1336,24 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setEditorModelType('')
     setReferenceModelCustomized(false)
     setEditorModelCustomized(false)
+    setCandidateKind('image_pack')
     setAssetType('character')
     setSheetMode('production')
     setIntent('generic')
     setDepth('standard')
     setCustomSheetCount(3)
-    setPreset(resetConvenience.preset ?? 'identity')
-    setSections(resetConvenience.anatomy_option
-      ? selectCanonicalCharacterAnatomy(resetSections, undefined)
-      : resetSections)
+    setPreset('identity')
+    setSections(resetSections)
     setCustomSectionInputs({})
     setAuthoringStatus('')
     setDetailSettings({})
     setPlanningModel('auto')
     setReviewModel('auto_local')
     setReferenceExplicitOutput(explicitOutputRef.current)
+    setExplicitConvenience(false)
+    setCharacterGender('unspecified')
+    setCharacterAge('')
+    setCharacterExplicitAnatomy([])
     setContentCapability(explicitOutputRef.current ? 'unrestricted_local' : 'standard')
     setInitialBlur(explicitOutputRef.current || privateOutputRef.current)
     setIntelligencePolicy(explicitOutputRef.current ? 'uncensored_auto' : 'standard_auto')
@@ -1485,6 +1647,69 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   }, [machineControls, project, uncensoredReviewContract?.resolved_model])
 
   useEffect(() => {
+    if (!open) return
+    const syncVisibility = () => setReviewerPageVisible(document.visibilityState !== 'hidden')
+    syncVisibility()
+    document.addEventListener('visibilitychange', syncVisibility)
+    return () => document.removeEventListener('visibilitychange', syncVisibility)
+  }, [open])
+
+  useEffect(() => {
+    if (!reviewerNeedsAutomaticRefresh) return
+    const epoch = projectEpoch.current
+    const submittedProject = project
+    const sequence = ++reviewerAutoRefreshSequence.current
+    let cancelled = false
+    let attempt = 0
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
+
+    const isCurrent = () => (
+      !cancelled
+      && sequence === reviewerAutoRefreshSequence.current
+      && isProjectAssetOperationCurrent(
+        submittedProject, epoch, currentProject.current, projectEpoch.current,
+      )
+    )
+    const scheduleNext = () => {
+      if (!isCurrent() || attempt >= REVIEWER_AUTO_REFRESH_DELAYS_MS.length) return
+      const delay = REVIEWER_AUTO_REFRESH_DELAYS_MS[attempt]
+      attempt += 1
+      timeoutId = setTimeout(() => { void pollReviewerSetup() }, delay)
+    }
+    const pollReviewerSetup = async () => {
+      if (!isCurrent()) return
+      try {
+        const [llmCatalog, capabilities] = await Promise.all([
+          fetchLlmModels(submittedProject),
+          fetchProjectReferenceCapabilities(submittedProject),
+        ])
+        if (!isCurrent()) return
+        setLlmCatalogModels(llmCatalog.models)
+        setReferenceCapabilities(capabilities)
+        const next = capabilities.uncensored_auto_review
+        if (next.queue_ready
+          || next.setup_state === 'missing_model'
+          || next.setup_state === 'missing_projector'
+          || next.setup_state === 'ready_unloaded'
+          || next.setup_state === 'ready_resident') return
+        if (next.setup_state !== 'loading' && next.setup_state !== 'loaded_without_vision') return
+      } catch {
+        if (!isCurrent()) return
+        // Automatic refresh is best-effort; the visible manual Refresh action
+        // remains the explicit error-reporting fallback.
+      }
+      scheduleNext()
+    }
+
+    scheduleNext()
+    return () => {
+      cancelled = true
+      if (sequence === reviewerAutoRefreshSequence.current) reviewerAutoRefreshSequence.current += 1
+      if (timeoutId !== null) clearTimeout(timeoutId)
+    }
+  }, [project, reviewerNeedsAutomaticRefresh])
+
+  useEffect(() => {
     if (!open || browsingUploads || projectExplicitlyLocked || privateAuthoringTargetSignature === '[]') return
     const targets = JSON.parse(privateAuthoringTargetSignature) as Array<{
       assetId: string
@@ -1494,6 +1719,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       needsAuthoring: boolean
       needsStyle: boolean
       styleCommitment: string
+      characterReplayContract: Pick<NonNullable<ProjectAssetVariant['metadata']['reference_pack']>,
+        'explicit_convenience' | 'authored_settings'>
       needsLoraParameters: boolean
       parameterRecords: Array<{
         id: string
@@ -1523,8 +1750,17 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         continue
       }
       const authoredSnapshot = authoredSettingsSnapshots.current.get(target.authoredSeal)
+      const characterReplayReady = isProjectReferenceCharacterReplayReady(
+        target.characterReplayContract,
+        authoredSnapshot ? {
+          character_profile: authoredSnapshot.characterProfile,
+          explicit_convenience: authoredSnapshot.explicitConvenience,
+        } : undefined,
+      )
       const authoringReady = !target.needsAuthoring
-        || Boolean(authoredSnapshot && (!target.needsStyle || authoredSnapshot.style.trim().length > 0))
+        || Boolean(authoredSnapshot
+          && characterReplayReady
+          && (!target.needsStyle || authoredSnapshot.style.trim().length > 0))
       const loraParametersReady = !target.needsLoraParameters
         || loraParameterSnapshots.current.has(target.planSeal)
       if (authoringReady && loraParametersReady) {
@@ -1551,6 +1787,13 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
             && (typeof response.authored_settings.style !== 'string'
               || response.authored_settings.style.trim().length === 0)) {
             publish(key, 'unavailable')
+              return
+            }
+          if (!isProjectReferenceCharacterReplayReady(
+            target.characterReplayContract,
+            response.authored_settings,
+          )) {
+            publish(key, 'unavailable')
             return
           }
           authoredSettingsSnapshots.current.set(
@@ -1559,6 +1802,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
               response.authored_settings.type_fields,
               response.authored_settings.detail_callouts,
               response.authored_settings.style,
+              response.authored_settings.character_profile,
+              response.authored_settings.explicit_convenience,
             ),
           )
         }
@@ -1649,15 +1894,19 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   }, [jobs, pendingFreshJobIds, projectExplicitlyLocked])
 
   const changeAssetType = (nextType: ProjectReferenceAssetType) => {
-    const definition = REFERENCE_TYPE_DEFINITIONS[nextType]
-    const convenience = getProjectReferenceExplicitConvenienceState(
-      nextType, referenceExplicitOutput,
+    const transition = getProjectReferenceCreationTransition(
+      { candidateKind, assetType },
+      { kind: 'select_asset_type', assetType: nextType },
     )
-    const nextPreset = convenience.preset ?? definition.defaultPreset
+    setCandidateKind(transition.candidateKind)
+    if (!transition.assetTypeChanged) return
+    const definition = REFERENCE_TYPE_DEFINITIONS[nextType]
+    const usesCharacterConvenience = nextType === 'character' && explicitConvenience
+    const nextPreset = usesCharacterConvenience ? 'anatomy' : definition.defaultPreset
     const nextSections = createSectionState(nextType, depth, customSheetCount)
     setAssetType(nextType)
     setPreset(nextPreset)
-    setSections(convenience.anatomy_option
+    setSections(usesCharacterConvenience
       ? selectCanonicalCharacterAnatomy(
         nextSections,
         referenceCapabilities?.reference_types.find(capability => capability.id === nextType),
@@ -1666,14 +1915,17 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setCustomSectionInputs({})
     setAuthoringStatus('')
     setDetailSettings({})
-    if (convenience.content_capability) setContentCapability(convenience.content_capability)
-    if (convenience.initial_blur) setInitialBlur(convenience.initial_blur)
-    if (convenience.intelligence_policy) {
-      setIntelligencePolicy(convenience.intelligence_policy)
-      setIntelligenceCustomized(false)
-    } else if (!intelligenceCustomized) {
+    if (!intelligenceCustomized) {
       setIntelligencePolicy('standard_auto')
     }
+  }
+
+  const changeCreationMethod = (nextMethod: ProjectReferenceCreationMethod) => {
+    const transition = getProjectReferenceCreationTransition(
+      { candidateKind, assetType },
+      { kind: 'select_method', candidateKind: nextMethod },
+    )
+    setCandidateKind(transition.candidateKind)
   }
 
   const changeIntent = (nextIntent: ProjectReferenceIntent) => {
@@ -1690,9 +1942,6 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const changeDepth = (nextDepth: ProjectReferenceDepth) => {
     setDepth(nextDepth)
     const definitions = sectionDefinitions
-    const convenience = getProjectReferenceExplicitConvenienceState(
-      assetType, referenceExplicitOutput,
-    )
     setSections(current => {
       const next = current.map(section => {
         if (section.pinned) return section
@@ -1701,7 +1950,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
           ? { ...section, values: defaultSectionValues(definition, nextDepth, customSheetCount) }
           : section
       })
-      return convenience.anatomy_option
+      return assetType === 'character' && explicitConvenience
         ? selectCanonicalCharacterAnatomy(next, authoritativeTypeCapabilities)
         : next
     })
@@ -1712,9 +1961,6 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setCustomSheetCount(bounded)
     if (depth !== 'custom') return
     const definitions = sectionDefinitions
-    const convenience = getProjectReferenceExplicitConvenienceState(
-      assetType, referenceExplicitOutput,
-    )
     setSections(current => {
       const next = current.map(section => {
         if (section.pinned) return section
@@ -1723,19 +1969,16 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
           ? { ...section, values: defaultSectionValues(definition, 'custom', bounded) }
           : section
       })
-      return convenience.anatomy_option
+      return assetType === 'character' && explicitConvenience
         ? selectCanonicalCharacterAnatomy(next, authoritativeTypeCapabilities)
         : next
     })
   }
 
   const changePreset = (nextPreset: ProjectReferencePreset) => {
-    const presetConvenience = getProjectReferenceExplicitConvenienceState(
-      assetType, referenceExplicitOutput, nextPreset,
-    )
-    const exitsCharacterConvenience = referenceExplicitOutput
-      && !presetConvenience.explicit_output
-    if (exitsCharacterConvenience) setReferenceExplicitOutput(false)
+    const exitsCharacterConvenience = assetType === 'character'
+      && explicitConvenience && nextPreset !== 'anatomy'
+    if (exitsCharacterConvenience) setExplicitConvenience(false)
     setPreset(nextPreset)
     if (nextPreset === 'anatomy') setContentCapability('unrestricted_local')
     setSections(current => current.map(section => {
@@ -1746,7 +1989,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       const definition = sectionDefinitions.find(item => item.id === section.id)
       if (!definition) return section
       if (section.id === 'anatomy') {
-        const anatomyLabel = assetType === 'character' && referenceExplicitOutput
+        const anatomyLabel = assetType === 'character' && explicitConvenience
           ? 'nude anatomy'
           : 'anatomy'
         const anatomy = sectionOptionItem(authoritativeTypeCapabilities, definition, anatomyLabel)
@@ -1772,19 +2015,13 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   }
 
   const applyExplicitConvenience = (enabled: boolean) => {
-    const convenience = getProjectReferenceExplicitConvenienceState(assetType, enabled)
-    setReferenceExplicitOutput(convenience.explicit_output)
-    if (!convenience.explicit_output) return
-    if (convenience.preset) setPreset(convenience.preset)
-    if (convenience.anatomy_option) {
-      setSections(current => selectCanonicalCharacterAnatomy(
-        current, authoritativeTypeCapabilities,
-      ))
-    }
-    if (convenience.content_capability) setContentCapability(convenience.content_capability)
-    if (convenience.initial_blur) setInitialBlur(convenience.initial_blur)
-    if (convenience.intelligence_policy) setIntelligencePolicy(convenience.intelligence_policy)
-    setIntelligenceCustomized(false)
+    setExplicitConvenience(enabled)
+    if (!enabled) return
+    setReferenceExplicitOutput(true)
+    setPreset('anatomy')
+    setSections(current => selectCanonicalCharacterAnatomy(
+      current, authoritativeTypeCapabilities,
+    ))
   }
 
   const addAdditionalLora = () => {
@@ -1964,6 +2201,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
 
   const generate = async () => {
     if (queueBlockers.length > 0) return
+    const requestId = createProjectReferenceRequestId()
     const epoch = projectEpoch.current
     const submittedProject = project
     setSubmitting(true)
@@ -1973,6 +2211,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       : visualStyle
     try {
       const response = await generateProjectAssetReferences(project, {
+        request_id: requestId,
         schema_version: 2,
         name: name.trim(),
         asset_type: assetType,
@@ -2008,15 +2247,38 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         editor_model_type: sheetMode !== 'draft' ? editorModelType : undefined,
         private_output: anchorBasis === 'anatomy' ? anatomyPrivate : privateOutput,
         explicit_output: referenceExplicitOutput,
+        character_profile: assetType === 'character'
+          ? characterProfileSerialization.profile
+          : undefined,
+        explicit_convenience: assetType === 'character'
+          ? explicitConvenience
+          : undefined,
       })
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
+      requestQueueView()
+      setName('')
+      setDescription('')
+      setPendingFreshJobIds(current => [...new Set([...current, response.job_id])])
+      const queuedSheets = response.plan?.sheet_count ?? sheetCount
+      setQueuedMessage(`Reference submission accepted (${response.job_id}); confirming it with the Queue.`)
+      requestRefresh()
       const authoredSeal = response.plan?.authored_settings?.seal
+      const acceptedSnapshot = cloneReferenceAuthoredSnapshot(
+        typeFields,
+        detailCallouts,
+        authoredStyle,
+        characterProfileSerialization.profile,
+        explicitConvenience,
+      )
       if (authoredSeal && isProjectReferenceStyleReplayReady(
         response.plan?.authored_settings, authoredStyle,
-      )) {
+      ) && isProjectReferenceCharacterReplayReady(response.plan, {
+        character_profile: acceptedSnapshot.characterProfile,
+        explicit_convenience: acceptedSnapshot.explicitConvenience,
+      })) {
         authoredSettingsSnapshots.current.set(
           authoredSeal,
-          cloneReferenceAuthoredSnapshot(typeFields, detailCallouts, authoredStyle),
+          acceptedSnapshot,
         )
       }
       if (response.plan?.plan_seal) {
@@ -2025,23 +2287,20 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
           cloneAdditionalLoras(additionalLoras),
         )
       }
-      await confirmReconnectedJob(
+      const jobConfirmed = await confirmAcceptedProjectReferenceJob(
         response.job_id,
-        reconnectJobs,
-        () => useStore.getState().jobs,
+        jobId => confirmReconnectedJob(
+          jobId,
+          reconnectJobs,
+          () => useStore.getState().jobs,
+        ),
       )
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
-      setName('')
-      setDescription('')
-      setVisualStyle('')
-      setCustomVisualStyle('')
-      setPendingFreshJobIds(current => [...new Set([...current, response.job_id])])
-      const queuedSheets = response.plan?.sheet_count ?? sheetCount
-      setQueuedMessage(`Queued ${candidateCount} ${candidateCount === 1 ? 'candidate pack' : 'candidate packs'} with ${queuedSheets} ${queuedSheets === 1 ? 'sheet' : 'sheets'} each (${response.job_id}). They will appear here when complete.`)
-      requestRefresh()
-      // Navigation is a durable-success effect: every blocker, request error,
-      // or reconnect failure keeps the author in Reference with their state.
-      setSidebarMode(referenceReturnMode)
+      setQueuedMessage(jobConfirmed
+        ? `Queued ${candidateCount} ${candidateCount === 1 ? 'candidate pack' : 'candidate packs'} with ${queuedSheets} ${queuedSheets === 1 ? 'sheet' : 'sheets'} each (${response.job_id}). They will appear here when complete.`
+        : `Reference submission accepted (${response.job_id}); Queue confirmation is still catching up. The accepted pack will appear here when the Queue reconnects.`)
+      // Queue navigation and accepted-state updates happen before confirmation;
+      // the Reference peer remains mounted with the retained next-run defaults.
     } catch (reason) {
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setActionError(projectReferenceSafeErrorMessage(reason, 'Could not queue reference generation.'))
@@ -2059,7 +2318,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     const requiresPrivateAuthoring = projectReferenceRetryNeedsPrivateAuthoring(variant)
     if (requiresPrivateAuthoring && (!sourceAuthoredSeal
       || !authoredSettingsSnapshots.current.has(sourceAuthoredSeal))) {
-      setActionError('Exact private authoring is unavailable for this candidate. Retry and Edit stay disabled so style, custom fields, and details are never silently dropped; create a new authored pack instead.')
+      setActionError('Exact private authoring is unavailable for this candidate. Retry and Edit stay disabled so style, profile, custom fields, and details are never silently dropped; create a new authored pack instead.')
       return
     }
     const sourceAssetType = normalizeProjectReferenceAssetType(asset.asset_type) ?? assetType
@@ -2079,6 +2338,16 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       sourcePackMetadata?.authored_settings, sourceAuthoredSnapshot?.style,
     )) {
       setActionError('Exact private style is unavailable or its commitment changed. Retry and Edit remain disabled; create a new authored pack instead.')
+      return
+    }
+    if (!isProjectReferenceCharacterReplayReady(
+      sourcePackMetadata,
+      sourceAuthoredSnapshot ? {
+        character_profile: sourceAuthoredSnapshot.characterProfile,
+        explicit_convenience: sourceAuthoredSnapshot.explicitConvenience,
+      } : undefined,
+    )) {
+      setActionError('Exact private Character profile or convenience setting is unavailable or changed. Retry and Edit remain disabled; create a new authored pack instead.')
       return
     }
     const sourcePlanSeal = sourcePackMetadata?.plan_seal
@@ -2118,6 +2387,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         ?? (sourceAssetType === assetType ? typeFields : {}),
       authored_settings_seal: sourceAuthoredSnapshot ? sourceAuthoredSeal : undefined,
       style: sourceAuthoredSnapshot?.style,
+      character_profile: sourceAuthoredSnapshot?.characterProfile,
+      explicit_convenience: sourceAuthoredSnapshot?.explicitConvenience
+        ?? sourcePackMetadata?.explicit_convenience,
       managed_layout_assist: 'off',
       planning_model: planningModel,
       planning_provider: planningModel === 'auto' || planningModel === 'deterministic'
@@ -2210,6 +2482,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       pendingSheetActionLocks.current, project, asset.id, variant.id,
     )
     if (!key) return
+    const requestId = createProjectReferenceRequestId()
     const epoch = projectEpoch.current
     const submittedProject = project
     setPendingSheetActions(current => ({
@@ -2219,6 +2492,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setQueuedMessage('')
     try {
       const response = await generateProjectAssetReferences(project, {
+        request_id: requestId,
         asset_id: asset.id,
         parent_variant_id: variant.id,
         edit_instruction: instruction?.trim() || undefined,
@@ -2255,19 +2529,39 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
           : undefined,
         private_output: sourceSettings.private_output,
         explicit_output: sourceSettings.explicit_output,
+        character_profile: sourceSettings.character_profile,
+        explicit_convenience: sourceSettings.explicit_convenience,
       })
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
+      requestQueueView()
+      setPendingSheetActions(current => ({
+        ...current,
+        [key]: { project, assetId: asset.id, variantId: variant.id, jobId: response.job_id },
+      }))
+      setQueuedMessage(`${instruction?.trim() ? 'Edit' : 'Retry'} accepted (${response.job_id}); confirming it with the Queue.`)
+      setEditVariantId(null)
+      setEditInstruction('')
+      requestRefresh()
       const authoredSeal = response.plan?.authored_settings?.seal
+      const replaySnapshot = cloneReferenceAuthoredSnapshot(
+        sourceSettings.type_fields,
+        sourceSettings.detail_callouts,
+        sourceSettings.style,
+        sourceSettings.character_profile,
+        sourceSettings.explicit_convenience,
+      )
       if (authoredSeal && isProjectReferenceStyleReplayReady(
         response.plan?.authored_settings, sourceSettings.style,
+      ) && isProjectReferenceCharacterReplayReady(
+        response.plan,
+        {
+          character_profile: replaySnapshot.characterProfile,
+          explicit_convenience: replaySnapshot.explicitConvenience,
+        },
       )) {
         authoredSettingsSnapshots.current.set(
           authoredSeal,
-          cloneReferenceAuthoredSnapshot(
-              sourceSettings.type_fields,
-              sourceSettings.detail_callouts,
-              sourceSettings.style,
-          ),
+          replaySnapshot,
         )
       }
       if (response.plan?.plan_seal) {
@@ -2276,20 +2570,20 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
           cloneAdditionalLoras(sourceSettings.additional_loras ?? []),
         )
       }
-      await confirmReconnectedJob(
+      const jobConfirmed = await confirmAcceptedProjectReferenceJob(
         response.job_id,
-        reconnectJobs,
-        () => useStore.getState().jobs,
+        jobId => confirmReconnectedJob(
+          jobId,
+          reconnectJobs,
+          () => useStore.getState().jobs,
+        ),
       )
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
-      setPendingSheetActions(current => ({
-        ...current,
-        [key]: { project, assetId: asset.id, variantId: variant.id, jobId: response.job_id },
-      }))
-      setQueuedMessage(`${instruction?.trim() ? 'Edit' : 'Retry'} queued (${response.job_id}). Available source mode, model, privacy, and repair policy were preserved; ${retryReview.use_current_reviewer ? 'the current compatible reviewer replaced an unavailable recorded reviewer' : 'current layout and review intent were used'}. The original and any kept source stay unchanged.`)
-      setEditVariantId(null)
-      setEditInstruction('')
-      requestRefresh()
+      setQueuedMessage(jobConfirmed
+        ? `${instruction?.trim() ? 'Edit' : 'Retry'} queued (${response.job_id}). Available source mode, model, privacy, and repair policy were preserved; ${retryReview.use_current_reviewer ? 'the current compatible reviewer replaced an unavailable recorded reviewer' : 'current layout and review intent were used'}. The original and any kept source stay unchanged.`
+        : `${instruction?.trim() ? 'Edit' : 'Retry'} accepted (${response.job_id}); Queue confirmation is still catching up. The original and any kept source stay unchanged.`)
+      // Queue navigation and accepted-state updates happen before confirmation;
+      // the Reference peer remains mounted with its existing asset identity.
     } catch (reason) {
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       pendingSheetActionLocks.current.delete(key)
@@ -2505,22 +2799,51 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <legend className="px-1 text-[10px] font-medium text-text-primary">Creation method</legend>
                   <p className="text-[8px] leading-relaxed text-text-muted">Creation method is separate from the durable Character, Location, Wardrobe, and other semantic types above.</p>
                   <div className="mt-1.5 grid grid-cols-2 gap-1.5">
-                    <div aria-label="Image Reference Pack creation method" className="rounded border border-accent-blue bg-accent-blue/10 p-2">
+                    <button
+                      type="button"
+                      aria-pressed={candidateKind === 'image_pack'}
+                      aria-controls="project-reference-image-pack-method"
+                      onClick={() => changeCreationMethod('image_pack')}
+                      className={`rounded border p-2 text-left ${candidateKind === 'image_pack' ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-secondary'}`}
+                    >
                       <span className="block text-[10px] font-medium text-accent-blue">Image Reference Pack</span>
                       <span className="mt-0.5 block text-[8px] text-text-muted">Author the selected semantic type using the controls below.</span>
-                    </div>
-                    <details className="rounded border border-border bg-bg-secondary p-2 open:col-span-2">
-                    <summary className="cursor-pointer list-none text-[10px] font-medium text-accent-blue">Blender Motion Video</summary>
-                    <p className="mt-0.5 text-[8px] text-text-muted">Create, preview, Keep, and apply a structured motion/camera reference to Generate. This method does not become an asset type and does not remove Blender from Tools.</p>
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={candidateKind === 'blender_motion'}
+                      aria-controls="project-reference-blender-motion-method"
+                      onClick={() => changeCreationMethod('blender_motion')}
+                      className={`rounded border p-2 text-left ${candidateKind === 'blender_motion' ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-secondary'}`}
+                    >
+                      <span className="block text-[10px] font-medium text-accent-blue">Blender Motion Video</span>
+                      <span className="mt-0.5 block text-[8px] text-text-muted">Create a structured motion and camera reference.</span>
+                    </button>
+                  </div>
+                </fieldset>
+                <section
+                  id="project-reference-blender-motion-method"
+                  aria-label="Blender Motion Video creation panel"
+                  aria-hidden={creationPanelStates.blender_motion.hidden}
+                  hidden={creationPanelStates.blender_motion.hidden}
+                  inert={creationPanelStates.blender_motion.inert}
+                  className="mt-3 rounded-md border border-accent-blue/30 bg-accent-blue/5 p-2"
+                >
+                    <p className="text-[8px] text-text-muted">Create, preview, Keep, and apply a structured motion/camera reference to Generate. This method does not become an asset type and does not remove Blender from Tools.</p>
                     <BlenderSceneTool
                       compact
                       referenceName={name}
                       referenceDescription={description}
                       privateOutput={referenceExplicitOutput || privateOutput}
                     />
-                  </details>
-                  </div>
-                </fieldset>
+                </section>
+                <div
+                  id="project-reference-image-pack-method"
+                  aria-label="Image Reference Pack creation panel"
+                  aria-hidden={creationPanelStates.image_pack.hidden}
+                  hidden={creationPanelStates.image_pack.hidden}
+                  inert={creationPanelStates.image_pack.inert}
+                >
                 <fieldset className="mt-3">
                   <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Intent</legend>
                   <div className="grid grid-cols-3 gap-1">
@@ -2572,13 +2895,81 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     ))}
                   </div>
                 </fieldset>
+                {assetType === 'character' && (
+                  <fieldset className="mt-3 rounded-md border border-border bg-bg-tertiary/40 p-2">
+                    <legend className="px-1 text-[10px] font-medium text-text-secondary">Character profile · optional</legend>
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <label htmlFor="project-reference-character-gender" className="text-[9px] text-text-muted">Gender
+                        <select
+                          id="project-reference-character-gender"
+                          value={characterGender}
+                          onChange={event => setCharacterGender(event.target.value as ProjectReferenceCharacterGender)}
+                          className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary"
+                        >
+                          <option value="unspecified">Unspecified</option>
+                          <option value="woman">Woman</option>
+                          <option value="man">Man</option>
+                          <option value="non_binary">Non-binary</option>
+                        </select>
+                      </label>
+                      <label htmlFor="project-reference-character-age" className="text-[9px] text-text-muted">Age
+                        <input
+                          id="project-reference-character-age"
+                          aria-describedby="project-reference-character-profile-help"
+                          type="number"
+                          inputMode="numeric"
+                          min={0}
+                          max={999}
+                          step={1}
+                          value={characterAge}
+                          placeholder="Optional"
+                          onChange={event => setCharacterAge(event.target.value)}
+                          className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary"
+                        />
+                      </label>
+                    </div>
+                    <p id="project-reference-character-profile-help" className="mt-1.5 text-[8px] leading-relaxed text-text-muted">These structured facts guide Character planning and review. Age is separate from gender and from any age written in the description; if both specify an age, keep them consistent. Maestro does not scan or infer age from text, appearance, or gender.</p>
+                    <fieldset className="mt-2 rounded border border-border/70 p-1.5">
+                      <legend className="px-1 text-[9px] text-text-secondary">Authored anatomy</legend>
+                      <div className="grid grid-cols-1 gap-1 sm:grid-cols-3">
+                        {([
+                          ['breasts', 'Breasts · front + profile'],
+                          ['vulva', 'Vulva'],
+                          ['penis', 'Penis'],
+                        ] as Array<[ProjectReferenceCharacterAnatomy, string]>).map(([value, label]) => (
+                          <label key={value} className="flex items-start gap-1.5 rounded border border-border/60 px-1.5 py-1 text-[8px] text-text-secondary">
+                            <input
+                              type="checkbox"
+                              checked={characterExplicitAnatomy.includes(value)}
+                              onChange={event => setCharacterExplicitAnatomy(current => event.target.checked
+                                ? [...current.filter(item => item !== value), value]
+                                : current.filter(item => item !== value))}
+                            />
+                            {label}
+                          </label>
+                        ))}
+                      </div>
+                    </fieldset>
+                    <label className="mt-2 flex items-start gap-2 text-[9px] text-text-secondary">
+                      <input type="checkbox" checked={explicitConvenience} onChange={event => applyExplicitConvenience(event.target.checked)} />
+                      <span><span className="font-medium">Explicit convenience</span><span className="mt-0.5 block text-[8px] text-text-muted">Uses the Anatomy / Nude anchor and asks the server to create managed detail callouts for the anatomy selected above. It turns on Explicit output authorization; turning convenience off does not change that separate choice. Breasts creates separate front and profile callouts; vulva and penis remain independent choices. Draft keeps the profile but does not create callout sheets.</span></span>
+                    </label>
+                    <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Explicit convenience is for adult characters. An authored age below 18 blocks queueing; leaving age blank does not assert adulthood. Gender never selects anatomy or establishes age.</p>
+                    {explicitConvenience && <p role="status" className="mt-1 text-[8px] text-text-muted">{managedCharacterCalloutCount} managed {managedCharacterCalloutCount === 1 ? 'callout' : 'callouts'} will be requested for this {sheetMode === 'draft' ? 'profile; Draft creates no callout sheets' : 'pack'}.</p>}
+                  </fieldset>
+                )}
                 <fieldset className="mt-3 rounded-md border border-border bg-bg-tertiary/40 p-2">
                   <legend className="px-1 text-[10px] font-medium text-text-secondary">Output handling</legend>
                   <label className="flex items-center gap-2 text-[9px] text-text-secondary">
-                    <input type="checkbox" checked={referenceExplicitOutput} onChange={event => applyExplicitConvenience(event.target.checked)} />
-                    Explicit convenience
+                    <input type="checkbox" checked={referenceExplicitOutput} onChange={event => {
+                      const enabled = event.target.checked
+                      setReferenceExplicitOutput(enabled)
+                      if (!enabled) setExplicitConvenience(false)
+                    }} />
+                    Explicit output
                   </label>
-                  <p className="mt-1 text-[8px] text-text-muted">For Characters, this atomically selects Anatomy / Nude with the nude anatomy anchor, unrestricted local content, initial blur, and mandatory local fidelity review. Other reference types keep their native preset and anchor. Individual settings remain editable; choosing another Character preset turns this convenience off.</p>
+                  <p className="mt-1 text-[8px] text-text-muted">This is separate from Character profile facts. Managed anatomy-callout convenience requires this authorization, so turning Explicit output off also turns that convenience off. Content capability, initial blur, and intelligence remain explicit choices below.</p>
+                  <p className="mt-1 text-[8px] text-text-muted">The visual fidelity reviewer checks identity, anatomy, layout, style adherence, and retry quality. It does not classify or censor content or decide whether a request is allowed.</p>
                   <div className="mt-2 grid grid-cols-1 gap-1.5">
                     <label htmlFor="project-reference-content-capability" className="text-[9px] text-text-muted">Content capability
                       <select id="project-reference-content-capability" value={contentCapability} onChange={event => setContentCapability(event.target.value as 'standard' | 'unrestricted_local')} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary">
@@ -2991,12 +3382,11 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 )}
                 {capabilitiesLoadError && <p role="status" className="mt-2 text-[10px] text-red-300">{capabilitiesLoadError}</p>}
                 {hasInvalidAuthoredSettings && <p role="status" className="mt-2 text-[9px] text-red-300">Authored values must be unique, bounded, and free of leading or trailing spaces; every detail output also needs an available source sheet.</p>}
-                {!explicitCharacterStateValid && <p role="status" className="mt-2 text-[9px] text-red-300">Character Explicit convenience requires the Anatomy / Nude preset and nude anatomy selection. Choose Anatomy / Nude again or turn off Explicit convenience.</p>}
-                {queueBlockers.length > 0 && (
+                {visibleQueueBlockers.length > 0 && (
                   <section id="project-reference-queue-blockers" aria-label="Queue blocked by" className="mt-3 rounded border border-red-400/30 bg-red-400/5 px-2 py-1.5">
                     <h4 className="text-[9px] font-medium text-red-200">Queue blocked by</h4>
                     <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[8px] text-red-200/90">
-                      {queueBlockers.map(blocker => <li key={blocker.id}>{blocker.message}</li>)}
+                      {visibleQueueBlockers.map(blocker => <li key={blocker.id}>{blocker.message}</li>)}
                     </ul>
                   </section>
                 )}
@@ -3004,8 +3394,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   onClick={() => void generate()}
                   disabled={queueBlockers.length > 0}
                   aria-disabled={queueBlockers.length > 0}
-                  aria-describedby={queueBlockers.length > 0 ? 'project-reference-queue-blockers' : undefined}
-                  title={queueBlockers.length > 0 ? `Queue blocked: ${queueBlockers.map(blocker => blocker.message).join(' ')}` : 'Queue reference packs'}
+                  aria-describedby={visibleQueueBlockers.length > 0 ? 'project-reference-queue-blockers' : undefined}
+                  title={visibleQueueBlockers.length > 0 ? `Queue blocked: ${visibleQueueBlockers.map(blocker => blocker.message).join(' ')}` : 'Queue reference packs'}
                   className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent-blue px-3 py-2 text-xs font-medium text-white disabled:opacity-40"
                 >
                   {submitting ? <Loader2 size={13} className="animate-spin" /> : <ImagePlus size={13} />} Queue reference packs
@@ -3016,6 +3406,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   const job = jobs.find(candidate => candidate.id === jobId)
                   return <p key={jobId} role="status" className="mt-1 text-[9px] text-text-muted">Pack {jobId}: {job?.phase || 'Queued'}</p>
                 })}
+                </div>
               </div>
 
               <div className="overflow-visible p-4">
@@ -3061,6 +3452,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                               ? applyOutputs.slice(1)
                               : componentOutputs
                             const packMetadata = variant.metadata.reference_pack
+                            const qualityPresentation = projectReferenceQualityPresentation(packMetadata)
                             const anchorPrivacy = normalizeProjectReferenceAnchorPrivacy(
                               packMetadata?.anchor_privacy,
                               packMetadata?.schema_version,
@@ -3077,7 +3469,14 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             const exactStyleReady = isProjectReferenceStyleReplayReady(
                               packMetadata?.authored_settings, privateAuthoredSnapshot?.style,
                             )
-                            const exactAuthoringReady = exactStyleReady && (
+                            const exactCharacterReplayReady = isProjectReferenceCharacterReplayReady(
+                              packMetadata,
+                              privateAuthoredSnapshot ? {
+                                character_profile: privateAuthoredSnapshot.characterProfile,
+                                explicit_convenience: privateAuthoredSnapshot.explicitConvenience,
+                              } : undefined,
+                            )
+                            const exactAuthoringReady = exactStyleReady && exactCharacterReplayReady && (
                               !requiresPrivateAuthoring || (
                                 authoringAvailability[pendingKey] === 'ready'
                                 && Boolean(authoredSeal && privateAuthoredSnapshot)
@@ -3085,8 +3484,10 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             )
                             const exactAuthoringCopy = !exactStyleReady
                               ? 'The recorded style contract is incomplete or changed. Retry and Edit remain disabled; create a new authored pack instead.'
+                              : !exactCharacterReplayReady
+                                ? 'The recorded Character profile or convenience contract is incomplete or changed. Retry and Edit remain disabled; create a new authored pack instead.'
                               : authoringAvailability[pendingKey] === 'unavailable'
-                                ? 'Exact private authoring is unavailable. Retry the owner-private replay; Retry and Edit remain disabled so style, custom fields, and details are never silently dropped.'
+                                ? 'Exact private authoring is unavailable. Retry the owner-private replay; Retry and Edit remain disabled so style, profile, custom fields, and details are never silently dropped.'
                                 : 'Loading the exact private authoring needed for safe Retry and Edit…'
                             const summarizedLoras = [
                               ...(packMetadata?.additional_loras?.applied ?? []),
@@ -3146,11 +3547,32 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                   />
                                 )}
                                 <div className="p-2">
-                                  <div className="flex items-center justify-between gap-1 text-[9px]"><span className="truncate text-text-secondary">{variant.label}</span><span className="shrink-0 text-text-muted">{variant.status}</span></div>
+                                  <div className="flex items-center justify-between gap-1 text-[9px]">
+                                    <span className="truncate text-text-secondary">{variant.label}</span>
+                                    <span className="flex shrink-0 items-center gap-1">
+                                      {qualityPresentation?.recommended && (
+                                        <span className="rounded-full border border-accent-blue/40 bg-accent-blue/10 px-1.5 py-0.5 text-[8px] font-medium text-accent-blue" title={qualityPresentation.preliminary ? 'Preliminary recommendation; fidelity review is still deferred.' : 'Recommended from the available candidate assessments.'}>Recommended</span>
+                                      )}
+                                      <span className="text-text-muted">{variant.status}</span>
+                                    </span>
+                                  </div>
                                   {sheetStatus && (
                                     <div className="mt-1 text-[9px] leading-relaxed">
                                       <p className={sheetStatus.className}>{sheetStatus.label}</p>
                                       {sheetStatus.repair && <p className="text-text-muted">{sheetStatus.repair}</p>}
+                                    </div>
+                                  )}
+                                  {qualityPresentation && (
+                                    <div className={`mt-1 rounded border px-1.5 py-1 text-[8px] leading-relaxed ${qualityPresentation.tone === 'pass' ? 'border-accent-green/30 bg-accent-green/10 text-accent-green' : qualityPresentation.tone === 'residual' ? 'border-amber-400/30 bg-amber-400/10 text-amber-200' : 'border-border bg-bg-secondary/60 text-text-muted'}`} data-reference-fidelity={qualityPresentation.tone}>
+                                      <p className="font-medium">
+                                        {qualityPresentation.stateLabel}
+                                        {qualityPresentation.gradeLabel ? ` · ${qualityPresentation.gradeLabel}` : ''}
+                                        {qualityPresentation.scoreLabel ? ` · ${qualityPresentation.scoreLabel}` : ''}
+                                      </p>
+                                      {qualityPresentation.preliminary && <p>Preliminary recommendation · ungraded</p>}
+                                      {qualityPresentation.residualSummary && <p>{qualityPresentation.residualSummary}</p>}
+                                      {qualityPresentation.correctionAvailable && <p>Structured correction guidance is available for Retry or Edit.</p>}
+                                      {qualityPresentation.notice && <p>{qualityPresentation.notice}</p>}
                                     </div>
                                   )}
                                   {packMetadata && (

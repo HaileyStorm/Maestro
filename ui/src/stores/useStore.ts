@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { StoreApi } from 'zustand'
-import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping } from '../types'
+import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportPublicProjection, SupportSelfProjection } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
@@ -604,6 +604,9 @@ function _jobStatusDetails(
     ...(status.parent_job_id !== undefined
       ? { parentJobId: status.parent_job_id }
       : {}),
+    ...(status.logical_job_kind !== undefined
+      ? { logicalJobKind: status.logical_job_kind }
+      : {}),
     ...(status.failed_child_job_id !== undefined
       ? { failedChildJobId: status.failed_child_job_id }
       : {}),
@@ -765,6 +768,9 @@ function _queueJobDetails(
       : {}),
     ...(status.parent_job_id !== undefined
       ? { parentJobId: status.parent_job_id }
+      : {}),
+    ...(status.logical_job_kind !== undefined
+      ? { logicalJobKind: status.logical_job_kind }
       : {}),
     planReviewRequired: status.status === 'waiting_for_plan_approval',
     planReviewTermsRequired: status.plan_review_terms_required === true,
@@ -2266,6 +2272,59 @@ interface AppState {
   // System config
   accessContext: api.AccessContext | null
   loadAccessContext: () => Promise<api.AccessContext>
+  accountContext: AccountContext | null
+  accountContextLoading: boolean
+  accountDrawerOpen: boolean
+  accountSessions: AccountSession[]
+  accountUsers: AccountSummary[]
+  accountDetailsLoading: boolean
+  supportCatalog: SupportPublicProjection | null
+  supportCatalogLoading: boolean
+  supportCatalogUnavailable: boolean
+  supportSelf: SupportSelfProjection | null
+  responsibleUse: ResponsibleUseProjection | null
+  supportAdminAccountId: string | null
+  supportAdmin: SupportAdminProjection | null
+  supportDetailsLoading: boolean
+  setAccountDrawerOpen: (open: boolean) => void
+  loadAccountContext: () => Promise<AccountContext | null>
+  bootstrapAccount: (input: {
+    username: string
+    password: string
+    email?: string
+    deviceLabel?: string
+  }) => Promise<AccountAuthResult>
+  loginAccount: (input: {
+    username: string
+    password: string
+    deviceLabel?: string
+  }) => Promise<AccountAuthResult>
+  logoutAccount: () => Promise<void>
+  reauthenticateAccount: (password: string) => Promise<void>
+  recoverAccount: (input: {
+    username: string
+    recoveryCode: string
+    newPassword: string
+    deviceLabel?: string
+  }) => Promise<AccountAuthResult>
+  changeAccountPassword: (newPassword: string) => Promise<void>
+  rotateAccountRecoveryCodes: () => Promise<string[]>
+  loadAccountSessions: () => Promise<void>
+  revokeAccountSession: (sessionHandle: string) => Promise<boolean>
+  revokeAllAccountSessions: (retainCurrent: boolean) => Promise<number>
+  loadAccountUsers: () => Promise<void>
+  createServerAccount: (input: {
+    username: string
+    password: string
+    email?: string
+  }) => Promise<AccountAuthResult>
+  setServerAccountDisabled: (accountId: string, disabled: boolean) => Promise<void>
+  loadSupportCatalog: () => Promise<SupportPublicProjection | null>
+  loadSupportSelf: () => Promise<SupportSelfProjection | null>
+  loadResponsibleUse: () => Promise<ResponsibleUseProjection | null>
+  acceptResponsibleUse: (documentVersion: number, contentSha256: string) => Promise<void>
+  loadSupportAdmin: (accountId: string) => Promise<SupportAdminProjection>
+  clearSupportAdmin: () => void
   systemConfig: SystemConfig | null
   systemConfigLoading: boolean
   loadSystemConfig: () => Promise<void>
@@ -2947,6 +3006,12 @@ async function _captureDirectorImageRoleRequest(
     effective_editor_model: effectiveEditor,
   }
 }
+
+let _supportAdminRequestSequence = 0
+let _supportCatalogRequestSequence = 0
+let _supportSelfRequestSequence = 0
+let _responsibleUseRequestSequence = 0
+let _responsibleUseAcceptanceSequence = 0
 
 export const useStore = create<AppState>((set, get) => ({
   // Generation mode
@@ -7671,8 +7736,435 @@ export const useStore = create<AppState>((set, get) => ({
   accessContext: null,
   loadAccessContext: async () => {
     const context = await api.fetchAccessContext()
-    set({ accessContext: context })
+    const previous = get().accountContext
+    const next = context.accounts ?? null
+    const supportIdentityChanged = previous?.account?.id !== next?.account?.id
+      || previous?.capabilities.includes('account.self') !== next?.capabilities.includes('account.self')
+    if (supportIdentityChanged) {
+      _supportSelfRequestSequence += 1
+      _responsibleUseRequestSequence += 1
+      _responsibleUseAcceptanceSequence += 1
+      _supportAdminRequestSequence += 1
+    }
+    set({
+      accessContext: context,
+      accountContext: next,
+      ...(supportIdentityChanged ? {
+        supportSelf: null,
+        responsibleUse: null,
+        supportAdminAccountId: null,
+        supportAdmin: null,
+        supportDetailsLoading: false,
+      } : {}),
+    })
     return context
+  },
+  accountContext: null,
+  accountContextLoading: false,
+  accountDrawerOpen: false,
+  accountSessions: [],
+  accountUsers: [],
+  accountDetailsLoading: false,
+  supportCatalog: null,
+  supportCatalogLoading: false,
+  supportCatalogUnavailable: false,
+  supportSelf: null,
+  responsibleUse: null,
+  supportAdminAccountId: null,
+  supportAdmin: null,
+  supportDetailsLoading: false,
+  setAccountDrawerOpen: (open) => {
+    if (!open) _supportAdminRequestSequence += 1
+    set(open
+      ? { accountDrawerOpen: true }
+      : {
+          accountDrawerOpen: false,
+          supportAdminAccountId: null,
+          supportAdmin: null,
+          supportDetailsLoading: false,
+        })
+  },
+  loadAccountContext: async () => {
+    if (get().accessContext?.accounts?.enabled !== true) {
+      _supportSelfRequestSequence += 1
+      _responsibleUseRequestSequence += 1
+      _responsibleUseAcceptanceSequence += 1
+      _supportAdminRequestSequence += 1
+      set({
+        accountContext: get().accessContext?.accounts ?? null,
+        accountContextLoading: false,
+        accountSessions: [],
+        accountUsers: [],
+        supportSelf: null,
+        responsibleUse: null,
+        supportAdminAccountId: null,
+        supportAdmin: null,
+        supportDetailsLoading: false,
+      })
+      return get().accessContext?.accounts ?? null
+    }
+    set({ accountContextLoading: true })
+    try {
+      const context = await api.fetchAccountContext()
+      const previous = get().accountContext
+      const supportIdentityChanged = previous?.account?.id !== context.account?.id
+        || previous?.capabilities.includes('account.self') !== context.capabilities.includes('account.self')
+      if (supportIdentityChanged) {
+        _supportSelfRequestSequence += 1
+        _responsibleUseRequestSequence += 1
+        _responsibleUseAcceptanceSequence += 1
+        _supportAdminRequestSequence += 1
+      }
+      set(state => {
+        const identityChanged = state.accountContext?.account?.id !== context.account?.id
+        const selfUnavailable = context.authenticated !== true
+          || !context.capabilities.includes('account.self')
+        return {
+          accountContext: context,
+          accountContextLoading: false,
+          accessContext: state.accessContext
+            ? { ...state.accessContext, accounts: context }
+            : state.accessContext,
+          ...(identityChanged || selfUnavailable ? {
+            accountSessions: [],
+            accountUsers: [],
+            supportSelf: null,
+            responsibleUse: null,
+            supportAdminAccountId: null,
+            supportAdmin: null,
+            supportDetailsLoading: false,
+          } : {}),
+          ...(
+            context.reauthenticated !== true
+            || !context.capabilities.includes('accounts.admin')
+            || !context.capabilities.includes('services.admin')
+              ? { supportAdminAccountId: null, supportAdmin: null }
+              : {}
+          ),
+        }
+      })
+      return context
+    } catch (error) {
+      set({ accountContextLoading: false })
+      throw error
+    }
+  },
+  bootstrapAccount: async (input) => {
+    const result = await api.bootstrapAccount(input)
+    await get().loadAccountContext().catch(() => null)
+    await Promise.all([
+      get().loadAccountSessions().catch(() => undefined),
+      get().loadAccountUsers().catch(() => undefined),
+    ])
+    return result
+  },
+  loginAccount: async (input) => {
+    const result = await api.loginAccount(input)
+    await get().loadAccountContext().catch(() => null)
+    await Promise.all([
+      get().loadAccountSessions().catch(() => undefined),
+      get().loadAccountUsers().catch(() => undefined),
+    ])
+    return result
+  },
+  logoutAccount: async () => {
+    await api.logoutAccount()
+    _supportSelfRequestSequence += 1
+    _responsibleUseRequestSequence += 1
+    _responsibleUseAcceptanceSequence += 1
+    _supportAdminRequestSequence += 1
+    set(state => ({
+      accountContext: state.accountContext
+        ? {
+            ...state.accountContext,
+            authenticated: false,
+            account: null,
+            capabilities: [],
+            reauthenticated: false,
+          }
+        : null,
+      accountSessions: [],
+      accountUsers: [],
+      supportSelf: null,
+      responsibleUse: null,
+      supportAdminAccountId: null,
+      supportAdmin: null,
+      supportDetailsLoading: false,
+    }))
+    await get().loadAccountContext().catch(() => null)
+  },
+  reauthenticateAccount: async (password) => {
+    await api.reauthenticateAccount(password)
+    await get().loadAccountContext().catch(() => null)
+  },
+  recoverAccount: async (input) => {
+    const result = await api.recoverAccount(input)
+    await get().loadAccountContext().catch(() => null)
+    await Promise.all([
+      get().loadAccountSessions().catch(() => undefined),
+      get().loadAccountUsers().catch(() => undefined),
+    ])
+    return result
+  },
+  changeAccountPassword: async (newPassword) => {
+    await api.changeAccountPassword(newPassword)
+    await Promise.all([
+      get().loadAccountContext().catch(() => null),
+      get().loadAccountSessions().catch(() => undefined),
+    ])
+  },
+  rotateAccountRecoveryCodes: async () => {
+    const result = await api.rotateAccountRecoveryCodes()
+    return result.recovery_codes
+  },
+  loadAccountSessions: async () => {
+    if (!get().accountContext?.capabilities.includes('account.self')) {
+      set({ accountSessions: [] })
+      return
+    }
+    set({ accountDetailsLoading: true })
+    try {
+      const result = await api.fetchAccountSessions()
+      set({ accountSessions: result.sessions, accountDetailsLoading: false })
+    } catch (error) {
+      set({ accountDetailsLoading: false })
+      throw error
+    }
+  },
+  revokeAccountSession: async (sessionHandle) => {
+    const result = await api.revokeAccountSession(sessionHandle)
+    if (result.current) {
+      set({ accountSessions: [], accountUsers: [] })
+      await get().loadAccountContext().catch(() => null)
+    } else {
+      await get().loadAccountSessions()
+    }
+    return result.current
+  },
+  revokeAllAccountSessions: async (retainCurrent) => {
+    const result = await api.revokeAllAccountSessions(retainCurrent)
+    if (result.current_revoked) {
+      set({ accountSessions: [], accountUsers: [] })
+      await get().loadAccountContext().catch(() => null)
+    } else {
+      await get().loadAccountSessions()
+    }
+    return result.revoked
+  },
+  loadAccountUsers: async () => {
+    const context = get().accountContext
+    if (
+      context?.reauthenticated !== true
+      || !context.capabilities.includes('accounts.admin')
+      || !context.capabilities.includes('services.admin')
+    ) {
+      set({ accountUsers: [], supportAdminAccountId: null, supportAdmin: null })
+      return
+    }
+    set({ accountDetailsLoading: true })
+    try {
+      const result = await api.fetchServerAccounts()
+      set({ accountUsers: result.accounts, accountDetailsLoading: false })
+    } catch (error) {
+      set({ accountDetailsLoading: false })
+      throw error
+    }
+  },
+  createServerAccount: async (input) => {
+    const result = await api.createServerAccount(input)
+    await get().loadAccountUsers()
+    return result
+  },
+  setServerAccountDisabled: async (accountId, disabled) => {
+    await api.setServerAccountDisabled(accountId, disabled)
+    await get().loadAccountUsers()
+  },
+  loadSupportCatalog: async () => {
+    const requestSequence = ++_supportCatalogRequestSequence
+    set({ supportCatalogLoading: true, supportCatalogUnavailable: false })
+    try {
+      const catalog = await api.fetchSupportCatalog()
+      if (requestSequence === _supportCatalogRequestSequence) {
+        set({
+          supportCatalog: catalog,
+          supportCatalogLoading: false,
+          supportCatalogUnavailable: false,
+        })
+      }
+      return catalog
+    } catch {
+      if (requestSequence === _supportCatalogRequestSequence) {
+        set({
+          supportCatalog: null,
+          supportCatalogLoading: false,
+          supportCatalogUnavailable: true,
+        })
+      }
+      return null
+    }
+  },
+  loadSupportSelf: async () => {
+    const context = get().accountContext
+    if (
+      context?.authenticated !== true
+      || !context.capabilities.includes('account.self')
+    ) {
+      _supportSelfRequestSequence += 1
+      set({ supportSelf: null, supportDetailsLoading: false })
+      return null
+    }
+    const accountId = context.account?.id
+    const requestSequence = ++_supportSelfRequestSequence
+    _responsibleUseAcceptanceSequence += 1
+    set({ supportDetailsLoading: true })
+    try {
+      const projection = await api.fetchSupportSelf()
+      if (requestSequence !== _supportSelfRequestSequence) return null
+      const current = get().accountContext
+      if (
+        current?.authenticated !== true
+        || !current.capabilities.includes('account.self')
+        || current.account?.id !== accountId
+      ) {
+        set({ supportSelf: null, supportDetailsLoading: false })
+        return null
+      }
+      set({
+        supportSelf: projection,
+        supportCatalog: projection.public,
+        supportCatalogUnavailable: false,
+        supportDetailsLoading: false,
+      })
+      return projection
+    } catch (error) {
+      if (requestSequence === _supportSelfRequestSequence) {
+        set({ supportSelf: null, supportDetailsLoading: false })
+      }
+      throw error
+    }
+  },
+  loadResponsibleUse: async () => {
+    const context = get().accountContext
+    if (
+      context?.authenticated !== true
+      || !context.capabilities.includes('account.self')
+    ) {
+      _responsibleUseRequestSequence += 1
+      set({ responsibleUse: null, supportDetailsLoading: false })
+      return null
+    }
+    const accountId = context.account?.id
+    const requestSequence = ++_responsibleUseRequestSequence
+    _responsibleUseAcceptanceSequence += 1
+    set({ supportDetailsLoading: true })
+    try {
+      const projection = await api.fetchResponsibleUse()
+      if (requestSequence !== _responsibleUseRequestSequence) return null
+      const current = get().accountContext
+      if (
+        current?.authenticated !== true
+        || !current.capabilities.includes('account.self')
+        || current.account?.id !== accountId
+      ) {
+        set({ responsibleUse: null, supportDetailsLoading: false })
+        return null
+      }
+      set({ responsibleUse: projection, supportDetailsLoading: false })
+      return projection
+    } catch (error) {
+      if (requestSequence === _responsibleUseRequestSequence) {
+        set({ responsibleUse: null, supportDetailsLoading: false })
+      }
+      throw error
+    }
+  },
+  acceptResponsibleUse: async (documentVersion, contentSha256) => {
+    const context = get().accountContext
+    if (
+      context?.authenticated !== true
+      || !context.capabilities.includes('account.self')
+    ) throw new Error('Sign in to acknowledge responsible use.')
+    const accountId = context.account?.id
+    const acceptanceSequence = ++_responsibleUseAcceptanceSequence
+    const result = await api.acceptResponsibleUse({ documentVersion, contentSha256 })
+    const current = get()
+    const currentNotice = current.responsibleUse?.notice
+      || current.supportSelf?.responsible_use.notice
+    const bindingIsCurrent = acceptanceSequence === _responsibleUseAcceptanceSequence
+      && current.accountContext?.authenticated === true
+      && current.accountContext.capabilities.includes('account.self')
+      && current.accountContext.account?.id === accountId
+      && currentNotice?.version === documentVersion
+      && currentNotice.content_sha256 === contentSha256
+      && result.status.document_id === currentNotice.document_id
+      && result.status.document_version === documentVersion
+      && result.status.content_sha256 === contentSha256
+    if (!bindingIsCurrent) {
+      throw new Error('Responsible-use account or notice changed before acknowledgement completed.')
+    }
+    set(state => ({
+      responsibleUse: state.responsibleUse
+        ? { ...state.responsibleUse, status: result.status }
+        : state.responsibleUse,
+      supportSelf: state.supportSelf
+        ? {
+            ...state.supportSelf,
+            responsible_use: {
+              ...state.supportSelf.responsible_use,
+              status: result.status,
+            },
+          }
+        : state.supportSelf,
+    }))
+  },
+  loadSupportAdmin: async (accountId) => {
+    const context = get().accountContext
+    const eligible = context?.authenticated === true
+      && context.reauthenticated === true
+      && context.capabilities.includes('accounts.admin')
+      && context.capabilities.includes('services.admin')
+      && get().accountDrawerOpen
+      && get().accountUsers.some(account => account.id === accountId)
+    if (!eligible) {
+      _supportAdminRequestSequence += 1
+      set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
+      throw new Error('Choose a server-returned account after confirming owner access.')
+    }
+    const requestSequence = ++_supportAdminRequestSequence
+    set({
+      supportDetailsLoading: true,
+      supportAdminAccountId: accountId,
+      supportAdmin: null,
+    })
+    try {
+      const projection = await api.fetchAdminAccountSupport(accountId)
+      const current = get()
+      if (
+        requestSequence !== _supportAdminRequestSequence
+        || current.supportAdminAccountId !== accountId
+      ) return projection
+      const stillEligible = current.accountContext?.authenticated === true
+        && current.accountContext.reauthenticated === true
+        && current.accountContext.capabilities.includes('accounts.admin')
+        && current.accountContext.capabilities.includes('services.admin')
+        && current.accountDrawerOpen
+        && current.accountUsers.some(account => account.id === accountId)
+      if (!stillEligible) {
+        set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
+        throw new Error('Owner access changed while Support details were loading.')
+      }
+      set({ supportAdmin: projection, supportDetailsLoading: false })
+      return projection
+    } catch (error) {
+      if (requestSequence === _supportAdminRequestSequence) {
+        set({ supportAdmin: null, supportDetailsLoading: false })
+      }
+      throw error
+    }
+  },
+  clearSupportAdmin: () => {
+    _supportAdminRequestSequence += 1
+    set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
   },
   systemConfig: null,
   systemConfigLoading: false,

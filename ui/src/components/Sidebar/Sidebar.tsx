@@ -389,7 +389,7 @@ export function Sidebar() {
           }`}>
             {!isReference && <GenerationPrivacyControls />}
             {!isReference && (isDirector ? <DirectorChat /> : studioControls)}
-            <ProjectReferenceLibrary active={isReference} />
+            <ProjectReferenceLibrary active={isReference && sidebarOpen} />
             {machineControls && <HardwareStatusBar />}
           </div>
         </aside>

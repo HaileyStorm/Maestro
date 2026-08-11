@@ -167,6 +167,65 @@ PACK_DETAIL_OPERATIONS = frozenset({"auto", "crop", "enhance", "reconstruct"})
 PACK_OPERATION_ORDER = ("generation", "edit", "repair", "callout")
 PACK_OPERATION_STATUSES = frozenset({"standard", "applied", "skipped"})
 
+CHARACTER_PROFILE_SCHEMA_VERSION = 1
+CHARACTER_GENDERS = ("woman", "man", "non_binary", "unspecified")
+CHARACTER_EXPLICIT_ANATOMY = ("breasts", "vulva", "penis")
+CHARACTER_MANAGED_CALLOUT_PROVENANCE = "character-profile-explicit-v1"
+_CHARACTER_ANATOMY_ROLES = frozenset({
+    "canonical_identity", "turnaround", "identity_details",
+})
+_CHARACTER_PROFILE_REVIEW_ITEMS = frozenset({
+    "identity_anchor", "structural_proportions", "authored_details",
+    "anatomy_callouts", "pose_view", "cross_sheet_continuity",
+    "authored_callouts",
+})
+# These identities are deliberately opaque outside the private authored wire.
+# Their order and values are versioned so recovery can distinguish a missing
+# callout from a newly derived one without exposing anatomy in public roles.
+_CHARACTER_MANAGED_CALLOUT_SPECS: tuple[
+    tuple[str, str, str, str], ...
+] = (
+    ("breasts_front", "breasts", "custom:cpref00000001", "breasts (front)"),
+    ("breasts_profile", "breasts", "custom:cpref00000002", "breasts (profile)"),
+    ("vulva", "vulva", "custom:cpref00000003", "vulva"),
+    ("penis", "penis", "custom:cpref00000004", "penis"),
+)
+_CHARACTER_MANAGED_BY_ID = MappingProxyType({
+    managed_id: (key, anatomy, label)
+    for key, anatomy, managed_id, label in _CHARACTER_MANAGED_CALLOUT_SPECS
+})
+_CHARACTER_MANAGED_BY_KEY = MappingProxyType({
+    key: (anatomy, managed_id, label)
+    for key, anatomy, managed_id, label in _CHARACTER_MANAGED_CALLOUT_SPECS
+})
+
+
+def _is_managed_character_role(role: object) -> bool:
+    if not isinstance(role, str) or not role.startswith("detail_callout:"):
+        return False
+    return role.removeprefix("detail_callout:") in _CHARACTER_MANAGED_BY_ID
+
+
+def _public_pack_role(role: str | None) -> str | None:
+    if role is None or not _is_managed_character_role(role):
+        return role
+    return "detail_callout:managed"
+
+
+def _public_pack_roles(roles: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(
+        str(_public_pack_role(role)) for role in roles
+    ))
+
+
+def _public_pack_role_text(value: str) -> str:
+    rendered = value
+    for managed_id in _CHARACTER_MANAGED_BY_ID:
+        rendered = rendered.replace(
+            f"detail_callout:{managed_id}", "detail_callout:managed",
+        )
+    return rendered
+
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}$")
 _AUTHORED_ID_RE = re.compile(
     r"^(?:custom:[A-Za-z0-9][A-Za-z0-9_-]{11,95}|"
@@ -206,8 +265,9 @@ _REASON_FOR_CHECK = {
 FIDELITY_ASSESSMENT_VERSION = "fidelity_assessment_v2"
 FIDELITY_RUBRIC_VERSION = "reference-fidelity-rubric-v1"
 FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION = (
-    "reference-fidelity-attempt-acceptance-v1"
+    "reference-fidelity-attempt-acceptance-v2"
 )
+FIDELITY_QUESTION_REVIEW_ATTEMPTS = 2
 FIDELITY_CORRECTION_TEMPLATE_ID = "reference-residual-correction"
 FIDELITY_CORRECTION_TEMPLATE_VERSION = "v1"
 FIDELITY_GRADES = (
@@ -230,6 +290,15 @@ _FIDELITY_ASSESSMENT_CLASS_RANK = MappingProxyType({
     "minor_residual": 1,
     "material_residual": 2,
 })
+# Tolerance is deliberately separate from assessment.  The fixed v2 policy is
+# monotonic and bounded: exact on the first pass, minor residuals on the first
+# repair, then only cumulative material residuals whose individual dimensions
+# remain minor and whose weighted score is at least 70%.
+_FIDELITY_ATTEMPT_ACCEPTANCE_TIERS = (
+    ("exact", 10_000, 0),
+    ("minor_residual", 8_000, 1),
+    ("bounded_residual", 7_000, 1),
+)
 _FIDELITY_CORRECTION_CLAUSES = MappingProxyType({
     "style_language": "follow the authored style and rendering language",
     "materials_palette": "follow the authored materials, palette, and surface treatment",
@@ -601,7 +670,7 @@ class FidelityDimensionAssessment:
         return {
             "dimension": self.dimension,
             "grade": self.grade,
-            "affected_roles": list(self.affected_roles),
+            "affected_roles": _public_pack_roles(self.affected_roles),
             "reason_codes": list(self.reason_codes),
             "failed_item_ids": list(self.failed_item_ids),
             "matched_weight": self.matched_weight,
@@ -697,7 +766,7 @@ class FidelityAssessment:
             "dimensions": [item.public_metadata() for item in self.dimensions],
             "status": self.status,
             "dimension_checks": self.dimension_checks_dict(),
-            "failed_roles": list(self.failed_roles),
+            "failed_roles": _public_pack_roles(self.failed_roles),
             "reason_codes": list(self.reason_codes),
         }
 
@@ -719,6 +788,9 @@ class FidelityCorrectionBrief:
 
     def public_metadata(self) -> dict[str, Any]:
         _validate_fidelity_correction_brief_shape(self)
+        contains_managed_role = any(
+            _is_managed_character_role(role) for role in self.affected_roles
+        )
         return {
             "assessment_version": self.assessment_version,
             "rubric_version": self.rubric_version,
@@ -726,12 +798,12 @@ class FidelityCorrectionBrief:
             "template_id": self.template_id,
             "template_version": self.template_version,
             "severity": self.severity,
-            "affected_roles": list(self.affected_roles),
+            "affected_roles": _public_pack_roles(self.affected_roles),
             "reason_codes": list(self.reason_codes),
             "failed_item_ids": list(self.failed_item_ids),
             "score_basis_points": self.score_basis_points,
-            "rendered_brief": self.rendered_brief,
-            "commitment": self.commitment,
+            "rendered_brief": _public_pack_role_text(self.rendered_brief),
+            "commitment": None if contains_managed_role else self.commitment,
         }
 
 
@@ -740,6 +812,57 @@ class ReferenceCandidateAssessment:
     candidate_index: int
     assessment: FidelityAssessment
     repair_count: int
+
+
+@dataclass(frozen=True)
+class ReferencePackAttempt:
+    """One immutable, valid artifact set and its optional fidelity assessment."""
+
+    attempt_index: int
+    artifacts: tuple[ReferencePackArtifact, ...]
+    review: SemanticReviewResult
+    repair_count: int
+    repaired_role: str | None = None
+    applied_correction_brief_commitment: str | None = None
+
+    def public_metadata(self, *, selected: bool = False) -> dict[str, Any]:
+        assessment = self.review.fidelity_assessment
+        outcome = (
+            "review_unavailable"
+            if assessment is None
+            else "target_met"
+            if self.review.fidelity_accepted
+            else "residual"
+        )
+        result: dict[str, Any] = {
+            "attempt_index": self.attempt_index,
+            "repair_count": self.repair_count,
+            "repaired_role": _public_pack_role(self.repaired_role),
+            "review_outcome": outcome,
+            "selected": bool(selected),
+        }
+        if assessment is not None:
+            assessment = _validate_fidelity_assessment(assessment)
+            result["assessment"] = {
+                "version": assessment.version,
+                "assessment_class": assessment.assessment_class,
+                "worst_severity": assessment.worst_severity,
+                "residual_count": assessment.residual_count,
+                "score_basis_points": assessment.score_basis_points,
+                "affected_roles": _public_pack_roles(
+                    assessment.failed_roles,
+                ),
+                "reason_codes": list(assessment.reason_codes),
+            }
+            result["target_met"] = bool(self.review.fidelity_accepted)
+        if (
+            self.applied_correction_brief_commitment is not None
+            and not _is_managed_character_role(self.repaired_role)
+        ):
+            result["applied_correction_brief_commitment"] = (
+                self.applied_correction_brief_commitment
+            )
+        return result
 
 
 FIDELITY_RUBRIC = (
@@ -893,6 +1016,143 @@ class PackTypeFieldItem:
 
 
 @dataclass(frozen=True)
+class CharacterProfile:
+    """One private, authored character profile; no value is inferred."""
+
+    gender: str
+    age: int | None
+    explicit_anatomy: tuple[str, ...]
+    commitment_nonce: str
+    profile_seal: str
+
+    def private_metadata(self) -> dict[str, Any]:
+        return {
+            "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+            "gender": self.gender,
+            "age": self.age,
+            "explicit_anatomy": list(self.explicit_anatomy),
+            "commitment_nonce": self.commitment_nonce,
+        }
+
+    def commitment(self, field: str, value: object) -> str:
+        return _pack_seal({
+            "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+            "nonce": self.commitment_nonce,
+            "field": field,
+            "value": value,
+        })
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+            "gender": {
+                "present": self.gender != "unspecified",
+                "commitment": (
+                    self.commitment("gender", self.gender)
+                    if self.gender != "unspecified" else None
+                ),
+            },
+            "age": {
+                "present": self.age is not None,
+                "commitment": (
+                    self.commitment("age", self.age)
+                    if self.age is not None else None
+                ),
+            },
+            "explicit_anatomy": {
+                "count": len(self.explicit_anatomy),
+                "commitments": [
+                    self.commitment(f"explicit_anatomy:{index}", value)
+                    for index, value in enumerate(self.explicit_anatomy)
+                ],
+            },
+        }
+
+
+@dataclass(frozen=True)
+class CharacterAuthoredFacts:
+    """Private role-local facts passed to planning, generation, and review."""
+
+    gender: str | None
+    age: int | None
+    explicit_anatomy: tuple[str, ...]
+    profile_seal: str
+
+    def private_metadata(self) -> dict[str, Any]:
+        return {
+            "gender": self.gender,
+            "age": self.age,
+            "explicit_anatomy": list(self.explicit_anatomy),
+            "profile_seal": self.profile_seal,
+        }
+
+
+@dataclass(frozen=True)
+class CharacterManagedCallout:
+    """Private reconciliation record for one server-derived callout."""
+
+    key: str
+    managed_id: str
+    label: str
+    requested_operation: str
+    source_role: str
+    status: str
+    renamed: bool
+    provenance: str = CHARACTER_MANAGED_CALLOUT_PROVENANCE
+
+    def private_metadata(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "managed_id": self.managed_id,
+            "label": self.label,
+            "operation": self.requested_operation,
+            "source_role": self.source_role,
+            "status": self.status,
+            "renamed": self.renamed,
+            "provenance": self.provenance,
+        }
+
+
+@dataclass(frozen=True)
+class CharacterManagedCalloutState:
+    entries: tuple[CharacterManagedCallout, ...]
+    state_seal: str
+
+    def private_metadata(self) -> dict[str, Any]:
+        return {
+            "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+            "entries": [item.private_metadata() for item in self.entries],
+        }
+
+    def public_metadata(self, profile: CharacterProfile) -> dict[str, Any]:
+        active = tuple(item for item in self.entries if item.status == "active")
+        return {
+            "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+            "active_count": len(active),
+            "tombstone_count": sum(
+                item.status == "tombstoned" for item in self.entries
+            ),
+            "rename_count": sum(item.renamed for item in active),
+            "commitments": [
+                profile.commitment(
+                    f"managed_callout:{index}",
+                    {
+                        "key": item.key,
+                        "id": item.managed_id,
+                        "label": item.label,
+                        "operation": item.requested_operation,
+                        "source_role": item.source_role,
+                        "status": item.status,
+                        "renamed": item.renamed,
+                        "provenance": item.provenance,
+                    },
+                )
+                for index, item in enumerate(self.entries)
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class PackDetailCallout:
     custom_id: str
     label: str
@@ -908,7 +1168,12 @@ class PackDetailCallout:
     def label_digest(self) -> str:
         return hashlib.sha256(self.label.encode("utf-8")).hexdigest()
 
-    def public_metadata(self) -> dict[str, str]:
+    def public_metadata(self) -> dict[str, Any]:
+        if self.custom_id in _CHARACTER_MANAGED_BY_ID:
+            return {
+                "managed": True,
+                "requested_operation": self.requested_operation,
+            }
         return {
             "custom_id": self.custom_id,
             "kind": self.kind,
@@ -938,6 +1203,7 @@ class PackAuthoredRequestContract:
     style_commitment: str | None
     type_fields: tuple[tuple[str, tuple[PackTypeFieldItem, ...]], ...]
     detail_callouts: tuple[PackDetailCallout, ...]
+    character_facts: CharacterAuthoredFacts | None
     authored_settings_seal: str | None
     contract_seal: str
 
@@ -1020,7 +1286,7 @@ class PackLoraSelection:
             "weight": self.multiplier,
             "requested_scope": self.requested_scope,
             "resolved_scope": list(self.resolved_scopes),
-            "roles": list(self.roles),
+            "roles": _public_pack_roles(self.roles),
             **parameter_metadata,
         }
 
@@ -1091,6 +1357,9 @@ class ReferencePackPlan:
     review_contract: str
     operation_routing: tuple[PackOperationRoute, ...]
     additional_loras: tuple[PackLoraSelection, ...]
+    character_profile: CharacterProfile | None
+    managed_character_callouts: CharacterManagedCalloutState | None
+    explicit_convenience: bool
     resource_seal: str
     role_brief_seal: str
     authored_settings_seal: str
@@ -1111,6 +1380,18 @@ class ReferencePackPlan:
     @property
     def output_roles(self) -> tuple[str, ...]:
         return (*self.sheet_roles, *(item.target_role for item in self.detail_callouts))
+
+    @property
+    def public_output_roles(self) -> tuple[str, ...]:
+        managed_index = 0
+        roles = list(self.sheet_roles)
+        for item in self.detail_callouts:
+            if item.custom_id in _CHARACTER_MANAGED_BY_ID:
+                managed_index += 1
+                roles.append(f"detail_callout:managed:{managed_index}")
+            else:
+                roles.append(item.target_role)
+        return tuple(roles)
 
     def private_authored_settings(self) -> dict[str, Any]:
         settings = {
@@ -1142,6 +1423,12 @@ class ReferencePackPlan:
         ]
         if parameterized_loras:
             settings["additional_lora_parameters"] = parameterized_loras
+        if self.character_profile is not None:
+            settings["character_profile"] = self.character_profile.private_metadata()
+        if self.managed_character_callouts is not None:
+            settings["managed_character_callouts"] = (
+                self.managed_character_callouts.private_metadata()
+            )
         return settings
 
     def public_authored_settings(self) -> dict[str, Any]:
@@ -1163,6 +1450,20 @@ class ReferencePackPlan:
                 "style_present": bool(self.style),
                 "style_commitment": self.style_commitment,
             })
+        if self.character_profile is not None:
+            settings["character_profile"] = self.character_profile.public_metadata()
+            settings["managed_character_callouts"] = (
+                self.managed_character_callouts.public_metadata(
+                    self.character_profile,
+                )
+                if self.managed_character_callouts is not None else {
+                    "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+                    "active_count": 0,
+                    "tombstone_count": 0,
+                    "rename_count": 0,
+                    "commitments": [],
+                }
+            )
         return settings
 
     def operation_route(self, operation: str) -> PackOperationRoute:
@@ -1182,7 +1483,7 @@ class ReferencePackPlan:
             "sheet_count": len(self.sheets),
             "ordered_sheet_roles": list(self.sheet_roles),
             "detail_callout_count": len(self.detail_callouts),
-            "ordered_output_roles": list(self.output_roles),
+            "ordered_output_roles": list(self.public_output_roles),
             "candidate_count": candidate_count,
             "anchor_strategy": self.anchor_strategy,
             "anchor_role": self.anchor_role,
@@ -1311,20 +1612,41 @@ class ReferencePackArtifact:
     detail_provenance: Mapping[str, Any] | None = None
 
     def public_metadata(self) -> dict[str, Any]:
+        managed_role = _is_managed_character_role(self.role)
         metadata = {
             "schema_version": PACK_SCHEMA_VERSION,
             "planner_version": PACK_PLANNER_VERSION,
-            "role": self.role,
+            "role": _public_pack_role(self.role),
             "index": self.index,
             "model": self.model,
             "provenance": {
                 **self.provenance.public_metadata(),
-                "anchor_role": self.anchor_role,
+                "anchor_role": _public_pack_role(self.anchor_role),
             },
             "reason_codes": list(self.reason_codes),
         }
         if self.detail_provenance is not None:
-            metadata["detail"] = dict(self.detail_provenance)
+            if managed_role or self.detail_provenance.get("managed") is True:
+                public_detail = {
+                    key: self.detail_provenance[key]
+                    for key in (
+                        "managed", "source_digest", "normalized_crop",
+                        "requested_operation", "resolved_operation",
+                        "editor_model",
+                    )
+                    if key in self.detail_provenance
+                }
+                commitment = self.detail_provenance.get("commitment")
+                if (
+                    self.detail_provenance.get("commitment_kind")
+                    == "nonce_bound_v1"
+                    and isinstance(commitment, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", commitment) is not None
+                ):
+                    public_detail["commitment"] = commitment
+                metadata["detail"] = public_detail
+            else:
+                metadata["detail"] = dict(self.detail_provenance)
         return metadata
 
 
@@ -1339,6 +1661,14 @@ class ReferencePackResult:
     # Callback results are private source artifacts. The route owns their
     # lifecycle and removes this complete set after atomic store publication.
     private_source_paths: tuple[Path, ...]
+    attempt_history: tuple[ReferencePackAttempt, ...] = ()
+    selected_attempt_index: int = 0
+    final_correction_brief: FidelityCorrectionBrief | None = None
+
+    @property
+    def publication_eligible(self) -> bool:
+        """Valid generated artifacts remain publishable regardless of review grade."""
+        return True
 
     def public_metadata(self) -> dict[str, Any]:
         preview = self.plan.public_preview()
@@ -1346,6 +1676,7 @@ class ReferencePackResult:
         preview["review"] = {
             **self.plan.review_selection.public_metadata(),
             "status": self.review.status,
+            "publication_eligible": self.publication_eligible,
         }
         if self.review.fidelity_assessment is not None:
             assessment = _validate_fidelity_assessment(
@@ -1368,14 +1699,42 @@ class ReferencePackResult:
                     FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION
                 ),
             })
+        if self.final_correction_brief is not None:
+            if self.review.fidelity_assessment is None:
+                raise ValueError("final correction brief has no assessment")
+            brief = _validate_fidelity_correction_brief(
+                self.review.fidelity_assessment,
+                self.final_correction_brief,
+            )
+            preview["review"]["final_correction"] = brief.public_metadata()
+        if self.attempt_history:
+            if (
+                type(self.selected_attempt_index) is not int
+                or not 0 <= self.selected_attempt_index < len(self.attempt_history)
+            ):
+                raise ValueError("selected attempt index is invalid")
+            selected = self.attempt_history[self.selected_attempt_index]
+            if selected.artifacts != self.artifacts or selected.review != self.review:
+                raise ValueError("selected attempt does not match result")
+            preview["review"]["attempt_history"] = [
+                attempt.public_metadata(
+                    selected=index == self.selected_attempt_index,
+                )
+                for index, attempt in enumerate(self.attempt_history)
+            ]
+            preview["review"]["selected_attempt_index"] = (
+                self.selected_attempt_index
+            )
         return {
             **preview,
             "roles": {
                 "sheets": list(self.plan.sheet_roles),
-                "repaired": list(self.repaired_roles),
+                "repaired": _public_pack_roles(self.repaired_roles),
             },
             "reason_codes": list(self.review.reason_codes),
             "review_status": self.review.status,
+            "publication_status": "ready",
+            "publication_eligible": self.publication_eligible,
             "max_repair_attempts": self.max_repair_attempts,
             "repair_attempts_used": self.repair_attempts_used,
         }
@@ -1696,15 +2055,69 @@ def _save_new_png(image: Image.Image, output_path: Path) -> None:
         os.close(ownership_descriptor)
 
 
-def _staging_path(output_path: Path) -> Path:
-    """Return a high-entropy, nonexistent sibling path for review composition."""
+def _staging_path(
+    output_path: Path,
+    *,
+    publication_safe_basename: bool = False,
+) -> Path:
+    """Return a high-entropy, nonexistent sibling path for generated media."""
     for _attempt in range(16):
-        candidate = output_path.parent / (
-            f".{output_path.name}.review-{secrets.token_hex(12)}.png"
+        token = secrets.token_hex(12)
+        basename = (
+            f"reference-detail-{token}.png"
+            if publication_safe_basename
+            else f".{output_path.name}.review-{token}.png"
         )
+        candidate = output_path.parent / basename
         if not candidate.exists() and not candidate.is_symlink():
             return candidate
     raise ReferenceSheetStructureError("sheet_staging_unavailable")
+
+
+def _create_unpublished_media_guard(
+    media_path: Path,
+) -> tuple[Path, tuple[int, int]]:
+    """Create a fail-closed sidecar before non-dot staged media can exist."""
+    guard_path = media_path.with_suffix(".meta.json")
+    descriptor = -1
+    ownership: tuple[int, int] | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(
+            os, "O_NOFOLLOW", 0,
+        )
+        descriptor = os.open(guard_path, flags, 0o600)
+        guard_stat = os.fstat(descriptor)
+        ownership = (guard_stat.st_dev, guard_stat.st_ino)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            # A present non-object sidecar is intentionally rejected by both
+            # Gallery enumeration and direct output access. ProjectAssetStore
+            # copies only the media and authors the final policy metadata.
+            handle.write(b"null\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        current = guard_path.lstat()
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != ownership
+        ):
+            raise ReferenceSheetStructureError("sheet_output_replaced")
+        return guard_path, ownership
+    except Exception:
+        if ownership is not None:
+            try:
+                current = guard_path.lstat()
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and (current.st_dev, current.st_ino) == ownership
+                ):
+                    guard_path.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _promote_new_file(
@@ -1967,6 +2380,7 @@ def _authored_contract_payload(
     style_commitment: str | None,
     type_fields: Sequence[tuple[str, Sequence[PackTypeFieldItem]]],
     detail_callouts: Sequence[PackDetailCallout],
+    character_facts: CharacterAuthoredFacts | None,
     authored_settings_seal: str | None,
 ) -> dict[str, Any]:
     return {
@@ -1984,6 +2398,10 @@ def _authored_contract_payload(
         "detail_callouts": [
             item.private_metadata() for item in detail_callouts
         ],
+        "character_facts": (
+            None if character_facts is None
+            else character_facts.private_metadata()
+        ),
         "authored_settings_seal": authored_settings_seal,
     }
 
@@ -1996,6 +2414,7 @@ def _build_pack_authored_request_contract(
     style_commitment: str | None = None,
     type_fields: Sequence[tuple[str, Sequence[PackTypeFieldItem]]] = (),
     detail_callouts: Sequence[PackDetailCallout] = (),
+    character_facts: CharacterAuthoredFacts | None = None,
     authored_settings_seal: str | None = None,
 ) -> PackAuthoredRequestContract:
     normalized_type_fields = tuple(
@@ -2009,6 +2428,7 @@ def _build_pack_authored_request_contract(
         style_commitment=style_commitment,
         type_fields=normalized_type_fields,
         detail_callouts=normalized_callouts,
+        character_facts=character_facts,
         authored_settings_seal=authored_settings_seal,
     )
     return PackAuthoredRequestContract(
@@ -2018,6 +2438,7 @@ def _build_pack_authored_request_contract(
         style_commitment=style_commitment,
         type_fields=normalized_type_fields,
         detail_callouts=normalized_callouts,
+        character_facts=character_facts,
         authored_settings_seal=authored_settings_seal,
         contract_seal=_pack_seal(payload),
     )
@@ -2069,6 +2490,34 @@ def _validate_pack_authored_request_contract(
         )
         or len(contract.detail_callouts) > 1
         or (
+            contract.character_facts is not None
+            and (
+                not isinstance(contract.character_facts, CharacterAuthoredFacts)
+                or contract.character_facts.gender not in {
+                    None, "woman", "man", "non_binary",
+                }
+                or (
+                    contract.character_facts.age is not None
+                    and (
+                        isinstance(contract.character_facts.age, bool)
+                        or not isinstance(contract.character_facts.age, int)
+                        or not 0 <= contract.character_facts.age <= 999
+                    )
+                )
+                or any(
+                    item not in CHARACTER_EXPLICIT_ANATOMY
+                    for item in contract.character_facts.explicit_anatomy
+                )
+                or tuple(
+                    item for item in CHARACTER_EXPLICIT_ANATOMY
+                    if item in set(contract.character_facts.explicit_anatomy)
+                ) != contract.character_facts.explicit_anatomy
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", contract.character_facts.profile_seal,
+                ) is None
+            )
+        )
+        or (
             contract.target_role.startswith("detail_callout:")
             and contract.type_fields
         )
@@ -2094,6 +2543,7 @@ def _validate_pack_authored_request_contract(
             style_commitment=contract.style_commitment,
             type_fields=contract.type_fields,
             detail_callouts=contract.detail_callouts,
+            character_facts=contract.character_facts,
             authored_settings_seal=contract.authored_settings_seal,
         )
     except (AttributeError, TypeError, ValueError) as exc:
@@ -2129,6 +2579,11 @@ def _pack_authored_contract_for_plan(
         item for item in plan.detail_callouts
         if include_callouts and item.target_role == target_role
     )
+    facts = _character_facts_for_plan(
+        plan,
+        target_role=target_role,
+        rubric_item_id=rubric_item_id,
+    )
     return _build_pack_authored_request_contract(
         target_role=target_role,
         rubric_item_id=rubric_item_id,
@@ -2139,7 +2594,58 @@ def _pack_authored_contract_for_plan(
         ),
         type_fields=plan.type_fields if include_type_fields else (),
         detail_callouts=callouts,
+        character_facts=facts,
         authored_settings_seal=plan.authored_settings_seal,
+    )
+
+
+def _character_facts_for_plan(
+    plan: ReferencePackPlan,
+    *,
+    target_role: str,
+    rubric_item_id: str | None,
+) -> CharacterAuthoredFacts | None:
+    profile = plan.character_profile
+    if (
+        plan.reference_type != "character"
+        or profile is None
+        or (
+            rubric_item_id is not None
+            and rubric_item_id not in _CHARACTER_PROFILE_REVIEW_ITEMS
+        )
+    ):
+        return None
+    anatomy: tuple[str, ...] = ()
+    if target_role in _CHARACTER_ANATOMY_ROLES:
+        anatomy = profile.explicit_anatomy
+    elif target_role.startswith("detail_callout:"):
+        managed_id = target_role.removeprefix("detail_callout:")
+        managed = _CHARACTER_MANAGED_BY_ID.get(managed_id)
+        if managed is not None and managed[1] in profile.explicit_anatomy:
+            anatomy = (managed[1],)
+    if rubric_item_id not in {None, "anatomy_callouts", "authored_callouts"}:
+        anatomy = ()
+    gender = None if profile.gender == "unspecified" else profile.gender
+    if gender is None and profile.age is None and not anatomy:
+        return None
+    return CharacterAuthoredFacts(
+        gender=gender,
+        age=profile.age,
+        explicit_anatomy=anatomy,
+        profile_seal=profile.profile_seal,
+    )
+
+
+def reference_pack_authored_contract(
+    plan: ReferencePackPlan,
+    *,
+    target_role: str,
+    rubric_item_id: str | None = None,
+) -> PackAuthoredRequestContract:
+    """Public service helper for planner/generator/reviewer role contracts."""
+    plan = _validate_reference_pack_plan(plan)
+    return _pack_authored_contract_for_plan(
+        plan, target_role=target_role, rubric_item_id=rubric_item_id,
     )
 
 
@@ -2443,7 +2949,7 @@ def fidelity_attempt_accepted(
     attempt_index: int,
     policy_version: str = FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION,
 ) -> bool:
-    """Apply acceptance separately: attempt zero is exact-only, later allows minor."""
+    """Apply the versioned, monotonic, bounded tolerance policy."""
     if policy_version != FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION:
         raise ValueError("acceptance policy is not supported")
     if type(attempt_index) is not int or attempt_index < 0:
@@ -2454,8 +2960,15 @@ def fidelity_attempt_accepted(
             assessment.assessment_class == "exact"
             and assessment.worst_severity == "exact"
         )
+    if attempt_index == 1:
+        return (
+            assessment.assessment_class in {"exact", "minor_residual"}
+            and assessment.worst_severity in {"exact", "minor_residual"}
+        )
+    score = assessment.score_basis_points
     return (
-        assessment.assessment_class in {"exact", "minor_residual"}
+        score is not None
+        and score >= _FIDELITY_ATTEMPT_ACCEPTANCE_TIERS[2][1]
         and assessment.worst_severity in {"exact", "minor_residual"}
     )
 
@@ -2629,7 +3142,7 @@ def _validate_fidelity_correction_brief(
 
 def reference_candidate_ranking_key(
     candidate: ReferenceCandidateAssessment,
-) -> tuple[int, int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int, int]:
     if (
         not isinstance(candidate, ReferenceCandidateAssessment)
         or type(candidate.candidate_index) is not int
@@ -2641,8 +3154,11 @@ def reference_candidate_ranking_key(
     assessment = _validate_fidelity_assessment(candidate.assessment)
     score = assessment.score_basis_points
     return (
-        _FIDELITY_ASSESSMENT_CLASS_RANK[assessment.assessment_class],
+        0 if fidelity_attempt_accepted(
+            assessment, attempt_index=candidate.repair_count,
+        ) else 1,
         _FIDELITY_GRADE_SEVERITY[assessment.worst_severity],
+        _FIDELITY_ASSESSMENT_CLASS_RANK[assessment.assessment_class],
         -(score if score is not None else -1),
         assessment.residual_count,
         candidate.repair_count,
@@ -3505,10 +4021,233 @@ def _pack_seal(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def normalize_character_profile(
+    value: object,
+    *,
+    explicit_convenience: bool = False,
+) -> CharacterProfile | None:
+    """Normalize only structured authored values; never inspect prompt text."""
+    if type(explicit_convenience) is not bool:
+        raise ValueError("explicit_convenience must be a boolean")
+    if value is None:
+        return None
+    if isinstance(value, CharacterProfile):
+        value = value.private_metadata()
+    allowed = {
+        "schema_version", "gender", "age", "explicit_anatomy",
+        "commitment_nonce",
+    }
+    if not isinstance(value, Mapping) or set(value).difference(allowed):
+        raise ValueError("character_profile schema is invalid")
+    if value.get("schema_version", CHARACTER_PROFILE_SCHEMA_VERSION) != (
+        CHARACTER_PROFILE_SCHEMA_VERSION
+    ):
+        raise ValueError("character_profile schema is invalid")
+    gender = value.get("gender", "unspecified")
+    age = value.get("age")
+    anatomy = value.get("explicit_anatomy", [])
+    nonce = value.get("commitment_nonce")
+    if gender not in CHARACTER_GENDERS:
+        raise ValueError("character_profile gender is invalid")
+    if age is not None and (
+        isinstance(age, bool) or not isinstance(age, int) or not 0 <= age <= 999
+    ):
+        raise ValueError("character_profile age must be an integer from 0 through 999")
+    if (
+        not isinstance(anatomy, Sequence)
+        or isinstance(anatomy, (str, bytes))
+        or any(item not in CHARACTER_EXPLICIT_ANATOMY for item in anatomy)
+        or len(set(anatomy)) != len(anatomy)
+    ):
+        raise ValueError("character_profile explicit_anatomy is invalid")
+    normalized_anatomy = tuple(
+        item for item in CHARACTER_EXPLICIT_ANATOMY if item in set(anatomy)
+    )
+    if explicit_convenience and age is not None and age < 18:
+        raise ValueError(
+            "explicit convenience requires omitted age or an authored age of at least 18"
+        )
+    if nonce is None:
+        nonce = secrets.token_hex(32)
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{64}", nonce) is None:
+        raise ValueError("character_profile commitment_nonce is invalid")
+    private = {
+        "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+        "gender": gender,
+        "age": age,
+        "explicit_anatomy": list(normalized_anatomy),
+        "commitment_nonce": nonce,
+    }
+    return CharacterProfile(
+        gender=gender,
+        age=age,
+        explicit_anatomy=normalized_anatomy,
+        commitment_nonce=nonce,
+        profile_seal=_pack_seal(private),
+    )
+
+
+def _normalize_character_managed_callout_state(
+    value: object,
+) -> CharacterManagedCalloutState | None:
+    if value is None:
+        return None
+    if isinstance(value, CharacterManagedCalloutState):
+        value = value.private_metadata()
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"schema_version", "entries"}
+        or value.get("schema_version") != CHARACTER_PROFILE_SCHEMA_VERSION
+        or not isinstance(value.get("entries"), list)
+        or len(value["entries"]) > len(_CHARACTER_MANAGED_CALLOUT_SPECS)
+    ):
+        raise ValueError("managed character callout state is invalid")
+    entries = []
+    seen = set()
+    for raw in value["entries"]:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "key", "managed_id", "label", "operation", "source_role",
+            "status", "renamed", "provenance",
+        }:
+            raise ValueError("managed character callout state is invalid")
+        key = raw.get("key")
+        expected = _CHARACTER_MANAGED_BY_KEY.get(key)
+        if (
+            expected is None
+            or key in seen
+            or raw.get("managed_id") != expected[1]
+            or not isinstance(raw.get("label"), str)
+            or not raw["label"].strip()
+            or raw["label"] != raw["label"].strip()
+            or len(raw["label"]) > 500
+            or "\x00" in raw["label"]
+            or raw.get("operation") not in PACK_DETAIL_OPERATIONS
+            or not isinstance(raw.get("source_role"), str)
+            or not raw["source_role"]
+            or len(raw["source_role"]) > 128
+            or raw.get("status") not in {"active", "tombstoned"}
+            or type(raw.get("renamed")) is not bool
+            or raw.get("renamed") != (raw.get("label") != expected[2])
+            or raw.get("provenance") != CHARACTER_MANAGED_CALLOUT_PROVENANCE
+        ):
+            raise ValueError("managed character callout state is invalid")
+        seen.add(key)
+        entries.append(CharacterManagedCallout(
+            key=key,
+            managed_id=expected[1],
+            label=raw["label"],
+            requested_operation=raw["operation"],
+            source_role=raw["source_role"],
+            status=raw["status"],
+            renamed=raw["renamed"],
+        ))
+    order = {key: index for index, (key, *_rest) in enumerate(
+        _CHARACTER_MANAGED_CALLOUT_SPECS
+    )}
+    if [item.key for item in entries] != sorted(
+        (item.key for item in entries), key=order.__getitem__,
+    ):
+        raise ValueError("managed character callout state is invalid")
+    private = {
+        "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+        "entries": [item.private_metadata() for item in entries],
+    }
+    return CharacterManagedCalloutState(tuple(entries), _pack_seal(private))
+
+
+def _character_callout_source(key: str, sheet_roles: Sequence[str]) -> str:
+    if key == "breasts_profile" and "turnaround" in sheet_roles:
+        return "turnaround"
+    return sheet_roles[0]
+
+
+def _reconcile_character_managed_callouts(
+    callouts: Sequence[PackDetailCallout],
+    *,
+    profile: CharacterProfile | None,
+    previous_state: CharacterManagedCalloutState | None,
+    sheet_roles: Sequence[str],
+    explicit_convenience: bool,
+    mode: str,
+) -> tuple[tuple[PackDetailCallout, ...], CharacterManagedCalloutState | None]:
+    previous = {
+        item.key: item for item in (() if previous_state is None else previous_state.entries)
+    }
+    managed_current: dict[str, PackDetailCallout] = {}
+    unmanaged = []
+    for callout in callouts:
+        managed_spec = _CHARACTER_MANAGED_BY_ID.get(callout.custom_id)
+        if managed_spec is None:
+            unmanaged.append(callout)
+            continue
+        key = managed_spec[0]
+        if previous_state is None or key not in previous:
+            raise ValueError("reserved managed callout identity is invalid")
+        managed_current[key] = callout
+
+    selected = set(() if profile is None else profile.explicit_anatomy)
+    desired_keys = {
+        key for key, anatomy, _managed_id, _label
+        in _CHARACTER_MANAGED_CALLOUT_SPECS
+        if anatomy in selected
+    }
+    can_derive = explicit_convenience and mode != "draft"
+    entries = []
+    active_callouts = []
+    for key, anatomy, managed_id, default_label in _CHARACTER_MANAGED_CALLOUT_SPECS:
+        prior = previous.get(key)
+        current = managed_current.get(key)
+        desired = can_derive and key in desired_keys
+        if prior is not None and prior.status == "tombstoned":
+            entries.append(prior)
+            continue
+        if not desired:
+            if prior is not None:
+                entries.append(replace(prior, status="tombstoned"))
+            continue
+        if prior is not None and current is None:
+            entries.append(replace(prior, status="tombstoned"))
+            continue
+        source_role = _character_callout_source(key, sheet_roles)
+        if current is None:
+            current = PackDetailCallout(
+                custom_id=managed_id,
+                label=default_label,
+                kind="custom",
+                requested_operation="auto",
+                source_role=source_role,
+            )
+        entry = CharacterManagedCallout(
+            key=key,
+            managed_id=managed_id,
+            label=current.label,
+            requested_operation=current.requested_operation,
+            source_role=current.source_role,
+            status="active",
+            renamed=current.label != default_label,
+        )
+        entries.append(entry)
+        active_callouts.append(current)
+    combined = (*unmanaged, *active_callouts)
+    if len(combined) > 8:
+        raise ValueError("detail_callouts must contain at most 8 total targets")
+    if not entries:
+        return tuple(combined), None
+    private = {
+        "schema_version": CHARACTER_PROFILE_SCHEMA_VERSION,
+        "entries": [item.private_metadata() for item in entries],
+    }
+    return (
+        tuple(combined),
+        CharacterManagedCalloutState(tuple(entries), _pack_seal(private)),
+    )
+
+
 def reference_pack_authored_settings_seal(value: object) -> str:
     """Validate and seal one owner-private authored-settings snapshot."""
     allowed_keys = {
         "type_fields", "detail_callouts", "additional_lora_parameters", "style",
+        "character_profile", "managed_character_callouts",
     }
     if (
         not isinstance(value, Mapping)
@@ -3520,6 +4259,8 @@ def reference_pack_authored_settings_seal(value: object) -> str:
     detail_callouts = value.get("detail_callouts")
     parameterized_loras = value.get("additional_lora_parameters", [])
     style = value.get("style")
+    character_profile = value.get("character_profile")
+    managed_character_callouts = value.get("managed_character_callouts")
     if (
         not isinstance(type_fields, Mapping)
         or any(
@@ -3539,6 +4280,39 @@ def reference_pack_authored_settings_seal(value: object) -> str:
                 or style != style.strip()
             )
         )
+        or (
+            "character_profile" in value
+            and not isinstance(character_profile, Mapping)
+        )
+        or (
+            "managed_character_callouts" in value
+            and not isinstance(managed_character_callouts, Mapping)
+        )
+    ):
+        raise ValueError("private authored settings are invalid")
+    try:
+        normalized_profile = normalize_character_profile(character_profile)
+        normalized_managed = _normalize_character_managed_callout_state(
+            managed_character_callouts,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("private authored settings are invalid") from error
+    if (
+        ("character_profile" in value) != (normalized_profile is not None)
+        or (
+            normalized_profile is not None
+            and normalized_profile.private_metadata() != dict(character_profile)
+        )
+        or (
+            "managed_character_callouts" in value
+            and normalized_managed is None
+        )
+        or (
+            normalized_managed is not None
+            and normalized_managed.private_metadata()
+            != dict(managed_character_callouts)
+        )
+        or (normalized_managed is not None and normalized_profile is None)
     ):
         raise ValueError("private authored settings are invalid")
     seen_loras = set()
@@ -3651,6 +4425,12 @@ def reference_pack_authored_settings_seal(value: object) -> str:
                 }
                 for item in parameterized_loras
             ]
+        if normalized_profile is not None:
+            payload["character_profile"] = normalized_profile.private_metadata()
+        if normalized_managed is not None:
+            payload["managed_character_callouts"] = (
+                normalized_managed.private_metadata()
+            )
         if len(json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode("utf-8")) > 262_144:
@@ -3814,6 +4594,9 @@ def build_reference_pack_plan(
     user_lora_count: int = 0,
     type_fields: object = None,
     detail_callouts: object = None,
+    character_profile: object = None,
+    managed_character_callouts: object = None,
+    explicit_convenience: bool = False,
     planning: PackIntelligenceSelection | None = None,
     review_selection: PackIntelligenceSelection | None = None,
     generation_schedule: PackModelSchedule | Mapping[str, Any] | None = None,
@@ -3829,6 +4612,21 @@ def build_reference_pack_plan(
 ) -> ReferencePackPlan:
     """Build one immutable, prompt-private v2 candidate-pack plan."""
     canonical_type = normalize_reference_pack_type(reference_type)
+    if type(explicit_convenience) is not bool:
+        raise ValueError("explicit_convenience must be a boolean")
+    if canonical_type != "character" and (
+        character_profile is not None
+        or managed_character_callouts is not None
+        or explicit_convenience
+    ):
+        raise ValueError("character profile is supported only for character packs")
+    normalized_character_profile = normalize_character_profile(
+        character_profile,
+        explicit_convenience=explicit_convenience,
+    )
+    normalized_managed_state = _normalize_character_managed_callout_state(
+        managed_character_callouts,
+    )
     if mode not in MODES:
         raise ValueError("mode must be production, hybrid, or draft")
     if intent not in PACK_INTENTS:
@@ -4061,6 +4859,14 @@ def build_reference_pack_plan(
         intent=intent,
         sheet_roles=tuple(recipe.role for recipe in recipes),
     )
+    callouts, normalized_managed_state = _reconcile_character_managed_callouts(
+        callouts,
+        profile=normalized_character_profile,
+        previous_state=normalized_managed_state,
+        sheet_roles=tuple(recipe.role for recipe in recipes),
+        explicit_convenience=explicit_convenience,
+        mode=mode,
+    )
     if mode == "draft" and callouts:
         raise ValueError("draft packs do not support editor-dependent detail callouts")
     planning = planning or PackIntelligenceSelection(
@@ -4128,6 +4934,14 @@ def build_reference_pack_plan(
         private_authored_settings["additional_lora_parameters"] = (
             parameterized_loras
         )
+    if normalized_character_profile is not None:
+        private_authored_settings["character_profile"] = (
+            normalized_character_profile.private_metadata()
+        )
+    if normalized_managed_state is not None:
+        private_authored_settings["managed_character_callouts"] = (
+            normalized_managed_state.private_metadata()
+        )
     authored_settings_seal = reference_pack_authored_settings_seal(
         private_authored_settings,
     )
@@ -4150,6 +4964,7 @@ def build_reference_pack_plan(
         "managed_layout_assist": managed_layout_assist,
         "user_lora_count": user_lora_count,
         "authored_settings_seal": authored_settings_seal,
+        "explicit_convenience": explicit_convenience,
         **(
             {"style_commitment": style_commitment}
             if style_commitment is not None else {}
@@ -4261,6 +5076,9 @@ def build_reference_pack_plan(
         review_contract=resolved_review_contract,
         operation_routing=sealed_operation_routing,
         additional_loras=sealed_loras,
+        character_profile=normalized_character_profile,
+        managed_character_callouts=normalized_managed_state,
+        explicit_convenience=explicit_convenience,
         resource_seal=resource_seal,
         role_brief_seal=role_brief_seal,
         authored_settings_seal=authored_settings_seal,
@@ -4290,6 +5108,15 @@ def _validate_reference_pack_plan(plan: object) -> ReferencePackPlan:
             user_lora_count=plan.user_lora_count,
             type_fields=plan.private_authored_settings()["type_fields"],
             detail_callouts=plan.private_authored_settings()["detail_callouts"],
+            character_profile=(
+                None if plan.character_profile is None
+                else plan.character_profile.private_metadata()
+            ),
+            managed_character_callouts=(
+                None if plan.managed_character_callouts is None
+                else plan.managed_character_callouts.private_metadata()
+            ),
+            explicit_convenience=plan.explicit_convenience,
             planning=plan.planning,
             review_selection=plan.review_selection,
             generation_schedule=plan.generation_schedule,
@@ -4334,6 +5161,15 @@ def apply_reference_pack_role_briefs(
         user_lora_count=plan.user_lora_count,
         type_fields=plan.private_authored_settings()["type_fields"],
         detail_callouts=plan.private_authored_settings()["detail_callouts"],
+        character_profile=(
+            None if plan.character_profile is None
+            else plan.character_profile.private_metadata()
+        ),
+        managed_character_callouts=(
+            None if plan.managed_character_callouts is None
+            else plan.managed_character_callouts.private_metadata()
+        ),
+        explicit_convenience=plan.explicit_convenience,
         planning=plan.planning,
         review_selection=plan.review_selection,
         generation_schedule=plan.generation_schedule,
@@ -4512,24 +5348,34 @@ def review_reference_pack(
                             rubric_item_id=item_id,
                         ),
                     )
-                    try:
-                        raw = reviewer(request)
-                    except Exception:  # noqa: BLE001 - provider boundary
+                    observation = None
+                    for _review_attempt in range(
+                        FIDELITY_QUESTION_REVIEW_ATTEMPTS
+                    ):
+                        provider_failed = False
+                        try:
+                            raw = reviewer(request)
+                        except Exception:  # noqa: BLE001 - provider boundary
+                            provider_failed = True
+                        finally:
+                            # Every retry uses the same isolated request and
+                            # descriptor-sealed inputs. Mutation is structural,
+                            # never an availability result and never retried.
+                            for path, snapshot in snapshots:
+                                _assert_stage_unchanged(path, snapshot)
+                        if provider_failed:
+                            continue
+                        try:
+                            observation = record_fidelity_rubric_answer(
+                                request, raw,
+                            )
+                        except ReferenceSheetReviewError:
+                            continue
+                        break
+                    if observation is None:
                         review_failed = True
                         break
-                    finally:
-                        # A reviewer gets no second inference after changing a
-                        # descriptor-sealed input. Integrity failure remains
-                        # structural and is never normalized to availability.
-                        for path, snapshot in snapshots:
-                            _assert_stage_unchanged(path, snapshot)
-                    try:
-                        observations.append(record_fidelity_rubric_answer(
-                            request, raw,
-                        ))
-                    except Exception:  # noqa: BLE001 - schema/answer boundary
-                        review_failed = True
-                        break
+                    observations.append(observation)
                 if review_failed:
                     break
             if not review_failed:
@@ -4659,9 +5505,24 @@ def _stage_pack_detail_crop(
             cropped,
             ((target_width - crop_width) // 2, (target_height - crop_height) // 2),
         )
-        staged = _staging_path(source_path.with_name(f"{source_path.stem}-detail.png"))
+        staged = _staging_path(
+            source_path.with_name(f"{source_path.stem}-detail.png"),
+            publication_safe_basename=True,
+        )
+        guard_path, guard_identity = _create_unpublished_media_guard(staged)
         try:
             _save_new_png(composed, staged)
+        except Exception:
+            try:
+                current = guard_path.lstat()
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and (current.st_dev, current.st_ino) == guard_identity
+                ):
+                    guard_path.unlink()
+            except OSError:
+                pass
+            raise
         finally:
             cropped.close()
             composed.close()
@@ -4696,6 +5557,32 @@ def create_reference_pack(
     owned_identities: dict[Path, tuple[int, int]] = {}
     artifacts: list[ReferencePackArtifact] = []
     repaired_roles: list[str] = []
+    attempt_history: list[ReferencePackAttempt] = []
+    attempt_fingerprints: list[tuple[tuple[Path, tuple[int, str], str], ...]] = []
+
+    def record_attempt(
+        current_artifacts: Sequence[ReferencePackArtifact],
+        current_review: SemanticReviewResult,
+        *,
+        repaired_role: str | None = None,
+        applied_correction_brief_commitment: str | None = None,
+    ) -> None:
+        attempt_index = len(attempt_history)
+        immutable_artifacts = tuple(current_artifacts)
+        attempt_history.append(ReferencePackAttempt(
+            attempt_index=attempt_index,
+            artifacts=immutable_artifacts,
+            review=current_review,
+            repair_count=attempt_index,
+            repaired_role=repaired_role,
+            applied_correction_brief_commitment=(
+                applied_correction_brief_commitment
+            ),
+        ))
+        attempt_fingerprints.append(tuple(
+            (artifact.path, _fingerprint(artifact.path), artifact.role)
+            for artifact in immutable_artifacts
+        ))
 
     def remember_owned(path: Path) -> None:
         try:
@@ -4722,7 +5609,8 @@ def create_reference_pack(
         reason_codes: Sequence[str] = (),
         detail_provenance: Mapping[str, Any] | None = None,
     ) -> ReferencePackArtifact:
-        paths.append(path)
+        if path not in paths:
+            paths.append(path)
         remember_owned(path)
         if _image_size(path, role) != plan.sheet_size:
             raise ReferenceSheetStructureError(
@@ -4770,9 +5658,8 @@ def create_reference_pack(
             editor_primary, normalized_crop, direct_crop = _stage_pack_detail_crop(
                 source.path, target_size=plan.sheet_size,
             )
-            if not direct_crop:
-                paths.append(editor_primary)
-                remember_owned(editor_primary)
+            paths.append(editor_primary)
+            remember_owned(editor_primary)
         operation = (
             "crop"
             if direct_crop
@@ -4827,18 +5714,35 @@ def create_reference_pack(
             strategy=strategy,
             anchor_role=plan.sheet_roles[0],
             reason_codes=reason_codes,
-            detail_provenance={
-                "custom_id": callout.custom_id,
-                "kind": callout.kind,
-                "source_role": callout.source_role,
-                "source_digest": source_digest,
-                "normalized_crop": list(request.normalized_crop or ()),
-                "requested_operation": callout.requested_operation,
-                "resolved_operation": operation,
-                "editor_model": None if direct_crop else request.model,
-                "label_digest": callout.label_digest,
-                "seal": request.detail_seal,
-            },
+            detail_provenance=(
+                {
+                    "managed": True,
+                    "source_digest": source_digest,
+                    "normalized_crop": list(request.normalized_crop or ()),
+                    "requested_operation": callout.requested_operation,
+                    "resolved_operation": operation,
+                    "editor_model": None if direct_crop else request.model,
+                    "commitment": (
+                        plan.character_profile.commitment(
+                            "managed_artifact", callout.private_metadata(),
+                        )
+                        if plan.character_profile is not None else None
+                    ),
+                    "commitment_kind": "nonce_bound_v1",
+                }
+                if callout.custom_id in _CHARACTER_MANAGED_BY_ID else {
+                    "custom_id": callout.custom_id,
+                    "kind": callout.kind,
+                    "source_role": callout.source_role,
+                    "source_digest": source_digest,
+                    "normalized_crop": list(request.normalized_crop or ()),
+                    "requested_operation": callout.requested_operation,
+                    "resolved_operation": operation,
+                    "editor_model": None if direct_crop else request.model,
+                    "label_digest": callout.label_digest,
+                    "seal": request.detail_seal,
+                }
+            ),
         )
     try:
         anchor_path: Path | None = None
@@ -4920,6 +5824,7 @@ def create_reference_pack(
         review = review_reference_pack(
             plan, artifacts, reviewer, attempt_index=0,
         )
+        record_attempt(artifacts, review)
         if plan.mode != "draft":
             assert anchor_path is not None and anchor_fingerprint is not None
             while (
@@ -5085,14 +5990,65 @@ def create_reference_pack(
                     reviewer,
                     attempt_index=len(repaired_roles),
                 )
+                record_attempt(
+                    artifacts,
+                    review,
+                    repaired_role=role,
+                    applied_correction_brief_commitment=(
+                        correction_brief.commitment
+                    ),
+                )
+        assessed_attempts = tuple(
+            ReferenceCandidateAssessment(
+                candidate_index=attempt.attempt_index,
+                assessment=attempt.review.fidelity_assessment,
+                repair_count=attempt.repair_count,
+            )
+            for attempt in attempt_history
+            if attempt.review.fidelity_assessment is not None
+        )
+        ungraded_corrected_attempts = tuple(
+            attempt for attempt in attempt_history
+            if attempt.attempt_index > 0
+            and attempt.review.fidelity_assessment is None
+        )
+        # A valid correction whose bounded re-review becomes unavailable must
+        # remain the selected, explicitly ungraded result. Falling back to an
+        # older negative grade would discard the corrected artifact and hide
+        # the reviewer outage. Fully assessed attempts still use deterministic
+        # quality ranking rather than latest-wins selection.
+        selected_attempt_index = (
+            ungraded_corrected_attempts[-1].attempt_index
+            if ungraded_corrected_attempts
+            else recommend_reference_candidate(assessed_attempts).candidate_index
+            if assessed_attempts
+            else 0
+        )
+        selected_attempt = attempt_history[selected_attempt_index]
+        final_correction_brief = (
+            build_fidelity_correction_brief(
+                selected_attempt.review.fidelity_assessment,
+            )
+            if selected_attempt.review.fidelity_assessment is not None
+            else None
+        )
+        # Every valid attempt remains byte-for-byte immutable until selection.
+        # Later attempts always use distinct output paths, so an older, better
+        # candidate can be selected without reconstructing or overwriting it.
+        for fingerprints in attempt_fingerprints:
+            for path, fingerprint, role in fingerprints:
+                _assert_preserved(path, fingerprint, role)
         return ReferencePackResult(
             plan=plan,
-            artifacts=tuple(artifacts),
-            review=review,
+            artifacts=selected_attempt.artifacts,
+            review=selected_attempt.review,
             repaired_roles=tuple(repaired_roles),
             max_repair_attempts=max_repair_attempts,
             repair_attempts_used=len(repaired_roles),
             private_source_paths=tuple(paths),
+            attempt_history=tuple(attempt_history),
+            selected_attempt_index=selected_attempt_index,
+            final_correction_brief=final_correction_brief,
         )
     except Exception:
         # Only paths returned by injected generators are known-owned here. The
@@ -5117,6 +6073,7 @@ __all__ = [
     "ASSET_TYPES",
     "FIDELITY_ASSESSMENT_VERSION",
     "FIDELITY_ATTEMPT_ACCEPTANCE_POLICY_VERSION",
+    "FIDELITY_QUESTION_REVIEW_ATTEMPTS",
     "FIDELITY_CORRECTION_TEMPLATE_ID",
     "FIDELITY_CORRECTION_TEMPLATE_VERSION",
     "FIDELITY_DIMENSIONS",
@@ -5138,10 +6095,18 @@ __all__ = [
     "PACK_SCHEMA_VERSION",
     "PACK_TYPE_FIELDS",
     "PACK_TYPE_PRESETS",
+    "CHARACTER_EXPLICIT_ANATOMY",
+    "CHARACTER_GENDERS",
+    "CHARACTER_MANAGED_CALLOUT_PROVENANCE",
+    "CHARACTER_PROFILE_SCHEMA_VERSION",
     "PLANNER_VERSION",
     "ROLE_RECIPES",
     "SCHEMA_VERSION",
     "ArtifactProvenance",
+    "CharacterAuthoredFacts",
+    "CharacterManagedCallout",
+    "CharacterManagedCalloutState",
+    "CharacterProfile",
     "CompositionGeometry",
     "DraftGenerationRequest",
     "FidelityAssessment",
@@ -5156,6 +6121,7 @@ __all__ = [
     "PanelPlacement",
     "PanelRecipe",
     "PackDetailCallout",
+    "PackAuthoredRequestContract",
     "PackIntelligenceSelection",
     "PackLoraSelection",
     "PackModelSchedule",
@@ -5163,6 +6129,7 @@ __all__ = [
     "PackSheetRecipe",
     "PackSheetRepairRequest",
     "ReferencePackArtifact",
+    "ReferencePackAttempt",
     "ReferencePackPlan",
     "ReferencePackResult",
     "ReferenceCandidateAssessment",
@@ -5184,6 +6151,7 @@ __all__ = [
     "create_reference_sheet",
     "create_reference_pack",
     "normalize_reference_pack_type",
+    "normalize_character_profile",
     "fidelity_attempt_accepted",
     "fidelity_rubric_applicability",
     "fidelity_rubric_role_applicability",
@@ -5193,6 +6161,7 @@ __all__ = [
     "record_fidelity_rubric_answer",
     "recommend_reference_candidate",
     "reference_candidate_ranking_key",
+    "reference_pack_authored_contract",
     "review_reference_sheet",
     "review_reference_pack",
     "validate_panel_files",

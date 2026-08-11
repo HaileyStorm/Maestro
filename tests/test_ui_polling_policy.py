@@ -287,8 +287,19 @@ class UiPollingStateTests(unittest.TestCase):
             "ui/src/components/Sidebar/ProjectReferenceLibrary.tsx"
         ]
         self.assertIn("await generateProjectAssetReferences(project", references)
-        self.assertIn("await confirmReconnectedJob(", references)
-        self.assertIn("response.job_id,\n        reconnectJobs,", references)
+        self.assertEqual(
+            references.count("await confirmAcceptedProjectReferenceJob("),
+            2,
+        )
+        self.assertEqual(references.count("jobId => confirmReconnectedJob("), 2)
+        self.assertIn(
+            "response.job_id,\n        jobId => confirmReconnectedJob(",
+            references,
+        )
+        self.assertIn(
+            "jobId,\n          reconnectJobs,\n          () => useStore.getState().jobs,",
+            references,
+        )
         retake = UI_SOURCES["ui/src/components/RetakeDialog.tsx"]
         self.assertIn("await api.submitRetake({", retake)
         self.assertNotIn("fetchJobStatus(", retake)
