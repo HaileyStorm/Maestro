@@ -1,15 +1,20 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import worker, { canonicalQuickTunnelOrigin, paths } from "./worker.mjs"
+import worker, {
+  canonicalQuickTunnelOrigin,
+  paths,
+  validatedRestartStatus,
+} from "./worker.mjs"
 import { extractNamespaceId } from "./provision_helpers.mjs"
 
 const secret = "test-secret-that-is-long-enough-for-tests"
 
 const environment = () => {
   const values = new Map()
-  return {
+  const env = {
     UPDATE_TOKEN: secret,
+    __TEST_VALUES: values,
     __TEST_FETCH: async () => new Response('{"status":"ok"}', {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -17,13 +22,32 @@ const environment = () => {
     MAESTRO_TARGETS: {
       get: async (key) => values.get(key) || null,
       put: async (key, value) => values.set(key, value),
+      delete: async (key) => values.delete(key),
     },
   }
+  return env
 }
 
 const auth = { Authorization: `Bearer ${secret}` }
 const target = "https://current-tunnel.trycloudflare.com"
 const stable = "https://maestro.example.workers.dev"
+const statusUrl = `${stable}${paths.STATUS_PATH}`
+const now = Date.parse("2030-01-02T03:04:05Z")
+const statusRecord = (overrides = {}) => ({
+  schema_version: 1,
+  generation: "generation_000001",
+  state: "restarting",
+  reason: "maintenance",
+  message: "Maestro is restarting for a planned update.",
+  issued_at: "2030-01-02T03:00:00Z",
+  expires_at: "2030-01-02T04:00:00Z",
+  eta: {
+    kind: "range",
+    earliest: "2030-01-02T03:15:00Z",
+    latest: "2030-01-02T03:30:00Z",
+  },
+  ...overrides,
+})
 const fetchedRequest = (input, init) => (
   input instanceof Request ? input : new Request(input, init)
 )
@@ -31,6 +55,12 @@ const fetchedRequest = (input, init) => (
 const configureTarget = async (env, value = target) => {
   await env.MAESTRO_TARGETS.put("quick-tunnel-origin", value)
 }
+
+const statusRequest = (method, body, headers = auth) => new Request(statusUrl, {
+  method,
+  headers: body === undefined ? headers : { ...headers, "Content-Type": "application/json" },
+  body: body === undefined ? undefined : JSON.stringify(body),
+})
 
 test("provisioner parses Wrangler JSONC and TOML namespace output", () => {
   const id = "0123456789abcdef0123456789abcdef"
@@ -97,6 +127,198 @@ test("authenticated health confirms the exact stored target", async () => {
   ), env)
   assert.equal(health.status, 200)
   assert.deepEqual(await health.json(), { ok: true, configured: true, target })
+})
+
+test("restart status management is authenticated and method bounded", async () => {
+  const env = environment()
+  for (const method of ["GET", "PUT", "DELETE"]) {
+    const response = await worker.fetch(statusRequest(
+      method,
+      method === "GET" ? undefined : (method === "PUT" ? statusRecord() : { generation: "generation_000001" }),
+      {},
+    ), env)
+    assert.equal(response.status, 401, method)
+    assert.deepEqual(await response.json(), { ok: false })
+  }
+  const unsupported = await worker.fetch(new Request(statusUrl, {
+    method: "POST",
+    headers: auth,
+  }), env)
+  assert.equal(unsupported.status, 405)
+  assert.deepEqual(await unsupported.json(), { ok: false })
+})
+
+test("restart status schema accepts only the closed canonical contract", async () => {
+  const validAt = statusRecord({
+    state: "planned",
+    reason: "restart",
+    eta: { kind: "at", at: "2030-01-02T03:20:00Z" },
+  })
+  assert.deepEqual(validatedRestartStatus(validAt), validAt)
+  assert.deepEqual(validatedRestartStatus(statusRecord({ eta: null })), statusRecord({ eta: null }))
+  for (const state of ["planned", "waiting_for_boundary", "restarting", "verifying", "complete", "postponed", "forced_emergency"]) {
+    assert.ok(validatedRestartStatus(statusRecord({ state })), state)
+  }
+  for (const reason of ["restart", "maintenance", "shutdown", "incident"]) {
+    assert.ok(validatedRestartStatus(statusRecord({ reason })), reason)
+  }
+  assert.ok(validatedRestartStatus(statusRecord({ generation: "a".repeat(16) })))
+  assert.ok(validatedRestartStatus(statusRecord({ generation: "a".repeat(64) })))
+  assert.ok(validatedRestartStatus(statusRecord({ message: "x".repeat(240) })))
+
+  const invalid = [
+    { ...statusRecord(), extra: true },
+    statusRecord({ schema_version: 2 }),
+    statusRecord({ generation: "too-short" }),
+    statusRecord({ generation: "a".repeat(65) }),
+    statusRecord({ generation: "generation.invalid" }),
+    statusRecord({ state: "unknown" }),
+    statusRecord({ reason: "upgrade" }),
+    statusRecord({ message: "" }),
+    statusRecord({ message: "x".repeat(241) }),
+    statusRecord({ message: "line one\nline two" }),
+    statusRecord({ issued_at: "2030-01-02T03:00:00.000Z" }),
+    statusRecord({ issued_at: "2030-02-30T03:00:00Z" }),
+    statusRecord({ expires_at: "2030-01-03T03:00:01Z" }),
+    statusRecord({ expires_at: "2030-01-02T03:00:00Z" }),
+    statusRecord({ eta: { kind: "at", at: "2030-01-02T04:00:01Z" } }),
+    statusRecord({ eta: { kind: "range", earliest: "2030-01-02T03:40:00Z", latest: "2030-01-02T03:30:00Z" } }),
+    statusRecord({ eta: { kind: "range", earliest: "2030-01-02T03:15:00Z", latest: "2030-01-02T03:30:00Z", extra: true } }),
+  ]
+  for (const [index, record] of invalid.entries()) {
+    assert.equal(validatedRestartStatus(record), null, `validator case ${index}`)
+    const response = await worker.fetch(statusRequest("PUT", record), environment())
+    assert.equal(response.status, 400, `endpoint case ${index}`)
+    assert.deepEqual(await response.json(), { ok: false })
+  }
+})
+
+test("restart status bounds request bodies and fails closed on KV errors", async () => {
+  const oversized = await worker.fetch(new Request(statusUrl, {
+    method: "PUT",
+    headers: { ...auth, "Content-Type": "application/json" },
+    body: "x".repeat(4097),
+  }), environment())
+  assert.equal(oversized.status, 413)
+
+  const readFailure = environment()
+  readFailure.MAESTRO_TARGETS.get = async () => { throw new Error("synthetic read failure") }
+  assert.equal((await worker.fetch(statusRequest("GET"), readFailure)).status, 503)
+  assert.equal((await worker.fetch(statusRequest("PUT", statusRecord()), readFailure)).status, 503)
+
+  const putFailure = environment()
+  putFailure.MAESTRO_TARGETS.put = async () => { throw new Error("synthetic put failure") }
+  assert.equal((await worker.fetch(statusRequest("PUT", statusRecord()), putFailure)).status, 503)
+
+  const deleteFailure = environment()
+  deleteFailure.__TEST_VALUES.set("restart-status", JSON.stringify(statusRecord()))
+  deleteFailure.MAESTRO_TARGETS.delete = async () => { throw new Error("synthetic delete failure") }
+  const clear = await worker.fetch(statusRequest("DELETE", {
+    generation: statusRecord().generation,
+  }), deleteFailure)
+  assert.equal(clear.status, 503)
+  assert.ok(deleteFailure.__TEST_VALUES.has("restart-status"))
+})
+
+test("restart status PUT is replay-safe and newer generations replace older ones", async () => {
+  const env = environment()
+  let puts = 0
+  const originalPut = env.MAESTRO_TARGETS.put
+  env.MAESTRO_TARGETS.put = async (...args) => {
+    puts += 1
+    return originalPut(...args)
+  }
+
+  const empty = await worker.fetch(statusRequest("GET"), env)
+  assert.equal(empty.status, 200)
+  assert.deepEqual(await empty.json(), { ok: true, status: null })
+
+  const firstRecord = statusRecord()
+  const first = await worker.fetch(statusRequest("PUT", firstRecord), env)
+  assert.equal(first.status, 200)
+  assert.deepEqual(await first.json(), { ok: true, status: firstRecord })
+  assert.equal(puts, 1)
+  assert.equal(env.__TEST_VALUES.size, 1)
+  assert.equal(
+    env.__TEST_VALUES.get("restart-status"),
+    JSON.stringify(firstRecord),
+  )
+
+  const replay = await worker.fetch(statusRequest("PUT", { ...firstRecord }), env)
+  assert.equal(replay.status, 200)
+  assert.equal(puts, 1)
+
+  const alteredReplay = await worker.fetch(statusRequest("PUT", statusRecord({
+    message: "Changed under the same generation.",
+  })), env)
+  assert.equal(alteredReplay.status, 409)
+
+  const older = await worker.fetch(statusRequest("PUT", statusRecord({
+    generation: "generation_000002",
+    issued_at: "2030-01-02T02:59:59Z",
+  })), env)
+  assert.equal(older.status, 409)
+
+  const sameTime = await worker.fetch(statusRequest("PUT", statusRecord({
+    generation: "generation_000003",
+  })), env)
+  assert.equal(sameTime.status, 409)
+
+  const newerRecord = statusRecord({
+    generation: "generation_000004",
+    state: "verifying",
+    issued_at: "2030-01-02T03:05:00Z",
+  })
+  const newer = await worker.fetch(statusRequest("PUT", newerRecord), env)
+  assert.equal(newer.status, 200)
+  assert.equal(puts, 2)
+
+  const current = await worker.fetch(statusRequest("GET"), env)
+  assert.deepEqual(await current.json(), { ok: true, status: newerRecord })
+})
+
+test("restart status DELETE clears only its matching generation", async () => {
+  const env = environment()
+  const current = statusRecord({ generation: "generation_000010" })
+  await worker.fetch(statusRequest("PUT", current), env)
+
+  const malformed = await worker.fetch(statusRequest("DELETE", {
+    generation: current.generation,
+    extra: true,
+  }), env)
+  assert.equal(malformed.status, 400)
+
+  const stale = await worker.fetch(statusRequest("DELETE", {
+    generation: "generation_000009",
+  }), env)
+  assert.equal(stale.status, 200)
+  assert.deepEqual(await stale.json(), { ok: true, cleared: false })
+  assert.ok(env.__TEST_VALUES.has("restart-status"))
+
+  const matching = await worker.fetch(statusRequest("DELETE", {
+    generation: current.generation,
+  }), env)
+  assert.equal(matching.status, 200)
+  assert.deepEqual(await matching.json(), { ok: true, cleared: true })
+  assert.equal(env.__TEST_VALUES.has("restart-status"), false)
+
+  const repeated = await worker.fetch(statusRequest("DELETE", {
+    generation: current.generation,
+  }), env)
+  assert.deepEqual(await repeated.json(), { ok: true, cleared: false })
+})
+
+test("restart status DELETE rejects non-string generation values", async () => {
+  const env = environment()
+  const current = statusRecord({ generation: "generation_000010" })
+  await worker.fetch(statusRequest("PUT", current), env)
+
+  for (const generation of [1234567890123456, [current.generation]]) {
+    const response = await worker.fetch(statusRequest("DELETE", { generation }), env)
+    assert.equal(response.status, 400)
+    assert.deepEqual(await response.json(), { ok: false })
+    assert.ok(env.__TEST_VALUES.has("restart-status"))
+  }
 })
 
 test("GET polling stays on the stable address and preserves request details", async () => {
@@ -448,6 +670,144 @@ test("offline browser navigation gets static no-tracking HTML", async () => {
   assert.equal(probes[0].url, "https://expired-tunnel.trycloudflare.com/health")
   assert.equal(probes[0].options.redirect, "manual")
   assert.equal(probes[0].options.method, "GET")
+})
+
+test("current restart status renders escaped accessible HTML before origin health", async () => {
+  const env = environment()
+  env.__TEST_NOW = now
+  const record = statusRecord({
+    state: "waiting_for_boundary",
+    message: 'Please wait <script>alert("unsafe")</script> & retry.',
+  })
+  const stored = await worker.fetch(statusRequest("PUT", record), env)
+  assert.equal(stored.status, 200)
+  await configureTarget(env)
+  let healthProbes = 0
+  env.__TEST_FETCH = async () => {
+    healthProbes += 1
+    return new Response(null, { status: 530 })
+  }
+
+  const response = await worker.fetch(new Request(`${stable}/project/current`, {
+    headers: { "Sec-Fetch-Mode": "navigate" },
+  }), env)
+  assert.equal(response.status, 503)
+  assert.match(response.headers.get("Content-Type"), /^text\/html/)
+  assert.equal(response.headers.get("Cache-Control"), "no-store")
+  assert.match(response.headers.get("Content-Security-Policy"), /default-src 'none'/)
+  const html = await response.text()
+  assert.match(html, /aria-labelledby="status-title"/)
+  assert.match(html, /Waiting for boundary/)
+  assert.match(html, /Please wait &lt;script&gt;alert\(&quot;unsafe&quot;\)&lt;\/script&gt; &amp; retry\./)
+  assert.match(html, /2030-01-02T03:15:00Z to 2030-01-02T03:30:00Z/)
+  assert.doesNotMatch(html, /<script|alert\("unsafe"\)/)
+  assert.equal(healthProbes, 1)
+})
+
+test("proxy disconnect also renders the current restart status for navigation", async () => {
+  const env = environment()
+  env.__TEST_NOW = now
+  await configureTarget(env)
+  await worker.fetch(statusRequest("PUT", statusRecord({
+    state: "verifying",
+    eta: { kind: "at", at: "2030-01-02T03:20:00Z" },
+  })), env)
+  env.__TEST_FETCH = async (input, init) => {
+    const request = fetchedRequest(input, init)
+    if (new URL(request.url).pathname === "/health") {
+      return new Response(null, { status: 204 })
+    }
+    throw new Error("synthetic proxy disconnect")
+  }
+
+  const response = await worker.fetch(new Request(`${stable}/project/current`, {
+    headers: { Accept: "text/html" },
+  }), env)
+  assert.equal(response.status, 503)
+  const html = await response.text()
+  assert.match(html, /Maestro service update/)
+  assert.match(html, /Verifying/)
+  assert.match(html, /2030-01-02T03:20:00Z/)
+})
+
+test("expired, malformed, and unreadable restart status use the unchanged generic HTML", async () => {
+  const baselineEnv = environment()
+  baselineEnv.__TEST_NOW = now
+  const baseline = await worker.fetch(new Request(`${stable}/`, {
+    headers: { Accept: "text/html" },
+  }), baselineEnv)
+  const genericHtml = await baseline.text()
+
+  const expired = environment()
+  expired.__TEST_NOW = now
+  expired.__TEST_VALUES.set("restart-status", JSON.stringify(statusRecord({
+    issued_at: "2030-01-02T01:00:00Z",
+    expires_at: "2030-01-02T02:00:00Z",
+    eta: null,
+  })))
+
+  const malformed = environment()
+  malformed.__TEST_NOW = now
+  malformed.__TEST_VALUES.set("restart-status", "{not-json")
+
+  const future = environment()
+  future.__TEST_NOW = now
+  future.__TEST_VALUES.set("restart-status", JSON.stringify(statusRecord({
+    issued_at: "2030-01-02T04:00:00Z",
+    expires_at: "2030-01-02T05:00:00Z",
+    eta: null,
+  })))
+
+  const unreadable = environment()
+  unreadable.__TEST_NOW = now
+  const unreadableGet = unreadable.MAESTRO_TARGETS.get
+  unreadable.MAESTRO_TARGETS.get = async (key) => {
+    if (key === "restart-status") throw new Error("synthetic KV read failure")
+    return unreadableGet(key)
+  }
+
+  for (const [name, env] of [["expired", expired], ["future", future], ["malformed", malformed], ["unreadable", unreadable]]) {
+    const response = await worker.fetch(new Request(`${stable}/`, {
+      headers: { Accept: "text/html" },
+    }), env)
+    assert.equal(response.status, 503, name)
+    assert.equal(await response.text(), genericHtml, name)
+  }
+})
+
+test("restart status never changes GET API paths into browser offline HTML", async () => {
+  const env = environment()
+  env.__TEST_NOW = now
+  env.__TEST_VALUES.set("restart-status", JSON.stringify(statusRecord()))
+  let statusReads = 0
+  const originalGet = env.MAESTRO_TARGETS.get
+  env.MAESTRO_TARGETS.get = async (key) => {
+    if (key === "restart-status") statusReads += 1
+    return originalGet(key)
+  }
+  for (const pathname of ["/api", "/api/v1/jobs"]) {
+    const response = await worker.fetch(new Request(`${stable}${pathname}`, {
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "Sec-Fetch-Mode": "navigate",
+      },
+    }), env)
+    assert.equal(response.status, 503, pathname)
+    assert.match(response.headers.get("Content-Type"), /^application\/json/)
+    assert.deepEqual(
+      await response.json(),
+      { ok: false, detail: "Maestro is offline" },
+      pathname,
+    )
+  }
+  assert.equal(statusReads, 0)
+
+  const ordinaryNavigation = await worker.fetch(new Request(`${stable}/apiary`, {
+    headers: { "Sec-Fetch-Mode": "navigate" },
+  }), env)
+  assert.equal(ordinaryNavigation.status, 503)
+  assert.match(ordinaryNavigation.headers.get("Content-Type"), /^text\/html/)
+  assert.match(await ordinaryNavigation.text(), /Maestro service update/)
 })
 
 test("offline API and non-navigation requests get 503 JSON without redirect", async () => {

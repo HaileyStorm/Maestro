@@ -2,8 +2,8 @@
 
 This tiny Cloudflare Worker gives Maestro a reusable `https://*.workers.dev`
 address while Pinokio continues to create a free Quick Tunnel on every launch.
-It stores only the current canonical `https://*.trycloudflare.com` origin in KV
-and supports two public traffic modes. The default `proxy` mode streams HTTP
+It stores the current canonical `https://*.trycloudflare.com` origin and one
+bounded restart-status record in KV, and supports two public traffic modes. The default `proxy` mode streams HTTP
 requests and responses through the reusable address, so refreshing a Maestro
 page keeps the stable hostname after Maestro or Pinokio restarts. The explicit
 `redirect` rollback mode preserves the previous low-traffic `307` behavior. In
@@ -18,7 +18,8 @@ Proxy mode is a privacy and capacity tradeoff compared with redirect mode:
 request and response content now transits the Cloudflare Worker runtime as well
 as the Quick Tunnel. The Worker does not log request bodies, cookies,
 Authorization, prompts, media, or responses; observability remains disabled and
-it stores only the current Quick Tunnel origin in KV. Proxied responses use
+KV stores only the current Quick Tunnel origin plus the optional restart-status
+record described below. Proxied responses use
 `Cache-Control: no-store`. Host-only browser cookies stay attached to the stable
 hostname and are forwarded only to the currently registered canonical Quick
 Tunnel target.
@@ -37,9 +38,13 @@ the Quick Tunnel establish the actual upstream host and forwarding identity.
 > larger uploads. Chunked upload assembly is not implemented here.
 
 When the Quick Tunnel or Maestro is unavailable, a normal browser navigation
-receives a self-contained no-tracking offline page. API calls and non-navigation
-requests receive a small `503` JSON response. The page has no scripts, remote
-assets, forms, user content, or analytics and is served with a restrictive CSP.
+receives a self-contained no-tracking offline page. A valid current restart
+status replaces the generic copy with its escaped message, state, reason,
+validity, and ETA; malformed, expired, future, or unreadable status falls back
+to the generic page. API calls and non-navigation requests always receive the
+same small `503` JSON response. Both pages have no scripts, remote assets,
+forms, analytics, or executable user content and are served with a restrictive
+CSP.
 
 Use only a Cloudflare **Workers Free** account. Do not enable a paid Workers
 plan, paid usage, or a custom domain for this setup. Free-plan limits fail
@@ -104,11 +109,73 @@ Any missing, unauthorized, unhealthy, or still-stale Worker falls back to the
 current Quick Tunnel.
 
 Workers KV is globally eventually consistent. A different edge can briefly
-retain the previous launch's target even after local verification, typically
-failing on that expired Quick Tunnel until KV converges. The proxy never
+retain the previous launch's target or restart status even after local
+verification. A stale target typically fails on the expired Quick Tunnel until
+KV converges; a stale status can briefly show older restart information. The
+status protocol therefore requires one serialized writer that awaits each
+mutation before issuing the next. Its generation and timestamp checks prevent
+ordinary sequential stale or altered replays at the edge handling the write,
+but KV is not a transactional compare-and-swap store and cannot provide global
+linearizability. Overlapping writes or clears are unsupported and can race even
+when they came from the same logical caller. The proxy never
 weakens the backend's project passwords or remote restrictions, and target
 validation prevents KV from sending traffic outside canonical Quick Tunnel
 origins.
+
+## Restart-status protocol
+
+The authenticated `/.well-known/maestro-share/status` endpoint uses the same
+`UPDATE_TOKEN` bearer secret as target registration. It accepts only one closed
+JSON schema (no additional properties):
+
+```json
+{
+  "schema_version": 1,
+  "generation": "restart_20300102_abcd",
+  "state": "restarting",
+  "reason": "maintenance",
+  "message": "Maestro is restarting for a planned update.",
+  "issued_at": "2030-01-02T03:00:00Z",
+  "expires_at": "2030-01-02T04:00:00Z",
+  "eta": {
+    "kind": "range",
+    "earliest": "2030-01-02T03:15:00Z",
+    "latest": "2030-01-02T03:30:00Z"
+  }
+}
+```
+
+`generation` must be a 16-64 character URL-safe opaque value. `state` is one
+of `planned`, `waiting_for_boundary`, `restarting`, `verifying`, `complete`,
+`postponed`, or `forced_emergency`; `reason` is one of `restart`,
+`maintenance`, `shutdown`, or `incident`. `message` is 1-240 characters and
+cannot contain control characters. All timestamps are canonical UTC
+whole-second strings. The validity window must be positive and no longer than
+24 hours. `eta` is either `null`, `{ "kind": "at", "at": "..." }`, or a
+range as above; every ETA timestamp must fall within the record's validity
+window.
+
+- `GET` returns `{ "ok": true, "status": null }` or the stored valid record.
+- `PUT` creates or replaces the record. For the required serialized writer, an
+  exact replay is idempotent. A
+  changed replay of the current generation, a different generation with the
+  same `issued_at`, or an older generation returns `409`.
+- `DELETE` requires exactly `{ "generation": "..." }` and clears only a
+  matching generation. For serialized operations, a stale clear succeeds with
+  `cleared: false` and cannot delete a newer record. Callers must never overlap
+  this read/modify/delete operation with another mutation.
+
+Use the bounded operator helper from the repository root after making
+`PINOKIO_STABLE_SHARE_URL` and `PINOKIO_STABLE_SHARE_UPDATE_SECRET` available
+in its process environment. The helper reads the bearer secret only from the
+environment, sends it in the request header, and does not place it in command
+arguments or output:
+
+```sh
+python app/scripts/restart_status.py show
+python app/scripts/restart_status.py set --state restarting --reason maintenance --message "Maestro is restarting for a planned update." --ttl-seconds 900
+python app/scripts/restart_status.py clear --generation restart_20300102_abcd
+```
 
 ## Default proxy, direct fallback, and rollback
 
@@ -136,9 +203,10 @@ The reserved authenticated endpoints are:
 
 - `PUT /.well-known/maestro-share/target`
 - `GET /.well-known/maestro-share/health`
+- `GET|PUT|DELETE /.well-known/maestro-share/status`
 - `GET /.well-known/maestro-share/direct` (public bounded fallback)
 
-The target and health endpoints require
+The target, health, and status endpoints require
 `Authorization: Bearer <PINOKIO_STABLE_SHARE_UPDATE_SECRET>`; the direct fallback
 does not. Responses use `Cache-Control: no-store`, and the update secret is
 never returned. Run the offline Worker tests with
