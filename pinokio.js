@@ -33,7 +33,6 @@ module.exports = {
     } else if (installed) {
       if (running.restart) {
         return [{
-          default: true,
           icon: "fa-solid fa-rotate",
           text: "Restarting Maestro",
           href: "restart.js",

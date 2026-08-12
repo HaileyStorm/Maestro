@@ -228,10 +228,22 @@ Promise.resolve(launcher.menu({}, info))
                     locals_by_script={"start.js": local},
                 )
                 actions = [item for item in menu if item.get("href") == "restart.js"]
-                self.assertEqual(bool(actions), expected)
+                self.assertEqual(len(actions), 1 if expected else 0)
                 if actions:
                     self.assertEqual(actions[0]["text"], "Restart Maestro")
+                    self.assertNotIn("default", actions[0])
                 self.assertIn("start.js", [item.get("href") for item in menu])
+
+    def test_running_restart_status_is_visible_without_auto_restarting(self):
+        menu = self._render_launcher_menu(
+            running={"restart.js": True},
+            locals_by_script={},
+        )
+
+        actions = [item for item in menu if item.get("href") == "restart.js"]
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["text"], "Restarting Maestro")
+        self.assertNotIn("default", actions[0])
 
     def test_restart_script_publishes_before_restart_with_one_opaque_generation(self):
         loader = r"""
