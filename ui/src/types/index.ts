@@ -874,6 +874,28 @@ export interface SupportFulfillmentMutationInput {
   proof_reference: string | null
 }
 
+export type SupportContributionSource =
+  | 'buy_me_a_coffee'
+  | 'patreon'
+  | 'direct_compute_sponsorship'
+
+export type SupportManualContributionKind =
+  | 'one_time_contribution'
+  | 'recurring_started'
+  | 'recurring_renewed'
+  | 'recurring_canceled'
+  | 'refund'
+  | 'chargeback'
+
+export interface SupportManualContributionInput {
+  source: SupportContributionSource
+  kind: SupportManualContributionKind
+  amount_minor: number
+  currency: string
+  target_event_id: string | null
+  idempotency_key: string
+}
+
 export interface SupportAdminDiscrepancy {
   event_id: string
   reason: 'unresolved_or_mismatched_adjustment' | 'adjustments_exceed_contribution'

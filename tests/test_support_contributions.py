@@ -29,6 +29,7 @@ from services.entitlements import (  # noqa: E402
     ContributionLedger,
     EntitlementError,
     LedgerIntegrityError,
+    ManualContributionConflict,
     RecordedAllowancePolicy,
     DEFAULT_BENEFIT_POLICY,
     opaque_key,
@@ -866,6 +867,198 @@ class ContributionLedgerTests(unittest.TestCase):
         self.assertEqual(sorted(result[0] for result in outcomes), [
             "conflict", "ok",
         ])
+        self.assertEqual(len(self.ledger.events()), 2)
+
+    def test_manual_owner_contribution_lifecycle_is_atomic_and_idempotent(self):
+        common = {
+            "subject_key": self.subject,
+            "source": "buy_me_a_coffee",
+            "currency": "USD",
+            "actor_key": keyed("manual_actor", "owner-1"),
+            "occurred_at": NOW,
+            "received_at": NOW,
+        }
+        one_time = self.ledger.record_manual_contribution(
+            **common,
+            kind="one_time_contribution",
+            amount_minor=1_000,
+            target_event_id=None,
+            source_event_key=keyed("manual_request", "gift-1"),
+        )
+        self.assertEqual(one_time.provider, "manual_buy_me_a_coffee")
+        self.assertEqual(
+            self.ledger.record_manual_contribution(
+                **common,
+                kind="one_time_contribution",
+                amount_minor=1_000,
+                target_event_id=None,
+                source_event_key=keyed("manual_request", "gift-1"),
+            ),
+            one_time,
+        )
+        with self.assertRaises(ManualContributionConflict):
+            self.ledger.record_manual_contribution(
+                **common,
+                kind="one_time_contribution",
+                amount_minor=1_001,
+                target_event_id=None,
+                source_event_key=keyed("manual_request", "gift-1"),
+            )
+
+        recurring = self.ledger.record_manual_contribution(
+            **common,
+            kind="recurring_started",
+            amount_minor=500,
+            target_event_id=None,
+            source_event_key=keyed("manual_request", "recurring-start"),
+        )
+        renewed = self.ledger.record_manual_contribution(
+            **common,
+            kind="recurring_renewed",
+            amount_minor=500,
+            target_event_id=recurring.event_id,
+            source_event_key=keyed("manual_request", "recurring-renew"),
+        )
+        self.assertEqual(renewed.contract_key, recurring.contract_key)
+        self.assertEqual(renewed.related_event_key, recurring.source_event_key)
+        canceled = self.ledger.record_manual_contribution(
+            **common,
+            kind="recurring_canceled",
+            amount_minor=0,
+            target_event_id=renewed.event_id,
+            source_event_key=keyed("manual_request", "recurring-cancel"),
+        )
+        self.assertEqual(canceled.contract_key, recurring.contract_key)
+        self.assertEqual(
+            self.ledger.record_manual_contribution(
+                **common,
+                kind="recurring_canceled",
+                amount_minor=0,
+                target_event_id=renewed.event_id,
+                source_event_key=keyed("manual_request", "recurring-cancel"),
+            ),
+            canceled,
+        )
+        with self.assertRaises(ManualContributionConflict):
+            self.ledger.record_manual_contribution(
+                **common,
+                kind="recurring_renewed",
+                amount_minor=500,
+                target_event_id=renewed.event_id,
+                source_event_key=keyed("manual_request", "renew-after-cancel"),
+            )
+
+        refund = self.ledger.record_manual_contribution(
+            **common,
+            kind="refund",
+            amount_minor=600,
+            target_event_id=one_time.event_id,
+            source_event_key=keyed("manual_request", "refund"),
+        )
+        chargeback = self.ledger.record_manual_contribution(
+            **common,
+            kind="chargeback",
+            amount_minor=400,
+            target_event_id=one_time.event_id,
+            source_event_key=keyed("manual_request", "chargeback"),
+        )
+        self.assertEqual(refund.related_event_key, one_time.source_event_key)
+        self.assertEqual(chargeback.related_event_key, one_time.source_event_key)
+        with self.assertRaises(ManualContributionConflict):
+            self.ledger.record_manual_contribution(
+                **common,
+                kind="refund",
+                amount_minor=1,
+                target_event_id=one_time.event_id,
+                source_event_key=keyed("manual_request", "excess-refund"),
+            )
+        self.assertEqual(
+            self.ledger.reauthenticated_admin_projection(self.subject)[
+                "currency_totals_minor"
+            ]["USD"],
+            1_000,
+        )
+
+    def test_manual_targets_are_same_account_source_currency_and_active_chain(self):
+        actor = keyed("manual_actor", "owner")
+        funding = self.ledger.record_manual_contribution(
+            subject_key=self.subject,
+            source="patreon",
+            kind="recurring_started",
+            amount_minor=900,
+            currency="USD",
+            target_event_id=None,
+            source_event_key=keyed("manual_request", "patreon-start"),
+            actor_key=actor,
+            occurred_at=NOW,
+            received_at=NOW,
+        )
+        base = {
+            "subject_key": self.subject,
+            "kind": "recurring_renewed",
+            "amount_minor": 900,
+            "target_event_id": funding.event_id,
+            "actor_key": actor,
+            "occurred_at": NOW,
+            "received_at": NOW,
+        }
+        for label, replacement in (
+            ("source", {"source": "buy_me_a_coffee", "currency": "USD"}),
+            ("currency", {"source": "patreon", "currency": "EUR"}),
+            ("account", {
+                "source": "patreon",
+                "currency": "USD",
+                "subject_key": keyed("test_subject", "other"),
+            }),
+        ):
+            with self.subTest(label=label), self.assertRaises(
+                ManualContributionConflict,
+            ):
+                self.ledger.record_manual_contribution(
+                    **{**base, **replacement},
+                    source_event_key=keyed("manual_request", f"bad-{label}"),
+                )
+
+    def test_competing_manual_adjustments_serialize_remaining_net(self):
+        common = {
+            "subject_key": self.subject,
+            "source": "direct_compute_sponsorship",
+            "currency": "USD",
+            "actor_key": keyed("manual_actor", "owner"),
+        }
+        funding = self.ledger.record_manual_contribution(
+            **common,
+            kind="one_time_contribution",
+            amount_minor=100,
+            target_event_id=None,
+            source_event_key=keyed("manual_request", "compute-funding"),
+        )
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def adjust(label):
+            barrier.wait()
+            try:
+                self.ledger.record_manual_contribution(
+                    **common,
+                    kind="refund",
+                    amount_minor=75,
+                    target_event_id=funding.event_id,
+                    source_event_key=keyed("manual_request", label),
+                )
+                outcomes.append("ok")
+            except ManualContributionConflict:
+                outcomes.append("conflict")
+
+        threads = [threading.Thread(target=adjust, args=(label,)) for label in (
+            "race-refund-a", "race-refund-b",
+        )]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(sorted(outcomes), ["conflict", "ok"])
         self.assertEqual(len(self.ledger.events()), 2)
 
     def test_malformed_events_and_orphan_adjustments_are_bounded(self):

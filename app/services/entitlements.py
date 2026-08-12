@@ -59,6 +59,17 @@ RECURRING_KINDS = frozenset({
 FULFILLMENT_STATES = frozenset({
     "pending", "in_progress", "fulfilled", "declined", "reversed",
 })
+MANUAL_CONTRIBUTION_SOURCES = frozenset({
+    "buy_me_a_coffee", "patreon", "direct_compute_sponsorship",
+})
+MANUAL_CONTRIBUTION_KINDS = frozenset({
+    "one_time_contribution", "recurring_started", "recurring_renewed",
+    "recurring_canceled", "refund", "chargeback",
+})
+_MANUAL_PROVIDER_BY_SOURCE = MappingProxyType({
+    source: f"manual_{source}" for source in MANUAL_CONTRIBUTION_SOURCES
+})
+_MANUAL_PROVIDERS = frozenset(_MANUAL_PROVIDER_BY_SOURCE.values())
 LEGACY_FULFILLMENT_STATES = frozenset({"complete"})
 _FULFILLMENT_TRANSITIONS = MappingProxyType({
     None: frozenset({"pending"}),
@@ -86,6 +97,10 @@ class LedgerIntegrityError(EntitlementError):
 
 
 class ContributionConflict(EntitlementError):
+    pass
+
+
+class ManualContributionConflict(ContributionConflict):
     pass
 
 
@@ -503,7 +518,17 @@ def _normalize_draft(
             or draft.actor_key is None
         ):
             raise EntitlementError("fulfillment events require item, state, actor, and target")
-    elif any((draft.fulfillment_item, draft.fulfillment_status, draft.actor_key)):
+    elif (
+        draft.fulfillment_item is not None
+        or draft.fulfillment_status is not None
+        or (
+            draft.actor_key is not None
+            and not (
+                draft.provider in _MANUAL_PROVIDERS
+                and draft.kind in MANUAL_CONTRIBUTION_KINDS
+            )
+        )
+    ):
         raise EntitlementError("fulfillment fields are reserved for fulfillment events")
     return {
         "provider": draft.provider,
@@ -1164,6 +1189,164 @@ class ContributionLedger:
                 related_event_key=related,
                 fulfillment_item=item,
                 fulfillment_status=status,
+                actor_key=actor_key,
+            ))
+            return self._append_normalized_unlocked(events, normalized, received)
+
+    def record_manual_contribution(
+        self,
+        *,
+        subject_key: str,
+        source: str,
+        kind: str,
+        amount_minor: int,
+        currency: str,
+        target_event_id: str | None,
+        source_event_key: str,
+        actor_key: str,
+        occurred_at: datetime | str | None = None,
+        received_at: datetime | str | None = None,
+    ) -> ContributionEvent:
+        """Validate and append one owner-recorded contribution atomically."""
+
+        _validate_opaque(subject_key, name="subject", required=True)
+        _validate_opaque(source_event_key, name="source event", required=True)
+        _validate_opaque(actor_key, name="actor", required=True)
+        if source not in MANUAL_CONTRIBUTION_SOURCES:
+            raise EntitlementError("manual contribution source is invalid")
+        if kind not in MANUAL_CONTRIBUTION_KINDS:
+            raise EntitlementError("manual contribution kind is invalid")
+        if (
+            not isinstance(amount_minor, int)
+            or isinstance(amount_minor, bool)
+            or amount_minor < 0
+            or amount_minor > 10_000_000_000
+        ):
+            raise EntitlementError("amount_minor is invalid")
+        if not isinstance(currency, str) or re.fullmatch(
+            r"[A-Z]{3}", currency,
+        ) is None:
+            raise EntitlementError("currency must be a three-letter uppercase code")
+        if target_event_id is not None and (
+            not isinstance(target_event_id, str)
+            or re.fullmatch(r"evt_[0-9a-f]{32}", target_event_id) is None
+        ):
+            raise ManualContributionConflict(
+                "manual contribution target is unavailable"
+            )
+        provider = _MANUAL_PROVIDER_BY_SOURCE[source]
+        received = _iso_utc(received_at or datetime.now(timezone.utc))
+        requested_time = _as_utc(occurred_at or datetime.now(timezone.utc))
+        with self._locked():
+            events = list(self._read_unlocked())
+            effective_events = _events_for_subject(
+                events, subject_key, as_of=datetime.now(timezone.utc),
+            )
+            target = next((
+                event for event in effective_events
+                if event.event_id == target_event_id
+                and event.subject_key == subject_key
+                and event.kind in FUNDING_KINDS
+            ), None)
+            related_event_key = None if target is None else target.source_event_key
+            contract_key = None
+            if kind == "recurring_started":
+                contract_key = source_event_key
+            elif kind in {"recurring_renewed", "recurring_canceled"}:
+                contract_key = None if target is None else target.contract_key
+
+            existing_idempotency = next((
+                event for event in events
+                if event.source_event_key == source_event_key
+            ), None)
+            if existing_idempotency is not None:
+                if (
+                    existing_idempotency.provider == provider
+                    and existing_idempotency.subject_key == subject_key
+                    and existing_idempotency.kind == kind
+                    and existing_idempotency.amount_minor == amount_minor
+                    and existing_idempotency.currency == currency
+                    and existing_idempotency.contract_key == contract_key
+                    and existing_idempotency.related_event_key == related_event_key
+                    and existing_idempotency.actor_key == actor_key
+                ):
+                    return existing_idempotency
+                raise ManualContributionConflict(
+                    "manual contribution idempotency key conflicts"
+                )
+
+            initial = kind in {"one_time_contribution", "recurring_started"}
+            if initial:
+                if target_event_id is not None:
+                    raise ManualContributionConflict(
+                        "manual funding events cannot target another event"
+                    )
+            else:
+                if target is None:
+                    raise ManualContributionConflict(
+                        "manual contribution target is unavailable"
+                    )
+                if target.provider != provider or target.currency != currency:
+                    raise ManualContributionConflict(
+                        "manual contribution target does not match its source"
+                    )
+
+            if kind in FUNDING_KINDS and amount_minor <= 0:
+                raise EntitlementError("funding events require a positive amount")
+            if kind == "recurring_canceled" and amount_minor != 0:
+                raise EntitlementError("recurring_canceled cannot carry money")
+            if kind in {"recurring_renewed", "recurring_canceled"}:
+                if (
+                    target is None
+                    or target.kind not in {"recurring_started", "recurring_renewed"}
+                    or target.contract_key is None
+                ):
+                    raise ManualContributionConflict(
+                        "manual recurring target is unavailable"
+                    )
+                contract_events = [
+                    event for event in effective_events
+                    if event.provider == provider
+                    and event.subject_key == subject_key
+                    and event.contract_key == target.contract_key
+                    and event.kind in RECURRING_KINDS
+                ]
+                latest = max(
+                    contract_events,
+                    key=lambda event: (_as_utc(event.occurred_at), event.sequence),
+                    default=None,
+                )
+                if latest is None or latest.kind == "recurring_canceled":
+                    raise ManualContributionConflict(
+                        "manual recurring contract is not active"
+                    )
+            if kind in ADJUSTMENT_KINDS:
+                if amount_minor <= 0:
+                    raise EntitlementError(
+                        "adjustments require a positive amount"
+                    )
+                adjusted = sum(
+                    event.amount_minor for event in effective_events
+                    if event.provider == provider
+                    and event.subject_key == subject_key
+                    and event.kind in ADJUSTMENT_KINDS
+                    and event.related_event_key == target.source_event_key
+                )
+                if amount_minor > target.amount_minor - adjusted:
+                    raise ManualContributionConflict(
+                        "manual adjustment exceeds remaining contribution"
+                    )
+
+            normalized = _normalize_draft(ContributionEventDraft(
+                provider=provider,
+                source_event_key=source_event_key,
+                subject_key=subject_key,
+                kind=kind,
+                occurred_at=requested_time,
+                amount_minor=amount_minor,
+                currency=currency,
+                contract_key=contract_key,
+                related_event_key=related_event_key,
                 actor_key=actor_key,
             ))
             return self._append_normalized_unlocked(events, normalized, received)

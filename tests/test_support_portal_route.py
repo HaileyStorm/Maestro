@@ -31,6 +31,7 @@ from services.entitlements import (
     ContributionLedger,
     EntitlementError,
     LedgerIntegrityError,
+    ManualContributionConflict,
 )
 from services.responsible_use import (
     ResponsibleUseError,
@@ -172,6 +173,32 @@ class _Portal:
             },
         }
 
+    def record_owner_contribution(
+        self,
+        session_id,
+        *,
+        remote,
+        target_account_id,
+        source,
+        kind,
+        amount_minor,
+        currency,
+        target_event_id,
+        idempotency_key,
+    ):
+        self.calls.append((
+            "contribution", session_id, remote, target_account_id, source,
+            kind, amount_minor, currency, target_event_id, idempotency_key,
+        ))
+        return {
+            "account_support": {
+                "recorded": {
+                    "subject_key": "key_" + "f" * 64,
+                    "currency_totals_minor": {currency: amount_minor},
+                },
+            },
+        }
+
 
 class SupportPortalRouteTests(unittest.TestCase):
     @staticmethod
@@ -185,6 +212,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "accept_account_responsible_use",
             "get_admin_account_support",
             "transition_admin_account_fulfillment",
+            "record_admin_account_contribution",
         )
         module, path = _launch_nodes(*names)
         namespace = {
@@ -214,6 +242,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "accept_account_responsible_use",
             "get_admin_account_support",
             "transition_admin_account_fulfillment",
+            "record_admin_account_contribution",
         )
         module, path = _launch_nodes(*names, decorators=True)
 
@@ -256,6 +285,11 @@ class SupportPortalRouteTests(unittest.TestCase):
                 "/api/v1/support/admin/accounts/{account_id}/fulfillment",
                 "transition_admin_account_fulfillment",
             ),
+            (
+                "POST",
+                "/api/v1/support/admin/accounts/{account_id}/contributions",
+                "record_admin_account_contribution",
+            ),
         })
 
     def test_route_envelopes_use_only_live_account_session_and_preserve_browser(self):
@@ -286,6 +320,19 @@ class SupportPortalRouteTests(unittest.TestCase):
                 "2" * 32, request,
             )
         )
+        request._body = {
+            "source": "patreon",
+            "kind": "one_time_contribution",
+            "amount_minor": 500,
+            "currency": "USD",
+            "target_event_id": None,
+            "idempotency_key": "key_" + "8" * 64,
+        }
+        contribution = asyncio.run(
+            namespace["record_admin_account_contribution"](
+                "2" * 32, request,
+            )
+        )
 
         self.assertEqual(catalog["provider_catalog"]["providers"][0]["state"], "disabled")
         self.assertEqual(self_projection["account_support"]["recorded"]["event_count"], 0)
@@ -301,6 +348,12 @@ class SupportPortalRouteTests(unittest.TestCase):
             ],
             "pending",
         )
+        self.assertEqual(
+            contribution["account_support"]["recorded"][
+                "currency_totals_minor"
+            ],
+            {"USD": 500},
+        )
         self.assertEqual(request.state.maestro_session_id, browser_session)
         self.assertEqual(portal.calls, [
             ("catalog",),
@@ -312,6 +365,11 @@ class SupportPortalRouteTests(unittest.TestCase):
                 "fulfillment", "a" * 32, True, "2" * 32,
                 "evt_" + "3" * 32, "one_time_credit_grant", "pending",
                 "key_" + "9" * 64, None,
+            ),
+            (
+                "contribution", "a" * 32, True, "2" * 32, "patreon",
+                "one_time_contribution", 500, "USD", None,
+                "key_" + "8" * 64,
             ),
         ])
 
@@ -333,6 +391,32 @@ class SupportPortalRouteTests(unittest.TestCase):
         ):
             with self.subTest(body=body), self.assertRaises(HTTPException) as raised:
                 asyncio.run(namespace["transition_admin_account_fulfillment"](
+                    "2" * 32, _Request(body),
+                ))
+            self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(portal.calls, [])
+
+    def test_manual_contribution_body_is_exact_and_rejects_derived_fields(self):
+        portal = _Portal()
+        namespace = self._route_namespace(portal)
+        valid = {
+            "source": "buy_me_a_coffee",
+            "kind": "one_time_contribution",
+            "amount_minor": 500,
+            "currency": "USD",
+            "target_event_id": None,
+            "idempotency_key": "key_" + "9" * 64,
+        }
+        for body in (
+            {key: value for key, value in valid.items() if key != "target_event_id"},
+            {**valid, "occurred_at": "2020-01-01T00:00:00Z"},
+            {**valid, "actor_key": "key_" + "f" * 64},
+            {**valid, "notes": "private text"},
+            {**valid, "contract_reference": "private"},
+            {**valid, "email": "private@example.test"},
+        ):
+            with self.subTest(body=body), self.assertRaises(HTTPException) as raised:
+                asyncio.run(namespace["record_admin_account_contribution"](
                     "2" * 32, _Request(body),
                 ))
             self.assertEqual(raised.exception.status_code, 400)
@@ -398,6 +482,16 @@ class SupportPortalRouteTests(unittest.TestCase):
         fulfillment_denial = reject(fulfillment_request)
         self.assertEqual(fulfillment_denial.status_code, 403)
         self.assertEqual(fulfillment_request.json_calls, 0)
+
+        contribution_request = _Request({"notes": "must-not-be-read"})
+        contribution_request.method = "POST"
+        contribution_request.url.path = (
+            "/api/v1/support/admin/accounts/" + "1" * 32 + "/contributions"
+        )
+        contribution_request.headers = {"origin": "https://evil.example"}
+        contribution_denial = reject(contribution_request)
+        self.assertEqual(contribution_denial.status_code, 403)
+        self.assertEqual(contribution_request.json_calls, 0)
 
         account_request = _Request()
         account_request.method = "POST"
@@ -516,6 +610,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "AccountAuthError": AccountAuthError,
             "EntitlementError": EntitlementError,
             "ContributionConflict": ContributionConflict,
+            "ManualContributionConflict": ManualContributionConflict,
             "LedgerIntegrityError": LedgerIntegrityError,
             "ResponsibleUseError": ResponsibleUseError,
             "StaleResponsibleUseNoticeError": StaleResponsibleUseNoticeError,
@@ -534,6 +629,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             (SupportCatalogError("private@example.test?token=secret"), 503),
             (SupportPortalError("private malformed value"), 400),
             (ContributionConflict("private conflict detail"), 409),
+            (ManualContributionConflict("private manual conflict"), 409),
         )
         for error, status in cases:
             with self.subTest(error=type(error).__name__), self.assertRaises(
@@ -656,6 +752,7 @@ class SupportPortalRouteTests(unittest.TestCase):
                 "HTTPException": HTTPException,
                 "AccountAuthError": AccountAuthError,
                 "ContributionConflict": ContributionConflict,
+                "ManualContributionConflict": ManualContributionConflict,
                 "EntitlementError": EntitlementError,
                 "LedgerIntegrityError": LedgerIntegrityError,
                 "ResponsibleUseError": ResponsibleUseError,

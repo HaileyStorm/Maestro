@@ -18,6 +18,7 @@ import {
   loginAccount,
   logoutAccount,
   reauthenticateAccount,
+  recordAdminAccountContribution,
   recoverAccount,
   revokeAccountSession,
   revokeAllAccountSessions,
@@ -658,6 +659,14 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
       idempotency_key: opaqueSupportKey('9'),
       proof_reference: opaqueSupportKey('c'),
     })
+    const recorded = await recordAdminAccountContribution('account/id', {
+      source: 'buy_me_a_coffee',
+      kind: 'one_time_contribution',
+      amount_minor: 1250,
+      currency: 'USD',
+      target_event_id: null,
+      idempotency_key: opaqueSupportKey('8'),
+    })
     assert.equal(catalog.provider_catalog.provider_neutral, true)
     assert.equal(self.account.event_count, 2)
     assert.equal(notice.notice.version, 1)
@@ -709,6 +718,7 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     }])
     assert.equal(admin.audit.incomplete, true)
     assert.equal(transitioned.audit.fulfillment[0].status, 'fulfilled')
+    assert.equal(recorded.audit.events.length, 4)
     assert.doesNotMatch(JSON.stringify(self), /currency_totals_minor|amount_minor|subject_key|source_event|account_id|"audit"|private@example|private-allowance|private-source/)
     assert.doesNotMatch(JSON.stringify(admin), /subject_key|source_event_key|actor_key|account_id|unsafe_currency|private@example|private-invoice|provider_secret|private fulfillment note|private_reason/)
   })
@@ -720,6 +730,7 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     ['POST', '/api/v1/support/responsible-use/accept'],
     ['GET', '/api/v1/support/admin/accounts/account%2Fid'],
     ['POST', '/api/v1/support/admin/accounts/account%2Fid/fulfillment'],
+    ['POST', '/api/v1/support/admin/accounts/account%2Fid/contributions'],
   ])
   for (const call of calls) {
     assert.equal(call.init.credentials, 'same-origin')
@@ -736,6 +747,14 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     status: 'fulfilled',
     idempotency_key: opaqueSupportKey('9'),
     proof_reference: opaqueSupportKey('c'),
+  })
+  assert.deepEqual(JSON.parse(calls[6].init.body), {
+    source: 'buy_me_a_coffee',
+    kind: 'one_time_contribution',
+    amount_minor: 1250,
+    currency: 'USD',
+    target_event_id: null,
+    idempotency_key: opaqueSupportKey('8'),
   })
   assert.equal(calls[0].init.body, undefined)
 })
@@ -754,6 +773,63 @@ test('Support account mapping preserves legacy responses without a recorded allo
   }), async () => {
     const self = await fetchSupportSelf()
     assert.equal(Object.hasOwn(self.account, 'recorded_allowance'), false)
+  })
+})
+
+test('Support admin decoder admits only the bounded manual-provider actor shape', async () => {
+  await withFetchMock(async () => jsonResponse({
+    account_support: {
+      recorded: {
+        event_count: 1,
+        active_recurring_count: 0,
+        currency_totals_minor: { USD: 1250 },
+        audit: [{
+          sequence: 1,
+          event_id: supportEventId('1'),
+          provider: 'manual_buy_me_a_coffee',
+          source_event_key: opaqueSupportKey('1'),
+          kind: 'one_time_contribution',
+          occurred_at: '2026-08-12T09:00:00Z',
+          received_at: '2026-08-12T09:00:01Z',
+          amount_minor: 1250,
+          currency: 'USD',
+          contract_key: null,
+          related_event_key: null,
+          fulfillment_item: null,
+          fulfillment_status: null,
+          actor_key: opaqueSupportKey('2'),
+          operator_note: 'must not cross the decoder',
+        }],
+        fulfillment: [],
+        unresolved: [],
+      },
+      benefits: {
+        state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
+        effective_benefits: [], recorded_eligibility: [],
+      },
+    },
+    responsible_use: responsibleUse.status,
+    support_priority: publicSupport.support_priority,
+  }), async () => {
+    const admin = await fetchAdminAccountSupport('account-id')
+    assert.equal(admin.audit.incomplete, false)
+    assert.deepEqual(admin.audit.events, [{
+      sequence: 1,
+      event_id: supportEventId('1'),
+      provider: 'manual_buy_me_a_coffee',
+      source_reference: opaqueSupportKey('1'),
+      kind: 'one_time_contribution',
+      occurred_at: '2026-08-12T09:00:00Z',
+      received_at: '2026-08-12T09:00:01Z',
+      amount_minor: 1250,
+      currency: 'USD',
+      contract_reference: null,
+      related_reference: null,
+      fulfillment_item: null,
+      fulfillment_status: null,
+      actor_reference: opaqueSupportKey('2'),
+    }])
+    assert.doesNotMatch(JSON.stringify(admin), /operator_note|must not cross/)
   })
 })
 
@@ -1108,12 +1184,19 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
 })
 
 test('Support panel renders a bounded owner audit with fulfillment controls, loading, empty, error, and stale-selection states', async t => {
-  const { SupportPanel } = await loadSupportPanel()
+  const {
+    SupportPanel,
+    manualContributionRetryIdentity,
+    manualContributionTargetState,
+  } = await loadSupportPanel()
   t.after(() => {
     delete globalThis.__supportSelectedUserIndex
     delete globalThis.__supportNotice
     delete globalThis.__supportStore
     delete globalThis.__supportTransitions
+    delete globalThis.__supportManualContributions
+    delete globalThis.__supportManualDeferred
+    delete globalThis.__supportManualReject
   })
   globalThis.__supportSelectedUserIndex = '0'
   const account = {
@@ -1172,15 +1255,35 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
       globalThis.__supportTransitions.push(input)
       return null
     },
+    recordSupportContribution: async (_accountId, input) => {
+      globalThis.__supportManualContributions.push(input)
+      if (globalThis.__supportManualDeferred) return globalThis.__supportManualDeferred.promise
+      if (globalThis.__supportManualReject) throw new Error('ambiguous network failure')
+      return null
+    },
     clearSupportAdmin: () => {},
   }
   globalThis.__supportTransitions = []
+  globalThis.__supportManualContributions = []
 
   const tree = expandElement(SupportPanel())
   const text = elementText(tree)
   assert.match(text, /Private contribution and fulfillment audit/)
   assert.match(text, /recorded_not_enforced/)
   assert.match(text, /do not process payments, activate providers, or enforce benefits/)
+  assert.match(text, /manual audit record only; no payment is processed and benefits remain unenforced/i)
+  const manualOptionValues = findElements(tree, node => node.type === 'option')
+    .map(node => node.props.value)
+  assert.deepEqual(
+    ['buy_me_a_coffee', 'patreon', 'direct_compute_sponsorship'].filter(value => manualOptionValues.includes(value)),
+    ['buy_me_a_coffee', 'patreon', 'direct_compute_sponsorship'],
+  )
+  assert.deepEqual(
+    ['one_time_contribution', 'recurring_started', 'recurring_renewed', 'recurring_canceled', 'refund', 'chargeback']
+      .filter(value => manualOptionValues.includes(value)),
+    ['one_time_contribution', 'recurring_started', 'recurring_renewed', 'recurring_canceled', 'refund', 'chargeback'],
+    'all manual sources retain all lifecycle kinds independently of public-link marketing modes',
+  )
   assert.match(text, /2,500 USD minor units/)
   assert.match(text, /One-time contribution|Refund|Chargeback|Recurring support canceled/)
   assert.match(text, /Adjustment does not match a recorded contribution/)
@@ -1204,6 +1307,162 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   ])
   assert.equal(globalThis.__supportTransitions.every(input => input.proof_reference === null), true)
   assert.equal(globalThis.__supportTransitions.every(input => /^key_[0-9a-f]{64}$/.test(input.idempotency_key)), true)
+  const manualRecordButton = findElements(tree, node => (
+    node.type === 'button' && elementText(node) === 'Record manual audit event'
+  ))[0]
+  assert.ok(manualRecordButton)
+  assert.match(manualRecordButton.props.className, /\bmin-h-11\b/)
+  globalThis.__supportManualDeferred = deferred()
+  manualRecordButton.props.onClick()
+  manualRecordButton.props.onClick()
+  await Promise.resolve()
+  assert.equal(
+    globalThis.__supportManualContributions.length,
+    1,
+    'a second click cannot duplicate a contribution while the first request is in flight',
+  )
+  globalThis.__supportManualDeferred.resolve(null)
+  await new Promise(resolve => setImmediate(resolve))
+  delete globalThis.__supportManualDeferred
+  globalThis.__supportManualContributions = []
+  globalThis.__supportManualReject = true
+  manualRecordButton.props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  manualRecordButton.props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(globalThis.__supportManualContributions.length, 2)
+  assert.equal(
+    globalThis.__supportManualContributions[0].idempotency_key,
+    globalThis.__supportManualContributions[1].idempotency_key,
+    'an unchanged ambiguous retry reuses its opaque key',
+  )
+  globalThis.__supportManualReject = false
+  manualRecordButton.props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  manualRecordButton.props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(globalThis.__supportManualContributions.length, 4)
+  assert.equal(
+    globalThis.__supportManualContributions[1].idempotency_key,
+    globalThis.__supportManualContributions[2].idempotency_key,
+    'the successful attempt finishes the same ambiguous retry',
+  )
+  assert.notEqual(
+    globalThis.__supportManualContributions[2].idempotency_key,
+    globalThis.__supportManualContributions[3].idempotency_key,
+    'a definitive success rotates the next record key',
+  )
+  assert.deepEqual({
+    ...globalThis.__supportManualContributions[3],
+    idempotency_key: '<opaque>',
+  }, {
+    source: 'buy_me_a_coffee', kind: 'one_time_contribution', amount_minor: 1,
+    currency: 'USD', target_event_id: null, idempotency_key: '<opaque>',
+  })
+  assert.match(globalThis.__supportManualContributions[3].idempotency_key, /^key_[0-9a-f]{64}$/)
+
+  const retainedRetryIdentities = new Map()
+  const originalFingerprint = JSON.stringify([
+    'buy_me_a_coffee', 'one_time_contribution', 1, 'USD', null,
+  ])
+  const editedFingerprint = JSON.stringify([
+    'patreon', 'one_time_contribution', 1, 'USD', null,
+  ])
+  const ambiguousOriginalKey = manualContributionRetryIdentity(
+    retainedRetryIdentities,
+    originalFingerprint,
+  )
+  const editedKey = manualContributionRetryIdentity(
+    retainedRetryIdentities,
+    editedFingerprint,
+  )
+  const restoredOriginalKey = manualContributionRetryIdentity(
+    retainedRetryIdentities,
+    originalFingerprint,
+  )
+  assert.notEqual(editedKey, ambiguousOriginalKey)
+  assert.equal(
+    restoredOriginalKey,
+    ambiguousOriginalKey,
+    'ambiguous failure then edit and exact restore retains the original retry identity',
+  )
+  retainedRetryIdentities.delete(originalFingerprint)
+  assert.notEqual(
+    manualContributionRetryIdentity(retainedRetryIdentities, originalFingerprint),
+    ambiguousOriginalKey,
+    'definitive success rotates only the completed fingerprint identity',
+  )
+
+  const largeEvents = Array.from({ length: 20_000 }, (_, index) => ({
+    sequence: index + 1,
+    event_id: `evt_${(index + 1).toString(16).padStart(32, '0')}`,
+    provider: 'manual_buy_me_a_coffee',
+    source_reference: `key_${(index + 1).toString(16).padStart(64, '0')}`,
+    kind: 'one_time_contribution',
+    occurred_at: '2026-08-12T09:00:00Z',
+    received_at: '2026-08-12T09:00:01Z',
+    amount_minor: 100,
+    currency: 'USD',
+    contract_reference: null,
+    related_reference: null,
+    fulfillment_item: null,
+    fulfillment_status: null,
+    actor_reference: opaqueSupportKey('d'),
+  }))
+  let eventVisits = 0
+  const observedEvents = new Proxy(largeEvents, {
+    get(target, property, receiver) {
+      if (typeof property === 'string' && /^\d+$/.test(property)) eventVisits += 1
+      return Reflect.get(target, property, receiver)
+    },
+  })
+  const largeTargetState = manualContributionTargetState(
+    observedEvents,
+    'buy_me_a_coffee',
+    'USD',
+  )
+  assert.equal(largeTargetState.matchingFundingEvents.length, 20_000)
+  assert.ok(eventVisits <= largeEvents.length * 2, 'manual target preprocessing remains linear')
+  const recurringContract = opaqueSupportKey('e')
+  const recurringStarted = {
+    ...largeEvents[0], sequence: 1, event_id: supportEventId('1'),
+    source_reference: opaqueSupportKey('1'), kind: 'recurring_started',
+    contract_reference: recurringContract, occurred_at: '2026-08-12T09:00:00Z',
+  }
+  const recurringRenewed = {
+    ...largeEvents[0], sequence: 2, event_id: supportEventId('2'),
+    source_reference: opaqueSupportKey('2'), kind: 'recurring_renewed',
+    contract_reference: recurringContract, occurred_at: '2026-08-12T11:00:00Z',
+  }
+  const earlierCancellationAppendedLater = {
+    ...largeEvents[0], sequence: 3, event_id: supportEventId('3'),
+    source_reference: opaqueSupportKey('3'), kind: 'recurring_canceled', amount_minor: 0,
+    contract_reference: recurringContract, related_reference: opaqueSupportKey('1'),
+    occurred_at: '2026-08-12T10:00:00Z',
+  }
+  const outOfOrderState = manualContributionTargetState([
+    recurringStarted, recurringRenewed, earlierCancellationAppendedLater,
+  ], 'buy_me_a_coffee', 'USD')
+  assert.deepEqual(
+    [...outOfOrderState.activeRecurringTargets],
+    [recurringRenewed.event_id],
+    'active recurring target ordering matches backend occurred_at then sequence authority',
+  )
+  globalThis.__supportStore.supportAdmin = {
+    ...globalThis.__supportStore.supportAdmin,
+    audit: {
+      currency_totals_minor: { USD: 2_000_000 },
+      events: largeEvents,
+      discrepancies: [],
+      fulfillment: [],
+      incomplete: false,
+    },
+  }
+  const largeAuditTree = expandElement(SupportPanel())
+  assert.equal(findElements(
+    findElements(largeAuditTree, node => node.props?.['aria-label'] === 'Private contribution source events')[0],
+    node => node.type === 'li',
+  ).length, 40)
 
   globalThis.__supportStore.supportAdmin = {
     ...globalThis.__supportStore.supportAdmin,
@@ -1357,6 +1616,8 @@ test('Support store loads public catalog with accounts off and gates self and ad
   const calls = []
   let deferAdmin = false
   let deferFulfillment = false
+  let deferContribution = false
+  let contributionErrorStatus = 0
   let deferAccountContext = false
   let adminErrorStatus = 0
   let deferSelf = false
@@ -1368,6 +1629,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
   const pendingAcceptance = []
   const pendingAdmins = []
   const pendingFulfillment = []
+  const pendingContributions = []
   const pendingAccountContexts = []
   const waitForPendingAdmins = async count => {
     for (let attempt = 0; attempt < 20 && pendingAdmins.length < count; attempt += 1) {
@@ -1380,6 +1642,12 @@ test('Support store loads public catalog with accounts off and gates self and ad
       await Promise.resolve()
     }
     assert.ok(pendingFulfillment.length >= count, `expected ${count} pending fulfillment request(s)`)
+  }
+  const waitForPendingContributions = async count => {
+    for (let attempt = 0; attempt < 20 && pendingContributions.length < count; attempt += 1) {
+      await Promise.resolve()
+    }
+    assert.ok(pendingContributions.length >= count, `expected ${count} pending contribution request(s)`)
   }
   const allowancePayload = effectiveAllowance => ({
     ...recordedAllowance,
@@ -1445,6 +1713,13 @@ test('Support store loads public catalog with accounts off and gates self and ad
     if (url.endsWith('/fulfillment')) {
       if (deferFulfillment) return new Promise(resolve => { pendingFulfillment.push(resolve) })
       return jsonResponse(adminPayload(4))
+    }
+    if (url.endsWith('/contributions')) {
+      if (contributionErrorStatus) return jsonResponse({
+        detail: { code: 'manual_contribution_invalid', message: 'bounded failure' },
+      }, contributionErrorStatus)
+      if (deferContribution) return new Promise(resolve => { pendingContributions.push(resolve) })
+      return jsonResponse(adminPayload(5))
     }
     if (url.includes('/support/admin/accounts/')) {
       if (adminErrorStatus) return jsonResponse({
@@ -1551,6 +1826,43 @@ test('Support store loads public catalog with accounts off and gates self and ad
   assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account/fulfillment')
   assert.deepEqual(JSON.parse(calls.at(-1).init.body), fulfillmentInput)
   assert.equal(useStore.getState().supportAdmin.account.event_count, 4)
+  const contributionInput = {
+    source: 'patreon', kind: 'one_time_contribution', amount_minor: 2500,
+    currency: 'USD', target_event_id: null, idempotency_key: opaqueSupportKey('7'),
+  }
+  await useStore.getState().recordSupportContribution(account.id, contributionInput)
+  assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account/contributions')
+  assert.deepEqual(JSON.parse(calls.at(-1).init.body), contributionInput)
+  assert.equal(useStore.getState().supportAdmin.account.event_count, 5)
+
+  deferContribution = true
+  const staleContribution = useStore.getState().recordSupportContribution(account.id, {
+    ...contributionInput, idempotency_key: opaqueSupportKey('6'),
+  })
+  await waitForPendingContributions(1)
+  useStore.getState().clearSupportAdmin()
+  pendingContributions.shift()(jsonResponse(adminPayload(6)))
+  await assert.rejects(staleContribution, /access or Support selection changed/)
+  assert.equal(useStore.getState().supportAdmin, null)
+  deferContribution = false
+  await useStore.getState().loadSupportAdmin(account.id)
+
+  contributionErrorStatus = 400
+  await assert.rejects(useStore.getState().recordSupportContribution(account.id, contributionInput))
+  assert.equal(useStore.getState().supportAdminAccountId, account.id)
+  assert.notEqual(useStore.getState().supportAdmin, null)
+
+  contributionErrorStatus = 409
+  await assert.rejects(useStore.getState().recordSupportContribution(account.id, contributionInput))
+  assert.equal(useStore.getState().supportAdminAccountId, account.id)
+  assert.notEqual(useStore.getState().supportAdmin, null, 'a conflict refreshes the current private audit')
+
+  contributionErrorStatus = 403
+  await assert.rejects(useStore.getState().recordSupportContribution(account.id, contributionInput))
+  assert.equal(useStore.getState().supportAdminAccountId, null)
+  assert.equal(useStore.getState().supportAdmin, null)
+  contributionErrorStatus = 0
+  await useStore.getState().loadSupportAdmin(account.id)
 
   deferFulfillment = true
   const staleFulfillment = useStore.getState().transitionSupportFulfillment(account.id, {

@@ -43,6 +43,7 @@ import type {
   ResponsibleUseStatus,
   SupportAccountSummary,
   SupportFulfillmentMutationInput,
+  SupportManualContributionInput,
   SupportAdminProjection,
   SupportPublicProjection,
   SupportSelfProjection,
@@ -1289,6 +1290,11 @@ const SUPPORT_FUNDING_EVENT_KINDS = new Set(['one_time_contribution', 'recurring
 const SUPPORT_ADJUSTMENT_EVENT_KINDS = new Set(['refund', 'chargeback'])
 const SUPPORT_RECURRING_EVENT_KINDS = new Set(['recurring_started', 'recurring_renewed', 'recurring_canceled'])
 const SUPPORT_ACCOUNT_LINK_EVENT_KINDS = new Set(['account_link_verified', 'account_link_revoked'])
+const SUPPORT_MANUAL_PROVIDERS = new Set([
+  'manual_buy_me_a_coffee',
+  'manual_patreon',
+  'manual_direct_compute_sponsorship',
+])
 const SUPPORT_FULFILLMENT_STATUSES = new Set([
   'pending',
   'in_progress',
@@ -1333,6 +1339,7 @@ function supportFulfillmentStatus(value: unknown): SupportAdminProjection['audit
 }
 
 function supportAdminEventContractIsValid(input: {
+  provider: string
   kind: string
   amount: number
   contractReference: string | null
@@ -1343,15 +1350,20 @@ function supportAdminEventContractIsValid(input: {
 }): boolean {
   const hasFulfillmentFields = input.fulfillmentItem !== null
     || input.fulfillmentStatus !== null
-    || input.actorReference !== null
-  if (SUPPORT_FUNDING_EVENT_KINDS.has(input.kind) && input.amount <= 0) return false
+  const actorMatchesSource = SUPPORT_MANUAL_PROVIDERS.has(input.provider)
+    ? input.actorReference !== null
+    : input.actorReference === null
+  if (SUPPORT_FUNDING_EVENT_KINDS.has(input.kind)) {
+    return input.amount > 0 && !hasFulfillmentFields && actorMatchesSource
+      && (!SUPPORT_RECURRING_EVENT_KINDS.has(input.kind) || input.contractReference !== null)
+  }
   if (SUPPORT_ADJUSTMENT_EVENT_KINDS.has(input.kind)) {
     return input.amount > 0 && input.relatedReference !== null
-      && !hasFulfillmentFields
+      && !hasFulfillmentFields && actorMatchesSource
   }
   if (SUPPORT_RECURRING_EVENT_KINDS.has(input.kind) && input.contractReference === null) return false
   if (input.kind === 'recurring_canceled') {
-    return input.amount === 0 && !hasFulfillmentFields
+    return input.amount === 0 && !hasFulfillmentFields && actorMatchesSource
   }
   if (input.kind === 'fulfillment_set') {
     return input.amount === 0 && input.relatedReference !== null && input.fulfillmentItem !== null
@@ -1360,8 +1372,9 @@ function supportAdminEventContractIsValid(input: {
   if (SUPPORT_ACCOUNT_LINK_EVENT_KINDS.has(input.kind)) {
     return input.amount === 0 && input.contractReference !== null
       && input.relatedReference !== null && !hasFulfillmentFields
+      && input.actorReference === null
   }
-  return !hasFulfillmentFields
+  return !hasFulfillmentFields && input.actorReference === null
 }
 
 function supportAdminAudit(recorded: Record<string, unknown>): SupportAdminProjection['audit'] {
@@ -1427,6 +1440,7 @@ function supportAdminAudit(recorded: Record<string, unknown>): SupportAdminProje
       || fulfillmentStatus === undefined
       || (event.actor_key !== null && actorReference === null)
       || !supportAdminEventContractIsValid({
+        provider: event.provider as string,
         kind: kind || '',
         amount: amount ?? 0,
         contractReference,
@@ -1669,6 +1683,21 @@ export async function transitionAdminAccountFulfillment(
     responsible_use: ResponsibleUseStatus
     support_priority: SupportAdminProjection['support_priority']
   }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}/fulfillment`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  return supportAdminProjection(raw)
+}
+
+export async function recordAdminAccountContribution(
+  accountId: string,
+  input: SupportManualContributionInput,
+): Promise<SupportAdminProjection> {
+  const raw = await accountRequest<{
+    account_support?: RawSupportAccountProjection
+    responsible_use: ResponsibleUseStatus
+    support_priority: SupportAdminProjection['support_priority']
+  }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}/contributions`, {
     method: 'POST',
     body: JSON.stringify(input),
   })

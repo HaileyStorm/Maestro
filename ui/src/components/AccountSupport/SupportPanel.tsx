@@ -8,6 +8,9 @@ import type {
   SupportAdminEventKind,
   SupportFulfillmentMutationInput,
   SupportFulfillmentStatus,
+  SupportManualContributionInput,
+  SupportManualContributionKind,
+  SupportContributionSource,
 } from '../../types'
 import {
   affectedPriorityNotice,
@@ -39,6 +42,16 @@ function fulfillmentErrorMessage(error: unknown): string {
   return 'Fulfillment could not be recorded. Review the current audit and try again.'
 }
 
+function manualContributionErrorMessage(error: unknown): string {
+  if (error instanceof AccountApiError) {
+    if (error.status === 409) return 'The contribution audit changed on the server. The private audit was refreshed; review it before recording again.'
+    if (error.status === 401 || error.status === 403) return 'Recent owner access is required before a manual contribution can be recorded.'
+    if (error.status === 400) return 'The manual record was rejected. Review its amount, currency, and target event.'
+    if (error.retryAfter > 0) return `The manual record could not be saved. Retry in about ${error.retryAfter} seconds.`
+  }
+  return 'The manual record could not be saved. You can retry the unchanged form safely.'
+}
+
 const allowanceSourceLabels = {
   free: 'Free allowance',
   one_time_support: 'One-time support',
@@ -63,6 +76,28 @@ const allowanceRefundLabels = {
 const PRIVATE_SUPPORT_AUDIT_DISPLAY_TTL_MS = 4 * 60 * 1000
 const OPAQUE_SUPPORT_REFERENCE = /^key_[0-9a-f]{64}$/
 const FULFILLMENT_ITEM = /^[a-z][a-z0-9_]{1,63}$/
+const SUPPORT_CURRENCY = /^[A-Z]{3}$/
+const MAX_SUPPORT_AMOUNT_MINOR = 10_000_000_000
+
+const contributionSourceLabels: Record<SupportContributionSource, string> = {
+  buy_me_a_coffee: 'Buy Me a Coffee',
+  patreon: 'Patreon',
+  direct_compute_sponsorship: 'Direct compute sponsorship',
+}
+
+const manualContributionKindLabels: Record<SupportManualContributionKind, string> = {
+  one_time_contribution: 'One-time contribution',
+  recurring_started: 'Recurring support started',
+  recurring_renewed: 'Recurring support renewed',
+  recurring_canceled: 'Recurring support canceled',
+  refund: 'Refund',
+  chargeback: 'Chargeback',
+}
+
+const manualContributionSources = Object.keys(contributionSourceLabels) as SupportContributionSource[]
+// Manual audit provenance is independent of passive public-link marketing modes:
+// every source can record every lifecycle kind, subject to target/state rules.
+const manualContributionKinds = Object.keys(manualContributionKindLabels) as SupportManualContributionKind[]
 
 const fulfillmentStatusLabels: Record<SupportFulfillmentStatus, string> = {
   pending: 'Pending',
@@ -126,12 +161,87 @@ function minorUnits(value: number, currency: string): string {
   return `${value.toLocaleString()} ${currency} minor unit${value === 1 ? '' : 's'}`
 }
 
+// Exported for deterministic linear-work regression coverage.
+// eslint-disable-next-line react-refresh/only-export-components
+export function manualContributionTargetState(
+  events: SupportAdminAudit['events'],
+  source: SupportContributionSource,
+  currency: string,
+) {
+  const normalizedCurrency = currency.trim().toUpperCase()
+  const provider = `manual_${source}`
+  const matchingFundingEvents: SupportAdminAudit['events'] = []
+  const adjustmentBySourceReference = new Map<string, number>()
+  const latestRecurringByContract = new Map<string, SupportAdminAudit['events'][number]>()
+  for (const event of events) {
+    if (
+      (event.kind === 'one_time_contribution'
+        || event.kind === 'recurring_started'
+        || event.kind === 'recurring_renewed')
+      && event.provider === provider
+      && event.currency === normalizedCurrency
+    ) matchingFundingEvents.push(event)
+    if (
+      (event.kind === 'refund' || event.kind === 'chargeback')
+      && event.provider === provider
+      && event.currency === normalizedCurrency
+      && event.related_reference !== null
+    ) {
+      adjustmentBySourceReference.set(
+        event.related_reference,
+        (adjustmentBySourceReference.get(event.related_reference) || 0) + event.amount_minor,
+      )
+    }
+    if (
+      event.contract_reference !== null
+      && event.provider === provider
+      && event.currency === normalizedCurrency
+      && (event.kind === 'recurring_started'
+        || event.kind === 'recurring_renewed'
+        || event.kind === 'recurring_canceled')
+    ) {
+      const previous = latestRecurringByContract.get(event.contract_reference)
+      if (
+        !previous
+        || event.occurred_at > previous.occurred_at
+        || (event.occurred_at === previous.occurred_at && event.sequence > previous.sequence)
+      ) {
+        latestRecurringByContract.set(event.contract_reference, event)
+      }
+    }
+  }
+  const remainingByTarget = new Map(matchingFundingEvents.map(event => [
+    event.event_id,
+    Math.max(0, event.amount_minor - (adjustmentBySourceReference.get(event.source_reference) || 0)),
+  ]))
+  const activeRecurringTargets = new Set<string>()
+  for (const latest of latestRecurringByContract.values()) {
+    if (latest.kind !== 'recurring_canceled') activeRecurringTargets.add(latest.event_id)
+  }
+  return { matchingFundingEvents, remainingByTarget, activeRecurringTargets }
+}
+
+// Exported for exact ambiguous-response retry regression coverage.
+// eslint-disable-next-line react-refresh/only-export-components
+export function manualContributionRetryIdentity(
+  identities: Map<string, string>,
+  fingerprint: string,
+): string {
+  const retained = identities.get(fingerprint)
+  if (retained) return retained
+  const created = fulfillmentIdempotencyKey()
+  identities.set(fingerprint, created)
+  return created
+}
+
 function AdminSupportAudit({
   audit,
   onTransition,
+  onRecordContribution,
 }: {
   audit: SupportAdminAudit
   onTransition: (input: SupportFulfillmentMutationInput) => Promise<void>
+  onRecordContribution: (input: SupportManualContributionInput) => Promise<void>
 }) {
   const [fulfillmentLimit, setFulfillmentLimit] = useState(20)
   const [fundingEventLimit, setFundingEventLimit] = useState(40)
@@ -142,6 +252,15 @@ function AdminSupportAudit({
   const [busyKey, setBusyKey] = useState<string | null>(null)
   const [transitionNotice, setTransitionNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
   const retryRef = useRef<{ fingerprint: string; idempotencyKey: string } | null>(null)
+  const [manualSource, setManualSource] = useState<SupportContributionSource>('buy_me_a_coffee')
+  const [manualKind, setManualKind] = useState<SupportManualContributionKind>('one_time_contribution')
+  const [manualAmount, setManualAmount] = useState('1')
+  const [manualCurrency, setManualCurrency] = useState('USD')
+  const [manualTarget, setManualTarget] = useState('')
+  const [manualBusy, setManualBusy] = useState(false)
+  const [manualNotice, setManualNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
+  const manualRetryRef = useRef(new Map<string, string>())
+  const manualInFlightRef = useRef(false)
   const totals = Object.entries(audit.currency_totals_minor)
   const visibleEvents = audit.events.slice(-40).reverse()
   const hiddenEventCount = audit.events.length - visibleEvents.length
@@ -160,6 +279,102 @@ function AdminSupportAudit({
     || event.kind === 'recurring_renewed'
   )).reverse()
   const visibleFundingEvents = fundingEvents.slice(0, fundingEventLimit)
+  const manualTargetRequired = manualKind !== 'one_time_contribution'
+    && manualKind !== 'recurring_started'
+  const { matchingFundingEvents, remainingByTarget, activeRecurringTargets } = manualContributionTargetState(
+    audit.events,
+    manualSource,
+    manualCurrency,
+  )
+  const manualTargetEvents = matchingFundingEvents.filter(event => {
+    if (manualKind === 'recurring_renewed' || manualKind === 'recurring_canceled') {
+      return activeRecurringTargets.has(event.event_id)
+    }
+    return (remainingByTarget.get(event.event_id) || 0) > 0
+  }).reverse()
+
+  const changeManualSemantic = (change: () => void) => {
+    setManualNotice(null)
+    change()
+  }
+
+  const recordManualContribution = async () => {
+    if (manualBusy || manualInFlightRef.current) return
+    const currency = manualCurrency.trim().toUpperCase()
+    const amount = Number(manualAmount)
+    const target = manualTargetEvents.some(event => event.event_id === manualTarget)
+      ? manualTarget
+      : manualTargetEvents[0]?.event_id || ''
+    const canceled = manualKind === 'recurring_canceled'
+    if (!SUPPORT_CURRENCY.test(currency)) {
+      setManualNotice({ kind: 'error', text: 'Use a three-letter uppercase currency code.' })
+      return
+    }
+    if (
+      !Number.isSafeInteger(amount)
+      || amount < 0
+      || amount > MAX_SUPPORT_AMOUNT_MINOR
+      || (canceled ? amount !== 0 : amount <= 0)
+    ) {
+      setManualNotice({
+        kind: 'error',
+        text: canceled
+          ? 'A recurring cancellation must record zero minor units.'
+          : 'Enter a positive whole number of minor currency units.',
+      })
+      return
+    }
+    if (manualTargetRequired && target === '') {
+      setManualNotice({
+        kind: 'error',
+        text: 'Choose a matching contribution event from the current private audit.',
+      })
+      return
+    }
+    if (
+      (manualKind === 'refund' || manualKind === 'chargeback')
+      && amount > (remainingByTarget.get(target) || 0)
+    ) {
+      setManualNotice({
+        kind: 'error',
+        text: 'The adjustment cannot exceed the selected contribution’s remaining recorded amount.',
+      })
+      return
+    }
+    const normalizedTarget = manualTargetRequired ? target : null
+    const fingerprint = JSON.stringify([
+      manualSource, manualKind, amount, currency, normalizedTarget,
+    ])
+    const idempotencyKey = manualContributionRetryIdentity(manualRetryRef.current, fingerprint)
+    manualInFlightRef.current = true
+    setManualBusy(true)
+    setManualNotice(null)
+    try {
+      await onRecordContribution({
+        source: manualSource,
+        kind: manualKind,
+        amount_minor: amount,
+        currency,
+        target_event_id: normalizedTarget,
+        idempotency_key: idempotencyKey,
+      })
+      manualRetryRef.current.delete(fingerprint)
+      setManualAmount(canceled ? '0' : '1')
+      setManualTarget('')
+      setManualNotice({
+        kind: 'success',
+        text: 'Manual audit record saved. No payment was processed and benefits remain unenforced.',
+      })
+    } catch (error) {
+      if (error instanceof AccountApiError && [400, 401, 403, 404, 409].includes(error.status)) {
+        manualRetryRef.current.delete(fingerprint)
+      }
+      setManualNotice({ kind: 'error', text: manualContributionErrorMessage(error) })
+    } finally {
+      manualInFlightRef.current = false
+      setManualBusy(false)
+    }
+  }
 
   const recordTransition = async (
     targetEventId: string,
@@ -239,6 +454,118 @@ function AdminSupportAudit({
           Some audit data was unavailable or invalid and was not displayed. Empty sections below are not proof that no records exist.
         </p>
       )}
+
+      <details className="mt-3 rounded-md border border-border/70 bg-bg-tertiary/20 px-2 text-[9px] text-text-muted">
+        <summary className="flex min-h-11 cursor-pointer select-none items-center font-medium text-text-secondary">
+          Record a manual contribution event
+        </summary>
+        <div className="space-y-2 pb-3">
+          <p className="leading-relaxed">
+            This is a manual audit record only; no payment is processed and benefits remain unenforced.
+          </p>
+          {manualNotice && (
+            <p
+              className={`rounded-md border px-2 py-2 leading-relaxed ${
+                manualNotice.kind === 'error'
+                  ? 'border-chip-red/50 bg-chip-red/10 text-chip-red'
+                  : 'border-indicator-success/50 bg-indicator-success/10 text-indicator-success'
+              }`}
+              role={manualNotice.kind === 'error' ? 'alert' : 'status'}
+            >
+              {manualNotice.text}
+            </p>
+          )}
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <label className="block">
+              <span>Support source</span>
+              <select
+                value={manualSource}
+                onChange={event => changeManualSemantic(() => {
+                  setManualSource(event.target.value as SupportContributionSource)
+                  setManualTarget('')
+                })}
+                className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
+              >
+                {manualContributionSources.map(source => (
+                  <option key={source} value={source}>{contributionSourceLabels[source]}</option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span>Event kind</span>
+              <select
+                value={manualKind}
+                onChange={event => changeManualSemantic(() => {
+                  const kind = event.target.value as SupportManualContributionKind
+                  setManualKind(kind)
+                  setManualAmount(kind === 'recurring_canceled' ? '0' : '1')
+                  setManualTarget('')
+                })}
+                className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
+              >
+                {manualContributionKinds.map(kind => (
+                  <option key={kind} value={kind}>{manualContributionKindLabels[kind]}</option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span>Amount in minor units</span>
+              <input
+                type="number"
+                min={manualKind === 'recurring_canceled' ? 0 : 1}
+                max={MAX_SUPPORT_AMOUNT_MINOR}
+                step={1}
+                inputMode="numeric"
+                value={manualAmount}
+                disabled={manualKind === 'recurring_canceled'}
+                onChange={event => changeManualSemantic(() => setManualAmount(event.target.value))}
+                className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue disabled:opacity-70"
+              />
+            </label>
+            <label className="block">
+              <span>Currency</span>
+              <input
+                type="text"
+                value={manualCurrency}
+                maxLength={3}
+                autoComplete="off"
+                spellCheck={false}
+                onChange={event => changeManualSemantic(() => {
+                  setManualCurrency(event.target.value.toUpperCase())
+                  setManualTarget('')
+                })}
+                className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 font-mono text-[10px] uppercase text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
+              />
+            </label>
+          </div>
+          {manualTargetRequired && (
+            <label className="block">
+              <span>Target contribution event</span>
+              <select
+                value={manualTarget || manualTargetEvents[0]?.event_id || ''}
+                onChange={event => changeManualSemantic(() => setManualTarget(event.target.value))}
+                disabled={manualTargetEvents.length === 0}
+                className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue disabled:opacity-70"
+              >
+                {manualTargetEvents.length === 0 && <option value="">No matching event in this audit</option>}
+                {manualTargetEvents.map(event => (
+                  <option key={event.event_id} value={event.event_id}>
+                    {auditEventLabels[event.kind]} · sequence {event.sequence} · {minorUnits(event.amount_minor, event.currency)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button
+            type="button"
+            disabled={manualBusy || (manualTargetRequired && manualTargetEvents.length === 0)}
+            onClick={() => void recordManualContribution()}
+            className="min-h-11 w-full rounded-md bg-accent-blue px-3 py-2 text-[10px] font-semibold text-white hover:opacity-90 disabled:opacity-50"
+          >
+            {manualBusy ? 'Recording…' : 'Record manual audit event'}
+          </button>
+        </div>
+      </details>
 
       <section aria-labelledby="audit-totals-heading" className="mt-3">
         <h5 id="audit-totals-heading" className="text-[10px] font-semibold text-text-secondary">Recorded net totals</h5>
@@ -565,6 +892,7 @@ export function SupportPanel() {
   const acceptNotice = useStore(state => state.acceptResponsibleUse)
   const loadAdmin = useStore(state => state.loadSupportAdmin)
   const transitionFulfillment = useStore(state => state.transitionSupportFulfillment)
+  const recordContribution = useStore(state => state.recordSupportContribution)
   const clearAdmin = useStore(state => state.clearSupportAdmin)
   const [selectedUserIndex, setSelectedUserIndex] = useState('')
   const adminSelectionEpochRef = useRef(0)
@@ -691,6 +1019,13 @@ export function SupportPanel() {
       throw new Error('Owner access or Support selection changed.')
     }
     await transitionFulfillment(adminAccountId, input)
+  }
+
+  const recordManualContribution = async (input: SupportManualContributionInput) => {
+    if (!ownerSupport || adminAccountId === null || adminAccountId !== selectedAdminAccountId) {
+      throw new Error('Owner access or Support selection changed.')
+    }
+    await recordContribution(adminAccountId, input)
   }
 
   return (
@@ -854,7 +1189,11 @@ export function SupportPanel() {
             && (
             <div className="mt-3 space-y-2">
               <RecordedSupport summary={admin.account} />
-              <AdminSupportAudit audit={admin.audit} onTransition={recordFulfillment} />
+              <AdminSupportAudit
+                audit={admin.audit}
+                onTransition={recordFulfillment}
+                onRecordContribution={recordManualContribution}
+              />
               {adminPriorityNotice && (
                 <p className="rounded-lg border border-indicator-warning/40 bg-indicator-warning/5 px-3 py-2 text-[10px] leading-relaxed text-text-secondary">
                   {adminPriorityNotice}

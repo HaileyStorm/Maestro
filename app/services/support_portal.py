@@ -28,6 +28,8 @@ from .account_auth import (
 )
 from .entitlements import (
     FULFILLMENT_STATES,
+    MANUAL_CONTRIBUTION_KINDS,
+    MANUAL_CONTRIBUTION_SOURCES,
     SUPPORT_PRIORITY_IDENTITY_CONTRACTS,
     ContributionLedger,
     exclusive_file_lease,
@@ -620,6 +622,83 @@ class SupportPortal:
                 None
                 if proof_reference is None
                 else proof_reference
+            ),
+            occurred_at=datetime.now(timezone.utc),
+        )
+        return self._admin_projection_for_subject(subject_key)
+
+    def record_owner_contribution(
+        self,
+        actor_session_id: str,
+        *,
+        remote: bool,
+        target_account_id: str,
+        source: Any,
+        kind: Any,
+        amount_minor: Any,
+        currency: Any,
+        target_event_id: Any,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        """Append one owner-recorded contribution and refresh its audit view."""
+
+        actor, subject_key = self._resolve_owner_target(
+            actor_session_id,
+            remote=remote,
+            target_account_id=target_account_id,
+        )
+        if (
+            not isinstance(source, str)
+            or source not in MANUAL_CONTRIBUTION_SOURCES
+            or not isinstance(kind, str)
+            or kind not in MANUAL_CONTRIBUTION_KINDS
+            or not isinstance(amount_minor, int)
+            or isinstance(amount_minor, bool)
+            or amount_minor < 0
+            or amount_minor > 10_000_000_000
+            or not isinstance(currency, str)
+            or re.fullmatch(r"[A-Z]{3}", currency) is None
+            or (
+                target_event_id is not None
+                and (
+                    not isinstance(target_event_id, str)
+                    or _EVENT_ID_RE.fullmatch(target_event_id) is None
+                )
+            )
+            or not isinstance(idempotency_key, str)
+            or _FULFILLMENT_REFERENCE_RE.fullmatch(idempotency_key) is None
+            or (
+                kind in {"one_time_contribution", "recurring_started"}
+                and (amount_minor <= 0 or target_event_id is not None)
+            )
+            or (
+                kind == "recurring_renewed"
+                and (amount_minor <= 0 or target_event_id is None)
+            )
+            or (
+                kind == "recurring_canceled"
+                and (amount_minor != 0 or target_event_id is None)
+            )
+            or (
+                kind in {"refund", "chargeback"}
+                and (amount_minor <= 0 or target_event_id is None)
+            )
+        ):
+            raise SupportPortalError("Manual contribution is invalid")
+        self._ledger.record_manual_contribution(
+            subject_key=subject_key,
+            source=source,
+            kind=kind,
+            amount_minor=amount_minor,
+            currency=currency,
+            target_event_id=target_event_id,
+            source_event_key=opaque_key(
+                "manual_contribution_idempotency",
+                idempotency_key,
+                self._identity_key,
+            ),
+            actor_key=opaque_key(
+                "manual_contribution_actor", actor["id"], self._identity_key,
             ),
             occurred_at=datetime.now(timezone.utc),
         )

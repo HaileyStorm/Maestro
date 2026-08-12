@@ -197,6 +197,7 @@ from services.entitlements import (
     ContributionLedger,
     EntitlementError,
     LedgerIntegrityError,
+    ManualContributionConflict,
     SUPPORT_PRIORITY_IDENTITY_CONTRACTS,
     opaque_key,
     support_priority_capability_marker,
@@ -18726,6 +18727,14 @@ def _raise_support_http_error(error: Exception) -> None:
                 "message": "Responsible-use acceptance is invalid.",
             },
         ) from error
+    if isinstance(error, ManualContributionConflict):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "manual_contribution_conflict",
+                "message": "Contribution state changed; refresh and try again.",
+            },
+        ) from error
     if isinstance(error, ContributionConflict):
         raise HTTPException(
             status_code=409,
@@ -18870,6 +18879,41 @@ async def transition_admin_account_fulfillment(
             status=body["status"],
             idempotency_key=body["idempotency_key"],
             proof_reference=body["proof_reference"],
+        )
+    except (AccountAuthError, EntitlementError, OSError, ResponsibleUseError,
+            SupportCatalogError, SupportPortalError) as error:
+        _raise_support_http_error(error)
+
+
+@api.post("/api/v1/support/admin/accounts/{account_id}/contributions")
+async def record_admin_account_contribution(
+    account_id: str,
+    request: Request,
+):
+    portal = _require_support_portal(request)
+    actor_session_id, remote = _support_request_context(request)
+    body = await _account_request_body(request)
+    expected = {
+        "source", "kind", "amount_minor", "currency", "target_event_id",
+        "idempotency_key",
+    }
+    if set(body) != expected:
+        raise HTTPException(
+            status_code=400,
+            detail="Expected manual contribution fields only",
+        )
+    try:
+        return await asyncio.to_thread(
+            portal.record_owner_contribution,
+            actor_session_id,
+            remote=remote,
+            target_account_id=account_id,
+            source=body["source"],
+            kind=body["kind"],
+            amount_minor=body["amount_minor"],
+            currency=body["currency"],
+            target_event_id=body["target_event_id"],
+            idempotency_key=body["idempotency_key"],
         )
     except (AccountAuthError, EntitlementError, OSError, ResponsibleUseError,
             SupportCatalogError, SupportPortalError) as error:

@@ -538,6 +538,91 @@ class SupportPortalTests(unittest.TestCase):
                 )
         self.assertEqual(len(self.ledger.events()), 1)
 
+    def test_owner_manual_contribution_is_server_derived_and_idempotent(self):
+        request = {
+            "remote": True,
+            "target_account_id": self.user_id,
+            "source": "buy_me_a_coffee",
+            "kind": "one_time_contribution",
+            "amount_minor": 1_250,
+            "currency": "USD",
+            "target_event_id": None,
+            "idempotency_key": opaque_key(
+                "manual_request", "private-request", IDENTITY_KEY,
+            ),
+        }
+        projection = self.portal.record_owner_contribution(
+            self.owner_session, **request,
+        )
+        self.assertEqual(
+            projection["account_support"]["recorded"]["currency_totals_minor"],
+            {"USD": 1_250},
+        )
+        before = self.ledger.events()
+        replay = self.portal.record_owner_contribution(
+            self.owner_session, **request,
+        )
+        self.assertEqual(replay, projection)
+        self.assertEqual(self.ledger.events(), before)
+        event = before[0]
+        self.assertEqual(event.provider, "manual_buy_me_a_coffee")
+        self.assertEqual(event.subject_key, self.subject(self.user_id))
+        self.assertRegex(event.source_event_key, r"^key_[0-9a-f]{64}$")
+        self.assertRegex(event.actor_key or "", r"^key_[0-9a-f]{64}$")
+        self.assertNotEqual(event.source_event_key, request["idempotency_key"])
+        self.assertLessEqual(
+            abs((datetime.now(timezone.utc) - datetime.fromisoformat(
+                event.occurred_at.replace("Z", "+00:00")
+            )).total_seconds()),
+            5,
+        )
+        stored = self.ledger_path.read_text(encoding="utf-8")
+        self.assertNotIn(request["idempotency_key"], stored)
+        self.assertNotIn(self.owner_id, stored)
+        self.assertNotIn(self.user_id, stored)
+        self.assertEqual(
+            projection["account_support"]["benefits"]["state"],
+            "recorded_not_enforced",
+        )
+
+    def test_owner_manual_contribution_revalidates_authority_and_body_semantics(self):
+        valid = {
+            "remote": True,
+            "target_account_id": self.user_id,
+            "source": "patreon",
+            "kind": "one_time_contribution",
+            "amount_minor": 500,
+            "currency": "USD",
+            "target_event_id": None,
+            "idempotency_key": opaque_key(
+                "manual_request", "auth", IDENTITY_KEY,
+            ),
+        }
+        with self.assertRaises(SupportAuthorizationError):
+            self.portal.record_owner_contribution(self.user_session, **valid)
+        for replacement in (
+            {"source": "stripe"},
+            {"kind": "gift"},
+            {"amount_minor": True},
+            {"amount_minor": 0},
+            {"currency": "usd"},
+            {"target_event_id": "evt_private"},
+            {"idempotency_key": "private request"},
+        ):
+            with self.subTest(replacement=replacement), self.assertRaises(
+                SupportPortalError,
+            ):
+                self.portal.record_owner_contribution(
+                    self.owner_session, **{**valid, **replacement},
+                )
+        self.assertEqual(self.ledger.events(), ())
+        local = self.portal.record_owner_contribution(
+            self.owner_session, **{**valid, "remote": False},
+        )
+        self.assertEqual(
+            local["account_support"]["recorded"]["event_count"], 1,
+        )
+
     def test_responsible_use_acceptance_is_self_bound_and_restart_durable(self):
         before = self.portal.self_projection(
             self.user_session, remote=True,
