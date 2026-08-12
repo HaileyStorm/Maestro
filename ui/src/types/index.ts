@@ -663,6 +663,14 @@ export type LogicalJobKind = 'reference_pack_parent' | 'reference_pack_child'
 
 export type AccountRole = 'owner' | 'user'
 
+export type AccountActivationState =
+  | 'disabled'
+  | 'setup_available'
+  | 'setup_requires_loopback'
+  | 'disable_bootstrap'
+  | 'ready'
+  | 'unavailable'
+
 export interface AccountSummary {
   id: string
   username: string
@@ -681,7 +689,9 @@ export interface AccountContext {
   capabilities: string[]
   reauthenticated: boolean
   passkey_authentication_available: boolean
-  /** Present only on the dedicated account-context response. */
+  /** Server-authored account activation readiness; never infer from client state. */
+  activation_state: AccountActivationState
+  /** Server-authored bootstrap availability, including the access-context projection. */
   bootstrap_available?: boolean
 }
 

@@ -1547,6 +1547,106 @@ class AccountCapabilityTests(unittest.TestCase):
         }, clear=True):
             self.assertTrue(namespace["_account_bootstrap_enabled"]())
 
+    def test_account_context_reports_activation_readiness_without_remote_store_reads(self):
+        module, path = self._launch_subset(
+            "_account_activation_context", "_public_account_context",
+            "get_account_context",
+        )
+
+        class _Store:
+            def __init__(self, has_accounts):
+                self.has_accounts_value = has_accounts
+                self.reads = 0
+
+            def has_accounts(self):
+                self.reads += 1
+                return self.has_accounts_value
+
+        flags = {"accounts": False, "bootstrap": False}
+        direct_loopback = True
+        store = _Store(False)
+        namespace = {
+            "Request": object,
+            "AccountAuthError": AccountAuthError,
+            "_accounts_enabled": lambda: flags["accounts"],
+            "_account_bootstrap_enabled": lambda: (
+                flags["accounts"] and flags["bootstrap"]
+            ),
+            "_account_local_bootstrap_allowed": lambda _request: direct_loopback,
+            "_require_account_store": lambda _request: store,
+            "_raise_account_http_error": lambda error: (_ for _ in ()).throw(error),
+            "_request_has_recent_account_reauth": lambda _request: False,
+        }
+        exec(compile(module, str(path), "exec"), namespace)
+        request = types.SimpleNamespace(
+            state=types.SimpleNamespace(maestro_account_principal=None),
+        )
+
+        def context():
+            return namespace["get_account_context"](request)
+
+        self.assertEqual(context()["activation_state"], "disabled")
+        self.assertFalse(context()["bootstrap_available"])
+        self.assertEqual(store.reads, 0)
+
+        flags.update(accounts=True, bootstrap=True)
+        local_setup = context()
+        self.assertEqual(local_setup["activation_state"], "setup_available")
+        self.assertTrue(local_setup["bootstrap_available"])
+        self.assertEqual(store.reads, 1)
+
+        store.has_accounts_value = True
+        local_complete = context()
+        self.assertEqual(local_complete["activation_state"], "disable_bootstrap")
+        self.assertFalse(local_complete["bootstrap_available"])
+        self.assertEqual(store.reads, 2)
+
+        direct_loopback = False
+        remote_setup = context()
+        self.assertEqual(
+            remote_setup["activation_state"], "setup_requires_loopback",
+        )
+        self.assertFalse(remote_setup["bootstrap_available"])
+        self.assertEqual(store.reads, 2)
+
+        flags["bootstrap"] = False
+        ready = context()
+        self.assertEqual(ready["activation_state"], "ready")
+        self.assertFalse(ready["bootstrap_available"])
+        self.assertEqual(store.reads, 2)
+
+        self.assertFalse(ready["authenticated"])
+        self.assertIsNone(ready["account"])
+        self.assertEqual(ready["capabilities"], [])
+
+    def test_account_activation_store_errors_preserve_existing_http_semantics(self):
+        module, path = self._launch_subset("_account_activation_context")
+        unavailable = AccountStoreCorruptError()
+
+        class _Store:
+            @staticmethod
+            def has_accounts():
+                raise unavailable
+
+        class _RaisedHTTP(Exception):
+            pass
+
+        namespace = {
+            "Request": object,
+            "AccountAuthError": AccountAuthError,
+            "_accounts_enabled": lambda: True,
+            "_account_bootstrap_enabled": lambda: True,
+            "_account_local_bootstrap_allowed": lambda _request: True,
+            "_require_account_store": lambda _request: _Store(),
+            "_raise_account_http_error": lambda error: (_ for _ in ()).throw(
+                _RaisedHTTP(error.code)
+            ),
+        }
+        exec(compile(module, str(path), "exec"), namespace)
+        with self.assertRaises(_RaisedHTTP) as raised:
+            namespace["_account_activation_context"](object())
+        self.assertEqual(str(raised.exception), "account_store_unavailable")
+
     def test_exact_account_origin_rejects_rebinding_and_other_local_ports(self):
         names = (
             "_env_flag_enabled", "_server_bind_is_widened",
@@ -2430,9 +2530,14 @@ class AccountCapabilityTests(unittest.TestCase):
             "get_access_context",
             constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT",),
         )
+        projected_accounts = {
+            "authenticated": True,
+            "activation_state": "setup_requires_loopback",
+            "bootstrap_available": False,
+        }
         namespace = {
             "Request": object,
-            "_public_account_context": lambda _request: {"authenticated": True},
+            "_public_account_context": lambda _request: projected_accounts,
             "_request_has_account_capability": lambda _request, capability: (
                 capability == "owner.remote_parity"
             ),
@@ -2444,6 +2549,7 @@ class AccountCapabilityTests(unittest.TestCase):
         request = types.SimpleNamespace(state=types.SimpleNamespace(maestro_remote=True))
         context = namespace["get_access_context"](request)
         self.assertFalse(context["machine_controls"])
+        self.assertEqual(context["accounts"], projected_accounts)
         controls = context["remote_owner_controls"]
         self.assertTrue(controls["enabled"])
         self.assertEqual(
@@ -2451,6 +2557,24 @@ class AccountCapabilityTests(unittest.TestCase):
             namespace["_REMOTE_OWNER_REAUTH_ALLOWED_EXACT"],
         )
         self.assertTrue(all(item["reason"] for item in controls["unavailable"]))
+
+    def test_access_context_fallback_has_disabled_account_activation_state(self):
+        module, path = self._launch_subset(
+            "get_access_context",
+            constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT",),
+        )
+        namespace = {
+            "Request": object,
+            "_env_flag_enabled": lambda _name: False,
+            "_public_share_url": lambda: "",
+        }
+        exec(compile(module, str(path), "exec"), namespace)
+        request = types.SimpleNamespace(
+            state=types.SimpleNamespace(maestro_remote=False),
+        )
+        accounts = namespace["get_access_context"](request)["accounts"]
+        self.assertEqual(accounts["activation_state"], "disabled")
+        self.assertFalse(accounts["bootstrap_available"])
 
     def test_llm_control_repeats_capability_gate_at_endpoint_boundary(self):
         module, path = self._launch_subset("_require_local_llm_control")

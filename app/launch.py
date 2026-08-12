@@ -18377,6 +18377,36 @@ def _clear_account_session(request: Request) -> None:
     )
 
 
+def _account_activation_context(request: Request) -> dict:
+    """Describe account setup readiness without disclosing account existence remotely."""
+    if not _accounts_enabled():
+        return {
+            "activation_state": "disabled",
+            "bootstrap_available": False,
+        }
+    if not _account_bootstrap_enabled():
+        return {
+            "activation_state": "ready",
+            "bootstrap_available": False,
+        }
+    if not _account_local_bootstrap_allowed(request):
+        return {
+            "activation_state": "setup_requires_loopback",
+            "bootstrap_available": False,
+        }
+    store = _require_account_store(request)
+    try:
+        bootstrap_available = not store.has_accounts()
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    return {
+        "activation_state": (
+            "setup_available" if bootstrap_available else "disable_bootstrap"
+        ),
+        "bootstrap_available": bootstrap_available,
+    }
+
+
 def _public_account_context(request: Request) -> dict:
     principal = getattr(request.state, "maestro_account_principal", None)
     account = None
@@ -18400,20 +18430,13 @@ def _public_account_context(request: Request) -> dict:
         "capabilities": capabilities,
         "reauthenticated": _request_has_recent_account_reauth(request),
         "passkey_authentication_available": False,
+        **_account_activation_context(request),
     }
 
 
 @api.get("/api/v1/account/context")
 def get_account_context(request: Request):
-    context = _public_account_context(request)
-    bootstrap_available = False
-    if _account_bootstrap_enabled() and _account_local_bootstrap_allowed(request):
-        store = _require_account_store(request)
-        try:
-            bootstrap_available = not store.has_accounts()
-        except AccountAuthError as error:
-            _raise_account_http_error(error)
-    return {**context, "bootstrap_available": bootstrap_available}
+    return _public_account_context(request)
 
 
 @api.post("/api/v1/account/nonce")
@@ -18935,6 +18958,8 @@ def get_access_context(request: Request):
             "capabilities": [],
             "reauthenticated": False,
             "passkey_authentication_available": False,
+            "activation_state": "disabled",
+            "bootstrap_available": False,
         }
     )
     has_capability = globals().get("_request_has_account_capability")

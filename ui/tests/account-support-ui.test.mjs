@@ -461,10 +461,12 @@ test('account context is explicitly no-store and structured server errors stay b
       capabilities: [],
       reauthenticated: false,
       passkey_authentication_available: false,
+      activation_state: 'setup_available',
       bootstrap_available: true,
     })
   }, async () => {
     const context = await fetchAccountContext()
+    assert.equal(context.activation_state, 'setup_available')
     assert.equal(context.bootstrap_available, true)
   })
   assert.equal(calls[0].init.credentials, 'same-origin')
@@ -1091,6 +1093,69 @@ function findElements(value, predicate, found = []) {
   }
   return found
 }
+
+test('Support renders only server-authored account activation readiness as passive, privacy-bounded status', async t => {
+  const { SupportPanel } = await loadSupportPanel()
+  t.after(() => { delete globalThis.__supportStore })
+  const context = {
+    enabled: false,
+    authenticated: false,
+    account: null,
+    capabilities: [],
+    reauthenticated: false,
+    passkey_authentication_available: false,
+    bootstrap_available: true,
+  }
+  globalThis.__supportStore = {
+    accountContext: context,
+    accountUsers: [], supportCatalog: publicSupport, supportCatalogLoading: false,
+    supportCatalogUnavailable: false, supportSelf: null, responsibleUse: null,
+    supportAdmin: null, supportAdminAccountId: null, supportDetailsLoading: false,
+    loadSupportCatalog: async () => null, loadSupportSelf: async () => null,
+    loadResponsibleUse: async () => null, acceptResponsibleUse: async () => null,
+    loadSupportAdmin: async () => null, clearSupportAdmin: () => {},
+  }
+
+  const expected = new Map([
+    ['disabled', ['Accounts are optional and off', 'No account setup or sign-in is required to keep using Maestro.']],
+    ['setup_available', ['Owner setup is available', 'Set up the owner from the Account tab on this direct local connection. Maestro will not create an account automatically.']],
+    ['setup_requires_loopback', ['Owner setup requires direct loopback access', 'Open Maestro directly on its loopback address for initial owner setup. No account details or setup action are available from this connection.']],
+    ['disable_bootstrap', ['Owner setup is complete', 'Set MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false, then restart Maestro to finish disabling initial setup.']],
+    ['ready', ['Account access is ready', 'Sign-in and account controls are available. Project passwords and browser sessions remain separate from accounts.']],
+    ['unavailable', ['Account activation status is unavailable', 'This server response does not provide a recognized activation state, so no setup action is offered here.']],
+  ])
+
+  for (const [activationState, copy] of expected) {
+    globalThis.__supportStore.accountContext = { ...context, activation_state: activationState }
+    const tree = expandElement(SupportPanel())
+    const readinessSections = findElements(tree, node => node.props?.['aria-label'] === 'Account activation readiness')
+    assert.equal(readinessSections.length, 1)
+    const readinessText = elementText(readinessSections[0])
+    assert.match(readinessText, new RegExp(copy[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    assert.match(readinessText, new RegExp(copy[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    assert.equal(findElements(readinessSections[0], node => node.type === 'button' || node.type === 'a').length, 0)
+    assert.equal(findElements(readinessSections[0], node => node.props?.role === 'status').length, 1)
+    assert.doesNotMatch(readinessText, /credential|passkey|account count|created at|timestamp|store path|provider|payment|credit/i)
+  }
+
+  globalThis.__supportStore.accountContext = { ...context, activation_state: 'unknown_future_state' }
+  const malformedText = elementText(findElements(
+    expandElement(SupportPanel()),
+    node => node.props?.['aria-label'] === 'Account activation readiness',
+  )[0])
+  assert.match(malformedText, /Account activation status is unavailable/)
+  globalThis.__supportStore.accountContext = {
+    ...context,
+    enabled: true,
+    bootstrap_available: true,
+  }
+  const fallbackText = elementText(findElements(
+    expandElement(SupportPanel()),
+    node => node.props?.['aria-label'] === 'Account activation readiness',
+  )[0])
+  assert.match(fallbackText, /Account activation status is unavailable/)
+  assert.doesNotMatch(fallbackText, /Owner setup is available/)
+})
 
 test('Support panel renders a semantic mobile-safe recorded allowance without overstating enforcement', async () => {
   const { SupportPanel } = await loadSupportPanel()

@@ -3,6 +3,7 @@ import { Check, ExternalLink, HeartHandshake, Loader2, ShieldCheck } from 'lucid
 import { AccountApiError } from '../../api/client'
 import { useStore } from '../../stores/useStore'
 import type {
+  AccountActivationState,
   SupportAccountSummary,
   SupportAdminAudit,
   SupportAdminEventKind,
@@ -17,6 +18,44 @@ import {
   responsibleUseIsAccepted,
   visibleSupportProviders,
 } from './supportPresentation'
+
+interface AccountActivationReadiness {
+  label: string
+  detail: string
+}
+
+const accountActivationReadinessByState: Record<AccountActivationState, AccountActivationReadiness> = {
+  disabled: {
+    label: 'Accounts are optional and off',
+    detail: 'No account setup or sign-in is required to keep using Maestro.',
+  },
+  setup_available: {
+    label: 'Owner setup is available',
+    detail: 'Set up the owner from the Account tab on this direct local connection. Maestro will not create an account automatically.',
+  },
+  setup_requires_loopback: {
+    label: 'Owner setup requires direct loopback access',
+    detail: 'Open Maestro directly on its loopback address for initial owner setup. No account details or setup action are available from this connection.',
+  },
+  disable_bootstrap: {
+    label: 'Owner setup is complete',
+    detail: 'Set MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false, then restart Maestro to finish disabling initial setup.',
+  },
+  ready: {
+    label: 'Account access is ready',
+    detail: 'Sign-in and account controls are available. Project passwords and browser sessions remain separate from accounts.',
+  },
+  unavailable: {
+    label: 'Account activation status is unavailable',
+    detail: 'This server response does not provide a recognized activation state, so no setup action is offered here.',
+  },
+}
+
+function accountActivationReadiness(state: unknown): AccountActivationReadiness {
+  return typeof state === 'string' && Object.hasOwn(accountActivationReadinessByState, state)
+    ? accountActivationReadinessByState[state as AccountActivationState]
+    : accountActivationReadinessByState.unavailable
+}
 
 function supportErrorMessage(error: unknown): string {
   if (error instanceof AccountApiError && error.retryAfter > 0) {
@@ -898,6 +937,7 @@ export function SupportPanel() {
   const adminSelectionEpochRef = useRef(0)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
+  const activationReadiness = accountActivationReadiness(context?.activation_state)
 
   const authenticated = context?.enabled === true
     && context.authenticated === true
@@ -1043,6 +1083,19 @@ export function SupportPanel() {
           {notice.text}
         </div>
       )}
+
+      <section aria-label="Account activation readiness" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
+        <div className="flex items-center gap-2">
+          <Check size={14} className="shrink-0 text-accent-blue" aria-hidden="true" />
+          <h3 className="text-xs font-semibold text-text-primary">Account activation</h3>
+        </div>
+        <p className="mt-2 text-[10px] font-semibold leading-relaxed text-text-secondary" role="status">
+          {activationReadiness.label}
+        </p>
+        <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+          {activationReadiness.detail}
+        </p>
+      </section>
 
       <section className="rounded-xl border border-accent-blue/40 bg-accent-blue/5 p-4">
         <div className="flex items-start gap-3">
