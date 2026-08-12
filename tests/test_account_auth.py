@@ -2091,7 +2091,7 @@ class AccountCapabilityTests(unittest.TestCase):
                 return self.has_accounts_value
 
         flags = {"accounts": False, "bootstrap": False}
-        direct_loopback = True
+        readiness_allowed = True
         store = _Store(False)
         namespace = {
             "Request": object,
@@ -2100,7 +2100,7 @@ class AccountCapabilityTests(unittest.TestCase):
             "_account_bootstrap_enabled": lambda: (
                 flags["accounts"] and flags["bootstrap"]
             ),
-            "_account_local_bootstrap_allowed": lambda _request: direct_loopback,
+            "_account_activation_read_allowed": lambda _request: readiness_allowed,
             "_require_account_store": lambda _request: store,
             "_raise_account_http_error": lambda error: (_ for _ in ()).throw(error),
             "_request_has_recent_account_reauth": lambda _request: False,
@@ -2129,7 +2129,7 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertFalse(local_complete["bootstrap_available"])
         self.assertEqual(store.reads, 2)
 
-        direct_loopback = False
+        readiness_allowed = False
         remote_setup = context()
         self.assertEqual(
             remote_setup["activation_state"], "setup_requires_loopback",
@@ -2164,7 +2164,7 @@ class AccountCapabilityTests(unittest.TestCase):
             "AccountAuthError": AccountAuthError,
             "_accounts_enabled": lambda: True,
             "_account_bootstrap_enabled": lambda: True,
-            "_account_local_bootstrap_allowed": lambda _request: True,
+            "_account_activation_read_allowed": lambda _request: True,
             "_require_account_store": lambda _request: _Store(),
             "_raise_account_http_error": lambda error: (_ for _ in ()).throw(
                 _RaisedHTTP(error.code)
@@ -2175,7 +2175,7 @@ class AccountCapabilityTests(unittest.TestCase):
             namespace["_account_activation_context"](object())
         self.assertEqual(str(raised.exception), "account_store_unavailable")
 
-    def test_exact_account_origin_rejects_rebinding_and_other_local_ports(self):
+    def test_exact_account_origin_and_headerless_readiness_reject_rebinding(self):
         names = (
             "_env_flag_enabled", "_server_bind_is_widened",
             "_cloudflare_origin_has_suffix", "_is_quick_tunnel_origin",
@@ -2183,6 +2183,7 @@ class AccountCapabilityTests(unittest.TestCase):
             "_first_forwarded_value", "_request_external_origins",
             "_configured_app_origins", "_matches_verified_stable_redirect_origin",
             "_account_exact_origin_allowed", "_account_local_bootstrap_allowed",
+            "_account_activation_read_allowed", "_account_activation_context",
             "_reject_cross_origin_mutation",
         )
         module, path = self._launch_subset(
@@ -2202,30 +2203,71 @@ class AccountCapabilityTests(unittest.TestCase):
             "Request": object,
             "JSONResponse": _Response,
             "_runtime_share_registration": lambda: ("", "", False),
-            "_request_is_cloudflare_remote": lambda _request: False,
+            "AccountAuthError": AccountAuthError,
+            "_accounts_enabled": lambda: True,
+            "_account_bootstrap_enabled": lambda: True,
+            "_request_is_cloudflare_remote": lambda request: bool(
+                getattr(request, "cloudflare", False)
+            ),
             "_is_loopback_request_client": lambda request: request.client.host == "127.0.0.1",
+            "_raise_account_http_error": lambda error: (_ for _ in ()).throw(error),
         }
         exec(compile(module, str(path), "exec"), namespace)
 
-        def request(base, origin, client="127.0.0.1", forwarded_host=""):
-            headers = {"origin": origin}
+        class _Store:
+            reads = 0
+
+            def has_accounts(self):
+                self.reads += 1
+                return False
+
+        store = _Store()
+        namespace["_require_account_store"] = lambda _request: store
+
+        def request(
+            base, origin=None, client="127.0.0.1", forwarded_host="",
+            cloudflare=False, method="POST", path_name="/api/v1/account/nonce",
+        ):
+            headers = {}
+            if origin is not None:
+                headers["origin"] = origin
             if forwarded_host:
                 headers.update({"x-forwarded-proto": "https", "x-forwarded-host": forwarded_host})
             return types.SimpleNamespace(
                 base_url=base,
                 headers=headers,
                 client=types.SimpleNamespace(host=client),
-                method="POST",
-                url=types.SimpleNamespace(path="/api/v1/account/nonce"),
+                cloudflare=cloudflare,
+                method=method,
+                url=types.SimpleNamespace(path=path_name),
             )
 
         allowed = namespace["_account_exact_origin_allowed"]
         bootstrap = namespace["_account_local_bootstrap_allowed"]
+        readiness = namespace["_account_activation_read_allowed"]
+        activation = namespace["_account_activation_context"]
         with patch.dict(os.environ, {"SERVER_PORT": "7860"}, clear=True):
             exact = request("http://127.0.0.1:7860/", "http://127.0.0.1:7860")
             self.assertTrue(allowed(exact))
             self.assertTrue(bootstrap(exact))
+            self.assertTrue(readiness(exact))
             self.assertIsNone(namespace["_reject_cross_origin_mutation"](exact))
+
+            headerless = request(
+                "http://127.0.0.1:7860/", method="GET",
+                path_name="/api/v1/account/context",
+            )
+            self.assertTrue(readiness(headerless))
+            self.assertEqual(activation(headerless)["activation_state"], "setup_available")
+            self.assertEqual(store.reads, 1)
+            headerless_mutation = request("http://127.0.0.1:7860/")
+            self.assertEqual(
+                namespace["_reject_cross_origin_mutation"](
+                    headerless_mutation
+                ).status_code,
+                403,
+            )
+
             self.assertFalse(allowed(request(
                 "http://127.0.0.1:7860/", "http://localhost:5173",
             )))
@@ -2235,6 +2277,26 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertFalse(bootstrap(request(
                 "https://attacker.example/", "https://attacker.example",
             )))
+            rejected_reads = (
+                request("https://attacker.example/"),
+                request("http://127.0.0.1:7860/", client="192.0.2.10"),
+                request("http://127.0.0.1:7860/", cloudflare=True),
+                request(
+                    "http://127.0.0.1:7860/",
+                    forwarded_host="attacker.example",
+                ),
+                request(
+                    "http://127.0.0.1:7860/",
+                    origin="https://attacker.example",
+                ),
+            )
+            for rejected in rejected_reads:
+                self.assertFalse(readiness(rejected))
+                self.assertEqual(
+                    activation(rejected)["activation_state"],
+                    "setup_requires_loopback",
+                )
+            self.assertEqual(store.reads, 1)
             origins = namespace["_configured_app_origins"]()
             self.assertIn("http://127.0.0.1:7860", origins)
             self.assertNotIn("http://localhost:5173", origins)

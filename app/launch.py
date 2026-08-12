@@ -18581,6 +18581,24 @@ def _account_local_bootstrap_allowed(request: Request) -> bool:
     return _account_exact_origin_allowed(request)
 
 
+def _account_activation_read_allowed(request: Request) -> bool:
+    """Allow a setup-readiness read from this exact direct loopback app."""
+    if _request_is_cloudflare_remote(request) or not _is_loopback_request_client(request):
+        return False
+    approved = _configured_app_origins()
+    direct = _canonical_http_origin(str(request.base_url), allow_path=True)
+    if direct is None or direct not in approved:
+        return False
+    request_origins = _request_external_origins(request)
+    if not request_origins or any(
+        origin not in approved for origin in request_origins
+    ):
+        return False
+    if "origin" in request.headers:
+        return _account_exact_origin_allowed(request)
+    return True
+
+
 def _account_request_source(request: Request) -> str:
     """Return the socket peer only; never trust caller-controlled forwarding."""
     client = getattr(request, "client", None)
@@ -18621,7 +18639,7 @@ def _account_activation_context(request: Request) -> dict:
             "activation_state": "ready",
             "bootstrap_available": False,
         }
-    if not _account_local_bootstrap_allowed(request):
+    if not _account_activation_read_allowed(request):
         return {
             "activation_state": "setup_requires_loopback",
             "bootstrap_available": False,

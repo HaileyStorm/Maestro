@@ -1,0 +1,170 @@
+# Maestro Continuation Guide
+
+This is the durable starting point for a fresh development session. It records
+contracts and procedures, not a claim that any particular deployment is live.
+
+## Start at the repository root
+
+Resolve the checkout instead of relying on a machine-specific path:
+
+```bash
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+test -f "$REPO_ROOT/AGENTS.md" && test -d "$REPO_ROOT/.beads" || exit 1
+cd "$REPO_ROOT"
+```
+
+Then read `AGENTS.md`, this guide, and `CONTRIBUTING.md`. Inventory the shared
+workspace before changing it:
+
+```bash
+bd where
+bd prime
+bd show ISSUE_ID
+git status --short --branch
+```
+
+Inspect `.working`. Create a short scope/owner sentinel only when none exists;
+never overwrite another active owner. Preserve every pre-existing dirty path,
+reserve one writer per file or symbol cluster, and stage only owned files.
+
+Some older checkouts can contain Beads data that the installed `bd` cannot open
+without a historical database migration. If a command above fails for that
+reason, do not initialize a second tracker or delete, move, or rewrite `.beads`.
+Record the exact blocker for the coordinating owner and preserve the canonical
+repo-root tracker.
+
+## Accounts and existing projects
+
+Accounts are an optional host feature. They may be enabled in an operator's
+ignored configuration, but no tracked document should claim their current live
+state. Project passwords and browser project sessions remain separate.
+
+The first-owner procedure is:
+
+1. Set `MAESTRO_ACCOUNTS_ENABLED=true` and
+   `MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=true` in Pinokio's per-app **Configure**
+   tab, then use **Restart Maestro**.
+2. Open the direct loopback Web UI on the computer running Maestro. In
+   **Support** > **Account**, create the first owner and save the one-time
+   recovery codes offline. Owner setup is never offered over LAN or Cloudflare.
+3. Set `MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false` and restart again. Keep
+   `MAESTRO_ACCOUNTS_ENABLED=true` so accounts and sign-in remain available.
+
+Never invent an owner password, store recovery codes in the repository, or put
+account-store or signing-secret values in documentation, commands, or logs.
+
+Enabling accounts alone does not hide or reassign existing projects. Until the
+owner explicitly completes a zero-quarantine migration, account-based project
+filtering remains off and the legacy browser/project-password view continues to
+show existing projects.
+
+After owner creation, use the direct loopback UI to sign in and confirm the
+owner password. In **Support** > **Account**, choose **Connect existing projects
+to this owner**. The corresponding owner-only, recent-reauth, loopback-only API
+is:
+
+- `GET /api/v1/account/projects/migration` — inspect current migration state.
+- `POST /api/v1/account/projects/migration` — explicitly census and bind the
+  existing projects to the owner.
+
+Migration states are:
+
+| State | Meaning |
+| --- | --- |
+| `disabled` | Accounts are off; account project filtering is off. |
+| `not_started` | No migration was committed; existing projects remain visible. |
+| `needs_attention` | At least one project could not be safely bound; filtering remains off. |
+| `active` | The complete zero-quarantine inventory is bound and account project access is enforced. |
+
+Do not bypass `needs_attention`, silently orphan a folder, or treat a partial
+census as success. Repair an invalid project or resolve an explicitly approved,
+recoverable removal, then rerun the normal flow.
+
+`GET /api/v1/account/context` is the server-authored source for account
+activation state. Relevant values are `disabled`, `setup_available`,
+`setup_requires_loopback`, `disable_bootstrap`, and `ready`; do not infer them
+from client state.
+
+## Credits remain a separate activation gate
+
+Runtime credit accounting is currently compiled hard-off. Do not describe an
+environment flag, support contribution, or account activation as credit
+enforcement.
+
+Before credits can be enabled, a separate release must prove both sides of the
+contract:
+
+- A freshly resolved owner role from the sealed account store bypasses new-job
+  reservation, allowance consumption, journaling, and credit denial. Client
+  fields and persisted job parameters are not authority. Historical owner holds
+  still need their normal release path.
+- Non-owner hosted jobs follow one validated allowance and denial contract,
+  including recovery and child-job behavior, with no accidental local or
+  project-password bypass.
+
+Keep credit activation off until the implementation, regression matrix, and
+live acceptance for that contract are complete.
+
+## Coordinated restart and status
+
+Use Pinokio's **Restart Maestro** launcher action. It invokes `restart.js`,
+publishes a bounded public restart notice when stable sharing is configured,
+and restarts `start.js`. Do not assume that launching an already-ready app with
+a default selector has performed a restart; confirm an actual lifecycle change.
+
+For a manually coordinated maintenance window, use one untracked generation
+value and the existing helper:
+
+```bash
+RESTART_GENERATION="$(python -c 'from app.scripts.restart_status import new_generation; print(new_generation())')"
+python app/scripts/restart_status.py set --state planned --reason restart \
+  --message "Planned maintenance" --generation "$RESTART_GENERATION"
+python app/scripts/restart_status.py show
+```
+
+After the intended surfaces are healthy, clear only that exact generation and
+show the result:
+
+```bash
+python app/scripts/restart_status.py clear --generation "$RESTART_GENERATION"
+python app/scripts/restart_status.py show
+unset RESTART_GENERATION
+```
+
+Never clear on process visibility alone. A `NOT_CLEARED` result is a safety
+stop, not permission to try a different generation.
+
+Maestro's port is dynamic. Resolve the app with `pterm search`, keep its returned
+canonical reference, and use:
+
+```bash
+pterm status "$MAESTRO_REF" --probe --timeout=5000
+curl -fsS "${MAESTRO_URL%/}/health"
+```
+
+Set `MAESTRO_URL` from the current `ready_url` or the specific external surface
+being tested; never copy an old port from a handoff.
+
+## Verification matrix
+
+Verify only configured surfaces and label each evidence level accurately.
+
+| Surface | Required checks |
+| --- | --- |
+| Direct local | `pterm status --probe`, then `/health`, `/api/v1/account/context`, and `/api/v1/workspaces` against the current `ready_url`. |
+| LAN | Use the currently advertised LAN URL; repeat the relevant health, account-context, and workspace checks from a LAN client. |
+| Stable/Cloudflare | Use the currently advertised stable URL, confirm `/health`, then exercise account context and workspaces with a cookie-aware browser/client. Keep the direct Quick Tunnel as a separately tested fallback when claimed. |
+
+For account activation, also confirm that direct loopback offers the expected
+setup state while LAN and Cloudflare never offer first-owner setup. Before
+migration, confirm the existing project inventory remains visible. After an
+`active` migration, confirm the owner sees the same intended inventory through
+account authorization.
+
+Do not record project names, credentials, cookies, private URLs, ports, process
+IDs, or secrets in the handoff. Static checks and tests are not live acceptance;
+automated browser evidence is not human acceptance.
+
+Finish with the quality and serial Git/Beads closure procedure in
+`CONTRIBUTING.md`. Remove `.working` only when its coordinated scope is truly
+complete.

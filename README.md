@@ -568,6 +568,10 @@ Click **Reset** to wipe the install and start over. Removes `app/env/`, `ui/node
 
 ### Continuing development work
 
+Start with the durable [Maestro continuation guide](docs/operations/CONTINUATION.md)
+for the current account, project-migration, credit, restart, and verification
+contracts.
+
 Continuation is repository-rooted, not machine-path-rooted. Resolve the Git root
 and require both `AGENTS.md` and `.beads/`; then run `bd where`, `bd prime`,
 `bd show ISSUE_ID`, and `git status --short --branch`, and inspect `.working`
