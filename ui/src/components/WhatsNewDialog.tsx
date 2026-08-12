@@ -140,7 +140,7 @@ function WhatsNewDialog({
           <div className="min-w-0 flex-1">
             <h2 id={titleId} className="text-base font-semibold text-text-primary">What's new in {PRODUCT_NAME}</h2>
             <p id={descriptionId} className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
-              Public, UI-bundled notes only. No project, runtime, or machine data is read.
+              These notes are included with the app. Opening them does not access your projects, running work, or device information.
             </p>
           </div>
           <button
@@ -158,10 +158,10 @@ function WhatsNewDialog({
           <section aria-labelledby={`${titleId}-current`}>
             <div className="flex flex-wrap items-center gap-2">
               <h3 id={`${titleId}-current`} className="text-sm font-semibold text-text-primary">Continuum v{CURRENT_RELEASE.version}</h3>
-              <span className="rounded-full bg-accent-blue/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-accent-blue">Current build</span>
+              <span className="rounded-full bg-accent-blue/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-accent-blue">Latest</span>
             </div>
             <p className="mt-2 text-[11px] leading-relaxed text-text-secondary">{CURRENT_RELEASE.summary}</p>
-            <h4 className="mt-4 text-[10px] font-semibold uppercase tracking-[0.14em] text-text-muted">Shipped in this Continuum build</h4>
+            <h4 className="mt-4 text-[10px] font-semibold uppercase tracking-[0.14em] text-text-muted">New in this release</h4>
             <ul className="mt-2 space-y-2" aria-label={`Continuum ${CURRENT_RELEASE.version} release highlights`}>
               {CURRENT_RELEASE.highlights.map(highlight => (
                 <li key={highlight.id} className="flex gap-2 rounded-lg border border-border/80 bg-bg-primary/40 px-3 py-2.5">
@@ -177,7 +177,7 @@ function WhatsNewDialog({
 
           <section className="mt-5 border-t border-border pt-5" aria-labelledby={`${titleId}-why`}>
             <h3 id={`${titleId}-why`} className="text-sm font-semibold text-text-primary">Why Continuum</h3>
-            <p className="mt-1 text-[10px] leading-relaxed text-text-muted">The all-time product view, kept separate from this build's release delta.</p>
+            <p className="mt-1 text-[10px] leading-relaxed text-text-muted">What Continuum adds over time, beyond this release.</p>
             <ul className="mt-2 space-y-2" aria-label="Why Continuum">
               {CHANGELOG_MANIFEST.whyContinuum.map(highlight => (
                 <li key={highlight.id} className="rounded-lg border border-border/70 bg-bg-tertiary/25 px-3 py-2">
@@ -193,14 +193,14 @@ function WhatsNewDialog({
           <details className="group mt-5 rounded-xl border border-border bg-bg-tertiary/35">
             <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 px-3.5 py-3 text-xs font-semibold text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue md:min-h-0 [&::-webkit-details-marker]:hidden">
               <History size={14} aria-hidden="true" className="text-accent-blue" />
-              All release history
+              Earlier releases
               <ChevronRight size={14} aria-hidden="true" className="ml-auto transition-transform group-open:rotate-90" />
             </summary>
             <div className="space-y-5 border-t border-border px-3.5 py-4">
-              <ReleaseGroup title="Continuum history" releases={continuumArchive} />
-              <ReleaseGroup title="Maestro base archive" releases={maestroArchive} />
+              <ReleaseGroup title="Earlier Continuum releases" releases={continuumArchive} />
+              <ReleaseGroup title="Included Maestro history" releases={maestroArchive} />
               <p className="rounded-lg border border-border/70 bg-bg-primary/40 px-3 py-2 text-[10px] leading-relaxed text-text-muted">
-                {CHANGELOG_MANIFEST.lineageNote} WanGP details remain in its upstream history and are not presented as Continuum releases.
+                {CHANGELOG_MANIFEST.lineageNote} Earlier WanGP changes are documented by the WanGP project and are not listed as Continuum releases.
               </p>
             </div>
           </details>
@@ -247,10 +247,10 @@ function ReleaseGroup({ title, releases }: { title: string; releases: readonly P
 
 function ReleaseProvenance({ release }: { release: PublicReleaseNote }) {
   if (release.provenance.kind === 'git-tag') {
-    return <span className="text-[9px] text-text-muted">tag {release.provenance.tag} · {release.provenance.date}</span>
+    return <span className="text-[9px] text-text-muted">GitHub tag {release.provenance.tag} · {release.provenance.date}</span>
   }
   if (release.provenance.kind === 'bundled-snapshot') {
-    return <span title={release.provenance.note} className="text-[9px] text-text-muted">untagged bundled snapshot</span>
+    return <span title={release.provenance.note} className="text-[9px] text-text-muted">Included version · no GitHub tag</span>
   }
-  return <span className="text-[9px] text-text-muted">Continuum build · no release link</span>
+  return <span className="text-[9px] text-text-muted">Continuum release · no separate link</span>
 }

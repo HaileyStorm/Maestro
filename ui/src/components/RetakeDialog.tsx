@@ -7,6 +7,16 @@ import * as api from '../api/client'
 import { modelDisplayName } from '../lib/modelDisplay'
 import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
 
+function retakeFrameCount(frameRange: string): number | null {
+  const match = /^(\d+)-(\d+)(?:\/\d+)?$/.exec(frameRange.trim())
+  if (!match) return null
+  const start = Number(match[1])
+  const end = Number(match[2])
+  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && end > start
+    ? end - start
+    : null
+}
+
 export function RetakeDialog() {
   const titleId = useId()
   const descriptionId = useId()
@@ -138,14 +148,17 @@ export function RetakeDialog() {
         workspace: activeWorkspace,
       })
       if (requestEpochRef.current !== requestEpoch) return
-      setSuccess(`Retake queued: ${result.retake_frames}`)
+      const frameCount = retakeFrameCount(result.retake_frames)
+      setSuccess(frameCount === null
+        ? 'Retake queued.'
+        : `Retake queued for ${frameCount} ${frameCount === 1 ? 'frame' : 'frames'}.`)
       loadOutputs()
       successTimerRef.current = setTimeout(() => {
         successTimerRef.current = null
         if (requestEpochRef.current === requestEpoch) closeDialog()
       }, 1500)
-    } catch (e) {
-      if (requestEpochRef.current === requestEpoch) setError((e as Error).message)
+    } catch {
+      if (requestEpochRef.current === requestEpoch) setError('The retake could not be queued. Try again.')
     } finally {
       if (requestEpochRef.current === requestEpoch) {
         submittingRef.current = false

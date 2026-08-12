@@ -695,6 +695,19 @@ export interface AccountContext {
   bootstrap_available?: boolean
 }
 
+export type AccountProjectMigrationState =
+  | 'disabled'
+  | 'not_started'
+  | 'needs_attention'
+  | 'active'
+
+export interface AccountProjectMigrationStatus {
+  state: AccountProjectMigrationState
+  enforced: boolean
+  project_count: number
+  needs_attention: number
+}
+
 export interface AccountSession {
   id: string
   device_label: string

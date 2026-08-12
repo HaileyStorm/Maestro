@@ -24,13 +24,13 @@ export interface PublicReleaseNote {
 const whyContinuumHighlights = [
   {
     id: 'project-access',
-    title: 'Project-scoped creation, privacy, and remote access',
-    summary: 'Projects separate outputs and references; remote visitors unlock only an authorized project, while machine controls stay with the host.',
+    title: 'Organized projects with private, controlled access',
+    summary: 'Keep outputs and references together by project. Remote visitors can open only the projects you authorize, while computer settings stay with the person running Continuum.',
   },
   {
     id: 'h3-long-form',
-    title: 'Curated H3 long-form planning and recovery',
-    summary: 'Continuum carries the bundled Maestro 1.6.5 H3 contract through Generate and Director: server-authored profiles, one authored timeline, deterministic native-shot plans, and supported recovery controls.',
+    title: 'Longer H3 videos with clear plans and recovery',
+    summary: 'Continuum brings the included Maestro 1.6.5 H3 features into Generate and Director, keeping timing consistent, choosing compatible shot lengths, and offering clear recovery options.',
   },
   {
     id: 'reference-studio',
@@ -39,44 +39,44 @@ const whyContinuumHighlights = [
   },
   {
     id: 'local-intelligence',
-    title: 'Request-scoped local LLM and Director tools',
-    summary: 'Host-configured local language-model tools apply explicit guidance per request and keep Director planning tied to the active project.',
+    title: 'Local creative guidance when you want it',
+    summary: 'Use the local AI tools chosen by the person running Continuum for individual requests, with Director guidance kept inside the active project.',
   },
   {
     id: 'queue-recovery',
-    title: 'Queue and recovery visibility',
-    summary: 'Owner-only queue cards show position, segment progress, checkpoints, failures, and resumable states when the selected workflow supports them.',
+    title: 'A queue you can follow and resume',
+    summary: 'Project owners can see position, progress, saved checkpoints, problems, and resume options on each queue card when the workflow supports them.',
   },
 ] as const satisfies readonly ReleaseHighlight[]
 
 const continuum030Highlights = [
   {
     id: 'continuum-030-reference-pack-v2',
-    title: 'Adaptive, sealed Reference Pack v2',
-    summary: 'Reference preserves authored sheet order in sealed v2 plans, carries exact generation and editor model choices, and keeps optional LoRAs explicitly scoped instead of enabling them automatically.',
+    title: 'Reference Packs that keep your choices together',
+    summary: 'Reference Pack v2 keeps sheet order, generation and editor model choices, and optional LoRAs with the work. LoRAs stay off unless you choose them.',
   },
   {
     id: 'continuum-030-host-model-controls',
-    title: 'Host-authorized models and exact-family recipes',
-    summary: 'Host controls present exact model-license notices and user-confirmed manual review commitments, while curated recipes are pinned to exact supported model families.',
+    title: 'Clear model choices and compatible recipes',
+    summary: 'The person running Continuum can review model licenses and confirm any required checks, while curated recipes appear only for models they support.',
   },
   {
     id: 'continuum-030-private-gallery',
     title: 'Blur/Reveal controls for large galleries',
-    summary: 'Browser-session Blur/Reveal controls protect private previews without changing project access, while virtualized rendering keeps large galleries responsive.',
+    summary: 'Blur or reveal private previews in this browser without changing project access. Large galleries stay responsive by loading previews as needed.',
   },
   {
     id: 'continuum-030-durable-queue',
-    title: 'Durable plans, recovery, and resource visibility',
-    summary: 'Queued work preserves its authored plan and surfaces bounded recovery actions, preparation status, and resource estimates on its queue card.',
+    title: 'Reliable queues with recovery and estimates',
+    summary: 'Queued work keeps its plan, while each queue card shows preparation progress, available recovery options, and expected resource use.',
   },
 ] as const satisfies readonly ReleaseHighlight[]
 
 const continuum020Highlights = [
   {
     id: 'continuum-020-project-access',
-    title: 'Project-aware local and remote workspace',
-    summary: 'Extends project-scoped creation with explicit remote project unlocks while keeping machine controls host-only.',
+    title: 'Projects that work locally and remotely',
+    summary: 'Let remote visitors unlock approved projects while keeping computer settings available only to the person running Continuum.',
   },
   {
     id: 'continuum-020-reference-studio',
@@ -85,13 +85,13 @@ const continuum020Highlights = [
   },
   {
     id: 'continuum-020-local-intelligence',
-    title: 'Request-scoped LLM and Director controls',
-    summary: 'Local language-model guidance is selected per request, while Director planning remains tied to the active project and visible host backend.',
+    title: 'Local guidance for each request',
+    summary: 'Choose local AI guidance when you need it, while Director keeps its planning inside the active project.',
   },
   {
     id: 'continuum-020-queue-recovery',
-    title: 'Visible queue and recovery states',
-    summary: 'Owner-only queue cards expose position, segment progress, checkpoints, failures, and resumable states where the workflow supports them.',
+    title: 'Queue progress and recovery',
+    summary: 'Project owners can follow position, progress, saved checkpoints, problems, and resume options where the workflow supports them.',
   },
 ] as const satisfies readonly ReleaseHighlight[]
 
@@ -100,78 +100,78 @@ export const CHANGELOG_MANIFEST = {
   currentVersion: PRODUCT_VERSION,
   maestroBaseVersion: MAESTRO_BASE_VERSION,
   whyContinuum: whyContinuumHighlights,
-  lineageNote: 'Continuum product history, Maestro base history, and the upstream WanGP pipeline history are separate lineages.',
+  lineageNote: 'Continuum, Maestro, and WanGP each have their own release history.',
   releases: [
     {
       lineage: 'continuum',
       version: '0.3.0',
-      label: 'Current Continuum build',
-      summary: 'Continuum 0.3 advances reference production, host-authorized model workflows, private gallery control, and durable queued planning.',
+      label: 'Current Continuum release',
+      summary: 'Continuum 0.3 improves Reference, makes model choices clearer, adds private gallery controls, and makes queued work easier to follow and recover.',
       provenance: { kind: 'continuum-build' },
       highlights: continuum030Highlights,
     },
     {
       lineage: 'continuum',
       version: '0.2.0',
-      label: 'Continuum project-authoring expansion',
-      summary: 'Continuum 0.2 expands its project-aware authoring layer with Reference, request-scoped local intelligence, and visible queue recovery.',
+      label: 'More ways to create in projects',
+      summary: 'Continuum 0.2 added Reference, optional local AI guidance, and clearer queue progress and recovery.',
       provenance: { kind: 'continuum-build' },
       highlights: continuum020Highlights,
     },
     {
       lineage: 'continuum',
       version: '0.1.0',
-      label: 'Continuum foundation',
-      summary: 'Established Continuum as a distinct product layer over the Maestro base, centered on project-oriented creation and host-authorized remote use.',
+      label: 'First Continuum release',
+      summary: 'Continuum began as a new creative workspace built on Maestro, with projects at the center and remote access controlled by the person running it.',
       provenance: { kind: 'continuum-build' },
       highlights: [
         {
           id: 'continuum-identity',
           title: 'Distinct product foundation',
-          summary: 'Introduced Continuum identity and a project-centered studio experience while preserving attribution to the Maestro base.',
+          summary: 'Introduced the Continuum name and a project-centered studio while clearly crediting the Maestro base.',
         },
         {
           id: 'continuum-access-foundation',
-          title: 'Host-authorized access',
-          summary: 'Established local-host ownership and explicit project access as the foundation for local and remote use.',
+          title: 'Controlled project access',
+          summary: 'Let the person running Continuum choose which projects can be opened locally or remotely.',
         },
       ],
     },
     {
       lineage: 'maestro-base',
       version: '1.6.5',
-      label: 'Bundled Maestro base snapshot',
-      summary: 'The bundled 1.6.5 base established server-authored H3 performance profiles and a deterministic native-shot plan shared by Studio and Director.',
+      label: 'Included Maestro 1.6.5 base',
+      summary: 'The included Maestro 1.6.5 base added ready-to-use H3 quality profiles and compatible shot planning shared by Studio and Director.',
       provenance: {
         kind: 'bundled-snapshot',
-        note: 'Documented in the bundled Maestro changelog; this snapshot is not represented as a tagged GitHub release.',
+        note: 'This version is documented in the included Maestro changelog and does not have its own GitHub tag.',
       },
       highlights: [
         {
           id: 'base-h3-profiles',
-          title: 'Server-authored H3 profiles',
-          summary: 'Draft and Fast use managed four- and eight-step Turbo profiles; Quality and High retain 20-step native generation.',
+          title: 'Ready-to-use H3 quality profiles',
+          summary: 'Draft and Fast use ready-made four- and eight-step Turbo settings. Quality and High keep the fuller 20-step process.',
         },
         {
           id: 'base-h3-planner',
           title: 'Coherent H3 timelines',
-          summary: 'Authored timing remains authoritative while untimed work is mapped deterministically onto legal native shots.',
+          summary: 'Your timing choices are preserved, while untimed sections are fitted to shot lengths that H3 supports.',
         },
       ],
     },
     {
       lineage: 'maestro-base',
       version: '1.6.1',
-      label: 'Historical Maestro base',
-      summary: 'This tagged snapshot introduced the earlier adjustable Full-model H3 Turbo adapter surface, later superseded by the managed 1.6.5 profile contract.',
+      label: 'Earlier Maestro release',
+      summary: 'This tagged release let people tune the Full-model H3 Turbo adapter. Maestro 1.6.5 later replaced those controls with ready-to-use profiles.',
       provenance: { kind: 'git-tag', tag: 'v1.6.1', date: '2026-08-06' },
       highlights: [],
     },
     {
       lineage: 'maestro-base',
       version: '1.5.0',
-      label: 'Historical Maestro base',
-      summary: 'This tagged snapshot added major SCAIL-2 Recast and Repaint work, LTX-2.3 Outpaint improvements, and broader Studio reliability updates.',
+      label: 'Earlier Maestro release',
+      summary: 'This tagged release added major SCAIL-2 Recast and Repaint features, LTX-2.3 Outpaint improvements, and broader Studio reliability updates.',
       provenance: { kind: 'git-tag', tag: 'v1.5.0', date: '2026-08-02' },
       highlights: [],
     },

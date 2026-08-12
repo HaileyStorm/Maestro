@@ -12,11 +12,13 @@ import {
   createServerAccount,
   fetchAdminAccountSupport,
   fetchAccountContext,
+  fetchAccountProjectMigration,
   fetchResponsibleUse,
   fetchSupportCatalog,
   fetchSupportSelf,
   loginAccount,
   logoutAccount,
+  migrateAccountProjects,
   reauthenticateAccount,
   recordAdminAccountContribution,
   recoverAccount,
@@ -243,6 +245,7 @@ test('a successful sign-in hydrates current sessions and owner users without reo
       created_at: 1, last_seen_at: 2, expires_at: 3, current: true,
     }] })
     if (url.endsWith('/account/users')) return jsonResponse({ accounts: [account] })
+    if (url.endsWith('/workspaces')) return jsonResponse({ workspaces: [{ name: 'owned-project', project_role: 'owner', project_permissions: ['project.read'] }], active: 'owned-project' })
     throw new Error(`Unexpected account request: ${url} ${init.method || 'GET'}`)
   }
   t.after(() => {
@@ -276,10 +279,11 @@ test('a successful sign-in hydrates current sessions and owner users without reo
   })
   await useStore.getState().loginAccount({ username: 'Owner', password: 'long enough password' })
 
-  assert.deepEqual(calls.slice(-5), [
+  assert.deepEqual(calls.slice(-6), [
     '/api/v1/account/nonce',
     '/api/v1/account/login',
     '/api/v1/account/context',
+    '/api/v1/workspaces',
     '/api/v1/account/sessions',
     '/api/v1/account/users',
   ])
@@ -320,6 +324,7 @@ test('account loaders ignore reverse-order and post-logout responses from a stal
   const sessionRequests = []
   const userRequests = []
   const accessRequests = []
+  let workspaceRequests = 0
   let logoutContext = false
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input)
@@ -343,6 +348,13 @@ test('account loaders ignore reverse-order and post-logout responses from a stal
       const request = deferred()
       userRequests.push(request)
       return request.promise
+    }
+    if (url.endsWith('/workspaces')) {
+      workspaceRequests += 1
+      return jsonResponse(workspaceRequests === 2 ? {
+        workspaces: [{ name: 'project-b', project_permissions: ['project.read'] }],
+        active: 'project-b',
+      } : { workspaces: [], active: '' })
     }
     if (url.endsWith('/account/nonce')) {
       return jsonResponse({ nonce: 'logout-nonce', purpose: 'revoke_session', expires_in: 300 })
@@ -398,6 +410,8 @@ test('account loaders ignore reverse-order and post-logout responses from a stal
   const newerAccountContext = useStore.getState().loadAccountContext()
   contextRequests[0].resolve(jsonResponse(context(accountB)))
   await newerAccountContext
+  assert.equal(workspaceRequests, 2, 'a passive account identity change refreshes project visibility')
+  assert.equal(useStore.getState().activeWorkspace, 'project-b')
   accessRequests[1].resolve(jsonResponse({
     remote: false,
     project_password_required: false,
@@ -450,6 +464,333 @@ test('account loaders ignore reverse-order and post-logout responses from a stal
   assert.equal(useStore.getState().accountDetailsLoading, false)
 })
 
+test('superseded bootstrap and recovery responses never return one-time recovery codes', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+
+  const account = (id, username) => ({
+    id, username, role: 'owner', disabled: false, created_at: 1,
+    has_email: false, passkey_credentials: 0, passkey_authentication_available: false,
+  })
+  const accountA = account('account-a', 'Account A')
+  const accountB = account('account-b', 'Account B')
+  const context = current => ({
+    enabled: true, authenticated: Boolean(current), account: current,
+    capabilities: current ? ['account.self', 'accounts.admin', 'services.admin', 'owner.admin'] : [],
+    reauthenticated: Boolean(current), passkey_authentication_available: false,
+    activation_state: current ? 'ready' : 'setup_available', bootstrap_available: !current,
+  })
+  const bootstrapResponse = deferred()
+  const recoveryResponse = deferred()
+  let visibleAccount = accountB
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.endsWith('/account/nonce')) {
+      const purpose = JSON.parse(init.body).purpose
+      return jsonResponse({ nonce: `${purpose}-nonce`, purpose, expires_in: 300 })
+    }
+    if (url.endsWith('/account/bootstrap')) return bootstrapResponse.promise
+    if (url.endsWith('/account/recover')) return recoveryResponse.promise
+    if (url.endsWith('/access-context')) return jsonResponse({ remote: false, accounts: context(visibleAccount) })
+    throw new Error(`Unexpected stale-secret request: ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+  })
+
+  const bundled = await build({
+    stdin: {
+      contents: "export { useStore } from './src/stores/useStore.ts'",
+      resolveDir: uiRoot,
+      loader: 'js',
+    },
+    bundle: true,
+    format: 'esm',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+  })
+  const { useStore } = await import(`${asDataModule(bundled.outputFiles[0].text)}#stale-secret-results`)
+  const anonymous = context(null)
+  useStore.setState({ accessContext: { remote: false, accounts: anonymous }, accountContext: anonymous })
+
+  const staleBootstrap = useStore.getState().bootstrapAccount({
+    username: 'Account A', password: 'long enough password', deviceLabel: 'Browser',
+  })
+  await Promise.resolve()
+  await useStore.getState().loadAccessContext(false)
+  bootstrapResponse.resolve(jsonResponse({ account: accountA, recovery_codes: ['BOOTSTRAP-SECRET'] }))
+  assert.equal(await staleBootstrap, null)
+
+  const staleRecovery = useStore.getState().recoverAccount({
+    username: 'Account B', recoveryCode: 'old recovery secret',
+    newPassword: 'replacement long password', deviceLabel: 'Browser',
+  })
+  await Promise.resolve()
+  visibleAccount = accountA
+  await useStore.getState().loadAccessContext(false)
+  recoveryResponse.resolve(jsonResponse({ account: accountB, recovery_codes: ['RECOVERY-SECRET'] }))
+  assert.equal(await staleRecovery, null)
+})
+
+test('same-account capability loss cancels deferred recovery-code and user-creation secrets', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = new StorageFake()
+  const owner = {
+    id: 'owner', username: 'Owner', role: 'owner', disabled: false, created_at: 1,
+    has_email: false, passkey_credentials: 0, passkey_authentication_available: false,
+  }
+  const context = (reauthenticated, capabilities = ['account.self', 'accounts.admin', 'services.admin']) => ({
+    enabled: true, authenticated: true, account: owner, capabilities, reauthenticated,
+    passkey_authentication_available: false, activation_state: 'ready', bootstrap_available: false,
+  })
+  const rotateResponse = deferred()
+  const createResponse = deferred()
+  let currentContext = context(true)
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.endsWith('/account/nonce')) {
+      const purpose = JSON.parse(init.body).purpose
+      return jsonResponse({ nonce: `${purpose}-nonce`, purpose, expires_in: 300 })
+    }
+    if (url.endsWith('/account/recovery-codes')) return rotateResponse.promise
+    if (url.endsWith('/account/users') && init.method === 'POST') return createResponse.promise
+    if (url.endsWith('/account/context')) return jsonResponse(currentContext)
+    throw new Error(`Unexpected authorization-race request: ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+  })
+
+  const bundled = await build({
+    stdin: {
+      contents: "export { useStore } from './src/stores/useStore.ts'",
+      resolveDir: uiRoot,
+      loader: 'js',
+    },
+    bundle: true,
+    format: 'esm',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+  })
+  const { useStore } = await import(`${asDataModule(bundled.outputFiles[0].text)}#secret-authorization-lease`)
+  useStore.setState({ accountContext: currentContext })
+
+  const staleRotation = useStore.getState().rotateAccountRecoveryCodes()
+  currentContext = context(false)
+  await useStore.getState().loadAccountContext(false)
+  rotateResponse.resolve(jsonResponse({ recovery_codes: ['ROTATED-SECRET'] }))
+  assert.equal(await staleRotation, null)
+
+  currentContext = context(true)
+  useStore.setState({ accountContext: currentContext })
+  const staleCreation = useStore.getState().createServerAccount({
+    username: 'New user', password: 'temporary long password',
+  })
+  currentContext = context(true, ['account.self'])
+  await useStore.getState().loadAccountContext(false)
+  createResponse.resolve(jsonResponse({ account: { ...owner, id: 'new-user' }, recovery_codes: ['CREATED-SECRET'] }))
+  assert.equal(await staleCreation, null)
+})
+
+test('account identity fences reverse-order projects and logout scrubs before preserving grant endpoints', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.localStorage = new StorageFake()
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+
+  const accountA = {
+    id: 'account-a', username: 'Account A', role: 'owner', disabled: false,
+    created_at: 1, has_email: false, passkey_credentials: 0,
+    passkey_authentication_available: false,
+  }
+  const accountB = { ...accountA, id: 'account-b', username: 'Account B' }
+  const accountContext = account => ({
+    enabled: true, authenticated: Boolean(account), account,
+    capabilities: account ? ['account.self', 'accounts.admin', 'services.admin', 'owner.admin'] : [],
+    reauthenticated: Boolean(account), passkey_authentication_available: false,
+    activation_state: 'ready', bootstrap_available: false,
+  })
+  const staleProjects = deferred()
+  const logoutResponse = deferred()
+  const calls = []
+  let workspaceCalls = 0
+  let loggedOut = false
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    calls.push(url)
+    if (url.endsWith('/workspaces')) {
+      workspaceCalls += 1
+      if (workspaceCalls === 1) return staleProjects.promise
+      return jsonResponse(loggedOut ? { workspaces: [], active: '' } : {
+        workspaces: [{
+          name: 'project-b', project_role: 'owner',
+          project_permissions: ['project.read', 'project.generate', 'project.lifecycle', 'project.delete'],
+        }],
+        active: 'project-b',
+      })
+    }
+    if (url.endsWith('/account/nonce')) {
+      const purpose = JSON.parse(init.body).purpose
+      return jsonResponse({ nonce: `${purpose}-nonce`, purpose, expires_in: 300 })
+    }
+    if (url.endsWith('/account/login')) return jsonResponse({ account: accountB })
+    if (url.endsWith('/account/logout')) return logoutResponse.promise
+    if (url.endsWith('/account/context')) return jsonResponse(accountContext(loggedOut ? null : accountB))
+    if (url.endsWith('/account/sessions')) return jsonResponse({ sessions: [] })
+    if (url.endsWith('/account/users')) return jsonResponse({ accounts: [accountB] })
+    throw new Error(`Unexpected account/project request: ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+  })
+
+  const bundled = await build({
+    stdin: {
+      contents: "export { useStore } from './src/stores/useStore.ts'",
+      resolveDir: uiRoot,
+      loader: 'js',
+    },
+    bundle: true,
+    format: 'esm',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+  })
+  const { useStore } = await import(`${asDataModule(bundled.outputFiles[0].text)}#project-identity-race`)
+  useStore.setState({
+    accessContext: { remote: false, accounts: accountContext(accountA) },
+    accountContext: accountContext(accountA),
+    workspaces: [{ name: 'project-a', project_permissions: ['project.read'] }],
+    activeWorkspace: 'project-a',
+    outputs: [{ name: 'old-output', workspace: 'project-a' }],
+    outputsTotal: 1,
+    jobs: [{ id: 'old-job', status: 'running', workspace: 'project-a' }],
+    isGenerating: true,
+  })
+
+  const staleLoad = useStore.getState().loadWorkspaces()
+  await useStore.getState().loginAccount({ username: 'Account B', password: 'long enough password' })
+  assert.equal(useStore.getState().activeWorkspace, 'project-b')
+  staleProjects.resolve(jsonResponse({
+    workspaces: [{ name: 'project-a', project_permissions: ['project.read'] }],
+    active: 'project-a',
+  }))
+  assert.equal(await staleLoad, false)
+  assert.equal(useStore.getState().activeWorkspace, 'project-b')
+
+  useStore.setState({
+    outputs: [{ name: 'private-output', workspace: 'project-b' }],
+    outputsTotal: 1,
+    jobs: [{ id: 'private-job', status: 'running', workspace: 'project-b' }],
+    isGenerating: true,
+    toolsSourcePath: '/private/project-b/source.mp4',
+    toolsSourceName: 'source.mp4',
+    toolsSourceUrl: '/api/private/project-b/source.mp4',
+    toolsRevoiceRefs: [{ filename: 'voice.wav', path: '/private/project-b/voice.wav' }, null],
+    directorAudioFile: { name: 'private.wav' },
+    directorAudioPath: '/private/project-b/audio.wav',
+    directorReferenceImage: { name: 'private.png' },
+    directorReferenceImagePath: '/private/project-b/reference.png',
+    directorClipImages: [{ clipIndex: 0, filename: 'private.png' }],
+    shortFilmPath: { kind: 'uploaded_story', value: '/private/project-b/story.txt' },
+    startImage: { name: 'director-start.png' },
+    endImage: { name: 'director-end.png' },
+    continueVideo: { name: 'director-continue.mp4' },
+    continueVideoPath: '/private/project-b/director-continue.mp4',
+    continueVideoUrl: '/api/private/project-b/director-continue.mp4',
+    audioGuideFilename: 'director-audio.wav',
+    imageRefs: [{ name: 'director-reference.png' }],
+    clips: [{ prompt: 'private director prompt', startImagePath: '/private/project-b/clip.png' }],
+  })
+  const logout = useStore.getState().logoutAccount()
+  assert.deepEqual(useStore.getState().workspaces, [])
+  assert.deepEqual(useStore.getState().outputs, [])
+  assert.deepEqual(useStore.getState().jobs, [])
+  assert.equal(useStore.getState().toolsSourcePath, null)
+  assert.deepEqual(useStore.getState().toolsRevoiceRefs, [null, null])
+  assert.equal(useStore.getState().directorAudioPath, null)
+  assert.equal(useStore.getState().directorReferenceImagePath, null)
+  assert.deepEqual(useStore.getState().directorClipImages, [])
+  assert.equal(useStore.getState().shortFilmPath, null)
+  assert.equal(useStore.getState().startImage, null)
+  assert.equal(useStore.getState().endImage, null)
+  assert.equal(useStore.getState().continueVideoPath, '')
+  assert.equal(useStore.getState().audioGuideFilename, null)
+  assert.deepEqual(useStore.getState().imageRefs, [])
+  assert.deepEqual(useStore.getState().clips, [])
+  loggedOut = true
+  logoutResponse.resolve(jsonResponse({ status: 'logged_out' }))
+  await logout
+  assert.equal(useStore.getState().accountContext.account, null)
+  assert.equal(calls.some(url => url.includes('/workspaces/lock')), false)
+  assert.equal(calls.some(url => url.includes('/workspaces/lock-all')), false)
+  const migrationCallsBefore = calls.filter(url => url.includes('/account/projects/migration')).length
+  const disabled = { ...accountContext(null), enabled: false, activation_state: 'disabled' }
+  useStore.setState({ accessContext: { remote: false, accounts: disabled }, accountContext: disabled })
+  assert.equal(await useStore.getState().loadAccountProjectMigration(), null)
+  assert.equal(
+    calls.filter(url => url.includes('/account/projects/migration')).length,
+    migrationCallsBefore,
+  )
+})
+
 test('account context is explicitly no-store and structured server errors stay bounded', async () => {
   const calls = []
   await withFetchMock(async (url, init = {}) => {
@@ -483,6 +824,32 @@ test('account context is explicitly no-store and structured server errors stay b
       return true
     })
   })
+})
+
+test('project setup status and migration use the exact explicit no-store account route', async () => {
+  const calls = []
+  await withFetchMock(async (url, init = {}) => {
+    calls.push({ url: String(url), init })
+    return jsonResponse({
+      state: calls.length === 1 ? 'not_started' : 'active',
+      enforced: calls.length > 1,
+      project_count: calls.length > 1 ? 3 : 0,
+      needs_attention: 0,
+    })
+  }, async () => {
+    assert.equal((await fetchAccountProjectMigration()).state, 'not_started')
+    assert.equal((await migrateAccountProjects()).state, 'active')
+  })
+
+  assert.deepEqual(calls.map(call => ({
+    url: call.url,
+    method: call.init.method || 'GET',
+    credentials: call.init.credentials,
+    cache: call.init.cache,
+  })), [
+    { url: '/api/v1/account/projects/migration', method: 'GET', credentials: 'same-origin', cache: 'no-store' },
+    { url: '/api/v1/account/projects/migration', method: 'POST', credentials: 'same-origin', cache: 'no-store' },
+  ])
 })
 
 const publicSupport = {
@@ -1002,7 +1369,10 @@ async function loadAccountButton() {
           if (args.path === 'lucide') return { contents: `
             export const Check='Check', ExternalLink='ExternalLink', HeartHandshake='HeartHandshake', KeyRound='KeyRound', Loader2='Loader2', LogIn='LogIn', LogOut='LogOut', RefreshCw='RefreshCw', ShieldCheck='ShieldCheck', UserCog='UserCog', UserPlus='UserPlus', UserRound='UserRound', X='X'
           ` }
-          if (args.path === 'api') return { contents: 'export class AccountApiError extends Error {}' }
+          if (args.path === 'api') return { contents: `
+            export class AccountApiError extends Error {}
+            export const isDirectLoopbackHostname = hostname => hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1'
+          ` }
           if (args.path === 'focus') return { contents: 'export const closeModalIfTop = () => true; export const installModalFocus = () => () => {}' }
           if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__accountStore)' }
           return null
@@ -1118,17 +1488,17 @@ test('Support renders only server-authored account activation readiness as passi
 
   const expected = new Map([
     ['disabled', ['Accounts are optional and off', 'No account setup or sign-in is required to keep using Maestro.']],
-    ['setup_available', ['Owner setup is available', 'Set up the owner from the Account tab on this direct local connection. Maestro will not create an account automatically.']],
-    ['setup_requires_loopback', ['Owner setup requires direct loopback access', 'Open Maestro directly on its loopback address for initial owner setup. No account details or setup action are available from this connection.']],
-    ['disable_bootstrap', ['Owner setup is complete', 'Set MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false, then restart Maestro to finish disabling initial setup.']],
-    ['ready', ['Account access is ready', 'Sign-in and account controls are available. Project passwords and browser sessions remain separate from accounts.']],
-    ['unavailable', ['Account activation status is unavailable', 'This server response does not provide a recognized activation state, so no setup action is offered here.']],
+    ['setup_available', ['Owner setup is available', 'Create the first owner account from the Account tab while using Maestro directly on this computer. Maestro will not create an account automatically.']],
+    ['setup_requires_loopback', ['Open Maestro on this computer to continue', 'For security, create the first owner account by opening Maestro directly on the computer where it is running. Setup details are hidden on this connection.']],
+    ['disable_bootstrap', ['Owner setup is complete', 'Restart Maestro after turning off first-owner setup in its account configuration.']],
+    ['ready', ['Account access is ready', 'Sign-in and account controls are available. Existing project access may still depend on this browser or a project password.']],
+    ['unavailable', ['Account setup status is unavailable', 'Maestro could not determine whether account setup is ready, so setup is unavailable from this connection.']],
   ])
 
   for (const [activationState, copy] of expected) {
     globalThis.__supportStore.accountContext = { ...context, activation_state: activationState }
     const tree = expandElement(SupportPanel())
-    const readinessSections = findElements(tree, node => node.props?.['aria-label'] === 'Account activation readiness')
+    const readinessSections = findElements(tree, node => node.props?.['aria-label'] === 'Account setup status')
     assert.equal(readinessSections.length, 1)
     const readinessText = elementText(readinessSections[0])
     assert.match(readinessText, new RegExp(copy[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
@@ -1141,9 +1511,9 @@ test('Support renders only server-authored account activation readiness as passi
   globalThis.__supportStore.accountContext = { ...context, activation_state: 'unknown_future_state' }
   const malformedText = elementText(findElements(
     expandElement(SupportPanel()),
-    node => node.props?.['aria-label'] === 'Account activation readiness',
+    node => node.props?.['aria-label'] === 'Account setup status',
   )[0])
-  assert.match(malformedText, /Account activation status is unavailable/)
+  assert.match(malformedText, /Account setup status is unavailable/)
   globalThis.__supportStore.accountContext = {
     ...context,
     enabled: true,
@@ -1151,9 +1521,9 @@ test('Support renders only server-authored account activation readiness as passi
   }
   const fallbackText = elementText(findElements(
     expandElement(SupportPanel()),
-    node => node.props?.['aria-label'] === 'Account activation readiness',
+    node => node.props?.['aria-label'] === 'Account setup status',
   )[0])
-  assert.match(fallbackText, /Account activation status is unavailable/)
+  assert.match(fallbackText, /Account setup status is unavailable/)
   assert.doesNotMatch(fallbackText, /Owner setup is available/)
 })
 
@@ -1204,20 +1574,23 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   const unavailableSupport = findElements(tree, node => node.props?.['aria-disabled'] === 'true')
   assert.equal(unavailableSupport.length, 1)
   assert.match(unavailableSupport[0].props.className, /\bmin-h-11\b/)
-  assert.match(text, /Current recorded allowance/)
+  assert.match(text, /Recorded informational compute allowance/)
+  assert.match(text, /Recorded amount: 460 compute seconds/)
   assert.match(text, /460 compute seconds/)
-  assert.match(text, /Recorded only as of/)
-  assert.match(text, /not enforced and does not currently change generation, queueing, or retries/)
+  assert.match(text, /Recorded as of/)
+  assert.match(text, /not an active balance and does not change generation, queueing, or retries/)
+  assert.match(text, /Recorded status: active/)
+  assert.match(text, /Recorded informational amount:/)
   assert.match(text, /Free allowance/)
   assert.match(text, /One-time support/)
   assert.match(text, /Recurring support/)
   assert.match(text, /Partial refund recorded/)
   assert.doesNotMatch(text, /spendable|remaining|private-source|source-event|provider/i)
 
-  const allowanceSection = findElements(tree, node => node.props?.['aria-label'] === 'Recorded compute allowance')
+  const allowanceSection = findElements(tree, node => node.props?.['aria-label'] === 'Recorded informational compute allowance')
   assert.equal(allowanceSection.length, 1)
   assert.match(allowanceSection[0].props.className, /\bmin-w-0\b/)
-  const sourceList = findElements(tree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Recorded allowance sources')
+  const sourceList = findElements(tree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Allowance breakdown')
   assert.equal(sourceList.length, 1)
   assert.match(sourceList[0].props.className, /\bgrid-cols-1\b/)
   assert.match(sourceList[0].props.className, /\bmin-w-0\b/)
@@ -1235,9 +1608,9 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
     responsible_use: responsibleUse,
   }
   const boundedTree = expandElement(SupportPanel())
-  const boundedList = findElements(boundedTree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Recorded allowance sources')[0]
+  const boundedList = findElements(boundedTree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Allowance breakdown')[0]
   assert.equal(findElements(boundedList, node => node.type === 'li').length, 20)
-  assert.match(elementText(boundedTree), /5 additional recorded sources are not shown in this compact view/)
+  assert.match(elementText(boundedTree), /5 additional items are not shown/)
 
   globalThis.__supportStore.supportSelf = {
     public: publicSupport,
@@ -1245,7 +1618,7 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
     responsible_use: responsibleUse,
   }
   const legacyText = elementText(expandElement(SupportPanel()))
-  assert.doesNotMatch(legacyText, /Current recorded allowance|Recorded allowance sources/)
+  assert.doesNotMatch(legacyText, /Recorded informational compute allowance|Allowance breakdown/)
 })
 
 test('Support panel renders a bounded owner audit with fulfillment controls, loading, empty, error, and stale-selection states', async t => {
@@ -1295,7 +1668,8 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     }],
     fulfillment: ['pending', 'in_progress', 'fulfilled', 'declined', 'reversed'].map((status, index) => ({
       target_event_id: `evt_${(index + 1).toString(16).padStart(32, '0')}`,
-      item: `credit_grant_${index + 1}`,
+      item: ['one_time_credit_grant', 'retention_follow_up', 'backdated_follow_up'][index]
+        || `credit_grant_${index + 1}`,
       status,
       audit_event_id: `evt_${(index + 11).toString(16).padStart(32, '0')}`,
       actor_reference: opaqueSupportKey('d'),
@@ -1333,10 +1707,10 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
 
   const tree = expandElement(SupportPanel())
   const text = elementText(tree)
-  assert.match(text, /Private contribution and fulfillment audit/)
-  assert.match(text, /recorded_not_enforced/)
-  assert.match(text, /do not process payments, activate providers, or enforce benefits/)
-  assert.match(text, /manual audit record only; no payment is processed and benefits remain unenforced/i)
+  assert.match(text, /Private support history and follow-up/)
+  assert.match(text, /do not process payments, enable support services, apply credits, or provide benefits/)
+  assert.match(text, /saves a record only[^]*does not process a payment or apply credits or benefits/i)
+  assert.doesNotMatch(text, /recorded_not_enforced|opaque|audit|proof|loopback|cookie|fulfillment|minor unit|terminal|sequence/i)
   const manualOptionValues = findElements(tree, node => node.type === 'option')
     .map(node => node.props.value)
   assert.deepEqual(
@@ -1349,15 +1723,41 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     ['one_time_contribution', 'recurring_started', 'recurring_renewed', 'recurring_canceled', 'refund', 'chargeback'],
     'all manual sources retain all lifecycle kinds independently of public-link marketing modes',
   )
-  assert.match(text, /2,500 USD minor units/)
+  const recordOptionLabels = findElements(tree, node => node.type === 'option')
+    .map(elementText)
+    .filter(label => /\bRecord \d+\b/.test(label))
+  assert.ok(recordOptionLabels.length > 1)
+  assert.equal(new Set(recordOptionLabels).size, recordOptionLabels.length, 'contribution choices remain distinguishable')
+  assert.match(text, /Enter cents for USD: 2500 = \$25\.00/)
+  assert.match(text, /Amount \(USD cents\)/)
+  assert.match(text, /2,500 cents \(\$25\.00\)/)
   assert.match(text, /One-time contribution|Refund|Chargeback|Recurring support canceled/)
   assert.match(text, /Adjustment does not match a recorded contribution/)
-  assert.match(text, /credit grant 3 · Fulfilled/)
-  assert.match(text, /Showing the 40 newest recorded events; 2 older events are hidden/)
+  assert.match(text, /One-time credit record · Pending/)
+  assert.match(text, /Result-retention follow-up · In progress/)
+  assert.match(text, /Backdated follow-up · Fulfilled/)
+  assert.match(text, /Showing the 40 newest history items; 2 older items are not shown/)
   assert.doesNotMatch(text, /private@example|customer|invoice|payment method|prompt|media|job log/i)
-  const eventLists = findElements(tree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Private contribution source events')
+  const eventLists = findElements(tree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Private contribution history')
   assert.equal(eventLists.length, 1)
   assert.equal(findElements(eventLists[0], node => node.type === 'li').length, 40)
+  const followUpList = findElements(tree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Recorded support follow-up')[0]
+  const knownFollowUpRow = findElements(followUpList, node => (
+    node.type === 'li' && elementText(node).includes('One-time credit record')
+  ))[0]
+  const knownFollowUpLabel = findElements(knownFollowUpRow, node => (
+    node.type === 'span' && String(node.props?.className || '').includes('font-semibold')
+  ))[0]
+  assert.equal(elementText(knownFollowUpLabel), 'One-time credit record')
+  assert.doesNotMatch(elementText(knownFollowUpLabel), /one_time_credit_grant/)
+  const knownFollowUpTechnicalDetails = findElements(knownFollowUpRow, node => (
+    node.type === 'details' && elementText(node).includes('Follow-up type key: one_time_credit_grant')
+  ))[0]
+  assert.ok(knownFollowUpTechnicalDetails, 'the raw follow-up key stays under Technical details')
+  assert.equal(
+    elementText(findElements(knownFollowUpTechnicalDetails, node => node.type === 'summary')[0]),
+    'Technical details',
+  )
   const transitionButtons = findElements(tree, node => (
     node.type === 'button' && /^Mark /.test(elementText(node))
   ))
@@ -1373,7 +1773,7 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   assert.equal(globalThis.__supportTransitions.every(input => input.proof_reference === null), true)
   assert.equal(globalThis.__supportTransitions.every(input => /^key_[0-9a-f]{64}$/.test(input.idempotency_key)), true)
   const manualRecordButton = findElements(tree, node => (
-    node.type === 'button' && elementText(node) === 'Record manual audit event'
+    node.type === 'button' && elementText(node) === 'Save contribution record'
   ))[0]
   assert.ok(manualRecordButton)
   assert.match(manualRecordButton.props.className, /\bmin-h-11\b/)
@@ -1525,7 +1925,7 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   }
   const largeAuditTree = expandElement(SupportPanel())
   assert.equal(findElements(
-    findElements(largeAuditTree, node => node.props?.['aria-label'] === 'Private contribution source events')[0],
+    findElements(largeAuditTree, node => node.props?.['aria-label'] === 'Private contribution history')[0],
     node => node.type === 'li',
   ).length, 40)
 
@@ -1536,38 +1936,38 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   }
   const emptyText = elementText(expandElement(SupportPanel()))
   assert.match(emptyText, /No net contribution total is recorded/)
-  assert.match(emptyText, /No contribution audit events are recorded/)
-  assert.match(emptyText, /No recorded discrepancies need follow-up/)
-  assert.match(emptyText, /No fulfillment follow-up is recorded/)
+  assert.match(emptyText, /No contribution activity is recorded/)
+  assert.match(emptyText, /No items need review/)
+  assert.match(emptyText, /No support follow-up is recorded/)
 
   globalThis.__supportStore.supportAdmin = {
     ...globalThis.__supportStore.supportAdmin,
     audit: { currency_totals_minor: {}, events: [], discrepancies: [], fulfillment: [], incomplete: true },
   }
   const incompleteText = elementText(expandElement(SupportPanel()))
-  assert.match(incompleteText, /Some audit data was unavailable or invalid/)
-  assert.match(incompleteText, /Empty sections below are not proof that no records exist/)
-  assert.match(incompleteText, /Contribution event data is incomplete/)
-  assert.doesNotMatch(incompleteText, /No contribution audit events are recorded/)
+  assert.match(incompleteText, /Some support data could not be loaded/)
+  assert.match(incompleteText, /A blank section does not necessarily mean there are no records/)
+  assert.match(incompleteText, /Contribution history is incomplete/)
+  assert.doesNotMatch(incompleteText, /No contribution activity is recorded/)
 
   globalThis.__supportStore.supportAdmin = null
   globalThis.__supportStore.supportDetailsLoading = true
   const loadingText = elementText(expandElement(SupportPanel()))
-  assert.match(loadingText, /Loading private support audit/)
-  assert.doesNotMatch(loadingText, /Private support audit is unavailable/)
+  assert.match(loadingText, /Loading private support history/)
+  assert.doesNotMatch(loadingText, /Private support history is unavailable/)
 
   globalThis.__supportStore.supportDetailsLoading = false
   globalThis.__supportNotice = { kind: 'error', text: 'Support details could not be refreshed.' }
   const errorTree = expandElement(SupportPanel())
   assert.match(elementText(errorTree), /Support details could not be refreshed/)
-  assert.match(elementText(errorTree), /Private support audit is unavailable/)
+  assert.match(elementText(errorTree), /Private support history is unavailable/)
   assert.equal(findElements(errorTree, node => node.props?.role === 'alert').length, 1)
 
   delete globalThis.__supportNotice
   globalThis.__supportStore.supportAdmin = { account: summary, audit, responsible_use: responsibleUse.status, support_priority: publicSupport.support_priority }
   globalThis.__supportStore.supportAdminAccountId = 'stale-account'
   const staleText = elementText(expandElement(SupportPanel()))
-  assert.doesNotMatch(staleText, /Private contribution and fulfillment audit/)
+  assert.doesNotMatch(staleText, /Private support history and follow-up/)
 
   globalThis.__supportStore.accountContext = {
     ...globalThis.__supportStore.accountContext,
@@ -1575,7 +1975,7 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   }
   globalThis.__supportStore.supportAdminAccountId = account.id
   const nonOwnerText = elementText(expandElement(SupportPanel()))
-  assert.doesNotMatch(nonOwnerText, /Owner support records|Private contribution and fulfillment audit/)
+  assert.doesNotMatch(nonOwnerText, /Manage support records|Private support history and follow-up/)
 })
 
 test('Support trigger stays discoverable with accounts off and describes optional account state truthfully', async () => {
@@ -1601,6 +2001,59 @@ test('Support trigger stays discoverable with accounts off and describes optiona
   }
   const authenticated = AccountSupportButton({ compact: false })
   assert.equal(authenticated.props['aria-label'], 'Open Support and account for LAN Owner')
+})
+
+test('account and Support error copy maps backend codes and HTTP states without exposing raw server jargon', async () => {
+  const [{ safeAccountErrorMessage, safeAccountHttpErrorMessage }, { safeSupportErrorMessage }] = await Promise.all([
+    loadAccountButton(),
+    loadSupportPanel(),
+  ])
+  assert.equal(
+    safeAccountErrorMessage('bootstrap_complete'),
+    'The first owner account already exists. Refresh account status, then sign in.',
+  )
+  assert.equal(
+    safeAccountErrorMessage('account_request_failed', 9),
+    'The account request could not be completed. Try again in about 9 seconds.',
+  )
+  for (const status of [403, 404, 409, 423, 503]) {
+    const generic = safeAccountHttpErrorMessage(status)
+    assert.equal(generic, 'The account request could not be completed.')
+    assert.doesNotMatch(generic, /project|setup|unlock|access/i)
+  }
+  assert.equal(
+    safeAccountHttpErrorMessage(404, 'account_request_failed', 0, 'project-migration'),
+    'Project setup is not available on this Maestro host.',
+  )
+  assert.equal(
+    safeAccountHttpErrorMessage(423, 'account_request_failed', 0, 'project-migration'),
+    'Unlock the project in this browser, then try again.',
+  )
+  assert.equal(
+    safeAccountHttpErrorMessage(503, 'account_request_failed', 9, 'project-migration'),
+    'Project access is temporarily unavailable. Try again after Maestro is ready. Try again in about 9 seconds.',
+  )
+  assert.equal(
+    safeAccountHttpErrorMessage(409, 'project_migration_needs_attention', 0, 'project-migration'),
+    'Some existing project folders need attention. Fix or remove them on this computer, then retry. Account-based project filtering remains off, and existing project access stays unchanged.',
+  )
+  assert.equal(
+    safeAccountHttpErrorMessage(409, 'project_migration_needs_attention'),
+    'The account request could not be completed.',
+  )
+  assert.equal(
+    safeSupportErrorMessage('responsible_use_notice_changed'),
+    'The notice changed. Review the updated notice, then try again.',
+  )
+  assert.equal(safeSupportErrorMessage('unknown_backend_code'), 'Support details could not be refreshed.')
+  assert.doesNotMatch(
+    [
+      safeAccountErrorMessage('account_request_failed'),
+      safeAccountErrorMessage('bootstrap_complete'),
+      safeSupportErrorMessage('unknown_backend_code'),
+    ].join(' '),
+    /loopback|bootstrap|raw private server detail/i,
+  )
 })
 
 test('Support links require an available server HTTPS URL and priority copy requires an affected record', async () => {
@@ -1767,6 +2220,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
       if (deferAccountContext) return new Promise(resolve => pendingAccountContexts.push(resolve))
       return jsonResponse(nextAccountContext)
     }
+    if (url.endsWith('/workspaces')) return jsonResponse({ workspaces: [], active: '' })
     if (url.endsWith('/support/self')) {
       if (deferSelf) return new Promise(resolve => { pendingSelf.push({ url, resolve }) })
       return jsonResponse(selfPayload(1))
@@ -2130,16 +2584,17 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(scrollRegion, /aria-label=\{accountsEnabled \? 'Support and account content' : 'Support content'\}/)
   assert.match(scrollRegion, /tabIndex=\{0\}/)
   assert.match(supportSource, /rel="noopener noreferrer"/)
-  assert.match(supportSource, /This is an acknowledgement[^]*not moderation, classification, or permission/)
+  assert.match(supportSource, /Acknowledging this notice does not review, restrict, or approve what you create/)
   assert.match(supportSource, /hundreds already spent on Codex while building Maestro/)
   assert.match(supportSource, /After support becomes sustainable, it will fund hosting Maestro Continuum with more compute/)
   assert.match(supportSource, /offers no guarantees or perks/)
-  assert.match(supportSource, /not enforced yet/)
+  assert.match(supportSource, /Support benefits are not active/)
+  assert.match(supportSource, /not an active balance and does not change generation, queueing, or retries/)
   assert.doesNotMatch(supportSource, /localStorage|sessionStorage|console\.|subject_key|source_event_key|account_id|email|customer|invoice|payment_method|credential|secret|@|\$600|tax|end-to-end|passkey/i)
   assert.doesNotMatch(supportSource, /['"]SLA['"]/)
-  assert.match(supportSource, /private records and owner fulfillment controls shown after recent owner confirmation/i)
-  assert.match(supportSource, /recorded_not_enforced/)
-  assert.match(supportSource, /function adminSupportErrorMessage[^]*Private support audit could not be refreshed[^]*Confirm recent owner access and try again/)
+  assert.match(supportSource, /available only after the owner recently confirmed their password/i)
+  assert.match(supportSource, /summary\.benefits\.state === 'recorded_not_enforced'/)
+  assert.match(supportSource, /function adminSupportErrorMessage[^]*Private support history could not be refreshed[^]*Confirm the owner password and try again/)
   assert.match(supportSource, /const chooseAdminAccount[^]*setNotice\(\{ kind: 'error', text: adminSupportErrorMessage\(error\) \}\)/)
   assert.match(supportSource, /PRIVATE_SUPPORT_AUDIT_DISPLAY_TTL_MS = 4 \* 60 \* 1000/)
   assert.match(supportSource, /if \(adminAccountId !== selectedAdminAccountId\) \{[^]*setSelectedUserIndex\(''\)[^]*clearAdmin\(\)/)
@@ -2148,8 +2603,21 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(supportSource, /pending: \['in_progress', 'fulfilled', 'declined'\]/)
   assert.match(supportSource, /fulfilled: \['reversed'\]/)
   assert.match(supportSource, /className="min-h-11[^]*Record pending follow-up/)
+  assert.equal([...supportSource.matchAll(/Record \{event\.sequence\.toLocaleString\(\)\}/g)].length, 2)
   assert.doesNotMatch(supportSource, /<textarea|Fulfillment note/i)
   assert.doesNotMatch(supportSource, /onClick=.*(?:refund|chargeback|payment|provider)/i)
+  assert.match(source, /Existing project access may also depend on this browser or a project password/)
+  assert.match(source, /Sign out all account sessions/)
+  assert.match(source, /These controls affect account sign-in only[^]*Separate browser or project-password access is unchanged/)
+  assert.match(source, /Any separate browser or project-password access remains unchanged/)
+  assert.match(source, /Direct or local-network sign-in/)
+  assert.match(source, /accountsEnabled[^]*View optional ways to support Maestro\. Support does not change access or available controls\./)
+  assert.match(source, /safeAccountHttpErrorMessage\(error\.status, error\.code, error\.retryAfter\)/)
+  assert.match(source, /safeAccountHttpErrorMessage\([^]*'project-migration'/)
+  assert.match(supportSource, /safeSupportErrorMessage\(error\.code, error\.retryAfter\)/)
+  assert.doesNotMatch(source, /return `\$\{error\.message\}/)
+  assert.doesNotMatch(supportSource, /return `\$\{error\.message\}/)
+  assert.doesNotMatch(source, /account cookie|local bootstrap|same-origin secure cookies|Project access stays separate|signing out other devices/i)
   assert.match(appSource, /context\.accounts\?\.enabled === true/)
   assert.match(appSource, /AccountSupportDrawer/)
 })

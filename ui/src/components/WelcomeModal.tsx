@@ -71,12 +71,12 @@ export function WelcomeModal() {
   if (!open) return null
 
   const accessLabel = accessContext?.remote
-    ? `Remote access · ${activeWorkspace}`
-    : 'Local studio · this machine is home'
+    ? `Remote project · ${activeWorkspace}`
+    : 'Local access · on this computer'
   const accessDetail = accessContext?.remote
-    ? 'This browser works only inside projects you explicitly unlock. Machine settings stay on the host.'
+    ? 'This browser can open only the projects you unlock. Settings for this computer stay on the computer.'
     : accessContext?.cloudflare_enabled
-      ? 'Your local studio keeps working independently of its Cloudflare share address.'
+      ? 'Your local studio keeps working even if its Cloudflare share link is unavailable.'
       : `Open ${PRODUCT_NAME} from Pinokio for the most direct, dependable local connection.`
 
   return createPortal(
@@ -155,15 +155,15 @@ export function WelcomeModal() {
           </ModeCard>
           <ModeCard icon={<MessageSquare size={17} />} title="Chat" eyebrow="Think with your tools">
             {accessContext?.remote
-              ? `Develop concepts and production plans with the language-model service configured on the ${PRODUCT_NAME} host.`
-              : 'Develop concepts and production plans with the language-model service you choose in Settings.'}
+              ? `Develop concepts and production plans with the AI assistant selected by the person running this copy of ${PRODUCT_NAME}.`
+              : 'Develop concepts and production plans with the AI assistant you choose in Settings.'}
           </ModeCard>
           <ModeCard icon={<FolderLock size={17} />} title="Projects" eyebrow="Keep context together">
-            Isolate outputs, references, Cloudflare sessions, and share links. Password access remains separate from private-preview blur.
+            Keep outputs, references, remote access, and share links organized by project. Preview blur is a separate privacy choice.
           </ModeCard>
           <div className="grid gap-2.5 sm:col-span-2 sm:grid-cols-3">
             <FeaturePoint icon={<Gauge size={15} />} title="H3 control">
-              Pick performance and delivery profiles, then review or override the adaptive segment plan before generation.
+              Choose a speed or quality profile, review the suggested shot plan, and adjust it before generation.
             </FeaturePoint>
             <FeaturePoint icon={<ListRestart size={15} />} title="Queue + resume">
               Queue multiple generations, hold work, and resume supported queued jobs.
@@ -203,7 +203,7 @@ export function WelcomeModal() {
               ))}
             </ul>
           </div>
-          <p className="mt-2 text-[9px] leading-relaxed text-text-muted">Reopen these notes and the separate release archive from What's new in the product header.</p>
+          <p className="mt-2 text-[9px] leading-relaxed text-text-muted">You can reopen this guide and browse earlier releases from What's new in the header.</p>
         </div>
         </div>
 
@@ -211,11 +211,11 @@ export function WelcomeModal() {
           <div className="space-y-1.5 text-[10px] leading-relaxed text-text-muted sm:max-w-lg sm:text-[11px]">
             <div className="flex items-start gap-2">
               <ShieldCheck size={14} className="mt-0.5 shrink-0 text-accent-green" />
-              <span>Private outputs start blurred and reveal only when you choose. Project access controls which remote browsers can enter—not whether a preview is blurred.</span>
+              <span>Private previews start blurred until you reveal them. Project access controls who can open the project; blur controls what appears in this browser.</span>
             </div>
             <div className="flex items-start gap-2">
               <Download size={14} className="mt-0.5 shrink-0 text-accent-blue" />
-              <span>If needed, this {PRODUCT_NAME} host downloads and prepares model files in a shared cache. Allowed local and remote users reuse that host cache; project access and private-preview rules still apply.</span>
+              <span>If needed, the computer running {PRODUCT_NAME} downloads and prepares model files in a shared storage area. Approved local and remote users can reuse them; project access and private-preview settings still apply.</span>
             </div>
           </div>
           <button

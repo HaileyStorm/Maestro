@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { StoreApi } from 'zustand'
-import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection } from '../types'
+import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
@@ -270,6 +270,14 @@ let _workspaceLoadSequence = 0
 
 function _isActiveGenerationJob(job: Pick<GenerationJob, 'status'>): boolean {
   return ACTIVE_GENERATION_JOB_STATUSES.has(job.status)
+}
+
+function _discardStaleGenerationPlaceholder(placeholder: GenerationJob): void {
+  useStore.setState(state => {
+    if (!state.jobs.includes(placeholder)) return state
+    const jobs = state.jobs.filter(job => job !== placeholder)
+    return { jobs, isGenerating: jobs.some(_isActiveGenerationJob) }
+  })
 }
 
 type StoredDirectorPreparation = { requestId: string; workspace: string }
@@ -2222,12 +2230,14 @@ interface AppState {
   toolsSourceName: string | null
   toolsSourceUrl: string | null
   setToolsSource: (src: { path: string; name: string; url: string | null } | null) => void
+  uploadToolsSource: (file: File) => Promise<boolean>
   toolsUpscaleMethod: string
   setToolsUpscaleMethod: (m: string) => void
   toolsRevoiceMode: 'single' | 'two'
   setToolsRevoiceMode: (m: 'single' | 'two') => void
   toolsRevoiceRefs: ({ filename: string; path: string } | null)[]
   setToolsRevoiceRef: (index: number, ref: { filename: string; path: string } | null) => void
+  uploadToolsRevoiceRef: (index: number, file: File) => Promise<boolean>
   runTool: () => Promise<void>
   /** Gallery one-click: upscale a specific clip now, with the configured method. */
   quickUpscaleClip: (name: string, url: string | null) => Promise<void>
@@ -2292,7 +2302,7 @@ interface AppState {
   stopGeneration: (jobId?: string) => void
   dismissJob: (jobId: string) => void
   reconcileQueueState: (queue: api.QueueState) => void
-  reconnectJobs: () => Promise<void>
+  reconnectJobs: (accountIdentityEpoch?: number) => Promise<void>
   resumeJobRecovery: (jobId: string) => Promise<void>
   retryJobRecovery: (jobId: string) => Promise<void>
   _pollRecoveredJob: (jobId: string) => void
@@ -2355,9 +2365,11 @@ interface AppState {
 
   // System config
   accessContext: api.AccessContext | null
-  loadAccessContext: () => Promise<api.AccessContext>
+  loadAccessContext: (refreshProjectsOnIdentityChange?: boolean) => Promise<api.AccessContext>
   accountContext: AccountContext | null
   accountContextLoading: boolean
+  accountProjectMigration: AccountProjectMigrationStatus | null
+  accountProjectMigrationLoading: boolean
   accountDrawerOpen: boolean
   accountSessions: AccountSession[]
   accountUsers: AccountSummary[]
@@ -2371,13 +2383,15 @@ interface AppState {
   supportAdmin: SupportAdminProjection | null
   supportDetailsLoading: boolean
   setAccountDrawerOpen: (open: boolean) => void
-  loadAccountContext: () => Promise<AccountContext | null>
+  loadAccountContext: (refreshProjectsOnIdentityChange?: boolean) => Promise<AccountContext | null>
+  loadAccountProjectMigration: () => Promise<AccountProjectMigrationStatus | null>
+  migrateAccountProjects: () => Promise<AccountProjectMigrationStatus | null>
   bootstrapAccount: (input: {
     username: string
     password: string
     email?: string
     deviceLabel?: string
-  }) => Promise<AccountAuthResult>
+  }) => Promise<AccountAuthResult | null>
   loginAccount: (input: {
     username: string
     password: string
@@ -2390,9 +2404,9 @@ interface AppState {
     recoveryCode: string
     newPassword: string
     deviceLabel?: string
-  }) => Promise<AccountAuthResult>
+  }) => Promise<AccountAuthResult | null>
   changeAccountPassword: (newPassword: string) => Promise<void>
-  rotateAccountRecoveryCodes: () => Promise<string[]>
+  rotateAccountRecoveryCodes: () => Promise<string[] | null>
   loadAccountSessions: () => Promise<void>
   revokeAccountSession: (sessionHandle: string) => Promise<boolean>
   revokeAllAccountSessions: (retainCurrent: boolean) => Promise<number>
@@ -2401,7 +2415,7 @@ interface AppState {
     username: string
     password: string
     email?: string
-  }) => Promise<AccountAuthResult>
+  }) => Promise<AccountAuthResult | null>
   setServerAccountDisabled: (accountId: string, disabled: boolean) => Promise<void>
   loadSupportCatalog: () => Promise<SupportPublicProjection | null>
   loadSupportSelf: () => Promise<SupportSelfProjection | null>
@@ -3150,16 +3164,132 @@ let _accountSessionsRequestSequence = 0
 let _accountUsersRequestSequence = 0
 let _accountMutationRequestSequence = 0
 let _accessContextRequestSequence = 0
+let _accountProjectMigrationRequestSequence = 0
+let _accountIdentityEpoch = 0
+
+function _accountIdentity(context: AccountContext | null | undefined): string {
+  return context?.authenticated === true && context.account ? context.account.id : ''
+}
+
+function _advanceAccountIdentityEpoch(): void {
+  _accountIdentityEpoch += 1
+  _workspaceLoadSequence += 1
+  _accountProjectMigrationRequestSequence += 1
+}
+
+function _accountIdentityIsCurrent(epoch: number): boolean {
+  return epoch === _accountIdentityEpoch
+}
+
+function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
+  for (const workspace of state.workspaces) hidePrivatePreviewsForWorkspace(workspace.name)
+  for (const poll of _recoveryJobPolls.values()) poll.stop()
+  _recoveryJobPolls.clear()
+  for (const jobId of [..._terminalJobWaiters.keys()]) {
+    _rejectTerminalJobWaiter(jobId, 'Account changed while waiting for generation')
+  }
+  _outputsRequestGeneration += 1
+  _metadataRequestGeneration += 1
+  _h3PlanReviewSequence += 1
+  _directorPipelineLifecycleToken = null
+  _dashboardPipelineLoadToken += 1
+  _dashboardPipelineListLoadToken += 1
+  _stopDirectorPreparationPoll()
+  _storeDirectorPreparation(null, null)
+  return {
+    workspaces: [],
+    activeWorkspace: '',
+    browsingUploads: false,
+    outputs: [],
+    outputsTotal: 0,
+    outputsLoading: false,
+    selectedOutput: 0,
+    selectedOutputMeta: null,
+    selectedOutputMetaName: null,
+    metadataLoading: false,
+    selectedOutputKeys: [],
+    gallerySelectionMode: false,
+    jobs: [],
+    isGenerating: false,
+    params: { ...state.params, ...BLANK_VIDEO_INPUT_PARAMS },
+    startImage: null,
+    endImage: null,
+    continueVideo: null,
+    continueVideoPath: '',
+    continueVideoUrl: '',
+    continueVideoDuration: 0,
+    audioGuideFilename: null,
+    imageRefs: [],
+    clips: [],
+    videoSubModeStash: {},
+    toolsSourcePath: null,
+    toolsSourceName: null,
+    toolsSourceUrl: null,
+    toolsRevoiceRefs: [null, null],
+    directorStep: 'upload',
+    directorAudioFile: null,
+    directorAudioPath: null,
+    directorAnalysis: null,
+    directorPlannedClips: [],
+    directorClipPlans: [],
+    directorSceneDescription: '',
+    directorVisualStyle: '',
+    directorCustomVisualStyle: '',
+    directorLoadingMessage: null,
+    directorError: null,
+    directorComponentError: null,
+    directorReferenceImage: null,
+    directorReferenceImagePath: null,
+    directorCharacterRefs: [],
+    directorCharacterRefPaths: [],
+    directorCharacterRefLabels: [],
+    directorLocationRefs: [],
+    directorLocationRefPaths: [],
+    directorLocationRefLabels: [],
+    directorVoiceRef: null,
+    directorVoiceRefPath: null,
+    directorClipImages: [],
+    directorImageGenProgress: null,
+    directorSpeakers: [],
+    directorSpeakerMappings: [],
+    directorMusicSource: null,
+    directorSongDescription: '',
+    directorSongStyle: '',
+    directorSongLyrics: '',
+    directorTrackGenerating: false,
+    pipelineId: null,
+    pipelineStatus: null,
+    pipelinePolling: false,
+    directorLoading: false,
+    directorRequestId: null,
+    directorRequestWorkspace: null,
+    directorPreparationStatus: null,
+    shortFilmCharacters: [],
+    shortFilmPath: null,
+    dashboardOpen: false,
+    dashboardPipelineList: [],
+    dashboardSelectedPipeline: null,
+    dashboardLoading: false,
+    pendingH3Plan: null,
+    pendingH3PlanEstimate: null,
+    pendingH3PlanJobId: null,
+    pendingH3PlanWorkspace: null,
+    h3PlanReviewLoading: false,
+    h3PlanReviewError: null,
+  }
+}
 
 function _invalidateAccountRequests(): void {
   _accessContextRequestSequence += 1
   _accountContextRequestSequence += 1
   _accountSessionsRequestSequence += 1
   _accountUsersRequestSequence += 1
+  _accountProjectMigrationRequestSequence += 1
 }
 
-function _beginAccountMutation(): number {
+function _beginAccountMutation(advanceIdentity = true): number {
   _invalidateAccountRequests()
+  if (advanceIdentity) _advanceAccountIdentityEpoch()
   return ++_accountMutationRequestSequence
 }
 
@@ -5204,6 +5334,19 @@ export const useStore = create<AppState>((set, get) => ({
   setToolsSource: (src) => set(src
     ? { toolsSourcePath: src.path, toolsSourceName: src.name, toolsSourceUrl: src.url }
     : { toolsSourcePath: null, toolsSourceName: null, toolsSourceUrl: null }),
+  uploadToolsSource: async (file) => {
+    const accountIdentityEpoch = _accountIdentityEpoch
+    let uploaded: Awaited<ReturnType<typeof api.uploadImage>>
+    try {
+      uploaded = await api.uploadImage(file)
+    } catch (error) {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return false
+      throw error
+    }
+    if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return false
+    set({ toolsSourcePath: uploaded.path, toolsSourceName: file.name, toolsSourceUrl: uploaded.url })
+    return true
+  },
   toolsUpscaleMethod: 'flashvsr2',
   setToolsUpscaleMethod: (m) => set({ toolsUpscaleMethod: m }),
   toolsRevoiceMode: 'single',
@@ -5215,7 +5358,26 @@ export const useStore = create<AppState>((set, get) => ({
     next[index] = ref
     return { toolsRevoiceRefs: next }
   }),
+  uploadToolsRevoiceRef: async (index, file) => {
+    const accountIdentityEpoch = _accountIdentityEpoch
+    let uploaded: Awaited<ReturnType<typeof api.uploadAudio>>
+    try {
+      uploaded = await api.uploadAudio(file)
+    } catch (error) {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return false
+      throw error
+    }
+    if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return false
+    set(state => {
+      const toolsRevoiceRefs = [...state.toolsRevoiceRefs]
+      while (toolsRevoiceRefs.length <= index) toolsRevoiceRefs.push(null)
+      toolsRevoiceRefs[index] = { filename: file.name, path: uploaded.path }
+      return { toolsRevoiceRefs }
+    })
+    return true
+  },
   runTool: async () => {
+    const accountIdentityEpoch = _accountIdentityEpoch
     const s = get()
     const source = s.toolsSourcePath
     if (!source) return
@@ -5240,6 +5402,10 @@ export const useStore = create<AppState>((set, get) => ({
       const result = tool === 'upscale'
         ? await api.submitToolUpscale({ video_path: source, method: s.toolsUpscaleMethod, workspace: s.activeWorkspace })
         : await api.submitToolRevoice({ video_path: source, voice_ref_paths: refPaths, mode: s.toolsRevoiceMode, workspace: s.activeWorkspace })
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return
+      }
 
       set(st => ({
         jobs: st.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
@@ -5247,6 +5413,10 @@ export const useStore = create<AppState>((set, get) => ({
       get()._pollRecoveredJob(result.job_id)
       window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
     } catch (e) {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return
+      }
       const msg = e instanceof Error ? e.message : (tool === 'upscale' ? 'Upscale failed' : 'Revoice failed')
       set(st => ({
         jobs: st.jobs.map(j => j === newJob ? { ...j, id: j.id || `tool-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
@@ -5700,6 +5870,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   startGeneration: async () => {
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const ownsSubmission = () => _accountIdentityIsCurrent(accountIdentityEpoch)
     let state = get()
     const submissionWorkspace = state.activeWorkspace
     // Model changes update params.model_type immediately and load capabilities
@@ -5713,6 +5885,7 @@ export const useStore = create<AppState>((set, get) => ({
       && !state.h3StyleWorkflowCatalog
       && !state.h3StyleWorkflowCatalogLoading) {
       await state.loadH3StyleWorkflowCatalog()
+      if (!ownsSubmission()) return
       state = get()
     }
     if (state.h3StyleWorkflow && state.h3StyleWorkflowCatalogLoading) {
@@ -5862,6 +6035,10 @@ export const useStore = create<AppState>((set, get) => ({
           // resolution, image_prompt_type) are overridden server-side.
           base_params: state.params as unknown as Record<string, unknown>,
         })
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
 
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
@@ -5869,6 +6046,10 @@ export const useStore = create<AppState>((set, get) => ({
         get()._pollRecoveredJob(result.job_id)
         window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
         const msg = e instanceof Error ? e.message : 'Blend failed'
         // Submit itself failed (pre-queue). Convert the placeholder to a
         // failed state in place so the user sees what went wrong instead of
@@ -5991,6 +6172,10 @@ export const useStore = create<AppState>((set, get) => ({
           private_output: state.privateOutput,
           explicit_output: state.explicitOutput,
         })
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
 
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
@@ -5998,6 +6183,10 @@ export const useStore = create<AppState>((set, get) => ({
         get()._pollRecoveredJob(result.job_id)
         window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
         const msg = e instanceof Error ? e.message : 'Outpaint failed'
         // Submit itself failed (pre-queue). Convert the placeholder to a
         // failed state in place so the user sees what went wrong instead of
@@ -6059,6 +6248,10 @@ export const useStore = create<AppState>((set, get) => ({
           private_output: state.privateOutput,
           explicit_output: state.explicitOutput,
         })
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
 
         set(s => ({
           jobs: s.jobs.map(j => j === newJob
@@ -6068,6 +6261,10 @@ export const useStore = create<AppState>((set, get) => ({
         get()._pollRecoveredJob(result.job_id)
         window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
         const msg = e instanceof Error ? e.message : 'Repaint failed'
         set(s => ({
           jobs: s.jobs.map(j => j === newJob
@@ -6148,6 +6345,10 @@ export const useStore = create<AppState>((set, get) => ({
           private_output: state.privateOutput,
           explicit_output: state.explicitOutput,
         })
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
 
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
@@ -6155,6 +6356,10 @@ export const useStore = create<AppState>((set, get) => ({
         get()._pollRecoveredJob(result.job_id)
         window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
         const msg = e instanceof Error ? e.message : 'Recast failed'
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: j.id || `submit-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
@@ -6259,6 +6464,10 @@ export const useStore = create<AppState>((set, get) => ({
             explicit_output: state.explicitOutput,
           })
         }
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
 
         set(s => ({
           jobs: s.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
@@ -6266,6 +6475,10 @@ export const useStore = create<AppState>((set, get) => ({
         get()._pollRecoveredJob(result.job_id)
         window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
+        if (!ownsSubmission()) {
+          _discardStaleGenerationPlaceholder(newJob)
+          return
+        }
         const msg = e instanceof Error ? e.message : 'Generation failed'
         // Submit itself failed (pre-queue). Convert the placeholder to a
         // failed state in place so the user sees what went wrong instead of
@@ -6581,8 +6794,10 @@ export const useStore = create<AppState>((set, get) => ({
         if (clip.startImage) {
           try {
             const result = await api.uploadImage(clip.startImage)
+            if (!ownsSubmission()) return
             imagePaths.push(result.path)
           } catch (e) {
+            if (!ownsSubmission()) return
             console.error('Failed to upload clip image:', e)
             imagePaths.push('')
           }
@@ -6596,9 +6811,11 @@ export const useStore = create<AppState>((set, get) => ({
         if (clip.endImage) {
           try {
             const result = await api.uploadImage(clip.endImage)
+            if (!ownsSubmission()) return
             endImagePaths.push(result.path)
             hasAnyEndImage = true
           } catch (e) {
+            if (!ownsSubmission()) return
             console.error('Failed to upload clip end image:', e)
             endImagePaths.push('')
           }
@@ -6633,12 +6850,14 @@ export const useStore = create<AppState>((set, get) => ({
     else if (state.startImage && state.generationMode !== 'image') {
       try {
         const result = await api.uploadImage(state.startImage)
+        if (!ownsSubmission()) return
         params.image_start = result.path
         params.image_mode = 0
         const ipt = (params.image_prompt_type as string) || ''
         if (!ipt.includes('S')) params.image_prompt_type = 'S' + ipt
         if (params.input_video_strength == null) params.input_video_strength = _defaultIVS
       } catch (e) {
+        if (!ownsSubmission()) return
         console.error('Failed to upload start image:', e)
       }
     } else if (params.image_start && state.generationMode !== 'image') {
@@ -6651,10 +6870,12 @@ export const useStore = create<AppState>((set, get) => ({
     if (state.endImage) {
       try {
         const result = await api.uploadImage(state.endImage)
+        if (!ownsSubmission()) return
         params.image_end = result.path
         const ipt = (params.image_prompt_type as string) || ''
         if (!ipt.includes('E')) params.image_prompt_type = ipt + 'E'
       } catch (e) {
+        if (!ownsSubmission()) return
         console.error('Failed to upload end image:', e)
       }
     } else if (params.image_end) {
@@ -6733,8 +6954,10 @@ export const useStore = create<AppState>((set, get) => ({
       for (const file of state.imageRefs) {
         try {
           const result = await api.uploadImage(file)
+          if (!ownsSubmission()) return
           refPaths.push(result.path)
         } catch (e) {
+          if (!ownsSubmission()) return
           console.error('Failed to upload reference image:', e)
         }
       }
@@ -6790,9 +7013,13 @@ export const useStore = create<AppState>((set, get) => ({
       if (!vrPath) {
         try {
           const uploaded = await api.uploadAudio(state.directorVoiceRef)
+          if (!ownsSubmission()) return
           vrPath = uploaded.path
           set({ directorVoiceRefPath: vrPath })
-        } catch { /* skip */ }
+        } catch {
+          if (!ownsSubmission()) return
+          /* skip */
+        }
       }
       if (vrPath) {
         params.voice_reference = vrPath
@@ -6805,7 +7032,7 @@ export const useStore = create<AppState>((set, get) => ({
       : null
     // Uploads above can outlive a project switch. Never admit the frozen
     // request under a project that is no longer active in this browser.
-    if (get().activeWorkspace !== submissionWorkspace) return
+    if (!ownsSubmission() || get().activeWorkspace !== submissionWorkspace) return
     params.enhance_before_generate = enhanceBeforeGenerate
     params.h3_ref2va_terms_accepted = h3Ref2VATermsAccepted()
     const durablePreparationExpected = enhanceBeforeGenerate
@@ -6842,6 +7069,10 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
       const { job_id, status, h3_estimate } = await api.submitGeneration(params)
+      if (!ownsSubmission()) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return
+      }
       const submittedEstimate = h3_estimate || newJob.h3Estimate || null
 
       // Update the job with its server-assigned ID
@@ -6877,6 +7108,10 @@ export const useStore = create<AppState>((set, get) => ({
       window.dispatchEvent(new CustomEvent('maestro:downloads-refresh'))
 
     } catch (e) {
+      if (!ownsSubmission()) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return
+      }
       const msg = e instanceof Error ? e.message : 'Generation failed'
       // Submit itself failed (pre-queue). Convert the placeholder to a failed
       // state in place so the user sees what happened, rather than making the
@@ -6948,15 +7183,19 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   resumeJobRecovery: async (jobId) => {
+    const accountIdentityEpoch = _accountIdentityEpoch
     const needsRecoveryPoll = !get().jobs.some(job => job.id === jobId && _isActiveGenerationJob(job))
     let recoveryError: unknown = null
     try {
       await api.resumeQueueRecovery(jobId)
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
     } catch (error) {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
       recoveryError = error
     }
     try {
       const status = await api.fetchJobStatus(jobId)
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
       set(s => ({
         jobs: s.jobs.map(job => job.id !== jobId ? job : _mergeJobStatus(job, status)),
         isGenerating: ACTIVE_GENERATION_JOB_STATUSES.has(status.status)
@@ -6965,21 +7204,26 @@ export const useStore = create<AppState>((set, get) => ({
     } catch {
       // Preserve the bounded recovery endpoint error below.
     }
+    if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
     if (recoveryError) throw recoveryError
     if (needsRecoveryPoll) get()._pollRecoveredJob(jobId)
-    await get().reconnectJobs()
+    await get().reconnectJobs(accountIdentityEpoch)
   },
 
   retryJobRecovery: async (jobId) => {
+    const accountIdentityEpoch = _accountIdentityEpoch
     const needsRecoveryPoll = !get().jobs.some(job => job.id === jobId && _isActiveGenerationJob(job))
     let recoveryError: unknown = null
     try {
       await api.retryQueueRecovery(jobId)
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
     } catch (error) {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
       recoveryError = error
     }
     try {
       const status = await api.fetchJobStatus(jobId)
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
       set(s => ({
         jobs: s.jobs.map(job => job.id !== jobId ? job : _mergeJobStatus(job, status)),
         isGenerating: ACTIVE_GENERATION_JOB_STATUSES.has(status.status)
@@ -6988,12 +7232,14 @@ export const useStore = create<AppState>((set, get) => ({
     } catch {
       // Preserve the bounded recovery endpoint error below.
     }
+    if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
     if (recoveryError) throw recoveryError
     if (needsRecoveryPoll) get()._pollRecoveredJob(jobId)
-    await get().reconnectJobs()
+    await get().reconnectJobs(accountIdentityEpoch)
   },
 
   _pollRecoveredJob: (jobId) => {
+    const accountIdentityEpoch = _accountIdentityEpoch
     const existing = _recoveryJobPolls.get(jobId)
     if (existing) {
       existing.wake()
@@ -7060,7 +7306,11 @@ export const useStore = create<AppState>((set, get) => ({
       running = true
       try {
         const status = await api.fetchJobStatus(jobId)
-        if (stopped || _recoveryJobPolls.get(jobId) !== poll) {
+        if (
+          stopped
+          || !_accountIdentityIsCurrent(accountIdentityEpoch)
+          || _recoveryJobPolls.get(jobId) !== poll
+        ) {
           stop()
           return
         }
@@ -7108,7 +7358,7 @@ export const useStore = create<AppState>((set, get) => ({
         consecutivePollFailures += 1
         if (consecutivePollFailures >= 3) {
           consecutivePollFailures = 0
-          void get().reconnectJobs()
+          void get().reconnectJobs(accountIdentityEpoch)
         }
       } finally {
         running = false
@@ -7135,6 +7385,10 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     function onVisibilityChange() {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) {
+        stop()
+        return
+      }
       if (document.hidden) return
       const current = get().jobs.find(job => job.id === jobId)
       if (!current || !_jobNeedsFastStatusPoll(current)) return
@@ -7153,10 +7407,12 @@ export const useStore = create<AppState>((set, get) => ({
     else void tick(true)
   },
 
-  reconnectJobs: async () => {
+  reconnectJobs: async (accountIdentityEpoch = _accountIdentityEpoch) => {
+    if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
     // On page load, check backend for any active jobs and restore them
     try {
       const data = await api.fetchActiveJobs()
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
       if (data.jobs.length > 0) {
         const serverJobs = new Map(data.jobs.map(job => [job.job_id, job]))
         set(s => ({
@@ -7192,6 +7448,7 @@ export const useStore = create<AppState>((set, get) => ({
           void get().loadOutputs()
         }
       }
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
       await get().reconnectDirectorPreparation()
     } catch {
       // Backend might not have the endpoint yet, silently ignore
@@ -7916,7 +8173,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   // System config
   accessContext: null,
-  loadAccessContext: async () => {
+  loadAccessContext: async (refreshProjectsOnIdentityChange = true) => {
     const requestSequence = ++_accessContextRequestSequence
     const accountProjectionSequence = _accountContextRequestSequence
     const context = await api.fetchAccessContext()
@@ -7927,6 +8184,9 @@ export const useStore = create<AppState>((set, get) => ({
     const projectedAccessContext = accountProjectionCurrent
       ? context
       : { ...context, accounts: next ?? undefined }
+    const accountIdentityChanged = _accountIdentity(previous) !== _accountIdentity(next)
+    if (accountIdentityChanged) _advanceAccountIdentityEpoch()
+    const projectUiScrub = accountIdentityChanged ? _scrubAccountBoundProjectUi(get()) : {}
     const supportIdentityChanged = previous?.account?.id !== next?.account?.id
       || previous?.capabilities.includes('account.self') !== next?.capabilities.includes('account.self')
     const supportAdminUnavailable = next?.authenticated !== true
@@ -7949,6 +8209,11 @@ export const useStore = create<AppState>((set, get) => ({
       accessContext: projectedAccessContext,
       accountContext: next,
       accountContextLoading: false,
+      ...(accountIdentityChanged ? {
+        ...projectUiScrub,
+        accountProjectMigration: null,
+        accountProjectMigrationLoading: false,
+      } : {}),
       ...(supportIdentityChanged ? {
         accountSessions: [],
         accountUsers: [],
@@ -7965,10 +8230,15 @@ export const useStore = create<AppState>((set, get) => ({
         supportDetailsLoading: false,
       } : {}),
     })
+    if (accountIdentityChanged && refreshProjectsOnIdentityChange) {
+      await get().loadWorkspaces()
+    }
     return context
   },
   accountContext: null,
   accountContextLoading: false,
+  accountProjectMigration: null,
+  accountProjectMigrationLoading: false,
   accountDrawerOpen: false,
   accountSessions: [],
   accountUsers: [],
@@ -7992,7 +8262,7 @@ export const useStore = create<AppState>((set, get) => ({
           supportDetailsLoading: false,
         })
   },
-  loadAccountContext: async () => {
+  loadAccountContext: async (refreshProjectsOnIdentityChange = true) => {
     const accessAccounts = get().accessContext?.accounts
     if (accessAccounts?.enabled !== true) {
       // A null access bootstrap is still in flight; do not supersede its
@@ -8005,9 +8275,15 @@ export const useStore = create<AppState>((set, get) => ({
       _responsibleUseRequestSequence += 1
       _responsibleUseAcceptanceSequence += 1
       _supportAdminRequestSequence += 1
+      const identityChanged = _accountIdentity(get().accountContext) !== _accountIdentity(accessAccounts)
+      if (identityChanged) _advanceAccountIdentityEpoch()
+      const projectUiScrub = identityChanged ? _scrubAccountBoundProjectUi(get()) : {}
       set({
+        ...projectUiScrub,
         accountContext: get().accessContext?.accounts ?? null,
         accountContextLoading: false,
+        accountProjectMigration: null,
+        accountProjectMigrationLoading: false,
         accountSessions: [],
         accountUsers: [],
         supportSelf: null,
@@ -8016,6 +8292,9 @@ export const useStore = create<AppState>((set, get) => ({
         supportAdmin: null,
         supportDetailsLoading: false,
       })
+      if (identityChanged && refreshProjectsOnIdentityChange) {
+        await get().loadWorkspaces()
+      }
       return get().accessContext?.accounts ?? null
     }
     const requestSequence = ++_accountContextRequestSequence
@@ -8024,6 +8303,9 @@ export const useStore = create<AppState>((set, get) => ({
       const context = await api.fetchAccountContext()
       if (requestSequence !== _accountContextRequestSequence) return null
       const previous = get().accountContext
+      const accountIdentityChanged = _accountIdentity(previous) !== _accountIdentity(context)
+      if (accountIdentityChanged) _advanceAccountIdentityEpoch()
+      const projectUiScrub = accountIdentityChanged ? _scrubAccountBoundProjectUi(get()) : {}
       const supportIdentityChanged = previous?.account?.id !== context.account?.id
         || previous?.capabilities.includes('account.self') !== context.capabilities.includes('account.self')
       const supportAdminUnavailable = context.authenticated !== true
@@ -8047,6 +8329,7 @@ export const useStore = create<AppState>((set, get) => ({
         const selfUnavailable = context.authenticated !== true
           || !context.capabilities.includes('account.self')
         return {
+          ...projectUiScrub,
           accountContext: context,
           accountContextLoading: false,
           accessContext: state.accessContext
@@ -8062,6 +8345,10 @@ export const useStore = create<AppState>((set, get) => ({
             supportAdmin: null,
             supportDetailsLoading: false,
           } : {}),
+          ...(accountIdentityChanged ? {
+            accountProjectMigration: null,
+            accountProjectMigrationLoading: false,
+          } : {}),
           ...(supportAdminUnavailable ? {
             supportAdminAccountId: null,
             supportAdmin: null,
@@ -8069,6 +8356,9 @@ export const useStore = create<AppState>((set, get) => ({
           } : {}),
         }
       })
+      if (accountIdentityChanged && refreshProjectsOnIdentityChange) {
+        await get().loadWorkspaces()
+      }
       return context
     } catch (error) {
       if (requestSequence === _accountContextRequestSequence) {
@@ -8077,23 +8367,143 @@ export const useStore = create<AppState>((set, get) => ({
       throw error
     }
   },
+  loadAccountProjectMigration: async () => {
+    const state = get()
+    const context = state.accountContext
+    const directLoopback = typeof window !== 'undefined'
+      && api.isDirectLoopbackHostname(window.location.hostname)
+    if (
+      state.accessContext?.accounts?.enabled !== true
+      || state.accessContext.remote
+      || !directLoopback
+      || context?.authenticated !== true
+      || context.account?.role !== 'owner'
+      || context.reauthenticated !== true
+      || !context.capabilities.includes('owner.admin')
+    ) {
+      _accountProjectMigrationRequestSequence += 1
+      set({ accountProjectMigration: null, accountProjectMigrationLoading: false })
+      return null
+    }
+    const requestSequence = ++_accountProjectMigrationRequestSequence
+    set({ accountProjectMigrationLoading: true })
+    try {
+      const status = await api.fetchAccountProjectMigration()
+      if (requestSequence !== _accountProjectMigrationRequestSequence) return null
+      set({ accountProjectMigration: status, accountProjectMigrationLoading: false })
+      return status
+    } catch (error) {
+      if (requestSequence === _accountProjectMigrationRequestSequence) {
+        set({ accountProjectMigration: null, accountProjectMigrationLoading: false })
+      }
+      throw error
+    }
+  },
+  migrateAccountProjects: async () => {
+    const state = get()
+    const context = state.accountContext
+    const directLoopback = typeof window !== 'undefined'
+      && api.isDirectLoopbackHostname(window.location.hostname)
+    if (
+      state.accessContext?.accounts?.enabled !== true
+      || state.accessContext.remote
+      || !directLoopback
+      || context?.authenticated !== true
+      || context.account?.role !== 'owner'
+      || context.reauthenticated !== true
+      || !context.capabilities.includes('owner.admin')
+    ) throw new api.AccountApiError('Project setup is not available here.', {
+      code: 'project_migration_unavailable',
+      status: 403,
+    })
+    const requestSequence = ++_accountProjectMigrationRequestSequence
+    set({ accountProjectMigrationLoading: true })
+    try {
+      const status = await api.migrateAccountProjects()
+      if (requestSequence !== _accountProjectMigrationRequestSequence) return null
+      _advanceAccountIdentityEpoch()
+      set({
+        ..._scrubAccountBoundProjectUi(get()),
+        accountProjectMigration: status,
+        accountProjectMigrationLoading: false,
+      })
+      if (!await get().loadWorkspaces()) {
+        throw new Error('Project setup finished, but project access could not be refreshed')
+      }
+      return status
+    } catch (error) {
+      if (requestSequence === _accountProjectMigrationRequestSequence) {
+        set({ accountProjectMigrationLoading: false })
+      }
+      throw error
+    }
+  },
   bootstrapAccount: async (input) => {
     const mutationSequence = _beginAccountMutation()
-    const result = await api.bootstrapAccount(input)
-    if (mutationSequence !== _accountMutationRequestSequence) return result
-    await get().loadAccountContext().catch(() => null)
-    if (mutationSequence !== _accountMutationRequestSequence) return result
+    const accountIdentityEpoch = _accountIdentityEpoch
+    set(_scrubAccountBoundProjectUi(get()))
+    let result: AccountAuthResult
+    try {
+      result = await api.bootstrapAccount(input)
+    } catch (error) {
+      if (
+        mutationSequence !== _accountMutationRequestSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+      ) return null
+      if (mutationSequence === _accountMutationRequestSequence) {
+        await get().loadAccountContext(false).catch(() => null)
+        await get().loadWorkspaces()
+      }
+      if (
+        mutationSequence !== _accountMutationRequestSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+      ) return null
+      throw error
+    }
+    if (
+      mutationSequence !== _accountMutationRequestSequence
+      || !_accountIdentityIsCurrent(accountIdentityEpoch)
+    ) return null
+    await get().loadAccountContext(false).catch(() => null)
+    if (
+      mutationSequence !== _accountMutationRequestSequence
+      || get().accountContext?.account?.id !== result.account.id
+    ) return null
+    const resolvedIdentityEpoch = _accountIdentityEpoch
+    await get().loadWorkspaces()
+    if (
+      mutationSequence !== _accountMutationRequestSequence
+      || !_accountIdentityIsCurrent(resolvedIdentityEpoch)
+      || get().accountContext?.account?.id !== result.account.id
+    ) return null
     await Promise.all([
       get().loadAccountSessions().catch(() => undefined),
       get().loadAccountUsers().catch(() => undefined),
     ])
+    if (
+      mutationSequence !== _accountMutationRequestSequence
+      || !_accountIdentityIsCurrent(resolvedIdentityEpoch)
+      || get().accountContext?.account?.id !== result.account.id
+    ) return null
     return result
   },
   loginAccount: async (input) => {
     const mutationSequence = _beginAccountMutation()
-    const result = await api.loginAccount(input)
+    set(_scrubAccountBoundProjectUi(get()))
+    let result: AccountAuthResult
+    try {
+      result = await api.loginAccount(input)
+    } catch (error) {
+      if (mutationSequence === _accountMutationRequestSequence) {
+        await get().loadAccountContext(false).catch(() => null)
+        await get().loadWorkspaces()
+      }
+      throw error
+    }
     if (mutationSequence !== _accountMutationRequestSequence) return result
-    await get().loadAccountContext().catch(() => null)
+    await get().loadAccountContext(false).catch(() => null)
+    if (mutationSequence !== _accountMutationRequestSequence) return result
+    await get().loadWorkspaces()
     if (mutationSequence !== _accountMutationRequestSequence) return result
     await Promise.all([
       get().loadAccountSessions().catch(() => undefined),
@@ -8103,7 +8513,16 @@ export const useStore = create<AppState>((set, get) => ({
   },
   logoutAccount: async () => {
     const mutationSequence = _beginAccountMutation()
-    await api.logoutAccount()
+    set(_scrubAccountBoundProjectUi(get()))
+    try {
+      await api.logoutAccount()
+    } catch (error) {
+      if (mutationSequence === _accountMutationRequestSequence) {
+        await get().loadAccountContext(false).catch(() => null)
+        await get().loadWorkspaces()
+      }
+      throw error
+    }
     if (mutationSequence !== _accountMutationRequestSequence) return
     _supportSelfRequestSequence += 1
     _responsibleUseRequestSequence += 1
@@ -8122,6 +8541,8 @@ export const useStore = create<AppState>((set, get) => ({
       accountSessions: [],
       accountUsers: [],
       accountContextLoading: false,
+      accountProjectMigration: null,
+      accountProjectMigrationLoading: false,
       accountDetailsLoading: false,
       supportSelf: null,
       responsibleUse: null,
@@ -8129,28 +8550,67 @@ export const useStore = create<AppState>((set, get) => ({
       supportAdmin: null,
       supportDetailsLoading: false,
     }))
-    await get().loadAccountContext().catch(() => null)
+    await get().loadAccountContext(false).catch(() => null)
+    if (mutationSequence === _accountMutationRequestSequence) await get().loadWorkspaces()
   },
   reauthenticateAccount: async (password) => {
-    const mutationSequence = _beginAccountMutation()
+    const mutationSequence = _beginAccountMutation(false)
     await api.reauthenticateAccount(password)
     if (mutationSequence !== _accountMutationRequestSequence) return
-    await get().loadAccountContext().catch(() => null)
+    await get().loadAccountContext(false).catch(() => null)
+    if (mutationSequence === _accountMutationRequestSequence) await get().loadWorkspaces()
   },
   recoverAccount: async (input) => {
     const mutationSequence = _beginAccountMutation()
-    const result = await api.recoverAccount(input)
-    if (mutationSequence !== _accountMutationRequestSequence) return result
-    await get().loadAccountContext().catch(() => null)
-    if (mutationSequence !== _accountMutationRequestSequence) return result
+    const accountIdentityEpoch = _accountIdentityEpoch
+    set(_scrubAccountBoundProjectUi(get()))
+    let result: AccountAuthResult
+    try {
+      result = await api.recoverAccount(input)
+    } catch (error) {
+      if (
+        mutationSequence !== _accountMutationRequestSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+      ) return null
+      if (mutationSequence === _accountMutationRequestSequence) {
+        await get().loadAccountContext(false).catch(() => null)
+        await get().loadWorkspaces()
+      }
+      if (
+        mutationSequence !== _accountMutationRequestSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+      ) return null
+      throw error
+    }
+    if (
+      mutationSequence !== _accountMutationRequestSequence
+      || !_accountIdentityIsCurrent(accountIdentityEpoch)
+    ) return null
+    await get().loadAccountContext(false).catch(() => null)
+    if (
+      mutationSequence !== _accountMutationRequestSequence
+      || get().accountContext?.account?.id !== result.account.id
+    ) return null
+    const resolvedIdentityEpoch = _accountIdentityEpoch
+    await get().loadWorkspaces()
+    if (
+      mutationSequence !== _accountMutationRequestSequence
+      || !_accountIdentityIsCurrent(resolvedIdentityEpoch)
+      || get().accountContext?.account?.id !== result.account.id
+    ) return null
     await Promise.all([
       get().loadAccountSessions().catch(() => undefined),
       get().loadAccountUsers().catch(() => undefined),
     ])
+    if (
+      mutationSequence !== _accountMutationRequestSequence
+      || !_accountIdentityIsCurrent(resolvedIdentityEpoch)
+      || get().accountContext?.account?.id !== result.account.id
+    ) return null
     return result
   },
   changeAccountPassword: async (newPassword) => {
-    const mutationSequence = _beginAccountMutation()
+    const mutationSequence = _beginAccountMutation(false)
     await api.changeAccountPassword(newPassword)
     if (mutationSequence !== _accountMutationRequestSequence) return
     await Promise.all([
@@ -8159,7 +8619,27 @@ export const useStore = create<AppState>((set, get) => ({
     ])
   },
   rotateAccountRecoveryCodes: async () => {
-    const result = await api.rotateAccountRecoveryCodes()
+    const mutationSequence = _beginAccountMutation(false)
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const accountId = get().accountContext?.account?.id
+    const ownsAuthorization = () => {
+      const context = get().accountContext
+      return _accountIdentityIsCurrent(accountIdentityEpoch)
+        && mutationSequence === _accountMutationRequestSequence
+        && Boolean(accountId)
+        && context?.authenticated === true
+        && context.account?.id === accountId
+        && context.reauthenticated === true
+        && context.capabilities.includes('account.self')
+    }
+    let result: Awaited<ReturnType<typeof api.rotateAccountRecoveryCodes>>
+    try {
+      result = await api.rotateAccountRecoveryCodes()
+    } catch (error) {
+      if (!ownsAuthorization()) return null
+      throw error
+    }
+    if (!ownsAuthorization()) return null
     return result.recovery_codes
   },
   loadAccountSessions: async () => {
@@ -8197,8 +8677,16 @@ export const useStore = create<AppState>((set, get) => ({
     _invalidateAccountRequests()
     const result = await api.revokeAccountSession(sessionHandle)
     if (result.current) {
-      set({ accountSessions: [], accountUsers: [] })
-      await get().loadAccountContext().catch(() => null)
+      _advanceAccountIdentityEpoch()
+      set({
+        ..._scrubAccountBoundProjectUi(get()),
+        accountSessions: [],
+        accountUsers: [],
+        accountProjectMigration: null,
+        accountProjectMigrationLoading: false,
+      })
+      await get().loadAccountContext(false).catch(() => null)
+      await get().loadWorkspaces()
     } else {
       await get().loadAccountSessions()
     }
@@ -8208,8 +8696,16 @@ export const useStore = create<AppState>((set, get) => ({
     _invalidateAccountRequests()
     const result = await api.revokeAllAccountSessions(retainCurrent)
     if (result.current_revoked) {
-      set({ accountSessions: [], accountUsers: [] })
-      await get().loadAccountContext().catch(() => null)
+      _advanceAccountIdentityEpoch()
+      set({
+        ..._scrubAccountBoundProjectUi(get()),
+        accountSessions: [],
+        accountUsers: [],
+        accountProjectMigration: null,
+        accountProjectMigrationLoading: false,
+      })
+      await get().loadAccountContext(false).catch(() => null)
+      await get().loadWorkspaces()
     } else {
       await get().loadAccountSessions()
     }
@@ -8259,8 +8755,30 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   createServerAccount: async (input) => {
-    const result = await api.createServerAccount(input)
+    const mutationSequence = _beginAccountMutation(false)
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const accountId = get().accountContext?.account?.id
+    const ownsAuthorization = () => {
+      const context = get().accountContext
+      return _accountIdentityIsCurrent(accountIdentityEpoch)
+        && mutationSequence === _accountMutationRequestSequence
+        && Boolean(accountId)
+        && context?.authenticated === true
+        && context.account?.id === accountId
+        && context.reauthenticated === true
+        && context.capabilities.includes('accounts.admin')
+        && context.capabilities.includes('services.admin')
+    }
+    let result: AccountAuthResult
+    try {
+      result = await api.createServerAccount(input)
+    } catch (error) {
+      if (!ownsAuthorization()) return null
+      throw error
+    }
+    if (!ownsAuthorization()) return null
     await get().loadAccountUsers()
+    if (!ownsAuthorization()) return null
     return result
   },
   setServerAccountDisabled: async (accountId, disabled) => {
@@ -9041,6 +9559,7 @@ export const useStore = create<AppState>((set, get) => ({
   setDirectorSongLyrics: (v) => set({ directorSongLyrics: v }),
   setDirectorSongDuration: (v) => set({ directorSongDuration: v }),
   reconnectDirectorPreparation: async () => {
+    const accountIdentityEpoch = _accountIdentityEpoch
     const { directorRequestId, directorRequestWorkspace } = get()
     if (!directorRequestId || !directorRequestWorkspace) return
     try {
@@ -9048,6 +9567,7 @@ export const useStore = create<AppState>((set, get) => ({
         directorRequestId,
         directorRequestWorkspace,
       )
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
       if (get().directorRequestId === directorRequestId) {
         set({ directorPreparationStatus: status })
       }
@@ -9055,6 +9575,10 @@ export const useStore = create<AppState>((set, get) => ({
         _stopDirectorPreparationPoll()
       } else if (_directorPreparationPoll === null) {
         _directorPreparationPoll = setInterval(() => {
+          if (!_accountIdentityIsCurrent(accountIdentityEpoch)) {
+            _stopDirectorPreparationPoll()
+            return
+          }
           void useStore.getState().reconnectDirectorPreparation()
         }, 2000)
       }
@@ -9346,6 +9870,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   directorUploadAndAnalyze: async (file) => {
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const requestWorkspace = get().activeWorkspace
+    const ownsRequest = () => (
+      _accountIdentityIsCurrent(accountIdentityEpoch)
+      && get().activeWorkspace === requestWorkspace
+    )
     _stopDirectorPreparationPoll()
     _storeDirectorPreparation(null, null)
     set({
@@ -9360,11 +9890,16 @@ export const useStore = create<AppState>((set, get) => ({
     })
     try {
       const uploaded = await api.uploadAudio(file)
+      if (!ownsRequest()) return
       await get().directorAnalyzeAndPlan(uploaded.path, { transcribe: true })
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Upload failed'
-      console.error('Director upload failed:', e)
-      set({ directorLoading: false, directorLoadingMessage: null, directorError: msg, directorStep: 'upload' })
+    } catch {
+      if (!ownsRequest()) return
+      set({
+        directorLoading: false,
+        directorLoadingMessage: null,
+        directorError: 'The audio file could not be uploaded or analyzed. Try again.',
+        directorStep: 'upload',
+      })
     }
   },
 
@@ -9541,7 +10076,13 @@ export const useStore = create<AppState>((set, get) => ({
   // chain the upload flow uses. In Auto mode, continue straight into the
   // pipeline so it's fully hands-off.
   directorGenerateTrack: async () => {
+    const accountIdentityEpoch = _accountIdentityEpoch
     const s = get()
+    const workspace = s.activeWorkspace
+    const ownsTrackRequest = () => (
+      _accountIdentityIsCurrent(accountIdentityEpoch)
+      && get().activeWorkspace === workspace
+    )
     const instrumental = s.directorSongInstrumental
     const description = s.directorSongDescription.trim()
     const style = s.directorSongStyle.trim()
@@ -9557,9 +10098,14 @@ export const useStore = create<AppState>((set, get) => ({
     if (!refPath && s.directorReferenceImage) {
       try {
         refPath = (await api.uploadImage(s.directorReferenceImage)).path
+        if (!ownsTrackRequest()) return
         set({ directorReferenceImagePath: refPath })
-      } catch { /* image upload is best-effort */ }
+      } catch {
+        if (!ownsTrackRequest()) return
+        /* image upload is best-effort */
+      }
     }
+    if (!ownsTrackRequest()) return
     set({
       directorTrackGenerating: true,
       directorError: null,
@@ -9568,7 +10114,6 @@ export const useStore = create<AppState>((set, get) => ({
       directorStep: 'analyze',
     })
     try {
-      const workspace = get().activeWorkspace
       const musicRequest: api.DirectorMusicRequest = {
         description: description || undefined,
         style: style || undefined,
@@ -9595,8 +10140,9 @@ export const useStore = create<AppState>((set, get) => ({
         // body plus that server-issued id.
         preparation = await api.startDirectorPreparation(musicRequest)
         directorRequestId = preparation.director_request_id
-        _storeDirectorPreparation(directorRequestId, workspace)
       }
+      if (!ownsTrackRequest()) return
+      _storeDirectorPreparation(directorRequestId, workspace)
       set({
         directorRequestId,
         directorRequestWorkspace: workspace,
@@ -9612,9 +10158,10 @@ export const useStore = create<AppState>((set, get) => ({
         ...musicRequest,
         director_request_id: directorRequestId,
       })
-      setTimeout(() => { void get().reconnectJobs() }, 1200)
-      setTimeout(() => { void get().reconnectJobs() }, 5000)
+      setTimeout(() => { void get().reconnectJobs(accountIdentityEpoch) }, 1200)
+      setTimeout(() => { void get().reconnectJobs(accountIdentityEpoch) }, 5000)
       const r = await trackPromise
+      if (!ownsTrackRequest()) return
       // Persist the (possibly LLM-written) song back into the editable fields.
       set({
         directorSongStyle: r.style || style,
@@ -9635,6 +10182,7 @@ export const useStore = create<AppState>((set, get) => ({
         transcribe: !instrumental,
         lyricsHint: instrumental ? undefined : (r.lyrics || lyrics || undefined),
       })
+      if (!ownsTrackRequest()) return
       // The song description doubles as the scene description, so the manual
       // 'style' step isn't needed — proceed straight to planning. Auto runs the
       // full server-side pipeline; manual runs the frontend plan→review chain.
@@ -9646,6 +10194,7 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
     } catch (e: unknown) {
+      if (!ownsTrackRequest()) return
       const msg = e instanceof Error ? e.message : 'Music generation failed'
       console.error('Director music generation failed:', e)
       set({
@@ -9967,6 +10516,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   directorGenerateStartImages: async () => {
+    const accountIdentityEpoch = _accountIdentityEpoch
     const initialState = get()
     const {
       directorClipPlans, directorPlannedClips, directorResolution,
@@ -9978,9 +10528,17 @@ export const useStore = create<AppState>((set, get) => ({
     // The server selects Creator for reference-free anchors and Editor when
     // authorized references are present, then derives role-specific defaults.
     const requestWorkspace = initialState.activeWorkspace
+    const ownsDirectorRequest = () => (
+      _accountIdentityIsCurrent(accountIdentityEpoch)
+      && get().activeWorkspace === requestWorkspace
+    )
+    const requireDirectorRequest = () => {
+      if (!ownsDirectorRequest()) throw new Error('Account changed during Director generation')
+    }
     const requestExplicitOutput = initialState.explicitOutput
     const requestPrivateOutput = initialState.privateOutput
     const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
+    if (!ownsDirectorRequest()) return
     const imageResolutionOptions = new Map<string, Promise<ModelOptions>>()
 
     const exactImageResolution = async (modelType: string): Promise<string> => {
@@ -9990,6 +10548,7 @@ export const useStore = create<AppState>((set, get) => ({
         imageResolutionOptions.set(modelType, request)
       }
       const options = await request
+      requireDirectorRequest()
       const resolution = resolveDeclaredResolution(
         options, directorResolution, directorAspectRatio,
       )
@@ -10006,6 +10565,7 @@ export const useStore = create<AppState>((set, get) => ({
         ? imageRoleRequest.effective_editor_model
         : imageRoleRequest.effective_creator_model
       const directorRes = await exactImageResolution(effectiveModel)
+      requireDirectorRequest()
       const genParams = {
         ...imageRoleRequest.wire,
         prompt,
@@ -10025,6 +10585,7 @@ export const useStore = create<AppState>((set, get) => ({
         video_length: 1,
       }
       const { job_id } = await api.submitGeneration(genParams)
+      requireDirectorRequest()
       const directorJob: GenerationJob = {
         id: job_id,
         status: 'queued',
@@ -10053,6 +10614,7 @@ export const useStore = create<AppState>((set, get) => ({
       let status: api.ApiJobStatus
       try {
         status = await terminalStatus
+        requireDirectorRequest()
       } catch (error) {
         if (error instanceof Error && error.message.endsWith('timed out')) {
           throw new Error(`${label} generation timed out`)
@@ -10066,7 +10628,9 @@ export const useStore = create<AppState>((set, get) => ({
       if (outputFiles.length === 0) throw new Error(`No output file for ${label}`)
       const filename = outputFiles[0]
       const imgRes = await fetch(api.getFileUrl(filename))
+      requireDirectorRequest()
       const blob = await imgRes.blob()
+      requireDirectorRequest()
       const file = new File([blob], filename, { type: blob.type || 'image/png' })
       return { file, filename }
     }
@@ -10075,6 +10639,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().llmStatus?.loaded) {
       try {
         await api.unloadLlm()
+        if (!ownsDirectorRequest()) return
         set({ llmStatus: { loaded: false, model_id: null, device: null, provider: '' } })
       } catch { /* best-effort */ }
     }
@@ -10098,12 +10663,16 @@ export const useStore = create<AppState>((set, get) => ({
         })
         const anchorPrompt = directorSceneDescription.trim() || directorClipPlans[0]?.image_prompt || 'cinematic establishing shot'
         const { file: anchorFile } = await genImage(anchorPrompt, [], 'Establishing image')
+        if (!ownsDirectorRequest()) return
         // Adopt as the reference image (uploaded just below via _uploadDirectorRefs).
         set({ directorReferenceImage: anchorFile, directorReferenceImagePath: null })
       }
 
       // Upload all reference images (main/anchor + character + location)
-      const { refImagePath: refPath, charPaths, locPaths } = await get()._uploadDirectorRefs()
+      const { refImagePath: refPath, charPaths, locPaths } = await get()._uploadDirectorRefs({
+        ownsWorkspace: ownsDirectorRequest,
+      })
+      if (!ownsDirectorRequest()) return
       const allRefs = [refPath, ...charPaths, ...locPaths].filter(Boolean) as string[]
 
       const total = directorClipPlans.length + (anchorMade ? 1 : 0)
@@ -10119,6 +10688,7 @@ export const useStore = create<AppState>((set, get) => ({
           directorImageGenProgress: { current: base + i, total, currentClipLabel: clipLabel, status: 'generating' },
         })
         const { file, filename } = await genImage(plan.image_prompt, allRefs, clipLabel)
+        if (!ownsDirectorRequest()) return
         generatedImages.push({ clipIndex: i, prompt: plan.image_prompt, file, filename })
         set({ directorClipImages: [...generatedImages] })
       }
@@ -10140,6 +10710,7 @@ export const useStore = create<AppState>((set, get) => ({
         get().directorPlanVideoPrompts()
       }
     } catch (e: unknown) {
+      if (!ownsDirectorRequest()) return
       const msg = e instanceof Error ? e.message : 'Image generation failed'
       console.error('Director image generation failed:', e)
       set({
@@ -10925,9 +11496,13 @@ export const useStore = create<AppState>((set, get) => ({
   browsingUploads: false,
   loadWorkspaces: async () => {
     const requestSequence = ++_workspaceLoadSequence
+    const accountIdentityEpoch = _accountIdentityEpoch
     try {
       const data = await api.fetchWorkspaces()
-      if (requestSequence !== _workspaceLoadSequence) return false
+      if (
+        requestSequence !== _workspaceLoadSequence
+        || accountIdentityEpoch !== _accountIdentityEpoch
+      ) return false
       const before = get()
       const previousActive = before.activeWorkspace
       const projectChanged = data.active !== previousActive
@@ -11001,7 +11576,10 @@ export const useStore = create<AppState>((set, get) => ({
       }
       return true
     } catch (e) {
-      console.error('Failed to load workspaces:', e)
+      if (
+        requestSequence === _workspaceLoadSequence
+        && accountIdentityEpoch === _accountIdentityEpoch
+      ) console.error('Failed to load workspaces:', e)
       return false
     }
   },

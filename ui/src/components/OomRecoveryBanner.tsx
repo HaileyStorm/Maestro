@@ -66,8 +66,8 @@ export function OomRecoveryBanner() {
         oom: failedJob.oomInfo,
         context: failedJob.oomInfo.stage === 'h3_delivery'
           ? failedJob.oomInfo.manual_retry_count != null
-            ? 'A delivery-only recovery attempt failed.'
-            : 'Native generation completed; exact delivery failed.'
+            ? 'The delivery retry failed.'
+            : 'Generation finished, but creating the requested output failed.'
           : 'Generation failed.',
         sourceJobId: failedJob.oomInfo.manual_retry_count == null ? failedJob.id : undefined,
         workspace: failedJob.oomInfo.manual_retry_count == null ? failedJob.workspace : undefined,
@@ -153,7 +153,7 @@ export function OomRecoveryBanner() {
       setApplyError(null)
       setAppliedToast({
         key: oomKey,
-        message: `VRAM headroom lowered to ${suggestedCoefficient.toFixed(2)} — try the generation again`,
+        message: `GPU memory setting changed to ${Math.round(suggestedCoefficient * 100)}% — try the generation again`,
       })
       setDismissed(d => new Set(d).add(oomKey))
     } catch {
@@ -197,11 +197,11 @@ export function OomRecoveryBanner() {
   const { oom, context } = activeOom
   const isDeliveryOom = oom.stage === 'h3_delivery'
   const vramGb = systemDetect?.hardware?.gpu_vram_gb
-  const vramHint = machineControls && vramGb ? `Your GPU has ${vramGb} GB VRAM.` : ''
+  const vramHint = machineControls && vramGb ? `Your GPU has ${vramGb} GB of memory.` : ''
   const canLower = !isDeliveryOom && machineControls && oom.suggested_coefficient !== null
-  const deliveryTarget = oom.requested_target ? `Exact ${oom.requested_target} delivery` : 'Exact delivery'
+  const deliveryTarget = oom.requested_target ? `${oom.requested_target} output` : 'requested output'
   const retriedDelivery = (oom.retry_count ?? 0) > 0
-  const alertSummary = `${isDeliveryOom ? 'Delivery' : 'Generation'} ran out of VRAM. ${context}`
+  const alertSummary = `${isDeliveryOom ? 'Output processing' : 'Generation'} ran out of GPU memory. ${context}`
 
   return (
     <div
@@ -217,7 +217,7 @@ export function OomRecoveryBanner() {
           <AlertTriangle size={18} aria-hidden="true" className="mt-0.5 shrink-0 text-indicator-warning" />
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium text-text-primary">
-              {isDeliveryOom ? 'Delivery ran out of VRAM' : 'Generation ran out of VRAM'}
+              {isDeliveryOom ? 'Output processing ran out of GPU memory' : 'Generation ran out of GPU memory'}
             </div>
             <div className="text-[12px] text-text-secondary mt-0.5">
               {context} {vramHint}
@@ -243,12 +243,12 @@ export function OomRecoveryBanner() {
             }`}>
               {oom.native_available ? (
                 <>
-                  <span className="font-medium text-accent-green">Native generation succeeded.</span>{' '}
-                  Maestro preserved the native result privately when {deliveryTarget.toLowerCase()} ran out of VRAM
-                  {retriedDelivery ? ' again after one automatic identical retry.' : '.'}
+                  <span className="font-medium text-accent-green">Generation finished.</span>{' '}
+                  Maestro saved the original result privately when creating the {deliveryTarget.toLowerCase()} ran out of GPU memory
+                  {retriedDelivery ? ' after one automatic retry.' : '.'}
                 </>
               ) : (
-                <>{deliveryTarget} ran out of VRAM, and no preserved native result is available.</>
+                <>Creating the {deliveryTarget.toLowerCase()} ran out of GPU memory, and the original result was not saved for recovery.</>
               )}
             </div>
           )}
@@ -265,9 +265,8 @@ export function OomRecoveryBanner() {
           {canLower ? (
             <>
               <div className="text-[12px] text-text-secondary leading-snug">
-                Lower VRAM headroom from <span className="font-mono text-text-primary">{oom.current_coefficient.toFixed(2)}</span> to{' '}
-                <span className="font-mono text-indicator-warning">{oom.suggested_coefficient!.toFixed(2)}</span> to reserve more memory for generation spikes
-                (long videos, VAE decode). About ~5% slower per generation.
+                Use a safer GPU memory setting: change <span className="font-mono text-text-primary">{Math.round(oom.current_coefficient * 100)}%</span> to{' '}
+                <span className="font-mono text-indicator-warning">{Math.round(oom.suggested_coefficient! * 100)}%</span>. This leaves more memory for long videos and final output processing, but generation may be about 5% slower.
               </div>
               {visibleApplyError && (
                 <div
@@ -286,7 +285,7 @@ export function OomRecoveryBanner() {
                   disabled={applying}
                   className="min-h-11 w-full flex-1 rounded-md bg-amber-500 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-200 focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary disabled:cursor-wait disabled:opacity-50 motion-reduce:transition-none sm:w-auto"
                 >
-                  {applying ? 'Applying...' : `Lower headroom to ${oom.suggested_coefficient!.toFixed(2)}`}
+                  {applying ? 'Applying...' : `Use safer setting ${Math.round(oom.suggested_coefficient! * 100)}%`}
                 </button>
                 <button
                   type="button"
@@ -297,14 +296,14 @@ export function OomRecoveryBanner() {
                 </button>
               </div>
               <div className="text-[10px] text-text-muted">
-                After applying, re-run the generation — it'll use the new headroom on next model load.
+                Try the generation again after applying. The new setting takes effect the next time the model loads.
               </div>
             </>
           ) : machineControls && !isDeliveryOom ? (
             <>
               <div className="text-[12px] text-text-secondary leading-snug">
-                VRAM headroom is already at <span className="font-mono">{oom.current_coefficient.toFixed(2)}</span> (the safe minimum).
-                Lowering it further won't help. Try a smaller model variant (e.g. INT8 or GGUF), reduce resolution, or shorten video length.
+                The GPU memory setting is already at its safest level (<span className="font-mono">{Math.round(oom.current_coefficient * 100)}%</span>).
+                Try a smaller model, reduce the resolution, or shorten the video.
               </div>
               <div className="flex justify-end">
                 <button

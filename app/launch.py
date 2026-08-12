@@ -192,6 +192,22 @@ from services.account_auth import (
     encode_account_session_cookie,
     resolve_account_capabilities,
 )
+from services.account_project_membership import (
+    AccountProjectMembershipStore,
+    ProjectMembershipConflictError,
+    ProjectMembershipError,
+    ProjectMembershipNotFoundError,
+    ProjectMembershipStoreUnavailableError,
+    permissions_for_role,
+    role_allows,
+)
+from services.account_project_migration import (
+    AccountProjectMigrationLedger,
+    ProjectMigrationConflictError,
+    ProjectMigrationCorruptError,
+    ProjectMigrationError,
+    ProjectMigrationSafetyError,
+)
 from services.entitlements import (
     ContributionConflict,
     ContributionLedger,
@@ -257,6 +273,10 @@ _session_secret_lock = threading.Lock()
 _session_secret_value = None
 _account_auth_lock = threading.Lock()
 _account_auth_value = None
+_account_project_migration_lock = threading.Lock()
+_account_project_migration_value = None
+_account_project_membership_lock = threading.Lock()
+_account_project_membership_value = None
 _support_portal_lock = threading.Lock()
 _support_portal_value = None
 _output_share_manager_lock = threading.Lock()
@@ -344,6 +364,53 @@ def _account_auth_store() -> AccountAuthStore | None:
                     path, _session_secret(),
                 )
     return _account_auth_value
+
+
+def _account_project_state_path(environment_name: str, filename: str) -> str:
+    configured = str(os.environ.get(environment_name) or "").strip()
+    if configured:
+        return (
+            configured
+            if os.path.isabs(configured)
+            else os.path.join(_app_dir, configured)
+        )
+    return os.path.join(_app_dir, "storage", filename)
+
+
+def _account_project_migration_ledger() -> AccountProjectMigrationLedger | None:
+    """Return the migration ledger only after accounts are explicitly enabled."""
+    global _account_project_migration_value
+    if not _accounts_enabled():
+        return None
+    if _account_project_migration_value is None:
+        with _account_project_migration_lock:
+            if _account_project_migration_value is None:
+                _account_project_migration_value = AccountProjectMigrationLedger(
+                    _account_project_state_path(
+                        "MAESTRO_ACCOUNT_PROJECT_MIGRATION_PATH",
+                        "account-project-migration.json",
+                    ),
+                    _session_secret(),
+                )
+    return _account_project_migration_value
+
+
+def _account_project_membership_store() -> AccountProjectMembershipStore | None:
+    """Return project membership only after accounts are explicitly enabled."""
+    global _account_project_membership_value
+    if not _accounts_enabled():
+        return None
+    if _account_project_membership_value is None:
+        with _account_project_membership_lock:
+            if _account_project_membership_value is None:
+                _account_project_membership_value = AccountProjectMembershipStore(
+                    _account_project_state_path(
+                        "MAESTRO_ACCOUNT_PROJECT_MEMBERSHIP_PATH",
+                        "account-project-membership.json",
+                    ),
+                    _session_secret(),
+                )
+    return _account_project_membership_value
 
 
 def _support_domain_key(purpose: str) -> bytes:
@@ -2959,6 +3026,154 @@ def _queue_recovery_existing_project_identity(project_dir: str) -> str:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _raise_project_setup_unavailable(error: Exception) -> None:
+    raise HTTPException(
+        status_code=503,
+        detail="Project account access is unavailable right now",
+    ) from error
+
+
+def _account_project_access_state() -> dict:
+    """Return the staged membership state without touching it when disabled."""
+    if not _accounts_enabled():
+        return {
+            "state": "disabled",
+            "enforced": False,
+            "project_count": 0,
+            "needs_attention": 0,
+        }
+    ledger_store = _account_project_migration_ledger()
+    membership_store = _account_project_membership_store()
+    if ledger_store is None or membership_store is None:
+        return {
+            "state": "not_started",
+            "enforced": False,
+            "project_count": 0,
+            "needs_attention": 0,
+        }
+    try:
+        ledger = ledger_store.load_if_present()
+        if ledger is None:
+            if membership_store.load(required=False) is not None:
+                raise ProjectMembershipStoreUnavailableError(
+                    "project migration source is missing",
+                )
+            return {
+                "state": "not_started",
+                "enforced": False,
+                "project_count": 0,
+                "needs_attention": 0,
+            }
+        projects_root = os.path.realpath(
+            wgp.server_config.get("save_path", "outputs"),
+        )
+        if not ledger_store.matches_root(ledger, projects_root):
+            raise ProjectMigrationConflictError(
+                "project migration belongs to a different output root",
+            )
+        membership = membership_store.initialize_from_ledger(
+            ledger,
+            require_existing=True,
+        )
+    except (
+        ProjectMigrationError,
+        ProjectMembershipError,
+    ) as error:
+        _raise_project_setup_unavailable(error)
+    needs_attention = len(membership["quarantine"])
+    return {
+        "state": "needs_attention" if needs_attention else "active",
+        # Do not cut over while any census entry still needs recovery.  The
+        # legacy password view keeps every project reachable until the complete
+        # inventory can be bound without hiding an unresolved directory.
+        "enforced": not needs_attention,
+        "project_count": len(membership["projects"]),
+        "needs_attention": needs_attention,
+    }
+
+
+def _require_account_project_permission(
+    request: Request,
+    workspace_dir: str,
+    permission: str,
+    *,
+    state: dict | None = None,
+) -> dict | None:
+    """Require an account role once the complete project move is active."""
+    state = state or _account_project_access_state()
+    if not state["enforced"]:
+        return None
+    _require_account_store(request)
+    principal = getattr(request.state, "maestro_account_principal", None)
+    if not isinstance(principal, dict):
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        project_instance = _queue_recovery_existing_project_identity(workspace_dir)
+        store = _account_project_membership_store()
+        if store is None:
+            raise ProjectMembershipStoreUnavailableError(
+                "project membership is unavailable",
+            )
+        record = store.lookup(
+            project_instance=project_instance,
+            include_inactive=permission == "project.delete",
+        )
+    except QueueRecoveryAdapterError as error:
+        raise HTTPException(status_code=404, detail="Project not found") from error
+    except ProjectMembershipError as error:
+        _raise_project_setup_unavailable(error)
+    if record is None or (
+        record["state"] != "active"
+        and not (
+            permission == "project.delete"
+            and record["state"] in {"deleting", "deleted"}
+        )
+    ):
+        raise HTTPException(status_code=404, detail="Project not found")
+    binding = next(
+        (
+            item
+            for item in record["bindings"]
+            if item["account_id"] == principal.get("id")
+        ),
+        None,
+    )
+    if binding is None or not role_allows(binding["role"], permission):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return record
+
+
+def _account_project_list_identities(request: Request) -> dict[str, dict] | None:
+    """Return visible project identities and caller permissions after cutover."""
+    state = _account_project_access_state()
+    if not state["enforced"]:
+        return None
+    _require_account_store(request)
+    principal = getattr(request.state, "maestro_account_principal", None)
+    if not isinstance(principal, dict):
+        return {}
+    try:
+        store = _account_project_membership_store()
+        if store is None:
+            raise ProjectMembershipStoreUnavailableError(
+                "project membership is unavailable",
+            )
+        return {
+            item["project_instance"]: {
+                "role": item["account_role"],
+                "permissions": sorted(
+                    permissions_for_role(item["account_role"]),
+                ),
+            }
+            for item in store.list_for_account(
+                principal["id"],
+                permission="project.list",
+            )
+        }
+    except ProjectMembershipError as error:
+        _raise_project_setup_unavailable(error)
 
 
 def _queue_recovery_file_values(params: dict) -> list[tuple[str, str]]:
@@ -8394,14 +8609,31 @@ def _require_project_access(
     workspace: str,
     *,
     existing_only: bool = False,
+    permission: str | None = None,
 ) -> str:
     """Return the contained workspace dir or reject a locked project."""
     remote = bool(getattr(request.state, "maestro_remote", False))
     if remote and workspace == "default":
         raise HTTPException(status_code=404, detail="Project not found")
+    account_project_state = _account_project_access_state()
+    account_projects_enforced = account_project_state["enforced"]
     workspace_dir = (
         _existing_workspace_dir(workspace)
-        if remote or existing_only else _workspace_dir(workspace)
+        if remote or existing_only or account_projects_enforced
+        else _workspace_dir(workspace)
+    )
+    if permission is None:
+        permission = (
+            "project.read"
+            if str(getattr(request, "method", "GET") or "GET").upper()
+            in {"GET", "HEAD"}
+            else "project.mutate"
+        )
+    _require_account_project_permission(
+        request,
+        workspace_dir,
+        permission,
+        state=account_project_state,
     )
     access_method = (
         _project_access.authorize
@@ -18439,6 +18671,120 @@ def get_account_context(request: Request):
     return _public_account_context(request)
 
 
+def _require_account_project_migration_owner(request: Request) -> dict:
+    _require_account_store(request)
+    principal = _require_account_principal(request)
+    if not _request_has_account_capability(request, "owner.admin"):
+        raise HTTPException(status_code=403, detail="Owner access is required")
+    if not _request_has_recent_account_reauth(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Confirm your password before setting up project access",
+        )
+    if not _account_local_bootstrap_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Open Maestro directly on this computer to set up project access",
+        )
+    return principal
+
+
+@api.get("/api/v1/account/projects/migration")
+def get_account_project_migration(request: Request):
+    _require_account_project_migration_owner(request)
+    return _account_project_access_state()
+
+
+@api.post("/api/v1/account/projects/migration")
+def migrate_account_projects(request: Request):
+    principal = _require_account_project_migration_owner(request)
+    ledger_store = _account_project_migration_ledger()
+    membership_store = _account_project_membership_store()
+    if ledger_store is None or membership_store is None:
+        raise HTTPException(status_code=404, detail="Accounts are not enabled")
+    projects_root = os.path.realpath(
+        wgp.server_config.get("save_path", "outputs"),
+    )
+    try:
+        with _workspace_creation_lock:
+            with _workspace_lifecycle_lock:
+                if _workspaces_deleting or _workspace_operations:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Wait for current project activity to finish, "
+                            "then try again"
+                        ),
+                    )
+                for item in _list_workspaces():
+                    if (
+                        _workspace_has_busy_jobs(item["name"], item["path"])
+                        or _workspace_has_busy_director_pipeline(
+                            item["name"], item["path"],
+                        )
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Wait for current project activity to finish, "
+                                "then try again"
+                            ),
+                        )
+                ledger = ledger_store.load_if_present()
+                if ledger is None:
+                    preview = ledger_store.inspect_inventory(
+                        projects_root,
+                        principal["id"],
+                    )
+                    if any(
+                        item["disposition"] == "quarantined"
+                        for item in preview["entries"]
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "project_migration_needs_attention",
+                                "message": (
+                                    "Some existing projects need attention before "
+                                    "account access can be set up. Repair or remove "
+                                    "them, then try again."
+                                ),
+                            },
+                        )
+                    ledger = ledger_store.migrate_inventory(
+                        projects_root,
+                        principal["id"],
+                        require_existing=False,
+                        expected_inventory=preview,
+                    )
+                if not ledger_store.matches_root(ledger, projects_root):
+                    raise ProjectMigrationConflictError(
+                        "project migration belongs to a different output root",
+                    )
+                membership_store.initialize_from_ledger(
+                    ledger,
+                    require_existing=False,
+                )
+    except HTTPException:
+        raise
+    except (ProjectMigrationConflictError, ProjectMembershipConflictError) as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Project setup no longer matches the current projects",
+        ) from error
+    except ProjectMigrationSafetyError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Projects changed while setup was running. Try again",
+        ) from error
+    except (
+        ProjectMigrationCorruptError,
+        ProjectMembershipStoreUnavailableError,
+    ) as error:
+        _raise_project_setup_unavailable(error)
+    return _account_project_access_state()
+
+
 @api.post("/api/v1/account/nonce")
 async def issue_account_nonce(request: Request):
     store = _require_account_store(request)
@@ -19191,10 +19537,22 @@ def _workspace_access_fields(status) -> dict:
 def list_workspaces_endpoint(request: Request):
     """List all workspaces and the active one."""
     remote = bool(getattr(request.state, "maestro_remote", False))
+    visible_projects = _account_project_list_identities(request)
     workspaces = []
     for item in _list_workspaces():
         if remote and item["name"] == "default":
             continue
+        project_membership = None
+        if visible_projects is not None:
+            try:
+                project_instance = _queue_recovery_existing_project_identity(
+                    item["path"],
+                )
+            except QueueRecoveryAdapterError:
+                continue
+            project_membership = visible_projects.get(project_instance)
+            if project_membership is None:
+                continue
         status = _project_access.status(
             item["name"], item["path"], request.state.maestro_session_id,
             remote,
@@ -19205,6 +19563,9 @@ def list_workspaces_endpoint(request: Request):
             "unlocked": status.unlocked and (status.protected if remote else True),
             **_workspace_access_fields(status),
         }
+        if project_membership is not None:
+            entry["project_role"] = project_membership["role"]
+            entry["project_permissions"] = project_membership["permissions"]
         # Project names form the remote sign-in directory. Counts are project
         # content and remain hidden until this browser unlocks that project.
         if not remote or entry["unlocked"]:
@@ -19221,6 +19582,10 @@ def list_workspaces_endpoint(request: Request):
             active = ""
     else:
         active = _get_active_workspace()
+        if visible_projects is not None and not any(
+            item["name"] == active for item in workspaces
+        ):
+            active = ""
     return {
         "workspaces": workspaces,
         "active": active,
@@ -19237,7 +19602,7 @@ async def set_active_workspace(request: Request):
     import re
     if name != "default" and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', name):
         raise HTTPException(status_code=400, detail="Invalid workspace name. Use letters, numbers, hyphens, underscores.")
-    _require_project_access(request, name)
+    _require_project_access(request, name, permission="project.open")
 
     if bool(getattr(request.state, "maestro_remote", False)):
         with _remote_active_projects_lock:
@@ -19279,6 +19644,18 @@ async def create_workspace(request: Request):
         raise HTTPException(status_code=400, detail="Invalid workspace name. Use letters, numbers, hyphens, underscores.")
 
     from services.win_safe_files import safe_join_under
+    project_account_state = _account_project_access_state()
+    project_account_id = None
+    project_membership_store = None
+    if project_account_state["state"] in {"active", "needs_attention"}:
+        _require_account_store(request)
+        project_account_id = _require_account_principal(request)["id"]
+        project_membership_store = _account_project_membership_store()
+        if project_membership_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Project account access is unavailable right now",
+            )
     with _workspace_creation_lock:
         base = os.path.realpath(wgp.server_config.get("save_path", "outputs"))
         existing = base if name == "default" else safe_join_under(base, name)
@@ -19293,7 +19670,7 @@ async def create_workspace(request: Request):
         ws_dir = _workspace_dir(name)
         os.makedirs(ws_dir, exist_ok=True)
         try:
-            ensure_project_instance_marker(ws_dir)
+            project_marker = ensure_project_instance_marker(ws_dir)
         except (ValueError, QueueRecoveryAdapterError) as error:
             try:
                 os.rmdir(ws_dir)
@@ -19322,6 +19699,36 @@ async def create_workspace(request: Request):
                 except OSError:
                     pass
                 raise HTTPException(status_code=400, detail=str(error)) from error
+        if project_membership_store is not None:
+            try:
+                project_membership_store.bind(
+                    project_account_id,
+                    "owner",
+                    marker=project_marker,
+                )
+            except ProjectMembershipError as error:
+                rollback_errors = []
+                try:
+                    _project_access.revoke_workspace(name)
+                except (OSError, ValueError) as rollback_error:
+                    rollback_errors.append(rollback_error)
+                from services.win_safe_files import safe_delete_dir
+                rollback = safe_delete_dir(ws_dir)
+                if not rollback["removed"]:
+                    rollback_errors.extend(rollback.get("errors") or [])
+                if rollback_errors:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "The project could not be added or fully rolled back"
+                        ),
+                    ) from error
+                if isinstance(error, ProjectMembershipConflictError):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This project could not be added to your account",
+                    ) from error
+                _raise_project_setup_unavailable(error)
 
     if remote:
         with _remote_active_projects_lock:
@@ -19357,8 +19764,17 @@ async def set_workspace_password(name: str, request: Request):
     remote = bool(getattr(request.state, "maestro_remote", False))
     # A remote password change may protect an existing project, but it must
     # never create or reserve a project name as a side effect of authorization.
+    account_project_state = _account_project_access_state()
     workspace_dir = (
-        _existing_workspace_dir(name) if remote else _workspace_dir(name)
+        _existing_workspace_dir(name)
+        if remote or account_project_state["enforced"]
+        else _workspace_dir(name)
+    )
+    _require_account_project_permission(
+        request,
+        workspace_dir,
+        "project.lifecycle",
+        state=account_project_state,
     )
     current = _require_remote_project_mutation_access(
         request, name, workspace_dir,
@@ -19394,6 +19810,11 @@ async def unlock_workspace(name: str, request: Request):
     if remote and name == "default":
         raise HTTPException(status_code=404, detail="Project not found")
     workspace_dir = _existing_workspace_dir(name)
+    _require_account_project_permission(
+        request,
+        workspace_dir,
+        "project.open",
+    )
     if remote and not _project_access.status(
         name, workspace_dir, request.state.maestro_session_id,
         remote,
@@ -19555,14 +19976,29 @@ def delete_workspace(name: str, request: Request):
             raise HTTPException(status_code=400, detail="Invalid workspace path.")
         if not os.path.isdir(ws_dir):
             raise HTTPException(status_code=404, detail=f"Workspace not found: {name}")
-        access = _require_remote_project_mutation_access(request, name, ws_dir)
-        if not access.unlocked:
-            raise HTTPException(status_code=423, detail="Project is password locked")
+        membership = _require_account_project_permission(
+            request,
+            ws_dir,
+            "project.delete",
+        )
+        if membership is None or membership["state"] == "active":
+            access = _require_remote_project_mutation_access(
+                request, name, ws_dir,
+            )
+            if not access.unlocked:
+                raise HTTPException(
+                    status_code=423,
+                    detail="Project is password locked",
+                )
 
         with _workspace_lifecycle_lock:
             if name in _workspaces_deleting:
                 raise HTTPException(status_code=409, detail="This project is being deleted")
             _workspaces_deleting.add(name)
+        deletion_operation_id = None
+        membership_store = None
+        deletion_finished = False
+        deletion_destructive = False
         try:
             with _workspace_lifecycle_lock:
                 if _workspace_operations.get(name, 0) > 0:
@@ -19582,10 +20018,41 @@ def delete_workspace(name: str, request: Request):
                     detail="A Director pipeline for this project is running or paused. Stop it before deleting the project.",
                 )
 
+            if membership is not None:
+                membership_store = _account_project_membership_store()
+                if membership_store is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Project account access is unavailable right now",
+                    )
+                try:
+                    if membership["state"] in {"deleting", "deleted"}:
+                        deleting = membership
+                    else:
+                        deleting = membership_store.begin_deletion(
+                            project_instance=membership["project_instance"],
+                            expected_revision=membership["revision"],
+                        )
+                    deletion_operation_id = deleting["deletion"]["operation_id"]
+                    deletion_finished = deleting["state"] == "deleted"
+                except ProjectMembershipNotFoundError as error:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Project not found",
+                    ) from error
+                except ProjectMembershipConflictError as error:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This project changed. Refresh and try again",
+                    ) from error
+                except ProjectMembershipError as error:
+                    _raise_project_setup_unavailable(error)
+
             # Revoke before the first destructive project mutation.  If the
             # durable grant/capability stores cannot be updated, the project
             # and its references remain intact; a crash can never leave
             # deleted bytes paired with authority that might revive on reuse.
+            deletion_destructive = True
             _project_access.revoke_workspace(name)
             _output_share_manager().revoke_workspace(name)
 
@@ -19610,8 +20077,26 @@ def delete_workspace(name: str, request: Request):
                     detail="Could not delete the project's protected reference data",
                 ) from error
 
+            # Fence the old identity before removing its directory. A crash
+            # can then resume cleanup through the still-present marker, while
+            # a completed removal can never leave an unfinished membership.
+            if (
+                membership_store is not None
+                and deletion_operation_id is not None
+                and not deletion_finished
+            ):
+                try:
+                    membership_store.finish_deletion(
+                        deletion_operation_id,
+                        project_instance=membership["project_instance"],
+                    )
+                    deletion_finished = True
+                except ProjectMembershipError as error:
+                    _raise_project_setup_unavailable(error)
+
             from services.win_safe_files import safe_delete_dir
             result = safe_delete_dir(ws_dir)
+            deletion_destructive = deletion_destructive or bool(result["removed"])
             with _remote_active_projects_lock:
                 for session_id, active_name in list(_remote_active_projects.items()):
                     if active_name == name:
@@ -19624,6 +20109,19 @@ def delete_workspace(name: str, request: Request):
                 "dir_removed": result["removed"], "switched_to_default": switched, "errors": result["errors"],
             }
         finally:
+            if (
+                membership_store is not None
+                and deletion_operation_id is not None
+                and not deletion_finished
+                and not deletion_destructive
+            ):
+                try:
+                    membership_store.cancel_deletion(
+                        deletion_operation_id,
+                        project_instance=membership["project_instance"],
+                    )
+                except ProjectMembershipError:
+                    pass
             with _workspace_lifecycle_lock:
                 _workspaces_deleting.discard(name)
 
@@ -20209,7 +20707,11 @@ async def add_project_asset_variant(project: str, asset_id: str, request: Reques
         _require_project_asset_media_access(
             project_id, workspace_id, asset_id, request.state.maestro_session_id,
         )
-        _require_project_access(request, source_workspace)
+        _require_project_access(
+            request,
+            source_workspace,
+            permission="project.read",
+        )
         outputs = []
         for raw in body.get("outputs") or []:
             if isinstance(raw, str):
@@ -23140,7 +23642,9 @@ async def generate_project_asset_references(project: str, request: Request):
         )),
     )
     workspace = project
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     asset_id = config["asset_id"]
     new_asset_request = not bool(asset_id)
 
@@ -25181,7 +25685,9 @@ async def blender_render_preview(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be an object")
     workspace = str(body.pop("workspace", "") or _get_active_workspace())
-    project_root = _require_project_access(request, workspace)
+    project_root = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     try:
         policy = output_policy_from_request(
             body,
@@ -28303,7 +28809,9 @@ async def llm_chat(request: Request):
     if _llm_chat_request_is_external(request):
         request.state.maestro_remote = True
     # Authorization happens before guide/model resolution or any download.
-    _require_project_access(request, workspace)
+    _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     image_paths = (
         _resolve_llm_chat_images(request, body, workspace)
         if "image_paths" in body else []
@@ -28451,7 +28959,9 @@ async def llm_generate(request: Request):
     body = await request.json()
     _promote_external_llm_request(request)
     workspace = _request_project_workspace(request, body.get("workspace"))
-    _require_project_access(request, workspace)
+    _require_project_access(
+        request, workspace, permission="project.generate",
+    )
 
     prompt = body.get("prompt", "")
     if not prompt:
@@ -28549,7 +29059,9 @@ async def llm_write_song(request: Request):
     if not image_paths and body.get("reference_image_path"):
         image_paths = [body["reference_image_path"]]
     workspace = _request_project_workspace(request, body.get("workspace"))
-    _require_project_access(request, workspace)
+    _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     image_paths = [
         resolved for path in image_paths
         if (resolved := _resolve_authorized_request_media(
@@ -28643,7 +29155,9 @@ async def director_preparation_start(request: Request):
             request, path, workspace,
         ))
     ]
-    project_dir = _require_project_access(request, workspace)
+    project_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     durable_request = dict(body)
     durable_request["workspace"] = workspace
     durable_request["image_paths"] = list(image_paths)
@@ -28697,7 +29211,9 @@ async def director_generate_music(request: Request):
         ))
     ]
 
-    out_dir = _require_project_access(request, workspace)
+    out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     durable_request = dict(body)
     durable_request["workspace"] = workspace
     durable_request["image_paths"] = list(image_paths)
@@ -28994,7 +29510,9 @@ async def llm_enhance_prompt(request: Request):
         raise HTTPException(status_code=400, detail="prompt is required")
 
     workspace = _request_project_workspace(request, body.get("workspace"))
-    _require_project_access(request, workspace)
+    _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     requested_image_paths = body.get("image_paths") or []
     if not requested_image_paths and body.get("image_path"):
         requested_image_paths = [body["image_path"]]
@@ -29361,7 +29879,9 @@ async def llm_describe_image(request: Request):
     if not image_path:
         raise HTTPException(status_code=400, detail="image_path is required")
     workspace = _request_project_workspace(request, body.get("workspace"))
-    _require_project_access(request, workspace)
+    _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     image_path = _resolve_authorized_request_media(
         request,
         image_path,
@@ -29673,7 +30193,9 @@ async def mix_audio(request: Request):
         raise HTTPException(status_code=400, detail="At least 2 tracks required (base + overlay)")
 
     workspace = body.get("workspace") or _get_active_workspace()
-    out_dir = _require_project_access(request, workspace)
+    out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     source_policies = []
     for i, t in enumerate(tracks):
         path = t.get("path", "")
@@ -30096,7 +30618,9 @@ async def director_plan_prompts(request: Request):
     body = await request.json()
     _promote_external_llm_request(request)
     workspace = _request_project_workspace(request, body.get("workspace"))
-    _require_project_access(request, workspace)
+    _require_project_access(
+        request, workspace, permission="project.generate",
+    )
 
     clips = body.get("clips")
     style_prompt = body.get("style_prompt", "")
@@ -30141,7 +30665,9 @@ async def director_plan_angle_prompts(request: Request):
     body = await request.json()
     _promote_external_llm_request(request)
     workspace = _request_project_workspace(request, body.get("workspace"))
-    _require_project_access(request, workspace)
+    _require_project_access(
+        request, workspace, permission="project.generate",
+    )
 
     style_prompt = body.get("style_prompt", "")
     if not style_prompt:
@@ -30189,7 +30715,9 @@ async def plan_audio_structure(request: Request):
         )
         analysis = preparation.get("analysis")
         director_project_dir = _require_project_access(
-            request, str(preparation.get("workspace") or "default"),
+            request,
+            str(preparation.get("workspace") or "default"),
+            permission="project.generate",
         )
     if not analysis:
         raise HTTPException(status_code=400, detail="analysis is required")
@@ -30268,11 +30796,15 @@ async def director_classify_sections(request: Request):
         )
         analysis = preparation.get("analysis")
         director_project_dir = _require_project_access(
-            request, str(preparation.get("workspace") or "default"),
+            request,
+            str(preparation.get("workspace") or "default"),
+            permission="project.generate",
         )
     else:
         workspace = _request_project_workspace(request, body.get("workspace"))
-        director_project_dir = _require_project_access(request, workspace)
+        director_project_dir = _require_project_access(
+            request, workspace, permission="project.generate",
+        )
     if not analysis:
         raise HTTPException(status_code=400, detail="analysis is required")
 
@@ -32140,7 +32672,9 @@ async def preview_generation_plan(request: Request):
     submitted = await request.json()
     body = copy.deepcopy(submitted)
     workspace = body.pop("workspace", None) or _get_active_workspace()
-    _require_project_access(request, workspace)
+    _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     _reject_client_h3_internal_state(body)
     _reject_client_h3_turbo_validation_controls(body)
     _authorize_generation_media_inputs(request, body, workspace)
@@ -34236,7 +34770,9 @@ async def generate(request: Request):
             status_code=400,
             detail="enhance_before_generate must be a boolean",
         )
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     is_sfx = body.get("sfx_mode")
     _reject_client_director_image_role_internals(body)
     director_role_mode = _director_image_role_wire_mode(body) == "roles"
@@ -34594,7 +35130,9 @@ async def retake_video_endpoint(request: Request):
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     video_path = _resolve_authorized_request_media(request, video_path, workspace)
     if not video_path:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -35065,7 +35603,9 @@ async def edit_anything_endpoint(request: Request):
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     video_path = _resolve_authorized_request_media(request, video_path, workspace)
     if not video_path:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -40586,7 +41126,9 @@ async def repaint_endpoint(request: Request):
     """
     body = await request.json()
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     original_video_path = _resolve_recast_media(
         request,
         body.get("video_path"),
@@ -41529,7 +42071,9 @@ async def recast_endpoint(request: Request):
     """
     body = await request.json()
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
 
     video_path = _resolve_recast_media(request, body.get("video_path"), workspace)
     if not video_path:
@@ -43470,7 +44014,9 @@ async def outpaint_endpoint(request: Request):
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     video_path = _resolve_authorized_request_media(request, video_path, workspace)
     if not video_path:
         raise HTTPException(status_code=404, detail="Source file not found")
@@ -44032,7 +44578,9 @@ async def blend_endpoint(request: Request):
         raise HTTPException(status_code=400, detail="Both clip_a_path and clip_b_path are required")
 
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     clip_a_path = _resolve_authorized_request_media(
         request, clip_a_path, workspace,
     )
@@ -44845,7 +45393,9 @@ async def inpaint_endpoint(request: Request):
         raise HTTPException(status_code=400, detail="model_type is required")
 
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     video_path = _resolve_authorized_request_media(request, video_path, workspace)
     if not video_path:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -48648,7 +49198,9 @@ async def tools_upscale(request: Request):
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     resolved = _resolve_authorized_request_media(request, video_path, workspace)
     if not resolved:
         raise HTTPException(status_code=400, detail=f"Clip not found: {video_path}")
@@ -48693,7 +49245,9 @@ async def tools_revoice(request: Request):
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
     workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(request, workspace)
+    job_out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
     resolved = _resolve_authorized_request_media(request, video_path, workspace)
     if not resolved:
         raise HTTPException(status_code=400, detail=f"Clip not found: {video_path}")
@@ -54034,16 +54588,27 @@ def _recovered_job_remote_project_accessible(
     request: Request,
 ) -> bool:
     """Bind recovered remote reads/actions to the unlocked project instance."""
-    if not bool(getattr(request.state, "maestro_remote", False)):
-        return True
     workspace = str(job.get("workspace") or "default")
     session_id = str(getattr(request.state, "maestro_session_id", "") or "")
+    remote = bool(getattr(request.state, "maestro_remote", False))
+    if not remote and not _accounts_enabled():
+        return True
+    try:
+        project_dir = _existing_workspace_dir(workspace)
+        _require_account_project_permission(
+            request,
+            project_dir,
+            "project.read",
+        )
+    except (HTTPException, QueueRecoveryAdapterError, OSError, ValueError):
+        return False
+    if not remote:
+        return True
     with _remote_active_projects_lock:
         active_workspace = _remote_active_projects.get(session_id, "")
     if active_workspace != workspace:
         return False
     try:
-        project_dir = _existing_workspace_dir(workspace)
         access = _project_access.status(
             workspace, project_dir, session_id, True,
         )
@@ -54086,9 +54651,11 @@ def _job_owned_by_request(job: dict | None, request: Request) -> bool:
         )
     if owner == request.state.maestro_session_id:
         return _recovered_job_remote_project_accessible(job, request)
-    return owner is None and not bool(
+    if owner is None and not bool(
         getattr(request.state, "maestro_remote", False)
-    )
+    ):
+        return _recovered_job_remote_project_accessible(job, request)
+    return False
 
 
 def _queue_recovery_reason_code(job: dict) -> str | None:
@@ -54650,6 +55217,11 @@ def _require_owned_job_project(
         raise HTTPException(status_code=404, detail="Job not found")
     try:
         out_dir = _existing_workspace_dir(expected)
+        _require_account_project_permission(
+            request,
+            out_dir,
+            "project.read",
+        )
         remote = bool(getattr(request.state, "maestro_remote", False))
         access = _project_access.status(
             expected,
@@ -55487,6 +56059,11 @@ def _require_h3_delivery_recovery_job(
         # Recovery must never create a missing local project as a side effect
         # of an authorization probe. All access denials share one opaque shape.
         out_dir = _existing_workspace_dir(expected_workspace)
+        _require_account_project_permission(
+            request,
+            out_dir,
+            "project.read",
+        )
         remote = bool(getattr(request.state, "maestro_remote", False))
         status = _project_access.status(
             expected_workspace, out_dir, request.state.maestro_session_id,
@@ -55665,6 +56242,11 @@ def _require_remote_queue_project(request: Request) -> None:
 
     try:
         workspace_dir = _existing_workspace_dir(project)
+        _require_account_project_permission(
+            request,
+            workspace_dir,
+            "project.list",
+        )
         access = _project_access.status(
             project, workspace_dir, session_id, True,
         )
@@ -55672,6 +56254,8 @@ def _require_remote_queue_project(request: Request) -> None:
         with _remote_active_projects_lock:
             if _remote_active_projects.get(session_id) == project:
                 _remote_active_projects.pop(session_id, None)
+        if error.status_code in {404, 503}:
+            raise
         raise HTTPException(
             status_code=423,
             detail="Select and unlock a protected project before viewing the queue",
@@ -55908,7 +56492,9 @@ def _resume_recovered_job(
                 ),
             )
         workspace = str(job.get("workspace") or "default")
-        _require_project_access(request, workspace)
+        _require_project_access(
+            request, workspace, permission="project.generate",
+        )
         request_owner = owner_principal_digest(
             _session_secret(), request.state.maestro_session_id,
         )
@@ -56959,7 +57545,9 @@ def list_favorites(request: Request, workspace: str = ""):
     if workspace == "__uploads__":
         return {"favorites": []}
     selected_workspace = _request_project_workspace(request, workspace)
-    out_dir = _require_project_access(request, selected_workspace)
+    out_dir = _require_project_access(
+        request, selected_workspace, permission="project.read",
+    )
     sidecars = load_media_sidecars(out_dir)
     visible = [
         name for name in _load_favorites(selected_workspace)
@@ -57130,7 +57718,9 @@ def list_outputs(
         selected_workspace = "__uploads__"
     else:
         selected_workspace = _request_project_workspace(request, workspace)
-        out_dir = _require_project_access(request, selected_workspace)
+        out_dir = _require_project_access(
+            request, selected_workspace, permission="project.read",
+        )
     if not os.path.isdir(out_dir):
         return {"outputs": [], "total": 0}
 
@@ -57749,7 +58339,9 @@ def rejoin_clips(request: Request, body: dict):
         raise HTTPException(status_code=400, detail="group_id is required")
 
     selected_workspace = _request_project_workspace(request, body.get("workspace"))
-    out_dir = _require_project_access(request, selected_workspace)
+    out_dir = _require_project_access(
+        request, selected_workspace, permission="project.generate",
+    )
     # Scan all sidecar files to find clips belonging to this group
     clips_by_index: dict[int, dict] = {}
     audio_path = None
@@ -57832,7 +58424,9 @@ def rejoin_clips(request: Request, body: dict):
     with _reserve_workspace_operations(selected_workspace):
         # Recheck after reservation: deletion may have won while the source
         # plan was being assembled, but cannot race publication from here.
-        out_dir = _require_project_access(request, selected_workspace)
+        out_dir = _require_project_access(
+            request, selected_workspace, permission="project.generate",
+        )
         if any(not os.path.isfile(path) for path in clip_paths):
             raise HTTPException(status_code=409, detail="Source clips changed before rejoin")
 

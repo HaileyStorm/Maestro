@@ -14,6 +14,44 @@ function safeStr(val: unknown): string {
   return String(val)
 }
 
+function pipelineTypeCopy(type: string): string {
+  return ({
+    music_video: 'Music video',
+    short_film_audio: 'Audio-led short film',
+    short_film_story: 'Story short film',
+  } as Record<string, string>)[type] || 'Director production'
+}
+
+function pipelineStatusCopy(status: string): string {
+  return ({
+    queued: 'Waiting to start',
+    planning: 'Planning',
+    running: 'In progress',
+    generating_images: 'Creating images',
+    generating_video: 'Creating video',
+    joining: 'Joining clips',
+    retrying: 'Trying again',
+    paused: 'Paused',
+    interrupted: 'Paused unexpectedly',
+    completed: 'Complete',
+    failed: 'Needs attention',
+    crashed: 'Stopped unexpectedly',
+    cancelled: 'Stopped',
+  } as Record<string, string>)[status] || 'Status unavailable'
+}
+
+function repairStatusCopy(status: string): string {
+  return ({
+    queued: 'Fixes waiting to start',
+    running: 'Fixing saved output',
+    cancelling: 'Stopping fixes',
+    completed: 'Fixes complete',
+    failed: 'Fixes need attention',
+    cancelled: 'Fixes stopped',
+    interrupted: 'Fixes paused unexpectedly',
+  } as Record<string, string>)[status] || 'Fix status unavailable'
+}
+
 /** Error boundary to prevent dashboard crash from bad data */
 class DashboardErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
   state = { error: null as string | null }
@@ -336,17 +374,17 @@ function ClipCard({ clip, pipeline, busy = false, onTag, onRerunImage, onRerunVi
           )}
         </div>
 
-        {/* Prompt polish diff */}
+        {/* Prompt refinement comparison */}
         {hasPolish && (
           <div>
             <button onClick={() => setShowPolish(!showPolish)}
               className="flex items-center gap-1 text-[9px] text-accent-blue hover:underline">
               <Sparkles size={8} />
-              {showPolish ? 'Hide' : 'Show'} prompt polish diff
+              {showPolish ? 'Hide' : 'Show'} prompt refinements
             </button>
             {showPolish && (() => {
-              // Compute change flags so the "no changes from polish"
-              // message only shows when literally nothing was modified
+              // Compute change flags so the unchanged message only shows
+              // when literally nothing was modified
               // by Pass 3 (across image, video, all windows, all keyframes).
               const imageChanged = !!(clip.image_prompt_pre_polish && clip.image_prompt_pre_polish !== clip.image_prompt)
               const videoChanged = !!(clip.video_prompt_pre_polish && clip.video_prompt_pre_polish !== clip.video_prompt)
@@ -365,38 +403,38 @@ function ClipCard({ clip, pipeline, busy = false, onTag, onRerunImage, onRerunVi
                 <div className="mt-1 space-y-1.5 bg-bg-tertiary rounded p-2">
                   {imageChanged && (
                     <div>
-                      <div className="text-[8px] text-text-muted uppercase">Image — Before Polish</div>
+                      <div className="text-[8px] text-text-muted uppercase">Image — Original</div>
                       <p className="text-[9px] text-red-400/70 line-through">{clip.image_prompt_pre_polish}</p>
-                      <div className="text-[8px] text-text-muted uppercase mt-0.5">After</div>
+                      <div className="text-[8px] text-text-muted uppercase mt-0.5">Refined</div>
                       <p className="text-[9px] text-indicator-success/80">{clip.image_prompt}</p>
                     </div>
                   )}
                   {videoChanged && (
                     <div>
-                      <div className="text-[8px] text-text-muted uppercase">Video — Before Polish</div>
+                      <div className="text-[8px] text-text-muted uppercase">Video — Original</div>
                       <p className="text-[9px] text-red-400/70 line-through">{clip.video_prompt_pre_polish}</p>
-                      <div className="text-[8px] text-text-muted uppercase mt-0.5">After</div>
+                      <div className="text-[8px] text-text-muted uppercase mt-0.5">Refined</div>
                       <p className="text-[9px] text-indicator-success/80">{clip.video_prompt}</p>
                     </div>
                   )}
                   {windowDiffs.map(({ pre, post, i }) => (
                     <div key={`wp${i}`}>
-                      <div className="text-[8px] text-text-muted uppercase">Window {i + 1} — Before Polish</div>
+                      <div className="text-[8px] text-text-muted uppercase">Window {i + 1} — Original</div>
                       <p className="text-[9px] text-red-400/70 line-through">{pre}</p>
-                      <div className="text-[8px] text-text-muted uppercase mt-0.5">After</div>
+                      <div className="text-[8px] text-text-muted uppercase mt-0.5">Refined</div>
                       <p className="text-[9px] text-indicator-success/80">{post}</p>
                     </div>
                   ))}
                   {keyframeDiffs.map(({ pre, post, i }) => (
                     <div key={`kf${i}`}>
-                      <div className="text-[8px] text-text-muted uppercase">Keyframe {i + 1} — Before Polish</div>
+                      <div className="text-[8px] text-text-muted uppercase">Keyframe {i + 1} — Original</div>
                       <p className="text-[9px] text-red-400/70 line-through">{pre}</p>
-                      <div className="text-[8px] text-text-muted uppercase mt-0.5">After</div>
+                      <div className="text-[8px] text-text-muted uppercase mt-0.5">Refined</div>
                       <p className="text-[9px] text-indicator-success/80">{post}</p>
                     </div>
                   ))}
                   {!anyChange && (
-                    <p className="text-[9px] text-text-muted italic">No changes from polish</p>
+                    <p className="text-[9px] text-text-muted italic">No prompt refinements were needed</p>
                   )}
                 </div>
               )
@@ -588,8 +626,8 @@ function DirectorDashboardInner() {
           <option value="">Select pipeline...</option>
           {pipelineList.map(p => (
             <option key={p.id} value={p.id}>
-              {p.repair_status ? `[repair: ${p.repair_status}] ` : ''}
-              {formatDate(p.created_at)} — {p.pipeline_type} ({p.clip_count} clips) [{p.status}]
+              {p.repair_status ? `${repairStatusCopy(p.repair_status)} · ` : ''}
+              {formatDate(p.created_at)} — {pipelineTypeCopy(p.pipeline_type)} ({p.clip_count} clips) · {pipelineStatusCopy(p.status)}
               {p.scene_description ? ` — ${p.scene_description}` : ''}
             </option>
           ))}
@@ -641,10 +679,10 @@ function DirectorDashboardInner() {
               <>
                 <span
                   className="flex items-center gap-1 px-2 py-1 text-[10px] bg-orange-500/10 border border-orange-500/30 rounded text-chip-orange"
-                  title={repair?.message || 'Repair running'}
+                  title={repairStatusCopy(repair?.status || '')}
                 >
                   <Loader2 size={10} className="animate-spin" />
-                  {repair?.message || 'Repairing'}
+                  {repairStatusCopy(repair?.status || '')}
                   {repair && repair.total > 0 ? ` (${repair.current}/${repair.total})` : ''}
                 </span>
                 <button
@@ -801,14 +839,21 @@ function DirectorDashboardInner() {
                   selectedPipeline.status === 'failed' || selectedPipeline.status === 'crashed' ? 'bg-red-500/20 text-chip-red' :
                   'bg-blue-500/20 text-chip-blue'
                 }`}>
-                  {selectedPipeline.status === 'crashed' ? 'crashed (process died)' : selectedPipeline.status}
+                  {pipelineStatusCopy(selectedPipeline.status)}
                 </span>
-                <span className="text-text-muted">{selectedPipeline.pipeline_type}</span>
+                <span className="text-text-muted">{pipelineTypeCopy(selectedPipeline.pipeline_type)}</span>
                 <span className="text-text-muted">|</span>
                 <span className="text-text-muted">{selectedPipeline.image_model}</span>
                 <span className="text-text-muted">+</span>
                 <span className="text-text-muted">{selectedPipeline.video_model}</span>
               </div>
+              <details className="text-[9px] text-text-muted">
+                <summary className="cursor-pointer text-text-secondary">Technical details</summary>
+                <p>Reported type: {selectedPipeline.pipeline_type}</p>
+                <p>Reported status: {selectedPipeline.status}</p>
+                {repair?.status && <p>Reported fix state: {repair.status}</p>}
+                {repair?.message && <p>Fix note: {repair.message}</p>}
+              </details>
               {selectedPipeline.scene_description && (
                 <p className="text-[11px] text-text-secondary">{selectedPipeline.scene_description}</p>
               )}

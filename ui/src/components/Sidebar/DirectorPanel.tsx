@@ -4,6 +4,16 @@ import { useStore } from '../../stores/useStore'
 const AUDIO_ACCEPT = '.wav,.mp3,.flac,.ogg,.m4a'
 const IMAGE_ACCEPT = '.png,.jpg,.jpeg,.webp,.bmp'
 
+function imageStatusCopy(status: string): string {
+  return ({
+    generating: 'Creating image',
+    polling: 'Waiting for image',
+    downloading: 'Saving image',
+    done: 'Image ready',
+    error: 'Image needs attention',
+  } as Record<string, string>)[status] || 'Image status unavailable'
+}
+
 function formatTime(s: number): string {
   const m = Math.floor(s / 60)
   const sec = Math.floor(s % 60)
@@ -636,9 +646,13 @@ export function DirectorPanel() {
                 </span>
                 <span className="text-text-muted">
                   {imageGenProgress.currentClipLabel}
-                  {imageGenProgress.status !== 'done' && ` — ${imageGenProgress.status}`}
+                  {imageGenProgress.status !== 'done' && ` — ${imageStatusCopy(imageGenProgress.status)}`}
                 </span>
               </div>
+              <details className="text-[9px] text-text-muted">
+                <summary className="cursor-pointer text-text-secondary">Technical details</summary>
+                <span>Reported state: {imageGenProgress.status}</span>
+              </details>
               <div className="w-full bg-bg-tertiary rounded-full h-1.5">
                 <div
                   className="bg-accent-blue h-1.5 rounded-full transition-all"

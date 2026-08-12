@@ -32,11 +32,78 @@ function resolveAccountSupportTrigger(document: Document, fallback: HTMLElement 
   return replacement && replacement.isConnected !== false ? replacement : null
 }
 
-function accountErrorMessage(error: unknown): string {
-  if (error instanceof AccountApiError && error.retryAfter > 0) {
-    return `${error.message} Try again in about ${error.retryAfter} seconds.`
+const accountErrorMessages: Record<string, string> = {
+  account_store_unavailable: 'Account access is temporarily unavailable.',
+  account_store_capacity: 'Account storage is full. Free some disk space, then try again.',
+  authentication_required: 'Sign in to continue.',
+  invalid_credentials: 'The username or password was not accepted.',
+  invalid_recovery: 'The recovery information was not accepted.',
+  owner_required: 'An owner account must confirm this change.',
+  reauth_required: 'Confirm your password before making this change.',
+  rate_limited: 'Too many account attempts were made.',
+  bootstrap_complete: 'The first owner account already exists. Refresh account status, then sign in.',
+  invalid_nonce: 'This account form expired. Try the action again.',
+  account_not_found: 'That account is no longer available.',
+  session_not_found: 'That account session is no longer active.',
+  invalid_username: 'Check the username and try again.',
+  invalid_email: 'Check the optional email address and try again.',
+  invalid_device_label: 'Check the device name and try again.',
+  invalid_password: 'Check the password requirements and try again.',
+  username_unavailable: 'That username is unavailable.',
+  self_disable_rejected: 'The active owner account cannot disable itself.',
+  project_migration_unavailable: 'Project setup is available only to a recently confirmed owner using Maestro directly on this computer.',
+}
+
+// Exported for deterministic copy-safety regression coverage.
+// eslint-disable-next-line react-refresh/only-export-components
+export function safeAccountErrorMessage(code: string, retryAfter = 0): string {
+  const message = accountErrorMessages[code] || 'The account request could not be completed.'
+  return retryAfter > 0
+    ? `${message} Try again in about ${retryAfter} seconds.`
+    : message
+}
+
+// Exported so status-specific fallback copy is exercised without rendering the drawer.
+// eslint-disable-next-line react-refresh/only-export-components
+export function safeAccountHttpErrorMessage(
+  status: number,
+  code = 'account_request_failed',
+  retryAfter = 0,
+  context: 'account' | 'project-migration' = 'account',
+): string {
+  if (context === 'project-migration' && code === 'project_migration_needs_attention') {
+    const message = 'Some existing project folders need attention. Fix or remove them on this computer, then retry. Account-based project filtering remains off, and existing project access stays unchanged.'
+    return retryAfter > 0 ? `${message} Try again in about ${retryAfter} seconds.` : message
   }
-  return error instanceof Error ? error.message : 'The account request could not be completed.'
+  if (code !== 'account_request_failed') return safeAccountErrorMessage(code, retryAfter)
+  if (context !== 'project-migration') return safeAccountErrorMessage(code, retryAfter)
+  const message = status === 404
+    ? 'Project setup is not available on this Maestro host.'
+    : status === 423
+      ? 'Unlock the project in this browser, then try again.'
+      : status === 503
+        ? 'Project access is temporarily unavailable. Try again after Maestro is ready.'
+        : status === 409
+          ? 'Wait for current project activity to finish, then try again.'
+          : status === 403
+            ? 'Confirm the owner password and open Maestro directly on this computer, then try again.'
+            : safeAccountErrorMessage(code)
+  return retryAfter > 0 ? `${message} Try again in about ${retryAfter} seconds.` : message
+}
+
+function accountErrorMessage(error: unknown): string {
+  if (!(error instanceof AccountApiError)) return 'The account request could not be completed.'
+  return safeAccountHttpErrorMessage(error.status, error.code, error.retryAfter)
+}
+
+function projectMigrationErrorMessage(error: unknown): string {
+  if (!(error instanceof AccountApiError)) return 'Existing project setup could not be refreshed.'
+  return safeAccountHttpErrorMessage(
+    error.status,
+    error.code,
+    error.retryAfter,
+    'project-migration',
+  )
 }
 
 function formatTime(timestamp: number): string {
@@ -44,6 +111,12 @@ function formatTime(timestamp: number): string {
     dateStyle: 'medium',
     timeStyle: 'short',
   })
+}
+
+function directLoopbackBrowser(): boolean {
+  if (typeof window === 'undefined') return false
+  const hostname = window.location.hostname.trim().toLowerCase().replace(/^\[|\]$/g, '')
+  return hostname === 'localhost' || hostname === '::1' || /^127(?:\.\d{1,3}){3}$/.test(hostname)
 }
 
 function Field({
@@ -154,14 +227,20 @@ export function AccountSupportDrawer() {
   const restoreFocusRef = useRef<HTMLElement | null>(null)
   const focusReturnRef = useRef<HTMLSpanElement>(null)
   const lifecycleRef = useRef(createAccountDrawerLifecycle())
+  const accountIdentityRef = useRef<string | null>(null)
   const open = useStore(state => state.accountDrawerOpen)
   const setOpen = useStore(state => state.setAccountDrawerOpen)
   const context = useStore(state => state.accountContext)
+  const accessContext = useStore(state => state.accessContext)
   const contextLoading = useStore(state => state.accountContextLoading)
+  const projectMigration = useStore(state => state.accountProjectMigration)
+  const projectMigrationLoading = useStore(state => state.accountProjectMigrationLoading)
   const sessions = useStore(state => state.accountSessions)
   const users = useStore(state => state.accountUsers)
   const detailsLoading = useStore(state => state.accountDetailsLoading)
   const loadContext = useStore(state => state.loadAccountContext)
+  const loadProjectMigration = useStore(state => state.loadAccountProjectMigration)
+  const migrateProjects = useStore(state => state.migrateAccountProjects)
   const bootstrap = useStore(state => state.bootstrapAccount)
   const login = useStore(state => state.loginAccount)
   const logout = useStore(state => state.logoutAccount)
@@ -191,6 +270,21 @@ export function AccountSupportDrawer() {
   const [managedPassword, setManagedPassword] = useState('')
   const [managedEmail, setManagedEmail] = useState('')
   const [activeTab, setActiveTab] = useState<AccountSupportTab>('support')
+  const accountsEnabled = context?.enabled === true
+  const authenticated = accountsEnabled && context.authenticated && context.account !== null
+  const accountIdentity = context?.authenticated === true && context.account
+    ? context.account.id
+    : ''
+  const selfService = authenticated && context.capabilities.includes('account.self')
+  const accountAdmin = authenticated
+    && context.capabilities.includes('accounts.admin')
+    && context.capabilities.includes('services.admin')
+  const migrationOwner = authenticated
+    && context.account!.role === 'owner'
+    && context.capabilities.includes('owner.admin')
+  const directLoopback = accessContext?.remote === false
+    && directLoopbackBrowser()
+  const migrationAvailable = migrationOwner && context.reauthenticated && directLoopback
 
   const clearSensitive = useCallback(() => {
     setPassword('')
@@ -244,6 +338,7 @@ export function AccountSupportDrawer() {
   const run = useCallback(async (
     name: string,
     action: (isCurrent: () => boolean) => Promise<void>,
+    errorMessage: (error: unknown) => string = accountErrorMessage,
   ) => {
     if (busy) return
     const isCurrent = lifecycleRef.current.operationLease()
@@ -252,7 +347,7 @@ export function AccountSupportDrawer() {
     try {
       await action(isCurrent)
     } catch (error) {
-      if (isCurrent()) setNotice({ kind: 'error', text: accountErrorMessage(error) })
+      if (isCurrent()) setNotice({ kind: 'error', text: errorMessage(error) })
     } finally {
       if (isCurrent()) setBusy('')
     }
@@ -303,6 +398,23 @@ export function AccountSupportDrawer() {
   }, [activeTab, clearSensitive, context?.enabled])
 
   useEffect(() => {
+    const previousIdentity = accountIdentityRef.current
+    accountIdentityRef.current = accountIdentity
+    if (previousIdentity === null || previousIdentity === accountIdentity) return
+    clearSensitive()
+    setBusy('')
+    setNotice(null)
+  }, [accountIdentity, clearSensitive])
+
+  useEffect(() => {
+    if (!open || activeTab !== 'account' || !migrationAvailable) return
+    const isCurrent = lifecycleRef.current.operationLease()
+    void loadProjectMigration().catch(error => {
+      if (isCurrent()) setNotice({ kind: 'error', text: projectMigrationErrorMessage(error) })
+    })
+  }, [activeTab, loadProjectMigration, migrationAvailable, open])
+
+  useEffect(() => {
     if (!open || !dialogRef.current || !closeRef.current) return
     const nativeControls = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
       'input:not([disabled]), select:not([disabled]), textarea:not([disabled])',
@@ -334,12 +446,6 @@ export function AccountSupportDrawer() {
   )
 
   if (!open) return focusReturnTarget
-  const accountsEnabled = context?.enabled === true
-  const authenticated = accountsEnabled && context.authenticated && context.account !== null
-  const selfService = authenticated && context.capabilities.includes('account.self')
-  const accountAdmin = authenticated
-    && context.capabilities.includes('accounts.admin')
-    && context.capabilities.includes('services.admin')
 
   return <>
     {focusReturnTarget}
@@ -373,7 +479,9 @@ export function AccountSupportDrawer() {
               {accountsEnabled ? 'Support & account' : 'Support'}
             </h2>
             <p id={descriptionId} className="mt-0.5 text-[10px] leading-relaxed text-text-muted">
-              Optional support and account controls. Project access stays separate from this account.
+              {accountsEnabled
+                ? 'Support Maestro or manage your account. Existing project access may also depend on this browser or a project password.'
+                : 'View optional ways to support Maestro. Support does not change access or available controls.'}
             </p>
           </div>
           <button
@@ -470,7 +578,7 @@ export function AccountSupportDrawer() {
                     event.preventDefault()
                     void run('bootstrap', async isCurrent => {
                       const result = await bootstrap({ username, password, email, deviceLabel })
-                      if (!isCurrent()) return
+                      if (!isCurrent() || !result) return
                       setPassword('')
                       setEmail('')
                       setOneTimeCodes(result.recovery_codes || [])
@@ -484,7 +592,7 @@ export function AccountSupportDrawer() {
                     <h3 className="text-xs font-semibold text-text-primary">Create the first owner account</h3>
                   </div>
                   <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
-                    This setup is available only because the server explicitly offered local bootstrap.
+                    For security, create the first owner account by opening Maestro directly on the computer where it is running.
                   </p>
                   <div className="mt-3 grid gap-3 sm:grid-cols-2">
                     <Field label="Username" value={username} onChange={setUsername} autoComplete="username" required />
@@ -546,7 +654,7 @@ export function AccountSupportDrawer() {
                     event.preventDefault()
                     void run('recover', async isCurrent => {
                       const result = await recover({ username, recoveryCode, newPassword, deviceLabel })
-                      if (!isCurrent()) return
+                      if (!isCurrent() || !result) return
                       setRecoveryCode('')
                       setNewPassword('')
                       setOneTimeCodes(result.recovery_codes || [])
@@ -591,9 +699,78 @@ export function AccountSupportDrawer() {
                   </span>
                 </div>
                 <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
-                  This account cookie does not replace or mutate the browser session that owns projects, uploads, jobs, or outputs.
+                  Signing in identifies your account. Access to existing projects may still depend on this browser or a project password.
                 </p>
               </section>
+
+              {migrationOwner && (
+                <section className="rounded-xl border border-border bg-bg-tertiary/20 p-3" aria-label="Existing project account setup">
+                  <div className="flex items-center gap-2">
+                    <ShieldCheck size={14} className="text-accent-blue" aria-hidden="true" />
+                    <h3 className="flex-1 text-xs font-semibold text-text-primary">Connect existing projects</h3>
+                    {migrationAvailable && (
+                      <button
+                        type="button"
+                        onClick={() => void run(
+                          'refresh-project-setup',
+                          async () => { await loadProjectMigration() },
+                          projectMigrationErrorMessage,
+                        )}
+                        disabled={Boolean(busy) || projectMigrationLoading}
+                        aria-label="Refresh existing project setup"
+                        className="rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary disabled:opacity-50"
+                      >
+                        <RefreshCw size={13} className={projectMigrationLoading ? 'animate-spin' : ''} />
+                      </button>
+                    )}
+                  </div>
+                  {!directLoopback ? (
+                    <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+                      To connect projects safely, open Maestro directly on the computer where it is running, then confirm the owner password.
+                    </p>
+                  ) : !context.reauthenticated ? (
+                    <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+                      Confirm the owner password above before connecting existing projects.
+                    </p>
+                  ) : projectMigrationLoading && !projectMigration ? (
+                    <p className="mt-2 text-[10px] text-text-muted">Checking existing project access…</p>
+                  ) : projectMigration?.state === 'not_started' ? (
+                    <>
+                      <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+                        Existing projects are not connected to this owner account yet. Maestro will not make this change automatically.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void run('migrate-projects', async isCurrent => {
+                          const status = await migrateProjects()
+                          if (!isCurrent() || !status) return
+                          if (status.needs_attention > 0) return
+                          setNotice({
+                            kind: 'success',
+                            text: `Project access is ready for ${status.project_count} project${status.project_count === 1 ? '' : 's'}.`,
+                          })
+                        }, projectMigrationErrorMessage)}
+                        disabled={Boolean(busy) || projectMigrationLoading}
+                        className="mt-3 w-full rounded-lg bg-accent-blue px-3 py-2 text-xs font-semibold text-white hover:bg-accent-blue-hover disabled:opacity-50"
+                      >
+                        {busy === 'migrate-projects' ? 'Connecting projects…' : 'Connect existing projects to this owner'}
+                      </button>
+                    </>
+                  ) : projectMigration?.state === 'needs_attention' ? (
+                    <p className="mt-2 text-[10px] leading-relaxed text-indicator-warning">
+                      Account-based project filtering is not enabled yet. {projectMigration.needs_attention} existing project folder{projectMigration.needs_attention === 1 ? '' : 's'} need attention. Fix or remove {projectMigration.needs_attention === 1 ? 'it' : 'them'} on this computer, then retry. Existing browser and project-password access stays unchanged.
+                    </p>
+                  ) : projectMigration?.state === 'active' ? (
+                    <p className="mt-2 text-[10px] leading-relaxed text-indicator-success">
+                      Project access is ready for {projectMigration.project_count} project{projectMigration.project_count === 1 ? '' : 's'}.
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+                      Existing project setup is unavailable. Refresh when Maestro is ready.
+                    </p>
+                  )}
+                </section>
+              )}
 
               {selfService && !context.reauthenticated && (
                 <form
@@ -611,7 +788,7 @@ export function AccountSupportDrawer() {
                   }}
                 >
                   <h3 className="text-xs font-semibold text-text-primary">Confirm your password</h3>
-                  <p className="mt-1 text-[10px] text-text-muted">Required before password, recovery-code, all-session, and owner-administration changes.</p>
+                  <p className="mt-1 text-[10px] text-text-muted">Confirm before changing passwords or recovery codes, signing out other account sessions, or managing users.</p>
                   <div className="mt-3">
                     <Field label="Current password" value={reauthPassword} onChange={setReauthPassword} type="password" autoComplete="current-password" required />
                   </div>
@@ -624,12 +801,12 @@ export function AccountSupportDrawer() {
               {selfService && (
                 <section className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
                   <div className="flex items-center gap-2">
-                    <h3 className="flex-1 text-xs font-semibold text-text-primary">Active sessions</h3>
+                    <h3 className="flex-1 text-xs font-semibold text-text-primary">Account sessions</h3>
                     <button
                       type="button"
                       onClick={() => void run('refresh-sessions', async () => { await loadSessions() })}
                       disabled={Boolean(busy)}
-                      aria-label="Refresh active sessions"
+                      aria-label="Refresh account sessions"
                       className="rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary disabled:opacity-50"
                     >
                       <RefreshCw size={13} className={busy === 'refresh-sessions' ? 'animate-spin' : ''} />
@@ -640,10 +817,10 @@ export function AccountSupportDrawer() {
                       <div key={session.id} className="flex items-start gap-2 rounded-lg border border-border/80 bg-bg-primary/40 p-2.5">
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-[10px] font-semibold text-text-primary">
-                            {session.device_label}{session.current ? ' · Current' : ''}
+                            {session.device_label}{session.current ? ' · Current account session' : ''}
                           </p>
                           <p className="mt-0.5 text-[9px] leading-relaxed text-text-muted">
-                            {session.remote_created ? 'Remote' : 'Local/LAN'} · Last seen {formatTime(session.last_seen_at)} · Expires {formatTime(session.expires_at)}
+                            {session.remote_created ? 'Remote sign-in' : 'Direct or local-network sign-in'} · Last used {formatTime(session.last_seen_at)} · Account sign-in expires {formatTime(session.expires_at)}
                           </p>
                         </div>
                         <button
@@ -651,16 +828,16 @@ export function AccountSupportDrawer() {
                           onClick={() => void run(`revoke-${session.id}`, async isCurrent => {
                             const current = await revokeSession(session.id)
                             if (!isCurrent()) return
-                            setNotice({ kind: 'success', text: current ? 'Signed out of this session.' : 'Session revoked.' })
+                            setNotice({ kind: 'success', text: current ? 'Signed out of this account session.' : 'That account session was signed out.' })
                           })}
                           disabled={Boolean(busy)}
                           className="shrink-0 rounded-lg border border-border px-2 py-1 text-[9px] font-semibold text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-50"
                         >
-                          {session.current ? 'Sign out' : 'Revoke'}
+                          Sign out
                         </button>
                       </div>
                     ))}
-                    {sessions.length === 0 && !detailsLoading && <p className="text-[10px] text-text-muted">No active sessions were returned.</p>}
+                    {sessions.length === 0 && !detailsLoading && <p className="text-[10px] text-text-muted">No active account sessions found.</p>}
                   </div>
                   <div className="mt-3 grid gap-2 sm:grid-cols-2">
                     <button
@@ -668,26 +845,29 @@ export function AccountSupportDrawer() {
                       onClick={() => void run('revoke-others', async isCurrent => {
                         const count = await revokeAllSessions(true)
                         if (!isCurrent()) return
-                        setNotice({ kind: 'success', text: `${count} other session${count === 1 ? '' : 's'} revoked.` })
+                        setNotice({ kind: 'success', text: `${count} other account session${count === 1 ? '' : 's'} signed out.` })
                       })}
                       disabled={Boolean(busy) || !context.reauthenticated}
                       className="rounded-lg border border-border px-3 py-2 text-[10px] font-semibold text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-40"
                     >
-                      Revoke other sessions
+                      Sign out other account sessions
                     </button>
                     <button
                       type="button"
                       onClick={() => void run('revoke-all', async isCurrent => {
                         await revokeAllSessions(false)
                         if (!isCurrent()) return
-                        setNotice({ kind: 'success', text: 'All sessions revoked.' })
+                        setNotice({ kind: 'success', text: 'All account sessions were signed out.' })
                       })}
                       disabled={Boolean(busy) || !context.reauthenticated}
                       className="rounded-lg border border-chip-red/50 px-3 py-2 text-[10px] font-semibold text-chip-red hover:bg-chip-red/10 disabled:opacity-40"
                     >
-                      Revoke all and sign out
+                      Sign out all account sessions
                     </button>
                   </div>
+                  <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
+                    These controls affect account sign-in only. Separate browser or project-password access is unchanged.
+                  </p>
                 </section>
               )}
 
@@ -715,7 +895,7 @@ export function AccountSupportDrawer() {
                     type="button"
                     onClick={() => void run('codes', async isCurrent => {
                       const codes = await rotateRecoveryCodes()
-                      if (!isCurrent()) return
+                      if (!isCurrent() || !codes) return
                       setOneTimeCodes(codes)
                       setCodesLabel('New recovery codes')
                       setNotice({ kind: 'success', text: 'Previous recovery codes were replaced.' })
@@ -732,10 +912,10 @@ export function AccountSupportDrawer() {
                 <section className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
                   <div className="flex items-center gap-2">
                     <UserCog size={14} className="text-accent-blue" aria-hidden="true" />
-                    <h3 className="text-xs font-semibold text-text-primary">User administration</h3>
+                    <h3 className="text-xs font-semibold text-text-primary">Manage users</h3>
                   </div>
                   {!context.reauthenticated ? (
-                    <p className="mt-2 text-[10px] text-text-muted">Confirm your password above to view or change server accounts.</p>
+                    <p className="mt-2 text-[10px] text-text-muted">Confirm your password above to view or change other accounts.</p>
                   ) : (
                     <>
                       <div className="mt-3 space-y-2">
@@ -766,7 +946,7 @@ export function AccountSupportDrawer() {
                           event.preventDefault()
                           void run('create-user', async isCurrent => {
                             const result = await createUser({ username: managedUsername, password: managedPassword, email: managedEmail })
-                            if (!isCurrent()) return
+                            if (!isCurrent() || !result) return
                             setManagedPassword('')
                             setManagedEmail('')
                             setManagedUsername('')
@@ -802,7 +982,7 @@ export function AccountSupportDrawer() {
                   await logout()
                   if (!isCurrent()) return
                   clearSensitive()
-                  setNotice({ kind: 'success', text: 'Signed out. Project and output access were not changed.' })
+                  setNotice({ kind: 'success', text: 'Signed out. Any separate browser or project-password access remains unchanged.' })
                 })}
                 disabled={Boolean(busy)}
                 className="flex w-full items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-xs font-semibold text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-50"
@@ -820,8 +1000,8 @@ export function AccountSupportDrawer() {
           <p className="flex items-start gap-2 text-[9px] leading-relaxed text-text-muted">
             <Check size={12} className="mt-0.5 shrink-0 text-indicator-success" aria-hidden="true" />
             {activeTab === 'account' && accountsEnabled
-              ? 'Account requests use same-origin secure cookies and are not saved in browser preferences. Email is optional and is never used as authentication by itself.'
-              : 'Support details are read from this server. External links are offered only when the server marks an HTTPS provider as available.'}
+              ? 'Maestro protects account sign-in in this browser and does not save your password in browser preferences. Email is optional and cannot be used alone to sign in.'
+              : 'Support details come from Maestro. External support links appear only when they are securely configured and available.'}
           </p>
         </footer>
       </div>

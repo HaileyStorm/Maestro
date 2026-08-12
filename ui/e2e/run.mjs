@@ -11,7 +11,10 @@ const PORT_PATTERN = /^(?:[1-9]|[1-9]\d{1,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}
 const uiRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const repositoryRoot = resolve(uiRoot, '..')
 const externalRoot = process.platform === 'linux' ? '/var/tmp' : tmpdir()
-const action = process.argv[2]
+const commandArgs = process.argv.slice(2)
+const explicitAction = commandArgs[0] === 'install' || commandArgs[0] === 'test'
+const action = explicitAction ? commandArgs[0] : 'test'
+const actionArgs = explicitAction ? commandArgs.slice(1) : commandArgs
 const runId = randomUUID()
 
 const browsersPath = resolve(process.env.PLAYWRIGHT_BROWSERS_PATH || join(externalRoot, 'maestro-playwright-browsers'))
@@ -66,7 +69,7 @@ function validateTestArguments(args) {
     if (option === '--project' && !['desktop-firefox', 'android-like-chromium', 'ios-like-webkit'].includes(value)) {
       throw new Error(`Unknown Playwright project rejected: ${value}`)
     }
-    validated.push(option, value)
+    validated.push(`${option}=${value}`)
   }
   return validated
 }
@@ -108,10 +111,18 @@ function buildChildEnvironment(runPort, runToken) {
   }
 }
 
-if (action !== 'install' && action !== 'test') {
-  throw new Error('Usage: node e2e/run.mjs <install|test> [safe Playwright selection arguments]')
+if (action === 'install' && actionArgs.length > 0) {
+  throw new Error('Playwright install does not accept additional arguments.')
 }
-const requestedArgs = action === 'test' ? validateTestArguments(process.argv.slice(3)) : []
+const requestedArgs = action === 'test' ? validateTestArguments(actionArgs) : []
+const hasExplicitProject = requestedArgs.some(argument => argument.startsWith('--project='))
+const testArgs = hasExplicitProject
+  ? requestedArgs
+  : [
+      ...requestedArgs,
+      '--project=desktop-firefox',
+      '--project=android-like-chromium',
+    ]
 const canonicalBrowsersPath = createAndValidateExternalDirectory('browser', browsersPath)
 createAndValidateExternalDirectory('output root', outputRoot)
 const canonicalNpmCache = createAndValidateExternalDirectory('npm cache', npmCache)
@@ -128,7 +139,7 @@ if ((runPort !== null && !PORT_PATTERN.test(runPort)) || (runToken !== null && !
 process.env.MAESTRO_E2E_PARENT_SENTINEL = runId
 const args = action === 'install'
   ? ['install', 'chromium', 'firefox', 'webkit']
-  : ['test', ...requestedArgs]
+  : ['test', ...testArgs]
 const cli = resolve(uiRoot, 'node_modules', '@playwright', 'test', 'cli.js')
 const child = spawn(process.execPath, [cli, ...args], {
   cwd: uiRoot,

@@ -1,7 +1,6 @@
 import { useRef, useState } from 'react'
 import { Wrench, Upload, X, Film, Mic, Play } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
-import * as api from '../../api/client'
 import { BlenderSceneTool } from './BlenderSceneTool'
 
 // Upscale methods — same set as Post Processing's Spatial Upsampling, minus the
@@ -23,12 +22,14 @@ export function ToolsPanel() {
   const sourceName = useStore(s => s.toolsSourceName)
   const sourceUrl = useStore(s => s.toolsSourceUrl)
   const setSource = useStore(s => s.setToolsSource)
+  const uploadSource = useStore(s => s.uploadToolsSource)
   const method = useStore(s => s.toolsUpscaleMethod)
   const setMethod = useStore(s => s.setToolsUpscaleMethod)
   const revoiceMode = useStore(s => s.toolsRevoiceMode)
   const setRevoiceMode = useStore(s => s.setToolsRevoiceMode)
   const revoiceRefs = useStore(s => s.toolsRevoiceRefs)
   const setRevoiceRef = useStore(s => s.setToolsRevoiceRef)
+  const uploadRevoiceRef = useStore(s => s.uploadToolsRevoiceRef)
   const runTool = useStore(s => s.runTool)
 
   const outputs = useStore(s => s.outputs)
@@ -41,14 +42,15 @@ export function ToolsPanel() {
   const vcFileRefs = [useRef<HTMLInputElement>(null), useRef<HTMLInputElement>(null)]
   const [uploading, setUploading] = useState(false)
   const [vcUploading, setVcUploading] = useState<number | null>(null)
+  const [uploadError, setUploadError] = useState<string | null>(null)
 
   const handleSourceUpload = async (file: File) => {
     setUploading(true)
+    setUploadError(null)
     try {
-      const r = await api.uploadImage(file)  // /api/v1/upload handles video too
-      setSource({ path: r.path, name: file.name, url: r.url })
-    } catch (e) {
-      console.error('Source upload failed:', e)
+      await uploadSource(file) // /api/v1/upload handles video too
+    } catch {
+      setUploadError('The source file could not be uploaded. Try again.')
     } finally {
       setUploading(false)
     }
@@ -60,11 +62,11 @@ export function ToolsPanel() {
 
   const handleVcUpload = async (index: number, file: File) => {
     setVcUploading(index)
+    setUploadError(null)
     try {
-      const r = await api.uploadAudio(file)
-      setRevoiceRef(index, { filename: file.name, path: r.path })
-    } catch (e) {
-      console.error('Voice ref upload failed:', e)
+      await uploadRevoiceRef(index, file)
+    } catch {
+      setUploadError('The voice sample could not be uploaded. Try again.')
     } finally {
       setVcUploading(null)
     }
@@ -76,6 +78,11 @@ export function ToolsPanel() {
 
   return (
     <div className="flex flex-col gap-4">
+      {uploadError && (
+        <p role="alert" className="rounded-lg border border-indicator-error/40 bg-indicator-error/5 px-3 py-2 text-[10px] text-indicator-error">
+          {uploadError}
+        </p>
+      )}
       <div>
         <div className="flex items-center gap-1.5 text-[11px] text-text-muted uppercase tracking-wider mb-2">
           <Wrench size={12} /> Tools — post-process any clip

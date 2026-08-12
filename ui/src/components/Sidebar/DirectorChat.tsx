@@ -75,6 +75,24 @@ const DIRECTOR_MODEL_COMPONENTS = new Set<DirectorFailureComponent>([
   'continuity_editor_lora',
 ])
 
+const DIRECTOR_PREPARATION_PHASE_COPY: Record<string, string> = {
+  registered: 'your saved request',
+  song_writing: 'writing the song',
+  music_queued: 'waiting to create the track',
+  music_completed: 'the completed track',
+  analyzing_audio: 'analyzing the audio',
+  analysis_interrupted: 'the saved audio analysis',
+  analysis_completed: 'the completed audio analysis',
+  classification_completed: 'the completed scene outline',
+  structure_completed: 'the completed scene structure',
+}
+
+const DIRECTOR_PREPARATION_ACTION_COPY: Record<string, string> = {
+  generate_music: 'creating the track',
+  analyze_audio: 'analyzing the audio',
+  classify_or_structure: 'planning the scenes',
+}
+
 function clearDirectorComponentError(component: DirectorFailureComponent) {
   const state = useStore.getState()
   if (state.directorComponentError?.component !== component) return
@@ -85,9 +103,19 @@ function DirectorComponentAlert({ component }: { component: DirectorFailureCompo
   const failure = useStore(s => s.directorComponentError?.component === component
     ? s.directorComponentError : null)
   if (!failure) return null
+  const label = DIRECTOR_COMPONENT_LABELS[component]
+  const message = failure.code === 'director_model_terms_required'
+    ? `Review and accept the terms for ${label.toLowerCase()}, then try again.`
+    : failure.code === 'director_model_not_ready'
+      ? `${label} needs setup before Director can use it.`
+      : failure.code === 'director_role_lora_unavailable'
+        ? `${label} is unavailable or does not work with the selected model. Choose another LoRA or remove it.`
+        : failure.code === 'director_reference_unavailable'
+          ? `${label} could not be opened. Remove it or choose another reference.`
+          : `${label} is unavailable for this production. Choose another available model.`
   return (
     <div role="alert" className="mt-1.5 rounded border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-red-300">
-      {failure.message}
+      {message}
     </div>
   )
 }
@@ -216,7 +244,7 @@ function LlmThinkingStream({ stage }: { stage: string }) {
   const pipelineStatus = useStore(s => s.pipelineStatus)
   const progress = pipelineStatus?.llm_progress ?? null
   const pipelineActive = isDirectorPipelineActive(pipelineStatus)
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(false)
   const streamScrollRef = useRef<HTMLDivElement>(null)
   const partialText = pipelineActive && progress && !progress.done
     ? progress.partial_text
@@ -236,12 +264,24 @@ function LlmThinkingStream({ stage }: { stage: string }) {
   const isStillThinking = thinkMatch ? !thinkMatch[2].includes('</think>') : false
   const output = partialText.replace(/<think>[\s\S]*?(<\/think>|$)/, '').trim()
   const hasPartial = Boolean(thinking || output)
-  const humanize = (value: string) => value.replace(/_/g, ' ')
-  const passLabel = humanize(progress.pass || 'LLM pass')
-  const phaseLabel = humanize(progress.phase || stage)
-  const activityLabel = humanize(progress.activity || (progress.done ? 'complete' : 'starting'))
-  const attemptLabel = `attempt ${progress.attempt} of ${progress.attempt_limit}`
-  const statusLabel = `${phaseLabel} · ${passLabel} · ${activityLabel} · ${attemptLabel}`
+  const reportedPass = progress.pass || stage
+  const activity = progress.activity || (progress.done ? 'complete' : 'starting')
+  const activityLabel = ({
+    starting: 'starting this planning step',
+    generating: 'working on your plan',
+    retrying: 'trying this planning step again',
+    complete: 'finished with this planning step',
+    failed: 'waiting for you to try this planning step again',
+    cancelled: 'stopped',
+  } as Record<string, string>)[activity] || 'working on your plan'
+  const attemptLabel = `try ${progress.attempt} of ${progress.attempt_limit}`
+  const statusLabel = activity === 'failed'
+    ? 'Director could not finish this planning step'
+    : activity === 'cancelled'
+      ? 'Director stopped this planning step'
+      : progress.done
+        ? 'Director finished this planning step'
+        : `Director is ${activityLabel}`
   const metrics: string[] = []
   if (progress.generated_tokens_approx > 0) metrics.push(`~${progress.generated_tokens_approx} tokens`)
   if (progress.elapsed_seconds > 0) metrics.push(`${progress.elapsed_seconds.toFixed(1)}s`)
@@ -251,7 +291,7 @@ function LlmThinkingStream({ stage }: { stage: string }) {
   return (
     <div className="mt-2">
       <span role="status" aria-live="polite" aria-atomic="true" className="sr-only">
-        {`Director ${statusLabel}`}
+        {statusLabel}
       </span>
       <div className="flex items-start justify-between gap-2">
         {hasPartial ? (
@@ -262,34 +302,40 @@ function LlmThinkingStream({ stage }: { stage: string }) {
           >
             {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
             <span>{statusLabel}</span>
+            <span className="text-[9px]">· {expanded ? 'Hide production details' : 'Show production details'}</span>
           </button>
         ) : (
           <span className="text-[10px] text-text-muted">{statusLabel}</span>
-        )}
-        {metrics.length > 0 && (
-          <span className="shrink-0 text-right text-[9px] text-text-muted">
-            {metrics.join(' · ')}
-          </span>
         )}
       </div>
       {expanded && hasPartial && (
         <div
           ref={streamScrollRef}
           className="mt-1 rounded bg-bg-primary/50 border border-border/30 p-2 max-h-32 overflow-y-auto"
-          aria-label="Live Director model output preview"
+          aria-label="Director production details"
           aria-live="off"
         >
+          <details className="mb-1 text-[9px] text-text-muted">
+            <summary className="cursor-pointer text-text-secondary">Technical details</summary>
+            <p>Reported step: {reportedPass} · Reported state: {activity} · {attemptLabel}{metrics.length > 0 ? ` · ${metrics.join(' · ')}` : ''}</p>
+          </details>
           {thinking && (
-            <pre className="text-[10px] text-text-muted whitespace-pre-wrap font-mono leading-relaxed">
+            <div>
+              <p className="text-[9px] font-medium text-text-secondary">Working notes</p>
+              <pre className="text-[10px] text-text-muted whitespace-pre-wrap font-mono leading-relaxed">
               {thinking}
               {isStillThinking && <span className="animate-pulse">|</span>}
-            </pre>
+              </pre>
+            </div>
           )}
           {output && (
-            <pre className="text-[10px] text-accent-blue/70 whitespace-pre-wrap font-mono leading-relaxed mt-1 pt-1 border-t border-border/30">
-              {output}
-              {!progress.done && !isStillThinking && <span className="animate-pulse">|</span>}
-            </pre>
+            <div className="mt-1 border-t border-border/30 pt-1">
+              <p className="text-[9px] font-medium text-text-secondary">Draft plan</p>
+              <pre className="text-[10px] text-accent-blue/70 whitespace-pre-wrap font-mono leading-relaxed">
+                {output}
+                {!progress.done && !isStillThinking && <span className="animate-pulse">|</span>}
+              </pre>
+            </div>
           )}
         </div>
       )}
@@ -567,9 +613,9 @@ export function DirectorChat() {
               type="button"
               onClick={() => useStore.getState().setDashboardOpen(true)}
               aria-haspopup="dialog"
-              aria-label="Open Director pipeline dashboard"
+              aria-label="Open Director production dashboard"
               className="mobile-control-target flex touch-manipulation items-center justify-center gap-0.5 px-2 text-[10px] text-accent-blue transition-colors hover:text-accent-blue/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:px-0"
-              title="Open pipeline dashboard"
+              title="Open production dashboard"
             >
               Dashboard
             </button>
@@ -600,10 +646,10 @@ export function DirectorChat() {
             <div className="flex items-center justify-between gap-2">
               <div>
                 <p className="text-xs text-text-secondary">
-                  Director preparation {preparationStatus.interrupted ? 'was safely interrupted' : 'was restored'}.
+                  Your Director setup {preparationStatus.interrupted ? 'paused safely' : 'was restored'}.
                 </p>
                 <p className="mt-0.5 text-[10px] text-text-muted">
-                  Phase: {preparationStatus.phase.replaceAll('_', ' ')} · Next: {(preparationStatus.next_action || 'start_pipeline').replaceAll('_', ' ')}
+                  Saved at {DIRECTOR_PREPARATION_PHASE_COPY[preparationStatus.phase] || 'your latest completed step'} · Continue with {preparationStatus.next_action ? (DIRECTOR_PREPARATION_ACTION_COPY[preparationStatus.next_action] || 'the next production step') : 'production'}
                 </p>
               </div>
               <button
@@ -811,7 +857,7 @@ export function DirectorChat() {
         {componentError && !isShortFilm && DIRECTOR_MODEL_COMPONENTS.has(componentError.component) && (
           <SystemBubble>
             <div aria-label="Director model recovery" className="space-y-1.5">
-              <p className="text-[10px] text-text-secondary">Review the exact failing role, then submit again.</p>
+              <p className="text-[10px] text-text-secondary">Check the highlighted image setting, then try again.</p>
               <DirectorLoraAccordion />
             </div>
           </SystemBubble>
@@ -1318,9 +1364,9 @@ function DirectorResolutionSelector() {
       </div>
       <p className={`mt-1 text-[9px] ${selectedPreset?.experimental ? 'text-amber-300' : 'text-text-muted'}`}>
         {optionsLoading && optionsModelType === videoModel
-          ? 'Loading exact model resolutions…'
+          ? 'Loading sizes for this model…'
           : optionsError && optionsModelType === videoModel
-            ? 'Exact resolution options are unavailable. Retry by reselecting the video model.'
+            ? 'Size options are unavailable right now. Reselect the video model to try again.'
             : !selectedPresetAvailable
               ? 'This carried selection is unavailable for the selected model. Choose an available resolution.'
               : !resolvedResolution
@@ -1863,7 +1909,7 @@ function AnalysisSummary({
           {analysis.lyrics && analysis.lyrics.length > 0 && (
             <div>
               <div className="text-text-muted uppercase tracking-wider mb-1 font-medium">
-                Lyrics {analysis.song_structure?.length ? '(LLM Structure)' : '(Whisper)'}
+                Lyrics {analysis.song_structure?.length ? '(organized by Director)' : '(from transcription)'}
               </div>
               <div className="space-y-0.5">
                 {analysis.song_structure && analysis.song_structure.length > 0 ? (
@@ -2323,7 +2369,7 @@ function DirectorAdvancedAccordion() {
                 className="w-full disabled:opacity-50"
               />
               <p className="text-[10px] text-text-muted mt-0.5">
-                {activeVideoOptions?.lock_inference_steps ? 'Fixed by the selected model recipe.' : 'Director-only, remembered separately for each video model.'}
+                {activeVideoOptions?.lock_inference_steps ? 'Set by the selected model.' : 'Saved separately for each Director video model.'}
               </p>
             </div>
 
@@ -2344,9 +2390,9 @@ function DirectorAdvancedAccordion() {
               <p className="text-[10px] text-text-muted mt-0.5">
                 {h3DirectorModel
                   ? selectedMaxShotFrames
-                    ? 'This is an exact ceiling, not a target or average. Director may plan shorter, unequal prompt-driven segments.'
-                    : 'Auto respects authored timing and may plan shorter, unequal segments up to the model-safe ceiling.'
-                  : 'Auto uses the selected model/backend safe limit; manual is an expert one-pass cap.'}
+                    ? 'This is the longest allowed segment, not a target. Director may choose shorter segments of different lengths to fit your story.'
+                    : 'Auto follows your timing and may choose shorter segments of different lengths, up to the model\'s limit.'
+                  : 'Auto uses the selected model\'s supported limit. A manual choice sets the longest shot Director may plan.'}
               </p>
               {h3DirectorModel && directorDuration > 0 && (
                 <p className="mt-1 text-[10px] text-text-muted" title={h3SegmentEstimate?.reason}>
@@ -2484,7 +2530,7 @@ function DirectorModelPicker({ value, onChange }: {
     && pinkCompatibility.loading === false
     && !pinkCompatibility.compatible
   )
-    ? `${requestedProfileLabel || 'Current profile'} incompatible; selects ${pinkCompatibility.fallbackProfileLabel || pinkCompatibility.fallbackProfileId || 'server fallback'}`
+    ? `${requestedProfileLabel || 'Current profile'} is unavailable; using ${pinkCompatibility.fallbackProfileLabel || pinkCompatibility.fallbackProfileId || 'Maestro fallback'}`
     : ''
   const pickerTitle = pipelineType === 'short_film_story'
       ? 'Only models that can render Director-planned shots with synchronized native audio are shown.'
@@ -2507,8 +2553,8 @@ function DirectorModelPicker({ value, onChange }: {
           title={pickerTitle}
           className="flex-1 min-w-0 bg-bg-tertiary border border-border rounded-lg px-2 py-1 text-[11px] text-text-primary focus:outline-none focus:border-accent-blue"
         >
-          {!known && value && <option value={value}>Selected exact model · unavailable in this session</option>}
-          {!value && <option value="">{compatibleModels.length === 0 ? 'No compatible models enabled' : 'Choose an exact video model'}</option>}
+          {!known && value && <option value={value}>Selected model · unavailable right now</option>}
+          {!value && <option value="">{compatibleModels.length === 0 ? 'No compatible models enabled' : 'Choose a video model'}</option>}
           {groups.map(({ family, models: famModels }) => (
             <optgroup key={family.id} label={family.label}>
               {famModels.map(m => (
@@ -2533,10 +2579,10 @@ function DirectorModelPicker({ value, onChange }: {
 
 const DIRECTOR_READINESS_COPY: Record<DirectorReadinessReason, string> = {
   director_incompatible: 'This model cannot perform this Director image role.',
-  manual_verification_required: 'The exact manual checkpoint must be verified on the host.',
+  manual_verification_required: 'This manually installed model needs to be checked on the Maestro computer.',
   model_disabled: 'This model is hidden in Enabled Models.',
   model_not_downloaded: 'The required local model files are not ready.',
-  model_terms_required: 'This host has not accepted every exact model/creator notice.',
+  model_terms_required: 'The required model terms have not been accepted on this Maestro computer.',
   model_unavailable: 'This model is unavailable in the current catalog.',
 }
 
@@ -2587,7 +2633,7 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
   }
 
   if (candidate.ready) {
-    return <p role="status" className="mt-1 text-[9px] text-indicator-success">Ready on this host.</p>
+    return <p role="status" className="mt-1 text-[9px] text-indicator-success">Ready on this Maestro computer.</p>
   }
   return (
     <div role="status" className="mt-1.5 space-y-1.5 rounded border border-amber-500/30 bg-amber-500/10 p-2 text-[9px] leading-relaxed text-amber-100">
@@ -2596,17 +2642,17 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
         <div key={requirement.term}>
           <p>{requirement.notice}</p>
           <div className="mt-1 flex flex-wrap gap-2">
-            <a href={requirement.license_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Review exact terms</a>
+            <a href={requirement.license_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Review terms</a>
             <button type="button" disabled={hostTermsLoading || !hostTerms || !machineControls} onClick={() => {
               const epoch = ++actionEpoch.current
               const workspace = activeWorkspace
               const explicit = explicitOutput
               void acceptHostTerm(requirement.term)
                 .then(() => refresh(epoch, workspace, explicit))
-                .catch(error => {
-                  if (actionIsCurrent(epoch, workspace, explicit)) setActionError(error instanceof Error ? error.message : 'Terms acceptance failed.')
+                .catch(() => {
+                  if (actionIsCurrent(epoch, workspace, explicit)) setActionError('The terms could not be accepted. Try again from Maestro on this computer.')
                 })
-            }} className="rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40">Accept for this host</button>
+            }} className="rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40">Accept on this computer</button>
           </div>
         </div>
       ))}
@@ -2621,7 +2667,7 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
       {model?.manual_installation && (
         <div className="flex flex-wrap gap-2">
           <a href={model.manual_installation.source_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Source page</a>
-          <a href={model.manual_installation.download_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Exact manual download</a>
+          <a href={model.manual_installation.download_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Download model file</a>
         </div>
       )}
       <div className="flex flex-wrap gap-1.5">
@@ -2645,11 +2691,11 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
                   })),
                 })
                 if (terminal.status === 'cancelled') return
-                if (terminal.status === 'failed') throw new Error('Model download failed. Check the host log and retry.')
+                if (terminal.status === 'failed') throw new Error('Model download failed. Check Maestro on this computer, then try again.')
               }
               await refresh(epoch, workspace, explicit)
-            })().catch(error => {
-              if (actionIsCurrent(epoch, workspace, explicit)) setActionError(error instanceof Error ? error.message : 'Download failed.')
+            })().catch(() => {
+              if (actionIsCurrent(epoch, workspace, explicit)) setActionError('The model download could not finish. Check Maestro on this computer, then try again.')
             }).finally(() => {
               if (actionIsCurrent(epoch, workspace, explicit)) setBusy('')
             })
@@ -2663,16 +2709,16 @@ function DirectorCandidateReadiness({ candidate }: { candidate: DirectorImageRol
             setBusy('verify'); setActionError('')
             void verifyManualCheckpoint(candidate.model_type)
               .then(() => refresh(epoch, workspace, explicit))
-              .catch(error => {
-                if (actionIsCurrent(epoch, workspace, explicit)) setActionError(error instanceof Error ? error.message : 'Verification failed.')
+              .catch(() => {
+                if (actionIsCurrent(epoch, workspace, explicit)) setActionError('The model file could not be checked. Confirm the filename and location, then try again.')
               }).finally(() => {
                 if (actionIsCurrent(epoch, workspace, explicit)) setBusy('')
               })
-          }} className="inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40"><HardDrive size={9} /> {busy === 'verify' ? 'Verifying…' : 'Verify checkpoint'}</button>
+          }} className="inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5 disabled:opacity-40"><HardDrive size={9} /> {busy === 'verify' ? 'Checking…' : 'Check model file'}</button>
         )}
       </div>
-      {accessState === 'loading' && candidate.actions.length > 0 && <p>Loading host permissions…</p>}
-      {accessState === 'lan' && candidate.actions.length > 0 && <p>Complete these host actions from Maestro at localhost. LAN/remote sessions retain catalog visibility but cannot mutate host models or accept host notices.</p>}
+      {accessState === 'loading' && candidate.actions.length > 0 && <p>Checking which setup actions are available…</p>}
+      {accessState === 'lan' && candidate.actions.length > 0 && <p>Open Maestro on this computer to finish model setup or accept model terms. Remote sessions can view these models but cannot change the computer's model setup.</p>}
       {hostTermsError && <p className="text-red-300">{hostTermsError}</p>}
       {actionError && <p className="text-red-300">{actionError}</p>}
     </div>
@@ -2722,16 +2768,16 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
       <DirectorComponentAlert component={modelComponent} />
       <p className="mt-1 text-[8px] text-text-muted">
         {!effectiveModel
-          ? 'The server default is hidden or unavailable in this session. Select an authorized model or use Maestro locally.'
+          ? 'The usual model is hidden or unavailable right now. Choose another available model or open Maestro on this computer.'
           : override
-          ? 'Deliberate override; the server will not substitute another model.'
+          ? 'Your selected model will be used without an automatic substitute.'
           : role === 'creator' && explicitOutput
             ? capability?.selection_source === 'verified_manual_preference'
-              ? 'Automatic Explicit creator uses the server-authoritative ready Moody preference.'
-              : 'No preferred Moody creator is ready; the server resolved its safe fallback.'
+              ? 'Automatic uses your ready preferred Moody creator.'
+              : 'Your preferred Moody creator is not ready, so Maestro chose an available alternative.'
             : role === 'creator'
-              ? 'Automatic Standard creator uses the server safe fallback.'
-              : 'Automatic editor uses the fixed edit-capable default.'}
+              ? 'Automatic uses Maestro\'s available standard image creator.'
+              : 'Automatic uses Maestro\'s available continuity editor.'}
       </p>
       {candidate && <DirectorCandidateReadiness candidate={candidate} />}
       {role === 'creator' && explicitOutput && !override && capability?.selection_source === 'safe_fallback' && (
@@ -2792,8 +2838,8 @@ function DirectorLoraAccordion() {
     <div className="space-y-1">
       {!rolesConfigured && legacyImageModel && (
         <div role="status" className="rounded border border-border bg-bg-tertiary/60 p-2 text-[9px] text-text-secondary">
-          <p><span className="font-medium">Legacy combined image model:</span> {models.find(model => model.model_type === legacyImageModel)?.name || legacyImageModel}</p>
-          <p className="mt-1 text-text-muted">Older saved settings remain readable. New Director jobs use the separate creator/editor roles below; save the automatic roles or keep this model deliberately as Creator.</p>
+          <p><span className="font-medium">Older all-in-one image model:</span> {models.find(model => model.model_type === legacyImageModel)?.name || legacyImageModel}</p>
+          <p className="mt-1 text-text-muted">This older project used one model for both image tasks. Director now lets you choose separate models for creating and editing images. Use the automatic choices, or keep this model as the Creator.</p>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             <button type="button" onClick={activateRoles} className="rounded border border-accent-blue/40 px-1.5 py-0.5 text-accent-blue">Use automatic roles</button>
             {legacyCreatorCompatible && <button type="button" onClick={() => setRoleModel('creator', legacyImageModel)} className="rounded border border-border px-1.5 py-0.5">Keep as Creator override</button>}
@@ -2882,7 +2928,7 @@ function StyleForm({
           <option value="custom">Custom…</option>
         </select>
         {visualStyle === 'custom' && <input aria-label="Custom Director visual style" value={customVisualStyle} onChange={event => setCustomVisualStyle(event.target.value)} placeholder="e.g. hand-painted stop motion" className="mt-1.5 w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary" />}
-        <p className="mt-1 text-[9px] leading-relaxed text-text-muted">Realistic is the fallback only. Choose a preset to make it explicit, or use Custom when your own freeform style should be authoritative.</p>
+        <p className="mt-1 text-[9px] leading-relaxed text-text-muted">Realistic is used when no style is chosen. Pick a preset, or choose Custom to describe your own style.</p>
       </fieldset>
 
       <H3StyleWorkflowField effectiveVideoModel={effectiveVideoModel} surface="Director" />
@@ -3046,6 +3092,13 @@ function ImageGenView({
   imageGenProgress: ReturnType<typeof useStore.getState>['directorImageGenProgress']
   clipImages: ReturnType<typeof useStore.getState>['directorClipImages']
 }) {
+  const imageStatusCopy = (status: string): string => ({
+    generating: 'Creating image',
+    polling: 'Waiting for image',
+    downloading: 'Saving image',
+    done: 'Image ready',
+    error: 'Image needs attention',
+  })[status] || 'Working on image'
   // Architecture-mismatch advisories from the backend's image-gen filter.
   // Surfacing these in chat (vs only in the console) lets the user see
   // immediately why some of their selected LoRAs didn't get applied —
@@ -3077,9 +3130,13 @@ function ImageGenView({
             </span>
             <span className="text-text-muted">
               {imageGenProgress.currentClipLabel}
-              {imageGenProgress.status !== 'done' && ` — ${imageGenProgress.status}`}
+              {imageGenProgress.status !== 'done' && ` — ${imageStatusCopy(imageGenProgress.status)}`}
             </span>
           </div>
+          <details className="text-[9px] text-text-muted">
+            <summary className="cursor-pointer text-text-secondary">Technical details</summary>
+            <span>Reported state: {imageGenProgress.status}</span>
+          </details>
           <div className="w-full bg-bg-tertiary rounded-full h-1.5">
             <div
               className="bg-accent-blue h-1.5 rounded-full transition-all"

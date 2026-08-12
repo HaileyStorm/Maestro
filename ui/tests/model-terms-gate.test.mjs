@@ -71,17 +71,17 @@ test('generic model selector requires explicit host acceptance before generation
   assert.match(store, /required_host_terms:\s*m\.required_host_terms \?\? \[\]/)
   assert.match(selector, /currentModel\?\.required_host_terms/)
   assert.match(selector, /acceptHostTerm\(requirement\.term\)/)
-  assert.match(selector, /Accept for this host/)
+  assert.match(selector, /Accept for this Maestro installation/)
   assert.match(selector, /hostTerms\?\.\[requirement\.term\]\?\.accepted !== true/)
   assert.match(button, /required_host_terms/)
   assert.match(button, /needsModelTerms/)
   assert.match(button, /Review terms/)
   assert.match(selector, /manual_checkpoint_verification_required/)
-  assert.match(selector, /Verify local checkpoint/)
-  assert.match(selector, /Maestro will not download this checkpoint/)
+  assert.match(selector, /Check model file/)
+  assert.match(selector, /Maestro will check its size and SHA-256 fingerprint on the computer where it runs/)
   assert.match(button, /needsManualCheckpointVerification/)
-  assert.match(button, /Manual install/)
-  assert.match(button, /verify its byte size and SHA-256 in the model selector/)
+  assert.match(button, /Model file needed/)
+  assert.match(button, /use the model selector to check it on the computer running Maestro/)
 })
 
 test('loading server term status never accepts a legacy browser flag', async () => {
@@ -105,7 +105,7 @@ test('Reference Studio gates the selected generation and editor recipe pair', as
   assert.match(component, /Accept for this host/)
   assert.match(component, /pendingManualModels/)
   assert.match(component, /getProjectReferenceModelAvailabilityCopy/)
-  assert.match(component, /Verify local checkpoint/)
+  assert.match(component, /Verify model file/)
   assert.match(component, /Maestro will not download it/)
 })
 
@@ -160,7 +160,7 @@ test('manual-only catalog metadata suppresses generic download affordance', asyn
     settings.indexOf("m.is_downloaded\n                              ? 'text-text-primary'"),
   )
   assert.match(row, /m\.downloadable === false/)
-  assert.match(row, /Manual install and verification required/)
+  assert.match(row, /Manual model setup required/)
   assert.ok(
     row.indexOf('m.downloadable === false')
       < row.indexOf('handleDownload(m.model_type)'),

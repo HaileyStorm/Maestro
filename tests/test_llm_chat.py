@@ -196,9 +196,20 @@ class ChatPolicyTests(unittest.TestCase):
         source = LLM_CHAT_UI_PATH.read_text(encoding="utf-8")
 
         self.assertIn(
-            "return `${modelPickerSpeedMeta(model)} · ${model.label}`",
+            "return `${model.label} · ${speedLabel}`",
             source,
         )
+        picker = source[
+            source.index("function modelPickerLabel"):
+            source.index("function providerDisplayName")
+        ]
+        technical = source[
+            source.index("function modelTechnicalMeta"):
+            source.index("function chatProgressStep")
+        ]
+        self.assertNotIn("speedMeta(model)", picker)
+        self.assertIn("speedMeta(model)", technical)
+        self.assertIn(">Technical details</summary>", source)
         self.assertIn('aria-describedby="llm-model-details chat-data-disclosure"', source)
         self.assertIn('id="llm-model-details"', source)
         self.assertIn('id="chat-data-disclosure"', source)
@@ -206,7 +217,7 @@ class ChatPolicyTests(unittest.TestCase):
         self.assertIn("OpenAI external provider", source)
         self.assertIn("Anthropic external provider", source)
         self.assertIn("configured external provider", source)
-        self.assertIn("local provider on this machine", source)
+        self.assertIn("local provider on the Maestro computer", source)
         _, _, composer = _jsx_div_element(source, "<div data-chat-composer")
         self.assertIn('id="chat-data-disclosure"', composer)
 
@@ -1013,9 +1024,14 @@ class ChatRouteTests(unittest.TestCase):
             generate_chat=generate_chat,
         )
         fake_package = types.SimpleNamespace(llm_service=fake_service)
+
+        def authorize(*_args, **kwargs):
+            self.assertEqual(kwargs.get("permission"), "project.generate")
+            events.append("authorize")
+
         namespace = _launch_chat_namespace(
             HTTPException=FakeHTTPException,
-            _require_project_access=lambda *_args: events.append("authorize"),
+            _require_project_access=authorize,
         )
         namespace["_resolve_llm_chat_model"] = (
             lambda *_args: events.append("resolve") or {
@@ -1078,7 +1094,7 @@ class ChatRouteTests(unittest.TestCase):
         self.assertTrue(admission.acquire(blocking=False))
         namespace = _launch_chat_namespace(
             HTTPException=FakeHTTPException,
-            _require_project_access=lambda *_args: None,
+            _require_project_access=lambda *_args, **_kwargs: None,
             _llm_chat_admission=admission,
         )
         namespace["_validate_llm_chat_request"] = lambda *_args: {
@@ -1136,7 +1152,7 @@ class ChatRouteTests(unittest.TestCase):
         package = types.SimpleNamespace(llm_service=service)
         namespace = _launch_chat_namespace(
             HTTPException=FakeHTTPException,
-            _require_project_access=lambda *_args: None,
+            _require_project_access=lambda *_args, **_kwargs: None,
             _resolve_llm_chat_images=(
                 lambda _request, body, _workspace:
                 ["/authorized/image.png"] if body.get("image_paths") else []
@@ -1220,6 +1236,18 @@ class ChatRouteTests(unittest.TestCase):
         self.assertIn('"guides": llm_service.get_chat_guides()', listing_source)
         self.assertIn("await run_blocking_shielded(", execute_source)
         self.assertIn("_validate_llm_chat_request", chat_source)
+        access_call = next(
+            item for item in ast.walk(chat)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Name)
+            and item.func.id == "_require_project_access"
+        )
+        permission = next(
+            keyword.value for keyword in access_call.keywords
+            if keyword.arg == "permission"
+        )
+        self.assertIsInstance(permission, ast.Constant)
+        self.assertEqual(permission.value, "project.generate")
         self.assertLess(
             chat_source.index("_validate_llm_chat_request"),
             chat_source.index("llm_chat_operation_manager.submit"),

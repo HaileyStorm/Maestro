@@ -8,20 +8,24 @@ interface Props {
   onSelectModel: (modelId: number) => void
 }
 
+type CheckpointError = 'load' | 'check'
+
 export function InstalledCheckpoints({ onSelectModel }: Props) {
   const [items, setItems] = useState<InstalledCheckpoint[]>([])
   const [loading, setLoading] = useState(true)
   const [checking, setChecking] = useState(false)
   const [lastCheck, setLastCheck] = useState<string | null>(null)
+  const [error, setError] = useState<CheckpointError | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
+    setError(null)
     try {
       const r = await fetchInstalledCheckpoints()
       setItems(r.checkpoints)
       setLastCheck(r.manifest_last_check_at)
     } catch {
-      /* surfaced via empty state */
+      setError('load')
     } finally {
       setLoading(false)
     }
@@ -32,11 +36,12 @@ export function InstalledCheckpoints({ onSelectModel }: Props) {
   const handleCheck = useCallback(async () => {
     if (checking) return
     setChecking(true)
+    setError(null)
     try {
       await checkCheckpointUpdates(true) // force: bypass 24h staleness window
       await load()
-    } catch (e) {
-      console.error('Checkpoint update check failed:', e)
+    } catch {
+      setError('check')
     } finally {
       setChecking(false)
     }
@@ -60,7 +65,7 @@ export function InstalledCheckpoints({ onSelectModel }: Props) {
         <button
           onClick={handleCheck}
           disabled={checking || items.length === 0}
-          className="ml-auto flex items-center gap-1 px-2 py-1 text-xs rounded-lg border border-border text-text-secondary hover:text-text-primary hover:border-border-light transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className="ml-auto flex min-h-11 items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs text-text-secondary transition-colors hover:border-border-light hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-50 md:min-h-0"
           title="Check CivitAI for newer checkpoint versions"
         >
           {checking ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
@@ -68,11 +73,28 @@ export function InstalledCheckpoints({ onSelectModel }: Props) {
         </button>
       </div>
 
+      {!loading && error && (
+        <div role="alert" className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">
+          <p>
+            {error === 'load'
+              ? 'Maestro could not load the imported checkpoints.'
+              : 'Maestro could not check CivitAI for checkpoint updates.'}
+          </p>
+          <button
+            type="button"
+            onClick={() => { if (error === 'load') void load(); else void handleCheck() }}
+            className="mt-2 min-h-11 rounded border border-red-400/40 px-3 text-xs font-medium text-red-100 transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {loading ? (
         <div className="flex items-center justify-center py-20">
           <Loader2 size={24} className="animate-spin text-accent-blue" />
         </div>
-      ) : items.length === 0 ? (
+      ) : error === 'load' && items.length === 0 ? null : items.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-text-muted">
           <Boxes size={32} className="mb-3 opacity-50" />
           <p className="text-sm">No checkpoints imported yet</p>

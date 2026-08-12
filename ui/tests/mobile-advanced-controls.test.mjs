@@ -37,7 +37,7 @@ test('Advanced mobile controls expose 44px targets without changing their handle
   }
 
   assert.match(advanced, /aria-controls="advanced-preset-save-form"[\s\S]{0,240}mobile-control-target[\s\S]{0,240}Save Current/)
-  assert.match(advanced, /setH3Custom\('h3_sol_dense_steps', 0\)[\s\S]{0,240}mobile-control-target[\s\S]{0,240}Apply quick task/)
+  assert.match(advanced, /setH3Custom\('h3_sol_dense_steps', 0\)[\s\S]{0,240}mobile-control-target[\s\S]{0,240}Apply benchmark settings/)
   assert.match(advanced, /setParam\('seed', -1\)[\s\S]{0,240}mobile-control-target[\s\S]{0,240}Random/)
   assert.match(advanced, /mobile-control-target[^"\n]*flex items-center gap-2 cursor-pointer group/)
   assert.match(advanced, /onClick=\{\(\) => setParam\('seed', -1\)\}/)
@@ -46,6 +46,15 @@ test('Advanced mobile controls expose 44px targets without changing their handle
   assert.match(advanced, /mobile-control-target min-w-0 flex-1/)
   assert.match(advanced, /mobile-control-target flex shrink-0 items-center justify-center/)
   assert.match(advanced, /opacity-100 md:opacity-0 md:group-hover:opacity-100/)
+})
+
+test('H3 advanced copy leads with practical tradeoffs and labels local measurements clearly', () => {
+  assert.match(advanced, /H3 Performance/)
+  assert.match(advanced, /Kijai Sol-Attn · faster, small quality tradeoff/)
+  assert.match(advanced, /Published speed claims are not measurements from this computer/)
+  assert.match(advanced, /Benchmark on this computer/)
+  assert.match(advanced, /Each result is one measured run/)
+  assert.doesNotMatch(advanced, /fail-closed|kernel, visual, and audio gates|conditioning prefix|privacy-safe timing|this-PC|authored distilled schedule/i)
 })
 
 test('Post Processing is a labelled disclosure with the same state transition', () => {

@@ -9,6 +9,7 @@ import { compile } from 'tailwindcss'
 const preflightUrl = new URL('../src/components/PreflightBanner.tsx', import.meta.url)
 const downloadUrl = new URL('../src/components/DownloadStatusBanner.tsx', import.meta.url)
 const oomUrl = new URL('../src/components/OomRecoveryBanner.tsx', import.meta.url)
+const installedCheckpointsUrl = new URL('../src/components/LoraBrowser/InstalledCheckpoints.tsx', import.meta.url)
 const clientUrl = new URL('../src/api/client.ts', import.meta.url)
 
 function childrenOf(node) {
@@ -38,6 +39,8 @@ function nodeText(node) {
 }
 
 async function flushPromises() {
+  await Promise.resolve()
+  await Promise.resolve()
   await Promise.resolve()
   await Promise.resolve()
 }
@@ -94,12 +97,19 @@ async function loadBanner(entryUrl, exportName) {
     ['lucide-react', `
       const icon = props => ({ type: 'svg', props: props || {} })
       export const AlertTriangle = icon
+      export const ArrowUpCircle = icon
+      export const Boxes = icon
+      export const Cpu = icon
       export const Download = icon
+      export const Loader2 = icon
+      export const RefreshCw = icon
       export const X = icon
     `],
     ['api', `
       export function fetchPreflight() { return globalThis.__fetchPreflight() }
       export function fetchActiveDownloads() { return globalThis.__fetchDownloads() }
+      export function fetchInstalledCheckpoints() { return globalThis.__fetchInstalledCheckpoints() }
+      export function checkCheckpointUpdates(force) { return globalThis.__checkCheckpointUpdates(force) }
     `],
     ['store', `
       export function useStore(selector) { return selector(globalThis.__bannerStore) }
@@ -274,6 +284,9 @@ test('Download exposes a quiet stable status plus determinate progress and prese
   assert.equal(progress.props['aria-valuemax'], 100)
   assert.equal(progress.props['aria-valuenow'], 50)
   assert.match(progress.props['aria-valuetext'], /^50 percent, /)
+  assert.equal(progress.props['aria-label'], 'Download progress for large-file.safetensors')
+  assert.match(nodeText(tree), /large-file\.safetensors/)
+  assert.doesNotMatch(nodeText(tree), /models\//)
 
   globalThis.__fetchDownloads = async () => { throw new Error('transient') }
   await globalThis.__bannerRefreshNow()
@@ -282,12 +295,86 @@ test('Download exposes a quiet stable status plus determinate progress and prese
   assert.ok(globalThis.__bannerListeners.has('maestro:downloads-refresh'))
 })
 
-test('Download announces interrupted state without putting changing bytes in the live region', async () => {
+test('Installed checkpoints distinguishes true empty from safe retryable load and provider-check failures', async () => {
+  const InstalledCheckpoints = await loadBanner(installedCheckpointsUrl, 'InstalledCheckpoints')
+  resetHarness()
+  let fetchCalls = 0
+  const selected = []
+  const checks = []
+  const emptyResult = { checkpoints: [], manifest_last_check_at: null }
+  globalThis.__fetchInstalledCheckpoints = async () => {
+    fetchCalls += 1
+    return emptyResult
+  }
+  globalThis.__checkCheckpointUpdates = async force => { checks.push(force) }
+
+  render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  await flushPromises()
+  let tree = render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  assert.match(nodeText(tree), /No checkpoints imported yet/)
+  assert.equal(findNodes(tree, node => node.props?.role === 'alert').length, 0)
+
+  resetHarness()
+  globalThis.__fetchInstalledCheckpoints = async () => {
+    fetchCalls += 1
+    throw new Error('/private/models/manifest.json')
+  }
+  render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  await flushPromises()
+  tree = render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  let alert = findNode(tree, node => node.props?.role === 'alert')
+  assert.equal(nodeText(alert), 'Maestro could not load the imported checkpoints.Retry')
+  assert.doesNotMatch(nodeText(tree), /No checkpoints imported yet|private|manifest\.json/i)
+  let retry = findNode(alert, node => node.type === 'button' && nodeText(node) === 'Retry')
+  assert.equal(retry.props.type, 'button')
+  assert.match(retry.props.className, /min-h-11/)
+  assert.match(retry.props.className, /focus-visible:ring-2/)
+  const callsBeforeRetry = fetchCalls
+  globalThis.__fetchInstalledCheckpoints = async () => {
+    fetchCalls += 1
+    return emptyResult
+  }
+  retry.props.onClick()
+  await flushPromises()
+  assert.equal(fetchCalls, callsBeforeRetry + 1)
+  tree = render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  await flushPromises()
+  tree = render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  assert.match(nodeText(tree), /No checkpoints imported yet/)
+
+  const checkpoint = {
+    model_type: 'video-model', name: 'Video model', architecture: 'video',
+    civitai_model_id: 73, update_status: 'current', preview_url: null,
+    auto_quantize: false, base_model: null,
+  }
+  resetHarness()
+  globalThis.__fetchInstalledCheckpoints = async () => ({ checkpoints: [checkpoint], manifest_last_check_at: null })
+  globalThis.__checkCheckpointUpdates = async force => { checks.push(force) }
+  render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  await flushPromises()
+  tree = render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  findNode(tree, node => node.type === 'button' && /Open on CivitAI/.test(node.props?.title || '')).props.onClick()
+  assert.deepEqual(selected, [73])
+  const check = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Check')
+  assert.match(check.props.className, /min-h-11/)
+  await check.props.onClick()
+  assert.deepEqual(checks, [true])
+
+  globalThis.__checkCheckpointUpdates = async () => { throw new Error('provider secret') }
+  tree = render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  await findNode(tree, node => node.type === 'button' && nodeText(node) === 'Check').props.onClick()
+  tree = render(() => InstalledCheckpoints({ onSelectModel: id => selected.push(id) }))
+  alert = findNode(tree, node => node.props?.role === 'alert')
+  assert.equal(nodeText(alert), 'Maestro could not check CivitAI for checkpoint updates.Retry')
+  assert.doesNotMatch(nodeText(alert), /provider secret/i)
+})
+
+test('Download identifies interrupted state safely and distinguishes explicit request retry', async () => {
   const DownloadStatusBanner = await loadBanner(downloadUrl, 'DownloadStatusBanner')
   resetHarness()
   globalThis.__bannerStore = { jobs: [], llmLoading: false, isEnhancing: false, llmStatus: null }
   globalThis.__fetchDownloads = async () => ({ downloads: [{
-    filename: 'partial.bin', downloaded_bytes: 20, total_bytes: 100,
+    filename: 'C:\\private\\project\\partial.bin?token=secret', downloaded_bytes: 20, total_bytes: 100,
     seconds_since_progress: 40, status: 'incomplete',
   }] })
   render(DownloadStatusBanner)
@@ -295,8 +382,37 @@ test('Download announces interrupted state without putting changing bytes in the
   const tree = render(DownloadStatusBanner)
   const alert = findNode(tree, node => node.props?.role === 'alert')
   assert.equal(alert.props['aria-live'], 'assertive')
-  assert.equal(nodeText(alert), 'A model download was interrupted. Re-run the request to finish it.')
+  assert.equal(
+    nodeText(alert),
+    'Model download interrupted for partial.bin. Automatic recovery stopped; re-run the request that needed this file to retry.',
+  )
   assert.doesNotMatch(nodeText(alert), /20|percent|bytes/i)
+  const progress = findNode(tree, node => node.props?.role === 'progressbar')
+  assert.equal(progress.props['aria-label'], 'Download progress for partial.bin')
+  assert.match(nodeText(tree), /Automatic recovery stopped for this file/)
+  assert.doesNotMatch(nodeText(tree), /Downloading model files/)
+  assert.equal(findNodes(tree, node => /animate-pulse/.test(node.props?.className || '')).length, 0)
+  assert.ok(findNode(progress, node => /bg-red-400/.test(node.props?.className || '')))
+  assert.doesNotMatch(nodeText(tree), /private|project|token|secret/i)
+})
+
+test('Download announces stalled recovery as automatic and action-free', async () => {
+  const DownloadStatusBanner = await loadBanner(downloadUrl, 'DownloadStatusBanner')
+  resetHarness()
+  globalThis.__bannerStore = { jobs: [], llmLoading: false, isEnhancing: false, llmStatus: null }
+  globalThis.__fetchDownloads = async () => ({ downloads: [{
+    filename: '/private/cache/slow-model.bin', downloaded_bytes: 20, total_bytes: 100,
+    seconds_since_progress: 40, status: 'downloading',
+  }] })
+  render(DownloadStatusBanner)
+  await flushPromises()
+  const tree = render(DownloadStatusBanner)
+  const status = findNode(tree, node => node.props?.role === 'status')
+  assert.equal(status.props['aria-live'], 'polite')
+  assert.equal(nodeText(status), 'Model download is slow for slow-model.bin. Maestro will retry automatically.')
+  assert.match(nodeText(tree), /Maestro will retry automatically/)
+  assert.match(nodeText(tree), /no action needed from you/i)
+  assert.doesNotMatch(nodeText(tree), /private|cache/i)
 })
 
 test('download stall documentation matches the executable thirty-second threshold', async () => {
@@ -343,18 +459,18 @@ test('OOM recovery keeps exact coefficient action payload and uses one stable al
   const alerts = findNodes(tree, node => node.props?.role === 'alert')
   assert.equal(alerts.length, 1)
   assert.equal(alerts[0].props['aria-live'], 'assertive')
-  assert.equal(nodeText(alerts[0]), 'Generation ran out of VRAM. Generation failed.')
+  assert.equal(nodeText(alerts[0]), 'Generation ran out of GPU memory. Generation failed.')
   const dismiss = findNode(tree, node => node.props?.['aria-label'] === 'Dismiss out-of-memory recovery notice')
   assert.match(dismiss.props.className, /min-h-11/)
   assert.match(dismiss.props.className, /focus-visible:ring-2/)
-  const apply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Lower headroom to'))
+  const apply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Use safer setting'))
   await apply.props.onClick()
   assert.deepEqual(updates, [{ vram_safety_coefficient: 0.82 }])
 
   tree = render(OomRecoveryBanner)
   const status = findNode(tree, node => node.props?.role === 'status')
   assert.equal(status.props['aria-live'], 'polite')
-  assert.match(nodeText(status), /VRAM headroom lowered to 0\.82/)
+  assert.match(nodeText(status), /GPU memory setting changed to 82%/)
 })
 
 test('OOM apply failure stays actionable and one exact retry clears its bounded error only on success', async () => {
@@ -387,7 +503,7 @@ test('OOM apply failure stays actionable and one exact retry clears its bounded 
   }
 
   let tree = render(OomRecoveryBanner)
-  let apply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Lower headroom to'))
+  let apply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Use safer setting'))
   await apply.props.onClick()
   tree = render(OomRecoveryBanner)
   const boundedErrors = findNodes(tree, node => (
@@ -396,9 +512,9 @@ test('OOM apply failure stays actionable and one exact retry clears its bounded 
   ))
   assert.equal(boundedErrors.length, 1)
   assert.equal(boundedErrors[0].props['aria-atomic'], 'true')
-  assert.match(nodeText(tree), /Lower headroom to 0\.82/)
+  assert.match(nodeText(tree), /Use safer setting 82%/)
   assert.equal(findNode(tree, node => node.props?.role === 'status'), null, 'failure never claims success')
-  apply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Lower headroom to'))
+  apply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Use safer setting'))
   assert.equal(apply.props.disabled, false)
 
   await apply.props.onClick()
@@ -408,7 +524,7 @@ test('OOM apply failure stays actionable and one exact retry clears its bounded 
   ])
   tree = render(OomRecoveryBanner)
   assert.equal(findNode(tree, node => nodeText(node).includes('System settings took too long')), null)
-  assert.match(nodeText(findNode(tree, node => node.props?.role === 'status')), /VRAM headroom lowered to 0\.82/)
+  assert.match(nodeText(findNode(tree, node => node.props?.role === 'status')), /GPU memory setting changed to 82%/)
   unmountHarness()
 })
 
@@ -438,7 +554,7 @@ test('OOM apply fences same-render duplicates, replacement failures, and unmount
   globalThis.__bannerStore = store
 
   let tree = render(OomRecoveryBanner)
-  const oldApply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Lower headroom to'))
+  const oldApply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Use safer setting'))
   const oldAttempt = oldApply.props.onClick()
   const duplicateAttempt = oldApply.props.onClick()
   assert.equal(calls, 1, 'imperative guard blocks a second click before rerender')
@@ -452,12 +568,12 @@ test('OOM apply fences same-render duplicates, replacement failures, and unmount
     },
   }]
   tree = render(OomRecoveryBanner)
-  assert.match(nodeText(tree), /Lower headroom to 0\.77/)
+  assert.match(nodeText(tree), /Use safer setting 77%/)
   assert.equal(oldSignal.aborted, true, 'replacement OOM aborts the superseded settings request')
   first.resolve({ ok: true, updated: { vram_safety_coefficient: 0.82 } })
   await oldAttempt
   tree = render(OomRecoveryBanner)
-  assert.match(nodeText(tree), /Lower headroom to 0\.77/)
+  assert.match(nodeText(tree), /Use safer setting 77%/)
   assert.equal(findNode(tree, node => node.props?.role === 'status'), null, 'old success cannot cover the replacement OOM')
 
   resetHarness()
@@ -478,7 +594,7 @@ test('OOM apply fences same-render duplicates, replacement failures, and unmount
     },
   }
   tree = render(OomRecoveryBanner)
-  const unmountedApply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Lower headroom to'))
+  const unmountedApply = findNode(tree, node => node.type === 'button' && nodeText(node).startsWith('Use safer setting'))
   const unmountedAttempt = unmountedApply.props.onClick()
   const stateBeforeCompletion = [...globalThis.__bannerState]
   unmountHarness()
@@ -518,6 +634,13 @@ test('delivery OOM keeps exact recovery source identity and inherits usable acti
   assert.match(actionGeometry.props.className, /\[&_button\]:min-w-11/)
   assert.match(actionGeometry.props.className, /\[&_button\]:focus-visible:ring-2/)
   assert.match(actionGeometry.props.className, /\[&_button\]:motion-reduce:transition-none/)
+
+  const recoverySource = await readFile(new URL('../src/components/H3DeliveryRecoveryStatus.tsx', import.meta.url), 'utf8')
+  assert.match(recoverySource, /Recovery is running\./)
+  assert.match(recoverySource, /Recovery is waiting in the generation queue\./)
+  assert.match(recoverySource, /Try delivery again using the saved original\. Generation will not run again, and machine settings will not change\./)
+  assert.match(recoverySource, /Use saved result/)
+  assert.doesNotMatch(recoverySource, /Recovery child|native result|denoise/i)
 })
 
 test('critical OOM recovery has explicit interaction priority over simultaneous preflight', async () => {

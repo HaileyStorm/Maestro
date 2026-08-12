@@ -10,7 +10,7 @@ const TEXTAREA_BASE =
 
 // Textarea that grows to fit its content (no inner scrollbar — the sidebar
 // already scrolls). Re-measures on every value change, so it also expands
-// when the LLM fills it in. A min-height keeps it from collapsing when empty.
+// when the writing assistant fills it in. A min-height keeps it from collapsing when empty.
 export function AutoGrowTextarea({
   value,
   onChange,
@@ -141,7 +141,7 @@ export function MusicControls() {
         </label>
       </div>
 
-      {/* Describe → let the LLM write it (optional — fields below are editable) */}
+      {/* Describe → ask the configured assistant for an editable draft */}
       <div className="space-y-2">
         <div>
           <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Describe your song</label>
@@ -166,7 +166,7 @@ export function MusicControls() {
         </button>
         {writeError && <p className="text-[10px] text-red-400 leading-snug">{writeError}</p>}
         <p className="text-[10px] text-text-muted leading-snug">
-          Let the LLM write the Style{instrumental ? '' : ' + Lyrics'} from your description — or just fill them in yourself below. Either way, edit and Generate.
+          Your configured AI writing assistant can draft the Style{instrumental ? '' : ' + Lyrics'} from your description. Review and edit the draft below, or write either field yourself, then Generate.
         </p>
       </div>
 

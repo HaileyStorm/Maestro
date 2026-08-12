@@ -408,6 +408,12 @@ test('Welcome and Recipes source geometry covers 320/390/430 widths and 320/767/
   assert.match(recipes, /min-h-11 min-w-11 shrink-0 items-center justify-center[^>]+>Dismiss/)
   assert.match(recipes, /confirmDelete !== card\.id/)
   assert.match(recipes, /setSettingsTab\('integrations'\); setSettingsOpen\(true\)/)
+  assert.match(recipes, /Automatic downloads from CivitAI require a free API key/)
+  assert.match(recipes, /Open download link/)
+  assert.match(recipes, /this session cannot install LoRAs/)
+  assert.match(recipes, /Install access required/)
+  assert.match(recipes, /Download started — track it in the download bar/)
+  assert.doesNotMatch(recipes, /Maestro host owner|host installation required|started ↓/)
 
   const utilities = await compile('@tailwind utilities;')
   const compiled = utilities.build([

@@ -1987,6 +1987,7 @@ class DirectorRecoveryTests(unittest.TestCase):
 
     def test_preparation_endpoint_issues_id_before_long_music_request(self):
         captured = {}
+        project_access_checks = []
 
         async def body_json():
             return {
@@ -2010,7 +2011,10 @@ class DirectorRecoveryTests(unittest.TestCase):
                 lambda _request, path, workspace: f"/{workspace}/{path}"
             ),
             "_require_project_access": (
-                lambda _request, workspace: f"/projects/{workspace}"
+                lambda _request, workspace, *, permission: (
+                    project_access_checks.append((workspace, permission))
+                    or f"/projects/{workspace}"
+                )
             ),
             "_register_director_preparation": register,
         }
@@ -2021,6 +2025,10 @@ class DirectorRecoveryTests(unittest.TestCase):
         self.assertEqual(response["director_request_id"], "d" * 32)
         self.assertEqual(response["actions"], ["generate_music"])
         self.assertNotIn("description", response)
+        self.assertEqual(
+            project_access_checks,
+            [("project-a", "project.generate")],
+        )
         self.assertEqual(
             captured["body"]["image_paths"],
             ["/project-a/reference.png"],

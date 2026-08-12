@@ -43,7 +43,7 @@ export function H3StyleWorkflowField({
     return (
       <div className="rounded border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-[9px] leading-relaxed text-amber-200">
         <p role="status">{error}</p>
-        <button type="button" onClick={() => void loadCatalog(true)} className="mobile-control-target mt-1 rounded border border-amber-400/40 px-2 py-0.5 text-[8px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry H3 catalog</button>
+        <button type="button" onClick={() => void loadCatalog(true)} className="mobile-control-target mt-1 rounded border border-amber-400/40 px-2 py-0.5 text-[8px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry creative guides</button>
       </div>
     )
   }
@@ -52,32 +52,35 @@ export function H3StyleWorkflowField({
   const sourceRevision = catalog?.source_revision || catalog?.revision || 'unknown'
   const provenance = catalog?.provenance
   return (
-    <fieldset aria-label={`${surface} H3 workflow`} className="rounded-lg border border-border bg-bg-tertiary/50 p-2">
-      <legend className="px-1 text-[10px] font-medium text-text-secondary">H3 workflow</legend>
+    <fieldset aria-label={`${surface} creative guide`} className="rounded-lg border border-border bg-bg-tertiary/50 p-2">
+      <legend className="px-1 text-[10px] font-medium text-text-secondary">Creative guide</legend>
       <select
-        aria-label={`${surface} H3 style workflow`}
+        aria-label={`${surface} creative guide`}
         value={selection}
         disabled={loading}
         onChange={event => setSelection(event.target.value)}
         className="mobile-control-target w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
       >
-        <option value="">No H3 workflow</option>
+        <option value="">Follow my prompt without a guide</option>
         {catalog?.styles.map(style => <option key={style.id} value={style.id}>{style.label}</option>)}
       </select>
       {selected && <p className="mt-1 text-[9px] leading-relaxed text-text-muted">{selected.description}</p>}
       <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-        Official MiniMax H3 Hub/canvas workflow metadata, adapted by Maestro as server-owned guidance. This does not reproduce the complete upstream workflow, and it stays separate from Visual style.
+        Choose an optional guide for pacing, framing, and finish. It works alongside Visual style; the original recipe may include details this guide does not apply.
       </p>
-      <p className="mt-1 text-[8px] leading-relaxed text-text-muted">
-        {catalog && <><a href={catalog.source} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Official source</a> · </>}
-        {catalog ? h3StyleWorkflowCatalogStateLabel(catalog) : 'Loading server catalog'} · source revision {sourceRevision}
-        {provenance?.prompt_brief_provenance === 'maestro_adapted' ? ' · Maestro-adapted brief' : ''}
-        {catalog?.update_error ? ' · last refresh unavailable' : ''}
-      </p>
+      <details className="mt-1 text-[8px] leading-relaxed text-text-muted">
+        <summary className="mobile-control-target inline-flex cursor-pointer items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Source details</summary>
+        <p className="mt-0.5">
+          {catalog && <><a href={catalog.source} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">MiniMax H3 recipe library</a> · </>}
+          {catalog ? h3StyleWorkflowCatalogStateLabel(catalog) : 'Loading guide catalog'} · revision {sourceRevision}
+          {provenance?.prompt_brief_provenance === 'maestro_adapted' ? ' · Maestro interpretation' : ''}
+          {catalog?.update_error ? ' · last refresh unavailable' : ''}
+        </p>
+      </details>
       {error && (
         <div className="mt-1 text-[8px] leading-relaxed text-amber-200">
           <p role="status">{error}</p>
-          <button type="button" onClick={() => void loadCatalog(true)} className="mobile-control-target mt-1 rounded border border-amber-400/40 px-2 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry H3 catalog</button>
+          <button type="button" onClick={() => void loadCatalog(true)} className="mobile-control-target mt-1 rounded border border-amber-400/40 px-2 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry creative guides</button>
         </div>
       )}
     </fieldset>
@@ -126,9 +129,9 @@ function useEnhanceStatus(
               if (matchesExpected && (filename.includes('mmproj') || filename.includes('projector'))) {
                 activity = 'Downloading vision projector'
               } else if (matchesExpected && loadingPhase === 'downloading_runtime') {
-                activity = 'Downloading accelerated LLM runtime'
+                activity = 'Downloading writing-assistant tools'
               } else if (matchesExpected && loadingPhase === 'building_runtime') {
-                activity = 'Building accelerated LLM runtime'
+                activity = 'Preparing writing-assistant tools'
               } else if (matchesExpected && loadingPhase === 'downloading') {
                 activity = `Downloading ${expectedModelLabel}`
               } else if (matchesExpected && loadingPhase) {
@@ -262,7 +265,7 @@ export function PromptInput() {
   const configuredEnhancerLabel = llmModels.find(model => model.id === configuredEnhancerId)?.label || configuredEnhancerId
   const enhancerModelLabel = wangpEnhancerMode > 0 && !needsH3Guide
     ? enhancerModeLabels[wangpEnhancerMode] || `Wan2GP enhancer mode ${wangpEnhancerMode}`
-    : configuredEnhancerLabel || 'Configured Director LLM'
+    : configuredEnhancerLabel || 'Configured writing assistant'
   const tracksEnhancerLlm = !(wangpEnhancerMode > 0 && !needsH3Guide)
   const enhanceStatus = useEnhanceStatus(
     isEnhancing,
@@ -340,7 +343,7 @@ export function PromptInput() {
         value={prompt}
         onChange={e => setParam('prompt', e.target.value)}
         placeholder={usesWindows
-          ? `Describe the whole video; add [00:00-00:10] timed beats for ${windowCount} automatic windows`
+          ? `Describe the whole video; add [00:00-00:10] timed beats for ${windowCount} planned ${usesSegmentedStudio ? 'shots' : 'sections'}`
           : modePlaceholder}
         className="w-full flex-1 rounded-lg border border-border bg-bg-tertiary px-3 py-2 pr-14 text-sm text-text-primary placeholder:text-text-muted transition-colors focus:border-accent-blue focus:outline-none md:pr-10"
         style={{ resize: 'none', minHeight: 112 }}
@@ -348,8 +351,8 @@ export function PromptInput() {
       {usesWindows && (
         <div className="px-1 pt-1 text-[10px] text-text-muted">
           {usesGlobalTimeline
-            ? `Global timeline detected — timestamps will be clipped and rebased automatically per ${usesSegmentedStudio ? 'segment' : 'window'}.`
-            : `Use [00:00-00:10] descriptions for one global timeline; plain lines remain one prompt per ${usesSegmentedStudio ? 'segment' : 'window'}.`}
+            ? `Full-video timing detected — timestamps are split across each planned ${usesSegmentedStudio ? 'shot' : 'section'} without changing their place in the video.`
+            : `Use [00:00-00:10] descriptions to time the whole video; plain lines provide one description per planned ${usesSegmentedStudio ? 'shot' : 'section'}.`}
         </div>
       )}
       {enhancerFooter && (

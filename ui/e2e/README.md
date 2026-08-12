@@ -12,17 +12,26 @@ From `ui/`:
 npm ci
 npm run test:e2e:install
 npm run check:e2e
-npm run test:e2e -- --project=desktop-firefox --project=android-like-chromium
+npm run test:e2e
 ```
 
 `check:e2e` compiles the harness and lists the checked-in Playwright suite as
 one explicit E2E gate. The ordinary product `build` does not invoke the harness
 or require its external cache/result volumes.
 
+The runner defaults to the `test` action and to the release-gate projects,
+desktop Firefox and Android-like Chromium. Any explicit `--project` selection
+replaces those defaults. WebKit remains available only by explicit opt-in:
+
+```sh
+npm run test:e2e -- --project=ios-like-webkit
+```
+
 The runner accepts only test-file filters plus `--grep`, `--grep-invert`,
 `--project`, and `--list`. It rejects configuration, output, reporter, trace,
 UI/debug, snapshot, and other Playwright overrides so command-line arguments
-cannot bypass the checked-in security and artifact settings.
+cannot bypass the checked-in security and artifact settings. The `install`
+action rejects additional arguments.
 
 Browser binaries, npm cache, Playwright results, and Vite cache must resolve to
 a different mounted filesystem or Windows volume from the checkout. The runner
@@ -73,13 +82,13 @@ The fixture also exercises the optional account UI without enabling real
 accounts or loading credentials. Deterministic, in-memory scenarios cover the
 accounts-disabled compatibility path, locally offered first-owner bootstrap,
 anonymous sign-in, authenticated owner and normal-user projections, recent
-owner confirmation, session inventory/revocation, sign-out, and the remote
-bootstrap boundary. The synthetic identities, passwords, nonces, sessions, and
-recovery codes exist only in the browser test process; no production account
-flags, cookies, passkeys, provider APIs, payments, or billing are used. These
-journeys verify that project/browser-session authority remains visibly separate
-from account state. They do not claim real credential, passkey, remote-device,
-or production account acceptance.
+owner confirmation, account-session inventory/sign-out, account sign-out, and
+the remote bootstrap boundary. The synthetic identities, passwords, nonces,
+sessions, and recovery codes exist only in the browser test process; no
+production account flags, cookies, passkeys, provider APIs, payments, or billing
+are used. These journeys verify that browser/project-password authority remains
+visibly separate from account state. They do not claim real credential,
+passkey, remote-device, or production account acceptance.
 
 CI images must provide Playwright's documented Linux browser dependencies.
 Android-like Chromium and iOS-like WebKit are browser emulations, not physical

@@ -30,11 +30,25 @@ from services.account_auth import (  # noqa: E402
     encode_account_session_cookie,
     resolve_account_capabilities,
 )
+from services.account_project_membership import (  # noqa: E402
+    AccountProjectMembershipStore,
+    ProjectMembershipConflictError,
+    ProjectMembershipError,
+    ProjectMembershipStoreUnavailableError,
+)
+from services.account_project_migration import (  # noqa: E402
+    AccountProjectMigrationLedger,
+    ProjectMigrationConflictError,
+    ProjectMigrationCorruptError,
+    ProjectMigrationError,
+    ProjectMigrationSafetyError,
+)
 from services.output_access import (  # noqa: E402
     SESSION_COOKIE_NAME,
     decode_session_cookie,
     encode_session_cookie,
 )
+from services.queue_recovery_adapter import ensure_project_instance_marker  # noqa: E402
 
 PASSWORD = "correct horse battery staple"
 SECOND_PASSWORD = "a different long password"
@@ -1546,6 +1560,520 @@ class AccountCapabilityTests(unittest.TestCase):
             "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED": "true",
         }, clear=True):
             self.assertTrue(namespace["_account_bootstrap_enabled"]())
+
+    def test_project_account_stores_are_lazy_and_disabled_paths_do_no_io(self):
+        module, path = self._launch_subset(
+            "_account_project_state_path",
+            "_account_project_migration_ledger",
+            "_account_project_membership_store",
+        )
+        calls = []
+
+        class _Ledger:
+            def __init__(self, path, _secret):
+                calls.append(("ledger", path))
+
+        class _Membership:
+            def __init__(self, path, _secret):
+                calls.append(("membership", path))
+
+        namespace = {
+            "os": os,
+            "threading": threading,
+            "AccountProjectMigrationLedger": _Ledger,
+            "AccountProjectMembershipStore": _Membership,
+            "_app_dir": "/app",
+            "_account_project_migration_lock": threading.Lock(),
+            "_account_project_migration_value": None,
+            "_account_project_membership_lock": threading.Lock(),
+            "_account_project_membership_value": None,
+            "_session_secret": lambda: b"x" * 32,
+        }
+        enabled = False
+        namespace["_accounts_enabled"] = lambda: enabled
+        exec(compile(module, str(path), "exec"), namespace)
+
+        self.assertIsNone(namespace["_account_project_migration_ledger"]())
+        self.assertIsNone(namespace["_account_project_membership_store"]())
+        self.assertEqual(calls, [])
+
+        enabled = True
+        with patch.dict(os.environ, {}, clear=True):
+            first_ledger = namespace["_account_project_migration_ledger"]()
+            first_membership = namespace["_account_project_membership_store"]()
+            self.assertIs(
+                first_ledger,
+                namespace["_account_project_migration_ledger"](),
+            )
+            self.assertIs(
+                first_membership,
+                namespace["_account_project_membership_store"](),
+            )
+        self.assertEqual(
+            calls,
+            [
+                ("ledger", "/app/storage/account-project-migration.json"),
+                ("membership", "/app/storage/account-project-membership.json"),
+            ],
+        )
+
+    def test_project_migration_state_enforces_only_after_complete_cutover(self):
+        module, path = self._launch_subset("_account_project_access_state")
+
+        class _Unavailable(Exception):
+            pass
+
+        class _Ledger:
+            value = None
+            reads = 0
+            root_matches = True
+
+            def load(self, *, required=False):
+                self.reads += 1
+                return self.value
+
+            def load_if_present(self):
+                self.reads += 1
+                return self.value
+
+            def matches_root(self, _ledger, _root):
+                return self.root_matches
+
+        class _Membership:
+            value = None
+            reads = 0
+
+            def load(self, *, required=False):
+                self.reads += 1
+                return self.value
+
+            def initialize_from_ledger(self, ledger, *, require_existing=False):
+                self.reads += 1
+                return self.value
+
+        ledger = _Ledger()
+        membership = _Membership()
+        enabled = False
+        namespace = {
+            "ProjectMigrationError": _Unavailable,
+            "ProjectMigrationConflictError": _Unavailable,
+            "ProjectMembershipError": _Unavailable,
+            "ProjectMembershipStoreUnavailableError": _Unavailable,
+            "_accounts_enabled": lambda: enabled,
+            "_account_project_migration_ledger": lambda: ledger,
+            "_account_project_membership_store": lambda: membership,
+            "_raise_project_setup_unavailable": (
+                lambda error: (_ for _ in ()).throw(error)
+            ),
+            "os": os,
+            "wgp": types.SimpleNamespace(
+                server_config={"save_path": "/outputs"},
+            ),
+        }
+        exec(compile(module, str(path), "exec"), namespace)
+
+        self.assertEqual(
+            namespace["_account_project_access_state"]()["state"],
+            "disabled",
+        )
+        self.assertEqual((ledger.reads, membership.reads), (0, 0))
+
+        enabled = True
+        self.assertEqual(
+            namespace["_account_project_access_state"]()["state"],
+            "not_started",
+        )
+        self.assertEqual((ledger.reads, membership.reads), (1, 1))
+
+        ledger.value = {"census": "sealed"}
+        membership.value = {
+            "projects": [{"id": "one"}],
+            "quarantine": [{"id": "two"}],
+        }
+        pending = namespace["_account_project_access_state"]()
+        self.assertEqual(pending["state"], "needs_attention")
+        self.assertFalse(pending["enforced"])
+        self.assertEqual(pending["needs_attention"], 1)
+
+        membership.value = {"projects": [{"id": "one"}], "quarantine": []}
+        active = namespace["_account_project_access_state"]()
+        self.assertEqual(active["state"], "active")
+        self.assertTrue(active["enforced"])
+
+        membership_reads = membership.reads
+        ledger.root_matches = False
+        with self.assertRaises(_Unavailable):
+            namespace["_account_project_access_state"]()
+        self.assertEqual(membership.reads, membership_reads)
+
+    def test_accounts_off_workspace_route_keeps_complete_legacy_view(self):
+        module, path = self._launch_subset(
+            "_account_project_access_state",
+            "_account_project_list_identities",
+            "_workspace_access_fields",
+            "list_workspaces_endpoint",
+        )
+
+        class _Unavailable(Exception):
+            pass
+
+        calls = {
+            "ledger": 0,
+            "membership": 0,
+            "identity": 0,
+            "account": 0,
+        }
+
+        def forbidden_call(key):
+            def call(*_args, **_kwargs):
+                calls[key] += 1
+                raise AssertionError(f"accounts-off route touched {key}")
+
+            return call
+
+        workspaces = [
+            {"name": "default", "path": "/outputs", "file_count": 1},
+            {"name": "valid", "path": "/outputs/valid", "file_count": 2},
+            {
+                "name": "missing-marker",
+                "path": "/outputs/missing-marker",
+                "file_count": 3,
+            },
+        ]
+        namespace = {
+            "Request": object,
+            "ProjectMigrationError": _Unavailable,
+            "ProjectMembershipError": _Unavailable,
+            "ProjectMembershipStoreUnavailableError": _Unavailable,
+            "QueueRecoveryAdapterError": _Unavailable,
+            "_accounts_enabled": lambda: False,
+            "_account_project_migration_ledger": forbidden_call("ledger"),
+            "_account_project_membership_store": forbidden_call("membership"),
+            "_require_account_store": forbidden_call("account"),
+            "_queue_recovery_existing_project_identity": forbidden_call(
+                "identity",
+            ),
+            "_raise_project_setup_unavailable": (
+                lambda error: (_ for _ in ()).throw(error)
+            ),
+            "permissions_for_role": lambda _role: frozenset(),
+            "_list_workspaces": lambda: list(workspaces),
+            "_project_access": types.SimpleNamespace(status=(
+                lambda name, *_args: types.SimpleNamespace(
+                    protected=name == "missing-marker",
+                    unlocked=True,
+                    remember_policy=None,
+                    unlock_expires_at=None,
+                    unlock_idle_expires_at=None,
+                )
+            )),
+            "_remote_active_projects": {},
+            "_remote_active_projects_lock": threading.RLock(),
+            "_get_active_workspace": lambda: "missing-marker",
+        }
+        exec(compile(module, str(path), "exec"), namespace)
+        request = types.SimpleNamespace(state=types.SimpleNamespace(
+            maestro_remote=False,
+            maestro_session_id="legacy-browser",
+            maestro_account_principal=None,
+        ))
+
+        listed = namespace["list_workspaces_endpoint"](request)
+
+        self.assertEqual(
+            [item["name"] for item in listed["workspaces"]],
+            ["default", "valid", "missing-marker"],
+        )
+        self.assertEqual(listed["active"], "missing-marker")
+        self.assertTrue(listed["workspaces"][-1]["password_protected"])
+        self.assertEqual(calls, {
+            "ledger": 0,
+            "membership": 0,
+            "identity": 0,
+            "account": 0,
+        })
+
+    def test_project_migration_route_keeps_all_projects_visible_until_complete(self):
+        module, path = self._launch_subset(
+            "_raise_project_setup_unavailable",
+            "_account_project_access_state",
+            "_account_project_list_identities",
+            "migrate_account_projects",
+            "_workspace_access_fields",
+            "list_workspaces_endpoint",
+        )
+
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        def exercise(*, unresolved):
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            root = Path(temporary.name) / "outputs"
+            valid = root / "valid"
+            valid.mkdir(parents=True)
+            ensure_project_instance_marker(root)
+            ensure_project_instance_marker(valid)
+            missing = root / "missing-marker"
+            if unresolved:
+                missing.mkdir()
+                hidden = root / ".hidden-project"
+                hidden.mkdir()
+                ensure_project_instance_marker(hidden)
+
+            secret = b"route-project-visibility" * 3
+            ledger = AccountProjectMigrationLedger(
+                Path(temporary.name) / "migration.json",
+                secret,
+            )
+            membership = AccountProjectMembershipStore(
+                Path(temporary.name) / "membership.json",
+                secret,
+            )
+            workspaces = [
+                {"name": "default", "path": str(root), "file_count": 1},
+                {"name": "valid", "path": str(valid), "file_count": 2},
+            ]
+            if unresolved:
+                workspaces.append({
+                    "name": "missing-marker",
+                    "path": str(missing),
+                    "file_count": 3,
+                })
+            owner_id = "1" * 32
+            request = types.SimpleNamespace(state=types.SimpleNamespace(
+                maestro_remote=False,
+                maestro_session_id="browser",
+                maestro_account_principal={"id": owner_id},
+            ))
+            namespace = {
+                "os": os,
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "ProjectMigrationError": ProjectMigrationError,
+                "ProjectMigrationConflictError": ProjectMigrationConflictError,
+                "ProjectMigrationCorruptError": ProjectMigrationCorruptError,
+                "ProjectMigrationSafetyError": ProjectMigrationSafetyError,
+                "ProjectMembershipError": ProjectMembershipError,
+                "ProjectMembershipConflictError": ProjectMembershipConflictError,
+                "ProjectMembershipStoreUnavailableError": (
+                    ProjectMembershipStoreUnavailableError
+                ),
+                "QueueRecoveryAdapterError": ValueError,
+                "_accounts_enabled": lambda: True,
+                "_require_account_project_migration_owner": lambda _request: {
+                    "id": owner_id,
+                },
+                "_require_account_store": lambda _request: object(),
+                "_account_project_migration_ledger": lambda: ledger,
+                "_account_project_membership_store": lambda: membership,
+                "_workspace_creation_lock": threading.RLock(),
+                "_workspace_lifecycle_lock": threading.RLock(),
+                "_workspaces_deleting": set(),
+                "_workspace_operations": {},
+                "_list_workspaces": lambda: list(workspaces),
+                "_workspace_has_busy_jobs": lambda *_args: False,
+                "_workspace_has_busy_director_pipeline": lambda *_args: False,
+                "_queue_recovery_existing_project_identity": lambda project: (
+                    membership.project_identity(
+                        marker=(
+                            Path(project) / ".maestro-project-instance"
+                        ).read_text(encoding="ascii").strip(),
+                    )
+                ),
+                "permissions_for_role": lambda _role: frozenset({
+                    "project.list", "project.open", "project.read",
+                }),
+                "_project_access": types.SimpleNamespace(status=(
+                    lambda name, *_args: types.SimpleNamespace(
+                        protected=name == "missing-marker",
+                        unlocked=True,
+                        remember_policy=None,
+                        unlock_expires_at=None,
+                        unlock_idle_expires_at=None,
+                    )
+                )),
+                "_remote_active_projects": {},
+                "_remote_active_projects_lock": threading.RLock(),
+                "_get_active_workspace": lambda: "default",
+                "wgp": types.SimpleNamespace(
+                    server_config={"save_path": str(root)},
+                ),
+            }
+            exec(compile(module, str(path), "exec"), namespace)
+            return namespace, request, workspaces, root, ledger, membership
+
+        (
+            pending,
+            pending_request,
+            workspaces,
+            root,
+            ledger,
+            membership,
+        ) = exercise(unresolved=True)
+        with self.assertRaises(FakeHTTPException) as blocked:
+            pending["migrate_account_projects"](pending_request)
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(
+            blocked.exception.detail,
+            {
+                "code": "project_migration_needs_attention",
+                "message": (
+                    "Some existing projects need attention before account "
+                    "access can be set up. Repair or remove them, then try again."
+                ),
+            },
+        )
+        self.assertFalse(ledger.path.exists())
+        self.assertFalse(Path(membership.path).exists())
+        self.assertFalse(
+            (ledger.path.parent / ".migration.json.lock").exists(),
+        )
+        pending_state = pending["_account_project_access_state"]()
+        self.assertEqual(pending_state["state"], "not_started")
+        self.assertFalse(pending_state["enforced"])
+        pending_list = pending["list_workspaces_endpoint"](pending_request)
+        self.assertEqual(
+            [item["name"] for item in pending_list["workspaces"]],
+            ["default", "valid", "missing-marker"],
+        )
+        self.assertTrue(pending_list["workspaces"][-1]["password_protected"])
+        self.assertNotIn("project_role", pending_list["workspaces"][-1])
+
+        ensure_project_instance_marker(root / "missing-marker")
+        hidden = root / ".hidden-project"
+        recovered = root / "recovered-hidden"
+        hidden.rename(recovered)
+        workspaces.append({
+            "name": "recovered-hidden",
+            "path": str(recovered),
+            "file_count": 0,
+        })
+        active_state = pending["migrate_account_projects"](pending_request)
+        self.assertEqual(active_state["state"], "active")
+        self.assertTrue(active_state["enforced"])
+        late = root / "created-after-cutover"
+        late.mkdir()
+        ensure_project_instance_marker(late)
+        workspaces.append({
+            "name": "created-after-cutover",
+            "path": str(late),
+            "file_count": 4,
+        })
+        active_list = pending["list_workspaces_endpoint"](pending_request)
+        self.assertEqual(
+            [item["name"] for item in active_list["workspaces"]],
+            ["default", "valid", "missing-marker", "recovered-hidden"],
+        )
+        self.assertTrue(all(
+            item["project_role"] == "owner"
+            for item in active_list["workspaces"]
+        ))
+
+    def test_explicit_project_migration_route_is_idempotent_on_synthetic_root(self):
+        module, path = self._launch_subset(
+            "_raise_project_setup_unavailable",
+            "_account_project_access_state",
+            "migrate_account_projects",
+        )
+
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "outputs"
+            child = root / "project-a"
+            child.mkdir(parents=True)
+            ensure_project_instance_marker(root)
+            ensure_project_instance_marker(child)
+            secret = b"route-project-migration" * 3
+            ledger = AccountProjectMigrationLedger(
+                Path(temporary) / "migration.json",
+                secret,
+            )
+            membership = AccountProjectMembershipStore(
+                Path(temporary) / "membership.json",
+                secret,
+            )
+            membership_initializations = 0
+            initialize_membership = membership.initialize_from_ledger
+
+            def counted_initialize(*args, **kwargs):
+                nonlocal membership_initializations
+                membership_initializations += 1
+                return initialize_membership(*args, **kwargs)
+
+            membership.initialize_from_ledger = counted_initialize
+            namespace = {
+                "os": os,
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "ProjectMigrationError": ProjectMigrationError,
+                "ProjectMigrationConflictError": ProjectMigrationConflictError,
+                "ProjectMigrationCorruptError": ProjectMigrationCorruptError,
+                "ProjectMigrationSafetyError": ProjectMigrationSafetyError,
+                "ProjectMembershipError": ProjectMembershipError,
+                "ProjectMembershipConflictError": ProjectMembershipConflictError,
+                "ProjectMembershipStoreUnavailableError": (
+                    ProjectMembershipStoreUnavailableError
+                ),
+                "_accounts_enabled": lambda: True,
+                "_require_account_project_migration_owner": lambda _request: {
+                    "id": "1" * 32,
+                },
+                "_account_project_migration_ledger": lambda: ledger,
+                "_account_project_membership_store": lambda: membership,
+                "_workspace_creation_lock": threading.RLock(),
+                "_workspace_lifecycle_lock": threading.RLock(),
+                "_workspaces_deleting": set(),
+                "_workspace_operations": {},
+                "_list_workspaces": lambda: [
+                    {"name": "default", "path": str(root)},
+                    {"name": "project-a", "path": str(child)},
+                ],
+                "_workspace_has_busy_jobs": lambda *_args: False,
+                "_workspace_has_busy_director_pipeline": lambda *_args: False,
+                "wgp": types.SimpleNamespace(
+                    server_config={"save_path": str(root)},
+                ),
+            }
+            exec(compile(module, str(path), "exec"), namespace)
+
+            first = namespace["migrate_account_projects"](object())
+            added = root / "created-after-cutover"
+            added.mkdir()
+            ensure_project_instance_marker(added)
+            second = namespace["migrate_account_projects"](object())
+            self.assertEqual(first, second)
+            self.assertEqual(first["state"], "active")
+            self.assertTrue(first["enforced"])
+            self.assertEqual(first["needs_attention"], 0)
+            saved = membership.load(required=True)
+            self.assertEqual(
+                saved["migration"]["classified_entries"],
+                saved["migration"]["bound_entries"]
+                + saved["migration"]["quarantined_entries"],
+            )
+            membership_bytes = Path(membership.path).read_bytes()
+            initialization_count = membership_initializations
+            other = Path(temporary) / "other-outputs"
+            other.mkdir()
+            namespace["wgp"].server_config["save_path"] = str(other)
+            with self.assertRaises(FakeHTTPException) as moved:
+                namespace["migrate_account_projects"](object())
+            self.assertEqual(moved.exception.status_code, 409)
+            self.assertEqual(
+                moved.exception.detail,
+                "Project setup no longer matches the current projects",
+            )
+            self.assertEqual(Path(membership.path).read_bytes(), membership_bytes)
+            self.assertEqual(membership_initializations, initialization_count)
 
     def test_account_context_reports_activation_readiness_without_remote_store_reads(self):
         module, path = self._launch_subset(

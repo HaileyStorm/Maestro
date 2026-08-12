@@ -85,6 +85,7 @@ def _load_launch_functions(names: set[str], namespace: dict) -> dict:
 def _w4a8_admission_namespace():
     """Load W4A8 admission paths without importing or invoking a model."""
     forbidden_events: list[str] = []
+    project_access_permissions: list[str] = []
     failed_preparations: list[dict] = []
     finished_jobs: list[tuple] = []
     capability_probes: list[bool] = []
@@ -109,6 +110,13 @@ def _w4a8_admission_namespace():
         }
 
     acceleration.get_h3_acceleration_status = unavailable_status
+
+    def require_project_generation(request, workspace, *, permission):
+        if permission != "project.generate":
+            raise AssertionError(f"unexpected project permission: {permission}")
+        project_access_permissions.append(permission)
+        return "/tmp/project"
+
     namespace = {
         "Request": _AdmissionRequest,
         "_GenerationPreparationRequest": object,
@@ -134,7 +142,8 @@ def _w4a8_admission_namespace():
         "_prepare_h3_long_studio_request": lambda body: None,
         "_validate_h3_lightx2v_recovery_identity": lambda body: None,
         "_get_active_workspace": lambda: "default",
-        "_require_project_access": lambda request, workspace: "/tmp/project",
+        "_require_project_access": require_project_generation,
+        "_project_access_permissions": project_access_permissions,
         "_reject_client_h3_internal_state": lambda body: None,
         "_reject_client_h3_turbo_validation_controls": lambda body: None,
         "_authorize_generation_media_inputs": (
@@ -518,7 +527,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("localStorage.setItem(H3_ATTENTION_ENGINE_KEY, restoredEngine)", store)
         self.assertIn("localStorage.setItem(H3_ATTENTION_ENGINE_KEY, engine)", store)
         self.assertIn("event.target.value === 'sage2' ? 'sage2' : 'sol_attn'", advanced)
-        self.assertIn("Official SageAttention2++ · {h3Acceleration?.sage2.validated ? 'Base validated' : 'unvalidated'}", advanced)
+        self.assertIn("Official SageAttention2++ · {h3Acceleration?.sage2.validated ? 'tested for Base H3' : 'not yet tested'}", advanced)
         self.assertIn("params.model_type !== 'minimax_h3'", advanced)
         transformer = _read(_APP / "models/minimax_h3/transformer.py")
         main = _read(_APP / "models/minimax_h3/minimax_h3_main.py")
@@ -703,6 +712,9 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         async def run_blocking(operation, *args, **kwargs):
             return operation(*args, **kwargs)
 
+        def require_project_generation(_request, _workspace, *, permission):
+            self.assertEqual(permission, "project.generate")
+
         namespace = {
             "Request": Request,
             "HTTPException": _HTTPException,
@@ -714,7 +726,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             "json": json,
             "_promote_external_llm_request": lambda _request: None,
             "_request_project_workspace": lambda _request, value: value,
-            "_require_project_access": lambda _request, _workspace: None,
+            "_require_project_access": require_project_generation,
             "_resolve_authorized_request_media": (
                 lambda _request, path, _workspace: path
             ),
@@ -956,6 +968,10 @@ class TestMiniMaxH3Definition(unittest.TestCase):
 
         self.assertEqual(preview_error.exception.status_code, 400)
         self.assertIn("W4A8 FL2VA is unavailable", preview_error.exception.detail)
+        self.assertEqual(
+            admission["_project_access_permissions"],
+            ["project.generate"],
+        )
         self.assertEqual(probes, [False, False, False])
         self.assertEqual(worker_admissions, ["w4a8-worker"])
         self.assertEqual(forbidden_events, [])

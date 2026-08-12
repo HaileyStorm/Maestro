@@ -42,17 +42,39 @@ const H3_MODEL_IDS = new Set<H3Model>([
 ])
 
 const MODEL_LABELS: Record<H3Model, string> = {
-  minimax_h3: 'FL2VA · frame anchor',
-  minimax_h3_pinkcherry_fl2va: 'PinkCherry FL2VA · explicit frame anchor',
-  minimax_h3_w4a8_fl2va: 'Kijai W4A8 FL2VA · experimental low-memory anchor',
-  minimax_h3_ref2va: 'Ref2VA · semantic/temporal refs',
+  minimax_h3: 'FL2VA · follows start and end frames',
+  minimax_h3_pinkcherry_fl2va: 'PinkCherry FL2VA · precise start and end frames',
+  minimax_h3_w4a8_fl2va: 'Kijai W4A8 FL2VA · experimental lower-memory option',
+  minimax_h3_ref2va: 'Ref2VA · follows reference images and recent motion',
 }
 
 const BOUNDARY_LABELS: Record<BoundaryType, string> = {
   continuous: 'Continuous motion',
   precut: 'Continue into cut',
   cut: 'Hard camera/scene cut',
-  transition: 'Transition boundary (conditioning)',
+  transition: 'Smooth transition',
+}
+
+const DURATION_MODE_LABELS: Record<DurationSnapMode, string> = {
+  manual: 'Edit segments',
+  nearest: 'Closest match',
+  down: 'Shorter match',
+}
+
+const DURATION_UNAVAILABLE_REASON_LABELS = new Map<string, string>([
+  ['Requested duration is outside the legal frame grid.', 'This length is not one of the available frame lengths.'],
+  ['Duration oracle call limit was reached.', 'Continuum could not verify another suggested length.'],
+  ['The authoritative planner found no legal candidate.', 'Continuum could not find a compatible suggested length.'],
+  ['No proven segment-efficient boundary satisfies the selected snap mode.', 'Continuum could not find a matching length it can confidently suggest.'],
+  ['The next segment is fixed, so no shorter option can be offered.', 'A fixed segment prevents a shorter suggested length.'],
+])
+
+function durationUnavailableReason(mode: Exclude<DurationSnapMode, 'manual'>, reason?: unknown): string {
+  const mapped = typeof reason === 'string' ? DURATION_UNAVAILABLE_REASON_LABELS.get(reason) : undefined
+  if (mapped) return mapped
+  return mode === 'down'
+    ? 'No shorter suggested length is available for this plan.'
+    : 'No nearby suggested length is available for this plan.'
 }
 
 export function H3GenerationPlanDialog() {
@@ -187,6 +209,11 @@ export function H3GenerationPlanDialog() {
     && boundaries.length === Math.max(0, plan.segments.length - 1),
   )
   const durationPlan = plan?.duration_plan
+  const durationOutcomeReason = durationPlan?.outcome === 'acceptable'
+    ? 'Continuum can use this length, but it does not exactly match your original target.'
+    : durationPlan?.outcome === 'insufficient_capacity'
+      ? 'The editable segments cannot be adjusted enough to reach your original target.'
+      : 'The current plan matches your original target.'
   const selectedSnapCandidate = durationSnapMode === 'manual'
     ? null
     : durationPlan?.snap_candidates[durationSnapMode]
@@ -226,18 +253,18 @@ export function H3GenerationPlanDialog() {
         available: model.is_downloaded === true,
         unavailable_reason: model.is_downloaded === true
           ? ''
-          : 'Availability requires a current server-authored generation plan.',
+          : 'This model is not available for the current plan.',
       }))
   const optionByModel = new Map(checkpointOptions.map(option => [option.model_type, option]))
   const getModelBlockedReason = (index: number, model: H3Model) => {
     const option = optionByModel.get(model)
-    if (!option) return 'This checkpoint is not in the server-managed H3 catalog.'
-    if (!option.available) return option.unavailable_reason || 'This checkpoint is unavailable.'
+    if (!option) return 'This model is not available for the current plan.'
+    if (!option.available) return option.unavailable_reason || 'This model is unavailable.'
     if (model === 'minimax_h3_ref2va' && plan?.segments[index]?.edge_anchor_locked) {
-      return 'Ref2VA cannot honor this segment’s supplied first/final-frame anchor.'
+      return 'Ref2VA cannot use the supplied start or end frame for this segment.'
     }
     if (!option.is_downloaded && !option.auto_download) {
-      return 'This checkpoint is not installed and has no managed download.'
+      return 'This model is not installed and cannot be downloaded automatically.'
     }
     return ''
   }
@@ -262,7 +289,7 @@ export function H3GenerationPlanDialog() {
       ) return
       const blockedIndex = models.findIndex((model, index) => getModelBlockedReason(index, model))
       if (blockedIndex >= 0) {
-        window.alert(getModelBlockedReason(blockedIndex, models[blockedIndex]) || 'This checkpoint is unavailable for the selected segment.')
+        window.alert(getModelBlockedReason(blockedIndex, models[blockedIndex]) || 'This model is unavailable for the selected segment.')
         return
       }
       if (models.includes('minimax_h3_ref2va') && !ref2vaTermsAccepted) {
@@ -370,9 +397,9 @@ export function H3GenerationPlanDialog() {
           <div className="min-w-0 flex-1">
             <h2 id="h3-plan-dialog-title" className="text-sm font-semibold text-text-primary">Review long-video plan</h2>
             <p id="h3-plan-dialog-description" className="mt-0.5 text-[11px] text-text-muted">
-              Planned segments {plan.clip_count} · {(planPublishedFrames / planFps).toFixed(2)}s published
+              {plan.clip_count} segment{plan.clip_count === 1 ? '' : 's'} · {(planPublishedFrames / planFps).toFixed(2)}s final video
               {plan.planned_frames !== planPublishedFrames && ` · ${(plan.planned_frames / planFps).toFixed(2)}s generated`}
-              {' '}· {switchCount} checkpoint switch{switchCount === 1 ? '' : 'es'}
+              {' '}· {switchCount} model change{switchCount === 1 ? '' : 's'}
             </p>
             {planEstimate && (
               <p className="mt-0.5 text-[10px] text-text-muted" title={`Confidence: ${planEstimate.confidence}. ${planEstimate.uncertainty_reasons.join('; ')}`}>
@@ -396,13 +423,13 @@ export function H3GenerationPlanDialog() {
         <div className="min-h-0 overflow-y-auto overscroll-contain flex-1 p-4 [-webkit-overflow-scrolling:touch]">
           <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-[10px] text-text-secondary">
             <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-400" />
-            <span>FL2VA continues motion from frame anchors. Ref2VA uses semantic references and recent context. A final end frame locks the last segment to FL2VA. Semantic references remain attached to the plan but are not consumed by FL2VA segments.</span>
+            <span>Choose FL2VA when exact start or end frames matter. Choose Ref2VA when reference images and recent motion matter. If you supplied a final frame, the last segment must use FL2VA. FL2VA keeps your references saved but does not use them.</span>
           </div>
           {needsRef2VA && (
             <div className="mb-3 rounded-lg border border-violet-500/30 bg-violet-500/5 p-2.5 text-[10px] text-text-secondary">
               <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-start">
                 <span className="flex-1">
-                  {ref2vaTermsAccepted ? 'MiniMax H3 Ref2VA model terms are accepted for this host. ' : `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
+                  {ref2vaTermsAccepted ? 'MiniMax H3 Ref2VA model terms are accepted on this computer. ' : `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
                   <a href={HOST_TERM_NOTICES.minimax_h3_ref2va.href} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">{HOST_TERM_NOTICES.minimax_h3_ref2va.linkLabel}</a>.
                 </span>
                 {!ref2vaTermsAccepted && hostTerms && (
@@ -412,7 +439,7 @@ export function H3GenerationPlanDialog() {
                     onClick={() => { void acceptHostTerm('minimax_h3_ref2va') }}
                     className="min-h-11 w-full shrink-0 rounded border border-violet-400/50 px-3 py-2 text-violet-200 transition-colors hover:bg-violet-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300 disabled:opacity-50 sm:w-auto"
                   >
-                    Accept for this host
+                    Accept on this computer
                   </button>
                 )}
               </div>
@@ -423,48 +450,59 @@ export function H3GenerationPlanDialog() {
           )}
           {missingModels.length > 0 && (
             <div className="mb-3 rounded-lg border border-blue-500/25 bg-blue-500/5 p-2.5 text-[10px] text-text-secondary">
-              Will auto-download after approval: {missingModels.map(option => MODEL_LABELS[option.model_type]).join(', ')}. These are server-managed checkpoints; this plan never selects a custom URL.
+              Continuum will download these models after you approve: {missingModels.map(option => MODEL_LABELS[option.model_type]).join(', ')}. Downloads come from Continuum’s built-in model list.
             </div>
           )}
 
           {durationPlan && (
             <section aria-labelledby="h3-duration-controls-title" className="mb-3 space-y-3 rounded-lg border border-border bg-bg-primary/30 p-3">
               <div>
-                <h3 id="h3-duration-controls-title" className="text-xs font-semibold text-text-primary">Published duration</h3>
+                <h3 id="h3-duration-controls-title" className="text-xs font-semibold text-text-primary">Final video length</h3>
                 <p className="mt-0.5 text-[10px] leading-relaxed text-text-muted">
-                  Keep the manual plan or choose a server-authored segment-efficient boundary. All frame geometry is verified again by the server at approval.
+                  Edit the segments yourself, or choose a suggested length. Continuum checks every frame count when you approve.
                 </p>
               </div>
               <fieldset disabled={reviewLoading} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-3">
                 <legend className="sr-only">Duration mode</legend>
                 {(['manual', 'nearest', 'down'] as const).map(mode => {
                   const candidate = mode === 'manual' ? null : durationPlan.snap_candidates[mode]
+                  const technicalReason = typeof candidate?.reason === 'string' && candidate.reason.trim()
+                    ? candidate.reason
+                    : null
                   const available = mode === 'manual' || Boolean(
                     candidate?.applied
                     && candidate.confidence === 'high'
                     && candidate.candidate_published_frames != null,
                   )
                   const detail = mode === 'manual'
-                    ? `${durationPlan.current_published_frames} published frames`
+                    ? `${durationPlan.current_published_frames} frames in final video`
                     : available
                       ? `${candidate?.candidate_published_frames} frames · ${candidate?.segment_count} segments`
-                      : candidate?.reason || 'Unavailable for this plan'
+                      : durationUnavailableReason(mode, candidate?.reason)
                   return (
-                    <label key={mode} className={`flex min-h-11 min-w-0 items-start gap-2 rounded border px-3 py-2 ${available ? 'border-border bg-bg-secondary' : 'border-border/60 bg-bg-tertiary/30 opacity-60'}`}>
-                      <input
-                        type="radio"
-                        name="h3-duration-mode"
-                        value={mode}
-                        checked={durationSnapMode === mode}
-                        disabled={!available || reviewLoading}
-                        onChange={() => setDurationSnapMode(mode)}
-                        className="mt-0.5"
-                      />
-                      <span className="min-w-0">
-                        <span className="block text-[10px] font-semibold capitalize text-text-primary">{mode}</span>
-                        <span className="block break-words text-[9px] leading-relaxed text-text-muted">{detail}</span>
-                      </span>
-                    </label>
+                    <div key={mode} className={`min-h-11 min-w-0 rounded border px-3 py-2 ${available ? 'border-border bg-bg-secondary' : 'border-border/60 bg-bg-tertiary/30 opacity-60'}`}>
+                      <label className="flex min-w-0 items-start gap-2">
+                        <input
+                          type="radio"
+                          name="h3-duration-mode"
+                          value={mode}
+                          checked={durationSnapMode === mode}
+                          disabled={!available || reviewLoading}
+                          onChange={() => setDurationSnapMode(mode)}
+                          className="mt-0.5"
+                        />
+                        <span className="min-w-0">
+                          <span className="block text-[10px] font-semibold text-text-primary">{DURATION_MODE_LABELS[mode]}</span>
+                          <span className="block break-words text-[9px] leading-relaxed text-text-muted">{detail}</span>
+                        </span>
+                      </label>
+                      {!available && technicalReason && (
+                        <details className="ml-5 mt-1 text-[9px] leading-relaxed text-text-muted">
+                          <summary className="cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Technical details</summary>
+                          <p className="mt-1 break-words">{technicalReason}</p>
+                        </details>
+                      )}
+                    </div>
                   )
                 })}
               </fieldset>
@@ -475,8 +513,8 @@ export function H3GenerationPlanDialog() {
                   return (
                     <label key={segment.index} className="min-w-0 rounded border border-border/70 p-2 text-[10px] text-text-secondary">
                       <span className="flex min-w-0 items-center justify-between gap-2">
-                        <span className="font-semibold text-text-primary">Segment {segment.index} published frames</span>
-                        {locked && <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[9px] text-amber-200">Locked</span>}
+                        <span className="font-semibold text-text-primary">Segment {segment.index} frames in final video</span>
+                        {locked && <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[9px] text-amber-200">Cannot edit</span>}
                       </span>
                       <input
                         type="number"
@@ -486,7 +524,7 @@ export function H3GenerationPlanDialog() {
                         step={segment.grid_step}
                         value={durationFrames[index] ?? segment.published_frames}
                         disabled={reviewLoading || durationSnapMode !== 'manual' || locked}
-                        aria-label={`Published frames for segment ${segment.index}`}
+                        aria-label={`Final video frames for segment ${segment.index}`}
                         onChange={event => {
                           const value = event.currentTarget.valueAsNumber
                           setDurationFrames(values => values.map((current, itemIndex) => itemIndex === index ? value : current))
@@ -494,8 +532,9 @@ export function H3GenerationPlanDialog() {
                         className="mt-1 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-sm text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-60"
                       />
                       <span className="mt-1 block break-words text-[9px] text-text-muted">
-                        Server range {segment.min_published_frames}–{segment.max_published_frames}f
-                        {locked && ` · ${segment.lock_reason || 'server locked'}`}
+                        Allowed range {segment.min_published_frames}–{segment.max_published_frames} frames
+                        {segment.completed_locked && ' · already generated'}
+                        {segment.authored_locked && !segment.completed_locked && ' · fixed by the original plan'}
                       </span>
                     </label>
                   )
@@ -508,12 +547,12 @@ export function H3GenerationPlanDialog() {
                   value={durationRedistribution}
                   disabled={reviewLoading || durationSnapMode !== 'manual'}
                   onChange={event => setDurationRedistribution(event.currentTarget.value as DurationRedistribution)}
-                  aria-label="Duration redistribution"
+                aria-label="How to keep the original video length"
                   className="mt-1 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[11px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-60"
                 >
-                  <option value="none">None · allow a visible mismatch</option>
-                  <option value="next">Adjust the next unlocked segment</option>
-                  <option value="future">Distribute across future unlocked segments</option>
+                  <option value="none">Allow the final length to differ</option>
+                  <option value="next">Adjust the next editable segment</option>
+                  <option value="future">Spread the adjustment across later editable segments</option>
                 </select>
               </label>
 
@@ -523,14 +562,14 @@ export function H3GenerationPlanDialog() {
                 currentGeneratedFrames={durationPlan.current_generated_frames}
                 currentMinusTargetFrames={-durationPlan.residual_published_frames}
                 outcome={durationPlan.outcome}
-                reason={durationPlan.reason}
+                reason={durationOutcomeReason}
               />
               <p role="status" className="break-words text-[9px] leading-relaxed text-text-muted">
-                This bar shows the current frozen server plan. Manual edits or a selected snap are verified and applied by the server when you approve; the browser does not estimate revised frame totals.
+                This chart shows the saved plan. Your changes are checked and applied when you approve, so the totals update after approval.
               </p>
               {durationSnapMode === 'manual' && !durationEditsReady && (
                 <p role="alert" className="break-words text-[9px] leading-relaxed text-red-300">
-                  Each edited segment must stay on its server-authored frame grid and within its unlocked range.
+                  Enter a value within the shown range, using the allowed step size.
                 </p>
               )}
             </section>
@@ -549,7 +588,7 @@ export function H3GenerationPlanDialog() {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-xs font-semibold text-text-primary">Segment {segment.index}</span>
                     <span className="text-[10px] text-text-muted">
-                      {publishedSeconds.toFixed(2)}s published · {publishedFrames}f
+                      {publishedSeconds.toFixed(2)}s final video · {publishedFrames}f
                       {generatedFrames !== publishedFrames && ` · ${generatedSeconds.toFixed(2)}s generated · ${generatedFrames}f`}
                     </span>
                     {index > 0 && (
@@ -559,7 +598,7 @@ export function H3GenerationPlanDialog() {
                     )}
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <select disabled={!editsReady || reviewLoading} value={models[index]} onChange={event => changeModel(index, event.target.value as H3Model)} aria-label={`Checkpoint for segment ${segment.index}`} className="min-h-11 max-w-full rounded border border-border bg-bg-primary px-2 py-1 text-[11px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
+                    <select disabled={!editsReady || reviewLoading} value={models[index]} onChange={event => changeModel(index, event.target.value as H3Model)} aria-label={`Model for segment ${segment.index}`} className="min-h-11 max-w-full rounded border border-border bg-bg-primary px-2 py-1 text-[11px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                       {checkpointOptions.map(option => (
                         <option
                           key={option.model_type}
@@ -575,20 +614,24 @@ export function H3GenerationPlanDialog() {
                         {modelStatus(selectedOption)}
                       </span>
                     )}
-                    <span className="text-[10px] text-text-muted">{segment.model_reason}</span>
+                    <span className="text-[10px] text-text-muted">
+                      {models[index] === 'minimax_h3_ref2va'
+                        ? 'Uses reference images and recent motion'
+                        : 'Follows this segment’s frame anchors'}
+                    </span>
                     {segment.edge_anchor_locked && (
                       <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[9px] text-sky-200">
-                        {index === plan.segments.length - 1 ? 'Final end frame reserved' : 'First frame reserved'}
+                        {index === plan.segments.length - 1 ? 'Uses your final frame' : 'Uses your first frame'}
                       </span>
                     )}
                     {index > 0 && (
                       <span className="text-[9px] text-text-muted">
-                        {models[index] === models[index - 1] ? 'Checkpoint retained' : 'Checkpoint switch'}
+                        {models[index] === models[index - 1] ? 'Same model as previous segment' : 'Model changes here'}
                       </span>
                     )}
                   </div>
                   {models[index] !== 'minimax_h3_ref2va' && (
-                    <p className="mt-1 text-[9px] text-text-muted">FL2VA uses this segment's frame/continuity anchors; supplied semantic references are not applied on this segment.</p>
+                    <p className="mt-1 text-[9px] text-text-muted">FL2VA follows this segment’s start, end, and continuity frames. It keeps reference images saved but does not use them for this segment.</p>
                   )}
                   {selectedBlockedReason && (
                     <p className="mt-1 text-[9px] text-red-300">Unavailable: {selectedBlockedReason}</p>
@@ -605,11 +648,11 @@ export function H3GenerationPlanDialog() {
             <p role="status" aria-live="polite" className="mt-1 text-amber-200">
               {reviewSecondsRemaining == null
                 ? !ref2vaTermsAccepted && (planReviewTermsRequired || needsRef2VA)
-                  ? 'Approval required to accept Ref2VA terms'
-                  : 'Explicit plan approval required'
+                  ? 'Accept the Ref2VA terms before approving'
+                  : 'Review the plan, then approve to continue'
                 : reviewSecondsRemaining > 0
-                  ? `Server auto-accepts this frozen plan in ${Math.ceil(reviewSecondsRemaining)}s`
-                  : 'Server is auto-accepting this frozen plan…'}
+                  ? `Continuum will approve the saved plan unchanged in ${Math.ceil(reviewSecondsRemaining)}s`
+                  : 'Approving the saved plan unchanged…'}
             </p>
             {reviewError && <p role="alert" className="mt-1 text-red-300">{reviewError}</p>}
           </div>

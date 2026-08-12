@@ -223,13 +223,13 @@ export function LoraBrowser() {
     setImporting(true)
     const trimmed = importUrl.trim()
     const isCivitai = /civitai\.com/i.test(trimmed)
-    setImportStatus(isCivitai ? 'Resolving CivitAI model…' : 'Parsing HuggingFace repo…')
+    setImportStatus(isCivitai ? 'Checking CivitAI link…' : 'Checking Hugging Face link…')
     try {
       // Backend endpoint dispatches by URL type — both HuggingFace and
       // CivitAI URLs route through the same /huggingface/import-lora
       // endpoint (historical name; now handles both).
       const result = await importHuggingFaceLora(trimmed)
-      setImportStatus(`Downloading ${result.filename} → ${result.target_dir}/ (base: ${result.base_model || 'auto-detected'})`)
+      setImportStatus(`Downloading ${result.filename}. Follow progress in the download bar.`)
       setImportUrl('')
       pollDownloads()
       // The download runs in background on the server — it'll appear in the download bar
@@ -353,17 +353,17 @@ export function LoraBrowser() {
                 }
               }}
               className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-bg-tertiary border border-border rounded-lg hover:border-indicator-warning text-text-secondary hover:text-indicator-warning transition-colors shrink-0"
-              title="Regenerate ALL guides (overwrites existing)"
+              title="Regenerate all guides and replace the existing guides"
             >
               <span className="hidden sm:inline">Regenerate All</span>
-              <span className="sm:hidden">Regen</span>
+              <span className="sm:hidden">Redo all</span>
             </button>
             <button
               onClick={() => setShowUrlImport(!showUrlImport)}
               className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-bg-tertiary border rounded-lg transition-colors shrink-0 ${
                 showUrlImport ? 'border-accent-blue text-accent-blue' : 'border-border text-text-secondary hover:border-accent-blue hover:text-accent-blue'
               }`}
-              title="Import LoRA from HuggingFace or CivitAI URL"
+              title="Import a LoRA from a Hugging Face or CivitAI URL"
             >
               <Link2 size={12} />
               <span className="hidden sm:inline">Import URL</span>
@@ -385,7 +385,7 @@ export function LoraBrowser() {
                 type="text"
                 value={importUrl}
                 onChange={e => setImportUrl(e.target.value)}
-                placeholder="HuggingFace repo or CivitAI model URL"
+                placeholder="Hugging Face repo or CivitAI model URL"
                 className="flex-1 bg-bg-secondary border border-border rounded-lg px-3 py-1.5 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue"
                 onKeyDown={e => {
                   if (e.key === 'Enter' && importUrl.trim() && !importing) {
@@ -403,7 +403,7 @@ export function LoraBrowser() {
               </button>
             </div>
             <p className="text-[9px] text-text-muted">
-              Paste a HuggingFace model URL. Downloads the LoRA, saves metadata, example media, and generates a usage guide.
+              Paste a Hugging Face repository or CivitAI model URL. Maestro downloads the LoRA, saves its details and example media, and creates a usage guide.
             </p>
             {importStatus && (
               <div className={`text-[10px] ${importStatus.startsWith('Error') ? 'text-red-400' : 'text-accent-blue'}`}>
@@ -744,7 +744,7 @@ export function LoraBrowser() {
                         {lora.linked && (
                           <span
                             className="text-[9px] px-1.5 py-0.5 rounded bg-accent-blue/70 text-white"
-                            title="From a linked install's loras folder (read-only) — guides and metadata are stored in Maestro"
+                            title="This LoRA is stored in another installation. You can use it here, but manage its file there; Maestro keeps its guide and details."
                           >
                             Linked
                           </span>
@@ -777,7 +777,7 @@ export function LoraBrowser() {
                     {!lora.civitai_model_id && (
                       <div className="absolute top-1.5 right-1.5">
                         <span className={`text-[8px] px-1 py-0.5 rounded bg-black/60 ${lora.hf_repo_id ? 'text-amber-300/80' : 'text-white/50'}`}>
-                          {lora.hf_repo_id ? 'HuggingFace' : 'Local only'}
+                          {lora.hf_repo_id ? 'Hugging Face' : 'Local only'}
                         </span>
                       </div>
                     )}

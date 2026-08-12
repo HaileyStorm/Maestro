@@ -238,19 +238,19 @@ class BlenderLaunchIntegrationTests(unittest.TestCase):
         self.assertIn("compact\n", refs)
         self.assertIn('aria-label="Reference creation method"', refs)
         self.assertIn("Blender Motion Video", refs)
-        self.assertIn("does not remove Blender from Tools", refs)
+        self.assertIn("Blender also remains available under Tools.", refs)
         self.assertIn("aria-hidden={!active}", refs)
         self.assertIn("\n      hidden={!active}", refs)
         self.assertIn("<ProjectReferenceLibrary active={isReference} />", sidebar)
         self.assertIn("planBlenderScene", component)
-        self.assertIn("Run Director review → full video", component)
+        self.assertIn("Plan, review, and render", component)
         self.assertIn("finalizeBlenderScene", component)
         self.assertIn("Keep motion video", component)
         self.assertNotIn("Approve reference", component)
         self.assertNotIn("Approve & sample", component)
         self.assertIn("review_frames", component)
         self.assertIn("const endFrame = frameCount - 1", component)
-        self.assertIn("hosted limit", component)
+        self.assertIn("Maestro limit", component)
 
     def test_no_camera_error_is_actionable_without_exposing_host_paths(self):
         blender_error = _load_functions("_blender_error")["_blender_error"]
@@ -348,7 +348,7 @@ class BlenderLaunchIntegrationTests(unittest.TestCase):
         self.assertNotIn("addCharacterRef", video_apply)
         self.assertNotIn("addLocationRef", video_apply)
         self.assertIn(
-            "Apply to Generate: LTX-2.3 control + semantic prompt", library,
+            "Use in Generate as an LTX-2.3 control and prompt", library,
         )
 
 

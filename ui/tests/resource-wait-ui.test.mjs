@@ -207,7 +207,7 @@ const cpuDescriptor = {
   execution_attempt: 7,
 }
 
-test('standard text execution is named GPU text with a concrete CPU contrast', async () => {
+test('standard text execution is described as accelerated text', async () => {
   const { describeResourceExecution } = await loadJobPlaceholder()
   const running = describeResourceExecution({
     intent: 'text',
@@ -217,10 +217,9 @@ test('standard text execution is named GPU text with a concrete CPU contrast', a
     state: 'running',
     execution_attempt: 1,
   })
-  assert.equal(running.label, 'GPU text')
-  assert.match(running.title, /planning or review text step/i)
-  assert.match(running.title, /GPU execution/i)
-  assert.match(running.title, /CPU-only text lane/i)
+  assert.equal(running.label, 'Text using GPU acceleration')
+  assert.match(running.title, /planning or review task/i)
+  assert.match(running.title, /GPU acceleration/i)
 
   const queued = describeResourceExecution({
     intent: 'text',
@@ -230,7 +229,7 @@ test('standard text execution is named GPU text with a concrete CPU contrast', a
     state: 'queued',
     execution_attempt: 1,
   })
-  assert.equal(queued.label, 'GPU text queued')
+  assert.equal(queued.label, 'Accelerated text queued')
 })
 
 test('status and queue mappers preserve the bounded resource descriptor across legacy responses', async () => {
@@ -442,7 +441,7 @@ test('status mappings preserve terminal Reference child correlation and allowlis
   assert.equal(Object.hasOwn(legacy, 'failureDetails'), false)
 })
 
-test('resource-wait job card renders durable queued copy without execution warnings', async t => {
+test('resource-wait job card clearly remains queued without execution warnings', async t => {
   const previousStore = globalThis.__resourceWaitStore
   globalThis.__resourceWaitStore = {
     accessContext: { machine_controls: false },
@@ -469,14 +468,14 @@ test('resource-wait job card renders durable queued copy without execution warni
     onDismiss() {},
   })
   const elements = flattenElements(tree)
-  const wait = elements.find(element => elementText(element) === 'Waiting for generation resources')
+  const wait = elements.find(element => elementText(element) === 'Waiting for available GPU resources')
   assert.ok(wait)
   assert.equal(
     wait.props.title,
-    'This job is durably queued and will start when the generation lane is available.',
+    'This generation is still in the queue. It will start when enough GPU resources are available, without interrupting a generation already running.',
   )
   const renderedText = elementText(tree)
-  assert.match(renderedText, /GPU generation queued/)
+  assert.match(renderedText, /Generation queued/)
   assert.doesNotMatch(renderedText, /CPU|restart|fairness|residen|preempt/i)
 })
 
@@ -580,7 +579,7 @@ test('Reference queue card presents recommended fidelity without exposing privat
   assert.match(text, /Reference packs ready/)
   assert.doesNotMatch(text, /Overall ETA/)
   assert.match(text, /Recommended · Fidelity review deferred · Ungraded/)
-  assert.match(text, /Preliminary recommendation · ungraded/)
+  assert.match(text, /Early recommendation · not graded yet/)
   assert.match(text, /remains usable/)
   assert.match(text, /2 candidates remain available in Reference/)
   assert.doesNotMatch(text, /provider|exception|private|commitment/i)
@@ -612,7 +611,7 @@ test('Reference queue card presents recommended fidelity without exposing privat
   const residualText = elementText(residualTree)
   assert.match(residualText, /Recommended · Fidelity reviewed · Minor residuals · 83\.5%/)
   assert.match(residualText, /Differences: style, identity/)
-  assert.match(residualText, /Structured correction guidance is available/)
+  assert.match(residualText, /Suggestions for improving the result are available/)
   assert.match(residualText, /remains usable/)
 
   const source = await readFile(mainUrl, 'utf8')
@@ -716,6 +715,7 @@ test('Reference parent failure renders only allowlisted child diagnostics', asyn
   globalThis.__resourceWaitStore = {
     accessContext: { machine_controls: false },
     hostTerms: { minimax_h3_ref2va: { accepted: true } },
+    models: [],
   }
   t.after(() => { globalThis.__resourceWaitStore = previousStore })
 
@@ -741,7 +741,25 @@ test('Reference parent failure renders only allowlisted child diagnostics', asyn
       },
     },
     onStop() {},
-    onDismiss() {},
+    onDismiss() { globalThis.__resourceWaitDismissed = true },
+    logOpen: true,
+    logEvents: [{
+      at: 1,
+      status: 'waiting_for_plan_approval',
+      progress: 20,
+      message: 'Plan ready',
+      phase: 'planning_generation',
+      step: 1,
+      total_steps: 5,
+    }, {
+      at: 2,
+      status: 'server_only_status',
+      progress: 25,
+      message: 'Still working',
+      phase: 'server_phase',
+      step: 1,
+      total_steps: 5,
+    }],
   })
   const text = elementText(tree)
   assert.match(text, /Reference Generation Failed/)
@@ -749,11 +767,118 @@ test('Reference parent failure renders only allowlisted child diagnostics', asyn
     element.type?.name === 'CopyableJobId' && element.props?.jobId === 'deadbeef'
   ))
   assert.equal(childId?.props.label, 'Child job ID')
-  assert.match(text, /Child status: failed/)
+  assert.match(text, /Child status: Failed/)
   assert.match(text, /Reason: reference_child_failed/)
   assert.match(text, /Code: reference_image_generation_failed/)
   assert.match(text, /Detail: The image worker stopped before publishing an output\./)
+  assert.match(text, /Waiting for plan review · 20%/)
+  assert.match(text, /Status update · 25%/)
+  assert.doesNotMatch(text, /server_only_status/)
   assert.doesNotMatch(text, /private\/path|traceback|nested|raw/)
+
+  const dismiss = flattenElements(tree).find(element => element.props?.['aria-label'] === 'Dismiss generation')
+  assert.equal(dismiss?.props.title, 'Dismiss generation')
+  assert.equal(dismiss?.props.type, 'button')
+  globalThis.__resourceWaitDismissed = false
+  dismiss.props.onClick()
+  assert.equal(globalThis.__resourceWaitDismissed, true)
+})
+
+test('queue card uses catalog model names and bounded segment presentation', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+    models: [{ model_type: 'minimax_h3_pinkcherry_fl2va', name: 'Catalog PinkCherry Model' }],
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+
+  const segment = (index, modelType, modelReason, boundaryType) => ({
+    index,
+    frames: 49,
+    duration_seconds: 2,
+    generated_frames: 49,
+    published_frames: 49,
+    generated_duration_seconds: 2,
+    published_duration_seconds: 2,
+    model_type: modelType,
+    model_reason: modelReason,
+    edge_anchor_locked: false,
+    switch_from_previous: index > 1,
+    boundary_from_previous: boundaryType ? { type: boundaryType, at_seconds: 2, source: 'server' } : null,
+  })
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const tree = JobPlaceholder({
+    job: {
+      id: 'catalog-card',
+      status: 'running',
+      progress: 0.2,
+      step: 2,
+      totalSteps: 10,
+      phase: 'Generating',
+      message: '',
+      outputFiles: [],
+      error: null,
+      workspace: 'project-a',
+      modelType: 'minimax_h3_pinkcherry_fl2va',
+      windowCurrent: 2,
+      windowTotal: 3,
+      currentSegmentModel: 'minimax_h3_pinkcherry_fl2va',
+      currentSegmentReason: 'raw_current_model_reason',
+      h3SegmentPlan: {
+        kind: 'h3_segments',
+        clip_count: 3,
+        fps: 24,
+        requested_frames: 147,
+        planned_frames: 147,
+        published_frames: 147,
+        adaptive_conditioning: true,
+        checkpoint_switches: 2,
+        segments: [
+          segment(1, 'minimax_h3_pinkcherry_fl2va', 'raw_catalog_reason', null),
+          segment(2, 'minimax_h3_ref2va', 'raw_reference_reason', 'transition'),
+          segment(3, 'server_only_model', 'raw_unknown_reason', 'server_only_boundary'),
+        ],
+      },
+    },
+    onStop() {},
+    onDismiss() {},
+  })
+
+  const text = elementText(tree)
+  assert.match(text, /Catalog PinkCherry Model · Project: project-a/)
+  assert.match(text, /Smooth transition/)
+  assert.match(text, /Boundary details unavailable/)
+  assert.match(text, /Catalog PinkCherry Model: Follows this segment’s frame anchors/)
+  assert.doesNotMatch(text, /minimax_h3|server_only_model|raw_current_model_reason/)
+
+  const segmentTitles = flattenElements(tree)
+    .map(element => element.props?.title)
+    .filter(title => typeof title === 'string' && title.startsWith('Segment '))
+  assert.equal(segmentTitles.length, 3)
+  assert.match(segmentTitles[0], /Catalog PinkCherry Model/)
+  assert.match(segmentTitles[1], /Ref2VA video model.*Uses reference images and recent motion.*Smooth transition/)
+  assert.match(segmentTitles[2], /Model details unavailable.*Boundary details unavailable/)
+  assert.doesNotMatch(segmentTitles.join(' '), /raw_catalog_reason|raw_reference_reason|raw_unknown_reason|server_only_model|server_only_boundary/)
+
+  const unknownModelTree = JobPlaceholder({
+    job: {
+      id: 'unknown-model-card',
+      status: 'queued',
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: '',
+      message: '',
+      outputFiles: [],
+      error: null,
+      modelType: 'server_only_job_model',
+    },
+    onStop() {},
+    onDismiss() {},
+  })
+  assert.match(elementText(unknownModelTree), /Model details unavailable/)
+  assert.doesNotMatch(elementText(unknownModelTree), /server_only_job_model/)
 })
 
 test('preemptible CPU-only owner card is visibly slower and keeps an unknown ETA unknown', async t => {
@@ -783,13 +908,13 @@ test('preemptible CPU-only owner card is visibly slower and keeps an unknown ETA
     onDismiss() {},
   })
   const renderedText = elementText(tree)
-  assert.match(renderedText, /CPU-only text · slower/)
-  assert.match(renderedText, /Slower CPU work may be discarded and restarted only when acceleration is predicted to deliver sooner/)
+  assert.match(renderedText, /Text using CPU · slower/)
+  assert.match(renderedText, /Maestro may restart this task from the beginning with GPU acceleration, but only when that is expected to finish sooner/)
   assert.match(renderedText, /Overall ETA unknown/)
-  const badge = flattenElements(tree).find(element => elementText(element) === 'CPU-only text · slower')
+  const badge = flattenElements(tree).find(element => elementText(element) === 'Text using CPU · slower')
   assert.equal(
     badge?.props.title,
-    'CPU text is slower and may be discarded and restarted with acceleration only when that is predicted to deliver sooner.',
+    'This text task is running on the CPU, so it may be slower. Maestro will restart it with GPU acceleration only if starting over is expected to finish sooner.',
   )
 })
 
@@ -824,15 +949,15 @@ test('ordinary CPU-only owner card never implies discard or restart', async t =>
     onDismiss() {},
   })
   const renderedText = elementText(tree)
-  assert.match(renderedText, /CPU-only text · slower/)
+  assert.match(renderedText, /Text using CPU · slower/)
   assert.match(renderedText, /Overall ETA unknown/)
   assert.doesNotMatch(renderedText, /discard|restart|deliver sooner/i)
   const badge = flattenElements(tree).find(element => (
-    elementText(element) === 'CPU-only text · slower' && element.props.title
+    elementText(element) === 'Text using CPU · slower' && element.props.title
   ))
   assert.equal(
     badge?.props.title,
-    'This text step is using CPU-only execution, which is slower than acceleration.',
+    'This text task is using the CPU, which is usually slower than GPU acceleration.',
   )
 })
 
@@ -846,9 +971,9 @@ test('preemption, release, and acceleration restart states never present CPU pro
 
   const { JobPlaceholder } = await loadJobPlaceholder()
   const expected = [
-    ['preemption_requested', 'Acceleration restart requested', 'CPU progress will be discarded before restart'],
-    ['resources_releasing', 'Releasing CPU resources', 'CPU progress is discarded'],
-    ['restarting_on_accelerator', 'Restarting with acceleration', 'ETA remains unknown until measured'],
+    ['preemption_requested', 'Faster restart requested', 'If the switch proceeds'],
+    ['resources_releasing', 'Preparing to restart faster', 'CPU progress was discarded'],
+    ['restarting_on_accelerator', 'Restarting with GPU acceleration', 'ETA is not known yet'],
   ]
   for (const [state, label, warning] of expected) {
     const tree = JobPlaceholder({
@@ -909,6 +1034,35 @@ test('legacy host-wait copy remains distinct from resource admission', async t =
   const wait = elements.find(element => elementText(element) === 'Waiting for another generation on this host')
   assert.ok(wait)
   assert.equal(wait.props.title, undefined)
+})
+
+test('running recovery never presents itself as merely queued', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const tree = JobPlaceholder({
+    job: {
+      id: 'running-recovery',
+      status: 'running',
+      recoveryState: 'retrying',
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: '',
+      message: '',
+      outputFiles: [],
+      error: null,
+    },
+    onStop() {},
+    onDismiss() {},
+  })
+  assert.match(elementText(tree), /Recovery Running/)
+  assert.doesNotMatch(elementText(tree), /Recovery Queued/)
 })
 
 test('plan-terms wait renders explicit bounded card copy instead of a generic phase', async t => {
@@ -1008,8 +1162,8 @@ test('owner queue row shows the same resource wait while global summary stays ag
   })
   const elements = flattenElements(tree)
   const ownerRow = elements.find(element => (
-    element.props?.title === 'This job is durably queued and will start when the generation lane is available.'
-    && elementText(element).includes('Waiting for generation resources')
+    element.props?.title === 'This generation is still in the queue. It will start when enough GPU resources are available, without interrupting a generation already running.'
+    && elementText(element).includes('Waiting for available GPU resources')
   ))
   assert.ok(ownerRow)
   const summaryElement = elements.find(element => (
@@ -1087,17 +1241,19 @@ test('owner queue row exposes CPU preemption truth while queue help stays bounde
   const elements = flattenElements(tree)
   const rowBadge = elements.find(element => (
     element.props?.['data-resource-state'] === 'preemption_requested'
-    && elementText(element) === 'Acceleration restart requested'
+    && elementText(element) === 'Faster restart requested'
   ))
   assert.ok(rowBadge)
-  assert.match(rowBadge.props.title, /discarded and restarted from zero/)
+  assert.match(rowBadge.props.title, /If Maestro can make the switch/)
 
   const renderedText = elementText(tree)
   assert.match(renderedText, /How queue priority works/)
-  assert.match(renderedText, /User-set priority is applied before queue-order and residency choices/)
-  assert.match(renderedText, /Reusing the exact loaded model can reorder otherwise eligible work/)
-  assert.match(renderedText, /Recent-service fair share is planned but is not active in this build/)
-  assert.match(renderedText, /Only CPU work explicitly marked preemptible may be discarded and restarted from zero, and only when acceleration is predicted to deliver sooner/)
+  assert.match(renderedText, /Ready jobs start by priority. When priorities match, Maestro usually keeps their queue order/)
+  assert.match(renderedText, /A job may start sooner when it can reuse a model that is already loaded/)
+  assert.match(renderedText, /Jobs that have waited a long time keep their place/)
+  assert.match(renderedText, /Queued generations do not interrupt work already running/)
+  assert.match(renderedText, /Only a restartable CPU text task may start over with GPU acceleration/)
+  assert.doesNotMatch(renderedText, /residency|starvation|authoritative|fair share|preemptible/i)
   assert.doesNotMatch(renderedText, /user[_ -]?id|device[_ -]?id|model[_ -]?id|VRAM|RAM|hostname|path/i)
 
   const summaryElement = elements.find(element => (
@@ -1276,7 +1432,7 @@ test('Reference logical queue folds physical children while controls retain exac
   assert.equal(duplicateSuppressed.length, 1)
   assert.equal(duplicateSuppressed[0].props.job.id, parent.id)
   assert.equal(duplicateSuppressed[0].props.job.message, 'Public parent label that does not match its child')
-  assert.match(elementText(projectedTree), /GPU generation queued/)
+  assert.match(elementText(projectedTree), /Generation queued/)
   assert.match(elementText(projectedTree), /ETA 2m · current task 30s/)
   assert.match(elementText(projectedTree), /0 running · 0 preparing · 0 awaiting review · 1 waiting/)
   assert.doesNotMatch(elementText(projectedTree), /37 waiting|37 active/)

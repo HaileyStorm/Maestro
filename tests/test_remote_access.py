@@ -609,8 +609,8 @@ class LaunchSecurityContractTests(unittest.TestCase):
         music = self._function_source("director_generate_music")
         director = self._function_source("director_pipeline_start")
 
-        self.assertIn("job_out_dir = _require_project_access(request, workspace)", ordinary)
-        self.assertIn("out_dir = _require_project_access(request, workspace)", music)
+        self.assertIn('permission="project.generate"', ordinary)
+        self.assertIn('permission="project.generate"', music)
         self.assertIn('body["_director_component_errors"] = True', director)
         self.assertIn("_authorize_director_media_inputs(request, body)", director)
         self.assertIn('body["workspace"] = workspace', director)
@@ -894,6 +894,395 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn("not enabled for remote access", unlock)
         self.assertNotIn("_remote_active_projects", unlock)
 
+    def test_account_membership_precedes_password_and_hides_nonmembers(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        class MembershipError(Exception):
+            pass
+
+        record = {
+            "project_instance": "project:v1:" + "a" * 64,
+            "state": "active",
+            "bindings": [{"account_id": "1" * 32, "role": "viewer"}],
+        }
+        store = types.SimpleNamespace(lookup=lambda **_kwargs: record)
+        namespace = self._function_namespace(
+            ("_require_account_project_permission",),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "ProjectMembershipError": MembershipError,
+                "ProjectMembershipStoreUnavailableError": MembershipError,
+                "QueueRecoveryAdapterError": ValueError,
+                "_account_project_access_state": lambda: {
+                    "enforced": True,
+                },
+                "_require_account_store": lambda _request: object(),
+                "_queue_recovery_existing_project_identity": (
+                    lambda _path: record["project_instance"]
+                ),
+                "_account_project_membership_store": lambda: store,
+                "_raise_project_setup_unavailable": (
+                    lambda error: (_ for _ in ()).throw(error)
+                ),
+                "role_allows": lambda role, permission: (
+                    role == "viewer" and permission in {
+                        "project.list", "project.open", "project.read",
+                    }
+                ),
+            },
+        )
+        guard = namespace["_require_account_project_permission"]
+
+        anonymous = types.SimpleNamespace(
+            state=types.SimpleNamespace(maestro_account_principal=None),
+        )
+        self.assertIsNone(
+            guard(
+                anonymous,
+                "/outputs/project",
+                "project.read",
+                state={"enforced": False},
+            ),
+        )
+        with self.assertRaises(FakeHTTPException) as hidden:
+            guard(anonymous, "/outputs/project", "project.read")
+        self.assertEqual(hidden.exception.status_code, 404)
+
+        viewer = types.SimpleNamespace(state=types.SimpleNamespace(
+            maestro_account_principal={"id": "1" * 32},
+        ))
+        self.assertIs(guard(viewer, "/outputs/project", "project.read"), record)
+        with self.assertRaises(FakeHTTPException) as denied:
+            guard(viewer, "/outputs/project", "project.delete")
+        self.assertEqual(denied.exception.status_code, 404)
+
+        outsider = types.SimpleNamespace(state=types.SimpleNamespace(
+            maestro_account_principal={"id": "2" * 32},
+        ))
+        with self.assertRaises(FakeHTTPException) as hidden:
+            guard(outsider, "/outputs/project", "project.read")
+        self.assertEqual(hidden.exception.status_code, 404)
+
+        require = self._function_source("_require_project_access")
+        self.assertLess(
+            require.index("_require_account_project_permission"),
+            require.index("_project_access.authorize"),
+        )
+
+    def test_pending_project_setup_keeps_legacy_password_access(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        class MembershipError(Exception):
+            pass
+
+        calls = {
+            "legacy_path": 0,
+            "existing_path": 0,
+            "account": 0,
+            "identity": 0,
+            "password": 0,
+        }
+        current_state = {
+            "state": "needs_attention",
+            "enforced": False,
+        }
+
+        def legacy_path(_workspace):
+            calls["legacy_path"] += 1
+            return "/outputs/missing-marker"
+
+        def existing_path(_workspace):
+            calls["existing_path"] += 1
+            return "/outputs/missing-marker"
+
+        def require_account(_request):
+            calls["account"] += 1
+            return object()
+
+        def project_identity(_path):
+            calls["identity"] += 1
+            raise AssertionError("pending access consulted membership identity")
+
+        def password_status(*_args):
+            calls["password"] += 1
+            return types.SimpleNamespace(protected=True, unlocked=True)
+
+        namespace = self._function_namespace(
+            (
+                "_require_account_project_permission",
+                "_require_project_access",
+            ),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "ProjectMembershipError": MembershipError,
+                "ProjectMembershipStoreUnavailableError": MembershipError,
+                "QueueRecoveryAdapterError": ValueError,
+                "_account_project_access_state": lambda: current_state,
+                "_require_account_store": require_account,
+                "_queue_recovery_existing_project_identity": project_identity,
+                "_account_project_membership_store": lambda: None,
+                "_raise_project_setup_unavailable": (
+                    lambda error: (_ for _ in ()).throw(error)
+                ),
+                "role_allows": lambda _role, _permission: False,
+                "_workspace_dir": legacy_path,
+                "_existing_workspace_dir": existing_path,
+                "_project_access": types.SimpleNamespace(
+                    status=password_status,
+                    authorize=password_status,
+                ),
+                "_STATE_CHANGING_METHODS": frozenset({"POST", "PUT", "DELETE"}),
+            },
+        )
+        request = types.SimpleNamespace(
+            method="GET",
+            state=types.SimpleNamespace(
+                maestro_remote=False,
+                maestro_session_id="legacy-browser",
+                maestro_account_principal=None,
+            ),
+        )
+
+        self.assertEqual(
+            namespace["_require_project_access"](request, "missing-marker"),
+            "/outputs/missing-marker",
+        )
+        self.assertEqual(calls, {
+            "legacy_path": 1,
+            "existing_path": 0,
+            "account": 0,
+            "identity": 0,
+            "password": 1,
+        })
+
+        current_state = {"state": "active", "enforced": True}
+        with self.assertRaises(FakeHTTPException) as hidden:
+            namespace["_require_project_access"](
+                request,
+                "missing-marker",
+            )
+        self.assertEqual(hidden.exception.status_code, 404)
+        self.assertEqual(calls, {
+            "legacy_path": 1,
+            "existing_path": 1,
+            "account": 1,
+            "identity": 0,
+            "password": 1,
+        })
+
+    def test_account_project_cutover_is_explicit_and_lifecycle_fenced(self):
+        state = self._function_source("_account_project_access_state")
+        migration = self._function_source("migrate_account_projects")
+        owner = self._function_source("_require_account_project_migration_owner")
+        bootstrap = self._function_source("bootstrap_account_owner")
+        create = self._function_source("create_workspace")
+        delete = self._function_source("delete_workspace")
+
+        self.assertNotIn("migrate_inventory", bootstrap)
+        self.assertNotIn("initialize_from_ledger", bootstrap)
+        self.assertIn('"enforced": not needs_attention', state)
+        self.assertIn('"state": "needs_attention"', state)
+        self.assertIn(
+            '_request_has_account_capability(request, "owner.admin")',
+            owner,
+        )
+        self.assertIn("_request_has_recent_account_reauth(request)", owner)
+        self.assertIn("_account_local_bootstrap_allowed(request)", owner)
+        self.assertIn("_workspace_creation_lock", migration)
+        self.assertIn("_workspace_lifecycle_lock", migration)
+        self.assertIn("inspect_inventory", migration)
+        self.assertIn("project_migration_needs_attention", migration)
+        self.assertLess(
+            migration.index("inspect_inventory"),
+            migration.index("migrate_inventory"),
+        )
+        self.assertLess(
+            migration.index("migrate_inventory"),
+            migration.index("initialize_from_ledger"),
+        )
+        self.assertIn("project_membership_store.bind", create)
+        self.assertLess(
+            create.index("ensure_project_instance_marker"),
+            create.index("project_membership_store.bind"),
+        )
+        self.assertIn("safe_delete_dir(ws_dir)", create)
+        self.assertLess(
+            create.index("_project_access.set_password"),
+            create.index("project_membership_store.bind"),
+        )
+        self.assertIn("membership_store.begin_deletion", delete)
+        self.assertIn("membership_store.finish_deletion", delete)
+        self.assertIn("membership_store.cancel_deletion", delete)
+        self.assertIn(
+            'membership["state"] in {"deleting", "deleted"}',
+            delete,
+        )
+        self.assertIn("deletion_destructive = True", delete)
+        self.assertLess(
+            delete.index("membership_store.begin_deletion"),
+            delete.index("_project_access.revoke_workspace(name)"),
+        )
+        self.assertLess(
+            delete.index("_project_access.revoke_workspace(name)"),
+            delete.index("safe_delete_dir(ws_dir)"),
+        )
+        self.assertLess(
+            delete.index("membership_store.finish_deletion"),
+            delete.index("safe_delete_dir(ws_dir)"),
+        )
+
+    def test_account_workspace_list_includes_only_memberships(self):
+        request = types.SimpleNamespace(state=types.SimpleNamespace(
+            maestro_remote=False,
+            maestro_session_id="browser",
+        ))
+        namespace = self._function_namespace(
+            ("_workspace_access_fields", "list_workspaces_endpoint"),
+            {
+                "Request": object,
+                "QueueRecoveryAdapterError": ValueError,
+                "_account_project_list_identities": lambda _request: {
+                    "project-a": {
+                        "role": "viewer",
+                        "permissions": [
+                            "project.list", "project.open", "project.read",
+                        ],
+                    },
+                },
+                "_queue_recovery_existing_project_identity": (
+                    lambda path: os.path.basename(path)
+                ),
+                "_list_workspaces": lambda: [
+                    {"name": "a", "path": "/outputs/project-a", "file_count": 1},
+                    {"name": "b", "path": "/outputs/project-b", "file_count": 2},
+                ],
+                "_project_access": types.SimpleNamespace(status=lambda *_args: (
+                    types.SimpleNamespace(
+                        protected=False,
+                        unlocked=True,
+                        remember_policy=None,
+                        unlock_expires_at=None,
+                        unlock_idle_expires_at=None,
+                    )
+                )),
+                "_remote_active_projects": {},
+                "_remote_active_projects_lock": threading.RLock(),
+                "_get_active_workspace": lambda: "b",
+            },
+        )
+        listed = namespace["list_workspaces_endpoint"](request)
+        self.assertEqual([item["name"] for item in listed["workspaces"]], ["a"])
+        self.assertEqual(listed["workspaces"][0]["project_role"], "viewer")
+        self.assertEqual(
+            listed["workspaces"][0]["project_permissions"],
+            ["project.list", "project.open", "project.read"],
+        )
+        self.assertEqual(listed["active"], "")
+
+    def test_job_session_ownership_remains_conjunctive_with_membership(self):
+        class FakeHTTPException(Exception):
+            pass
+
+        allowed = True
+
+        def require_membership(_request, _path, permission):
+            self.assertEqual(permission, "project.read")
+            if not allowed:
+                raise FakeHTTPException()
+
+        namespace = self._function_namespace(
+            (
+                "_recovered_job_remote_project_accessible",
+                "_job_owned_by_request",
+            ),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "QueueRecoveryAdapterError": ValueError,
+                "_accounts_enabled": lambda: True,
+                "_existing_workspace_dir": lambda name: f"/outputs/{name}",
+                "_require_account_project_permission": require_membership,
+            },
+        )
+        request = types.SimpleNamespace(state=types.SimpleNamespace(
+            maestro_remote=False,
+            maestro_session_id="shared-browser-session",
+        ))
+        job = {
+            "workspace": "project-a",
+            "session_id": "shared-browser-session",
+        }
+        self.assertTrue(namespace["_job_owned_by_request"](job, request))
+        ownerless = dict(job, session_id=None)
+        self.assertTrue(
+            namespace["_job_owned_by_request"](ownerless, request),
+        )
+        allowed = False
+        self.assertFalse(namespace["_job_owned_by_request"](job, request))
+        self.assertFalse(
+            namespace["_job_owned_by_request"](ownerless, request),
+        )
+
+        for helper in (
+            "_require_owned_job_project",
+            "_require_h3_delivery_recovery_job",
+            "_require_remote_queue_project",
+        ):
+            self.assertIn(
+                "_require_account_project_permission",
+                self._function_source(helper),
+            )
+
+    def test_generation_admission_uses_generate_permission(self):
+        for route in (
+            "generate_project_asset_references",
+            "llm_chat",
+            "llm_generate",
+            "director_preparation_start",
+            "director_generate_music",
+            "llm_enhance_prompt",
+            "llm_describe_image",
+            "mix_audio",
+            "director_plan_prompts",
+            "director_plan_angle_prompts",
+            "plan_audio_structure",
+            "director_classify_sections",
+            "preview_generation_plan",
+            "generate",
+            "retake_video_endpoint",
+            "edit_anything_endpoint",
+            "repaint_endpoint",
+            "recast_endpoint",
+            "outpaint_endpoint",
+            "blend_endpoint",
+            "inpaint_endpoint",
+            "tools_upscale",
+            "tools_revoice",
+            "_resume_recovered_job",
+            "rejoin_clips",
+        ):
+            self.assertIn(
+                'permission="project.generate"',
+                self._function_source(route),
+                route,
+            )
+        copy_variant = self._function_source("add_project_asset_variant")
+        self.assertIn('permission="project.read"', copy_variant)
+        for route in ("list_favorites", "list_outputs"):
+            source = self._function_source(route)
+            self.assertIn('permission="project.read"', source, route)
+            self.assertNotIn('permission="project.generate"', source, route)
+
     def test_remote_default_workspace_is_hidden_and_cannot_be_selected(self):
         class FakeHTTPException(Exception):
             def __init__(self, *, status_code, detail):
@@ -920,6 +1309,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
                     {"name": "default", "path": "/outputs", "file_count": 8},
                     {"name": "x_test", "path": "/outputs/x_test", "file_count": 2},
                 ],
+                "_account_project_list_identities": lambda _request: None,
                 "_project_access": project_access,
                 "_remote_active_projects": {"remote-session": "default"},
                 "_remote_active_projects_lock": threading.RLock(),
@@ -993,9 +1383,9 @@ class LaunchSecurityContractTests(unittest.TestCase):
         password = self._function_source("set_workspace_password")
         delete = self._function_source("delete_workspace")
         self.assertIn("_require_remote_project_mutation_access", password)
-        self.assertIn("_existing_workspace_dir(name) if remote", password)
+        self.assertIn('if remote or account_project_state["enforced"]', password)
         self.assertLess(
-            password.index("_existing_workspace_dir(name) if remote"),
+            password.index("_existing_workspace_dir(name)"),
             password.index("_require_remote_project_mutation_access"),
         )
         self.assertIn("_require_remote_project_mutation_access", delete)
@@ -1112,6 +1502,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
             "_remote_active_projects": active_projects,
             "_remote_active_projects_lock": threading.RLock(),
             "_existing_workspace_dir": lambda project: f"/outputs/{project}",
+            "_require_account_project_permission": lambda *_args: None,
             "_project_access": project_access,
         }
         module = ast.Module(body=[copy.deepcopy(helper)], type_ignores=[])
@@ -1166,7 +1557,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn("Required password (8+ chars)", selector)
         self.assertIn("Create project", selector)
         self.assertIn("const needsProject = !activeWorkspace", generate)
-        self.assertIn("Select or create a password-protected project", generate)
+        self.assertIn("Choose or create a project first.", generate)
 
     def test_remote_project_bootstrap_precedes_optional_welcome(self):
         app = APP_PATH.read_text(encoding="utf-8")
@@ -1177,10 +1568,19 @@ class LaunchSecurityContractTests(unittest.TestCase):
             ROOT / "ui/src/components/WelcomeModal.tsx"
         ).read_text(encoding="utf-8")
 
-        self.assertLess(
-            app.index("api.fetchWorkspaces()"),
-            app.index("setBootstrapState('ready')"),
-        )
+        access_context = app.index("loadAccessContext(false)")
+        account_gate = app.index("if (context.accounts?.enabled === true)")
+        account_context = app.index("loadAccountContext(false)")
+        workspaces = app.index("loadWorkspaces()")
+        ready = app.index("setBootstrapState('ready')")
+        self.assertIn("const loadWorkspaces = useStore(s => s.loadWorkspaces)", app)
+        self.assertIn("await bootstrapWithin(\n          loadAccountContext(false)", app)
+        self.assertIn("await bootstrapWithin(\n        loadWorkspaces()", app)
+        self.assertLess(access_context, account_gate)
+        self.assertLess(account_gate, account_context)
+        self.assertLess(account_context, workspaces)
+        self.assertLess(workspaces, ready)
+        self.assertNotIn("api.fetchWorkspaces", app)
         self.assertIn("setBootstrapState('error')", app)
         self.assertIn("Try again", app)
         self.assertIn("BOOTSTRAP_TIMEOUT_MS", app)
@@ -1202,14 +1602,17 @@ class LaunchSecurityContractTests(unittest.TestCase):
 
         for section in ("Studio", "Director", "Chat", "Projects"):
             self.assertIn(f'title="{section}"', welcome)
-        self.assertIn("Private outputs start blurred", welcome)
-        self.assertIn("Project access controls", welcome)
-        self.assertIn("Local studio · this machine is home", welcome)
+        self.assertIn("Private previews start blurred", welcome)
+        self.assertIn("Project access controls who can open the project", welcome)
+        self.assertIn("Local access · on this computer", welcome)
         for capability in ("H3 control", "Queue + resume", "Blender guidance"):
             self.assertIn(capability, welcome)
-        self.assertIn("Cloudflare sessions, and share links", welcome)
-        self.assertIn("this {PRODUCT_NAME} host downloads and prepares model files", welcome)
-        self.assertIn("Allowed local and remote users reuse that host cache", welcome)
+        self.assertIn("remote access, and share links", welcome)
+        self.assertIn(
+            "the computer running {PRODUCT_NAME} downloads and prepares model files",
+            welcome,
+        )
+        self.assertIn("Approved local and remote users can reuse them", welcome)
         self.assertIn('aria-modal="true"', welcome)
         self.assertNotIn("PG-13", welcome)
         self.assertNotIn("content generation", welcome)
@@ -1280,8 +1683,11 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn("shared host cache", text["main"])
         self.assertIn("follow preparation status on the generation card", text["main"])
         self.assertIn("waiting for another generation on this host", text["main"])
-        self.assertIn("allowed local and remote users reuse that host cache", text["welcome"])
-        self.assertIn("project access and private-preview rules still apply", text["welcome"])
+        self.assertIn("approved local and remote users can reuse them", text["welcome"])
+        self.assertIn(
+            "project access and private-preview settings still apply",
+            text["welcome"],
+        )
         self.assertIn("preparing transcription model on this host", text["audio"])
         self.assertIn("a download may be needed", text["audio"])
 
@@ -1943,6 +2349,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
                     "_require_remote_project_mutation_access": (
                         lambda *_args: types.SimpleNamespace(unlocked=True)
                     ),
+                    "_require_account_project_permission": lambda *_args: None,
                     "_get_active_workspace": lambda: "default",
                     "_persist_active_workspace": lambda *_args, **_kwargs: root,
                     "_project_asset_store": lambda: types.SimpleNamespace(

@@ -66,6 +66,9 @@ export function DurationSlider() {
     ? effectiveSlidingWindowGeometry(duration, windowSize, overlap, modelOptions, frameOverrides)
     : null
   const windowCount = geometry?.windowCount ?? 1
+  const plannedUnitLabel = usesSegments
+    ? windowCount === 1 ? 'shot' : 'shots'
+    : windowCount === 1 ? 'section' : 'sections'
   const showSlidingWindow = windowCount > 1
 
   const prompt = useStore(s => s.params.prompt)
@@ -122,8 +125,8 @@ export function DurationSlider() {
           {(usesSegments || showSlidingWindow) && (
             <span className="text-text-muted ml-1">
               ({usesSegments
-                ? `Estimated segments ${estimatedSegmentLabel}`
-                : `${windowCount} win`})
+                ? `Estimated shots ${estimatedSegmentLabel}`
+                : `${windowCount} ${plannedUnitLabel}`})
             </span>
           )}
         </span>
@@ -141,15 +144,15 @@ export function DurationSlider() {
         <div className="text-[10px] text-text-muted mt-1">
           {usesSegments ? (
             <span title={h3SegmentEstimate?.reason}>
-              {`Estimated segments ${estimatedSegmentLabel}`}
+              {`Estimated shots ${estimatedSegmentLabel}`}
               {' '}· maximum {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s each
-              {globalTimeline ? ' · authored timestamps mapped exactly' : ' · prompt beats can produce shorter unequal shots'}
+              {globalTimeline ? ' · authored timestamps stay exact' : ' · prompt beats can produce shorter, uneven shots'}
             </span>
           ) : <>
-            {windowCount} windows of up to {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s &middot; {globalTimeline ? (
-              'global timeline mapped automatically'
+            {windowCount} sections of up to {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s &middot; {globalTimeline ? (
+              'full-video timing mapped automatically'
             ) : (
-              <>{promptLineCount}/{windowCount} prompts{promptLineCount < windowCount && ' (last reused)'}</>
+              <>{promptLineCount}/{windowCount} descriptions{promptLineCount < windowCount && ' (last reused)'}</>
             )}
           </>}
         </div>
@@ -158,7 +161,7 @@ export function DurationSlider() {
         <div className="mt-3 rounded-lg border border-border bg-bg-tertiary/60 p-2.5">
           <div className="mb-1.5 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
             <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-              <label htmlFor="studio-window-seconds" className="text-[11px] text-text-muted uppercase tracking-wider">{usesSegments ? 'Maximum segment length' : 'Window size'}</label>
+              <label htmlFor="studio-window-seconds" className="text-[11px] text-text-muted uppercase tracking-wider">{usesSegments ? 'Maximum shot length' : 'Maximum section length'}</label>
               <button
                 type="button"
                 onClick={() => setLocked(!locked)}
@@ -166,16 +169,16 @@ export function DurationSlider() {
                 className={`mobile-control-target flex items-center justify-center gap-1 rounded px-2 py-0.5 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${locked ? 'text-accent-blue' : 'text-text-muted hover:text-text-secondary'}`}
                 title={usesSegments
                   ? locked
-                    ? 'Manual H3 segment ceiling — click for Automatic planning'
-                    : 'Automatic H3 segment planning — click to set a manual ceiling'
-                  : locked ? 'Manual window size — click for Automatic' : 'Automatic window size — click to edit manually'}
+                    ? 'Maximum shot length is set manually — click for Automatic planning'
+                    : 'Shot length is planned automatically — click to set a maximum'
+                  : locked ? 'Maximum section length is set manually — click for Automatic' : 'Section length is automatic — click to edit manually'}
               >
                 {locked ? <Lock size={10} /> : <Unlock size={10} />}
                 {locked ? 'Manual' : 'Automatic'}
               </button>
             </div>
             <span className="text-xs text-text-secondary">
-              {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s · {geometry?.windowFrames ?? Math.round(windowSize * fps)}f · {windowCount} {usesSegments ? 'seg' : 'win'}
+              {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s · {geometry?.windowFrames ?? Math.round(windowSize * fps)}f · {windowCount} {plannedUnitLabel}
             </span>
           </div>
           <input
@@ -193,9 +196,9 @@ export function DurationSlider() {
           <p className="mt-1 text-[9px] text-text-muted">
             {usesSegments
               ? locked
-                ? `This is an exact ceiling, not a target or average. Every H3 segment stays at or below ${windowSize.toFixed(2)}s; prompt-driven shots may be shorter and unequal. Generated grid-aligned tails are trimmed to the exact published duration.`
-                : `Automatic planning may choose shorter, unequal prompt-driven shots up to H3's ${windowMax.toFixed(2)}s legal aligned maximum. Authored timestamps remain exact; generated grid-aligned tails are trimmed to the exact published duration.`
-              : 'Effective aligned value for this model. Larger windows use more VRAM; smaller windows create more joins.'}
+                ? `This is a hard maximum: no planned shot exceeds ${windowSize.toFixed(2)}s. Prompt-led shots can be shorter or uneven, and the final export is trimmed to the duration above.`
+                : `Automatic planning can vary shot length up to ${windowMax.toFixed(2)}s to follow your prompt. Authored timestamps remain exact, and the final export is trimmed to the duration above.`
+              : 'Larger sections use more VRAM; smaller sections create more joins.'}
           </p>
           {usesSegments && (
             <label className="mobile-control-target mt-2 flex cursor-pointer items-start gap-2 rounded-md border border-border/70 bg-bg-primary/40 p-2 text-[10px] text-text-secondary">
@@ -206,10 +209,16 @@ export function DurationSlider() {
                 onChange={event => setParam('h3_adaptive_conditioning', event.target.checked)}
               />
               <span>
-                <span className="font-medium text-text-primary">Automatically choose FL2VA / Ref2VA per segment</span>
-                <span className="mt-0.5 block text-text-muted">On by default. Maestro queues immediately, then uses the supplied anchors/references and cut timing to plan segments. Multi-segment jobs wait on their card for explicit plan review.</span>
+                <span className="font-medium text-text-primary">Match each shot to its references automatically</span>
+                <span className="mt-0.5 block text-text-muted">On by default. The job appears on its card immediately while Maestro uses your start/end images, reference media, and cut timing to choose the best mode for each shot. Videos with more than one shot pause briefly for plan review, then continue automatically if you leave the plan unchanged and accept any required model terms.</span>
               </span>
             </label>
+          )}
+          {usesSegments && (
+            <details className="mt-1 pl-2 text-[8px] leading-relaxed text-text-muted">
+              <summary className="mobile-control-target inline-flex cursor-pointer items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Mode details</summary>
+              When enabled, Maestro may choose FL2VA or Ref2VA for each shot.
+            </details>
           )}
           {usesSegments && (
             <div className="mt-2">
@@ -220,7 +229,7 @@ export function DurationSlider() {
                 onClick={() => setEvaluationOpen(value => !value)}
                 className="mobile-control-target inline-flex items-center rounded text-left text-[9px] text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
               >
-                {evaluationOpen ? 'Hide' : 'Show'} evaluated H3 engine / encoder profiles
+                {evaluationOpen ? 'Hide' : 'Show'} technical comparison profiles
               </button>
               {evaluationOpen && (
                 <div id="h3-evaluated-profiles" className="mt-1.5 space-y-1 rounded-md border border-border/70 bg-bg-primary/40 p-2">
@@ -242,7 +251,7 @@ export function DurationSlider() {
       )}
       {!supportsWindowPlanning && modelOptions && (
         <p className="mt-1 text-[9px] text-text-muted">
-          Single-window model · effective aligned output {geometry?.totalFrames ?? Math.round(duration * fps)} frames at {fps} fps.
+          Creates this clip in one pass · {geometry?.totalFrames ?? Math.round(duration * fps)} frames at {fps} fps.
         </p>
       )}
     </div>

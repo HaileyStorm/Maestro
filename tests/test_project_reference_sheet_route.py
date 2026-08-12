@@ -62,6 +62,7 @@ def _load_route_symbols(namespace):
     wanted = {
         "_project_asset_error",
         "_project_asset_provenance",
+        "_asset_scope",
         "_require_authorized_output",
         "_can_access_project_asset_variant",
         "_public_authorized_project_assets",
@@ -330,6 +331,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.calls = []
         self.visibility_calls = []
         self.workspace_events = []
+        self.project_access_calls = []
         self.review = self._passing_review
         _ModelRegistry.lora_dir = ""
 
@@ -397,8 +399,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                     == request.state.maestro_session_id
             ),
             "_project_asset_store": lambda: self.store,
-            "_asset_scope": self._asset_scope,
-            "_require_project_access": lambda request, project: str(self.output),
+            "_require_project_access": self._require_project_access,
             "_require_project_asset_media_access": self._require_asset,
             "_set_blender_candidate_status": lambda *args, **kwargs: None,
             "_existing_workspace_dir": lambda project: str(self.output),
@@ -512,11 +513,6 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "resolved_provider": "local",
         }
 
-    def _asset_scope(self, request, project):
-        if request.state.maestro_session_id != "owner-session":
-            raise HTTPException(status_code=404, detail="Project not found")
-        return project, "main"
-
     def _require_asset(
         self, project, workspace, asset_id, session, *, variant_id=None,
     ):
@@ -610,6 +606,19 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             ((len(self.calls) * 31) % 255, 80, 140),
         ).save(path)
         return str(path)
+
+    def _require_project_access(
+        self,
+        _request,
+        project,
+        *,
+        permission="project.read",
+        **_kwargs,
+    ):
+        self.project_access_calls.append((project, permission))
+        if _request.state.maestro_session_id != "owner-session":
+            raise HTTPException(status_code=404, detail="Project not found")
+        return str(self.output)
 
     def _body(self, **updates):
         body = {
@@ -894,6 +903,13 @@ class ProjectReferenceRouteTests(unittest.TestCase):
 
     def test_production_is_one_anchor_then_reference_guided_ordered_pack(self):
         response = self._run(self._body())
+        self.assertEqual(
+            self.project_access_calls[:2],
+            [
+                ("project", "project.read"),
+                ("project", "project.generate"),
+            ],
+        )
         self.assertTrue(response["asset"]["pending"])
         self.assertEqual(
             [call["role"] for call in self.calls],
@@ -5806,8 +5822,13 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 }],
             }],
         )
+        self.project_access_calls.clear()
         response = self.ns["list_project_assets"](
             "project", _Request({}),
+        )
+        self.assertEqual(
+            self.project_access_calls,
+            [("project", "project.read")],
         )
         self.assertEqual(response["assets"][0]["id"], created["id"])
         public_policy = response["assets"][0]["variants"][0]["outputs"][0]["metadata"]

@@ -566,18 +566,24 @@ class GalleryApiUiContractTests(unittest.TestCase):
             item = handle.read()
         self.assertIn("params.set('artifact_scope'", client)
         self.assertIn("params.set('media_type'", client)
-        for label in ("Finals", "All", "Components", "Windows", "Temporary"):
+        for label in (
+            "Finished",
+            "All files",
+            "Parts",
+            "Generation steps",
+            "Temporary files",
+        ):
             self.assertIn(f"label: '{label}'", tabs)
         for label in ("Images", "Videos", "Audio"):
             self.assertIn(f"label: '{label}'", tabs)
         self.assertIn('role="dialog"', tabs)
         self.assertIn('aria-controls="gallery-filter-popover"', tabs)
-        self.assertIn('Media, artifact, and metadata selections all combine.', tabs)
+        self.assertIn("All selected filters are applied together.", tabs)
         self.assertIn("deleteOutputComponents(file.name, file.workspace)", item)
         self.assertIn("params.set('delete_components', 'true')", client)
         self.assertIn("params.set('workspace', workspace)", client)
         self.assertIn("OutputCleanupResult", client)
-        self.assertIn("Cleanup incomplete", item)
+        self.assertIn("Some related files remain", item)
 
     def test_ui_async_operations_keep_exact_output_identity(self):
         with open(os.path.join(_ROOT, "ui", "src", "stores", "useStore.ts"), "r", encoding="utf-8") as handle:

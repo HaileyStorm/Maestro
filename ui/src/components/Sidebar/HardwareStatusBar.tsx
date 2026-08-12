@@ -90,7 +90,7 @@ export function HardwareStatusBar() {
     setUnloading(true)
     try {
       const r = await releaseModels()
-      setUnloadNote(r.released.length ? 'Unloaded — memory freed' : 'Nothing to unload')
+      setUnloadNote(r.released.length ? 'Model memory freed' : 'No loaded models to clear')
       loadSystemStats()
     } catch (e) {
       setUnloadNote(e instanceof Error ? e.message : 'Unload failed')
@@ -131,7 +131,7 @@ export function HardwareStatusBar() {
         {gpu?.available && (
           <span
             className="flex items-center gap-1 shrink-0 text-text-secondary"
-            title={`GPU ${gpu.percent.toFixed(0)}% (3D engine)${gpu.compute_percent != null ? ` · compute ${gpu.compute_percent.toFixed(0)}%` : ''} · VRAM ${fmtGb(gpu.vram_used_gb, gpu.vram_total_gb)}`}
+            title={`GPU activity ${gpu.percent.toFixed(0)}%${gpu.compute_percent != null ? ` · compute activity ${gpu.compute_percent.toFixed(0)}%` : ''} · GPU memory ${fmtGb(gpu.vram_used_gb, gpu.vram_total_gb)}`}
           >
             <Zap size={11} className="text-text-muted" />
             <span className="tabular-nums">{gpu.percent.toFixed(0)}%</span>
@@ -162,7 +162,7 @@ export function HardwareStatusBar() {
   return (
     <div className="px-3 py-2 border-t border-border bg-bg-secondary shrink-0">
       <div className="flex items-center justify-between mb-1">
-        <span className="text-[9px] uppercase tracking-wider text-text-muted">System</span>
+        <span className="text-[9px] uppercase tracking-wider text-text-muted">Computer usage</span>
         <button
           onClick={toggle}
           title="Collapse"
@@ -175,7 +175,7 @@ export function HardwareStatusBar() {
         {gpu?.available ? (
           <>
             <Gauge label="GPU" percent={gpu.percent} value={`${gpu.percent.toFixed(0)}%`} fill="bg-accent-blue"
-              title={gpu.compute_percent != null ? `3D engine (matches Task Manager) · compute (nvidia-smi): ${gpu.compute_percent.toFixed(0)}%` : undefined} />
+              title={gpu.compute_percent != null ? `Overall GPU activity · compute activity ${gpu.compute_percent.toFixed(0)}%` : undefined} />
             <Gauge
               label="VRAM"
               percent={gpu.vram_percent}
@@ -184,7 +184,7 @@ export function HardwareStatusBar() {
             />
           </>
         ) : (
-          <div className="text-[10px] text-text-muted">No NVIDIA GPU detected</div>
+          <div className="text-[10px] text-text-muted">No compatible NVIDIA GPU found</div>
         )}
         <Gauge label="CPU" percent={cpu?.percent ?? 0} value={`${(cpu?.percent ?? 0).toFixed(0)}%`} fill="bg-accent-blue" />
         <Gauge label="RAM" percent={ram?.percent ?? 0} value={fmtGb(ram?.used_gb, ram?.total_gb)} fill={fullnessColor(ram?.percent ?? 0)} />
@@ -194,7 +194,7 @@ export function HardwareStatusBar() {
       <div className="mt-1.5 pt-1.5 border-t border-border/50 flex flex-col gap-0.5">
         <div
           className="flex items-center gap-1.5 min-w-0"
-          title={modelLoaded ? `${model?.name || 'Unknown model'} — resident in VRAM` : 'No generation model loaded'}
+          title={modelLoaded ? `${model?.name || 'Unknown model'} — ready in GPU memory` : 'No generation model loaded'}
         >
           <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${modelLoaded ? 'bg-emerald-500' : 'bg-text-muted/40'}`} />
           <span className="text-[11px] text-text-secondary truncate">
@@ -203,7 +203,7 @@ export function HardwareStatusBar() {
           {(modelLoaded || llmStatus?.loaded) && !confirmUnload && !unloading && (
             <button
               onClick={() => setConfirmUnload(true)}
-              title="Unload model — frees VRAM/RAM now; the next generation reloads it"
+              title="Free model memory now; Maestro will reload the model when it is needed"
               className="ml-auto p-0.5 rounded shrink-0 text-text-muted hover:text-text-secondary hover:bg-bg-hover transition-colors"
             >
               <Power size={11} />
@@ -211,19 +211,19 @@ export function HardwareStatusBar() {
           )}
         </div>
         {llmStatus?.loaded && llmStatus.model_id && (
-          <div className="flex items-center gap-1.5 min-w-0" title="LLM (Director / prompt enhancer)">
+          <div className="flex items-center gap-1.5 min-w-0" title="Director assistant model">
             <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-accent-blue" />
-            <span className="text-[10px] text-text-muted truncate">LLM · {llmStatus.model_id}</span>
+            <span className="text-[10px] text-text-muted truncate">Director assistant · {llmStatus.model_id}</span>
           </div>
         )}
         {confirmUnload && (
           <div className="flex items-center gap-1.5 text-[10px]">
-            <span className="text-text-secondary">Unload and free memory?</span>
+            <span className="text-text-secondary">Free model memory now?</span>
             <button
               onClick={doUnload}
               className="px-1.5 py-0.5 rounded bg-red-500/15 text-chip-red hover:bg-red-500/25 transition-colors"
             >
-              Unload
+              Free memory
             </button>
             <button
               onClick={() => setConfirmUnload(false)}
@@ -233,7 +233,7 @@ export function HardwareStatusBar() {
             </button>
           </div>
         )}
-        {unloading && <div className="text-[10px] text-text-muted">Unloading…</div>}
+        {unloading && <div className="text-[10px] text-text-muted">Freeing model memory…</div>}
         {unloadNote && !unloading && <div className="text-[10px] text-text-muted">{unloadNote}</div>}
       </div>
     </div>

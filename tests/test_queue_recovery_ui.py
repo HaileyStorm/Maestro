@@ -5,9 +5,8 @@ server-authored recovery protocol, action gating, and Director request chain
 reviewable without launching Maestro or a browser.
 """
 
-from pathlib import Path
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLIENT = (ROOT / "ui/src/api/client.ts").read_text(encoding="utf-8")
@@ -50,7 +49,7 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         self.assertIn("plan_review_terms_required?: boolean", CLIENT)
         self.assertIn("waiting_for_plan_approval", TYPES)
         self.assertIn("Review plan", placeholder)
-        self.assertIn("Server auto-accepts its frozen plan", placeholder)
+        self.assertIn("Maestro will accept this plan in", placeholder)
         self.assertIn("Approval required to accept Ref2VA terms", placeholder)
         self.assertIn("openH3PlanReview(job.id)", MAIN)
         self.assertIn("api.approveGenerationPlan(jobId", review)
@@ -58,8 +57,8 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         self.assertIn("job.id === jobId", review)
         self.assertIn("job.status === 'waiting_for_plan_approval'", STORE)
         self.assertIn("planReviewDeadline", PLAN_DIALOG)
-        self.assertIn("Server auto-accepts this frozen plan", PLAN_DIALOG)
-        self.assertIn("Approval required to accept Ref2VA terms", PLAN_DIALOG)
+        self.assertIn("Continuum will approve the saved plan unchanged in", PLAN_DIALOG)
+        self.assertIn("Accept the Ref2VA terms before approving", PLAN_DIALOG)
         self.assertIn("editorJobId === planJobId", PLAN_DIALOG)
         self.assertIn("!plan || !editsReady", PLAN_DIALOG)
         self.assertNotIn("if (seconds <= 0) submit()", PLAN_DIALOG)
@@ -76,7 +75,7 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         self.assertIn("serverOptions !== undefined", PLAN_DIALOG)
         self.assertNotIn("serverOptions?.length", PLAN_DIALOG)
         self.assertIn("plan_review_terms_required?: boolean", CLIENT)
-        self.assertIn("Approval required to accept Ref2VA terms", PLAN_DIALOG)
+        self.assertIn("Accept the Ref2VA terms before approving", PLAN_DIALOG)
 
     def test_plan_review_hydration_records_ownership_before_await(self):
         review = source_slice(STORE, "openH3PlanReview: async", "closeH3PlanReview: ()")
@@ -164,7 +163,7 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         actions = source_slice(STORE, "resumeJobRecovery: async", "reconnectJobs: async")
         self.assertIn("api.fetchJobStatus(jobId)", actions)
         self.assertIn("_mergeJobStatus(job, status)", actions)
-        self.assertIn("await get().reconnectJobs()", actions)
+        self.assertIn("await get().reconnectJobs(accountIdentityEpoch)", actions)
 
     def test_reconnect_updates_in_place_and_deduplicates_cards(self):
         reconnect = source_slice(STORE, "reconnectJobs: async", "// LoRA state")
@@ -182,20 +181,21 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         self.assertIn("_recoveryJobPolls.delete(jobId)", terminal_poll)
         self.assertIn("consecutivePollFailures += 1", terminal_poll)
         self.assertIn("consecutivePollFailures >= 3", terminal_poll)
-        self.assertIn("void get().reconnectJobs()", terminal_poll)
+        self.assertIn("void get().reconnectJobs(accountIdentityEpoch)", terminal_poll)
 
     def test_blocked_cards_use_only_server_actions_and_hide_generic_controls(self):
         placeholder = source_slice(MAIN, "function JobPlaceholder", "function queueSummaryLabel")
         queue_panel = source_slice(MAIN, "function QueuePanel", "function GalleryBulkToolbar")
         self.assertIn("job.recoveryActions.map(action =>", placeholder)
         self.assertNotIn("recoveryActionable ?", placeholder)
-        self.assertIn("The current safe unit restarts its denoise work; completed units are retained.", placeholder)
+        self.assertIn("The current part will restart from the beginning", placeholder)
+        self.assertIn("completed parts will stay saved", placeholder)
         self.assertIn("Estimated work after resume", placeholder)
         self.assertIn("!recoveryBlocked", placeholder)
         blocked_branch = source_slice(queue_panel, "info.recovery_blocked ?", ") : (")
         for forbidden in ("Start next", "setQueuePriority", "setQueueOutputCount", "resumeQueueJob"):
             self.assertNotIn(forbidden, blocked_branch)
-        self.assertIn("Recovery blocked", blocked_branch)
+        self.assertIn("Recovery needs your choice", blocked_branch)
 
     def test_remote_resume_uses_exact_project_unlock_then_refreshes(self):
         workspace = source_slice(MAIN, "function WorkspaceSelector", "const OVERSCAN")

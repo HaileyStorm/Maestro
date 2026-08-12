@@ -26,7 +26,7 @@ export function ResolutionPresets() {
       <div>
         <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Resolution</label>
         <select disabled aria-label="Resolution" className="mobile-control-target w-full rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-muted">
-          <option>Loading H3-native canvases…</option>
+          <option>Loading supported creation sizes…</option>
         </select>
       </div>
     )
@@ -44,8 +44,8 @@ export function ResolutionPresets() {
     const exactDelivery = deliveryResolution?.replace('x', '×')
     const delivery = deliveryScale > 0 && width > 0 && height > 0
       ? exactDelivery && deliveryResolution !== `${learnedWidth}x${learnedHeight}`
-        ? `${width}×${height} native → ${learnedWidth}×${learnedHeight} learned upscale → ${exactDelivery} exact delivery · FlashVSR ${flashMatch?.[1] ? 'two-pass ' : ''}${deliveryScale}x + ${deliveryFit === 'center_crop' ? 'center crop/downsample' : deliveryFit}`
-        : `${width}×${height} native → ${learnedWidth}×${learnedHeight} delivery · FlashVSR ${flashMatch?.[1] ? 'two-pass ' : ''}${deliveryScale}x`
+        ? `${width}×${height} creation size → FlashVSR ${flashMatch?.[1] ? 'two-pass ' : ''}${deliveryScale}x upscale to ${learnedWidth}×${learnedHeight} → ${exactDelivery} final export · ${deliveryFit === 'center_crop' ? 'center crop/downsample' : deliveryFit}`
+        : `${width}×${height} creation size → ${learnedWidth}×${learnedHeight} export · FlashVSR ${flashMatch?.[1] ? 'two-pass ' : ''}${deliveryScale}x upscale`
       : null
     return (
       <div>
@@ -57,20 +57,20 @@ export function ResolutionPresets() {
           className="mobile-control-target w-full rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
         >
           {!selectedIsNative && (
-            <option value={resolution} disabled>{resolution} · choose an H3-native canvas</option>
+            <option value={resolution} disabled>{resolution} · choose a supported size</option>
           )}
           {nativeResolutions.map(option => (
             <option key={option.value} value={option.value}>
-              {option.value} · native{option.value === '1344x768' ? ' max' : ''}
+              {option.value} · model size{option.value === '1344x768' ? ' · largest' : ''}
             </option>
           ))}
         </select>
         <p className="mt-1 text-[9px] text-text-muted">
           {delivery || (!selectedIsNative
-            ? 'This carried-over size is not H3-native; choose one of the exact canvases above.'
+            ? 'This saved size is not available for this model; choose a supported size above.'
             : width > 0 && height > 0
-            ? `${width} × ${height} · ${orientation} · ${aspect.toFixed(2)}:1 · exact H3-native canvas`
-            : 'Exact H3-native canvas')}
+            ? `${width} × ${height} · ${orientation} · ${aspect.toFixed(2)}:1 · supported creation size`
+            : 'Supported creation size')}
         </p>
       </div>
     )

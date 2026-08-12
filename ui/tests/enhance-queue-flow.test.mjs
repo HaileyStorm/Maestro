@@ -191,6 +191,13 @@ function deferred() {
   return { promise, reject, resolve }
 }
 
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
 function apiJobStatus(jobId, workspace, currentPlan, createdAt) {
   return {
     job_id: jobId,
@@ -253,6 +260,267 @@ test('generation admission carries enhancement intent in the single durable requ
   assert.equal(requests.length, 1)
   assert.equal(requests[0].url, '/api/v1/generate')
   assert.equal(requests[0].body.enhance_before_generate, true)
+})
+
+test('account identity changes fence deferred generation submission and active-job discovery', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  const events = []
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.window.addEventListener('maestro:queue-refresh', () => events.push('queue'))
+  globalThis.window.addEventListener('maestro:downloads-refresh', () => events.push('downloads'))
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+  })
+
+  const account = (id, username) => ({
+    id, username, role: 'owner', disabled: false, created_at: 1,
+    has_email: false, passkey_credentials: 0, passkey_authentication_available: false,
+  })
+  const context = current => ({
+    enabled: true,
+    authenticated: Boolean(current),
+    account: current,
+    capabilities: current ? ['account.self', 'owner.admin'] : [],
+    reauthenticated: Boolean(current),
+    passkey_authentication_available: false,
+    activation_state: 'ready',
+    bootstrap_available: false,
+  })
+  const accountA = account('account-a', 'Account A')
+  const accountB = account('account-b', 'Account B')
+  const submission = deferred()
+  const migration = deferred()
+  const discovery = deferred()
+  let discoverNext = false
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.endsWith('/api/v1/generate')) return submission.promise
+    if (url.endsWith('/api/v1/account/projects/migration') && init.method === 'POST') {
+      return migration.promise
+    }
+    if (url.endsWith('/api/v1/jobs')) {
+      if (!discoverNext) return jsonResponse({ jobs: [] })
+      return discovery.promise
+    }
+    if (url.endsWith('/api/v1/account/nonce')) {
+      return jsonResponse({ nonce: 'logout-nonce', purpose: 'revoke_session', expires_in: 300 })
+    }
+    if (url.endsWith('/api/v1/account/logout') && init.method === 'POST') {
+      return jsonResponse({ status: 'logged_out' })
+    }
+    if (url.endsWith('/api/v1/account/context')) return jsonResponse(context(null))
+    if (url.endsWith('/api/v1/access-context')) {
+      return jsonResponse({ remote: false, accounts: context(accountB) })
+    }
+    if (url.endsWith('/api/v1/workspaces')) return jsonResponse({ workspaces: [], active: '' })
+    throw new Error(`unexpected identity-race request ${url}`)
+  }
+
+  const { useStore } = await loadStoreModule()
+  const originalPoll = useStore.getState()._pollRecoveredJob
+  const originalReconnectDirector = useStore.getState().reconnectDirectorPreparation
+  let polls = 0
+  let directorReconnects = 0
+  const baseState = useStore.getState()
+  useStore.setState({
+    accessContext: { remote: false, accounts: context(accountA) },
+    accountContext: context(accountA),
+    activeWorkspace: 'same-project-name',
+    workspaces: [{ name: 'same-project-name', project_permissions: ['project.read', 'project.generate'] }],
+    generationMode: 'image',
+    modelOptions: null,
+    modelOptionsLoading: false,
+    h3StyleWorkflow: '',
+    params: {
+      ...baseState.params,
+      prompt: 'deferred request',
+      model_type: 'test_image_model',
+      image_mode: 1,
+    },
+    jobs: [],
+    isGenerating: false,
+    _pollRecoveredJob() { polls += 1 },
+    reconnectDirectorPreparation: async () => { directorReconnects += 1 },
+  })
+
+  const pendingSubmit = useStore.getState().startGeneration()
+  await Promise.resolve()
+  assert.equal(useStore.getState().jobs.length, 1, 'submission placeholder should be visible before logout')
+  await useStore.getState().logoutAccount()
+  assert.deepEqual(useStore.getState().jobs, [], 'logout synchronously scrubs the old placeholder')
+  const newerIdentityJob = {
+    id: 'newer-identity-job', status: 'queued', progress: 0, step: 0, totalSteps: 0,
+    phase: '', message: 'Queued...', outputFiles: [], error: null, oomInfo: null,
+    workspace: 'same-project-name',
+  }
+  useStore.setState({ jobs: [newerIdentityJob], isGenerating: true })
+  submission.resolve(jsonResponse({ job_id: 'stale-submit', status: 'queued', h3_estimate: null }))
+  await pendingSubmit
+  assert.deepEqual(useStore.getState().jobs, [newerIdentityJob], 'stale cleanup preserves newer identity jobs')
+  assert.equal(polls, 0)
+  assert.deepEqual(events, [])
+
+  useStore.setState({
+    accessContext: { remote: false, accounts: context(accountA) },
+    accountContext: context(accountA),
+    accountProjectMigration: null,
+    accountProjectMigrationLoading: false,
+  })
+  const pendingMigration = useStore.getState().migrateAccountProjects()
+  await Promise.resolve()
+  await useStore.getState().loadAccessContext(false)
+  migration.resolve(jsonResponse({
+    schema_version: 2,
+    state: 'active',
+    project_count: 7,
+    assigned_count: 7,
+    quarantined_count: 0,
+    needs_attention: 0,
+    migrated_at: 1,
+    owner_account_id: 'account-a',
+  }))
+  assert.equal(await pendingMigration, null, 'stale migration completion is not presented as success')
+  assert.equal(useStore.getState().accountProjectMigration, null)
+
+  useStore.setState({
+    accessContext: { remote: false, accounts: context(accountA) },
+    accountContext: context(accountA),
+    activeWorkspace: 'same-project-name',
+    workspaces: [{ name: 'same-project-name', project_permissions: ['project.read', 'project.generate'] }],
+    jobs: [],
+    isGenerating: false,
+  })
+  discoverNext = true
+  const pendingDiscovery = useStore.getState().reconnectJobs()
+  await Promise.resolve()
+  await useStore.getState().loadAccessContext(false)
+  discovery.resolve(jsonResponse({
+    jobs: [{ ...apiJobStatus('stale-discovery', 'same-project-name', plan(), 1), status: 'running' }],
+  }))
+  await pendingDiscovery
+  assert.deepEqual(useStore.getState().jobs, [])
+  assert.equal(polls, 0)
+  assert.equal(directorReconnects, 0)
+
+  useStore.setState({
+    _pollRecoveredJob: originalPoll,
+    reconnectDirectorPreparation: originalReconnectDirector,
+  })
+})
+
+test('account identity and Director leases reject deferred uploads without seeding new state', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+  })
+
+  const account = id => ({
+    id, username: id, role: 'owner', disabled: false, created_at: 1,
+    has_email: false, passkey_credentials: 0, passkey_authentication_available: false,
+  })
+  const context = current => ({
+    enabled: true, authenticated: true, account: current,
+    capabilities: ['account.self', 'owner.admin'], reauthenticated: true,
+    passkey_authentication_available: false, activation_state: 'ready', bootstrap_available: false,
+  })
+  const accountA = account('account-a')
+  const accountB = account('account-b')
+  let visibleAccount = accountA
+  const sourceUpload = deferred()
+  const voiceUpload = deferred()
+  const directorUpload = deferred()
+  let imageUploadCount = 0
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url.endsWith('/api/v1/access-context')) {
+      return jsonResponse({ remote: false, accounts: context(visibleAccount) })
+    }
+    if (url.endsWith('/api/v1/upload-audio')) return voiceUpload.promise
+    if (url.endsWith('/api/v1/upload')) {
+      imageUploadCount += 1
+      return imageUploadCount === 1 ? sourceUpload.promise : directorUpload.promise
+    }
+    throw new Error(`unexpected upload-race request ${url}`)
+  }
+
+  const { useStore } = await loadStoreModule()
+  await useStore.getState().loadAccessContext(false)
+  useStore.setState({
+    accountContext: context(accountA),
+    accessContext: { remote: false, accounts: context(accountA) },
+    toolsSourcePath: null,
+    toolsSourceName: null,
+    toolsSourceUrl: null,
+    toolsRevoiceRefs: [null, null],
+  })
+
+  const sourceFile = new File(['source'], 'old-source.mp4', { type: 'video/mp4' })
+  const staleSource = useStore.getState().uploadToolsSource(sourceFile)
+  visibleAccount = accountB
+  await useStore.getState().loadAccessContext(false)
+  sourceUpload.resolve(jsonResponse({ filename: 'old-source.mp4', path: '/private/account-a/source.mp4', url: '/stale' }))
+  assert.equal(await staleSource, false)
+  assert.equal(useStore.getState().toolsSourcePath, null)
+
+  const voiceFile = new File(['voice'], 'old-voice.wav', { type: 'audio/wav' })
+  const staleVoice = useStore.getState().uploadToolsRevoiceRef(0, voiceFile)
+  visibleAccount = accountA
+  await useStore.getState().loadAccessContext(false)
+  voiceUpload.resolve(jsonResponse({ filename: 'old-voice.wav', path: '/private/account-b/voice.wav', url: '/stale' }))
+  assert.equal(await staleVoice, false)
+  assert.deepEqual(useStore.getState().toolsRevoiceRefs, [null, null])
+
+  const referenceFile = new File(['image'], 'old-reference.png', { type: 'image/png' })
+  useStore.setState({ directorReferenceImage: referenceFile, directorReferenceImagePath: null })
+  let ownsDirectorRequest = true
+  const staleDirectorRefs = useStore.getState()._uploadDirectorRefs({
+    ownsWorkspace: () => ownsDirectorRequest,
+  })
+  ownsDirectorRequest = false
+  directorUpload.resolve(jsonResponse({ filename: 'old-reference.png', path: '/private/old-reference.png', url: '/stale' }))
+  await assert.rejects(staleDirectorRefs, error => error?.name === 'AbortError')
+  assert.equal(useStore.getState().directorReferenceImagePath, null)
 })
 
 test('plan approval binds overrides to the exact encoded job and project', async t => {

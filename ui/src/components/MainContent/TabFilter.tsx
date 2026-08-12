@@ -12,11 +12,11 @@ const mediaKinds: { value: MediaFilter; label: string }[] = [
 ]
 
 const artifactScopes: { value: OutputArtifactScope; label: string }[] = [
-  { value: 'final', label: 'Finals' },
-  { value: 'all', label: 'All' },
-  { value: 'component', label: 'Components' },
-  { value: 'window', label: 'Windows' },
-  { value: 'temporary', label: 'Temporary' },
+  { value: 'final', label: 'Finished' },
+  { value: 'all', label: 'All files' },
+  { value: 'component', label: 'Parts' },
+  { value: 'window', label: 'Generation steps' },
+  { value: 'temporary', label: 'Temporary files' },
 ]
 
 const savedViews: { value: MediaFilter; label: string; icon: 'heart' | 'film' | null }[] = [
@@ -159,7 +159,7 @@ export function TabFilter() {
   const activeFilterCount = metadataFilterCount + facetFilterCount
   const hasAnyGalleryFilter = activeFilterCount > 0 || Boolean(searchQuery)
   const mediaLabel = [...mediaKinds, ...savedViews].find(option => option.value === mediaFilter)?.label || 'All'
-  const artifactLabel = artifactScopes.find(option => option.value === artifactScope)?.label || 'Finals'
+  const artifactLabel = artifactScopes.find(option => option.value === artifactScope)?.label || 'Finished'
 
   return (
     <div className="relative flex min-w-0 max-w-full flex-1 basis-[24rem] items-center gap-1">
@@ -230,7 +230,7 @@ export function TabFilter() {
           <div className="mb-3 flex items-start justify-between gap-2">
             <div>
               <p id="gallery-filter-title" className="text-xs font-medium text-text-primary">Gallery filters</p>
-              <p id="gallery-filter-description" className="text-[9px] text-text-muted">Media, artifact, and metadata selections all combine.</p>
+              <p id="gallery-filter-description" className="text-[9px] text-text-muted">All selected filters are applied together.</p>
             </div>
             <div className="flex items-center gap-1">
               {hasAnyGalleryFilter && (
@@ -265,7 +265,7 @@ export function TabFilter() {
           </fieldset>
 
           <fieldset className="mt-3 space-y-1.5">
-            <legend className="text-[9px] font-medium uppercase tracking-wide text-text-muted">Artifact</legend>
+            <legend className="text-[9px] font-medium uppercase tracking-wide text-text-muted">Output stage</legend>
             <div className="grid grid-cols-2 gap-1 sm:grid-cols-5">
               {artifactScopes.map(option => (
                 <button
@@ -303,15 +303,15 @@ export function TabFilter() {
                 </button>
               ))}
             </div>
-            <p className="text-[9px] text-text-muted">Quick views replace the media-type selection and still combine with the artifact filter.</p>
+            <p className="text-[9px] text-text-muted">Quick views choose a media type and keep your output-stage filter.</p>
           </fieldset>
 
           <div className="mt-3 border-t border-border pt-3">
             <div className="mb-2 flex items-center justify-between gap-2">
-              <p className="text-[9px] font-medium uppercase tracking-wide text-text-muted">Generation metadata</p>
+              <p className="text-[9px] font-medium uppercase tracking-wide text-text-muted">Generation details</p>
               {metadataFilterCount > 0 && (
                 <button type="button" onClick={clearStructuredFilters} className="min-h-11 min-w-11 rounded px-2 py-1 text-[10px] text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0">
-                  Clear metadata
+                  Clear details
                 </button>
               )}
             </div>

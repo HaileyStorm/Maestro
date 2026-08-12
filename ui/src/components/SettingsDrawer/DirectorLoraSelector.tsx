@@ -162,7 +162,7 @@ export function DirectorImageRoleLoraSelector({
   return (
     <div className="space-y-2">
       <p className="text-[9px] leading-relaxed text-text-muted">
-        Only LoRAs found for the selected {role === 'creator' ? 'creator' : 'continuity editor'} model are listed, including read-only linked roots. Published inputs are sealed to their current schema.
+        Only LoRAs that work with the selected {role === 'creator' ? 'creator' : 'continuity editor'} model appear here. LoRAs from linked folders can be selected here, but their files must be managed where they are stored. If a LoRA's settings change, remove and add it again before generating.
       </p>
       {loading ? (
         <div role="status" className="flex items-center gap-1.5 text-[10px] text-text-muted"><Loader2 size={11} className="animate-spin" /> Loading role LoRAs…</div>

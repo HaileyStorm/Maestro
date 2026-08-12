@@ -146,7 +146,9 @@ class MultimodalChatRouteTests(unittest.TestCase):
         namespace = _launch_namespace(
             {"_llm_chat_image_signature", "llm_chat_upload"},
             _llm_chat_request_is_external=lambda _request: True,
-            _require_project_access=lambda *_args: events.append(("authorize",)),
+            _require_project_access=(
+                lambda *_args, **_kwargs: events.append(("authorize",))
+            ),
             _prune_stale_llm_chat_uploads=lambda: events.append(("prune",)),
             _register_llm_chat_upload=lambda _request, workspace, filename: (
                 events.append(("register", workspace, filename))
@@ -185,7 +187,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
         namespace = _launch_namespace(
             {"_llm_chat_image_signature", "llm_chat_upload"},
             _llm_chat_request_is_external=lambda _request: False,
-            _require_project_access=lambda *_args: None,
+            _require_project_access=lambda *_args, **_kwargs: None,
             _prune_stale_llm_chat_uploads=lambda: None,
             _register_llm_chat_upload=lambda *_args: self.fail(
                 "invalid content reached Chat upload registration"
@@ -365,12 +367,17 @@ class MultimodalChatRouteTests(unittest.TestCase):
             load_chat_guides=lambda _value: ([], ""),
             generate_chat=generate_chat,
         )
+
+        def authorize(*_args, **kwargs):
+            self.assertEqual(kwargs.get("permission"), "project.generate")
+            events.append("authorize")
+
         namespace = _launch_namespace(
             {
                 "_resolve_llm_chat_images", "_execute_llm_chat", "llm_chat",
             },
             _llm_chat_request_is_external=lambda _request: False,
-            _require_project_access=lambda *_args: events.append("authorize"),
+            _require_project_access=authorize,
             _resolve_authorized_request_media=resolve_media,
             _cleanup_llm_chat_uploads=lambda _request, workspace, paths: (
                 events.append(("cleanup", workspace, paths)) or ["upload.png"]
@@ -443,7 +450,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
         namespace = _launch_namespace(
             {"_resolve_llm_chat_images", "llm_chat"},
             _llm_chat_request_is_external=lambda _request: True,
-            _require_project_access=lambda *_args: None,
+            _require_project_access=lambda *_args, **_kwargs: None,
             _resolve_authorized_request_media=lambda *_args: None,
             _execute_llm_chat=lambda *_args: generated.append(True),
         )
@@ -480,7 +487,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
         namespace = _launch_namespace(
             {"_resolve_llm_chat_images", "llm_chat"},
             _llm_chat_request_is_external=lambda _request: False,
-            _require_project_access=lambda *_args: None,
+            _require_project_access=lambda *_args, **_kwargs: None,
             _resolve_authorized_request_media=(
                 lambda *_args: "/authorized/uploads/upload.png"
             ),
@@ -662,7 +669,7 @@ class MultimodalCatalogTests(unittest.TestCase):
     def test_project_instance_changes_when_same_name_is_recreated(self):
         namespace = _launch_namespace(
             {"_llm_project_instance_id"},
-            _require_project_access=lambda *_args: None,
+            _require_project_access=lambda *_args, **_kwargs: None,
             _session_secret=lambda: b"server-secret",
         )
         request = types.SimpleNamespace(state=types.SimpleNamespace())
@@ -710,7 +717,9 @@ class LlmChatUiContractTests(unittest.TestCase):
         self.assertIn("modelSelectionTouched.current = true", source)
         self.assertIn("prompt_tokens_per_second", source)
         self.assertIn("generation_tokens_per_second", source)
-        self.assertIn("Speed basis:", source)
+        self.assertIn("return `${model.label} · ${speedLabel}`", source)
+        self.assertIn("speedMeta(model),", source)
+        self.assertIn(">Technical details</summary>", source)
 
 
 class TransientLlmStatusTests(unittest.TestCase):

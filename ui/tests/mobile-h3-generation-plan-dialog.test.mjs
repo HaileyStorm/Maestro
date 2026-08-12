@@ -246,7 +246,7 @@ function planWithDuration() {
           segment_published_frames: [23, 24],
           confidence: 'high',
           applied: true,
-          reason: 'Nearest proven server boundary.',
+          reason: 'Closest available length.',
         },
         down: {
           requested_published_frames: 48,
@@ -256,7 +256,7 @@ function planWithDuration() {
           segment_published_frames: [],
           confidence: 'unavailable',
           applied: false,
-          reason: 'No lower boundary is available.',
+          reason: 'No proven segment-efficient boundary satisfies the selected snap mode.',
         },
       },
       segments: [
@@ -265,7 +265,7 @@ function planWithDuration() {
       ],
       redistribution_mode: 'none',
       outcome: 'exact',
-      reason: 'The server-authored plan exactly matches the target.',
+      reason: 'The current plan matches the target.',
       residual_published_frames: 0,
     },
   }
@@ -431,7 +431,7 @@ test('rendered H3 plan portals to body, captures its opener, and fences every mo
   closeControls[1].props.onClick()
   assert.equal(closes, 1)
 
-  const modelOne = findNodes(tree, node => node.props?.['aria-label'] === 'Checkpoint for segment 1')[0]
+  const modelOne = findNodes(tree, node => node.props?.['aria-label'] === 'Model for segment 1')[0]
   const boundaryTwo = findNodes(tree, node => node.props?.['aria-label'] === 'Boundary before segment 2')[0]
   modelOne.props.onChange({ target: { value: 'minimax_h3_pinkcherry_fl2va' } })
   boundaryTwo.props.onChange({ target: { value: 'cut' } })
@@ -525,7 +525,7 @@ test('loading and expired review states cannot dismiss or resubmit stale plan wo
   assert.equal(closes, 0)
   assert.equal(approvals, 0)
   assert.equal(cancels, 0)
-  assert.match(nodeText(tree), /Server is auto-accepting this frozen plan/)
+  assert.match(nodeText(tree), /Approving the saved plan unchanged/)
   assert.equal(findNodes(tree, node => node.props?.role === 'alert').length, 1)
 })
 
@@ -576,17 +576,36 @@ test('duration controls preserve server authority, locks, revision, and exact ap
     currentGeneratedFrames: 64,
     currentMinusTargetFrames: -0,
     outcome: 'exact',
-    reason: 'The server-authored plan exactly matches the target.',
+    reason: 'The current plan matches your original target.',
   })
-  const frameInputs = findNodes(tree, node => String(node.props?.['aria-label'] || '').startsWith('Published frames for segment'))
+  const frameInputs = findNodes(tree, node => String(node.props?.['aria-label'] || '').startsWith('Final video frames for segment'))
   assert.equal(frameInputs.length, 2)
   assert.equal(frameInputs[0].props.disabled, false)
   assert.equal(frameInputs[1].props.disabled, true)
-  assert.match(nodeText(tree), /No lower boundary is available/)
-  assert.match(nodeText(tree), /bar shows the current frozen server plan/i)
+  const technicalReason = 'No proven segment-efficient boundary satisfies the selected snap mode.'
+  assert.equal(currentPlan.duration_plan.snap_candidates.down.reason, technicalReason)
+  let shorterLabel = findNodes(tree, node => node.type === 'label' && nodeText(node).includes('Shorter match'))[0]
+  assert.match(nodeText(shorterLabel), /Continuum could not find a matching length it can confidently suggest/)
+  assert.doesNotMatch(nodeText(shorterLabel), new RegExp(technicalReason.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  const technicalDetails = findNodes(tree, node => node.type === 'details' && nodeText(node).includes(technicalReason))[0]
+  assert.ok(technicalDetails)
+  assert.equal(technicalDetails.props.open, undefined)
+  assert.match(nodeText(technicalDetails), /Technical details/)
+
+  const unknownReason = '__proto__'
+  currentPlan.duration_plan.snap_candidates.down.reason = unknownReason
+  tree = render(Dialog)
+  shorterLabel = findNodes(tree, node => node.type === 'label' && nodeText(node).includes('Shorter match'))[0]
+  assert.match(nodeText(shorterLabel), /No shorter suggested length is available for this plan/)
+  assert.doesNotMatch(nodeText(shorterLabel), new RegExp(unknownReason))
+  assert.equal(currentPlan.duration_plan.snap_candidates.down.reason, unknownReason)
+  const unknownDetails = findNodes(tree, node => node.type === 'details' && nodeText(node).includes(unknownReason))[0]
+  assert.match(nodeText(unknownDetails), /Technical details/)
+  assert.equal(unknownDetails.props.open, undefined)
+  assert.match(nodeText(tree), /chart shows the saved plan/i)
 
   frameInputs[0].props.onChange({ currentTarget: { valueAsNumber: 23 } })
-  const redistribution = findNodes(tree, node => node.props?.['aria-label'] === 'Duration redistribution')[0]
+  const redistribution = findNodes(tree, node => node.props?.['aria-label'] === 'How to keep the original video length')[0]
   redistribution.props.onChange({ currentTarget: { value: 'future' } })
   tree = render(Dialog)
   const approveButton = findNodes(tree, node => node.type === 'button' && nodeText(node).includes('Approve & resume'))[0]
@@ -614,6 +633,10 @@ test('duration controls preserve server authority, locks, revision, and exact ap
 
 test('H3 plan mobile shell compiles four-edge safe areas, dynamic viewport, scrolling, touch, zoom, and reduced-motion rules', async () => {
   const source = await readFile(dialogUrl, 'utf8')
+  assert.match(source, /Choose FL2VA when exact start or end frames matter/)
+  assert.match(source, /Edit the segments yourself, or choose a suggested length/)
+  assert.match(source, /Continuum will approve the saved plan unchanged/)
+  assert.doesNotMatch(source, /server-authored|frozen server plan|frame geometry|server range|server locked|Checkpoint retained|Checkpoint switch/i)
   assert.match(source, /priority: 180/)
   assert.match(source, /z-\[180\]/)
   for (const edge of ['top', 'right', 'bottom', 'left']) {

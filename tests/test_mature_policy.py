@@ -221,12 +221,28 @@ class LocalContentNeutralityTests(unittest.TestCase):
             if isinstance(node, ast.AsyncFunctionDef)
             and node.name == "llm_enhance_prompt"
         )
-        enhance_source = ast.get_source_segment(source, enhance) or ""
-        self.assertIn("_require_project_access(request, workspace)", enhance_source)
-        self.assertLess(
-            enhance_source.index("_require_project_access(request, workspace)"),
-            enhance_source.index("requested_image_paths ="),
+        access_call = next(
+            item for item in ast.walk(enhance)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Name)
+            and item.func.id == "_require_project_access"
         )
+        permission = next(
+            keyword.value for keyword in access_call.keywords
+            if keyword.arg == "permission"
+        )
+        requested_images = next(
+            item for item in ast.walk(enhance)
+            if isinstance(item, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "requested_image_paths"
+                for target in item.targets
+            )
+        )
+        self.assertIsInstance(permission, ast.Constant)
+        self.assertEqual(permission.value, "project.generate")
+        self.assertLess(access_call.lineno, requested_images.lineno)
 
 
 if __name__ == "__main__":

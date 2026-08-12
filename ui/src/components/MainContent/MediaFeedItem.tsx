@@ -351,7 +351,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
   const handleShare = async () => {
     if (sharing) return
     if (!shareUrl && (file.private || file.explicit) && !window.confirm(
-      "Anyone with this high-entropy link can view this one output without the project password. Creating the link does not change the output's Private preview flag. Continue?",
+      "Anyone with this link can view only this output without entering the project password. The link does not change whether its Gallery preview is blurred. Continue?",
     )) return
     setSharing(true)
     setShareMessage('')
@@ -429,12 +429,12 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
       const result = await deleteOutputComponents(file.name, file.workspace)
       if (result.failed.length) {
         setCleanupError(
-          `${result.failed.length} linked artifact(s) could not be removed; the final output was preserved.`,
+          `${result.failed.length} related file(s) could not be removed. The finished output was kept.`,
         )
       }
     } catch (e) {
       console.error('Failed to clean linked components:', e)
-      setCleanupError(e instanceof Error ? e.message : 'Component cleanup failed')
+      setCleanupError(e instanceof Error ? e.message : 'Related files could not be removed')
     } finally {
       await useStore.getState().loadOutputs()
       setCleaningComponents(false)
@@ -642,10 +642,10 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
             onClick={(event) => { event.stopPropagation(); revealPrivatePreview() }}
             aria-label={`Reveal blurred preview for ${file.name}`}
             className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/25 text-white"
-            title="Click, tap, or press Enter to Reveal for this browser session"
+            title="Show this preview in this browser"
           >
             <EyeOff size={24} />
-            <span className="rounded-full bg-black/60 px-3 py-1 text-[11px]">Blurred preview — click to Reveal</span>
+            <span className="rounded-full bg-black/60 px-3 py-1 text-[11px]">Blurred preview — select to show</span>
           </button>
         )}
         {file.private && privateRevealed && (
@@ -925,13 +925,13 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
                 ? 'bg-amber-500/20 text-amber-300'
                 : 'hover:bg-bg-hover text-text-secondary hover:text-amber-300'
             }`}
-            title={confirmCleanup ? 'Click again to delete linked components' : 'Delete linked component, window, and temporary outputs'}
+            title={confirmCleanup ? `Delete ${file.linked_component_count} related files and keep this finished output?` : 'Delete related parts, generation steps, and temporary files while keeping this finished output'}
           >
-            {cleaningComponents ? 'Cleaning…' : confirmCleanup ? 'Clean?' : `Clean ${file.linked_component_count}`}
+            {cleaningComponents ? 'Removing…' : confirmCleanup ? 'Delete related files?' : `Remove ${file.linked_component_count} related`}
           </button>
           {cleanupError && (
             <span className="max-w-40 truncate text-[9px] text-red-400" title={cleanupError}>
-              Cleanup incomplete
+              Some related files remain
             </span>
           )}
           </>
@@ -960,7 +960,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
             }`}
             title={confirmDelete
               ? file.linked_component_count > 0
-                ? `Click again to delete this output and ${file.linked_component_count} linked parts`
+                ? `Click again to permanently delete this output and ${file.linked_component_count} related files`
                 : 'Click again to confirm delete'
               : 'Delete output'}
           >

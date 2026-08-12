@@ -10,6 +10,7 @@ import { closeModalIfTop, installModalFocus } from '../src/lib/modalFocus.ts'
 
 const uiRoot = new URL('../', import.meta.url)
 const retakeUrl = new URL('../src/components/RetakeDialog.tsx', import.meta.url)
+const retakeControlsUrl = new URL('../src/components/Sidebar/RetakeControls.tsx', import.meta.url)
 const saveUrl = new URL('../src/components/Recipes/SaveRecipeDialog.tsx', import.meta.url)
 const mediaFeedUrl = new URL('../src/components/MainContent/MediaFeedItem.tsx', import.meta.url)
 
@@ -196,6 +197,11 @@ function deferred() {
   return { promise, reject, resolve }
 }
 
+async function flushPromises() {
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
 async function loadDialogComponent(entryUrl, exportName) {
   const modules = new Map([
     ['react', `
@@ -235,10 +241,16 @@ async function loadDialogComponent(entryUrl, exportName) {
       const icon = props => ({ type: 'svg', props: props || {} })
       export const BookMarked = icon
       export const Loader2 = icon
+      export const Upload = icon
       export const X = icon
     `],
     ['../stores/useStore', `
       export function useStore(selector) { return selector(globalThis.__retakeStore) }
+      useStore.setState = update => Object.assign(globalThis.__retakeStore, update)
+    `],
+    ['../../stores/useStore', `
+      export function useStore(selector) { return selector(globalThis.__retakeStore) }
+      useStore.setState = update => Object.assign(globalThis.__retakeStore, update)
     `],
     ['./shared/VideoTimelineSelector', `
       export function VideoTimelineSelector(props) { return { type: 'timeline', props } }
@@ -248,8 +260,11 @@ async function loadDialogComponent(entryUrl, exportName) {
       export async function submitRetake(payload) {
         globalThis.__retakePayloads.push(payload)
         if (globalThis.__retakeSubmit) return globalThis.__retakeSubmit(payload)
-        return { retake_frames: 17 }
+        return { retake_frames: '0-17/300' }
       }
+    `],
+    ['../../api/client', `
+      export async function uploadImage(file) { return globalThis.__retakeUpload(file) }
     `],
     ['../lib/modelDisplay', `
       export function modelDisplayName(model) { return 'Display ' + model }
@@ -403,10 +418,14 @@ async function loadMediaFeedItemHarness() {
 }
 
 function resetDialogHarness(refs) {
+  const video = { src: '', onloadedmetadata: null, onerror: null, duration: 0, videoWidth: 0, videoHeight: 0 }
   globalThis.document = {
     activeElement: null,
     body: { name: 'document body', style: { overflow: '' } },
-    createElement: () => ({ src: '', onloadedmetadata: null }),
+    createElement: () => {
+      globalThis.__retakeVideo = video
+      return video
+    },
     getElementById: id => ({ id }),
   }
   globalThis.__dialogHookIndex = 0
@@ -421,6 +440,8 @@ function resetDialogHarness(refs) {
   globalThis.__dialogAllowTopClose = true
   globalThis.__retakePayloads = []
   globalThis.__retakeSubmit = null
+  globalThis.__retakeUpload = async () => ({ path: '/uploaded/video.mp4' })
+  globalThis.__retakeVideo = null
 }
 
 function beginRender() {
@@ -599,6 +620,9 @@ test('bundled Retake dialog portals, captures exact active trigger, and preserve
     workspace: 'workspace-a',
   }])
   assert.equal(loadOutputs, 1)
+  beginRender()
+  tree = RetakeDialog()
+  assert.equal(nodeText(findNode(tree, node => node.props?.role === 'status')), 'Retake queued for 17 frames.')
 })
 
 test('Retake loading, failure, and close-reopen lifecycle ignore every stale completion', async () => {
@@ -668,8 +692,153 @@ test('Retake loading, failure, and close-reopen lifecycle ignore every stale com
   await findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.onClick()
   beginRender()
   tree = RetakeDialog()
-  assert.equal(nodeText(findNode(tree, node => node.props?.role === 'alert')), 'Retake service unavailable')
+  const alert = nodeText(findNode(tree, node => node.props?.role === 'alert'))
+  assert.equal(alert, 'The retake could not be queued. Try again.')
+  assert.doesNotMatch(alert, /service unavailable/i)
   assert.equal(findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.disabled, false)
+})
+
+test('Retake upload reports bounded inline failure and preserves accessible retry and metadata flow', async t => {
+  const RetakeControls = await loadDialogComponent(retakeControlsUrl, 'RetakeControls')
+  const originalCreateObjectURL = URL.createObjectURL
+  const originalRevokeObjectURL = URL.revokeObjectURL
+  const revoked = []
+  URL.createObjectURL = () => 'blob:retake-video'
+  URL.revokeObjectURL = url => { revoked.push(url) }
+  t.after(() => {
+    URL.createObjectURL = originalCreateObjectURL
+    URL.revokeObjectURL = originalRevokeObjectURL
+  })
+
+  const input = { clicks: 0, value: 'clip.mp4', click() { this.clicks += 1 } }
+  resetDialogHarness([{ current: input }])
+  const store = {
+    editVideoFile: null,
+    editVideoPath: '',
+    editVideoUrl: '',
+    editVideoDuration: 0,
+    editStartTime: 0,
+    editEndTime: 0,
+    editRetakeStrength: 0.5,
+    editRetakeEngine: 'native',
+    editRegenerateAudio: true,
+    setEditVideo() {},
+    clearEditVideo() {},
+  }
+  globalThis.__retakeStore = store
+  globalThis.__retakeUpload = async () => { throw new Error('/private/uploads/clip.mp4 failed') }
+
+  let tree = RetakeControls()
+  const upload = findNode(tree, node => node.type === 'button' && /Drop a video/.test(nodeText(node)))
+  assert.equal(upload.props.type, 'button')
+  assert.match(upload.props.className, /min-h-11/)
+  assert.match(upload.props.className, /focus-visible:ring-2/)
+  findNode(tree, node => node.type === 'input' && node.props?.type === 'file')
+    .props.onChange({ target: { files: [{ name: 'clip.mp4', type: 'video/mp4' }] } })
+  await flushPromises()
+  beginRender()
+  tree = RetakeControls()
+  const uploadAlert = findNode(tree, node => node.props?.role === 'alert')
+  assert.equal(nodeText(uploadAlert), 'The video could not be uploaded. Choose the file again.Choose file again')
+  assert.doesNotMatch(nodeText(uploadAlert), /private|uploads|clip\.mp4 failed/i)
+  const retry = findNode(uploadAlert, node => node.type === 'button' && nodeText(node) === 'Choose file again')
+  assert.match(retry.props.className, /min-h-11/)
+  retry.props.onClick()
+  assert.equal(input.clicks, 1)
+  assert.equal(input.value, '')
+
+  const selected = []
+  resetDialogHarness([{ current: input }])
+  globalThis.__retakeStore = {
+    ...store,
+    setEditVideo(...args) {
+      selected.push(args)
+      Object.assign(globalThis.__retakeStore, {
+        editVideoFile: args[0], editVideoPath: args[1], editVideoUrl: args[2],
+        editVideoDuration: args[3], editEndTime: args[3],
+      })
+    },
+  }
+  const file = { name: 'clip.mp4', type: 'video/mp4' }
+  tree = RetakeControls()
+  findNode(tree, node => node.type === 'input' && node.props?.type === 'file')
+    .props.onChange({ target: { files: [file] } })
+  await flushPromises()
+  globalThis.__retakeVideo.duration = 3.5
+  globalThis.__retakeVideo.videoWidth = 1280
+  globalThis.__retakeVideo.videoHeight = 720
+  globalThis.__retakeVideo.onloadedmetadata()
+  assert.deepEqual(selected, [[file, '/uploaded/video.mp4', 'blob:retake-video', 3.5, '1280x720']])
+  beginRender()
+  tree = RetakeControls()
+  const remove = findNode(tree, node => node.props?.['aria-label'] === 'Remove retake video')
+  assert.equal(remove.props.type, 'button')
+  assert.match(remove.props.className, /min-h-11/)
+  assert.match(remove.props.className, /min-w-11/)
+  remove.props.onClick()
+  assert.deepEqual(revoked, ['blob:retake-video'])
+  const native = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Native')
+  const compatibility = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Compatibility')
+  assert.equal(native.props['aria-pressed'], true)
+  assert.equal(compatibility.props['aria-pressed'], false)
+  assert.match(native.props.className, /min-h-11/)
+  assert.match(compatibility.props.className, /min-h-11/)
+  const engineGroup = findNode(tree, node => node.props?.role === 'group' && node.props?.['aria-label'] === 'Retake engine')
+  assert.ok(engineGroup)
+})
+
+test('Retake upload latest selection wins and unmounted completions stay inert', async t => {
+  const RetakeControls = await loadDialogComponent(retakeControlsUrl, 'RetakeControls')
+  const originalCreateObjectURL = URL.createObjectURL
+  const originalRevokeObjectURL = URL.revokeObjectURL
+  URL.createObjectURL = file => `blob:${file.name}`
+  URL.revokeObjectURL = () => {}
+  t.after(() => {
+    URL.createObjectURL = originalCreateObjectURL
+    URL.revokeObjectURL = originalRevokeObjectURL
+  })
+  const uploads = new Map()
+  const selected = []
+  resetDialogHarness([{ current: { value: '' } }])
+  globalThis.__retakeStore = {
+    editVideoFile: null, editVideoPath: '', editVideoUrl: '', editVideoDuration: 0,
+    editStartTime: 0, editEndTime: 0, editRetakeStrength: 0.5,
+    editRetakeEngine: 'native', editRegenerateAudio: true,
+    setEditVideo(...args) { selected.push(args) }, clearEditVideo() {},
+  }
+  globalThis.__retakeUpload = file => {
+    const pending = deferred()
+    uploads.set(file.name, pending)
+    return pending.promise
+  }
+  const firstFile = { name: 'first.mp4', type: 'video/mp4' }
+  const secondFile = { name: 'second.mp4', type: 'video/mp4' }
+  let tree = RetakeControls()
+  let picker = findNode(tree, node => node.type === 'input' && node.props?.type === 'file')
+  picker.props.onChange({ target: { files: [firstFile] } })
+  beginRender()
+  tree = RetakeControls()
+  picker = findNode(tree, node => node.type === 'input' && node.props?.type === 'file')
+  picker.props.onChange({ target: { files: [secondFile] } })
+  uploads.get('second.mp4').resolve({ path: '/uploads/second.mp4' })
+  await flushPromises()
+  globalThis.__retakeVideo.duration = 4
+  globalThis.__retakeVideo.videoWidth = 640
+  globalThis.__retakeVideo.videoHeight = 480
+  globalThis.__retakeVideo.onloadedmetadata()
+  uploads.get('first.mp4').resolve({ path: '/uploads/first.mp4' })
+  await flushPromises()
+  assert.deepEqual(selected, [[secondFile, '/uploads/second.mp4', 'blob:second.mp4', 4, '640x480']])
+
+  beginRender()
+  tree = RetakeControls()
+  picker = findNode(tree, node => node.type === 'input' && node.props?.type === 'file')
+  const lateFile = { name: 'late.mp4', type: 'video/mp4' }
+  picker.props.onChange({ target: { files: [lateFile] } })
+  for (const cleanup of globalThis.__dialogCleanups) cleanup?.()
+  uploads.get('late.mp4').resolve({ path: '/uploads/late.mp4' })
+  await flushPromises()
+  assert.equal(selected.length, 1)
 })
 
 test('MediaFeed lifecycle epoch prevents an old Save completion from closing a reopened dialog', async () => {

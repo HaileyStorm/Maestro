@@ -1239,7 +1239,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
         ):
             self.assertIn(field, source["client"])
         self.assertIn("QueueReorderReason", source["client"])
-        self.assertIn("Reordered to reuse the loaded model", source["main"])
+        self.assertIn("Started sooner by reusing the loaded model", source["main"])
         self.assertIn("Waiting for another generation on this host", source["main"])
         for field in ("running", "waiting", "held", "registering", "active_total"):
             self.assertIn(f"{field}: number", source["client"])

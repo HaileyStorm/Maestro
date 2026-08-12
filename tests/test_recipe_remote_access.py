@@ -169,11 +169,23 @@ class RecipeServiceVisibilityTests(unittest.TestCase):
 class RecipeRouteAuthorityTests(unittest.TestCase):
     def test_real_project_helpers_reject_missing_unprotected_and_locked_remote_scope(self):
         namespace = _launch_subset("_request_project_workspace", "_require_project_access")
+        disabled_access_state = {
+            "state": "disabled",
+            "enforced": False,
+            "project_count": 0,
+            "needs_attention": 0,
+        }
+        account_permissions = []
         request = types.SimpleNamespace(
             state=types.SimpleNamespace(maestro_remote=True, maestro_session_id="session-a")
         )
         namespace["_get_active_workspace"] = lambda: "host-global"
         namespace["_existing_workspace_dir"] = lambda workspace: f"/projects/{workspace}"
+        namespace["_account_project_access_state"] = lambda: disabled_access_state
+        namespace["_require_account_project_permission"] = (
+            lambda _request, workspace, permission, *, state=None:
+                account_permissions.append((workspace, permission, state))
+        )
 
         with self.assertRaises(namespace["HTTPException"]) as missing:
             namespace["_request_project_workspace"](request, "")
@@ -195,6 +207,14 @@ class RecipeRouteAuthorityTests(unittest.TestCase):
             namespace["_require_project_access"](request, "film-a"),
             "/projects/film-a",
         )
+        self.assertEqual(
+            account_permissions,
+            [
+                ("/projects/film-a", "project.read", disabled_access_state),
+                ("/projects/film-a", "project.read", disabled_access_state),
+                ("/projects/film-a", "project.read", disabled_access_state),
+            ],
+        )
 
     def test_remote_reads_require_an_explicit_authorized_project(self):
         namespace = _launch_subset("_recipe_read_scope")
@@ -203,13 +223,17 @@ class RecipeRouteAuthorityTests(unittest.TestCase):
             lambda _request, workspace: events.append(("resolve", workspace)) or workspace
         )
         namespace["_require_project_access"] = (
-            lambda _request, workspace: events.append(("authorize", workspace))
+            lambda _request, workspace, permission="project.read", **_kwargs:
+                events.append(("authorize", workspace, permission))
         )
         scope = namespace["_recipe_read_scope"]
         request = types.SimpleNamespace(state=types.SimpleNamespace(maestro_remote=True))
 
         self.assertEqual(scope(request, "film-a"), (True, "film-a"))
-        self.assertEqual(events, [("resolve", "film-a"), ("authorize", "film-a")])
+        self.assertEqual(events, [
+            ("resolve", "film-a"),
+            ("authorize", "film-a", "project.read"),
+        ])
 
     def test_remote_recipe_gets_pass_but_mutations_are_local_only(self):
         namespace = _launch_subset("_remote_local_only_denial", include_remote_constants=True)
@@ -271,7 +295,8 @@ class RecipeRouteAuthorityTests(unittest.TestCase):
             lambda _request, workspace: authority.append(("resolve", workspace)) or workspace
         )
         namespace["_require_project_access"] = (
-            lambda _request, workspace: authority.append(("authorize", workspace))
+            lambda _request, workspace, permission="project.read", **_kwargs:
+                authority.append(("authorize", workspace, permission))
         )
         namespace["recipes"] = types.SimpleNamespace(
             list_recipes=lambda **kwargs: calls.append(("list", kwargs)) or [{
@@ -303,7 +328,10 @@ class RecipeRouteAuthorityTests(unittest.TestCase):
                 ("thumbnail", "starter", {"bundled_only": True}),
             ],
         )
-        self.assertEqual(authority.count(("authorize", "film a")), 3)
+        self.assertEqual(
+            authority.count(("authorize", "film a", "project.read")),
+            3,
+        )
 
 
 class RecipeUiSourceHarnessTests(unittest.TestCase):
@@ -350,7 +378,9 @@ class RecipeUiSourceHarnessTests(unittest.TestCase):
         for edge in ("top", "right", "bottom", "left"):
             self.assertIn(f"safe-area-inset-{edge}", overlay)
         self.assertIn("machineControls && <button", overlay)
-        self.assertIn("host owner", overlay)
+        self.assertIn("this session cannot install LoRAs", overlay)
+        self.assertIn("Install access required", overlay)
+        self.assertNotIn("host owner", overlay)
         self.assertIn("applyingRef.current", overlay)
         self.assertIn("disabled={applying !== null}", overlay)
         self.assertIn('role="status" aria-live="polite"', overlay)

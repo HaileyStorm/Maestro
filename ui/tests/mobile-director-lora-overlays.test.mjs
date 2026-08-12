@@ -9,7 +9,9 @@ import { compile } from 'tailwindcss'
 import { closeModalIfTop, installModalFocus } from '../src/lib/modalFocus.ts'
 
 const directorUrl = new URL('../src/components/DirectorDashboard/DirectorDashboard.tsx', import.meta.url)
+const directorPanelUrl = new URL('../src/components/Sidebar/DirectorPanel.tsx', import.meta.url)
 const loraUrl = new URL('../src/components/LoraBrowser/LoraBrowser.tsx', import.meta.url)
+const modelCardUrl = new URL('../src/components/LoraBrowser/ModelCard.tsx', import.meta.url)
 
 class FakeDocument extends EventTarget {
   activeElement = null
@@ -348,9 +350,10 @@ test('rendered full-screen surfaces portal to body and route backdrop and X thro
 })
 
 test('full-screen source and compiled utilities cover safe-area, short-height, 200% zoom, and 767/768 contracts', async () => {
-  const [director, browser] = await Promise.all([
+  const [director, browser, modelCard] = await Promise.all([
     readFile(directorUrl, 'utf8'),
     readFile(loraUrl, 'utf8'),
+    readFile(modelCardUrl, 'utf8'),
   ])
   for (const source of [director, browser]) {
     assert.match(source, /createPortal\(/)
@@ -379,6 +382,19 @@ test('full-screen source and compiled utilities cover safe-area, short-height, 2
   assert.doesNotMatch(director, /md:\[&_(?:a|button|input|select|textarea)\]:min-[hw]-0/)
   assert.doesNotMatch(browser, /md:\[&_(?:a|button|input|select|textarea)\]:min-[hw]-0/)
   assert.match(browser, /min-h-11 flex-1 overflow-hidden/)
+  assert.match(browser, /Hugging Face repository or CivitAI model URL/)
+  assert.match(browser, /Downloading \$\{result\.filename\}\. Follow progress in the download bar\./)
+  assert.doesNotMatch(browser, /Downloading \$\{result\.filename\} →/)
+  assert.match(browser, />Redo all</)
+  assert.doesNotMatch(browser, />Regen</)
+  assert.doesNotMatch(browser, /Paste a HuggingFace model URL/)
+  assert.match(browser, /lora\.hf_repo_id \? 'Hugging Face' : 'Local only'/)
+  for (const label of ['LoRA', 'Textual Inversion', 'Aesthetic Gradient', 'ControlNet', 'Motion Module']) {
+    assert.match(modelCard, new RegExp(`['"]${label}['"]`))
+  }
+  assert.match(modelCard, /formatModelType\(model\.type\)/)
+  assert.match(modelCard, /aria-label=\{`View \$\{model\.name\} details`\}/)
+  assert.doesNotMatch(modelCard, />\{model\.type\}</)
 
   const utilities = await compile('@tailwind utilities;')
   const compiled = utilities.build([
@@ -421,4 +437,48 @@ test('full-screen source and compiled utilities cover safe-area, short-height, 2
 
   const zoomedWidths = [640, 780, 1534, 1536].map(width => width / 2)
   assert.deepEqual(zoomedWidths, [320, 390, 767, 768], 'matrix includes 200% zoom at both breakpoint edges')
+})
+
+test('Director dashboard presents bounded production, fix, and prompt-refinement copy', async () => {
+  const dashboard = await readFile(directorUrl, 'utf8')
+
+  for (const copy of [
+    "music_video: 'Music video'",
+    "short_film_audio: 'Audio-led short film'",
+    "short_film_story: 'Story short film'",
+    "|| 'Director production'",
+    "crashed: 'Stopped unexpectedly'",
+    "|| 'Status unavailable'",
+    "cancelling: 'Stopping fixes'",
+    "|| 'Fix status unavailable'",
+  ]) assert.match(dashboard, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+
+  assert.match(dashboard, /pipelineTypeCopy\(p\.pipeline_type\)/)
+  assert.match(dashboard, /pipelineStatusCopy\(p\.status\)/)
+  assert.match(dashboard, /repairStatusCopy\(p\.repair_status\)/)
+  assert.match(dashboard, /pipelineStatusCopy\(selectedPipeline\.status\)/)
+  assert.match(dashboard, /pipelineTypeCopy\(selectedPipeline\.pipeline_type\)/)
+  assert.match(dashboard, /repairStatusCopy\(repair\?\.status \|\| ''\)/)
+  assert.doesNotMatch(dashboard, /\{repair\?\.message \|\| 'Repairing'\}/)
+  assert.match(dashboard, /<summary[^>]*>Technical details<\/summary>[\s\S]*?Reported type: \{selectedPipeline\.pipeline_type\}[\s\S]*?Reported status: \{selectedPipeline\.status\}[\s\S]*?Fix note: \{repair\.message\}/)
+  assert.doesNotMatch(dashboard, /prompt polish diff|Before Polish|No changes from polish/)
+  for (const copy of ['prompt refinements', 'Original', 'Refined', 'No prompt refinements were needed']) {
+    assert.match(dashboard, new RegExp(copy))
+  }
+})
+
+test('Director panel translates image progress with an unknown fallback and optional raw detail', async () => {
+  const panel = await readFile(directorPanelUrl, 'utf8')
+
+  for (const copy of [
+    "generating: 'Creating image'",
+    "polling: 'Waiting for image'",
+    "downloading: 'Saving image'",
+    "done: 'Image ready'",
+    "error: 'Image needs attention'",
+    "|| 'Image status unavailable'",
+  ]) assert.match(panel, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.match(panel, /imageStatusCopy\(imageGenProgress\.status\)/)
+  assert.doesNotMatch(panel, /` — \$\{imageGenProgress\.status\}`/)
+  assert.match(panel, /<summary[^>]*>Technical details<\/summary>[\s\S]*?Reported state: \{imageGenProgress\.status\}/)
 })

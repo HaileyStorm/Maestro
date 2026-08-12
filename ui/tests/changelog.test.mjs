@@ -36,17 +36,17 @@ test('public release manifest is typed, current, unique, and newest first', () =
 
 test('all-time product themes and the current release delta are exact and separate', () => {
   assert.deepEqual(CHANGELOG_MANIFEST.whyContinuum.map(item => item.title), [
-    'Project-scoped creation, privacy, and remote access',
-    'Curated H3 long-form planning and recovery',
+    'Organized projects with private, controlled access',
+    'Longer H3 videos with clear plans and recovery',
     'Reference',
-    'Request-scoped local LLM and Director tools',
-    'Queue and recovery visibility',
+    'Local creative guidance when you want it',
+    'A queue you can follow and resume',
   ])
   assert.deepEqual(CURRENT_RELEASE.highlights.map(item => item.title), [
-    'Adaptive, sealed Reference Pack v2',
-    'Host-authorized models and exact-family recipes',
+    'Reference Packs that keep your choices together',
+    'Clear model choices and compatible recipes',
     'Blur/Reveal controls for large galleries',
-    'Durable plans, recovery, and resource visibility',
+    'Reliable queues with recovery and estimates',
   ])
   assert.notStrictEqual(CURRENT_RELEASE.highlights, CHANGELOG_MANIFEST.whyContinuum)
   const aliasedManifest = {
@@ -60,7 +60,7 @@ test('all-time product themes and the current release delta are exact and separa
   assert.doesNotMatch(JSON.stringify(CURRENT_RELEASE), /\bH3\b|Maestro 1\.6\.5|server-authored/i)
   assert.doesNotMatch(JSON.stringify(CURRENT_RELEASE), /restart-resumable|fixed-seed|quality acceptance|default promotion/i)
   const allTimeH3 = CHANGELOG_MANIFEST.whyContinuum.find(item => item.id === 'h3-long-form')
-  assert.match(allTimeH3.summary, /bundled Maestro 1\.6\.5 H3 contract/)
+  assert.match(allTimeH3.summary, /included Maestro 1\.6\.5 H3 features/)
   assert.match(welcomeSource, /CURRENT_RELEASE\.highlights\.map/)
   assert.match(welcomeSource, /CHANGELOG_MANIFEST\.whyContinuum\.map/)
   assert.match(dialogSource, /CURRENT_RELEASE\.highlights\.map/)
@@ -75,22 +75,46 @@ test('manifest is public-only and contains no runtime artifacts or invented link
   assert.doesNotMatch(serialized, /"(?:href|url|releaseLink)"/i)
 })
 
+test('release and welcome copy stays clear for people using the app', () => {
+  const userFacingManifestCopy = [
+    CHANGELOG_MANIFEST.lineageNote,
+    ...CHANGELOG_MANIFEST.whyContinuum.flatMap(item => [item.title, item.summary]),
+    ...CHANGELOG_MANIFEST.releases.flatMap(release => [
+      release.label,
+      release.summary,
+      ...(release.provenance.kind === 'bundled-snapshot' ? [release.provenance.note] : []),
+      ...release.highlights.flatMap(item => [item.title, item.summary]),
+    ]),
+  ].join(' ')
+
+  assert.doesNotMatch(userFacingManifestCopy, /UI-bundled|separate lineages|server-authored|deterministic|durable plans?|evidence ledger|structural proof|request-scoped|host-authorized|authored timeline|native-shot|bundled snapshot/i)
+  assert.match(dialogSource, /These notes are included with the app\. Opening them does not access your projects, running work, or device information\./)
+  assert.doesNotMatch(dialogSource, /Public, UI-bundled notes only|release delta|untagged bundled snapshot/)
+  assert.doesNotMatch(welcomeSource, /adaptive segment plan|language-model service|shared cache|Cloudflare sessions/)
+  assert.match(userFacingManifestCopy, /Remote visitors can open only the projects you authorize/)
+  assert.match(userFacingManifestCopy, /resume options[^.]*when the workflow supports them/)
+  assert.match(userFacingManifestCopy, /without changing project access/)
+  assert.match(welcomeSource, /Project access controls who can open the project; blur controls what appears in this browser/)
+  assert.match(welcomeSource, /If needed,[^<]*downloads and prepares model files in a shared storage area/)
+  assert.match(welcomeSource, /Approved local and remote users can reuse them; project access and private-preview settings still apply/)
+})
+
 test('Continuum, Maestro base, and WanGP provenance stay distinct', () => {
   const continuum = CHANGELOG_MANIFEST.releases.filter(release => release.lineage === 'continuum')
   const maestro = CHANGELOG_MANIFEST.releases.filter(release => release.lineage === 'maestro-base')
   assert.deepEqual(continuum.map(release => release.version), [continuumVersion, '0.2.0', '0.1.0'])
   assert.deepEqual(continuum[1].highlights.map(item => item.title), [
-    'Project-aware local and remote workspace',
+    'Projects that work locally and remotely',
     'Reference workflow',
-    'Request-scoped LLM and Director controls',
-    'Visible queue and recovery states',
+    'Local guidance for each request',
+    'Queue progress and recovery',
   ])
   assert.deepEqual(maestro.map(release => release.version), [maestroBaseVersion, '1.6.1', '1.5.0'])
   assert.equal(maestro[0].provenance.kind, 'bundled-snapshot')
   assert.deepEqual(maestro.slice(1).map(release => release.provenance.kind), ['git-tag', 'git-tag'])
   assert.deepEqual(maestro.slice(1).map(release => release.provenance.tag), ['v1.6.1', 'v1.5.0'])
-  assert.match(CHANGELOG_MANIFEST.lineageNote, /WanGP pipeline history are separate lineages/)
-  assert.match(dialogSource, /not presented as Continuum releases/)
+  assert.equal(CHANGELOG_MANIFEST.lineageNote, 'Continuum, Maestro, and WanGP each have their own release history.')
+  assert.match(dialogSource, /not listed as Continuum releases/)
 })
 
 test("what's-new dialog has persistent triggers and modal focus isolation", () => {
@@ -122,7 +146,7 @@ test("mobile what's-new trigger remains reachable while the sidebar drawer is cl
 test('current notes and collapsed archive remain reachable on mobile', () => {
   assert.match(dialogSource, /Continuum v\{CURRENT_RELEASE\.version\}/)
   assert.match(dialogSource, /<details className=/)
-  assert.match(dialogSource, /All release history/)
+  assert.match(dialogSource, /Earlier releases/)
   assert.match(dialogSource, /max-h-\[calc\(100dvh-1\.5rem\)\]/)
   assert.match(dialogSource, /overflow-y-auto/)
   assert.match(dialogSource, /env\(safe-area-inset-bottom\)/)
@@ -141,7 +165,7 @@ test("what's-new visible controls keep mobile touch targets and compact desktop 
   const releaseHistorySummary = dialogSource.match(/<summary[^]*?<\/summary>/)?.[0]
   assert.ok(releaseHistorySummary, 'the release-history disclosure must remain present')
   assert.match(releaseHistorySummary, /className="[^"]*\bmin-h-11\b[^"]*\bmd:min-h-0\b[^"]*"/)
-  assert.match(releaseHistorySummary, /All release history/)
+  assert.match(releaseHistorySummary, /Earlier releases/)
 
   const footer = dialogSource.match(/<footer[^]*?<\/footer>/)?.[0]
   const doneButton = footer?.match(/<button[^]*?>\s*Done\s*<\/button>/)?.[0]

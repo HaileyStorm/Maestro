@@ -1,8 +1,7 @@
 """Static contracts for the structured OOM recovery UI."""
-from pathlib import Path
 import subprocess
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TYPES = (ROOT / "ui/src/types/index.ts").read_text(encoding="utf-8")
@@ -56,12 +55,12 @@ import {
         ):
             self.assertIn(field, TYPES)
 
-    def test_banner_distinguishes_delivery_and_preserved_native_result(self):
+    def test_banner_distinguishes_delivery_and_saved_original_result(self):
         self.assertIn("oom.stage === 'h3_delivery'", BANNER)
-        self.assertIn("Delivery ran out of VRAM", BANNER)
-        self.assertIn("Native generation succeeded.", BANNER)
-        self.assertIn("preserved the native result privately", BANNER)
-        self.assertIn("one automatic identical retry", BANNER)
+        self.assertIn("Output processing ran out of GPU memory", BANNER)
+        self.assertIn("Generation finished.", BANNER)
+        self.assertIn("Maestro saved the original result privately", BANNER)
+        self.assertIn("after one automatic retry.", BANNER)
         self.assertNotIn("V1 scope", BANNER)
         self.assertNotIn("Deferred to a later phase", BANNER)
 
@@ -80,15 +79,15 @@ import {
         )
 
     def test_failed_delivery_card_stays_recoverable_without_rerun_copy(self):
-        self.assertIn("Delivery Failed After Native Generation", MAIN)
-        self.assertIn("recovery state shown above", MAIN)
-        self.assertIn("Recovery status is shown below.", MAIN)
+        self.assertIn("Output Processing Failed After Generation", MAIN)
+        self.assertIn("recovery options are below", MAIN)
+        self.assertIn("Generation will not run again", RECOVERY)
         self.assertIn("<H3DeliveryRecoveryStatus", MAIN)
 
     def test_failed_retry_child_never_queries_itself_for_source_actions(self):
         self.assertIn("const isDeliveryRecoveryChild", MAIN)
         self.assertIn("!isDeliveryRecoveryChild && job.workspace", MAIN)
-        self.assertIn("Delivery recovery child failed", MAIN)
+        self.assertIn("Delivery Retry Failed", MAIN)
         self.assertIn("selectRecoverySourceIndex", BANNER)
         self.assertIn(
             "failedJob.oomInfo.manual_retry_count == null ? failedJob.id : undefined",
@@ -117,7 +116,7 @@ if (selectRecoverySourceIndex([
         self.assertIn("{ cache: 'no-store' }", CLIENT)
         self.assertIn("acceptCapability &&", RECOVERY)
         self.assertIn("retryCapability &&", RECOVERY)
-        self.assertIn("Use native result", RECOVERY)
+        self.assertIn("Use saved result", RECOVERY)
         self.assertIn("Retry delivery only", RECOVERY)
         self.assertNotIn("console.", RECOVERY)
         self.assertNotIn("console.", RECOVERY_HOOK)
@@ -129,10 +128,10 @@ if (selectRecoverySourceIndex([
         self.assertIn("!activeChild) void reconnectJobs()", RECOVERY)
         self.assertIn("active_recovery_job_id", RECOVERY)
         self.assertIn("completed_recovery_job_id", RECOVERY)
-        self.assertIn("Delivery retries {retryCount}/{retryLimit}", RECOVERY)
+        self.assertIn("Delivery retries used: {retryCount} of {retryLimit}", RECOVERY)
         self.assertIn("typeof recovery.restart_supported === 'boolean'", RECOVERY)
-        self.assertIn("does not rerun generation or denoise", RECOVERY)
-        self.assertIn("does not change machine settings", RECOVERY)
+        self.assertIn("Generation will not run again", RECOVERY)
+        self.assertIn("machine settings will not change", RECOVERY)
         self.assertIn("recoveryIdentity === identity ? recovery : null", RECOVERY_HOOK)
 
     def test_completed_recovery_refreshes_and_opens_gallery(self):
@@ -169,10 +168,10 @@ if (recoveryGalleryNavigationVerified({ ...base, outputsLoaded: false })) {
         self.assertNotIn("failed jobs also don't survive", BANNER)
 
     def test_completed_parent_copy_is_historical_not_present_tense(self):
-        self.assertIn("preserved the native result privately when", BANNER)
-        self.assertIn("Maestro preserved it privately when", MAIN)
-        self.assertNotIn("still ran out of VRAM", BANNER)
-        self.assertNotIn("still ran out of VRAM", MAIN)
+        self.assertIn("saved the original result privately when", BANNER)
+        self.assertIn("Maestro saved the original result privately", MAIN)
+        self.assertNotIn("still ran out of GPU memory", BANNER)
+        self.assertNotIn("still ran out of GPU memory", MAIN)
 
 
 if __name__ == "__main__":

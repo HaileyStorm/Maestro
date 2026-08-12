@@ -28,7 +28,6 @@ import {
   getLoraParameterValue,
   getProjectReferenceRepairCopy,
   getProjectReferenceReviewerAction,
-  getProjectReferenceReviewerSetupCopy,
   getProjectReferenceRetrySettings,
   hasProjectReferenceLoraParameterSummary,
   isProjectReferenceReviewMandatory,
@@ -98,9 +97,9 @@ const ASSET_TYPES = [
 ] as const
 
 const INTENT_OPTIONS: Array<{ value: ProjectReferenceIntent; label: string; description: string }> = [
-  { value: 'exact_spec', label: 'Exact', description: 'Preserve only authored facts.' },
-  { value: 'generic', label: 'Generic', description: 'Use practical reference defaults.' },
-  { value: 'brainstorming', label: 'Brainstorming', description: 'Explore clearly marked visual alternatives.' },
+  { value: 'exact_spec', label: 'Follow my description', description: 'Stick closely to the details I provide.' },
+  { value: 'generic', label: 'Balanced', description: 'Fill in practical details when needed.' },
+  { value: 'brainstorming', label: 'Explore ideas', description: 'Try clearly marked visual alternatives.' },
 ]
 
 const DEPTH_OPTIONS: Array<{ value: ProjectReferenceDepth; label: string; description: string }> = [
@@ -167,7 +166,7 @@ function LoraParameterFields({
               )
             })}
           </ul>
-          <p className="mt-1">The selected values add these exact phrases only to matching Character generation prompts. LoRA multiplier remains a separate strength control.</p>
+          <p className="mt-1">These choices add the shown phrases only when creating matching Character images. LoRA strength is controlled separately.</p>
         </div>
       )}
       {schema.parameters.map(parameter => {
@@ -649,22 +648,148 @@ const SHEET_MODES: Array<{
   {
     value: 'production',
     label: 'Production',
-    description: 'Establishes one canonical anchor, then generates a coordinated, reviewable pack.',
+    description: 'Creates one main image, then builds and checks a consistent pack.',
   },
   {
     value: 'hybrid',
     label: 'Hybrid',
-    description: 'Establishes one canonical anchor, then derives targeted reference-guided edits.',
+    description: 'Creates one main image, then uses it to make focused variations.',
   },
   {
     value: 'draft',
     label: 'Draft',
-    description: 'Generates each requested sheet as a fast unanchored one-shot; it does not use panel repair.',
+    description: 'Creates each sheet independently for speed. Automatic fixes are off.',
   },
 ]
 
 function friendlyRole(role: string): string {
   return role.replaceAll('_', ' ').replace(/\b\w/g, letter => letter.toUpperCase())
+}
+
+const PROJECT_REFERENCE_PROVIDER_LABELS: Readonly<Record<string, string>> = {
+  local: 'Local',
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+}
+
+const PROJECT_REFERENCE_MODEL_LABELS: Readonly<Record<string, string>> = {
+  auto: 'Automatic local model',
+  auto_local: 'Automatic local model',
+  deterministic: 'Built-in planner',
+  off: 'Off',
+}
+
+const PROJECT_REFERENCE_VARIANT_STATUS_LABELS: Readonly<Record<string, string>> = {
+  candidate: 'Candidate',
+  kept: 'Kept',
+  rejected: 'Rejected',
+}
+
+const PROJECT_REFERENCE_ROUTE_STATUS_LABELS: Readonly<Record<string, string>> = {
+  standard: 'Standard settings',
+  applied: 'Adjusted for this model',
+  skipped: 'Not used',
+}
+
+const PROJECT_REFERENCE_OPERATION_LABELS: Readonly<Record<string, string>> = {
+  generation: 'Main image',
+  edit: 'Variations',
+  repair: 'Automatic fixes',
+  callout: 'Detail views',
+}
+
+const PROJECT_REFERENCE_LORA_SCOPE_LABELS: Readonly<Record<string, string>> = {
+  auto: 'Best fit',
+  generation: 'Main image',
+  editing: 'Variations',
+}
+
+const PROJECT_REFERENCE_REVIEWER_SETUP_LABELS: Readonly<Record<string, string>> = {
+  missing_model: 'Visual review model setup is required.',
+  missing_projector: 'Image understanding setup is required.',
+  loaded_without_vision: 'The visual review model is loaded, but image understanding is unavailable.',
+  ready_unloaded: 'Visual review is ready and will load automatically when needed.',
+  ready_resident: 'Visual review is ready.',
+}
+
+const PROJECT_REFERENCE_REVIEWER_ACTION_LABELS: Readonly<Record<string, string>> = {
+  load: 'Prepare visual review model',
+  reload: 'Reload visual review model',
+}
+
+function projectReferenceProviderLabel(provider: string | null | undefined): string {
+  if (!provider) return 'Local'
+  return PROJECT_REFERENCE_PROVIDER_LABELS[provider.toLowerCase()] ?? 'External service'
+}
+
+function projectReferenceModelLabel(
+  modelId: string | null | undefined,
+  catalog: readonly Pick<LlmModelOption, 'id' | 'label'>[] = [],
+): string {
+  if (!modelId) return 'Model unavailable'
+  return PROJECT_REFERENCE_MODEL_LABELS[modelId]
+    ?? catalog.find(model => model.id === modelId)?.label
+    ?? 'Model unavailable'
+}
+
+function projectReferenceVariantStatusLabel(status: string | null | undefined): string {
+  return status ? PROJECT_REFERENCE_VARIANT_STATUS_LABELS[status] ?? 'Status unavailable' : 'Status unavailable'
+}
+
+function projectReferenceRouteStatusLabel(status: string | null | undefined): string {
+  return status ? PROJECT_REFERENCE_ROUTE_STATUS_LABELS[status] ?? 'Status unavailable' : 'Status unavailable'
+}
+
+function projectReferenceOperationLabel(operation: string | null | undefined): string {
+  return operation ? PROJECT_REFERENCE_OPERATION_LABELS[operation] ?? 'Other step' : 'Other step'
+}
+
+function projectReferenceLoraScopeLabel(scope: string | null | undefined): string {
+  return scope ? PROJECT_REFERENCE_LORA_SCOPE_LABELS[scope] ?? 'Other use' : 'Other use'
+}
+
+function projectReferencePendingPhaseLabel(phase: string | null | undefined): string {
+  if (!phase) return 'Queued'
+  const normalized = phase.trim().toLowerCase().replace(/[_-]+/g, ' ')
+  if (normalized === 'reference generation held') return 'Waiting in the Queue'
+  if (normalized === 'planning' || normalized.startsWith('planning ')
+    || normalized.startsWith('freezing ')) return 'Preparing your pack'
+  if (normalized.startsWith('generating ')) return 'Creating pack sheets'
+  if (normalized.startsWith('deriving ')) return 'Creating variations'
+  if (normalized.startsWith('reviewing ')) return 'Checking visual quality'
+  if (normalized.startsWith('repairing ')) return 'Improving pack sheets'
+  if (normalized.startsWith('staging ') || normalized.startsWith('publishing ')
+    || normalized === 'publication recovery') return 'Finishing your pack'
+  return 'Status unavailable'
+}
+
+function projectReferenceReviewerLoadingLabel(phase: string | null | undefined): string {
+  if (!phase) return 'Preparing visual review'
+  const normalized = phase.trim().toLowerCase().replace(/[_-]+/g, ' ')
+  if (normalized === 'downloading' || normalized === 'downloading model') return 'Downloading visual review model'
+  if (normalized === 'downloading runtime') return 'Downloading visual review support'
+  if (normalized === 'building runtime') return 'Preparing visual review support'
+  if (normalized === 'downloading projector' || normalized === 'downloading vision projector') return 'Downloading image understanding'
+  if (normalized === 'building projector' || normalized === 'building vision projector') return 'Preparing image understanding'
+  if (normalized === 'loading model') return 'Loading visual review model'
+  if (normalized === 'loading projector' || normalized === 'loading vision projector'
+    || normalized === 'loading mmproj') return 'Loading image understanding'
+  return 'Preparation status unavailable'
+}
+
+function projectReferenceReviewerSetupLabel(
+  contract: ProjectReferenceCapabilities['uncensored_auto_review'] | null | undefined,
+): string {
+  if (!contract) return 'Visual review setup is unavailable. Refresh its status and try again.'
+  if (contract.setup_state === 'loading') {
+    return `${projectReferenceReviewerLoadingLabel(contract.loading_phase)}.`
+  }
+  return PROJECT_REFERENCE_REVIEWER_SETUP_LABELS[contract.setup_state]
+    ?? 'Visual review setup is unavailable. Refresh its status and try again.'
+}
+
+function projectReferenceReviewerActionLabel(kind: string | null | undefined): string {
+  return kind ? PROJECT_REFERENCE_REVIEWER_ACTION_LABELS[kind] ?? 'Prepare visual review model' : 'Prepare visual review model'
 }
 
 function referenceSheetStatus(variant: ProjectAssetVariant): {
@@ -682,15 +807,15 @@ function referenceSheetStatus(variant: ProjectAssetVariant): {
     : []
   const repair = getProjectReferenceRepairCopy(metadata)
   if (metadata?.review_status === 'pass') {
-    return { label: repaired.length > 0 ? 'Local review passed after repair' : 'Local review passed', className: 'text-accent-green', repair }
+    return { label: repaired.length > 0 ? 'Quality check passed after a fix' : 'Quality check passed', className: 'text-accent-green', repair }
   }
   if (metadata?.review_status === 'fail') {
-    return { label: 'Local review still needs attention', className: 'text-amber-300', repair }
+    return { label: 'Quality check found items to review', className: 'text-amber-300', repair }
   }
   if (metadata?.review_status === 'review_unavailable') {
-    return { label: 'Local review unavailable — candidate preserved for your review', className: 'text-text-muted', repair: '' }
+    return { label: 'Quality check unavailable — candidate kept for you to review', className: 'text-text-muted', repair: '' }
   }
-  return { label: 'Local review was not requested', className: 'text-text-muted', repair: '' }
+  return { label: 'Quality check was not requested', className: 'text-text-muted', repair: '' }
 }
 
 function ProjectAssetPreview({ project, assetId, output, label }: {
@@ -1114,7 +1239,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   )
   const mandatoryReviewUnavailable = mandatoryReview && !mandatoryReviewSelectionEligible
   const reviewSelectionUnavailable = uncensoredReviewUnavailable || mandatoryReviewUnavailable
-  const reviewerSetupCopy = getProjectReferenceReviewerSetupCopy(uncensoredReviewContract)
+  const reviewerSetupCopy = projectReferenceReviewerSetupLabel(uncensoredReviewContract)
   const reviewerSetupAction = getProjectReferenceReviewerAction(
     uncensoredReviewContract?.setup_state,
   )
@@ -1167,13 +1292,13 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   ))
   const loraParameterErrors = additionalLoras.flatMap(lora => {
     if (hasLoraSchemaConflict(lora.id, lora.scope)) {
-      return [`${lora.id}: generation and editing publish different parameter schemas; choose an explicit compatible scope.`]
+      return [`${lora.id}: this LoRA uses different settings for the main image and variations. Choose where to use it.`]
     }
     if (!lora.parameter_schema_digest) return []
     const schema = resolveLoraSchema(lora.id, lora.scope)
-    if (!schema) return [`${lora.id}: its published parameter schema is unavailable for the selected model scope.`]
+    if (!schema) return [`${lora.id}: its settings are unavailable for the selected model and use.`]
     if (schema.schema_digest !== lora.parameter_schema_digest) {
-      return [`${lora.id}: its published parameter schema changed. Remove and add it again to review the new inputs.`]
+      return [`${lora.id}: its available settings have changed. Remove and add it again to review them.`]
     }
     return validateLoraParameterValues(schema, lora.parameter_values)
       .map(error => `${lora.id}: ${error}`)
@@ -1540,7 +1665,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       setReferenceCapabilities(null)
       setCapabilitiesLoadError(projectReferenceSafeErrorMessage(
         reason,
-        'Could not load the authoritative Reference plan.',
+        'Could not load the Reference Studio plan.',
       ))
     })
     return () => { active = false }
@@ -1637,8 +1762,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         submittedProject, epoch, currentProject.current, projectEpoch.current,
       )) return
       setReviewerActionError(loadRequired
-        ? 'Could not install or load the required reviewer. Check the local model service, then refresh reviewer status.'
-        : 'Could not refresh reviewer status. Check the local model service and try again.')
+        ? 'Could not prepare the required visual review model. Check the local model service, then refresh its status.'
+        : 'Could not refresh the visual review model. Check the local model service and try again.')
     } finally {
       if (isProjectAssetOperationCurrent(
         submittedProject, epoch, currentProject.current, projectEpoch.current,
@@ -2062,10 +2187,10 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const loraCompatibilityCopy = (lora: ProjectReferenceAdditionalLora) => {
     const generationCompatible = generationLoras.includes(lora.id)
     const editingCompatible = sheetMode !== 'draft' && editingLoras.includes(lora.id)
-    if (lora.scope === 'generation') return generationCompatible ? 'Applied: Create / anchor' : 'Incompatible with creation model'
-    if (lora.scope === 'editing') return editingCompatible ? 'Applied: Edit / derivative' : 'Incompatible with editor model'
-    const applied = [generationCompatible ? 'Create / anchor' : '', editingCompatible ? 'Edit / derivative' : ''].filter(Boolean)
-    return applied.length > 0 ? `Auto compatible: ${applied.join(' + ')}` : 'Auto compatible: skipped by selected models'
+    if (lora.scope === 'generation') return generationCompatible ? 'Used for the main image' : 'Does not work with the creation model'
+    if (lora.scope === 'editing') return editingCompatible ? 'Used for variations' : 'Does not work with the editor model'
+    const applied = [generationCompatible ? 'Main image' : '', editingCompatible ? 'Variations' : ''].filter(Boolean)
+    return applied.length > 0 ? `Best fit: ${applied.join(' + ')}` : 'Not used by the selected models'
   }
 
   const toggleSectionValue = (sectionId: ReferenceSectionId, value: string) => {
@@ -2260,7 +2385,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       setDescription('')
       setPendingFreshJobIds(current => [...new Set([...current, response.job_id])])
       const queuedSheets = response.plan?.sheet_count ?? sheetCount
-      setQueuedMessage(`Reference submission accepted (${response.job_id}); confirming it with the Queue.`)
+      setQueuedMessage('Reference submission accepted; confirming it with the Queue.')
       requestRefresh()
       const authoredSeal = response.plan?.authored_settings?.seal
       const acceptedSnapshot = cloneReferenceAuthoredSnapshot(
@@ -2297,8 +2422,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       )
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setQueuedMessage(jobConfirmed
-        ? `Queued ${candidateCount} ${candidateCount === 1 ? 'candidate pack' : 'candidate packs'} with ${queuedSheets} ${queuedSheets === 1 ? 'sheet' : 'sheets'} each (${response.job_id}). They will appear here when complete.`
-        : `Reference submission accepted (${response.job_id}); Queue confirmation is still catching up. The accepted pack will appear here when the Queue reconnects.`)
+        ? `Queued ${candidateCount} ${candidateCount === 1 ? 'candidate pack' : 'candidate packs'} with ${queuedSheets} ${queuedSheets === 1 ? 'sheet' : 'sheets'} each. They will appear here when complete.`
+        : 'Reference submission accepted; Queue confirmation is still catching up. The accepted pack will appear here when the Queue reconnects.')
       // Queue navigation and accepted-state updates happen before confirmation;
       // the Reference peer remains mounted with the retained next-run defaults.
     } catch (reason) {
@@ -2318,7 +2443,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     const requiresPrivateAuthoring = projectReferenceRetryNeedsPrivateAuthoring(variant)
     if (requiresPrivateAuthoring && (!sourceAuthoredSeal
       || !authoredSettingsSnapshots.current.has(sourceAuthoredSeal))) {
-      setActionError('Exact private authoring is unavailable for this candidate. Retry and Edit stay disabled so style, profile, custom fields, and details are never silently dropped; create a new authored pack instead.')
+      setActionError('The private creation settings for this candidate are unavailable. Retry and Edit stay off so none of your style, profile, custom fields, or details are lost. Create a new pack instead.')
       return
     }
     const sourceAssetType = normalizeProjectReferenceAssetType(asset.asset_type) ?? assetType
@@ -2337,7 +2462,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     if (!isProjectReferenceStyleReplayReady(
       sourcePackMetadata?.authored_settings, sourceAuthoredSnapshot?.style,
     )) {
-      setActionError('Exact private style is unavailable or its commitment changed. Retry and Edit remain disabled; create a new authored pack instead.')
+      setActionError('The private style settings are unavailable or have changed. Retry and Edit remain off; create a new pack instead.')
       return
     }
     if (!isProjectReferenceCharacterReplayReady(
@@ -2347,7 +2472,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         explicit_convenience: sourceAuthoredSnapshot.explicitConvenience,
       } : undefined,
     )) {
-      setActionError('Exact private Character profile or convenience setting is unavailable or changed. Retry and Edit remain disabled; create a new authored pack instead.')
+      setActionError('The private Character profile or anatomy-detail settings are unavailable or have changed. Retry and Edit remain off; create a new pack instead.')
       return
     }
     const sourcePlanSeal = sourcePackMetadata?.plan_seal
@@ -2359,7 +2484,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       ? loraParameterSnapshots.current.get(sourcePlanSeal)
       : undefined
     if (summarizedParameterizedLoras.length > 0 && !privateLoraSnapshot) {
-      setActionError('Exact private LoRA inputs are unavailable for this candidate. Retry and Edit stay disabled so parameter values are never guessed or silently dropped; create a new pack instead.')
+      setActionError('The private LoRA settings for this candidate are unavailable. Retry and Edit stay off so no values are guessed or lost. Create a new pack instead.')
       return
     }
     const sourceSettings = getProjectReferenceRetrySettings(variant, {
@@ -2436,7 +2561,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
             Boolean(generationLora),
             Boolean(editingLora),
           )) {
-            throw new Error(`${lora.id} no longer publishes one matching parameter schema across its recorded operation models.`)
+            throw new Error(`${lora.id} no longer offers one set of settings that works with both saved models.`)
           }
           const schema = lora.scope === 'generation'
             ? generationLora?.parameter_schema
@@ -2444,7 +2569,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
               ? editingLora?.parameter_schema
               : generationLora?.parameter_schema ?? editingLora?.parameter_schema
           if (!schema || schema.schema_digest !== lora.parameter_schema_digest) {
-            throw new Error(`${lora.id} no longer has the exact recorded parameter schema. Retry and Edit are disabled until the LoRA is restored; values will not be guessed or migrated.`)
+            throw new Error(`${lora.id} no longer has the saved settings. Retry and Edit are off until the LoRA is restored; Maestro will not guess or change values.`)
           }
           const errors = validateLoraParameterValues(schema, lora.parameter_values)
           if (errors.length > 0) {
@@ -2538,7 +2663,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         ...current,
         [key]: { project, assetId: asset.id, variantId: variant.id, jobId: response.job_id },
       }))
-      setQueuedMessage(`${instruction?.trim() ? 'Edit' : 'Retry'} accepted (${response.job_id}); confirming it with the Queue.`)
+      setQueuedMessage(`${instruction?.trim() ? 'Edit' : 'Retry'} accepted; confirming it with the Queue.`)
       setEditVariantId(null)
       setEditInstruction('')
       requestRefresh()
@@ -2580,8 +2705,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       )
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setQueuedMessage(jobConfirmed
-        ? `${instruction?.trim() ? 'Edit' : 'Retry'} queued (${response.job_id}). Available source mode, model, privacy, and repair policy were preserved; ${retryReview.use_current_reviewer ? 'the current compatible reviewer replaced an unavailable recorded reviewer' : 'current layout and review intent were used'}. The original and any kept source stay unchanged.`
-        : `${instruction?.trim() ? 'Edit' : 'Retry'} accepted (${response.job_id}); Queue confirmation is still catching up. The original and any kept source stay unchanged.`)
+        ? `${instruction?.trim() ? 'Edit' : 'Retry'} queued. Available source mode, model, privacy, and repair policy were preserved; ${retryReview.use_current_reviewer ? 'the current compatible reviewer replaced an unavailable recorded reviewer' : 'current layout and review intent were used'}. The original and any kept source stay unchanged.`
+        : `${instruction?.trim() ? 'Edit' : 'Retry'} accepted; Queue confirmation is still catching up. The original and any kept source stay unchanged.`)
       // Queue navigation and accepted-state updates happen before confirmation;
       // the Reference peer remains mounted with its existing asset identity.
     } catch (reason) {
@@ -2745,7 +2870,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         <Library size={14} className="shrink-0 text-accent-blue" aria-hidden="true" />
         <div className="min-w-0">
           <h2 id="project-reference-title" className="text-sm font-semibold text-text-primary">Reference Studio</h2>
-          <p className="truncate text-[10px] text-text-muted">{project || 'Choose a project'} · create and manage reusable reference packs</p>
+          <p className="truncate text-[10px] text-text-muted">{project || 'Choose a project'} · create and manage reusable visual references</p>
         </div>
       </div>
 
@@ -2793,11 +2918,11 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     <option value="custom">Custom…</option>
                   </select>
                   {visualStyle === 'custom' && <input aria-label="Custom reference visual style" value={customVisualStyle} onChange={event => setCustomVisualStyle(event.target.value)} placeholder="e.g. 1970s editorial watercolor" className="mt-1.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-[10px] text-text-primary md:min-h-0" />}
-                  <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Realistic is the fallback only. Choose a preset to make it explicit, or use Custom when your own freeform style should be authoritative.</p>
+                  <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Realistic is used by default. Choose a preset, or select Custom to describe your own style.</p>
                 </fieldset>
                 <fieldset aria-label="Reference creation method" className="mt-3 rounded-md border border-accent-blue/30 bg-accent-blue/5 p-2">
                   <legend className="px-1 text-[10px] font-medium text-text-primary">Creation method</legend>
-                  <p className="text-[8px] leading-relaxed text-text-muted">Creation method is separate from the durable Character, Location, Wardrobe, and other semantic types above.</p>
+                  <p className="text-[8px] leading-relaxed text-text-muted">Choose what you want to create. Your reference category above stays the same.</p>
                   <div className="mt-1.5 grid grid-cols-2 gap-1.5">
                     <button
                       type="button"
@@ -2807,7 +2932,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                       className={`min-h-11 min-w-11 rounded border p-2 text-left md:min-h-0 md:min-w-0 ${candidateKind === 'image_pack' ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-secondary'}`}
                     >
                       <span className="block text-[10px] font-medium text-accent-blue">Image Reference Pack</span>
-                      <span className="mt-0.5 block text-[8px] text-text-muted">Author the selected semantic type using the controls below.</span>
+                      <span className="mt-0.5 block text-[8px] text-text-muted">Create image references for the selected category using the options below.</span>
                     </button>
                     <button
                       type="button"
@@ -2829,7 +2954,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   inert={creationPanelStates.blender_motion.inert}
                   className="mt-3 rounded-md border border-accent-blue/30 bg-accent-blue/5 p-2"
                 >
-                    <p className="text-[8px] text-text-muted">Create, preview, Keep, and apply a structured motion/camera reference to Generate. This method does not become an asset type and does not remove Blender from Tools.</p>
+                    <p className="text-[8px] text-text-muted">Create, preview, keep, and use a motion and camera reference in Generate. Blender also remains available under Tools.</p>
                     <BlenderSceneTool
                       compact
                       referenceName={name}
@@ -2928,9 +3053,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                         />
                       </label>
                     </div>
-                    <p id="project-reference-character-profile-help" className="mt-1.5 text-[8px] leading-relaxed text-text-muted">These structured facts guide Character planning and review. Age is separate from gender and from any age written in the description; if both specify an age, keep them consistent. Maestro does not scan or infer age from text, appearance, or gender.</p>
+                    <p id="project-reference-character-profile-help" className="mt-1.5 text-[8px] leading-relaxed text-text-muted">These optional details help Maestro create and check the Character. Age is separate from gender and from any age in the description; if you use both, keep them consistent. Maestro does not guess age from text, appearance, or gender.</p>
                     <fieldset className="mt-2 rounded border border-border/70 p-1.5">
-                      <legend className="px-1 text-[9px] text-text-secondary">Authored anatomy</legend>
+                      <legend className="px-1 text-[9px] text-text-secondary">Anatomy details</legend>
                       <div className="grid grid-cols-1 gap-1 sm:grid-cols-3">
                         {([
                           ['breasts', 'Breasts · front + profile'],
@@ -2953,10 +3078,10 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     </fieldset>
                     <label className="mt-2 flex min-h-11 items-start gap-2 py-1 text-[9px] text-text-secondary md:min-h-0 md:py-0">
                       <input type="checkbox" checked={explicitConvenience} onChange={event => applyExplicitConvenience(event.target.checked)} className="h-5 w-5 shrink-0 md:h-auto md:w-auto" />
-                      <span><span className="font-medium">Explicit convenience</span><span className="mt-0.5 block text-[8px] text-text-muted">Uses the Anatomy / Nude anchor and asks the server to create managed detail callouts for the anatomy selected above. It turns on Explicit output authorization; turning convenience off does not change that separate choice. Breasts creates separate front and profile callouts; vulva and penis remain independent choices. Draft keeps the profile but does not create callout sheets.</span></span>
+                      <span><span className="font-medium">Create anatomy detail views</span><span className="mt-0.5 block text-[8px] text-text-muted">Uses the Anatomy / Nude main image and creates detail views for the anatomy selected above. This also turns on Allow explicit output. Turning this option off does not turn that separate permission off. Breasts creates front and profile views; vulva and penis remain separate choices. Draft saves the profile but does not create detail sheets.</span></span>
                     </label>
-                    <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Explicit convenience is for adult characters. An authored age below 18 blocks queueing; leaving age blank does not assert adulthood. Gender never selects anatomy or establishes age.</p>
-                    {explicitConvenience && <p role="status" className="mt-1 text-[8px] text-text-muted">{managedCharacterCalloutCount} managed {managedCharacterCalloutCount === 1 ? 'callout' : 'callouts'} will be requested for this {sheetMode === 'draft' ? 'profile; Draft creates no callout sheets' : 'pack'}.</p>}
+                    <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Anatomy detail views are for adult characters. An age below 18 blocks queueing; leaving age blank does not confirm adulthood. Gender never chooses anatomy or sets age.</p>
+                    {explicitConvenience && <p role="status" className="mt-1 text-[8px] text-text-muted">{managedCharacterCalloutCount} anatomy {managedCharacterCalloutCount === 1 ? 'detail view' : 'detail views'} will be requested for this {sheetMode === 'draft' ? 'profile; Draft creates no detail sheets' : 'pack'}.</p>}
                   </fieldset>
                 )}
                 <fieldset className="mt-3 rounded-md border border-border bg-bg-tertiary/40 p-2">
@@ -2967,15 +3092,15 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                       setReferenceExplicitOutput(enabled)
                       if (!enabled) setExplicitConvenience(false)
                     }} />
-                    Explicit output
+                    Allow explicit output
                   </label>
-                  <p className="mt-1 text-[8px] text-text-muted">This is separate from Character profile facts. Managed anatomy-callout convenience requires this authorization, so turning Explicit output off also turns that convenience off. Content capability, initial blur, and intelligence remain explicit choices below.</p>
-                  <p className="mt-1 text-[8px] text-text-muted">The visual fidelity reviewer checks identity, anatomy, layout, style adherence, and retry quality. It does not classify or censor content or decide whether a request is allowed.</p>
+                  <p className="mt-1 text-[8px] text-text-muted">This permission is separate from the Character profile. Anatomy detail views require it, so turning it off also turns that option off. You can choose the content mode, initial blur, and automatic model behavior below.</p>
+                  <p className="mt-1 text-[8px] text-text-muted">The visual quality check looks for consistent identity, anatomy, layout, and style. It does not classify or censor content or decide whether a request is allowed.</p>
                   <div className="mt-2 grid grid-cols-1 gap-1.5">
-                    <label htmlFor="project-reference-content-capability" className="text-[9px] text-text-muted">Content capability
+                    <label htmlFor="project-reference-content-capability" className="text-[9px] text-text-muted">Content mode
                       <select id="project-reference-content-capability" value={contentCapability} onChange={event => setContentCapability(event.target.value as 'standard' | 'unrestricted_local')} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary md:min-h-0">
                         {contentCapabilities.includes('standard') && <option value="standard">Standard</option>}
-                        {contentCapabilities.includes('unrestricted_local') && <option value="unrestricted_local">Unrestricted local</option>}
+                        {contentCapabilities.includes('unrestricted_local') && <option value="unrestricted_local">Unrestricted · local only</option>}
                       </select>
                     </label>
                     <label htmlFor="project-reference-initial-blur" className="text-[9px] text-text-muted">Initial output
@@ -2984,10 +3109,10 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                         <option value="reveal">Reveal</option>
                       </select>
                     </label>
-                    <label htmlFor="project-reference-intelligence-policy" className="text-[9px] text-text-muted">Intelligence
+                    <label htmlFor="project-reference-intelligence-policy" className="text-[9px] text-text-muted">Automatic model choice
                       <select id="project-reference-intelligence-policy" value={intelligencePolicy} onChange={event => { setIntelligenceCustomized(true); setIntelligencePolicy(event.target.value as 'standard_auto' | 'uncensored_auto') }} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary md:min-h-0">
-                        {intelligencePolicies.includes('standard_auto') && <option value="standard_auto">Standard Auto</option>}
-                        {intelligencePolicies.includes('uncensored_auto') && <option value="uncensored_auto">Uncensored-capable Auto</option>}
+                        {intelligencePolicies.includes('standard_auto') && <option value="standard_auto">Standard automatic</option>}
+                        {intelligencePolicies.includes('uncensored_auto') && <option value="uncensored_auto">Unrestricted local automatic</option>}
                       </select>
                     </label>
                   </div>
@@ -3000,11 +3125,11 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                       <fieldset key={definition.id} className="rounded-md border border-border bg-bg-tertiary/40 p-2">
                         <legend className="px-1 text-[10px] font-medium text-text-secondary">
                           {definition.label}
-                          {section.pinned && <span className="ml-1 text-accent-blue">Customized · pinned</span>}
+                          {section.pinned && <span className="ml-1 text-accent-blue">· Customized</span>}
                         </legend>
                         {definition.id === 'details' && (
                           <p className="mb-1.5 text-[8px] leading-relaxed text-text-muted">
-                            Add up to 8 flexible labels. Use separate view-specific callouts when needed—for example, breasts (front) and breasts (profile). Source Sheet chooses the authored pack sheet to crop from; Operation chooses whether Maestro auto-selects, crops, enhances, or reconstructs that detail. Exact labels remain owner-private and preserve their authored wording.
+                            Add up to 8 custom details. Create separate entries for different views when needed—for example, breasts (front) and breasts (profile). Source sheet chooses which image to use. Action chooses whether Maestro decides, crops, enhances, or rebuilds the detail. Your custom labels stay private to the project owner.
                           </p>
                         )}
                         <div className="flex flex-wrap gap-1">
@@ -3047,7 +3172,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                       {validDetailSourceRoles.map(role => <option key={role} value={role}>{friendlyRole(role)}</option>)}
                                     </select>
                                   </label>
-                                  <label className="text-[8px] text-text-muted">Operation
+                                  <label className="text-[8px] text-text-muted">Action
                                     <select aria-label={`${item.label} detail operation`} disabled={sheetMode === 'draft'} value={callout?.operation ?? setting.operation} onChange={event => setDetailSettings(current => ({ ...current, [item.id]: { ...setting, operation: event.target.value as ProjectReferenceDetailOperation } }))} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary disabled:opacity-50 md:min-h-0">
                                       {(authoritativePreset?.detail_operations ?? referenceCapabilities?.detail_operations ?? []).map(operation => <option key={operation} value={operation} disabled={operation === 'reconstruct' && intent === 'exact_spec'}>{detailOperationLabel(operation)}</option>)}
                                     </select>
@@ -3056,8 +3181,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                               </div>
                               )
                             })}
-                            {intent === 'exact_spec' && <p className="text-[8px] text-amber-300">Exact intent never reconstructs absent identity detail; use Auto, Crop, or Enhance.</p>}
-                            {sheetMode === 'draft' && <p className="text-[8px] text-amber-300">Draft does not create editor-dependent detail outputs. These selections will be used when you choose Production or Hybrid.</p>}
+                            {intent === 'exact_spec' && <p className="text-[8px] text-amber-300">Follow my description will not invent a missing identity detail. Use Auto, Crop, or Enhance.</p>}
+                            {sheetMode === 'draft' && <p className="text-[8px] text-amber-300">Draft does not create details that require the editor model. These choices will be used when you select Production or Hybrid.</p>}
                           </div>
                         )}
                         <div className="mt-1.5 flex flex-col gap-1 md:flex-row">
@@ -3075,17 +3200,17 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     <h4 className="text-[10px] font-medium text-text-primary">Pack preview</h4>
                     <span className="text-[9px] text-accent-blue">{sheetCount} base {sheetCount === 1 ? 'sheet' : 'sheets'}{detailCallouts.length > 0 ? ` + ${detailCallouts.length} detail ${detailCallouts.length === 1 ? 'output' : 'outputs'}` : ''} × {candidateCount} {candidateCount === 1 ? 'candidate' : 'candidates'}</span>
                   </div>
-                  <p className="mt-1 text-[9px] text-text-secondary">Canonical anchor: {anchorBasis === 'anatomy' ? 'Anatomy / Nude' : anchorBasis === 'primary_outfit' ? 'Primary outfit' : 'Least-occluded view'}</p>
+                  <p className="mt-1 text-[9px] text-text-secondary">Main image: {anchorBasis === 'anatomy' ? 'Anatomy / Nude' : anchorBasis === 'primary_outfit' ? 'Primary outfit' : 'Clearest available view'}</p>
                   {anchorBasis === 'anatomy' && (
                     <label className="mt-1 flex min-h-11 items-center gap-2 text-[9px] text-text-secondary md:min-h-0">
                       <input type="checkbox" checked={anatomyPrivate} onChange={event => setAnatomyPrivate(event.target.checked)} className="h-5 w-5 shrink-0 md:h-auto md:w-auto" />
-                      Keep anatomy anchor private and blurred
+                      Keep the anatomy main image private and blurred
                     </label>
                   )}
                   <ol className="mt-1 space-y-0.5 text-[9px] text-text-muted">
                     {deliverables.map(deliverable => <li key={deliverable}>{deliverable}</li>)}
                   </ol>
-                  {deliverables.length !== sheetCount && <p role="status" className="mt-1 text-[9px] text-red-300">Authoritative ordered roles are unavailable; generation is disabled.</p>}
+                  {deliverables.length !== sheetCount && <p role="status" className="mt-1 text-[9px] text-red-300">The sheet plan is unavailable, so generation is disabled. Refresh Reference Studio or choose another preset.</p>}
                   {detailCallouts.length > 0 && (
                     <div className="mt-1 flex flex-wrap gap-1">
                       {detailCallouts.map(callout => (
@@ -3095,7 +3220,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                       ))}
                     </div>
                   )}
-                  <p className="mt-1 text-[8px] text-text-muted">Depth changes update untouched sections only. Customized sections stay pinned.</p>
+                  <p className="mt-1 text-[8px] text-text-muted">Changing reference depth updates only sections you have not customized.</p>
                 </section>
                 <label htmlFor="project-reference-generation-model" className="mt-3 block text-[10px] text-text-secondary">Generation model
                   <select id="project-reference-generation-model" aria-label="Reference generation model" value={referenceModelType} onChange={event => { setReferenceModelCustomized(true); setReferenceModelType(event.target.value) }} disabled={referenceModels.length === 0} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50 md:min-h-0">
@@ -3116,7 +3241,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 <section aria-label="Moody Krea 2 quick select" className="mt-2 rounded border border-accent-blue/25 bg-accent-blue/5 p-2">
                   <div className="flex items-center justify-between gap-2">
                     <h4 className="text-[10px] font-medium text-text-primary">Moody Krea 2 quick select</h4>
-                    <span className="text-[8px] text-text-muted">catalog-backed · manual install</span>
+                    <span className="text-[8px] text-text-muted">manual setup required</span>
                   </div>
                   <div className="mt-1.5 grid grid-cols-1 gap-1 sm:grid-cols-2">
                     {MOODY_MODEL_TYPES.map(modelType => {
@@ -3155,7 +3280,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 </section>
                 {disabledMoodyModels.length > 0 && (
                   <div role="status" className="mt-2 rounded border border-border bg-bg-tertiary/60 px-2 py-1.5 text-[9px] text-text-secondary">
-                    <p>Moody Krea 2 recipes are available but are not enabled for this host: {disabledMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')}.</p>
+                    <p>These Moody Krea 2 models are available but not enabled on this computer: {disabledMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')}.</p>
                     {machineControls ? (
                       <button type="button" onClick={() => openModelVisibility('image')} className="mt-1 min-h-11 min-w-11 rounded border border-accent-blue/40 px-3 py-0.5 text-accent-blue hover:bg-accent-blue/10 md:min-h-0 md:min-w-0 md:px-1.5">
                         Open Settings → System → Enabled Models
@@ -3167,8 +3292,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 )}
                 {enabledMissingMoodyModels.length > 0 && (
                   <div role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] text-amber-100">
-                    <p>{enabledMissingMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')} {enabledMissingMoodyModels.length === 1 ? 'is' : 'are'} enabled host-wide but missing from this session’s Reference catalog.</p>
-                    <p className="mt-1">Refresh Reference after the host catalog finishes loading. From a LAN session, complete terms, installation, and verification at localhost; host-machine controls are intentionally hidden remotely.</p>
+                    <p>{enabledMissingMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')} {enabledMissingMoodyModels.length === 1 ? 'is' : 'are'} enabled on this computer but not available in Reference Studio yet.</p>
+                    <p className="mt-1">Refresh Reference Studio after the model list finishes loading. From a LAN session, accept terms, install, and verify models at localhost; those computer-wide controls are hidden remotely.</p>
                   </div>
                 )}
                 {modelLoadError && <p role="status" className="mt-2 text-[10px] text-red-300">{modelLoadError}</p>}
@@ -3178,7 +3303,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     <div key={requirement.term} role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
                       <p>{requirement.notice}</p>
                       <div className="mt-1 flex flex-col gap-1 md:flex-row md:items-center md:gap-2">
-                        <a href={requirement.license_url} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center text-accent-blue hover:underline md:min-h-0">{notice.linkLabel || 'Review exact terms'}</a>
+                        <a href={requirement.license_url} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center text-accent-blue hover:underline md:min-h-0">{notice.linkLabel || 'Review terms'}</a>
                         <button type="button" disabled={hostTermsLoading || !hostTerms} onClick={() => { void acceptHostTerm(requirement.term) }} className="min-h-11 min-w-11 rounded border border-amber-400/40 px-3 py-0.5 font-medium text-amber-100 disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">Accept for this host</button>
                       </div>
                     </div>
@@ -3187,22 +3312,22 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 {pendingRecipeTermRequirements.length > 0 && hostTermsError && <p role="status" className="mt-1 text-[9px] text-red-300">{hostTermsError}</p>}
                 {pendingManualModels.map(model => (
                   <div key={model.model_type} role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
-                    <p>{model.name} requires the exact checkpoint to be installed and verified locally. Maestro will not download it.</p>
+                    <p>{model.name} requires its model file to be installed and verified on this computer. Maestro will not download it.</p>
                     {model.manual_installation ? (
                       <dl className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[8px]">
                         <dt className="text-amber-200">Filename</dt><dd className="break-all font-mono select-all">{model.manual_installation.filename}</dd>
                         <dt className="text-amber-200">Place in</dt><dd className="break-all font-mono select-all">{manualInstallationDestination(model.manual_installation)}</dd>
                         <dt className="text-amber-200">Size</dt><dd>{formatManualInstallationBytes(model.manual_installation.size_bytes)}</dd>
                         <dt className="text-amber-200">SHA-256</dt><dd className="break-all font-mono select-all">{model.manual_installation.sha256}</dd>
-                        <dt className="text-amber-200">Verification</dt><dd>{model.manual_installation.local_verification_required ? 'Local host only · required' : 'Not required by this manifest'}</dd>
+                        <dt className="text-amber-200">Verification</dt><dd>{model.manual_installation.local_verification_required ? 'Required at localhost' : 'Not required for this model'}</dd>
                       </dl>
                     ) : (
-                      <p className="mt-1 text-red-300">The exact public manual-install manifest is unavailable; installation cannot be verified safely.</p>
+                      <p className="mt-1 text-red-300">The required download and verification details are unavailable. Maestro cannot safely verify or use this model.</p>
                     )}
                     {model.manual_installation && (
                       <div className="mt-1 flex flex-col gap-1 md:flex-row md:flex-wrap md:gap-2">
                         <a href={model.manual_installation.source_url} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center text-accent-blue hover:underline md:min-h-0">Open source page</a>
-                        <a href={model.manual_installation.download_url} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center text-accent-blue hover:underline md:min-h-0">Open exact manual download</a>
+                        <a href={model.manual_installation.download_url} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center text-accent-blue hover:underline md:min-h-0">Open required download</a>
                       </div>
                     )}
                     {model.manual_checkpoint_verification_required && machineControls ? (
@@ -3220,7 +3345,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             })
                             .catch(error => {
                               if (projectEpoch.current === epoch) {
-                                setModelLoadError(error instanceof Error ? error.message : 'Manual checkpoint verification failed.')
+                                setModelLoadError(error instanceof Error ? error.message : 'Model file verification failed.')
                               }
                             })
                             .finally(() => {
@@ -3230,23 +3355,23 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                         className="mt-1 inline-flex min-h-11 min-w-11 items-center gap-1 rounded border border-amber-400/40 px-3 py-0.5 font-medium text-amber-100 disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5"
                       >
                         {verifyingManualModel === model.model_type && <Loader2 size={9} className="animate-spin" />}
-                        {verifyingManualModel === model.model_type ? 'Verifying local checkpoint…' : 'Verify local checkpoint'}
+                        {verifyingManualModel === model.model_type ? 'Verifying model file…' : 'Verify model file'}
                       </button>
                     ) : !model.manual_checkpoint_verification_required ? (
-                      <p className="mt-1 text-red-300">No supported exact verification contract is available for this recipe.</p>
+                      <p className="mt-1 text-red-300">The required verification method is unavailable, so Maestro cannot safely use this model.</p>
                     ) : (
-                      <p className="mt-1 text-amber-200">Local-only verification: after placing the exact file, open Maestro at localhost on the host machine and choose Verify local checkpoint. Verification is intentionally unavailable from LAN sessions.</p>
+                      <p className="mt-1 text-amber-200">After placing the required file, open Maestro at localhost on the host computer and choose Verify model file. Verification is unavailable from LAN sessions.</p>
                     )}
                   </div>
                 ))}
                 <fieldset className="mt-3 rounded-md border border-border p-2">
                   <legend className="px-1 text-[10px] font-medium text-text-secondary">Additional LoRAs</legend>
-                  <p className="text-[8px] text-text-muted">Choices are filtered by the selected creation/editor models. Auto compatible applies only to compatible stages; explicit stage scopes must be compatible.</p>
+                  <p className="text-[8px] text-text-muted">Only LoRAs that work with the selected creation and editor models are shown. Choose Best fit, Main image, or Variations.</p>
                   <div className="mt-1.5 grid grid-cols-1 gap-1 md:grid-cols-[1fr_auto]">
                     <select aria-label="Additional LoRA scope" value={pendingLoraScope} onChange={event => { setPendingLoraScope(event.target.value as ProjectReferenceLoraScope); setPendingLoraId('') }} className="min-h-11 rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[9px] text-text-secondary md:min-h-0">
-                      {loraScopes.includes('auto') && <option value="auto">Auto compatible</option>}
-                      {loraScopes.includes('generation') && <option value="generation">Create / anchor</option>}
-                      {loraScopes.includes('editing') && sheetMode !== 'draft' && <option value="editing">Edit / derivative</option>}
+                      {loraScopes.includes('auto') && <option value="auto">Best fit</option>}
+                      {loraScopes.includes('generation') && <option value="generation">Main image</option>}
+                      {loraScopes.includes('editing') && sheetMode !== 'draft' && <option value="editing">Variations</option>}
                     </select>
                     <input aria-label="Additional LoRA multiplier" type="number" min={-10} max={10} step="0.05" value={pendingLoraMultiplier} onChange={event => setPendingLoraMultiplier(Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 1)} className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-1.5 py-1 text-right text-[9px] text-text-secondary md:min-h-0 md:w-20" />
                     <select aria-label="Additional compatible LoRA" value={pendingLoraId} onChange={event => setPendingLoraId(event.target.value)} disabled={availablePendingLoras.length === 0} className="min-h-11 rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[9px] text-text-secondary disabled:opacity-50 md:min-h-0">
@@ -3255,7 +3380,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     </select>
                     <button type="button" onClick={addAdditionalLora} disabled={!pendingLoraId || pendingLoraMultiplier < -10 || pendingLoraMultiplier > 10 || pendingLoraSchemaConflict || additionalLoras.length >= 64} className="min-h-11 min-w-11 rounded border border-border px-3 py-1 text-[9px] text-text-secondary disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-2">Add</button>
                   </div>
-                  {pendingLoraSchemaConflict && <p role="status" className="mt-1 text-[8px] text-red-300">This LoRA publishes different generation and editing input schemas. Choose Create / anchor or Edit / derivative before adding it.</p>}
+                  {pendingLoraSchemaConflict && <p role="status" className="mt-1 text-[8px] text-red-300">This LoRA uses different settings for the main image and variations. Choose one before adding it.</p>}
                   {additionalLoras.length > 0 && (
                     <div className="mt-2 space-y-1">
                       {additionalLoras.map(lora => {
@@ -3276,9 +3401,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             <button type="button" aria-label={`Remove ${lora.id}`} onClick={() => setAdditionalLoras(current => current.filter(candidate => candidate.id !== lora.id))} className="flex min-h-11 min-w-11 items-center justify-center rounded p-0.5 text-text-muted hover:text-red-300 md:min-h-0 md:min-w-0"><X size={10} /></button>
                           </div>
                           <select aria-label={`${lora.id} scope`} value={lora.scope} onChange={event => updateAdditionalLora(lora.id, { scope: event.target.value as ProjectReferenceLoraScope })} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary md:min-h-0">
-                            {loraScopes.includes('auto') && <option value="auto">Auto compatible</option>}
-                            {loraScopes.includes('generation') && <option value="generation" disabled={!generationLoras.includes(lora.id)}>Create / anchor</option>}
-                            {loraScopes.includes('editing') && <option value="editing" disabled={sheetMode === 'draft' || !editingLoras.includes(lora.id)}>Edit / derivative</option>}
+                            {loraScopes.includes('auto') && <option value="auto">Best fit</option>}
+                            {loraScopes.includes('generation') && <option value="generation" disabled={!generationLoras.includes(lora.id)}>Main image</option>}
+                            {loraScopes.includes('editing') && <option value="editing" disabled={sheetMode === 'draft' || !editingLoras.includes(lora.id)}>Variations</option>}
                           </select>
                           <p className={`mt-0.5 text-[8px] ${lora.scope !== 'auto' && loraCompatibilityCopy(lora).startsWith('Incompatible') ? 'text-red-300' : 'text-text-muted'}`}>{loraCompatibilityCopy(lora)}</p>
                           {parameterFieldsReady && parameterSchema && (
@@ -3299,9 +3424,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     </div>
                   )}
                   {loraLoadError && <p role="status" className="mt-1 text-[8px] text-red-300">{loraLoadError}</p>}
-                  {hasInvalidExplicitLora && <p role="status" className="mt-1 text-[8px] text-red-300">An explicitly scoped LoRA is incompatible with its selected operation model; change its scope or remove it.</p>}
+                  {hasInvalidExplicitLora && <p role="status" className="mt-1 text-[8px] text-red-300">A LoRA does not work with the selected model. Change where it is used or remove it.</p>}
                   {hasInvalidLoraMultiplier && <p role="status" className="mt-1 text-[8px] text-red-300">LoRA multipliers must be between -10 and 10.</p>}
-                  {hasInvalidLoraParameters && <p role="status" className="mt-1 text-[8px] text-red-300">Resolve the published LoRA input errors above before queueing.</p>}
+                  {hasInvalidLoraParameters && <p role="status" className="mt-1 text-[8px] text-red-300">Fix the LoRA settings above before queueing.</p>}
                 </fieldset>
                 <label className="mt-3 flex items-center justify-between text-[10px] text-text-secondary">
                   Candidate packs
@@ -3315,74 +3440,97 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     <input aria-label="Reference sheet palette swatches" type="number" min={3} max={12} value={paletteSwatches} onChange={event => setPaletteSwatches(Math.max(3, Math.min(12, Number(event.target.value) || 3)))} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-text-secondary md:min-h-0" />
                   </label>
                 </div>
-                <label htmlFor="project-reference-planning-model" className="mt-2 block text-[10px] text-text-secondary">Planning model
+                <label htmlFor="project-reference-planning-model" className="mt-2 block text-[10px] text-text-secondary">Idea planning
                   <select id="project-reference-planning-model" aria-label="Reference planning model" value={planningModel} onChange={event => setPlanningModel(event.target.value)} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary md:min-h-0">
                     <option value="auto">Auto (local only)</option>
-                    <option value="deterministic">Deterministic only</option>
-                    {planningModels.map(model => <option key={model.id} value={model.id}>{model.label} · {model.provider ?? 'local'} · loaded</option>)}
+                    <option value="deterministic">Built-in planner</option>
+                    {planningModels.map(model => <option key={model.id} value={model.id}>{model.label} · {projectReferenceProviderLabel(model.provider)} · Ready</option>)}
                   </select>
                 </label>
-                {selectedPlanningModel && (selectedPlanningModel.provider ?? 'local') !== 'local' && <p className="mt-1 text-[9px] text-amber-300">Selected remote planning sends the reference text to {selectedPlanningModel.provider}; that provider’s terms and privacy policy apply.</p>}
-                <label htmlFor="project-reference-review-model" className="mt-2 block text-[10px] text-text-secondary">Visual review model
+                {selectedPlanningModel && (selectedPlanningModel.provider ?? 'local') !== 'local' && (
+                  <div className="mt-1 text-[9px] text-amber-300">
+                    <p>Selected remote planning sends the reference text to {projectReferenceProviderLabel(selectedPlanningModel.provider)}; that provider’s terms and privacy policy apply.</p>
+                    <details className="mt-1 text-text-muted">
+                      <summary className="flex min-h-11 cursor-pointer items-center md:min-h-0">Technical details</summary>
+                      <p>Model ID: {selectedPlanningModel.id} · Provider ID: {selectedPlanningModel.provider}</p>
+                    </details>
+                  </div>
+                )}
+                <label htmlFor="project-reference-review-model" className="mt-2 block text-[10px] text-text-secondary">Visual quality check
                   <select id="project-reference-review-model" aria-label="Reference visual review model" value={reviewModel} onChange={event => setReviewModel(event.target.value)} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary md:min-h-0">
-                    <option value="auto_local">{intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract ? `Auto local · ${uncensoredReviewContract.resolved_model}` : 'Auto local'}</option>
+                    <option value="auto_local">{intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract ? `Auto local · ${projectReferenceModelLabel(uncensoredReviewContract.resolved_model, llmCatalogModels)}` : 'Auto local'}</option>
                     <option value="off" disabled={mandatoryReview}>{mandatoryReview ? 'Off · unavailable for unrestricted / explicit output' : 'Off'}</option>
-                    {selectableReviewModels.map(model => <option key={model.id} value={model.id}>{model.label} · {model.provider ?? 'local'} · {intelligencePolicy !== 'uncensored_auto' || uncensoredReviewContract?.setup_state === 'ready_resident' ? 'vision ready' : uncensoredReviewContract?.setup_state === 'ready_unloaded' ? 'installed; auto-loads for review' : 'setup required'}</option>)}
+                    {selectableReviewModels.map(model => <option key={model.id} value={model.id}>{model.label} · {projectReferenceProviderLabel(model.provider)} · {intelligencePolicy !== 'uncensored_auto' || uncensoredReviewContract?.setup_state === 'ready_resident' ? 'Ready' : uncensoredReviewContract?.setup_state === 'ready_unloaded' ? 'Installed; loads when needed' : 'Setup required'}</option>)}
                   </select>
                 </label>
-                <p className="mt-1 text-[8px] text-text-muted">Auto never sends data remotely. Standard Auto uses currently loaded local vision options. Uncensored-capable Auto pins the exact local Paperscarecrow reviewer and MMProj; when both are installed, they may load automatically when fidelity review starts.</p>
-                {mandatoryReview && <p role="status" className="mt-1 text-[9px] text-amber-200">Vision fidelity review is required for unrestricted or explicit output and cannot be turned off.</p>}
+                <p className="mt-1 text-[8px] text-text-muted">Automatic choices never send data remotely. Standard automatic uses an available local vision model. Unrestricted local automatic uses the required Paperscarecrow model and its vision projector; both may load when the quality check starts.</p>
+                {mandatoryReview && <p role="status" className="mt-1 text-[9px] text-amber-200">A visual quality check is required for unrestricted or explicit output and cannot be turned off.</p>}
                 {intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract && (
                   <div aria-label="Required visual reviewer setup" className="mt-1.5 rounded border border-border bg-bg-primary/50 p-1.5 text-[8px] leading-relaxed text-text-muted">
-                    <p>Selected: {uncensoredReviewContract.resolved_model} · local only · no generic or remote fallback</p>
-                    <p>Checkpoint: {uncensoredReviewContract.installed ? 'installed' : 'missing'} · MMProj: {uncensoredReviewContract.projector_available ? 'installed' : 'missing'} ({uncensoredReviewContract.required_projector})</p>
-                    <p>Runtime: {uncensoredReviewContract.loading ? `loading${uncensoredReviewContract.loading_phase ? ` (${uncensoredReviewContract.loading_phase})` : ''}` : uncensoredReviewContract.resident ? 'loaded' : uncensoredReviewContract.queue_ready ? 'not loaded; automatic load available' : 'not loaded'} · Vision: {!uncensoredReviewContract.vision_capable ? 'not registered' : uncensoredReviewContract.vision_available === true ? 'ready' : uncensoredReviewContract.vision_available === false ? 'unavailable' : 'checked after load'}</p>
+                    <p>Model: {projectReferenceModelLabel(uncensoredReviewContract.resolved_model, llmCatalogModels)} · Local only · No remote fallback</p>
+                    <p>Model file: {uncensoredReviewContract.installed ? 'Installed' : 'Missing'} · Image understanding: {uncensoredReviewContract.projector_available ? 'Installed' : 'Missing'}</p>
+                    <p>Status: {uncensoredReviewContract.loading ? projectReferenceReviewerLoadingLabel(uncensoredReviewContract.loading_phase) : uncensoredReviewContract.resident ? 'Loaded' : uncensoredReviewContract.queue_ready ? 'Ready to load automatically' : 'Not loaded'} · Image understanding: {!uncensoredReviewContract.vision_capable ? 'Not configured' : uncensoredReviewContract.vision_available === true ? 'Ready' : uncensoredReviewContract.vision_available === false ? 'Unavailable' : 'Checked after loading'}</p>
                     <p role="status" className={uncensoredReviewContract.queue_ready ? 'mt-0.5 text-accent-green' : 'mt-0.5 text-red-300'}>{reviewerSetupCopy}</p>
                     <div className="mt-1 flex flex-wrap gap-1">
                       {reviewerSetupAction && machineControls && (
                         <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(true) }} className="min-h-11 min-w-11 rounded border border-accent-blue/40 px-3 py-0.5 text-accent-blue disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">
-                          {reviewerAction === 'loading' ? 'Preparing required reviewer…' : reviewerSetupAction.label}
+                          {reviewerAction === 'loading' ? 'Preparing visual review model…' : projectReferenceReviewerActionLabel(reviewerSetupAction.kind)}
                         </button>
                       )}
                       <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="min-h-11 min-w-11 rounded border border-border px-3 py-0.5 text-text-secondary disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">
-                        {reviewerAction === 'refreshing' ? 'Refreshing reviewer status…' : 'Refresh reviewer status'}
+                        {reviewerAction === 'refreshing' ? 'Refreshing visual review status…' : 'Refresh visual review status'}
                       </button>
                     </div>
-                    {reviewerSetupAction && !machineControls && <p className="mt-1 text-amber-200">Open Maestro at localhost on the host machine to install, load, or reload the required reviewer. LAN sessions can refresh status but cannot change the local model runtime.</p>}
+                    {reviewerSetupAction && !machineControls && <p className="mt-1 text-amber-200">Open Maestro at localhost on the host computer to install, load, or reload the required visual review model. LAN sessions can refresh its status but cannot change models running on the host.</p>}
                     {reviewerActionError && <p role="status" className="mt-1 text-red-300">{reviewerActionError}</p>}
+                    <details className="mt-1 rounded border border-border/70 px-1.5">
+                      <summary className="flex min-h-11 cursor-pointer items-center md:min-h-0">Technical details</summary>
+                      <p>Model ID: {uncensoredReviewContract.resolved_model}</p>
+                      <p>Provider ID: {uncensoredReviewContract.resolved_provider}</p>
+                      <p>Projector ID: {uncensoredReviewContract.required_projector}</p>
+                      {uncensoredReviewContract.loading_phase && <p>Loading phase ID: {uncensoredReviewContract.loading_phase}</p>}
+                    </details>
                   </div>
                 )}
                 {intelligencePolicy === 'uncensored_auto' && !uncensoredReviewContract && (
                   <div className="mt-1 text-[9px]">
                     <p role="status" className="text-red-300">{reviewerSetupCopy}</p>
-                    <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="mt-1 min-h-11 min-w-11 rounded border border-border px-3 py-0.5 text-text-secondary disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">{reviewerAction === 'refreshing' ? 'Refreshing reviewer status…' : 'Refresh reviewer status'}</button>
+                    <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="mt-1 min-h-11 min-w-11 rounded border border-border px-3 py-0.5 text-text-secondary disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">{reviewerAction === 'refreshing' ? 'Refreshing visual review status…' : 'Refresh visual review status'}</button>
                     {reviewerActionError && <p role="status" className="mt-1 text-red-300">{reviewerActionError}</p>}
                   </div>
                 )}
-                {intelligencePolicy === 'standard_auto' && selectedReviewModel && (selectedReviewModel.provider ?? 'local') !== 'local' && <p className="mt-1 text-[9px] text-amber-300">Selected remote visual review sends generated reference images to {selectedReviewModel.provider}; that provider’s terms and privacy policy apply.</p>}
+                {intelligencePolicy === 'standard_auto' && selectedReviewModel && (selectedReviewModel.provider ?? 'local') !== 'local' && (
+                  <div className="mt-1 text-[9px] text-amber-300">
+                    <p>Selected remote visual review sends generated reference images to {projectReferenceProviderLabel(selectedReviewModel.provider)}; that provider’s terms and privacy policy apply.</p>
+                    <details className="mt-1 text-text-muted">
+                      <summary className="flex min-h-11 cursor-pointer items-center md:min-h-0">Technical details</summary>
+                      <p>Model ID: {selectedReviewModel.id} · Provider ID: {selectedReviewModel.provider}</p>
+                    </details>
+                  </div>
+                )}
                 <details className="mt-2 rounded border border-border px-2 py-1.5">
                   <summary className="flex min-h-11 cursor-pointer items-center text-[10px] text-text-secondary md:min-h-0">Advanced</summary>
                   <fieldset className="mt-2">
-                    <legend className="text-[9px] text-text-muted">Structural layout assist</legend>
+                    <legend className="text-[9px] text-text-muted">Automatic layout help</legend>
                     <div className="mt-1 grid grid-cols-2 gap-1">
-                      <button type="button" disabled aria-pressed={false} title="No vetted managed layout assist is installed" className="min-h-11 min-w-11 rounded border border-border px-2 py-1 text-[9px] text-text-muted opacity-50 md:min-h-0 md:min-w-0">Automatic · unavailable</button>
+                      <button type="button" disabled aria-pressed={false} title="No approved automatic layout helper is installed" className="min-h-11 min-w-11 rounded border border-border px-2 py-1 text-[9px] text-text-muted opacity-50 md:min-h-0 md:min-w-0">Automatic · unavailable</button>
                       <button type="button" aria-pressed className="min-h-11 min-w-11 rounded border border-accent-blue bg-accent-blue/10 px-2 py-1 text-[9px] text-accent-blue md:min-h-0 md:min-w-0">Off</button>
                     </div>
-                    <p className="mt-1 text-[8px] text-text-muted">Only vetted structural/layout assists can appear here. Subject and content LoRAs are never enabled automatically.</p>
+                    <p className="mt-1 text-[8px] text-text-muted">Only approved layout helpers appear here. Subject and content LoRAs are never turned on automatically.</p>
                   </fieldset>
                 </details>
                 {sheetMode === 'draft' ? (
-                  <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Draft creates each requested sheet as an unanchored one-shot and does not use panel repair. It sends 0 repair attempts.</p>
+                  <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Draft creates each sheet independently and does not use automatic fixes.</p>
                 ) : mandatoryReview || reviewModel !== 'off' ? (
                   <label htmlFor="project-reference-max-repairs" className="mt-2 flex items-center justify-between gap-2 text-[10px] text-text-secondary">
                     Maximum panel repairs
                     <input id="project-reference-max-repairs" aria-label="Maximum panel repair attempts" type="number" min={1} max={5} value={maxRepairAttempts} onChange={event => setMaxRepairAttempts(Math.max(1, Math.min(5, Number(event.target.value) || 1)))} className="min-h-11 w-16 rounded border border-border bg-bg-tertiary px-2 py-1 text-right md:min-h-0" />
                   </label>
                 ) : (
-                  <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Review is off, so panel repair is disabled and 0 repair attempts are sent.</p>
+                  <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Visual review is off, so automatic fixes are also off.</p>
                 )}
                 {capabilitiesLoadError && <p role="status" className="mt-2 text-[10px] text-red-300">{capabilitiesLoadError}</p>}
-                {hasInvalidAuthoredSettings && <p role="status" className="mt-2 text-[9px] text-red-300">Authored values must be unique, bounded, and free of leading or trailing spaces; every detail output also needs an available source sheet.</p>}
+                {hasInvalidAuthoredSettings && <p role="status" className="mt-2 text-[9px] text-red-300">Remove duplicate values, stay within the allowed limits, and trim extra spaces. Every detail also needs an available source sheet.</p>}
                 {visibleQueueBlockers.length > 0 && (
                   <section id="project-reference-queue-blockers" aria-label="Queue blocked by" className="mt-3 rounded border border-red-400/30 bg-red-400/5 px-2 py-1.5">
                     <h4 className="text-[9px] font-medium text-red-200">Queue blocked by</h4>
@@ -3401,12 +3549,21 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 >
                   {submitting ? <Loader2 size={13} className="animate-spin" /> : <ImagePlus size={13} />} Queue reference packs
                 </button>
-                <p className="mt-2 text-[9px] leading-relaxed text-text-muted">Each candidate is one ordered reference pack containing the planned number of sheets. Candidate count creates alternatives; sheet count controls deliverables inside each pack. Keep one or more; originals and rejected candidates remain recorded until you delete them.</p>
+                <p className="mt-2 text-[9px] leading-relaxed text-text-muted">Each candidate is a complete reference pack with the selected number of sheets. Candidate count creates alternatives; Sheets per pack controls how many images each alternative contains. Keep one or more. Other candidates remain available until you delete them.</p>
                 {queuedMessage && <p role="status" className="mt-2 text-[10px] text-accent-blue">{queuedMessage}</p>}
-                {pendingFreshJobIds.map(jobId => {
+                {pendingFreshJobIds.map((jobId, index) => {
                   const job = jobs.find(candidate => candidate.id === jobId)
-                  return <p key={jobId} role="status" className="mt-1 text-[9px] text-text-muted">Pack {jobId}: {job?.phase || 'Queued'}</p>
+                  return <p key={jobId} role="status" className="mt-1 text-[9px] text-text-muted">Pack {index + 1}: {projectReferencePendingPhaseLabel(job?.phase)}</p>
                 })}
+                {pendingFreshJobIds.length > 0 && (
+                  <details className="mt-1 text-[8px] text-text-muted">
+                    <summary className="flex min-h-11 cursor-pointer items-center md:min-h-0">Technical details</summary>
+                    {pendingFreshJobIds.map(jobId => {
+                      const job = jobs.find(candidate => candidate.id === jobId)
+                      return <p key={jobId}>Job ID: {jobId} · Phase: {job?.phase || 'queued'}</p>
+                    })}
+                  </details>
+                )}
                 </div>
               </div>
 
@@ -3484,12 +3641,12 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                               )
                             )
                             const exactAuthoringCopy = !exactStyleReady
-                              ? 'The recorded style contract is incomplete or changed. Retry and Edit remain disabled; create a new authored pack instead.'
+                              ? 'The saved style settings are incomplete or have changed. Retry and Edit remain off; create a new pack instead.'
                               : !exactCharacterReplayReady
-                                ? 'The recorded Character profile or convenience contract is incomplete or changed. Retry and Edit remain disabled; create a new authored pack instead.'
+                                ? 'The saved Character profile or anatomy-detail settings are incomplete or have changed. Retry and Edit remain off; create a new pack instead.'
                               : authoringAvailability[pendingKey] === 'unavailable'
-                                ? 'Exact private authoring is unavailable. Retry the owner-private replay; Retry and Edit remain disabled so style, profile, custom fields, and details are never silently dropped.'
-                                : 'Loading the exact private authoring needed for safe Retry and Edit…'
+                                ? 'Private creation settings are unavailable. Reload them to enable Retry and Edit; Maestro will not guess or omit your settings.'
+                                : 'Loading the private settings needed for Retry and Edit…'
                             const summarizedLoras = [
                               ...(packMetadata?.additional_loras?.applied ?? []),
                               ...(packMetadata?.additional_loras?.skipped ?? []),
@@ -3525,18 +3682,22 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             const pendingJob = pendingAction?.jobId
                               ? jobs.find(candidate => candidate.id === pendingAction.jobId)
                               : undefined
+                            const planningModelId = packMetadata?.planning?.resolved_model
+                              ?? packMetadata?.planning?.requested_model
+                            const reviewModelId = packMetadata?.review?.resolved_model
+                              ?? packMetadata?.review?.requested_model
                             const editing = editVariantId === variant.id
                             const directorReferenceKind = getDirectorProjectReferenceKind(asset.asset_type)
                             const directorApplyUnsupported = referenceReturnMode === 'director'
                               && directorReferenceKind === null
                               && !applyOutput?.media_type?.startsWith('video/')
                             const applyLabel = applyOutput?.media_type?.startsWith('video/')
-                              ? 'Apply to Generate: LTX-2.3 control + semantic prompt'
+                              ? 'Use in Generate as an LTX-2.3 control and prompt'
                               : variant.variant_type === 'reference_pack'
-                                ? `Use ${applyOutputs.length} ordered pack ${applyOutputs.length === 1 ? 'sheet' : 'sheets'} as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic refs (auto-select)' : 'Generate references'}`
+                                ? `Use ${applyOutputs.length} pack ${applyOutputs.length === 1 ? 'sheet' : 'sheets'} as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 references (automatic)' : 'Generate references'}`
                               : variant.variant_type === 'reference_sheet'
-                                ? `Use complete sheet as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic ref (auto-select)' : 'Generate reference'}`
-                                : `Use as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 semantic ref (auto-select)' : 'Generate reference'}`
+                                ? `Use complete sheet as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 reference (automatic)' : 'Generate reference'}`
+                                : `Use as ${referenceReturnMode === 'director' ? asset.asset_type : generationMode === 'video' ? 'H3 reference (automatic)' : 'Generate reference'}`
                             return (
                               <div key={variant.id} className={`overflow-hidden rounded-md border ${variant.status === 'kept' ? 'border-accent-green/60' : variant.status === 'rejected' ? 'border-border opacity-60' : 'border-border'}`}>
                                 {applyOutput && (
@@ -3552,9 +3713,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                     <span className="truncate text-text-secondary">{variant.label}</span>
                                     <span className="flex shrink-0 items-center gap-1">
                                       {qualityPresentation?.recommended && (
-                                        <span className="rounded-full border border-accent-blue/40 bg-accent-blue/10 px-1.5 py-0.5 text-[8px] font-medium text-accent-blue" title={qualityPresentation.preliminary ? 'Preliminary recommendation; fidelity review is still deferred.' : 'Recommended from the available candidate assessments.'}>Recommended</span>
+                                        <span className="rounded-full border border-accent-blue/40 bg-accent-blue/10 px-1.5 py-0.5 text-[8px] font-medium text-accent-blue" title={qualityPresentation.preliminary ? 'Preliminary recommendation; the visual quality check is still pending.' : 'Recommended from the available candidate checks.'}>Recommended</span>
                                       )}
-                                      <span className="text-text-muted">{variant.status}</span>
+                                      <span className="text-text-muted">{projectReferenceVariantStatusLabel(variant.status)}</span>
                                     </span>
                                   </div>
                                   {sheetStatus && (
@@ -3570,49 +3731,65 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                         {qualityPresentation.gradeLabel ? ` · ${qualityPresentation.gradeLabel}` : ''}
                                         {qualityPresentation.scoreLabel ? ` · ${qualityPresentation.scoreLabel}` : ''}
                                       </p>
-                                      {qualityPresentation.preliminary && <p>Preliminary recommendation · ungraded</p>}
+                                      {qualityPresentation.preliminary && <p>Preliminary recommendation · not yet graded</p>}
                                       {qualityPresentation.residualSummary && <p>{qualityPresentation.residualSummary}</p>}
-                                      {qualityPresentation.correctionAvailable && <p>Structured correction guidance is available for Retry or Edit.</p>}
+                                      {qualityPresentation.correctionAvailable && <p>Suggested fixes are available for Retry or Edit.</p>}
                                       {qualityPresentation.notice && <p>{qualityPresentation.notice}</p>}
                                     </div>
                                   )}
                                   {packMetadata && (
                                     <div className="mt-1 text-[8px] leading-relaxed text-text-muted">
                                       <p>{friendlyRole(packMetadata.intent ?? 'generic')} · {friendlyRole(packMetadata.depth ?? 'standard')} · {packMetadata.sheet_count ?? applyOutputs.length} sheets</p>
-                                      <p>Planning: {packMetadata.planning?.resolved_model ?? packMetadata.planning?.requested_model ?? 'deterministic'} · Review: {packMetadata.review?.resolved_model ?? packMetadata.review?.requested_model ?? 'off'}</p>
-                                      {anchorPrivacy && <p>Anchor privacy: {friendlyRole(anchorPrivacy)} · {packMetadata.private_output ? 'private access' : 'project access'}</p>}
-                                      {operationRoutes && (
-                                        <p title={[
-                                          `requested capability: ${packMetadata.operation_routing?.requested_capability ?? 'unknown'}`,
-                                          ...Object.entries(operationRoutes).map(([operation, route]) => [
-                                            `${operation}: ${route.status}`,
-                                            `requested ${route.requested_model ?? 'none'}`,
-                                            `resolved ${route.resolved_model ?? 'none'}`,
-                                            route.schedule ? `schedule ${route.schedule.steps} steps / ${route.schedule.guidance} ${route.schedule.guidance_key} / ${route.schedule.source}` : 'schedule none',
-                                            route.recipe_id ? `recipe ${route.recipe_id}` : '',
-                                            route.verification_status ? `verification ${route.verification_status}` : '',
-                                            route.reason ? `reason ${route.reason}` : '',
-                                          ].filter(Boolean).join(', ')),
-                                        ].join('; ')}>
-                                          Operation routing: {Object.entries(operationRoutes).map(([operation, route]) => `${friendlyRole(operation)} ${route.status}`).join(' · ')}
-                                        </p>
-                                      )}
+                                      <p>
+                                        Planner: {planningModelId ? projectReferenceModelLabel(planningModelId, llmCatalogModels) : 'Built-in planner'}
+                                        {packMetadata.planning?.resolved_provider ? ` · ${projectReferenceProviderLabel(packMetadata.planning.resolved_provider)}` : ''}
+                                        {' · '}Quality check: {reviewModelId ? projectReferenceModelLabel(reviewModelId, llmCatalogModels) : 'Off'}
+                                        {packMetadata.review?.resolved_provider ? ` · ${projectReferenceProviderLabel(packMetadata.review.resolved_provider)}` : ''}
+                                      </p>
+                                      {anchorPrivacy && <p>Main image visibility: {friendlyRole(anchorPrivacy)} · {packMetadata.private_output ? 'private access' : 'project access'}</p>}
+                                      {operationRoutes && <p>Processing: {Object.entries(operationRoutes).map(([operation, route]) => `${projectReferenceOperationLabel(operation)} · ${projectReferenceRouteStatusLabel(route.status)}`).join(' · ')}</p>}
                                       {packMetadata.additional_loras && (
                                         <p>
-                                          Additional LoRAs: {packMetadata.additional_loras.applied.length} applied
-                                          {packMetadata.additional_loras.applied.length > 0 ? ` (${packMetadata.additional_loras.applied.map(lora => `${lora.id}: ${lora.resolved_scope.join(' + ')}`).join('; ')})` : ''}
-                                          {packMetadata.additional_loras.skipped.length > 0 ? ` · ${packMetadata.additional_loras.skipped.length} skipped (${packMetadata.additional_loras.skipped.map(lora => `${lora.id}: ${lora.reason}`).join('; ')})` : ''}
+                                          LoRAs: {packMetadata.additional_loras.applied.length} used
+                                          {packMetadata.additional_loras.applied.length > 0 ? ` (${packMetadata.additional_loras.applied.map(lora => `${lora.id}: ${lora.resolved_scope.map(projectReferenceLoraScopeLabel).join(' + ')}`).join('; ')})` : ''}
+                                          {packMetadata.additional_loras.skipped.length > 0 ? ` · ${packMetadata.additional_loras.skipped.length} not used` : ''}
                                           {summarizedLoras.some(hasProjectReferenceLoraParameterSummary)
-                                            ? ` · ${summarizedLoras.filter(hasProjectReferenceLoraParameterSummary).length} parameter ${summarizedLoras.filter(hasProjectReferenceLoraParameterSummary).length === 1 ? 'schema' : 'schemas'} sealed (${summarizedLoras.reduce((count, lora) => count + (lora.parameters?.count ?? 0), 0)} private values)`
+                                            ? ` · ${summarizedLoras.filter(hasProjectReferenceLoraParameterSummary).length} saved LoRA ${summarizedLoras.filter(hasProjectReferenceLoraParameterSummary).length === 1 ? 'setup' : 'setups'} (${summarizedLoras.reduce((count, lora) => count + (lora.parameters?.count ?? 0), 0)} private values)`
                                             : ''}
                                         </p>
                                       )}
+                                      <details className="mt-1 rounded border border-border/70 px-1.5">
+                                        <summary className="flex min-h-11 cursor-pointer items-center md:min-h-0">Technical details</summary>
+                                        <p>Variant status ID: {variant.status}</p>
+                                        <p>Planning model ID: {planningModelId ?? 'none'} · Provider ID: {packMetadata.planning?.resolved_provider ?? 'none'}</p>
+                                        <p>Review model ID: {reviewModelId ?? 'none'} · Provider ID: {packMetadata.review?.resolved_provider ?? 'none'}</p>
+                                        {packMetadata.additional_loras && (
+                                          <ul>
+                                            {packMetadata.additional_loras.applied.map(lora => <li key={`applied:${lora.id}`}>LoRA ID: {lora.id} · Resolved scope IDs: {lora.resolved_scope.join(' + ')}</li>)}
+                                            {packMetadata.additional_loras.skipped.map(lora => <li key={`skipped:${lora.id}`}>LoRA ID: {lora.id} · Not used reason ID: {lora.reason}</li>)}
+                                          </ul>
+                                        )}
+                                        {operationRoutes && (
+                                          <ul>
+                                            <li>Requested capability ID: {packMetadata.operation_routing?.requested_capability ?? 'unknown'}</li>
+                                            {Object.entries(operationRoutes).map(([operation, route]) => (
+                                              <li key={operation}>
+                                                {operation}: status {route.status}; requested model {route.requested_model ?? 'none'}; resolved model {route.resolved_model ?? 'none'}
+                                                {route.schedule ? `; schedule ${route.schedule.steps} steps / ${route.schedule.guidance} ${route.schedule.guidance_key} / ${route.schedule.source}` : '; schedule none'}
+                                                {route.recipe_id ? `; recipe ${route.recipe_id}` : ''}
+                                                {route.verification_status ? `; verification ${route.verification_status}` : ''}
+                                                {route.reason ? `; reason ${route.reason}` : ''}
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        )}
+                                      </details>
                                     </div>
                                   )}
                                   {supportingOutputs.length > 0 && (
                                     <details className="mt-1.5 rounded border border-border/70 bg-bg-secondary/50">
                                       <summary className="flex cursor-pointer list-none items-center justify-between px-2 py-1 text-[9px] text-text-secondary">
-                                        {supportingOutputs.length} {variant.variant_type === 'reference_pack' ? 'more ordered pack sheets' : 'component panels'} <ChevronDown size={10} aria-hidden="true" />
+                                        {supportingOutputs.length} {variant.variant_type === 'reference_pack' ? 'more pack sheets' : 'detail panels'} <ChevronDown size={10} aria-hidden="true" />
                                       </summary>
                                       <div className="grid grid-cols-2 gap-1 border-t border-border p-1.5">
                                         {supportingOutputs.map(output => {
@@ -3653,14 +3830,14 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                     </div>
                                   )}
                                       {(!exactStyleReady || (requiresPrivateAuthoring && !exactAuthoringReady)) && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{exactAuthoringCopy}</p>}
-                                  {requiresPrivateLoraInputs && !exactLoraInputsReady && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">Exact private LoRA inputs are loading or unavailable from the owner-private replay record. Retry and Edit are disabled so values are never guessed or silently dropped.</p>}
+                                  {requiresPrivateLoraInputs && !exactLoraInputsReady && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">Private LoRA settings are still loading or unavailable. Retry and Edit stay off so no values are guessed or lost.</p>}
                                   {authoringAvailability[pendingKey] === 'unavailable'
                                     && ((requiresPrivateAuthoring && !exactAuthoringReady) || (requiresPrivateLoraInputs && !exactLoraInputsReady)) && (
-                                    <button type="button" onClick={() => setPrivateReplayRetry(current => current + 1)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5 text-[8px] text-amber-100">Retry private replay</button>
+                                    <button type="button" onClick={() => setPrivateReplayRetry(current => current + 1)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5 text-[8px] text-amber-100">Reload private settings</button>
                                   )}
-                                  {!retryReview.ready && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{retryReview.intelligence_policy === 'uncensored_auto' ? `Retry and Edit are waiting for the required local fidelity reviewer. ${reviewerSetupCopy}` : 'Retry and Edit require a loaded local vision reviewer for this source pack. Load and select an eligible reviewer first.'}</p>}
-                                  {retryReview.use_current_reviewer && <p role="status" className="mt-1 text-[8px] leading-relaxed text-text-muted">The recorded reviewer is unavailable; Retry or Edit will use the current compatible reviewer.</p>}
-                                  {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry/Edit preserves recorded style, source mode, resolved model pair, privacy, repair, planning, and review policy. The kept parent remains unchanged.</p>}
+                                  {!retryReview.ready && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{retryReview.intelligence_policy === 'uncensored_auto' ? `Retry and Edit are waiting for the required local visual review model. ${reviewerSetupCopy}` : 'Retry and Edit need a loaded local visual review model for this pack. Load and select a compatible model first.'}</p>}
+                                  {retryReview.use_current_reviewer && <p role="status" className="mt-1 text-[8px] leading-relaxed text-text-muted">The original visual review model is unavailable. Retry or Edit will use the current compatible model.</p>}
+                                  {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry and Edit reuse the saved style, models, privacy, fixes, planning, and quality-check choices. The kept candidate does not change.</p>}
                                   {editing && (variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && (
                                     <div id={`reference-sheet-edit-${variant.id}`} className="mt-1.5 rounded border border-border p-1.5">
                                       <label htmlFor={`reference-sheet-edit-instruction-${variant.id}`} className="text-[9px] text-text-muted">What should change in the next candidate?</label>
@@ -3677,11 +3854,21 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                       </div>
                                     </div>
                                   )}
-                                  {pendingAction && <p role="status" className="mt-1.5 flex items-center gap-1 text-[9px] text-accent-blue"><Loader2 size={9} className="animate-spin" /> {pendingAction.jobId ? `${pendingJob?.phase || 'Queued'}; waiting for the new candidate…` : 'Submitting…'}</p>}
+                                  {pendingAction && (
+                                    <div className="mt-1.5 text-[9px] text-accent-blue">
+                                      <p role="status" className="flex items-center gap-1"><Loader2 size={9} className="animate-spin" /> {pendingAction.jobId ? `${projectReferencePendingPhaseLabel(pendingJob?.phase)}; waiting for the new candidate…` : 'Submitting…'}</p>
+                                      {pendingAction.jobId && (
+                                        <details className="mt-1 text-[8px] text-text-muted">
+                                          <summary className="flex min-h-11 cursor-pointer items-center md:min-h-0">Technical details</summary>
+                                          <p>Job ID: {pendingAction.jobId} · Phase: {pendingJob?.phase || 'queued'}</p>
+                                        </details>
+                                      )}
+                                    </div>
+                                  )}
                                   {variant.status === 'kept' && applyOutput && (
                                     <>
                                       <button type="button" disabled={directorApplyUnsupported} onClick={() => void applyReference(asset, variant)} className="mt-1.5 w-full rounded border border-accent-blue/40 px-1 py-1 text-[9px] text-accent-blue disabled:cursor-not-allowed disabled:border-border disabled:text-text-muted">{directorApplyUnsupported ? 'Use from Generate' : applyLabel}</button>
-                                      {directorApplyUnsupported && <p className="mt-1 text-[8px] leading-relaxed text-amber-200">Director currently accepts only Character and Location references. Expanded semantic types require the pending Director backend contract; this candidate remains available from Generate.</p>}
+                                      {directorApplyUnsupported && <p className="mt-1 text-[8px] leading-relaxed text-amber-200">Director currently accepts only Character and Location references. Use this candidate from Generate instead.</p>}
                                     </>
                                   )}
                                 </div>

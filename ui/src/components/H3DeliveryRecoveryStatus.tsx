@@ -70,7 +70,7 @@ export function H3DeliveryRecoveryStatus({
       await reconnectJobs()
       await refresh()
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : 'Recovery could not be queued. Try again.')
+      setActionError(reason instanceof Error ? reason.message : 'Could not add this recovery to the queue. Try again.')
       announceH3DeliveryRecoveryChange(sourceJobId)
       await refresh()
     } finally {
@@ -117,30 +117,32 @@ export function H3DeliveryRecoveryStatus({
     <div className={`rounded-md border border-accent-green/30 bg-bg-primary/30 ${compact ? 'p-2' : 'p-2.5'} text-left`}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-text-secondary">
         {recovery.native_available && (
-          <span className="font-medium text-accent-green">Native result preserved privately</span>
+          <span className="font-medium text-accent-green">Original result saved privately</span>
         )}
-        {recovery.recoverable && <span>Failed · recoverable</span>}
-        {recovery.requested_target && <span>Target {recovery.requested_target}</span>}
+        {recovery.recoverable && <span>Recovery available</span>}
+        {recovery.requested_target && <span>Requested output: {recovery.requested_target}</span>}
         {recovery.manual_retry_count != null && recovery.manual_retry_limit != null && (
-          <span>Delivery retries {retryCount}/{retryLimit}</span>
+          <span>Delivery retries used: {retryCount} of {retryLimit}</span>
         )}
         {typeof recovery.restart_supported === 'boolean' && (
           <span>
             {recovery.restart_supported
-              ? 'Recovery survives an app restart'
-              : 'Recovery is limited to this app session'}
+              ? 'Recovery remains available after Maestro restarts'
+              : 'Recovery is available until Maestro restarts'}
           </span>
         )}
       </div>
 
       {recovery.active_recovery_job_id && (
         <p className="mt-1.5 text-[10px] text-accent-blue">
-          Recovery child is {activeChild?.status === 'running' ? 'running' : 'queued'} in the generation queue.
+          {activeChild?.status === 'running'
+            ? 'Recovery is running.'
+            : 'Recovery is waiting in the generation queue.'}
         </p>
       )}
       {recovery.completed_recovery_job_id && (
         <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
-          <p className="text-[10px] text-accent-green">Recovery child completed; the result is available in Gallery.</p>
+          <p className="text-[10px] text-accent-green">Recovery finished; the result is available in Gallery.</p>
           <button
             type="button"
             onClick={() => void viewInGallery()}
@@ -154,7 +156,7 @@ export function H3DeliveryRecoveryStatus({
       {!recovery.active_recovery_job_id && !recovery.completed_recovery_job_id && (
         <>
           <p className="mt-1.5 text-[10px] text-text-muted">
-            Retry delivery reuses the preserved native result. It does not rerun generation or denoise and does not change machine settings.
+            Try delivery again using the saved original. Generation will not run again, and machine settings will not change.
           </p>
           {(acceptCapability || retryCapability) && (
             <div className="mt-2 flex flex-wrap gap-2">
@@ -165,7 +167,7 @@ export function H3DeliveryRecoveryStatus({
                   onClick={() => void schedule('accept_native', acceptCapability)}
                   className="rounded bg-accent-green px-3 py-1.5 text-[11px] font-medium text-white hover:opacity-90 disabled:cursor-wait disabled:opacity-50"
                 >
-                  {submitting === 'accept_native' ? 'Queuing native result…' : 'Use native result'}
+                  {submitting === 'accept_native' ? 'Adding saved result…' : 'Use saved result'}
                 </button>
               )}
               {retryCapability && (
@@ -175,13 +177,13 @@ export function H3DeliveryRecoveryStatus({
                   onClick={() => void schedule('retry_delivery', retryCapability)}
                   className="rounded border border-accent-blue/40 bg-accent-blue/10 px-3 py-1.5 text-[11px] font-medium text-accent-blue hover:bg-accent-blue/20 disabled:cursor-wait disabled:opacity-50"
                 >
-                  {submitting === 'retry_delivery' ? 'Queuing delivery…' : 'Retry delivery only'}
+                  {submitting === 'retry_delivery' ? 'Adding delivery retry…' : 'Retry delivery only'}
                 </button>
               )}
             </div>
           )}
           {!retryCapability && retryLimit > 0 && retryCount >= retryLimit && (
-            <p className="mt-1.5 text-[10px] text-text-muted">Delivery retry limit reached. The preserved native result can still be used.</p>
+            <p className="mt-1.5 text-[10px] text-text-muted">No delivery retries remain. You can still use the saved original result.</p>
           )}
         </>
       )}

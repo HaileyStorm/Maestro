@@ -37,7 +37,7 @@ test('target marker is fixed while the current indicator is derived only for dis
   assert.match(componentSource, />T<\/text>/)
   assert.match(componentSource, /x=\{currentX\}/)
   assert.match(componentSource, />C<\/text>/)
-  assert.match(componentSource, /Signed mismatch · C − T/)
+  assert.match(componentSource, /Difference · C − T/)
 })
 
 test('rendered mismatch exposes fixed target, current draft, signed delta, reason, and tail note', async () => {
@@ -47,16 +47,16 @@ test('rendered mismatch exposes fixed target, current draft, signed delta, reaso
     currentGeneratedFrames: 306,
     currentMinusTargetFrames: -10,
     outcome: 'acceptable',
-    reason: 'The verified frame grid cannot represent the final 10 frames without crossing the target.',
+    reason: 'The current segment settings cannot add the last 10 frames without going over the target.',
   })
 
   assert.match(markup, /Target 300f/)
-  assert.match(markup, /290 published frames/)
+  assert.match(markup, /290 frames/)
   assert.match(markup, /-10 frames · shorter than target/)
-  assert.match(markup, /≈ Acceptable mismatch/)
-  assert.match(markup, /verified frame grid cannot represent the final 10 frames/)
-  assert.match(markup, /306 frames are generated; 290 frames are published/)
-  assert.match(markup, /Generated tail work remains outside the published output/)
+  assert.match(markup, /≈ Close to target/)
+  assert.match(markup, /cannot add the last 10 frames without going over the target/)
+  assert.match(markup, /306 frames will be generated, and 290 will appear in the finished video/)
+  assert.match(markup, /extra ending frames will be trimmed/i)
 })
 
 test('insufficient capacity remains explicit and never masquerades as an exact result', async () => {
@@ -66,13 +66,13 @@ test('insufficient capacity remains explicit and never masquerades as an exact r
     currentGeneratedFrames: 280,
     currentMinusTargetFrames: -20,
     outcome: 'insufficient_capacity',
-    reason: 'No unlocked future segment has enough verified capacity to restore the target.',
+    reason: 'The remaining segments cannot be lengthened enough to reach the target.',
   })
 
-  assert.match(markup, /! Insufficient capacity/)
-  assert.match(markup, /No unlocked future segment has enough verified capacity/)
-  assert.doesNotMatch(markup, /✓ Exact target/)
-  assert.match(markup, /no generated tail is omitted/)
+  assert.match(markup, /! Cannot reach target/)
+  assert.match(markup, /remaining segments cannot be lengthened enough/)
+  assert.doesNotMatch(markup, /✓ Matches target/)
+  assert.match(markup, /All 280 generated frames will appear in the finished video/)
 })
 
 test('exact outcome reports zero signed mismatch and matching generated geometry', async () => {
@@ -84,10 +84,10 @@ test('exact outcome reports zero signed mismatch and matching generated geometry
     outcome: 'exact',
   })
 
-  assert.match(markup, /✓ Exact target/)
+  assert.match(markup, /✓ Matches target/)
   assert.match(markup, /0 frames · on target/)
-  assert.match(markup, /matches the original target/)
-  assert.match(markup, /300 frames are generated and 300 frames are published/)
+  assert.match(markup, /video length matches the original target/)
+  assert.match(markup, /All 300 generated frames will appear in the finished video/)
 })
 
 test('screen-reader table and SVG description duplicate every non-color cue', async () => {
@@ -97,19 +97,26 @@ test('screen-reader table and SVG description duplicate every non-color cue', as
     currentGeneratedFrames: 336,
     currentMinusTargetFrames: 20,
     outcome: 'acceptable',
-    reason: 'Manual redistribution is disabled, so the verified mismatch remains visible.',
+    reason: 'Automatic adjustment is off, so the 20-frame difference remains.',
   })
 
   assert.match(markup, /role="img"/)
   assert.match(markup, /<title>/)
   assert.match(markup, /<desc>/)
-  assert.match(markup, /fixed dashed T marker/)
-  assert.match(markup, /solid diamond C marker/)
+  assert.match(markup, /dashed T marker shows the original target/)
+  assert.match(markup, /solid diamond C marker shows the current plan/)
   assert.match(markup, /<table class="sr-only">/)
-  assert.match(markup, /<caption>Read-only H3 duration plan totals<\/caption>/)
+  assert.match(markup, /<caption>H3 video length comparison<\/caption>/)
   assert.equal(markup.match(/scope="row"/g)?.length, 5)
   assert.match(markup, /\+20 frames · longer than target/)
-  assert.match(markup, /Manual redistribution is disabled/)
+  assert.match(markup, /Automatic adjustment is off/)
+})
+
+test('visible copy explains the comparison without internal planning jargon', () => {
+  assert.match(componentSource, /How the video length compares/)
+  assert.match(componentSource, /This chart is for comparison only/)
+  assert.match(componentSource, /Extra generated frames/)
+  assert.doesNotMatch(componentSource, /server-authored|server-verified|Signed mismatch|Insufficient capacity|Generated vs published tail/i)
 })
 
 test('responsive source contract stays usable at 320px, landscape, and 200 percent zoom without motion', () => {

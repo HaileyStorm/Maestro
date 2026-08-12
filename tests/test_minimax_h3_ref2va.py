@@ -168,18 +168,18 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         store = _read(_STORE)
         types = _read(_TYPES)
         self.assertIn("H3_REF2VA_LIMITS = { images: 9, videos: 3, audio: 3, mixed: 12 }", inputs_panel)
-        self.assertIn("Selected checkpoint:", inputs_panel)
-        self.assertIn("Install correct Ref2VA checkpoint", inputs_panel)
+        self.assertIn("Selected model:", inputs_panel)
+        self.assertIn("Install required reference model", inputs_panel)
         self.assertIn("maestro:minimax-h3-ref2va-terms-v1", store)
         self.assertIn("acceptHostTerm('minimax_h3_ref2va')", inputs_panel)
-        self.assertIn("Accept for this host", inputs_panel)
+        self.assertIn("Accept for this Maestro installation", inputs_panel)
         self.assertIn("HOST_TERM_NOTICES.minimax_h3_ref2va.text", inputs_panel)
         self.assertIn("Pinned FL2VA cannot use semantic references", store)
         self.assertIn("Pinned Ref2VA cannot use first/last-frame anchors", store)
         self.assertIn("'minimax_h3_ref2va'", store)
         library = _read(_ROOT / "ui" / "src" / "components" / "Sidebar" / "ProjectReferenceLibrary.tsx")
         self.assertIn("selectModel('minimax_h3_ref2va')", library)
-        self.assertIn("H3 semantic ref (auto-select)", library)
+        self.assertIn("H3 reference (automatic)", library)
         self.assertIn("addProjectAssetVariant(project, assetId", library)
         self.assertIn("source_workspace: project", library)
         self.assertIn('accept="image/*,video/*"', library)
@@ -229,8 +229,8 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         # stripping inputs, while the plan discloses the actual model/transition.
         self.assertIn("!h3AdaptiveConditioning && !h3FixedRef2VA && h3HasSemanticReferences", store)
         self.assertIn("!h3AdaptiveConditioning && h3FixedRef2VA && h3HasFrameAnchors", store)
-        self.assertIn("Checkpoint switch", plan_dialog)
-        self.assertIn("semantic references are not applied on this segment", plan_dialog)
+        self.assertIn("Model changes here", plan_dialog)
+        self.assertIn("keeps reference images saved but does not use them for this segment", plan_dialog)
 
     def test_studio_final_end_frame_is_reserved_for_last_h3_segment(self):
         inputs_panel = _read(_INPUTS_PANEL)
@@ -239,7 +239,7 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("window: nativeEndWindow", inputs_panel)
         self.assertIn("modelOptions?.frames_steps || 0", inputs_panel)
         self.assertIn("Reserved as the final frame of the final FL2VA segment", inputs_panel)
-        self.assertIn("Final end frame reserved", plan_dialog)
+        self.assertIn("Uses your final frame", plan_dialog)
 
     def test_three_named_reference_video_slots_are_valid(self):
         valid = {

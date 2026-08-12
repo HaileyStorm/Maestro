@@ -1,7 +1,6 @@
 """Focused source contracts for Maestro Continuum branding and provenance."""
-from pathlib import Path
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTINUUM_VERSION = (ROOT / "CONTINUUM_VERSION").read_text(encoding="utf-8").strip()
@@ -87,9 +86,11 @@ class ProductBrandingTests(unittest.TestCase):
         self.assertIn('aria-modal="true"', WHATS_NEW)
         self.assertIn("installModalFocus({", WHATS_NEW)
         self.assertIn("max-h-[calc(100dvh-1.5rem)]", WHATS_NEW)
-        self.assertIn("All release history", WHATS_NEW)
-        self.assertIn("Maestro base archive", WHATS_NEW)
-        self.assertIn("WanGP details remain in its upstream history", WHATS_NEW)
+        self.assertIn("Earlier releases", WHATS_NEW)
+        self.assertIn("Earlier Continuum releases", WHATS_NEW)
+        self.assertIn("Included Maestro history", WHATS_NEW)
+        self.assertIn("Continuum, Maestro, and WanGP each have their own release history.", CHANGELOG)
+        self.assertIn("Earlier WanGP changes are documented by the WanGP project", WHATS_NEW)
         for source in (WHATS_NEW, WELCOME):
             self.assertIn("Continuum ${CURRENT_RELEASE.version} release highlights", source)
             self.assertNotIn("Continuum 0.2 release highlights", source)

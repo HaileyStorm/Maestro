@@ -31,23 +31,23 @@ const accountActivationReadinessByState: Record<AccountActivationState, AccountA
   },
   setup_available: {
     label: 'Owner setup is available',
-    detail: 'Set up the owner from the Account tab on this direct local connection. Maestro will not create an account automatically.',
+    detail: 'Create the first owner account from the Account tab while using Maestro directly on this computer. Maestro will not create an account automatically.',
   },
   setup_requires_loopback: {
-    label: 'Owner setup requires direct loopback access',
-    detail: 'Open Maestro directly on its loopback address for initial owner setup. No account details or setup action are available from this connection.',
+    label: 'Open Maestro on this computer to continue',
+    detail: 'For security, create the first owner account by opening Maestro directly on the computer where it is running. Setup details are hidden on this connection.',
   },
   disable_bootstrap: {
     label: 'Owner setup is complete',
-    detail: 'Set MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false, then restart Maestro to finish disabling initial setup.',
+    detail: 'Restart Maestro after turning off first-owner setup in its account configuration.',
   },
   ready: {
     label: 'Account access is ready',
-    detail: 'Sign-in and account controls are available. Project passwords and browser sessions remain separate from accounts.',
+    detail: 'Sign-in and account controls are available. Existing project access may still depend on this browser or a project password.',
   },
   unavailable: {
-    label: 'Account activation status is unavailable',
-    detail: 'This server response does not provide a recognized activation state, so no setup action is offered here.',
+    label: 'Account setup status is unavailable',
+    detail: 'Maestro could not determine whether account setup is ready, so setup is unavailable from this connection.',
   },
 }
 
@@ -57,38 +57,56 @@ function accountActivationReadiness(state: unknown): AccountActivationReadiness 
     : accountActivationReadinessByState.unavailable
 }
 
+const supportErrorMessages: Record<string, string> = {
+  authentication_required: 'Sign in to refresh support details.',
+  owner_required: 'An owner account must confirm this request.',
+  reauth_required: 'Confirm the owner password, then try again.',
+  rate_limited: 'Too many support requests were made.',
+  responsible_use_notice_changed: 'The notice changed. Review the updated notice, then try again.',
+  account_store_unavailable: 'Support details are temporarily unavailable.',
+  account_store_capacity: 'Support details cannot be updated because account storage is full.',
+}
+
+// Exported for deterministic copy-safety regression coverage.
+// eslint-disable-next-line react-refresh/only-export-components
+export function safeSupportErrorMessage(code: string, retryAfter = 0): string {
+  const message = supportErrorMessages[code] || 'Support details could not be refreshed.'
+  return retryAfter > 0
+    ? `${message} Try again in about ${retryAfter} seconds.`
+    : message
+}
+
 function supportErrorMessage(error: unknown): string {
-  if (error instanceof AccountApiError && error.retryAfter > 0) {
-    return `${error.message} Try again in about ${error.retryAfter} seconds.`
-  }
-  return error instanceof Error ? error.message : 'Support details could not be refreshed.'
+  return error instanceof AccountApiError
+    ? safeSupportErrorMessage(error.code, error.retryAfter)
+    : 'Support details could not be refreshed.'
 }
 
 function adminSupportErrorMessage(error: unknown): string {
   if (error instanceof AccountApiError && error.retryAfter > 0) {
-    return `Private support audit could not be refreshed. Try again in about ${error.retryAfter} seconds.`
+    return `Private support history could not be refreshed. Try again in about ${error.retryAfter} seconds.`
   }
-  return 'Private support audit could not be refreshed. Confirm recent owner access and try again.'
+  return 'Private support history could not be refreshed. Confirm the owner password and try again.'
 }
 
 function fulfillmentErrorMessage(error: unknown): string {
   if (error instanceof AccountApiError) {
-    if (error.status === 409) return 'Fulfillment changed on the server. The private audit was refreshed; review it and choose again.'
-    if (error.status === 401 || error.status === 403) return 'Recent owner access is required before fulfillment can be recorded.'
-    if (error.status === 404) return 'That fulfillment target is no longer available. Refresh the account audit and choose again.'
-    if (error.retryAfter > 0) return `Fulfillment could not be recorded. Retry in about ${error.retryAfter} seconds.`
+    if (error.status === 409) return 'The follow-up changed. Support history was refreshed; review it and choose again.'
+    if (error.status === 401 || error.status === 403) return 'Confirm the owner password before changing support follow-up.'
+    if (error.status === 404) return 'That follow-up is no longer available. Refresh support history and choose again.'
+    if (error.retryAfter > 0) return `The follow-up could not be saved. Try again in about ${error.retryAfter} seconds.`
   }
-  return 'Fulfillment could not be recorded. Review the current audit and try again.'
+  return 'The follow-up could not be saved. Review the current support history and try again.'
 }
 
 function manualContributionErrorMessage(error: unknown): string {
   if (error instanceof AccountApiError) {
-    if (error.status === 409) return 'The contribution audit changed on the server. The private audit was refreshed; review it before recording again.'
-    if (error.status === 401 || error.status === 403) return 'Recent owner access is required before a manual contribution can be recorded.'
-    if (error.status === 400) return 'The manual record was rejected. Review its amount, currency, and target event.'
-    if (error.retryAfter > 0) return `The manual record could not be saved. Retry in about ${error.retryAfter} seconds.`
+    if (error.status === 409) return 'Support history changed. It was refreshed; review it before saving again.'
+    if (error.status === 401 || error.status === 403) return 'Confirm the owner password before adding a contribution record.'
+    if (error.status === 400) return 'The contribution record was not accepted. Check its amount, currency, and related contribution.'
+    if (error.retryAfter > 0) return `The contribution record could not be saved. Try again in about ${error.retryAfter} seconds.`
   }
-  return 'The manual record could not be saved. You can retry the unchanged form safely.'
+  return 'The contribution record could not be saved. You can safely try again without changing the form.'
 }
 
 const allowanceSourceLabels = {
@@ -98,12 +116,12 @@ const allowanceSourceLabels = {
 } as const
 
 const allowanceStateText = {
-  active: 'Active',
-  inactive: 'Inactive',
-  refunded: 'Refunded',
-  expired: 'Expired',
-  capped: 'Capped',
-  canceled: 'Canceled',
+  active: 'Recorded status: active',
+  inactive: 'Recorded status: inactive',
+  refunded: 'Recorded status: refunded',
+  expired: 'Recorded status: expired',
+  capped: 'Recorded status: capped',
+  canceled: 'Recorded status: canceled',
 } as const
 
 const allowanceRefundLabels = {
@@ -146,6 +164,12 @@ const fulfillmentStatusLabels: Record<SupportFulfillmentStatus, string> = {
   reversed: 'Reversed',
 }
 
+const followUpItemLabels: Record<string, string> = {
+  one_time_credit_grant: 'One-time credit record',
+  retention_follow_up: 'Result-retention follow-up',
+  backdated_follow_up: 'Backdated follow-up',
+}
+
 const nextFulfillmentStatuses: Record<SupportFulfillmentStatus, SupportFulfillmentStatus[]> = {
   pending: ['in_progress', 'fulfilled', 'declined'],
   in_progress: ['fulfilled', 'declined'],
@@ -182,7 +206,7 @@ const auditEventLabels: Record<SupportAdminEventKind, string> = {
   refund: 'Refund',
   chargeback: 'Chargeback',
   recurring_canceled: 'Recurring support canceled',
-  fulfillment_set: 'Fulfillment updated',
+  fulfillment_set: 'Follow-up updated',
   account_link_verified: 'Account link verified',
   account_link_revoked: 'Account link revoked',
 }
@@ -196,8 +220,19 @@ function auditLabel(value: string): string {
   return value.replaceAll('_', ' ')
 }
 
+function followUpItemLabel(value: string): string {
+  return followUpItemLabels[value] || auditLabel(value)
+}
+
 function minorUnits(value: number, currency: string): string {
-  return `${value.toLocaleString()} ${currency} minor unit${value === 1 ? '' : 's'}`
+  if (currency === 'USD') {
+    const dollars = (value / 100).toLocaleString('en-US', {
+      style: 'currency',
+      currency: 'USD',
+    })
+    return `${value.toLocaleString('en-US')} cents (${dollars})`
+  }
+  return `${value.toLocaleString()} in the smallest ${currency} unit`
 }
 
 // Exported for deterministic linear-work regression coverage.
@@ -358,15 +393,15 @@ function AdminSupportAudit({
       setManualNotice({
         kind: 'error',
         text: canceled
-          ? 'A recurring cancellation must record zero minor units.'
-          : 'Enter a positive whole number of minor currency units.',
+          ? 'A recurring cancellation must have an amount of 0.'
+          : 'Enter a positive whole number in the currency’s smallest unit.',
       })
       return
     }
     if (manualTargetRequired && target === '') {
       setManualNotice({
         kind: 'error',
-        text: 'Choose a matching contribution event from the current private audit.',
+        text: 'Choose a related contribution from the current support history.',
       })
       return
     }
@@ -402,7 +437,7 @@ function AdminSupportAudit({
       setManualTarget('')
       setManualNotice({
         kind: 'success',
-        text: 'Manual audit record saved. No payment was processed and benefits remain unenforced.',
+        text: 'Contribution record saved. No payment was processed, and no credits or benefits were applied.',
       })
     } catch (error) {
       if (error instanceof AccountApiError && [400, 401, 403, 404, 409].includes(error.status)) {
@@ -426,11 +461,11 @@ function AdminSupportAudit({
     const normalizedItem = item.trim()
     const normalizedProof = proofReference.trim()
     if (!FULFILLMENT_ITEM.test(normalizedItem)) {
-      setTransitionNotice({ kind: 'error', text: 'Use a 2–64 character lowercase fulfillment item key.' })
+      setTransitionNotice({ kind: 'error', text: 'Use a 2–64 character lowercase follow-up type.' })
       return
     }
     if (normalizedProof !== '' && !OPAQUE_SUPPORT_REFERENCE.test(normalizedProof)) {
-      setTransitionNotice({ kind: 'error', text: 'Proof must be an opaque key_ reference or left blank.' })
+      setTransitionNotice({ kind: 'error', text: 'The optional reference ID must start with key_ and use the required format, or be left blank.' })
       return
     }
     const fingerprint = JSON.stringify([targetEventId, normalizedItem, status, normalizedProof])
@@ -451,7 +486,7 @@ function AdminSupportAudit({
       retryRef.current = null
       setTransitionNotice({
         kind: 'success',
-        text: `${fulfillmentStatusLabels[status]} was recorded. This is an audit update only; benefits remain not enforced.`,
+        text: `${fulfillmentStatusLabels[status]} was saved. This changes the record only; it does not apply credits or benefits.`,
       })
       if (taskKey === 'new') {
         setNewItem('')
@@ -471,10 +506,10 @@ function AdminSupportAudit({
   return (
     <section aria-labelledby="private-support-audit-heading" className="rounded-xl border border-border bg-bg-primary/30 p-3">
       <h4 id="private-support-audit-heading" className="text-[11px] font-semibold text-text-primary">
-        Private contribution and fulfillment audit
+        Private support history and follow-up
       </h4>
       <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-        Private records and owner fulfillment controls shown after recent owner confirmation. State is recorded_not_enforced: updates record follow-up only and do not process payments, activate providers, or enforce benefits.
+        Available only after the owner recently confirmed their password. These records are for tracking only: they do not process payments, enable support services, apply credits, or provide benefits.
       </p>
       {transitionNotice && (
         <p
@@ -490,17 +525,17 @@ function AdminSupportAudit({
       )}
       {audit.incomplete && (
         <p className="mt-2 rounded-md border border-indicator-warning/40 bg-indicator-warning/5 px-2 py-1 text-[9px] leading-relaxed text-text-secondary" role="status">
-          Some audit data was unavailable or invalid and was not displayed. Empty sections below are not proof that no records exist.
+          Some support data could not be loaded and is not shown. A blank section does not necessarily mean there are no records.
         </p>
       )}
 
       <details className="mt-3 rounded-md border border-border/70 bg-bg-tertiary/20 px-2 text-[9px] text-text-muted">
         <summary className="flex min-h-11 cursor-pointer select-none items-center font-medium text-text-secondary">
-          Record a manual contribution event
+          Add a contribution record
         </summary>
         <div className="space-y-2 pb-3">
           <p className="leading-relaxed">
-            This is a manual audit record only; no payment is processed and benefits remain unenforced.
+            This saves a record only. It does not process a payment or apply credits or benefits.
           </p>
           {manualNotice && (
             <p
@@ -531,7 +566,7 @@ function AdminSupportAudit({
               </select>
             </label>
             <label className="block">
-              <span>Event kind</span>
+              <span>Type</span>
               <select
                 value={manualKind}
                 onChange={event => changeManualSemantic(() => {
@@ -548,7 +583,11 @@ function AdminSupportAudit({
               </select>
             </label>
             <label className="block">
-              <span>Amount in minor units</span>
+              <span>
+                {manualCurrency.trim().toUpperCase() === 'USD'
+                  ? 'Amount (USD cents)'
+                  : 'Amount (whole number)'}
+              </span>
               <input
                 type="number"
                 min={manualKind === 'recurring_canceled' ? 0 : 1}
@@ -577,19 +616,24 @@ function AdminSupportAudit({
               />
             </label>
           </div>
+          <p className="leading-relaxed">
+            {manualCurrency.trim().toUpperCase() === 'USD'
+              ? 'Enter cents for USD: 2500 = $25.00.'
+              : 'Enter a whole number in the currency’s smallest unit.'}
+          </p>
           {manualTargetRequired && (
             <label className="block">
-              <span>Target contribution event</span>
+              <span>Related contribution</span>
               <select
                 value={manualTarget || manualTargetEvents[0]?.event_id || ''}
                 onChange={event => changeManualSemantic(() => setManualTarget(event.target.value))}
                 disabled={manualTargetEvents.length === 0}
                 className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue disabled:opacity-70"
               >
-                {manualTargetEvents.length === 0 && <option value="">No matching event in this audit</option>}
+                {manualTargetEvents.length === 0 && <option value="">No matching contribution in this history</option>}
                 {manualTargetEvents.map(event => (
                   <option key={event.event_id} value={event.event_id}>
-                    {auditEventLabels[event.kind]} · sequence {event.sequence} · {minorUnits(event.amount_minor, event.currency)}
+                    {auditEventLabels[event.kind]} · Record {event.sequence.toLocaleString()} · {allowanceDate(event.occurred_at)} UTC · {minorUnits(event.amount_minor, event.currency)}
                   </option>
                 ))}
               </select>
@@ -601,7 +645,7 @@ function AdminSupportAudit({
             onClick={() => void recordManualContribution()}
             className="min-h-11 w-full rounded-md bg-accent-blue px-3 py-2 text-[10px] font-semibold text-white hover:opacity-90 disabled:opacity-50"
           >
-            {manualBusy ? 'Recording…' : 'Record manual audit event'}
+            {manualBusy ? 'Saving…' : 'Save contribution record'}
           </button>
         </div>
       </details>
@@ -624,9 +668,9 @@ function AdminSupportAudit({
       </section>
 
       <section aria-labelledby="audit-events-heading" className="mt-3">
-        <h5 id="audit-events-heading" className="text-[10px] font-semibold text-text-secondary">Source events</h5>
+        <h5 id="audit-events-heading" className="text-[10px] font-semibold text-text-secondary">Contribution history</h5>
         {visibleEvents.length > 0 ? (
-          <ul className="mt-2 space-y-2" aria-label="Private contribution source events">
+          <ul className="mt-2 space-y-2" aria-label="Private contribution history">
             {visibleEvents.map(event => (
               <li key={event.event_id} className="min-w-0 rounded-md border border-border/70 bg-bg-tertiary/20 p-2">
                 <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
@@ -637,18 +681,18 @@ function AdminSupportAudit({
                   <p className="mt-1 text-[9px] font-medium text-text-secondary">{minorUnits(event.amount_minor, event.currency)}</p>
                 )}
                 <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-                  Occurred <time dateTime={event.occurred_at}>{allowanceDate(event.occurred_at)} UTC</time>
-                  {' · '}received <time dateTime={event.received_at}>{allowanceDate(event.received_at)} UTC</time>
-                  {' · '}sequence {event.sequence.toLocaleString()}
+                  <time dateTime={event.occurred_at}>{allowanceDate(event.occurred_at)} UTC</time>
                 </p>
                 <details className="mt-1 text-[9px] text-text-muted">
-                  <summary className="cursor-pointer select-none">Opaque reconciliation references</summary>
+                  <summary className="cursor-pointer select-none">Technical details</summary>
                   <div className="mt-1 space-y-1 break-all font-mono">
-                    <p>Event: {event.event_id}</p>
-                    <p>Source: {event.source_reference}</p>
-                    {event.contract_reference && <p>Contract: {event.contract_reference}</p>}
-                    {event.related_reference && <p>Related: {event.related_reference}</p>}
-                    {event.actor_reference && <p>Actor: {event.actor_reference}</p>}
+                    <p>Record ID: {event.event_id}</p>
+                    <p>Source ID: {event.source_reference}</p>
+                    <p>Received: {allowanceDate(event.received_at)} UTC</p>
+                    <p>Order: {event.sequence.toLocaleString()}</p>
+                    {event.contract_reference && <p>Recurring-support ID: {event.contract_reference}</p>}
+                    {event.related_reference && <p>Related record ID: {event.related_reference}</p>}
+                    {event.actor_reference && <p>Changed by: {event.actor_reference}</p>}
                   </div>
                 </details>
               </li>
@@ -656,52 +700,57 @@ function AdminSupportAudit({
           </ul>
         ) : (
           <p className="mt-1 text-[9px] text-text-muted">
-            {audit.incomplete ? 'Contribution event data is incomplete.' : 'No contribution audit events are recorded for this account.'}
+            {audit.incomplete ? 'Contribution history is incomplete.' : 'No contribution activity is recorded for this account.'}
           </p>
         )}
         {hiddenEventCount > 0 && (
           <p className="mt-2 text-[9px] text-text-muted">
-            Showing the 40 newest recorded events; {hiddenEventCount.toLocaleString()} older {hiddenEventCount === 1 ? 'event is' : 'events are'} hidden.
+            Showing the 40 newest history items; {hiddenEventCount.toLocaleString()} older {hiddenEventCount === 1 ? 'item is' : 'items are'} not shown.
           </p>
         )}
       </section>
 
       <section aria-labelledby="audit-discrepancies-heading" className="mt-3">
-        <h5 id="audit-discrepancies-heading" className="text-[10px] font-semibold text-text-secondary">Discrepancies and follow-up</h5>
+        <h5 id="audit-discrepancies-heading" className="text-[10px] font-semibold text-text-secondary">Items to review</h5>
         {visibleDiscrepancies.length > 0 ? (
           <ul className="mt-2 space-y-1" aria-label="Recorded support discrepancies">
             {visibleDiscrepancies.map(row => (
               <li key={`${row.event_id}-${row.reason}`} className="rounded-md border border-indicator-warning/40 bg-indicator-warning/5 p-2 text-[9px] leading-relaxed text-text-secondary">
-                {discrepancyLabels[row.reason]}. <span className="break-all font-mono text-text-muted">{row.event_id}</span>
+                {discrepancyLabels[row.reason]}.
+                <details className="mt-1 text-text-muted">
+                  <summary className="cursor-pointer select-none">Technical details</summary>
+                  <p className="mt-1 break-all font-mono">Record ID: {row.event_id}</p>
+                </details>
               </li>
             ))}
           </ul>
         ) : (
           <p className="mt-1 text-[9px] text-text-muted">
-            {audit.incomplete ? 'Discrepancy data is incomplete.' : 'No recorded discrepancies need follow-up.'}
+            {audit.incomplete ? 'Some review items could not be loaded.' : 'No items need review.'}
           </p>
         )}
         {hiddenDiscrepancyCount > 0 && (
-          <p className="mt-1 text-[9px] text-text-muted">{hiddenDiscrepancyCount.toLocaleString()} additional discrepancy rows are hidden.</p>
+          <p className="mt-1 text-[9px] text-text-muted">{hiddenDiscrepancyCount.toLocaleString()} additional items are not shown.</p>
         )}
       </section>
 
       <section aria-labelledby="audit-fulfillment-heading" className="mt-3">
-        <h5 id="audit-fulfillment-heading" className="text-[10px] font-semibold text-text-secondary">Fulfillment</h5>
+        <h5 id="audit-fulfillment-heading" className="text-[10px] font-semibold text-text-secondary">Support follow-up</h5>
         {visibleFulfillment.length > 0 ? (
-          <ul className="mt-2 space-y-1" aria-label="Recorded support fulfillment">
+          <ul className="mt-2 space-y-1" aria-label="Recorded support follow-up">
             {visibleFulfillment.map(row => (
               <li key={row.audit_event_id} className="rounded-md border border-border/70 bg-bg-tertiary/20 p-2 text-[9px] leading-relaxed text-text-secondary">
-                <span className="font-semibold text-text-primary">{auditLabel(row.item)}</span>
+                <span className="font-semibold text-text-primary">{followUpItemLabel(row.item)}</span>
                 {' · '}{fulfillmentStatusLabels[row.status]}
                 {' · '}<time dateTime={row.changed_at}>{allowanceDate(row.changed_at)} UTC</time>
                 <details className="mt-1 text-text-muted">
-                  <summary className="cursor-pointer select-none">Opaque fulfillment references</summary>
+                  <summary className="cursor-pointer select-none">Technical details</summary>
                   <div className="mt-1 space-y-1 break-all font-mono">
-                    <p>Audit event: {row.audit_event_id}</p>
-                    {row.target_event_id && <p>Target event: {row.target_event_id}</p>}
-                    <p>Actor: {row.actor_reference}</p>
-                    {row.proof_reference && <p>Proof: {row.proof_reference}</p>}
+                    <p>Follow-up type key: {row.item}</p>
+                    <p>Follow-up record ID: {row.audit_event_id}</p>
+                    {row.target_event_id && <p>Contribution record ID: {row.target_event_id}</p>}
+                    <p>Changed by: {row.actor_reference}</p>
+                    {row.proof_reference && <p>Reference ID: {row.proof_reference}</p>}
                   </div>
                 </details>
                 {row.target_event_id && nextFulfillmentStatuses[row.status].length > 0 && (
@@ -710,7 +759,7 @@ function AdminSupportAudit({
                       Record next status
                     </summary>
                     <label className="block pb-2">
-                      <span>Optional opaque proof reference</span>
+                      <span>Optional reference ID</span>
                       <input
                         type="text"
                         value={proofByTask[`${row.target_event_id}:${row.item}`] || ''}
@@ -741,7 +790,7 @@ function AdminSupportAudit({
                             )}
                             className="min-h-11 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-[10px] font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-50"
                           >
-                            {busyKey === taskKey ? 'Recording…' : `Mark ${fulfillmentStatusLabels[status].toLowerCase()}`}
+                            {busyKey === taskKey ? 'Saving…' : `Mark ${fulfillmentStatusLabels[status].toLowerCase()}`}
                           </button>
                         )
                       })}
@@ -749,14 +798,14 @@ function AdminSupportAudit({
                   </details>
                 )}
                 {nextFulfillmentStatuses[row.status].length === 0 && (
-                  <p className="mt-1 text-text-muted">This recorded status is terminal.</p>
+                  <p className="mt-1 text-text-muted">No further status changes are available.</p>
                 )}
               </li>
             ))}
           </ul>
         ) : (
           <p className="mt-1 text-[9px] text-text-muted">
-            {audit.incomplete ? 'Fulfillment data is incomplete.' : 'No fulfillment follow-up is recorded.'}
+            {audit.incomplete ? 'Follow-up history is incomplete.' : 'No support follow-up is recorded.'}
           </p>
         )}
         {hiddenFulfillmentCount > 0 && (
@@ -765,7 +814,7 @@ function AdminSupportAudit({
             onClick={() => setFulfillmentLimit(limit => limit + 20)}
             className="mt-2 min-h-11 w-full rounded-md border border-border px-3 py-2 text-[9px] font-medium text-text-secondary hover:bg-bg-hover"
           >
-            Show 20 more fulfillment rows ({hiddenFulfillmentCount.toLocaleString()} remaining)
+            Show 20 more follow-up items ({hiddenFulfillmentCount.toLocaleString()} remaining)
           </button>
         )}
         {fundingEvents.length > 0 && (
@@ -783,25 +832,25 @@ function AdminSupportAudit({
                 >
                   {visibleFundingEvents.map(event => (
                     <option key={event.event_id} value={event.event_id}>
-                      {auditEventLabels[event.kind]} · {auditLabel(event.provider)} · sequence {event.sequence}
+                      {auditEventLabels[event.kind]} · Record {event.sequence.toLocaleString()} · {auditLabel(event.provider)} · {allowanceDate(event.occurred_at)} UTC
                     </option>
                   ))}
                 </select>
               </label>
               <label className="block">
-                <span>Fulfillment item key</span>
+                <span>Custom follow-up type</span>
                 <input
                   type="text"
                   value={newItem}
                   onChange={event => setNewItem(event.target.value)}
-                  placeholder="one_time_credit_grant"
+                  placeholder="Enter a lowercase technical key"
                   autoComplete="off"
                   spellCheck={false}
                   className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 font-mono text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
                 />
               </label>
               <label className="block">
-                <span>Optional opaque proof reference</span>
+                <span>Optional reference ID</span>
                 <input
                   type="text"
                   value={newProof}
@@ -827,7 +876,7 @@ function AdminSupportAudit({
                 {busyKey === 'new' ? 'Recording…' : 'Record pending follow-up'}
               </button>
               <p className="leading-relaxed">
-                This appends an audited operational state only. It does not grant credit, enforce a benefit, contact a provider, or process a payment.
+                This saves a follow-up status only. It does not apply credits or benefits, contact a support service, or process a payment.
               </p>
               {visibleFundingEvents.length < fundingEvents.length && (
                 <button
@@ -863,23 +912,23 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
       </div>
       {summary.benefits.state === 'recorded_not_enforced' && (
         <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
-          Any listed eligibility is recorded only. Support-derived scheduling and retention benefits are not enforced yet.
+          Support benefits are not active. Any eligibility shown here is informational and does not change scheduling or how long results are kept.
         </p>
       )}
       {allowance && (
-        <section aria-label="Recorded compute allowance" className="mt-3 min-w-0 rounded-lg border border-border bg-bg-primary/40 p-3">
+        <section aria-label="Recorded informational compute allowance" className="mt-3 min-w-0 rounded-lg border border-border bg-bg-primary/40 p-3">
           <div className="min-w-0">
-            <h4 className="text-[11px] font-semibold text-text-primary">Current recorded allowance</h4>
+            <h4 className="text-[11px] font-semibold text-text-primary">Recorded informational compute allowance</h4>
             <p className="mt-1 break-words text-sm font-semibold text-accent-blue">
-              {allowanceUnits(allowance.effective_allowance, allowance.unit)}
+              Recorded amount: {allowanceUnits(allowance.effective_allowance, allowance.unit)}
             </p>
             <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-              Recorded only as of{' '}
+              Recorded as of{' '}
               <time dateTime={allowance.as_of}>{allowanceDate(allowance.as_of)} UTC</time>.
-              {' '}This allowance is not enforced and does not currently change generation, queueing, or retries.
+              {' '}This is not an active balance and does not change generation, queueing, or retries.
             </p>
           </div>
-          <ul aria-label="Recorded allowance sources" className="mt-3 grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
+          <ul aria-label="Allowance breakdown" className="mt-3 grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
             {visibleAllowanceSources.map((source, index) => (
               <li key={`${source.source}-${index}`} className="min-w-0 rounded-md border border-border/70 bg-bg-tertiary/30 p-2">
                 <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
@@ -887,12 +936,12 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
                   <span className="text-[9px] font-medium text-text-secondary">{allowanceStateText[source.status]}</span>
                 </div>
                 <p className="mt-1 break-words text-[9px] leading-relaxed text-text-muted">
-                  {allowanceUnits(source.effective_allowance, allowance.unit)} recorded in this snapshot
-                  {' '}from a {allowanceUnits(source.granted_allowance, allowance.unit)} recorded grant.
+                  Recorded informational amount: {allowanceUnits(source.effective_allowance, allowance.unit)}
+                  {' '}from an original recorded allowance of {allowanceUnits(source.granted_allowance, allowance.unit)}.
                 </p>
                 {source.expires_at && (
                   <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-                    Recorded expiry: <time dateTime={source.expires_at}>{allowanceDate(source.expires_at)} UTC</time>
+                    Listed expiration: <time dateTime={source.expires_at}>{allowanceDate(source.expires_at)} UTC</time>
                   </p>
                 )}
                 {source.refund_state in allowanceRefundLabels && (
@@ -905,7 +954,7 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
           </ul>
           {hiddenAllowanceSourceCount > 0 && (
             <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
-              {hiddenAllowanceSourceCount.toLocaleString()} additional recorded {hiddenAllowanceSourceCount === 1 ? 'source is' : 'sources are'} not shown in this compact view.
+              {hiddenAllowanceSourceCount.toLocaleString()} additional {hiddenAllowanceSourceCount === 1 ? 'item is' : 'items are'} not shown.
             </p>
           )}
         </section>
@@ -1084,10 +1133,10 @@ export function SupportPanel() {
         </div>
       )}
 
-      <section aria-label="Account activation readiness" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
+      <section aria-label="Account setup status" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
         <div className="flex items-center gap-2">
           <Check size={14} className="shrink-0 text-accent-blue" aria-hidden="true" />
-          <h3 className="text-xs font-semibold text-text-primary">Account activation</h3>
+          <h3 className="text-xs font-semibold text-text-primary">Account setup</h3>
         </div>
         <p className="mt-2 text-[10px] font-semibold leading-relaxed text-text-secondary" role="status">
           {activationReadiness.label}
@@ -1184,7 +1233,7 @@ export function SupportPanel() {
             ))}
           </div>
           <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
-            This is an acknowledgement of the server-owned notice, not moderation, classification, or permission to generate content.
+            Acknowledging this notice does not review, restrict, or approve what you create.
           </p>
           {responsibleUseAccepted ? (
             <p className="mt-3 flex items-center gap-2 text-[10px] font-semibold text-indicator-success" role="status">
@@ -1206,9 +1255,9 @@ export function SupportPanel() {
 
       {ownerSupport && users.length > 0 && (
         <section aria-labelledby="owner-support-heading" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
-          <h3 id="owner-support-heading" className="text-xs font-semibold text-text-primary">Owner support records</h3>
+          <h3 id="owner-support-heading" className="text-xs font-semibold text-text-primary">Manage support records</h3>
           <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
-            Choose only from the accounts returned by this server after recent owner confirmation.
+            Choose an account after confirming the owner password.
           </p>
           <label className="mt-3 block text-[10px] font-medium text-text-secondary">
             <span>Account</span>
@@ -1225,7 +1274,7 @@ export function SupportPanel() {
             && detailsLoading
             && (
               <p className="mt-3 flex items-center gap-2 rounded-lg bg-bg-primary/40 px-3 py-2 text-[10px] text-text-muted" role="status">
-                <Loader2 size={12} className="animate-spin" aria-hidden="true" /> Loading private support audit…
+                <Loader2 size={12} className="animate-spin" aria-hidden="true" /> Loading private support history…
               </p>
             )}
           {selectedUserIndex !== ''
@@ -1233,7 +1282,7 @@ export function SupportPanel() {
             && !admin
             && (
               <p className="mt-3 rounded-lg bg-bg-primary/40 px-3 py-2 text-[10px] text-text-muted" role="status">
-                Private support audit is unavailable.
+                Private support history is unavailable.
               </p>
             )}
           {selectedUserIndex !== ''

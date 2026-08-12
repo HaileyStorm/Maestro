@@ -2731,7 +2731,7 @@ class TestStudioPrimaryInferenceSteps(unittest.TestCase):
         self.assertIn("const minimumInferenceSteps = isH3 ? 2 : 1", source)
         self.assertIn('type="range" min={minimumInferenceSteps} max={50}', source)
         self.assertIn("Math.max(minimumInferenceSteps, Math.min(50", source)
-        self.assertIn("Select an editable non-distilled model", source)
+        self.assertIn("Choose a non-distilled model", source)
         self.assertIn(
             "disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}",
             source,
@@ -2832,7 +2832,10 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
         store = _read(_STORE_PATH)
         self.assertNotIn("h3_benchmark_capture", advanced)
         self.assertNotIn("h3_benchmark_capture", store)
-        self.assertIn("continuously refine privacy-safe timing estimates", advanced)
+        self.assertIn(
+            "Successful H3 generations improve time estimates on this computer.",
+            advanced,
+        )
 
     def test_resolution_is_main_and_h3_uses_native_canvases(self):
         sidebar = _read(_SIDEBAR_PATH)
@@ -2851,7 +2854,18 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
         self.assertNotIn("'Inference steps'", duration)
         self.assertIn("'Inference Steps'", advanced)
         self.assertIn("const nativeResolutions = h3OptionsReady ? (modelOptions?.resolutions || []) : []", resolution)
-        self.assertIn("exact H3-native canvas", resolution)
+        self.assertIn(
+            "const selectedIsNative = nativeResolutions.some(option => option.value === resolution)",
+            resolution,
+        )
+        self.assertIn(
+            "`${width} × ${height} · ${orientation} · ${aspect.toFixed(2)}:1 · supported creation size`",
+            resolution,
+        )
+        self.assertIn(
+            "FlashVSR ${flashMatch?.[1] ? 'two-pass ' : ''}${deliveryScale}x upscale",
+            resolution,
+        )
         self.assertIn("setH3NativeResolution(event.target.value)", resolution)
         store = _read(_STORE_PATH)
         native_resolution = store.split(

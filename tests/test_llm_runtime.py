@@ -205,8 +205,8 @@ class LlmRuntimeTests(unittest.TestCase):
         self.assertIn("loadingId === expectedModelId", prompt_input)
         self.assertIn("llmData.model_id === expectedModelId", prompt_input)
         self.assertIn("Downloading vision projector", prompt_input)
-        self.assertIn("Downloading accelerated LLM runtime", prompt_input)
-        self.assertIn("Building accelerated LLM runtime", prompt_input)
+        self.assertIn("Downloading writing-assistant tools", prompt_input)
+        self.assertIn("Preparing writing-assistant tools", prompt_input)
         self.assertIn("compactBytes(downloaded)", prompt_input)
         self.assertNotIn("if (!llmData.loaded)", prompt_input)
 

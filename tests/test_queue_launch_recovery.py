@@ -4460,6 +4460,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         owner = "owner-session"
         worker = lambda *_args: None
         selected_worker = {"value": None}
+        project_access_checks = []
         job = {
             "id": "job-remote", "workspace": "project-a",
             "recovery_state": "blocked_remote_reauth",
@@ -4478,7 +4479,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
                         status_code=404, detail="Job not found",
                     ))
                 ),
-                "_require_project_access": lambda *_args: "/project",
+                "_require_project_access": (
+                    lambda _request, workspace, *, permission: (
+                        project_access_checks.append((workspace, permission))
+                        or "/project"
+                    )
+                ),
                 "owner_principal_digest": owner_principal_digest,
                 "_session_secret": lambda: secret,
                 "hmac": hmac,
@@ -4529,6 +4535,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(result["recovery_state"], "retrying")
         self.assertEqual(result["recovery_attempt"], 1)
         self.assertEqual(FakeThread.started, 1)
+        self.assertEqual(
+            project_access_checks,
+            [("project-a", "project.generate")],
+        )
 
         job.update({
             "recovery_attempt": 3,
@@ -4552,6 +4562,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             ),
         )
         current_digest = {"value": project_digest}
+        project_permission_checks = []
         namespace = _isolated_functions(
             self.launch,
             (
@@ -4564,9 +4575,19 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "Request": object,
                 "HTTPException": Exception,
                 "QueueRecoveryAdapterError": RuntimeError,
+                "_accounts_enabled": lambda: False,
                 "_remote_active_projects": active,
                 "_remote_active_projects_lock": __import__("threading").RLock(),
                 "_existing_workspace_dir": lambda _workspace: "/projects/project-a",
+                "_require_account_project_permission": (
+                    lambda request, project_dir, permission: (
+                        project_permission_checks.append((
+                            request.state.maestro_session_id,
+                            project_dir,
+                            permission,
+                        ))
+                    )
+                ),
                 "_project_access": access,
                 "_queue_recovery_existing_project_identity": (
                     lambda *_args: current_digest["value"]
@@ -4615,6 +4636,15 @@ class QueueLaunchWiringTests(unittest.TestCase):
             protected=True, unlocked=True,
         )
         self.assertTrue(owned(legacy, remote))
+        self.assertTrue(project_permission_checks)
+        self.assertEqual(
+            {permission for _, _, permission in project_permission_checks},
+            {"project.read"},
+        )
+        self.assertEqual(
+            {project_dir for _, project_dir, _ in project_permission_checks},
+            {"/projects/project-a"},
+        )
 
         # Local ownership compatibility does not depend on the remote active
         # project map, while still requiring the exact recovered principal.

@@ -1,13 +1,13 @@
 import { useId } from 'react'
 
 export type H3DurationPlanBarProps = {
-  /** Original server-authored target, in published frames. */
+  /** Original target, in frames included in the finished video. */
   targetPublishedFrames: number
-  /** Current server-verified draft total, in published frames. */
+  /** Current planned total, in frames included in the finished video. */
   currentPublishedFrames: number
-  /** Current server-verified generated total before tail cropping. */
+  /** Current generated total before extra frames are trimmed. */
   currentGeneratedFrames: number
-  /** Server-authored current minus target delta. */
+  /** Current total minus the original target. */
   currentMinusTargetFrames: number
 } & (
   | { outcome: 'exact'; reason?: string }
@@ -39,9 +39,9 @@ function mismatchDirection(frames: number): string {
 }
 
 function outcomeLabel(outcome: H3DurationPlanBarProps['outcome']): string {
-  if (outcome === 'acceptable') return '≈ Acceptable mismatch'
-  if (outcome === 'insufficient_capacity') return '! Insufficient capacity'
-  return '✓ Exact target'
+  if (outcome === 'acceptable') return '≈ Close to target'
+  if (outcome === 'insufficient_capacity') return '! Cannot reach target'
+  return '✓ Matches target'
 }
 
 export function H3DurationPlanBar(props: H3DurationPlanBarProps) {
@@ -49,11 +49,11 @@ export function H3DurationPlanBar(props: H3DurationPlanBarProps) {
   const descriptionId = useId()
   const currentX = currentMarkerX(props.currentPublishedFrames, props.targetPublishedFrames)
   const outcomeText = outcomeLabel(props.outcome)
-  const reason = props.reason || 'The current published duration matches the original target.'
+  const reason = props.reason || 'The current video length matches the original target.'
   const hasGeneratedTail = props.currentGeneratedFrames > props.currentPublishedFrames
   const generatedTailText = hasGeneratedTail
-    ? `${props.currentGeneratedFrames} frames are generated; ${props.currentPublishedFrames} frames are published. Generated tail work remains outside the published output.`
-    : `${props.currentGeneratedFrames} frames are generated and ${props.currentPublishedFrames} frames are published; no generated tail is omitted.`
+    ? `${props.currentGeneratedFrames} frames will be generated, and ${props.currentPublishedFrames} will appear in the finished video. The extra ending frames will be trimmed.`
+    : `All ${props.currentGeneratedFrames} generated frames will appear in the finished video.`
 
   return (
     <section
@@ -63,10 +63,10 @@ export function H3DurationPlanBar(props: H3DurationPlanBarProps) {
       <div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
         <div className="min-w-0">
           <h3 id={titleId} className="text-[11px] font-semibold text-text-primary">
-            Published duration compared with target
+            How the video length compares
           </h3>
           <p id={descriptionId} className="mt-0.5 break-words text-[9px] leading-relaxed text-text-muted">
-            T is the fixed original target marker. C is the current server-verified draft. The bar is read-only.
+            T marks your original target. C shows the current plan. This chart is for comparison only.
           </p>
         </div>
         <span
@@ -90,10 +90,10 @@ export function H3DurationPlanBar(props: H3DurationPlanBarProps) {
           preserveAspectRatio="xMidYMid meet"
           className="block h-auto w-full min-w-0"
         >
-          <title>Original target and current published frame totals</title>
+          <title>Original target and current planned video length</title>
           <desc>
-            The fixed dashed T marker is the original target at {props.targetPublishedFrames} published frames.
-            The solid diamond C marker is the current draft at {props.currentPublishedFrames} published frames,
+            The dashed T marker shows the original target of {props.targetPublishedFrames} frames.
+            The solid diamond C marker shows the current plan of {props.currentPublishedFrames} frames,
             {` ${mismatchDirection(props.currentMinusTargetFrames)} by ${signedFrames(props.currentMinusTargetFrames)} frames.`}
           </desc>
           <line
@@ -139,22 +139,22 @@ export function H3DurationPlanBar(props: H3DurationPlanBarProps) {
           </text>
         </svg>
         <figcaption className="sr-only">
-          Current published duration is {props.currentPublishedFrames} frames; original target is {props.targetPublishedFrames} frames;
-          mismatch is {signedFrames(props.currentMinusTargetFrames)} frames, {mismatchDirection(props.currentMinusTargetFrames)}.
+          The current plan is {props.currentPublishedFrames} frames; the original target is {props.targetPublishedFrames} frames;
+          the difference is {signedFrames(props.currentMinusTargetFrames)} frames, {mismatchDirection(props.currentMinusTargetFrames)}.
         </figcaption>
       </figure>
 
       <dl className="mt-2 grid min-w-0 grid-cols-1 gap-2 text-[9px] sm:grid-cols-3">
         <div className="min-w-0 rounded border border-border/70 px-2 py-1.5">
           <dt className="text-text-muted">Original target · T</dt>
-          <dd className="mt-0.5 break-words font-semibold text-text-primary">{props.targetPublishedFrames} published frames</dd>
+          <dd className="mt-0.5 break-words font-semibold text-text-primary">{props.targetPublishedFrames} frames</dd>
         </div>
         <div className="min-w-0 rounded border border-border/70 px-2 py-1.5">
-          <dt className="text-text-muted">Current draft · C</dt>
-          <dd className="mt-0.5 break-words font-semibold text-text-primary">{props.currentPublishedFrames} published frames</dd>
+          <dt className="text-text-muted">Current plan · C</dt>
+          <dd className="mt-0.5 break-words font-semibold text-text-primary">{props.currentPublishedFrames} frames</dd>
         </div>
         <div className="min-w-0 rounded border border-border/70 px-2 py-1.5">
-          <dt className="text-text-muted">Signed mismatch · C − T</dt>
+          <dt className="text-text-muted">Difference · C − T</dt>
           <dd className="mt-0.5 break-words font-semibold text-text-primary">
             {signedFrames(props.currentMinusTargetFrames)} frames · {mismatchDirection(props.currentMinusTargetFrames)}
           </dd>
@@ -172,20 +172,20 @@ export function H3DurationPlanBar(props: H3DurationPlanBarProps) {
       </div>
 
       <p className="mt-2 break-words text-[9px] leading-relaxed text-text-muted">
-        <strong className="text-text-secondary">Generated vs published tail:</strong> {generatedTailText}
+        <strong className="text-text-secondary">Extra generated frames:</strong> {generatedTailText}
       </p>
 
       <table className="sr-only">
-        <caption>Read-only H3 duration plan totals</caption>
+        <caption>H3 video length comparison</caption>
         <thead>
           <tr><th scope="col">Measure</th><th scope="col">Frames</th><th scope="col">Meaning</th></tr>
         </thead>
         <tbody>
-          <tr><th scope="row">Original target</th><td>{props.targetPublishedFrames}</td><td>Fixed target marker T</td></tr>
-          <tr><th scope="row">Current draft</th><td>{props.currentPublishedFrames}</td><td>Current indicator C</td></tr>
-          <tr><th scope="row">Signed mismatch</th><td>{signedFrames(props.currentMinusTargetFrames)}</td><td>{mismatchDirection(props.currentMinusTargetFrames)}</td></tr>
-          <tr><th scope="row">Generated total</th><td>{props.currentGeneratedFrames}</td><td>{hasGeneratedTail ? 'Includes an unpublished generated tail' : 'No unpublished generated tail'}</td></tr>
-          <tr><th scope="row">Outcome</th><td colSpan={2}>{outcomeText}: {reason}</td></tr>
+          <tr><th scope="row">Original target</th><td>{props.targetPublishedFrames}</td><td>Target marker T</td></tr>
+          <tr><th scope="row">Current plan</th><td>{props.currentPublishedFrames}</td><td>Current marker C</td></tr>
+          <tr><th scope="row">Difference</th><td>{signedFrames(props.currentMinusTargetFrames)}</td><td>{mismatchDirection(props.currentMinusTargetFrames)}</td></tr>
+          <tr><th scope="row">Frames generated</th><td>{props.currentGeneratedFrames}</td><td>{hasGeneratedTail ? 'Extra ending frames will be trimmed' : 'All generated frames will be used'}</td></tr>
+          <tr><th scope="row">Result</th><td colSpan={2}>{outcomeText}: {reason}</td></tr>
         </tbody>
       </table>
     </section>

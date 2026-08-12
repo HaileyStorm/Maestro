@@ -182,7 +182,7 @@ function useAdvancedActiveItems(): string[] {
   } else if ((params.custom_settings as H3CustomSettings | undefined)?.h3_attention_engine === 'sage2') {
     items.push('H3 SageAttention2++')
   } else if ((params.custom_settings as H3CustomSettings | undefined)?.h3_attention_engine === 'sdpa') {
-    items.push('H3 dense SDPA override')
+    items.push('H3 Dense SDPA')
   }
   // injection_strength only matters when injected frames actually exist.
   // The persisted snapshot strips image_refs (file paths are ephemeral)
@@ -406,11 +406,11 @@ export function AdvancedSettings() {
                 <div className="space-y-3 rounded-lg border border-border bg-bg-tertiary/35 p-3">
                   <div>
                     <div className="flex items-center justify-between gap-2">
-                      <label className="text-[11px] text-text-muted uppercase tracking-wider">H3 Performance &amp; Hacks</label>
-                      <span className="text-[9px] text-text-muted">Per generation</span>
+                      <label className="text-[11px] text-text-muted uppercase tracking-wider">H3 Performance</label>
+                      <span className="text-[9px] text-text-muted">For this generation</span>
                     </div>
                     <p className="mt-1 text-[9px] text-text-muted">
-                      Quality uses Sol-Attn, validated Base speed profiles use Sage2, and Ultra uses exact dense SDPA.
+                      Quality favors speed with Sol-Attn. Tested Base speed presets use SageAttention2++. Ultra favors accuracy with Dense SDPA.
                     </p>
                   </div>
 
@@ -428,41 +428,41 @@ export function AdvancedSettings() {
                       )}
                       className="mobile-control-target w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                     >
-                      <option value="sdpa">Dense SDPA · exact override</option>
+                      <option value="sdpa">Dense SDPA · most accurate</option>
                       <option value="sol_attn" disabled={h3Acceleration?.sol_attn.available === false}>
-                        Kijai Sol-Attn · fast default (minimal-loss approximate)
+                        Kijai Sol-Attn · faster, small quality tradeoff
                       </option>
                       <option
                         value="sage2"
                         disabled={h3Acceleration?.sage2.available !== true || params.model_type !== 'minimax_h3'}
                       >
-                        Official SageAttention2++ · {h3Acceleration?.sage2.validated ? 'Base validated' : 'unvalidated'}
+                        Official SageAttention2++ · {h3Acceleration?.sage2.validated ? 'tested for Base H3' : 'not yet tested'}
                       </option>
                     </select>
                     {h3Acceleration?.sol_attn.available === false && (
                       <p className="mt-1 text-[9px] text-amber-400">
-                        Sol-Attn unavailable: {h3Acceleration.sol_attn.error || (!h3Acceleration.sol_attn.hardware_ok ? 'requires NVIDIA SM80+ and BF16' : 'pinned companion is not installed')}.
+                        Sol-Attn is unavailable: {h3Acceleration.sol_attn.error || (!h3Acceleration.sol_attn.hardware_ok ? 'it requires an NVIDIA SM80+ GPU with BF16 support' : 'the required Sol-Attn package is not installed')}.
                       </p>
                     )}
                     {h3Acceleration?.sage2.available !== true && (
                       <p className="mt-1 text-[9px] text-amber-400">
-                        SageAttention2++ unavailable: {h3Acceleration?.sage2.reason || 'requires the pinned official Linux CUDA 12.8+ SM120 source build'}.
+                        SageAttention2++ is unavailable: {h3Acceleration?.sage2.reason || 'it requires the official Linux CUDA 12.8+ package for SM120 GPUs'}.
                       </p>
                     )}
                     {h3Acceleration?.sage2.available === true && params.model_type !== 'minimax_h3' && (
                       <p className="mt-1 text-[9px] text-amber-400">
-                        SageAttention2++ is release-validated only for Base H3; W4A8, PinkCherry, and Ref2VA remain unavailable here.
+                        SageAttention2++ has only been tested with Base H3. Choose Base H3 to use it; W4A8, PinkCherry, and Ref2VA are not supported.
                       </p>
                     )}
                     {h3Engine === 'sage2' && (
                       <p className="mt-2 border-l border-amber-500/30 pl-2 text-[9px] text-amber-300">
-                        Quantized attention, fail-closed so benchmarks cannot be mislabeled after an SDPA fallback. Base Draft at 608×352 and Fast at 864×480 passed exact release/runtime-bound kernel, visual, and audio gates. Other H3 checkpoints remain unvalidated.
+                        Usually faster than Dense SDPA on the tested Base H3 profiles. If a run switches to SDPA, Continuum leaves it out of benchmark comparisons. Base Draft at 608×352 and Fast at 864×480 have been tested for video and audio; other H3 models have not.
                       </p>
                     )}
                     {h3Engine === 'sol_attn' && (
                       <div className="mt-2 space-y-2 border-l border-amber-500/30 pl-2">
                         <p className="text-[9px] text-amber-300">
-                          Approximate sparse attention. The first dense steps/blocks and conditioning prefix remain exact; any unsupported call falls back to dense SDPA.
+                          Faster approximate attention with a small quality tradeoff. Opening steps and reference-image setup use Dense SDPA, and unsupported operations switch back to Dense SDPA automatically.
                         </p>
                         <div>
                           <div className="flex justify-between text-[10px] text-text-muted"><span>Routing tau</span><span>{Number(h3Custom.h3_sol_tau ?? 1).toFixed(1)}</span></div>
@@ -477,13 +477,13 @@ export function AdvancedSettings() {
                   </div>
 
                   <div className="rounded border border-border/70 bg-bg-primary/40 p-2 text-[9px] text-text-muted">
-                    <div className="font-medium text-text-secondary">Required visual-context component</div>
+                    <div className="font-medium text-text-secondary">Reference-image model</div>
                     <div className="mt-0.5">
                       {params.model_type === 'minimax_h3_pinkcherry_fl2va'
                         ? 'Heretic Qwen3-VL-32B INT8 ConvRot · explicit PinkCherry profile'
                         : 'Official Qwen3-VL-32B NVFP4-AWQ · base fidelity/performance profile'}
                     </div>
-                    <div className="mt-1">Supplies reference conditioning; it does not enhance text prompts.</div>
+                    <div className="mt-1">Helps H3 follow reference images. It does not rewrite or enhance your prompt.</div>
                   </div>
 
                   <label className="flex items-start gap-2 text-[10px] text-text-muted">
@@ -500,20 +500,20 @@ export function AdvancedSettings() {
                       className="mt-0.5"
                     />
                     <span>
-                      <span className="block text-text-secondary">Kijai W4A8 FL2VA transformer · experimental / opt-in</span>
+                      <span className="block text-text-secondary">Kijai W4A8 FL2VA transformer · experimental, may use less memory</span>
                       <span className="block text-[9px]">{h3Acceleration?.w4a8.reason || 'Checking merged W4A8 runtime…'} Compatible only with base FL2VA text/first/last-frame segments; PinkCherry and Ref2VA use their own weights.</span>
                     </span>
                   </label>
 
                   <p className="text-[9px] text-text-muted">
-                    {h3Acceleration?.sol_attn.available ? 'Sol-Attn is ready on this machine.' : 'Sol-Attn is unavailable; generations use dense SDPA.'} Published speedups are not this-PC measurements.
+                    {h3Acceleration?.sol_attn.available ? 'Sol-Attn is available on this computer.' : 'Sol-Attn is unavailable, so generations use Dense SDPA.'} Published speed claims are not measurements from this computer.
                   </p>
 
                   <div className="space-y-2 border-t border-border pt-2">
                     <div className="flex items-center justify-between gap-2">
                       <div>
-                        <div className="text-[10px] font-medium text-text-secondary">Same-PC benchmark</div>
-                        <div className="text-[9px] text-text-muted">608×352 · 124 frames · 4 steps · one measured run</div>
+                        <div className="text-[10px] font-medium text-text-secondary">Benchmark on this computer</div>
+                        <div className="text-[9px] text-text-muted">Each result is one measured run: 608×352 · 124 frames · 4 steps</div>
                       </div>
                       <button
                         type="button"
@@ -526,11 +526,11 @@ export function AdvancedSettings() {
                         }}
                         className="mobile-control-target rounded border border-accent-blue/50 px-2 py-1 text-[9px] text-accent-blue hover:bg-accent-blue/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                       >
-                        Apply quick task
+                        Apply benchmark settings
                       </button>
                     </div>
                     <p className="text-[9px] text-text-muted">
-                      Successful H3 generations continuously refine privacy-safe timing estimates. Use this normalized task with text only, first frame, first+last, and Ref2VA references when you want directly comparable samples.
+                      Successful H3 generations improve time estimates on this computer. Use these standard settings with text only, a first frame, first and last frames, or Ref2VA references for comparable results.
                     </p>
                     {(h3Benchmark?.records.length || 0) > 0 ? (
                       <div className="max-h-32 space-y-1 overflow-y-auto">
@@ -538,13 +538,13 @@ export function AdvancedSettings() {
                           <div key={record.cache_key} className="grid grid-cols-[1fr_auto] gap-x-2 rounded bg-bg-primary/50 px-2 py-1 text-[9px]">
                             <span className="truncate text-text-secondary">{record.spec.case_id.replaceAll('_', ' ')} · {record.spec.model.id} · {benchmarkEngineLabel(record)}</span>
                             <span className="text-text-primary">{record.generation_wall_time_seconds.toFixed(1)}s · {record.effective_output_fps.toFixed(2)} fps</span>
-                            <span className="text-text-muted">{record.spec.task.profile === 'quick' ? 'normalized quick task' : 'observed job'}</span>
-                            <span className="text-text-muted">{record.normalized_speed_index == null ? 'needs SDPA baseline' : `${record.normalized_speed_index.toFixed(0)} speed index`}</span>
+                            <span className="text-text-muted">{record.spec.task.profile === 'quick' ? 'standard benchmark' : 'regular generation'}</span>
+                            <span className="text-text-muted">{record.normalized_speed_index == null ? 'needs a Dense SDPA comparison' : `${record.normalized_speed_index.toFixed(0)} relative speed score`}</span>
                           </div>
                         ))}
                       </div>
                     ) : (
-                      <p className="text-[9px] text-text-muted">No local measurements yet. Published claims remain separate and are never used as this-PC results.</p>
+                      <p className="text-[9px] text-text-muted">No measurements from this computer yet. Published speed claims are shown separately and are not treated as local results.</p>
                     )}
                   </div>
                 </div>
@@ -938,8 +938,8 @@ export function AdvancedSettings() {
                   />
                   {modelOptions?.lock_inference_steps && !isScailEdit && (
                     <p className="text-[9px] text-text-muted mt-0.5">
-                      Fixed at the model&apos;s authored distilled schedule ({modelOptions.default_num_inference_steps ?? params.num_inference_steps} steps).
-                      Select an editable non-distilled model to change the main step count. Stage 2/3 settings add refinement.
+                      This distilled model uses a fixed {modelOptions.default_num_inference_steps ?? params.num_inference_steps}-step recipe.
+                      Choose a non-distilled model to change the main step count. Stage 2/3 settings add refinement.
                     </p>
                   )}
                   {isScailFast && (

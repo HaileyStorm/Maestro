@@ -288,7 +288,7 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("clearServicesConfigError", SERVICES)
         self.assertNotIn("nsfw_accepted_at", SERVICES)
         self.assertIn("await updateConfig({ nsfw_mode: true })", SERVICES)
-        self.assertIn("Each job's Explicit choice remains separate", SERVICES)
+        self.assertIn("You still choose Explicit separately for each job", SERVICES)
         self.assertIn("servicesConfigError: message", STORE)
 
     def test_mobile_notice_actions_are_reachable_in_scrollable_safe_area_surfaces(self):
@@ -453,7 +453,7 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("const privateBlurred = file.private && !privateRevealed", MEDIA_ITEM)
         self.assertIn("privateBlurred ? 'blur-2xl'", MEDIA_ITEM)
         self.assertNotIn("group-hover/private:blur-none", MEDIA_ITEM)
-        self.assertIn("Blurred preview — click to Reveal", MEDIA_ITEM)
+        self.assertIn("Blurred preview — select to show", MEDIA_ITEM)
         self.assertIn("Reveal blurred preview for", MEDIA_ITEM)
         self.assertIn("Blur preview for", MEDIA_ITEM)
         self.assertIn("privatePreviewIdentity(file.workspace, file.name, file.revision)", MEDIA_ITEM)
@@ -539,7 +539,14 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("min-h-11", MAIN_CONTENT)
         self.assertIn("md:min-h-0", MAIN_CONTENT)
         self.assertNotIn("sm:min-h-0", MAIN_CONTENT)
-        self.assertIn("Browser-session preview only; project access unchanged.", MAIN_CONTENT)
+        self.assertIn(
+            "Browser-session preview only; project access unchanged.",
+            THUMBNAILS,
+        )
+        self.assertIn(
+            "This only changes previews in this browser. Project access does not change.",
+            MAIN_CONTENT,
+        )
         self.assertIn("setPrivatePreviewsForWorkspaceRevealed(", MAIN_CONTENT)
         self.assertIn("activeWorkspace && !browsingUploads", MAIN_CONTENT)
         self.assertIn('aria-controls="mobile-thumbnail-panel"', THUMBNAILS)
@@ -618,7 +625,10 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         ]
         self.assertIn("moveOutput(file.name, targetWs, file.workspace)", move_block)
         self.assertNotIn("private", move_block)
-        self.assertIn("does not change the output's Private preview flag", share_block)
+        self.assertIn(
+            "The link does not change whether its Gallery preview is blurred.",
+            share_block,
+        )
         self.assertNotIn("setOutputPrivacy", share_block)
 
 

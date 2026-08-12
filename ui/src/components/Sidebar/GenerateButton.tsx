@@ -91,22 +91,22 @@ export function GenerateButton() {
       : needsModelTerms
       ? 'Review terms'
       : needsManualCheckpointVerification
-      ? 'Manual install'
+      ? 'Model file needed'
       : needsImage
       ? 'Need image'
       : needsOutpaintSource
         ? 'Need source'
         : 'Choose canvas'
     const title = modelOptionsLoading
-      ? 'Loading this model\'s supported duration, window, steps, and reference controls.'
+      ? 'Loading the settings available for this model.'
       : needsOutpaintArea
       ? 'Choose a larger output aspect or resize the source to create an area for Outpaint to generate.'
       : needsProject
-      ? 'Select or create a password-protected project from the project picker first.'
+      ? 'Choose or create a project first.'
       : needsModelTerms
-      ? 'Review and accept the selected model recipe terms for this host.'
+      ? 'Read and accept the selected model\'s terms for this Maestro installation.'
       : needsManualCheckpointVerification
-      ? 'Install the exact checkpoint locally, then verify its byte size and SHA-256 in the model selector. Maestro will not download this checkpoint.'
+      ? 'Download the required model file yourself, then use the model selector to check it on the computer running Maestro. Maestro will not download this file.'
       : undefined
     return (
       <div className="flex flex-col items-end gap-0.5">

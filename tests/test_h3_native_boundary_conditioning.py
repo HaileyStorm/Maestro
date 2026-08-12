@@ -98,6 +98,7 @@ def _load_nested_function(path: Path, name: str, namespace: dict):
 def _native_admission_namespace():
     """Load public/preparation/worker guards with later work forbidden."""
     events: list[str] = []
+    project_access_permissions: list[str] = []
     worker_admissions: list[str] = []
 
     def forbidden(name: str):
@@ -109,6 +110,13 @@ def _native_admission_namespace():
 
     failed_preparations: list[dict] = []
     finished_jobs: list[tuple] = []
+
+    def require_project_generation(request, workspace, *, permission):
+        if permission != "project.generate":
+            raise AssertionError(f"unexpected project permission: {permission}")
+        project_access_permissions.append(permission)
+        return "/tmp/project"
+
     namespace = {
         "Request": _AdmissionRequest,
         "_GenerationPreparationRequest": object,
@@ -128,7 +136,8 @@ def _native_admission_namespace():
         "_H3_TURBO_BENCHMARK_REFERENCE_BYTES": 0,
         "_H3_TURBO_BENCHMARK_REFERENCE_SHA256": "",
         "_get_active_workspace": lambda: "default",
-        "_require_project_access": lambda request, workspace: "/tmp/project",
+        "_require_project_access": require_project_generation,
+        "_project_access_permissions": project_access_permissions,
         "_reject_client_h3_internal_state": lambda body: None,
         "_reject_client_h3_turbo_validation_controls": lambda body: None,
         "_authorize_generation_media_inputs": (
@@ -670,6 +679,10 @@ class NativeBoundaryPlanningTests(unittest.TestCase):
                 ))
         self.assertEqual(preview_error.exception.status_code, 400)
         self.assertIn("unavailable", str(preview_error.exception.detail))
+        self.assertEqual(
+            admission["_project_access_permissions"],
+            ["project.generate"],
+        )
         self.assertEqual(forbidden_events, [])
         self.assertEqual(worker_admissions, [])
 

@@ -190,7 +190,7 @@ export function StorageDashboard() {
         {/* Duplicates */}
         <section>
           <div className="mb-2 flex flex-wrap items-center gap-2">
-            <h2 className="text-xs font-medium text-text-primary uppercase tracking-wider">Duplicates in linked folders</h2>
+            <h2 className="text-xs font-medium text-text-primary uppercase tracking-wider">Duplicate files across installations</h2>
             <button
               type="button"
               onClick={scanDupes}
@@ -201,16 +201,16 @@ export function StorageDashboard() {
               Scan
             </button>
             <span className="w-full text-[10px] text-text-muted lg:w-auto lg:flex-1">
-              same file in Maestro AND a linked install — deleting Maestro's copy is free, the linked one keeps working
+              These files are stored in both Maestro and another installation. Delete Maestro's copy to free space here; the other copy keeps working.
             </span>
-            <label className="flex min-h-11 w-full cursor-pointer items-center gap-2 text-[10px] text-text-secondary md:ml-auto md:w-auto md:shrink-0" title="The inverse direction: keep Maestro's copy and remove the duplicate FROM the linked install. Removals go to the Windows Recycle Bin so they can be undone. Off by default because it modifies other installs.">
+            <label className="flex min-h-11 w-full cursor-pointer items-center gap-2 text-[10px] text-text-secondary md:ml-auto md:w-auto md:shrink-0" title="Also allow keeping Maestro's copy and moving the other installation's copy to the Windows Recycle Bin, where it can be restored. This is off by default because it changes files in another installation.">
               <input
                 type="checkbox"
                 checked={allowLinkedRemoval}
                 onChange={e => updateServicesConfig({ storage_allow_linked_removal: e.target.checked })}
                 className="h-4 w-4 rounded border-border bg-bg-tertiary accent-accent-blue"
               />
-              Allow removing from linked installs
+              Allow recycling copies from other installations
             </label>
           </div>
           {dupes && dupes.duplicates.length === 0 && (
@@ -222,9 +222,9 @@ export function StorageDashboard() {
                 <div key={d.primary_path} className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-1.5 text-xs last:border-b-0 hover:bg-bg-hover md:flex-nowrap">
                   <span className="text-[9px] px-1 py-0.5 rounded bg-bg-tertiary text-text-muted uppercase shrink-0">{d.kind}</span>
                   <span className="truncate text-text-primary flex-1 min-w-0" title={d.primary_path}>{d.rel_path}</span>
-                  <span className="text-text-muted shrink-0" title={`Also in ${d.linked_path}`}>in {d.linked_install}</span>
+                  <span className="text-text-muted shrink-0" title={`Also stored at ${d.linked_path}`}>also in {d.linked_install}</span>
                   <span className="text-text-secondary tabular-nums shrink-0">{formatBytes(d.size_bytes)}</span>
-                  {rowBtn(`dup:${d.primary_path}`, 'Reclaim', d.rel_path, async () => {
+                  {rowBtn(`dup:${d.primary_path}`, 'Delete Maestro copy', `${d.rel_path} from Maestro`, async () => {
                     await reclaimDuplicate(d.primary_path)
                     setDupes(prev => prev ? {
                       ...prev,
@@ -232,7 +232,7 @@ export function StorageDashboard() {
                       total_reclaimable_bytes: prev.total_reclaimable_bytes - d.size_bytes,
                     } : prev)
                   })}
-                  {allowLinkedRemoval && rowBtn(`dupl:${d.linked_path}`, 'Remove linked', d.rel_path, async () => {
+                  {allowLinkedRemoval && rowBtn(`dupl:${d.linked_path}`, 'Recycle other copy', `${d.rel_path} from ${d.linked_install} to the Recycle Bin`, async () => {
                     await removeLinkedDuplicate(d.linked_path)
                     // Pair broken the other way: Maestro's copy stays, the
                     // linked one is in that install's Recycle Bin.
@@ -248,7 +248,7 @@ export function StorageDashboard() {
           )}
           {dupes && dupes.conflicts.length > 0 && (
             <div className="mt-2 text-[10px] text-indicator-warning">
-              {dupes.conflicts.length} same-name files differ in size between installs (not listed as reclaimable — Maestro's copy is the one in use).
+              {dupes.conflicts.length} files have the same name but different sizes across installations. They are not safe to remove here because Maestro is using its copy.
             </div>
           )}
         </section>
@@ -280,9 +280,9 @@ export function StorageDashboard() {
                   ) : m.size_bytes > 0 ? (
                     <span
                       className="text-[9px] px-1.5 py-0.5 rounded bg-bg-tertiary text-text-muted shrink-0"
-                      title="Every copy of these weights lives in a linked install (read-only from here). Free the space in that install, or unlink it."
+                      title="These weights are stored only in another installation. Manage storage there, or disconnect that installation from Maestro."
                     >
-                      linked only
+                      stored elsewhere
                     </span>
                   ) : null}
                 </div>
@@ -302,7 +302,7 @@ export function StorageDashboard() {
                   {l.linked && (
                     <span
                       className="text-[9px] px-1 py-0.5 rounded bg-accent-blue/20 text-accent-blue shrink-0"
-                      title="Lives in a linked install's loras folder (read-only from here) — no delete. Free the space in that install, or unlink it."
+                      title="This LoRA is stored in another installation, so it cannot be deleted here. Manage storage there, or disconnect that installation from Maestro."
                     >
                       Linked
                     </span>

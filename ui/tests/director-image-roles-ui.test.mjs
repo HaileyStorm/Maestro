@@ -890,6 +890,11 @@ test('Director host actions distinguish loading, local authority, and LAN sessio
 })
 
 test('role LoRA component exposes accessible controls and a responsive parameter grid', async () => {
+  const source = await readFile(new URL('../src/components/SettingsDrawer/DirectorLoraSelector.tsx', import.meta.url), 'utf8')
+  assert.match(source, /LoRAs from linked folders can be selected here, but their files must be managed where they are stored/)
+  assert.match(source, /If a LoRA's settings change, remove and add it again before generating/)
+  assert.doesNotMatch(source, /read-only linked roots|sealed to their current schema/)
+
   const { DirectorImageRoleLoraSelector } = await loadRoleSelector()
   const sealed = createDirectorImageRoleLoraSelection(lora('finish.safetensors', schema))
   globalThis.__directorRoleStateOverrides = [[lora('finish.safetensors', schema)], false, '', '']
@@ -950,7 +955,7 @@ test('Director source keeps image roles explicit and one final-video post-proces
     readFile(new URL('../src/components/Sidebar/DirectorChat.tsx', import.meta.url), 'utf8'),
     readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8'),
   ])
-  for (const label of ['Image creator', 'Continuity editor', 'Creator LoRAs', 'Editor LoRAs', 'Legacy combined image model']) {
+  for (const label of ['Image creator', 'Continuity editor', 'Creator LoRAs', 'Editor LoRAs', 'Older all-in-one image model']) {
     assert.match(director, new RegExp(label))
   }
   assert.equal((director.match(/id="director-final-video-upsampling"/g) || []).length, 1)
@@ -978,7 +983,7 @@ test('Director source keeps image roles explicit and one final-video post-proces
   for (const match of store.matchAll(/_captureDirectorImageRoleRequest\(get, ([^)]+)\)/g)) {
     assert.match(match[1], /requestExplicitOutput|state\.explicitOutput/)
   }
-  assert.match(director, /Loading host permissions…/)
+  assert.match(director, /Checking which setup actions are available…/)
   assert.match(director, /waitForModelDownloadTerminal/)
   assert.match(director, /openDirectorModelVisibility/)
   assert.match(store, /_refreshDirectorModelAdmissionCatalog\(\(\) => get\(\)\.loadModels\(\)\)/)
@@ -1037,7 +1042,7 @@ test('Director mobile dashboard and output selectors keep accessible targets wit
   const resolution = director.slice(resolutionStart, resolutionEnd)
 
   assert.match(dashboard, /aria-haspopup="dialog"/)
-  assert.match(dashboard, /aria-label="Open Director pipeline dashboard"/)
+  assert.match(dashboard, /aria-label="Open Director production dashboard"/)
   assert.match(dashboard, /mobile-control-target/)
   assert.match(dashboard, /focus-visible:ring-2/)
 
@@ -1058,7 +1063,7 @@ test('Director mobile dashboard and output selectors keep accessible targets wit
   assert.match(resolution, /aria-disabled=\{!available\}/)
   assert.match(resolution, /disabled=\{!available\}/)
   assert.match(resolution, /tabIndex=\{available && \(resolution === p \|\| \(!selectedPresetAvailable && index === 1\)\) \? 0 : -1\}/)
-  assert.match(resolution, /Loading exact model resolutions/)
+  assert.match(resolution, /Loading sizes for this model/)
   assert.match(resolution, /carried selection is unavailable/)
   assert.doesNotMatch(resolution, /\['480p', '540p', '720p', '1080p'\]/)
   assert.match(resolution, /mobile-control-target min-w-0/)

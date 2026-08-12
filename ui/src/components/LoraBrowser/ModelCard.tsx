@@ -12,6 +12,19 @@ function formatCount(n: number): string {
   return String(n)
 }
 
+function formatModelType(type: string): string {
+  const labels: Record<string, string> = {
+    LORA: 'LoRA',
+    LoCon: 'LoCon',
+    DoRA: 'DoRA',
+    TextualInversion: 'Textual Inversion',
+    AestheticGradient: 'Aesthetic Gradient',
+    Controlnet: 'ControlNet',
+    MotionModule: 'Motion Module',
+  }
+  return labels[type] ?? type.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ')
+}
+
 export function ModelCard({ model, onClick }: Props) {
   // Get first image/video from first version
   const allMedia = model.modelVersions?.[0]?.images || []
@@ -23,6 +36,7 @@ export function ModelCard({ model, onClick }: Props) {
   return (
     <button
       onClick={onClick}
+      aria-label={`View ${model.name} details`}
       className="group relative rounded-lg border border-border overflow-hidden bg-bg-tertiary hover:border-accent-blue transition-all text-left"
     >
       {/* Thumbnail */}
@@ -76,7 +90,7 @@ export function ModelCard({ model, onClick }: Props) {
       {/* Type badge */}
       <div className="absolute top-1.5 left-1.5">
         <span className="text-[9px] px-1.5 py-0.5 rounded bg-black/60 text-white/80 font-medium">
-          {model.type}
+          {formatModelType(model.type)}
         </span>
       </div>
     </button>

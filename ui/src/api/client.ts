@@ -36,6 +36,7 @@ import type {
   LogicalJobKind,
   AccountAuthResult,
   AccountContext,
+  AccountProjectMigrationStatus,
   AccountNoncePurpose,
   AccountSession,
   AccountSummary,
@@ -1046,6 +1047,13 @@ export function getDirectorHostActionAccessState(
   return context.machine_controls ? 'local' : 'lan'
 }
 
+export function isDirectLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '')
+  return normalized === 'localhost'
+    || normalized === '::1'
+    || /^127(?:\.\d{1,3}){3}$/.test(normalized)
+}
+
 let accessContextRequest: Promise<AccessContext> | null = null
 
 export async function fetchAccessContext(): Promise<AccessContext> {
@@ -1119,6 +1127,16 @@ async function accountRequest<T>(path: string, init: RequestInit = {}): Promise<
 
 export async function fetchAccountContext(): Promise<AccountContext> {
   return accountRequest<AccountContext>('/api/v1/account/context')
+}
+
+export async function fetchAccountProjectMigration(): Promise<AccountProjectMigrationStatus> {
+  return accountRequest<AccountProjectMigrationStatus>('/api/v1/account/projects/migration')
+}
+
+export async function migrateAccountProjects(): Promise<AccountProjectMigrationStatus> {
+  return accountRequest<AccountProjectMigrationStatus>('/api/v1/account/projects/migration', {
+    method: 'POST',
+  })
 }
 
 export async function issueAccountNonce(purpose: AccountNoncePurpose): Promise<string> {
@@ -1713,6 +1731,8 @@ export interface Workspace {
   remember_policy?: WorkspaceRememberPolicy | null
   unlock_expires_at?: number | null
   unlock_idle_expires_at?: number | null
+  project_role?: 'owner' | 'editor' | 'viewer'
+  project_permissions?: string[]
 }
 
 export type WorkspaceRememberPolicy = 'session' | 'device'
@@ -1738,7 +1758,10 @@ export interface WorkspacePasswordResult {
 }
 
 export async function fetchWorkspaces(): Promise<{ workspaces: Workspace[]; active: string }> {
-  const res = await fetch(`${BASE}/api/v1/workspaces`)
+  const res = await fetch(`${BASE}/api/v1/workspaces`, {
+    credentials: 'same-origin',
+    cache: 'no-store',
+  })
   if (!res.ok) throw new Error('Failed to fetch workspaces')
   return res.json()
 }

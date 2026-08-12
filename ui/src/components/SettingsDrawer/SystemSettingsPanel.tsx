@@ -8,13 +8,13 @@ import { FAMILIES, resolveVariant, onOsThemeChange, type FamilyId, type ThemeMod
 import { DOWNLOAD_REFRESH_EVENT, POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
 
 const profileLabels: Record<string, string> = {
-  '1': 'Profile 1: High RAM + High VRAM',
-  '2': 'Profile 2: High RAM + Low VRAM',
-  '3': 'Profile 3: Low RAM + High VRAM',
-  '3.5': 'Profile 3.5: Very Low RAM + High VRAM',
-  '4': 'Profile 4: Low RAM + Low VRAM',
-  '4.5': 'Profile 4.5: Low RAM + Low VRAM (saves ~1GB)',
-  '5': 'Profile 5: Very Low RAM + Low VRAM',
+  '1': 'Profile 1: High RAM and GPU memory',
+  '2': 'Profile 2: High RAM, lower GPU memory',
+  '3': 'Profile 3: Lower RAM, high GPU memory',
+  '3.5': 'Profile 3.5: Minimal RAM, high GPU memory',
+  '4': 'Profile 4: Lower RAM and GPU memory',
+  '4.5': 'Profile 4.5: Lower memory (saves about 1 GB)',
+  '5': 'Profile 5: Minimal RAM and lower GPU memory',
 }
 
 const quantizationOptions = [
@@ -343,8 +343,8 @@ function ModelVisibilitySection() {
                             <Download size={10} className="text-text-muted shrink-0" />
                           ) : m.downloadable === false ? (
                             <span
-                              aria-label={m.manual_checkpoint_verified ? 'Manual checkpoint verified; supporting files pending' : 'Manual install and verification required'}
-                              title={m.manual_checkpoint_verified ? 'The exact manual checkpoint is verified; supporting model files are not ready yet' : 'Manual install and verification required; use the model selector to review terms and verify the exact local checkpoint'}
+                              aria-label={m.manual_checkpoint_verified ? 'Model verified; additional files still needed' : 'Manual model setup required'}
+                              title={m.manual_checkpoint_verified ? 'This model is verified, but it still needs additional files before it can run' : 'Open the model selector to review its terms and finish the manual setup'}
                             >
                               <FolderOpen
                                 size={10}
@@ -447,9 +447,9 @@ function LinkedModelFoldersSection() {
     try {
       const res = await api.scanModelFolders()
       setCandidates(res.candidates)
-      if (res.candidates.length === 0) setError('No other Pinokio apps with a ckpts folder found')
+      if (res.candidates.length === 0) setError('No reusable model folders were found in other Pinokio apps')
     } catch {
-      setError('Scan failed')
+      setError('Could not search other Pinokio apps')
     } finally {
       setScanning(false)
     }
@@ -472,16 +472,15 @@ function LinkedModelFoldersSection() {
         className="flex items-center gap-1.5 text-[11px] text-text-secondary uppercase tracking-wider font-medium hover:text-text-primary transition-colors w-full"
       >
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        <span className="flex-1 text-left">Linked Model Folders</span>
+        <span className="flex-1 text-left">Reuse Model Folders</span>
         <span className="text-[10px] text-text-muted font-normal normal-case">{folders.length} linked</span>
       </button>
 
       {open && (
         <div className="mt-3 space-y-3">
           <p className="text-[10px] text-text-muted leading-relaxed">
-            Search other apps&apos; model folders for checkpoints you already have — e.g. an existing
-            Wan2GP install — instead of re-downloading them. Linked folders are read-only:
-            new downloads always go to Maestro&apos;s own ckpts folder.
+            Reuse model files from another app, such as Wan2GP, instead of downloading them again.
+            Maestro only reads linked folders; new downloads still go to Maestro&apos;s own model folder.
           </p>
 
           {folders.length > 0 && (
@@ -510,7 +509,7 @@ function LinkedModelFoldersSection() {
               className="flex items-center gap-1 px-2 py-1 text-[10px] border border-border rounded text-text-secondary hover:text-text-primary hover:border-border-light transition-colors disabled:opacity-50"
             >
               {scanning ? <Loader2 size={10} className="animate-spin" /> : <RefreshCw size={10} />}
-              Scan Pinokio apps
+              Find Pinokio model folders
             </button>
           </div>
 
@@ -543,7 +542,7 @@ function LinkedModelFoldersSection() {
               value={manualPath}
               onChange={e => setManualPath(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && addFolder(manualPath)}
-              placeholder="Or paste a folder path..."
+              placeholder="Or paste a model folder path..."
               className="flex-1 bg-bg-tertiary border border-border rounded px-2 py-1 text-[11px] text-text-primary focus:outline-none focus:border-accent-blue"
             />
             <button
@@ -733,7 +732,7 @@ function AutoPerformanceCard() {
       const res = await api.applySystemDetect()
       await Promise.all([loadServicesConfig(), loadSystemConfig()])
       if (res.profile_changed) {
-        showToast('Auto-tune applied — profile changes take effect on next model load')
+        showToast('Auto-tune applied — the new settings will be used the next time a model loads')
       } else {
         showToast('Auto-tune applied')
       }
@@ -752,7 +751,7 @@ function AutoPerformanceCard() {
     setApplying(true)
     try {
       await updateServicesConfig({ auto_performance: false })
-      showToast('Auto-tune disabled — settings unchanged, you can edit them manually now')
+      showToast('Auto-tune is off. Your current settings are unchanged and can now be edited.')
     } catch (e) {
       console.error('toggle off failed:', e)
     } finally {
@@ -772,9 +771,9 @@ function AutoPerformanceCard() {
       // the newly-applied recommendation.
       await Promise.all([loadSystemDetect(), loadServicesConfig(), loadSystemConfig()])
       if (res.profile_changed) {
-        showToast('Re-detected — profile changes take effect on next model load')
+        showToast('Hardware checked — the new settings will be used the next time a model loads')
       } else {
-        showToast('Re-detected — no settings changed')
+        showToast('Hardware checked — your settings were already up to date')
       }
     } catch (e) {
       console.error('re-detect failed:', e)
@@ -855,9 +854,9 @@ function AutoPerformanceCard() {
               onClick={handleRedetect}
               disabled={applying}
               className="text-[11px] text-text-secondary hover:text-text-primary flex items-center gap-1 disabled:opacity-50"
-              title="Re-run hardware detection (use after a hardware change or driver update)"
+              title="Check your hardware again after an upgrade or driver update"
             >
-              <RefreshCw size={11} className={applying ? 'animate-spin' : ''} /> Re-detect
+              <RefreshCw size={11} className={applying ? 'animate-spin' : ''} /> Check again
             </button>
           )}
         </div>
@@ -879,10 +878,85 @@ function formatResearchTime(value: string | null | undefined): string {
   return Number.isNaN(parsed.getTime()) ? 'Unavailable' : parsed.toLocaleString()
 }
 
+const SUGGESTION_COPY_REPLACEMENTS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\bdurable plan\b/gi, 'saved plan'],
+  [/\bdurable plans\b/gi, 'saved plans'],
+  [/\bevidence ledger\b/gi, 'review history'],
+  [/\bevidence ledgers\b/gi, 'review histories'],
+  [/\bstructural proof\b/gi, 'consistency check'],
+  [/\bimplementation[- ]eligible finding\b/gi, 'idea ready for a code update'],
+  [/\bimplementation[- ]eligible findings\b/gi, 'ideas ready for a code update'],
+  [/\bagent note\b/gi, 'working note'],
+  [/\bagent notes\b/gi, 'working notes'],
+  [/\bruntime error\b/gi, 'service error'],
+  [/\bruntime errors\b/gi, 'service errors'],
+]
+
+function presentSuggestionText(value: string, fallback: string): { display: string; technical: string | null } {
+  const original = value.trim()
+  let presented = original
+    .replace(/^\s*(?:agent|research)\s+(?:note|finding)\s*[:—-]\s*/i, '')
+    .replace(/^\s{0,3}#{1,6}\s+/, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
+  for (const [pattern, replacement] of SUGGESTION_COPY_REPLACEMENTS) {
+    presented = presented.replace(pattern, replacement)
+  }
+  return {
+    display: presented || fallback,
+    technical: presented && presented !== original ? original : null,
+  }
+}
+
+function presentResearchError(value: string | null | undefined): { summary: string; technical: string } | null {
+  const technical = value?.trim()
+  if (!technical) return null
+  const normalized = technical.toLowerCase()
+  let summary = 'The improvement task stopped unexpectedly. Try again, or open the technical details below.'
+  if (/\b(?:busy|already active|already running)\b/.test(normalized)) {
+    summary = 'Another improvement task is already running. Wait for it to finish, then try again.'
+  } else if (/\b(?:nonce|capability|expired)\b/.test(normalized)) {
+    summary = 'This action expired before it could start. Try it again.'
+  } else if (/\b(?:not ready|eligible|threshold)\b/.test(normalized)) {
+    summary = 'No ideas are ready for a code update yet.'
+  } else if (/\b(?:timeout|timed out)\b/.test(normalized)) {
+    summary = 'The improvement task took too long and stopped. Try again.'
+  } else if (/\b(?:disabled|unavailable|not configured|could not start)\b/.test(normalized)) {
+    summary = 'Improvement checks are unavailable right now. Try again later.'
+  }
+  return { summary, technical }
+}
+
+function formatImprovementStatus(value: api.ResearchImplementationStatus['status']): string {
+  const labels: Record<api.ResearchImplementationStatus['status'], string> = {
+    never_run: 'Not yet',
+    running: 'In progress',
+    completed: 'Completed',
+    failed: 'Needs attention',
+    cancelled: 'Cancelled',
+    interrupted_requires_review: 'Paused for review',
+  }
+  return labels[value]
+}
+
+function presentResearchDisclosure(value: string | null | undefined): string {
+  if (!value) {
+    return 'Privacy: this check uses only public model, tool, and LoRA catalog details. Project names, prompts, jobs, media, and logs are never sent.'
+  }
+  return `Privacy: ${value}`
+    .replace('Only public model, tool, and LoRA catalog metadata is sent', 'only public model, tool, and LoRA catalog details are sent')
+    .replace("If DeepSeek's mechanical gate fails or its circuit opens, isolated GPT-5.6 Luna is the only fallback.", 'If DeepSeek cannot be used, the only fallback is an isolated GPT-5.6 Luna session.')
+    .replace('Maestro never sends project names, prompts, jobs, media, or logs.', 'Project names, prompts, jobs, media, and logs are never sent as part of this check.')
+}
+
 function ResearchCard() {
   const [status, setStatus] = useState<api.ResearchStatus | null>(null)
   const [pollError, setPollError] = useState<string | null>(null)
   const [action, setAction] = useState<'research' | 'implementation' | null>(null)
+  const [confirmImplementation, setConfirmImplementation] = useState(false)
   const requestSequence = useRef(0)
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
@@ -894,20 +968,21 @@ function ResearchCard() {
       setPollError(null)
     } catch (error) {
       if (signal?.aborted || sequence !== requestSequence.current) return
-      setPollError(error instanceof Error ? error.message : 'Research status is unavailable')
+      setPollError(error instanceof Error ? error.message : 'Improvement status is unavailable')
     }
   }, [])
 
   useVisibilityPolling(refresh, POLL_INTERVAL_MS.researchVisible)
 
   const runNow = useCallback(async () => {
+    setConfirmImplementation(false)
     setAction('research')
     setPollError(null)
     try {
       await api.runResearchNow()
       await refresh()
     } catch (error) {
-      setPollError(error instanceof Error ? error.message : 'Research could not start')
+      setPollError(error instanceof Error ? error.message : 'The improvement check could not start')
     } finally {
       setAction(null)
     }
@@ -915,6 +990,7 @@ function ResearchCard() {
 
   const startImplementation = useCallback(async () => {
     if (!status || status.implementation_chunk_count < 1) return
+    setConfirmImplementation(false)
     setAction('implementation')
     setPollError(null)
     try {
@@ -923,7 +999,7 @@ function ResearchCard() {
       await api.startResearchImplementation(!status.implementation_ready)
       await refresh()
     } catch (error) {
-      setPollError(error instanceof Error ? error.message : 'Implementation could not start')
+      setPollError(error instanceof Error ? error.message : 'Maestro could not start applying improvements')
     } finally {
       setAction(null)
     }
@@ -933,30 +1009,31 @@ function ResearchCard() {
   const eligible = status?.implementation_chunk_count ?? 0
   const threshold = status?.readiness_threshold ?? 3
   const recent = (status?.recent_pending ?? []).slice(0, 3)
+  const researchError = presentResearchError(pollError || status?.runtime_error)
 
   return (
     <div className="space-y-2.5">
       <div className="flex items-center justify-between gap-2">
-        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Research</h3>
+        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Improvement checks</h3>
         <span className={`text-[10px] ${status?.implementation_ready ? 'text-indicator-success' : 'text-text-muted'}`}>
-          {eligible}/{threshold} eligible · {status?.implementation_ready ? 'ready' : 'building'}
+          {eligible} {eligible === 1 ? 'idea' : 'ideas'} ready · {status?.implementation_ready ? 'group ready' : `${Math.max(0, threshold - eligible)} more for a group`}
         </span>
       </div>
 
       <div className="rounded-lg bg-bg-tertiary border border-border p-3 space-y-2.5">
         <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
-          <span className="text-text-muted">Queued</span>
+          <span className="text-text-muted">Potential ideas left to check</span>
           <span className="text-text-secondary text-right">{status?.queued_candidate_count ?? 0}</span>
-          <span className="text-text-muted">Next cycle</span>
+          <span className="text-text-muted">Next check</span>
           <span className="text-text-secondary text-right">{formatResearchTime(status?.next_due_at)}</span>
-          <span className="text-text-muted">Last cycle</span>
+          <span className="text-text-muted">Last check</span>
           <span className="text-text-secondary text-right">{formatResearchTime(status?.last_cycle_at)}</span>
-          <span className="text-text-muted">Last implementation</span>
+          <span className="text-text-muted">Last update</span>
           <span className="text-text-secondary text-right">
             {status?.last_implementation_run.status === 'never_run'
               ? 'Not yet'
               : status?.last_implementation_run
-                ? `${status.last_implementation_run.status} · ${formatResearchTime(
+                ? `${formatImprovementStatus(status.last_implementation_run.status)} · ${formatResearchTime(
                     status.last_implementation_run.active
                       ? status.last_implementation_run.started_at
                       : status.last_implementation_run.completed_at,
@@ -967,30 +1044,53 @@ function ResearchCard() {
 
         {busy && (
           <div className="text-[10px] text-indicator-warning">
-            Active: {status?.implementation_active ? 'implementation' : status?.research_phase || 'research'}
+            {status?.implementation_active ? 'Applying improvements…' : 'Checking sources for new ideas…'}
           </div>
         )}
 
         {recent.length > 0 && (
           <div className="space-y-1 border-t border-border/40 pt-2">
-            {recent.map(suggestion => (
-              <div key={suggestion.finding_id} className="text-[10px] leading-snug">
-                <span className="text-text-secondary">{suggestion.title}</span>
-                <span className="text-text-muted"> — {suggestion.summary}</span>
-              </div>
-            ))}
+            <div className="text-[9px] uppercase tracking-wider text-text-muted">Recent ideas</div>
+            {recent.map(suggestion => {
+              const title = presentSuggestionText(suggestion.title, 'Improvement idea')
+              const summary = presentSuggestionText(suggestion.summary, '')
+              const hasTechnicalDetails = title.technical !== null || summary.technical !== null
+              return (
+                <div key={suggestion.finding_id} className="text-[10px] leading-snug">
+                  <span className="text-text-secondary">{title.display}</span>
+                  {summary.display && <span className="text-text-muted"> — {summary.display}</span>}
+                  {hasTechnicalDetails && (
+                    <details className="mt-0.5 text-[9px] text-text-muted">
+                      <summary className="cursor-pointer">Original technical note</summary>
+                      <div className="mt-0.5 whitespace-pre-wrap break-words">
+                        {title.technical && <div>Title: {title.technical}</div>}
+                        {summary.technical && <div>Summary: {summary.technical}</div>}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              )
+            })}
           </div>
         )}
 
         <p className="text-[9px] leading-snug text-text-muted border-t border-border/40 pt-2">
-          {status?.disclosure || "Only public catalog metadata is sent to DeepSeek through Nous. If DeepSeek's mechanical gate fails or its circuit opens, isolated GPT-5.6 Luna is the only fallback. Project names, prompts, jobs, media, and logs are never sent."}
+          {presentResearchDisclosure(status?.disclosure)}
         </p>
 
-        {(pollError || status?.runtime_error) && (
+        {researchError && (
           <div className="text-[10px] text-indicator-warning">
-            {pollError || status?.runtime_error}
+            <div>{researchError.summary}</div>
+            <details className="mt-1 text-[9px] text-text-muted">
+              <summary className="cursor-pointer">Technical details</summary>
+              <div className="mt-0.5 whitespace-pre-wrap break-words">{researchError.technical}</div>
+            </details>
           </div>
         )}
+
+        <p className="text-[9px] leading-snug text-text-muted">
+          Starting a code update can change Maestro&apos;s code and settings on this computer.
+        </p>
 
         <div className="flex gap-2">
           <button
@@ -998,14 +1098,18 @@ function ResearchCard() {
             disabled={busy || action !== null}
             className="flex-1 px-2 py-1.5 text-[10px] rounded border border-border text-text-secondary hover:text-text-primary hover:border-border-light disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {action === 'research' ? 'Starting…' : 'Run research now'}
+            {action === 'research' ? 'Starting…' : 'Check for ideas now'}
           </button>
           <button
-            onClick={startImplementation}
+            onClick={() => confirmImplementation ? void startImplementation() : setConfirmImplementation(true)}
             disabled={busy || eligible < 1 || action !== null}
-            className="flex-1 px-2 py-1.5 text-[10px] rounded border border-border text-text-secondary hover:text-text-primary hover:border-border-light disabled:opacity-50 disabled:cursor-not-allowed"
+            className={`flex-1 px-2 py-1.5 text-[10px] rounded border disabled:opacity-50 disabled:cursor-not-allowed ${
+              confirmImplementation
+                ? 'border-amber-500/60 bg-amber-500/10 text-indicator-warning hover:bg-amber-500/15'
+                : 'border-border text-text-secondary hover:text-text-primary hover:border-border-light'
+            }`}
           >
-            {action === 'implementation' ? 'Starting…' : 'Start implementation'}
+            {action === 'implementation' ? 'Starting…' : confirmImplementation ? 'Confirm code update' : 'Start code update'}
           </button>
         </div>
       </div>
@@ -1079,7 +1183,7 @@ export function SystemSettingsPanel() {
 
         <div>
           <SelectField
-            label="Transformer Quantization"
+            label="Model Precision"
             value={systemConfig.transformer_quantization}
             options={quantizationOptions}
             onChange={val => updateConfigWithAutoFlip({ transformer_quantization: val })}
@@ -1095,8 +1199,8 @@ export function SystemSettingsPanel() {
               feels like INT8 — must be broken." */}
           {systemConfig.transformer_quantization === 'fp8' && (
             <p className="text-[10px] text-indicator-warning mt-1">
-              ⚠ Many models ship only BF16 + INT8 files. FP8 silently falls back to INT8 for those.
-              For guaranteed FP8, pick a model with "FP8" in its name (e.g. "LTX-2.3 Distilled FP8 22B").
+              Some models do not include FP8 files, so Maestro will use INT8 for them instead.
+              To ensure FP8 is used, choose a model with “FP8” in its name, such as “LTX-2.3 Distilled FP8 22B.”
             </p>
           )}
         </div>
@@ -1109,7 +1213,7 @@ export function SystemSettingsPanel() {
         />
 
         <SelectField
-          label="Compile"
+          label="Model Compilation"
           value={systemConfig.compile}
           options={compileOptions}
           onChange={val => updateConfigWithAutoFlip({ compile: val })}
@@ -1120,7 +1224,7 @@ export function SystemSettingsPanel() {
 
       {/* Profiles */}
       <div className="space-y-4">
-        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Profiles</h3>
+        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Memory profiles</h3>
 
         <SelectField
           label="Video Profile"
@@ -1144,13 +1248,13 @@ export function SystemSettingsPanel() {
         />
 
         <p className="text-[10px] text-text-muted">
-          Profile changes take effect on next model load
+          Changes are used the next time a model loads.
         </p>
 
         {/* VRAM Safety Coefficient */}
         <div>
           <div className="flex items-center justify-between mb-1.5">
-            <label className="text-[11px] text-text-muted uppercase tracking-wider">VRAM Safety Coefficient</label>
+            <label className="text-[11px] text-text-muted uppercase tracking-wider">GPU memory limit</label>
             <span className="text-xs text-text-secondary">{(systemConfig.vram_safety_coefficient ?? 0.8).toFixed(2)}</span>
           </div>
           <input
@@ -1160,9 +1264,9 @@ export function SystemSettingsPanel() {
             className="w-full"
           />
           <div className="flex justify-between text-[8px] text-text-muted mt-0.5 px-0.5">
-            <span>0.50 (conservative)</span>
+            <span>0.50 (more free memory)</span>
             <span>0.80 (default)</span>
-            <span>0.95 (aggressive)</span>
+            <span>0.95 (use more memory)</span>
           </div>
           <p className="text-[10px] text-text-muted mt-1">
             {(() => {
@@ -1171,8 +1275,8 @@ export function SystemSettingsPanel() {
               // — the auto card populates the store on mount.
               const totalVram = systemDetect?.hardware?.gpu_vram_gb ?? 24
               const coef = systemConfig.vram_safety_coefficient ?? 0.8
-              return `Max VRAM target: ~${(totalVram * coef).toFixed(1)} GB of ${totalVram} GB.`
-            })()} Lower = more headroom for spikes (long videos, VAE decode). Takes effect on next model load.
+              return `Maestro may use about ${(totalVram * coef).toFixed(1)} GB of ${totalVram} GB of GPU memory.`
+            })()} A lower limit leaves more room for demanding steps, including long videos. Changes are used the next time a model loads.
           </p>
         </div>
       </div>
@@ -1194,8 +1298,8 @@ export function SystemSettingsPanel() {
         aria-controls="storage-manager-dialog"
       >
         <HardDrive size={13} className="text-accent-blue" />
-        <span className="flex-1 text-left">Storage Manager</span>
-        <span className="text-[10px] text-text-muted">usage, duplicates, cleanup</span>
+        <span className="flex-1 text-left">Manage storage</span>
+        <span className="text-[10px] text-text-muted">view space and remove extra files</span>
       </button>
 
       <hr className="border-border" />

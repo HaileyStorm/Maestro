@@ -205,15 +205,15 @@ export function RecipesOverlay() {
               </div>
               {machineControls && !civitaiKeySet && missing.loras.some(l => l.source_url) && (
                 <div className="mt-1.5 text-[10px] text-text-secondary leading-snug">
-                  Auto-download needs a free CivitAI API key.{' '}
+                  Automatic downloads from CivitAI require a free API key.{' '}
                   <button type="button" onClick={openCivitaiKeySettings} className="inline-flex min-h-11 items-center underline hover:text-text-primary md:min-h-0">Add one in Settings</button>
-                  {' '}— then click Download. Or use each “Open source” link to grab it manually.
+                  {' '}— then select Download. You can also use each “Open download link” to download it yourself.
                 </div>
               )}
               <div className="mt-1.5 text-[10px] text-text-secondary">
                 {machineControls
-                  ? 'The recipe is applied in Studio. Install the LoRA before you Generate.'
-                  : 'The recipe is applied in Studio, but this LoRA can only be installed by the Maestro host owner. Ask them to install it before you Generate.'}
+                  ? 'The recipe is ready in Studio. Download or install each LoRA before generating.'
+                  : 'The recipe is ready in Studio, but this session cannot install LoRAs. Ask someone with install access to add them before generating.'}
               </div>
             </div>
             <button type="button" onClick={() => { setMissing(null); closeOverlay() }}
@@ -349,15 +349,15 @@ function MissingLoraRow({ lora, modelType, civitaiKeySet, canInstall }: {
     }
   }
 
-  // The "Open source" link — always a valid fallback (opens the CivitAI page/
-  // file directly, no key needed to view it).
+  // Keep the recipe-provided source available when automatic download is
+  // unavailable or fails; imported recipes may use any source provider.
   const sourceLink = lora.source_url ? (
     <a href={lora.source_url} target="_blank" rel="noreferrer"
       className="flex min-h-11 shrink-0 items-center gap-0.5 text-accent-blue hover:text-accent-blue-hover md:min-h-0">
-      <ExternalLink size={10} /> Open source
+      <ExternalLink size={10} /> Open download link
     </a>
   ) : (
-    <span className="text-text-secondary shrink-0">install manually</span>
+    <span className="text-text-secondary shrink-0">No source link</span>
   )
 
   return (
@@ -367,7 +367,7 @@ function MissingLoraRow({ lora, modelType, civitaiKeySet, canInstall }: {
       {/* In-app auto-download needs a CivitAI key. With a key → offer Download;
           without → skip the button (it would just fail) and show the source
           link so the user can grab it manually. */}
-      {!canInstall && <span className="text-text-secondary shrink-0">host installation required</span>}
+      {!canInstall && <span className="text-text-secondary shrink-0">Install access required</span>}
       {canInstall && lora.source_url && civitaiKeySet && state === 'idle' && (
         <button type="button" onClick={handleDownload}
           className="flex min-h-11 shrink-0 items-center gap-0.5 text-accent-blue hover:text-accent-blue-hover md:min-h-0">
@@ -376,7 +376,7 @@ function MissingLoraRow({ lora, modelType, civitaiKeySet, canInstall }: {
       )}
       {canInstall && lora.source_url && !civitaiKeySet && state === 'idle' && sourceLink}
       {canInstall && state === 'downloading' && <Loader2 size={10} className="animate-spin text-indicator-warning shrink-0" />}
-      {canInstall && state === 'done' && <span className="text-indicator-success shrink-0">started ↓ (see download bar)</span>}
+      {canInstall && state === 'done' && <span className="text-indicator-success shrink-0">Download started — track it in the download bar</span>}
       {canInstall && state === 'error' && sourceLink}
       {canInstall && !lora.source_url && state === 'idle' && sourceLink}
     </div>

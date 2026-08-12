@@ -128,7 +128,7 @@ export function ModelSelector() {
       await loadModels()
     } catch (error) {
       setManualVerificationError(
-        error instanceof Error ? error.message : 'Manual checkpoint verification failed.',
+        error instanceof Error ? error.message : 'The model file could not be checked.',
       )
     } finally {
       setVerifyingManualCheckpoint(false)
@@ -185,14 +185,14 @@ export function ModelSelector() {
         <div key={requirement.term} role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
           <p>{requirement.notice}</p>
           <div className="mt-1 flex flex-wrap items-center gap-2">
-            <a href={requirement.license_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Review exact terms</a>
+            <a href={requirement.license_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Read model terms</a>
             <button
               type="button"
               disabled={hostTermsLoading || !hostTerms}
               onClick={() => { void acceptHostTerm(requirement.term) }}
               className="mobile-control-target rounded border border-amber-400/40 px-2 py-0.5 text-[9px] font-medium text-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40"
             >
-              Accept for this host
+              Accept for this Maestro installation
             </button>
           </div>
         </div>
@@ -206,25 +206,25 @@ export function ModelSelector() {
             <dl className="mb-1.5 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5">
               <dt className="text-amber-200">Filename</dt>
               <dd className="break-all font-mono select-all">{currentModel.manual_installation.filename}</dd>
-              <dt className="text-amber-200">Place in</dt>
+              <dt className="text-amber-200">Save to</dt>
               <dd className="break-all font-mono select-all">{manualInstallationDestination(currentModel.manual_installation)}</dd>
               <dt className="text-amber-200">Size</dt>
               <dd>{formatManualInstallationBytes(currentModel.manual_installation.size_bytes)}</dd>
-              <dt className="text-amber-200">SHA-256</dt>
+              <dt className="text-amber-200">File fingerprint (SHA-256)</dt>
               <dd className="break-all font-mono select-all">{currentModel.manual_installation.sha256}</dd>
             </dl>
           )}
           {currentModel.manual_installation && (
             <div className="mb-1 flex flex-wrap gap-2">
-              <a href={currentModel.manual_installation.source_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Open source page</a>
-              <a href={currentModel.manual_installation.download_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Open exact manual download</a>
+              <a href={currentModel.manual_installation.source_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">About this model</a>
+              <a href={currentModel.manual_installation.download_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Download the required file</a>
             </div>
           )}
           {currentModel.manual_checkpoint_verified ? (
-            <p>Exact local checkpoint verified for this host. Routine catalog polling does not re-hash it.</p>
+            <p>The computer running Maestro has verified the required model file. Maestro will not repeatedly check it during normal model updates.</p>
           ) : (
             <>
-              <p>Manual install required. Place the exact published checkpoint in the destination above, then verify its byte size and SHA-256 locally on the host. Maestro will not download this checkpoint.</p>
+              <p>Download the required model file yourself and save it in the folder above. Maestro will check its size and SHA-256 fingerprint on the computer where it runs; it will not download this file for you.</p>
               {manualVerificationPending && machineControls && (
                 <button
                   type="button"
@@ -233,14 +233,14 @@ export function ModelSelector() {
                   className="mobile-control-target mt-1 inline-flex items-center gap-1 rounded border border-amber-400/40 px-2 py-0.5 font-medium text-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40"
                 >
                   {verifyingManualCheckpoint ? <Loader2 size={9} className="animate-spin" /> : <HardDrive size={9} />}
-                  {verifyingManualCheckpoint ? 'Verifying local checkpoint…' : 'Verify local checkpoint'}
+                  {verifyingManualCheckpoint ? 'Checking model file…' : 'Check model file'}
                 </button>
               )}
               {manualVerificationPending && !machineControls && (
-                <p className="mt-1 text-amber-200">Local-only verification: open Maestro on the host machine and choose Verify local checkpoint.</p>
+                <p className="mt-1 text-amber-200">To check the file, open Maestro on the computer where it is installed and choose Check model file.</p>
               )}
               {!currentModel.manual_checkpoint_verification_required && (
-                <p className="mt-1 text-red-300">No supported exact verification contract is available for this recipe.</p>
+                <p className="mt-1 text-red-300">Maestro does not have the file details needed to verify this model.</p>
               )}
             </>
           )}
@@ -350,21 +350,21 @@ function ModelBadges({ model }: {
   model: { model_type: string; is_i2v: boolean; is_t2v: boolean; supports_end_frame?: boolean; supports_audio?: boolean; supports_audio_input?: boolean; generates_audio?: boolean; supports_ref_images?: boolean; downloadable?: boolean; manual_checkpoint_verified?: boolean }
 }) {
   const badges: Array<{ label: string; title?: string }> = []
-  if (model.model_type === 'minimax_h3_pinkcherry_fl2va') badges.push({ label: 'Explicit FL2VA' })
-  else if (model.model_type === 'minimax_h3_w4a8_fl2va') badges.push({ label: 'Experimental W4A8 FL2VA' })
-  else if (model.model_type === 'minimax_h3_ref2va') badges.push({ label: 'Non-distilled Ref2VA' })
-  else if (model.model_type.startsWith('minimax_h3')) badges.push({ label: 'Non-distilled FL2VA' })
-  if (model.is_i2v && model.supports_end_frame) badges.push({ label: 'S/E Frame', title: 'Supports start and end frame guidance' })
-  else if (model.is_i2v) badges.push({ label: 'I2V', title: 'Supports image-to-video generation' })
-  if (model.generates_audio) badges.push({ label: 'Audio Out', title: 'Generates native audio with video' })
-  if (model.supports_audio_input) badges.push({ label: 'Audio In', title: 'Accepts audio conditioning' })
+  if (model.model_type === 'minimax_h3_pinkcherry_fl2va') badges.push({ label: 'Explicit' })
+  else if (model.model_type === 'minimax_h3_w4a8_fl2va') badges.push({ label: 'Experimental' })
+  else if (model.model_type === 'minimax_h3_ref2va') badges.push({ label: 'Reference media' })
+  else if (model.model_type.startsWith('minimax_h3')) badges.push({ label: 'H3' })
+  if (model.is_i2v && model.supports_end_frame) badges.push({ label: 'Start + end', title: 'Uses start and end images to guide the video' })
+  else if (model.is_i2v) badges.push({ label: 'Image to video', title: 'Creates video from an image' })
+  if (model.generates_audio) badges.push({ label: 'Makes audio', title: 'Creates audio with the video' })
+  if (model.supports_audio_input) badges.push({ label: 'Uses audio', title: 'Can follow an audio reference' })
   if (model.supports_audio && !model.generates_audio && !model.supports_audio_input) badges.push({ label: 'Audio' })
-  if (model.supports_ref_images) badges.push({ label: 'Refs', title: 'Supports reference images' })
+  if (model.supports_ref_images) badges.push({ label: 'Reference images', title: 'Can follow reference images' })
   if (model.downloadable === false) badges.push({
-    label: model.manual_checkpoint_verified ? 'Manual · verified' : 'Manual install',
+    label: model.manual_checkpoint_verified ? 'File checked' : 'File needed',
     title: model.manual_checkpoint_verified
-      ? 'The exact local checkpoint was verified on this host'
-      : 'Install and verify the exact checkpoint locally; Maestro will not download it',
+      ? 'The required model file was checked on the computer running Maestro'
+      : 'Download and check the required model file on the computer running Maestro; Maestro will not download it',
   })
   if (badges.length === 0) return null
   return (

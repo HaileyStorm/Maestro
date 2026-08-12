@@ -1197,7 +1197,13 @@ test('gallery privacy, revocation, and virtualization contracts are wired withou
   assert.match(main, /aria-pressed=\{privatePreviewActionPressed\}/)
   assert.match(main, /min-h-11[^"]*md:min-h-0/)
   assert.doesNotMatch(main, /min-h-11[^"]*sm:min-h-0/)
-  assert.match(main, /Browser-session preview only; project access unchanged\./)
+  assert.match(main, /This only changes previews in this browser\. Project access does not change\./)
+  assert.match(main, /> Move selected/)
+  assert.match(main, /Finished outputs bring their related parts, generation steps, and temporary files\./)
+  assert.match(main, /revoke their existing share links\. This does not change who can open the project\./)
+  assert.match(main, /Delete the selected outputs\. For each finished output, also delete its related parts, generation steps, and temporary files\./)
+  assert.match(main, /aria-label="Close selection tools"/)
+  assert.doesNotMatch(main, /Move lineage|sidecar-linked/)
   assert.match(main, /activeWorkspace && !browsingUploads/)
   assert.match(main, /Map<string, \{ height: number; epoch: number \}>/)
   assert.match(main, /measurement\?\.epoch === measurementEpoch/)
@@ -1250,6 +1256,8 @@ test('gallery privacy, revocation, and virtualization contracts are wired withou
   assert.match(item, /event\.key !== 'Enter' && event\.key !== ' '/)
   assert.match(item, /aria-label=\{`Reveal blurred preview for \$\{file\.name\}`\}/)
   assert.match(item, /aria-label=\{`Blur preview for \$\{file\.name\}`\}/)
+  assert.match(item, /Delete related parts, generation steps, and temporary files while keeping this finished output/)
+  assert.match(item, /permanently delete this output and \$\{file\.linked_component_count\} related files/)
   assert.doesNotMatch(item, /Re-blur/)
 
   assert.match(thumbnails, /const privateBlurred = file\.private && !privateRevealed/)
@@ -1334,8 +1342,8 @@ test('gallery uses compact composable media and artifact facets', async () => {
 
   assert.match(filters, /aria-controls="gallery-filter-popover"/)
   assert.match(filters, /aria-labelledby="gallery-filter-title"/)
-  assert.match(filters, /Media, artifact, and metadata selections all combine\./)
-  for (const label of ['All', 'Images', 'Videos', 'Audio', 'Finals', 'Components', 'Windows', 'Temporary']) {
+  assert.match(filters, /All selected filters are applied together\./)
+  for (const label of ['All', 'Images', 'Videos', 'Audio', 'Finished', 'All files', 'Parts', 'Generation steps', 'Temporary files']) {
     assert.match(filters, new RegExp(`label: '${label}'`))
   }
   assert.doesNotMatch(filters, /ResizeObserver|overflow-x-auto/)

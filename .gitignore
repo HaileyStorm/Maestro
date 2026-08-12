@@ -117,3 +117,6 @@ app/services/blender_mcp/
 app/services/sol_attn_kijai/
 app/services/sageattention_thu_ml/
 app/services/comfy_kitchen_w4a8/
+
+# bv (beads viewer) local config and caches
+.bv/

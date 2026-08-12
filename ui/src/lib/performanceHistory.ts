@@ -111,15 +111,15 @@ function estimatedPoint(
     uncertainty: { low, high, unit: 'inverse_step_work_x' },
     provenance: {
       kind: 'estimated_backfill',
-      sourceTitle: `Maestro ${release} release evidence`,
+      sourceTitle: `Maestro ${release} release notes`,
       sourceUrl: `${maestroSource}/commit/${sourceCommit}`,
       sourceDate: date,
-      method: 'Conservative inverse step-count proxy; its ideal ratio is discounted to illustrate sensitivity to fixed setup, encoding, decoding, and offload overhead.',
+      method: 'Estimate based on documented step counts. The ideal step-count ratio is reduced to allow for setup, encoding, decoding, memory, and offloading work.',
       confidence: 'low',
-      hardware: '4090-class reference host; no machine measurement asserted',
-      cohort: 'MiniMax H3 FL2VA, single native shot, 480p-class output',
+      hardware: 'Example 4090-class system; no generation time was measured',
+      cohort: 'MiniMax H3 FL2VA, one native shot, approximately 480p',
       profile,
-      comparability: 'Comparable only as an inverse documented-step index after the disclosed profile changes. It is not a measured generation rate or an end-to-end latency claim.',
+      comparability: 'Use this only to compare the documented presets shown here. It is not a measured generation speed or total generation time.',
       basis,
     },
   }
@@ -130,21 +130,21 @@ const turboCommit = '8a662b5b2d3a40b95d3d8edefaae44acc54b7fb7'
 const managedCommit = 'd500f58e0c2be948800c757fd106c5254c70b605'
 const continuumCommit = 'bead30709e0136e6087f1fff71cf871eef6385b6'
 
-const nativeBasis = 'The v1.5.5 release documents native H3 generation; the 20-step native profile is the 1.0x reference.'
-const turboBasis = 'The v1.6.1 release documents an experimental six-step Turbo surface versus the 20-step native reference.'
+const nativeBasis = 'Maestro v1.5.5 documents native H3 generation. Its 20-step preset is the 1× starting point.'
+const turboBasis = 'Maestro v1.6.1 adds an experimental six-step Turbo preset alongside the 20-step native preset.'
 
 export const PERFORMANCE_TREND_SERIES = [
   {
     id: 'iteration',
-    label: 'Lowest-step documented path',
+    label: 'Fewest documented steps',
     marker: 'triangle',
     dash: '2 3',
-    description: 'The lowest documented denoising-step path available at each release; profile names and resolutions change.',
+    description: 'The preset with the fewest documented denoising steps in each release. Preset names and resolutions change over time.',
     points: [
       estimatedPoint('iteration-155', 'iteration', '2026-08-04', 'v1.5.5', 1, 0.65, 1.2, nativeCommit, 'Native 20-step reference', nativeBasis),
       estimatedPoint('iteration-161', 'iteration', '2026-08-06', 'v1.6.1', 2.2, 1.4, 3.3, turboCommit, 'Experimental six-step Turbo', turboBasis),
-      estimatedPoint('iteration-165', 'iteration', '2026-08-08', 'v1.6.5', 2.2, 1.4, 3.3, managedCommit, 'Managed six-step Turbo', 'The exact v1.6.5 release documents a managed six-step preset; no later named profile is backdated into this point.'),
-      estimatedPoint('iteration-030', 'iteration', '2026-08-10', 'Continuum v0.3', 3, 1.8, 5, continuumCommit, 'Managed Draft, four-step Turbo at 608×352', 'The Continuum v0.3 commit introduces the named four-step Draft bundle; the upper bound is the undiluted 20/4 step ratio.'),
+      estimatedPoint('iteration-165', 'iteration', '2026-08-08', 'v1.6.5', 2.2, 1.4, 3.3, managedCommit, 'Managed six-step Turbo', 'Maestro v1.6.5 documents a managed six-step preset. Presets introduced in later releases are not applied to this date.'),
+      estimatedPoint('iteration-030', 'iteration', '2026-08-10', 'Continuum v0.3', 3, 1.8, 5, continuumCommit, 'Managed Draft, four-step Turbo at 608×352', 'Continuum v0.3 introduces the four-step Draft preset. Its upper estimate is the simple 20-step to four-step ratio.'),
     ],
   },
   {
@@ -152,12 +152,12 @@ export const PERFORMANCE_TREND_SERIES = [
     label: 'Native 20-step reference',
     marker: 'circle',
     dash: '1 0',
-    description: 'The stable 20-step native reference line.',
+    description: 'The native 20-step preset, kept as a consistent point of comparison.',
     points: [
       estimatedPoint('quality-155', 'quality', '2026-08-04', 'v1.5.5', 1, 0.85, 1.15, nativeCommit, 'Native 20-step path', nativeBasis),
       estimatedPoint('quality-161', 'quality', '2026-08-06', 'v1.6.1', 1, 0.85, 1.15, turboCommit, 'Native 20-step path', 'The optional Turbo surface did not replace the native 20-step path.'),
-      estimatedPoint('quality-165', 'quality', '2026-08-08', 'v1.6.5', 1, 0.85, 1.15, managedCommit, 'Native 20-step path', 'The exact v1.6.5 source retains a 20-step native default; the later named Quality bundle is not backdated.'),
-      estimatedPoint('quality-030', 'quality', '2026-08-10', 'Continuum v0.3', 1, 0.85, 1.15, continuumCommit, 'Managed Quality, 20 steps at 960×544', 'The Continuum v0.3 commit introduces the named 20-step Quality bundle; this line tracks denoising work only.'),
+      estimatedPoint('quality-165', 'quality', '2026-08-08', 'v1.6.5', 1, 0.85, 1.15, managedCommit, 'Native 20-step path', 'Maestro v1.6.5 keeps the 20-step native default. The Quality preset introduced later is not applied to this date.'),
+      estimatedPoint('quality-030', 'quality', '2026-08-10', 'Continuum v0.3', 1, 0.85, 1.15, continuumCommit, 'Managed Quality, 20 steps at 960×544', 'Continuum v0.3 introduces the 20-step Quality preset. This line compares step counts only.'),
     ],
   },
 ] as const satisfies readonly PerformanceTrendSeries[]
@@ -176,12 +176,12 @@ export const PUBLISHED_PERFORMANCE_REFERENCES = [
       sourceTitle: 'LTX-Video: Realtime Video Latent Diffusion',
       sourceUrl: 'https://arxiv.org/abs/2501.00103',
       sourceDate: '2024-12-30',
-      method: 'Official paper result retained without normalization as a context-only absolute latency.',
+      method: 'Reported in the official paper and shown as published, without converting it to Maestro settings.',
       confidence: 'high',
       hardware: 'NVIDIA H100',
       cohort: 'LTX-Video paper configuration, approximately 2B parameters before distillation',
       profile: '121 frames, 20 diffusion steps, 768×512, 24 fps, five-second output',
-      comparability: 'Different model, accelerator class, runtime, and output contract; not plotted on the Maestro axis.',
+      comparability: 'It uses a different model, GPU, software, and output setup, so it is shown separately from the Maestro estimates.',
       publishedMetric: 'Two seconds wall time for five seconds of output.',
     },
   },
@@ -198,12 +198,12 @@ export const PUBLISHED_PERFORMANCE_REFERENCES = [
       sourceTitle: 'Official Wan2.1 repository',
       sourceUrl: 'https://github.com/Wan-Video/Wan2.1/tree/9737cba9c1c3c4d04b33fcad41c111989865d315',
       sourceDate: '2025-02',
-      method: 'Official repository headline result; retained without applying quantization or another optimization.',
+      method: 'Reported in the official repository and shown as published, without adding optimizations such as quantization.',
       confidence: 'medium',
       hardware: 'NVIDIA RTX 4090',
       cohort: 'Wan2.1 T2V 1.3B',
       profile: 'Five-second 480p output, without optimization techniques such as quantization',
-      comparability: 'Different model and runtime; retained as a hollow context marker, not a connected line.',
+      comparability: 'It uses a different model and software setup, so it is shown separately from the Maestro estimates.',
       publishedMetric: 'Approximately four minutes wall time.',
     },
   },
@@ -212,7 +212,7 @@ export const PUBLISHED_PERFORMANCE_REFERENCES = [
     label: 'MiniMax Hailuo 02',
     date: '2025-06-18',
     datePrecision: 'day',
-    displayMetric: '2.5× architecture efficiency claim; no absolute latency',
+    displayMetric: '2.5× efficiency claim; no generation time given',
     marker: 'triangle',
     chartComparable: false,
     provenance: {
@@ -220,14 +220,14 @@ export const PUBLISHED_PERFORMANCE_REFERENCES = [
       sourceTitle: 'MiniMax Hailuo 02 launch note',
       sourceUrl: 'https://www.minimax.io/news/minimax-hailuo-02',
       sourceDate: '2025-06-18',
-      method: 'The source\'s relative architecture claim about training and inference efficiency is retained as context only; no aggregate metric is inferred.',
+      method: 'The source reports a 2.5× improvement in training and inference efficiency. No generation time is calculated from that claim.',
       confidence: 'low',
       hardware: 'Not disclosed for the claim',
-      cohort: 'Hailuo 02 architecture versus a prior comparable parameter scale',
-      profile: 'Relative architecture claim; product modes are 768p/6s, 768p/10s, and 1080p/6s',
-      comparability: 'No absolute time or matching hardware; excluded from both axes and all Maestro calculations.',
+      cohort: 'Hailuo 02 compared with an earlier model of a similar size',
+      profile: 'Published efficiency claim; product modes are 768p/6s, 768p/10s, and 1080p/6s',
+      comparability: 'The source gives no generation time or matching hardware, so this result is not included in the chart calculations.',
       publishedMetric: '2.5× training and inference efficiency at comparable parameter scale.',
-      adaptation: 'Shown as a relative-only annotation; it is not converted into wall time or a local generation rate.',
+      adaptation: 'Shown only as a published comparison. It is not converted into generation time or local speed.',
     },
   },
   {
@@ -243,19 +243,19 @@ export const PUBLISHED_PERFORMANCE_REFERENCES = [
       sourceTitle: 'Official HunyuanVideo-1.5 repository',
       sourceUrl: 'https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5/tree/60783e704160023913bee78f0b47036d393d4dfa',
       sourceDate: '2025-12-05',
-      method: 'Official step-distilled headline retained without inferring an unstated output duration.',
+      method: 'Reported in the official repository. The output duration is not stated, so none is assumed here.',
       confidence: 'medium',
       hardware: 'NVIDIA RTX 4090',
-      cohort: 'HunyuanVideo-1.5 480p I2V step-distilled',
+      cohort: 'HunyuanVideo-1.5 480p image-to-video, step-distilled model',
       profile: 'Eight or twelve inference steps; output duration not stated in the headline',
-      comparability: 'Duration and runtime differ or are incomplete; not plotted on the Maestro axis.',
+      comparability: 'The output duration and software setup differ or are incomplete, so this result is shown separately from the Maestro estimates.',
       publishedMetric: 'Within 75 seconds; end-to-end generation time reduced by 75% versus the original model.',
     },
   },
 ] as const satisfies readonly PublishedPerformanceReference[]
 
 export const PERFORMANCE_HISTORY_PRIVACY_NOTE =
-  'This bundled view contains release metadata and public claims only. It does not read prompts, projects, jobs, paths, seeds, devices, sessions, accounts, or runtime records.'
+  'This chart uses Maestro release information and public sources only. It does not access prompts, projects, jobs, file paths, seeds, devices, sessions, accounts, or live usage data.'
 
 function validateProvenance(provenance: PerformanceProvenance): void {
   const common = [

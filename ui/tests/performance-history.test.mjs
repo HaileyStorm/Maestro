@@ -24,7 +24,7 @@ async function renderHistoryChart() {
     root: fileURLToPath(new URL('../', import.meta.url)),
     appType: 'custom',
     logLevel: 'silent',
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, watch: { ignored: ['**/*'] } },
   })
   try {
     const { PerformanceHistoryChart } = await server.ssrLoadModule('/src/components/PerformanceHistoryChart.tsx')
@@ -47,7 +47,7 @@ test('performance history schema is complete, ordered, and bounded', () => {
   ])
   assert.deepEqual(PERFORMANCE_TREND_SERIES[0].points.map(point => point.value), [1, 2.2, 2.2, 3])
   assert.deepEqual(PERFORMANCE_TREND_SERIES[1].points.map(point => point.value), [1, 1, 1, 1])
-  assert.match(PERFORMANCE_TREND_SERIES[0].points[2].provenance.basis, /no later named profile is backdated/)
+  assert.match(PERFORMANCE_TREND_SERIES[0].points[2].provenance.basis, /Presets introduced in later releases are not applied/)
 
   for (const series of PERFORMANCE_TREND_SERIES) {
     const dates = series.points.map(point => point.date)
@@ -59,8 +59,8 @@ test('performance history schema is complete, ordered, and bounded', () => {
       assert.equal(point.provenance.confidence, 'low')
       assert.ok(point.uncertainty.low <= point.value)
       assert.ok(point.uncertainty.high >= point.value)
-      assert.match(point.provenance.method, /inverse step-count proxy/i)
-      assert.match(point.provenance.comparability, /inverse documented-step index/i)
+      assert.match(point.provenance.method, /documented step counts/i)
+      assert.match(point.provenance.comparability, /not a measured generation speed or total generation time/i)
     }
   }
 })
@@ -140,7 +140,7 @@ test('published references are primary-source context and never comparable chart
   ])
   assert.equal(PUBLISHED_PERFORMANCE_REFERENCES.every(reference => reference.chartComparable === false), true)
   assert.equal(PUBLISHED_PERFORMANCE_REFERENCES.every(reference => reference.provenance.sourceUrl.startsWith('https://')), true)
-  assert.equal(PUBLISHED_PERFORMANCE_REFERENCES.every(reference => /not plotted|excluded|hollow context marker/.test(reference.provenance.comparability)), true)
+  assert.equal(PUBLISHED_PERFORMANCE_REFERENCES.every(reference => /shown separately|not included in the chart calculations/.test(reference.provenance.comparability)), true)
   assert.equal(PUBLISHED_PERFORMANCE_REFERENCES.some(reference => reference.provenance.kind === 'adapted_published'), true)
   assert.deepEqual(PUBLISHED_PERFORMANCE_REFERENCES.map(reference => new URL(reference.provenance.sourceUrl).hostname), [
     'arxiv.org',
@@ -157,9 +157,9 @@ test('published references are primary-source context and never comparable chart
   assert.match(wan.provenance.sourceUrl, /\/tree\/[0-9a-f]{40}$/)
   const hailuo = PUBLISHED_PERFORMANCE_REFERENCES.find(reference => reference.id === 'hailuo02-efficiency')
   assert.match(hailuo.provenance.publishedMetric, /2\.5× training and inference efficiency/)
-  assert.match(hailuo.provenance.adaptation, /not converted into wall time or a local generation rate/)
+  assert.match(hailuo.provenance.adaptation, /not converted into generation time or local speed/)
   const hunyuan = PUBLISHED_PERFORMANCE_REFERENCES.find(reference => reference.id === 'hunyuan15-4090')
-  assert.match(hunyuan.provenance.method, /without inferring an unstated output duration/)
+  assert.match(hunyuan.provenance.method, /output duration is not stated, so none is assumed/)
   assert.match(hunyuan.provenance.publishedMetric, /generation time reduced by 75%/)
   assert.match(hunyuan.provenance.sourceUrl, /\/tree\/[0-9a-f]{40}$/)
 })
@@ -168,7 +168,7 @@ test('bundled history contains no private runtime or local-machine data', () => 
   const serialized = JSON.stringify({ PERFORMANCE_TREND_SERIES, PUBLISHED_PERFORMANCE_REFERENCES })
   assert.doesNotMatch(serialized, /(?:[A-Z]:\\|\/(?:home|media|Users)\/)/)
   assert.doesNotMatch(serialized, /"(?:prompt|project|job|seed|user|session|account)(?:s|Id|_id)?"\s*:/i)
-  assert.match(PERFORMANCE_HISTORY_PRIVACY_NOTE, /does not read prompts, projects, jobs, paths, seeds, devices, sessions, accounts, or runtime records/)
+  assert.match(PERFORMANCE_HISTORY_PRIVACY_NOTE, /does not access prompts, projects, jobs, file paths, seeds, devices, sessions, accounts, or live usage data/)
 })
 
 test('chart is accessible without color, hover, animation, or SVG-only disclosure', () => {
@@ -182,12 +182,12 @@ test('chart is accessible without color, hover, animation, or SVG-only disclosur
   assert.match(componentSource, /<table/)
   assert.match(componentSource, /<caption/)
   assert.match(componentSource, /<th scope="row"/)
-  assert.match(componentSource, /Data, uncertainty, and sources/)
+  assert.match(componentSource, /Details and sources/)
   assert.match(componentSource, /target="_blank" rel="noreferrer"/)
   assert.doesNotMatch(componentSource, /onMouseEnter|onMouseMove|requestAnimationFrame|animate-/)
 })
 
-test('server-rendered chart exposes every evidence row, source link, row header, and keyboard scroll region', async () => {
+test('server-rendered chart exposes every data row and makes its estimated step-count reduction direction explicit', async () => {
   const markup = await renderHistoryChart()
   const evidenceRows = PERFORMANCE_TREND_SERIES.reduce((count, series) => count + series.points.length, 0)
     + PUBLISHED_PERFORMANCE_REFERENCES.length
@@ -196,7 +196,19 @@ test('server-rendered chart exposes every evidence row, source link, row header,
   assert.equal(markup.match(/scope="row"/g)?.length, evidenceRows)
   assert.equal(markup.match(/role="region"/g)?.length, 2)
   assert.equal(markup.match(/tabindex="0"/g)?.length, 2)
-  assert.match(markup, /Sensitivity basis:/)
+  assert.match(markup, /How generation settings have changed/)
+  assert.match(markup, /<h3[^>]*>Estimated relative denoising step-count reduction<\/h3>/)
+  assert.match(markup, /higher values mean a larger estimated step-count reduction factor/)
+  assert.match(markup, /therefore fewer documented steps/)
+  assert.match(markup, /<title id="[^"]+">Estimated relative H3 denoising step-count reduction by Maestro release; higher values mean fewer documented steps<\/title>/)
+  assert.match(markup, /<desc id="[^"]+">[\s\S]*Higher values indicate fewer documented steps\.[\s\S]*do not measure wall-clock generation speed or elapsed time\.[\s\S]*<\/desc>/)
+  assert.match(markup, /<text[^>]*transform="rotate\(-90 16 124\)"[^>]*>\s*relative reduction \(higher = fewer steps\)\s*<\/text>/)
+  assert.match(markup, /<ul[^>]*aria-label="Relative denoising step-count reduction trend legend"/)
+  assert.match(markup, /<caption[^>]*>\s*The connected lines are relative denoising step-count reduction estimates\./)
+  assert.match(markup, /Published measurement/)
+  assert.match(markup, /Published comparison/)
+  assert.match(markup, /Why this value:/)
+  assert.doesNotMatch(markup, /Estimated generation work over time|Estimated H3 generation work|denoising-work chart|evidence ledger|estimated backfill|measured_published|adapted_published|sensitivity basis/i)
 })
 
 test('performance disclosure remains usable at 320, 390, 768, and desktop widths', () => {
@@ -209,8 +221,8 @@ test('performance disclosure remains usable at 320, 390, 768, and desktop widths
   assert.match(componentSource, /overflow-x-auto overscroll-x-contain/)
   assert.equal(componentSource.match(/role="region"/g)?.length, 2)
   assert.equal(componentSource.match(/tabIndex=\{0\}/g)?.length, 2)
-  assert.match(componentSource, /aria-label="Scrollable H3 denoising-work chart"/)
-  assert.match(componentSource, /aria-label="Scrollable generation-work evidence table"/)
+  assert.match(componentSource, /aria-label="Scrollable estimated relative H3 step-count-reduction chart"/)
+  assert.match(componentSource, /aria-label="Scrollable generation estimate details table"/)
   assert.match(componentSource, /motion-reduce:transition-none/)
 
   const chartMinWidth = 34 * 16
@@ -235,7 +247,7 @@ test("what's-new dialog mounts exactly one restrained performance view", () => {
   assert.doesNotMatch(dialogSource, /https?:\/\//i)
   const whyIndex = dialogSource.indexOf('Why Continuum')
   const evidenceIndex = dialogSource.indexOf('<PerformanceHistoryChart />')
-  const archiveIndex = dialogSource.indexOf('All release history')
+  const archiveIndex = dialogSource.indexOf('Earlier releases')
   assert.ok(whyIndex < evidenceIndex && evidenceIndex < archiveIndex)
   assert.doesNotMatch(`${componentSource}\n${dataSource}`, /useStore|fetch\s*\(|\/api\/v1\//)
 })

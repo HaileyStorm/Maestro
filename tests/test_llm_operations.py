@@ -778,7 +778,7 @@ class PrepareRouteScopeTests(unittest.IsolatedAsyncioTestCase):
             "_request_project_workspace": (
                 lambda _request, workspace: workspace
             ),
-            "_require_project_access": lambda *_args: None,
+            "_require_project_access": lambda *_args, **_kwargs: None,
             "_llm_operation_scope": (
                 lambda _request, workspace: ("owner", workspace)
             ),

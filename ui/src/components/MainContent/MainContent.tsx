@@ -6,8 +6,9 @@ import { MediaFeedItem } from './MediaFeedItem'
 import { LlmChat } from '../LlmChat'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
 import { useStore } from '../../stores/useStore'
-import type { GenerationJob } from '../../types'
+import type { GenerationJob, ModelDef } from '../../types'
 import * as api from '../../api/client'
+import { modelDisplayName } from '../../lib/modelDisplay'
 import {
   privatePreviewIdentity,
   privatePreviewWorkspaceHasRevealed,
@@ -21,8 +22,91 @@ import { isActiveLogicalQueueJob, projectLogicalQueue } from '../../lib/queuePro
 
 const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
-const RESOURCE_WAIT_TITLE = 'This job is durably queued and will start when the generation lane is available.'
-const CPU_RESTART_WARNING = 'CPU text is slower and may be discarded and restarted with acceleration only when that is predicted to deliver sooner.'
+const RESOURCE_WAIT_TITLE = 'This generation is still in the queue. It will start when enough GPU resources are available, without interrupting a generation already running.'
+const CPU_RESTART_WARNING = 'This text task is running on the CPU, so it may be slower. Maestro will restart it with GPU acceleration only if starting over is expected to finish sooner.'
+
+type ProjectPermission =
+  | 'project.open'
+  | 'project.read'
+  | 'project.mutate'
+  | 'project.generate'
+  | 'project.lifecycle'
+  | 'project.delete'
+
+// A missing projection is the pre-cutover compatibility shape. Once the
+// backend projects permissions, those exact values are the only UI authority.
+function workspaceAllowsPermission(
+  workspace: api.Workspace | undefined,
+  permission: ProjectPermission,
+): boolean {
+  if (!workspace) return false
+  return workspace.project_permissions === undefined
+    ? true
+    : workspace.project_permissions.includes(permission)
+}
+
+// Exported for executable role-projection regression coverage.
+// eslint-disable-next-line react-refresh/only-export-components
+export function projectActionVisibility(workspace: api.Workspace | undefined) {
+  return {
+    mutate: workspaceAllowsPermission(workspace, 'project.mutate'),
+    generate: workspaceAllowsPermission(workspace, 'project.generate'),
+    lifecycle: workspaceAllowsPermission(workspace, 'project.lifecycle'),
+    delete: workspaceAllowsPermission(workspace, 'project.delete'),
+  }
+}
+
+const H3_MODEL_FALLBACK_LABELS: Readonly<Record<string, string>> = {
+  minimax_h3: 'FL2VA video model',
+  minimax_h3_pinkcherry_fl2va: 'PinkCherry FL2VA video model',
+  minimax_h3_w4a8_fl2va: 'Kijai W4A8 FL2VA video model',
+  minimax_h3_ref2va: 'Ref2VA video model',
+}
+
+const H3_BOUNDARY_LABELS: Readonly<Record<string, string>> = {
+  continuous: 'Continuous motion',
+  precut: 'Continue into cut',
+  cut: 'Hard camera or scene cut',
+  transition: 'Smooth transition',
+}
+
+const JOB_STATUS_LABELS: Readonly<Record<string, string>> = {
+  preparing: 'Preparing',
+  waiting_for_plan_approval: 'Waiting for plan review',
+  queued: 'Queued',
+  running: 'Running',
+  completed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+  held: 'Held',
+  blocked: 'Needs attention',
+  interrupted: 'Interrupted',
+  restored: 'Restored',
+  retrying: 'Retrying',
+}
+
+function visibleModelName(modelType: string | null | undefined, models: ModelDef[]): string {
+  if (!modelType) return ''
+  const catalogName = modelDisplayName(modelType, models)
+  if (catalogName && catalogName !== modelType) return catalogName
+  return H3_MODEL_FALLBACK_LABELS[modelType] || 'Model details unavailable'
+}
+
+function h3SegmentPurpose(modelType: string | null | undefined): string {
+  if (modelType === 'minimax_h3_ref2va') return 'Uses reference images and recent motion'
+  if (modelType?.startsWith('minimax_h3')) return 'Follows this segment’s frame anchors'
+  return 'Selection details unavailable'
+}
+
+function visibleBoundaryName(boundary: string | null | undefined): string {
+  if (!boundary) return 'Start'
+  return H3_BOUNDARY_LABELS[boundary] || 'Boundary details unavailable'
+}
+
+function visibleJobStatus(status: string | null | undefined): string {
+  if (!status) return 'Status update'
+  return JOB_STATUS_LABELS[status] || 'Status update'
+}
 
 const MAIN_VIEWS = ['gallery', 'queue', 'chat'] as const
 type MainView = typeof MAIN_VIEWS[number]
@@ -229,65 +313,65 @@ function describeResourceExecution(
 
   if (descriptor.intent === 'generation') {
     const label = descriptor.state === 'queued'
-      ? 'GPU generation queued'
+      ? 'Generation queued'
       : descriptor.state === 'admitted'
-        ? 'Starting GPU generation'
+        ? 'Starting generation'
         : descriptor.state === 'blocked'
-          ? 'GPU generation waiting'
+          ? 'Generation waiting'
           : descriptor.state === 'released'
-            ? 'Generation resources released'
-            : 'GPU generation'
+            ? 'Generation no longer using the GPU'
+            : 'Generation using the GPU'
     return {
       label,
       title: descriptor.state === 'blocked'
-        ? 'Standard GPU generation is waiting for compatible generation resources.'
-        : 'Standard generation uses the GPU generation lane.',
+        ? 'This generation is waiting for enough compatible GPU resources.'
+        : 'This generation is using the GPU.',
       tone: descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'accelerated',
     }
   }
 
   if (descriptor.state === 'preemption_requested') {
     return {
-      label: 'Acceleration restart requested',
-      title: 'Acceleration is predicted to deliver sooner. CPU text will be discarded and restarted from zero; its progress will not carry over.',
-      warning: 'Acceleration is predicted to deliver sooner; CPU progress will be discarded before restart.',
+      label: 'Faster restart requested',
+      title: 'GPU acceleration may finish sooner. If Maestro can make the switch, this CPU text task will restart from the beginning and its current progress will not carry over.',
+      warning: 'If the switch proceeds, this CPU text task will restart from the beginning with GPU acceleration.',
       tone: 'transition',
     }
   }
   if (descriptor.state === 'resources_releasing') {
     return {
-      label: 'Releasing CPU resources',
-      title: 'CPU text has stopped and its progress is discarded. Maestro is confirming the resources are released before restarting.',
-      warning: 'CPU progress is discarded; waiting for resources to be fully released.',
+      label: 'Preparing to restart faster',
+      title: 'The CPU text task has stopped. Maestro is waiting for it to close fully before restarting with GPU acceleration.',
+      warning: 'The CPU progress was discarded; the task will restart from the beginning.',
       tone: 'transition',
     }
   }
   if (descriptor.state === 'restarting_on_accelerator') {
     return {
-      label: 'Restarting with acceleration',
-      title: 'CPU progress was discarded. This text step is restarting from zero with acceleration; ETA remains unknown until measured.',
-      warning: 'Restarting from zero with acceleration; ETA remains unknown until measured.',
+      label: 'Restarting with GPU acceleration',
+      title: 'This text task is restarting from the beginning with GPU acceleration. An ETA will appear after it starts.',
+      warning: 'Restarting from the beginning; the ETA is not known yet.',
       tone: 'transition',
     }
   }
 
   if (descriptor.execution === 'cpu') {
     const label = descriptor.state === 'queued'
-      ? 'CPU-only text queued'
+      ? 'Text queued for CPU'
       : descriptor.state === 'admitted'
-        ? 'Starting CPU-only text'
+        ? 'Starting text on CPU'
         : descriptor.state === 'blocked'
-          ? 'CPU text waiting'
+          ? 'Text waiting for CPU'
           : descriptor.state === 'released'
-            ? 'CPU resources released'
-            : 'CPU-only text · slower'
+            ? 'Text task no longer using CPU'
+            : 'Text using CPU · slower'
     return {
       label,
       title: descriptor.preemptible
         ? CPU_RESTART_WARNING
-        : 'This text step is using CPU-only execution, which is slower than acceleration.',
+        : 'This text task is using the CPU, which is usually slower than GPU acceleration.',
       ...(descriptor.preemptible ? {
-        warning: 'Slower CPU work may be discarded and restarted only when acceleration is predicted to deliver sooner.',
+        warning: 'Maestro may restart this task from the beginning with GPU acceleration, but only when that is expected to finish sooner.',
       } : {}),
       tone: descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'cpu',
     }
@@ -295,15 +379,15 @@ function describeResourceExecution(
 
   return {
     label: descriptor.state === 'queued'
-      ? 'GPU text queued'
+      ? 'Accelerated text queued'
       : descriptor.state === 'admitted'
-        ? 'Starting GPU text'
+        ? 'Starting accelerated text'
         : descriptor.state === 'blocked'
-          ? 'GPU text waiting'
+          ? 'Accelerated text waiting'
           : descriptor.state === 'released'
-            ? 'Text resources released'
-            : 'GPU text',
-    title: 'This planning or review text step is using GPU execution rather than the slower CPU-only text lane.',
+            ? 'Text task no longer using GPU'
+            : 'Text using GPU acceleration',
+    title: 'This planning or review task is using GPU acceleration.',
     tone: descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'accelerated',
   }
 }
@@ -346,7 +430,7 @@ function estimateRuntime(estimate: GenerationJob['estimateAfterResume']): number
 }
 
 function WorkspaceSelector() {
-  const workspaces = useStore(s => s.workspaces)
+  const workspaces = useStore(s => s.workspaces ?? [])
   const activeWorkspace = useStore(s => s.activeWorkspace)
   const browsingUploads = useStore(s => s.browsingUploads)
   const switchWorkspace = useStore(s => s.switchWorkspace)
@@ -360,6 +444,8 @@ function WorkspaceSelector() {
   const resumeJobRecovery = useStore(s => s.resumeJobRecovery)
   const accessContext = useStore(s => s.accessContext)
   const remote = accessContext?.remote === true
+  const accountsEnabled = accessContext?.accounts?.enabled === true
+  const canCreateProject = !accountsEnabled || accessContext?.accounts?.authenticated === true
   const [open, setOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
@@ -436,6 +522,10 @@ function WorkspaceSelector() {
 
   const handleDelete = async (name: string, e: React.MouseEvent) => {
     e.stopPropagation()
+    if (!workspaceAllowsPermission(
+      workspaces.find(workspace => workspace.name === name),
+      'project.delete',
+    )) return
     if (confirmDelete !== name) {
       setConfirmDelete(name)
       setTimeout(() => setConfirmDelete(c => (c === name ? null : c)), 4000)
@@ -560,7 +650,7 @@ function WorkspaceSelector() {
 
   const handleCreate = async () => {
     const name = newName.trim().replace(/\s+/g, '-')
-    if (!name || (newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword) || creatingProject) return
+    if (!canCreateProject || !name || (newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword) || creatingProject) return
     setCreateError(null)
     setCreatingProject(true)
     try {
@@ -641,6 +731,7 @@ function WorkspaceSelector() {
 
   const openPasswordEditor = (workspace: api.Workspace, event: React.MouseEvent) => {
     event.stopPropagation()
+    if (!workspaceAllowsPermission(workspace, 'project.lifecycle')) return
     setPasswordTarget({ name: workspace.name, password_protected: workspace.password_protected })
     setPasswordValue('')
     setPasswordConfirm('')
@@ -812,7 +903,7 @@ function WorkspaceSelector() {
                       : ws.unlocked ? <LockOpen size={12} /> : <Lock size={12} />}
                   </button>
                 )}
-                {!remote && (!ws.password_protected || ws.unlocked) && (
+                {!remote && (!ws.password_protected || ws.unlocked) && workspaceAllowsPermission(ws, 'project.lifecycle') && (
                   <button
                     onClick={event => openPasswordEditor(ws, event)}
                     disabled={passwordSaving && passwordTarget?.name === ws.name}
@@ -828,7 +919,7 @@ function WorkspaceSelector() {
                   </button>
                 )}
                 {/* default IS the outputs folder itself — not deletable */}
-                {ws.name !== 'default' && (!remote || ws.unlocked) && (
+                {ws.name !== 'default' && (!remote || ws.unlocked) && workspaceAllowsPermission(ws, 'project.delete') && (
                   <button
                     onClick={e => handleDelete(ws.name, e)}
                     disabled={deleting === ws.name}
@@ -1008,7 +1099,7 @@ function WorkspaceSelector() {
               {browsingUploads && <Check size={12} />}
             </button>
           </div>}
-          <div className="border-t border-border p-2">
+          {canCreateProject && <div className="border-t border-border p-2">
             {creating ? (
               <div className="space-y-1.5">
                 <input
@@ -1041,7 +1132,7 @@ function WorkspaceSelector() {
                 <Plus size={12} /> {remote ? 'New project' : 'New Workspace'}
               </button>
             )}
-          </div>
+          </div>}
           {!remote && accessContext && (
             <div className="border-t border-border px-3 py-2 text-[9px] leading-relaxed text-text-muted">
               <span className={accessContext.cloudflare_enabled ? 'text-accent-green' : 'text-text-muted'}>
@@ -1077,6 +1168,7 @@ function stripTimeSuffix(msg: string): string {
 
 function JobPlaceholder({
   job,
+  canManageGeneration,
   referenceQuality = null,
   onStop,
   onDismiss,
@@ -1088,6 +1180,7 @@ function JobPlaceholder({
   logError = null,
 }: {
   job: GenerationJob
+  canManageGeneration: boolean
   referenceQuality?: api.ProjectReferenceJobQualitySummary | null
   onStop: () => void
   onDismiss: () => void
@@ -1098,6 +1191,7 @@ function JobPlaceholder({
   logEvents?: api.JobLogEvent[]
   logError?: string | null
 }) {
+  const models = useStore(s => s.models ?? [])
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
   const ref2vaTermsAccepted = useStore(s => s.hostTerms?.minimax_h3_ref2va.accepted === true)
   const [reviewNowMs, setReviewNowMs] = useState(() => Date.now())
@@ -1154,8 +1248,8 @@ function JobPlaceholder({
     && job.oomInfo?.native_available === true
     && job.oomInfo.recoverable === true
   const deliveryTarget = job.oomInfo?.requested_target
-    ? `Exact ${job.oomInfo.requested_target} delivery`
-    : 'Exact delivery'
+    ? `${job.oomInfo.requested_target} output`
+    : 'Requested output'
   const hasLocalEvents = (job.logEvents?.length || 0) > 0
   const canOpenLog = (!job.oomInfo || machineControls) && (hasLocalEvents || api.isBackendJobId(job.id))
   const errorText = job.error || job.message || (job.status === 'cancelled' ? 'Cancelled' : 'Generation failed')
@@ -1163,19 +1257,20 @@ function JobPlaceholder({
   const hasFailedChild = !!failedChildJobId
   const failedChildDetail = job.failureDetails?.detail || null
   const failedChildCode = job.failureDetails?.code || null
+  const jobModelLabel = visibleModelName(job.modelType, models)
   const resourcePresentation = describeResourceExecution(job.resourceDescriptor)
   const resourceWaitTitle = job.queueWaitReason === 'resource_wait' ? RESOURCE_WAIT_TITLE : undefined
   const queueWaitLabel = job.status !== 'running' && !isFailed && !recoveryBlocked ? ({
     held: 'Held — use Start next or Resume when ready',
     queue_paused: 'Queue paused — use Start next or Resume queue',
-    registering: 'Registering with the scheduler',
+    registering: 'Adding to the queue',
     preparing: 'Preparing the generation',
     waiting_for_plan_approval: 'Generation plan ready for review',
     waiting_for_plan_terms: 'Waiting for required model terms',
     waiting_for_turn: 'Waiting for earlier queued work',
     waiting_for_active_generation: 'Waiting for another generation on this host',
     waiting_for_other_user: 'Waiting for another generation on this host',
-    resource_wait: 'Waiting for generation resources',
+    resource_wait: 'Waiting for available GPU resources',
     ready: 'Ready to start',
     running: 'Starting',
   } as const)[job.queueWaitReason || 'registering'] : null
@@ -1192,9 +1287,11 @@ function JobPlaceholder({
         {/* Dismiss button (top-right, failed only) */}
         {isFailed && (
           <button
+            type="button"
             onClick={onDismiss}
             className="absolute top-2 right-2 p-1.5 rounded-full bg-bg-active text-text-secondary hover:bg-red-600 hover:text-white transition-colors z-10"
-            title="Dismiss"
+            title="Dismiss generation"
+            aria-label="Dismiss generation"
           >
             <X size={14} />
           </button>
@@ -1213,7 +1310,7 @@ function JobPlaceholder({
                       ? isDeliveryRecoveryChild
                         ? 'Delivery Retry Failed'
                         : nativeRecoveryAvailable
-                          ? 'Delivery Failed After Native Generation'
+                          ? 'Output Processing Failed After Generation'
                           : 'Delivery Failed'
                       : 'Generation Failed')
                 : recoveryBlocked
@@ -1221,9 +1318,9 @@ function JobPlaceholder({
                   : recoveryState === 'restored'
                     ? 'Generation Restored'
                     : recoveryState === 'interrupted' || job.recoveryInterrupted
-                      ? 'Generation Interrupted — Recovery Preserved'
+                      ? 'Generation Interrupted — Completed Parts Saved'
                       : recoveryState === 'retrying'
-                      ? 'Recovery Queued'
+                        ? job.status === 'running' ? 'Recovery Running' : 'Recovery Queued'
                         : job.status === 'completed'
                           ? job.logicalJobKind === 'reference_pack_parent' ? 'Reference packs ready' : 'Generation complete'
                         : job.status === 'preparing'
@@ -1244,9 +1341,9 @@ function JobPlaceholder({
                   {referenceQuality.presentation.gradeLabel ? ` · ${referenceQuality.presentation.gradeLabel}` : ''}
                   {referenceQuality.presentation.scoreLabel ? ` · ${referenceQuality.presentation.scoreLabel}` : ''}
                 </p>
-                {referenceQuality.presentation.preliminary && <p>Preliminary recommendation · ungraded</p>}
+                {referenceQuality.presentation.preliminary && <p>Early recommendation · not graded yet</p>}
                 {referenceQuality.presentation.residualSummary && <p>{referenceQuality.presentation.residualSummary}</p>}
-                {referenceQuality.presentation.correctionAvailable && <p>Structured correction guidance is available.</p>}
+                {referenceQuality.presentation.correctionAvailable && <p>Suggestions for improving the result are available.</p>}
                 {referenceQuality.presentation.notice && <p>{referenceQuality.presentation.notice}</p>}
                 {referenceQuality.candidateCount > 1 && <p>{referenceQuality.candidateCount} candidates remain available in Reference.</p>}
               </div>
@@ -1271,7 +1368,7 @@ function JobPlaceholder({
             )}
             {job.status === 'waiting_for_plan_approval' && (
               <>
-                {job.h3SegmentPlan && (
+                {job.h3SegmentPlan && canManageGeneration && (
                   <button
                     type="button"
                     onClick={onReviewPlan}
@@ -1288,8 +1385,8 @@ function JobPlaceholder({
                         ? 'Approval required to accept model terms'
                         : 'Explicit plan approval required'
                     : planReviewSeconds > 0
-                      ? `Server auto-accepts its frozen plan in ${Math.ceil(planReviewSeconds)}s`
-                      : 'Server is auto-accepting its frozen plan…'}
+                      ? `Maestro will accept this plan in ${Math.ceil(planReviewSeconds)}s unless you review it first`
+                      : 'Maestro is accepting this plan…'}
                 </p>
               </>
             )}
@@ -1308,14 +1405,14 @@ function JobPlaceholder({
             {recoveryBlocked && (
               <div className="mt-2 rounded-md border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-left text-[10px] text-text-secondary">
                 <p className="font-medium text-amber-200">
-                  {job.recoveryReasonText || 'This generation is waiting for a safe recovery decision.'}
+                  {job.recoveryReasonText || 'This generation needs your choice before it can continue.'}
                 </p>
                 <p className="mt-1">
                   Recovery attempt {job.recoveryAttempt ?? 0} of {job.recoveryAttemptLimit ?? 0}.
                 </p>
                 {job.recoveryRerunsDenoise && (
                   <p className="mt-1">
-                    The current safe unit restarts its denoise work; completed units are retained.
+                    The current part will restart from the beginning; completed parts will stay saved.
                   </p>
                 )}
                 {estimateRuntime(job.estimateAfterResume) != null && (
@@ -1323,7 +1420,7 @@ function JobPlaceholder({
                     Estimated work after resume: {compactEta(estimateRuntime(job.estimateAfterResume))}.
                   </p>
                 )}
-                {!!job.recoveryActions?.length && (
+                {!!job.recoveryActions?.length && canManageGeneration && (
                   <div className="mt-2 flex flex-wrap gap-1.5">
                     {job.recoveryActions.map(action => (
                       <button
@@ -1378,9 +1475,9 @@ function JobPlaceholder({
                 </p>
               </div>
             )}
-            {(job.modelType || job.workspace) && (
+            {(jobModelLabel || job.workspace) && (
               <p className="mt-1.5 text-[9px] text-text-muted truncate">
-                {[job.modelType, job.workspace && `Project: ${job.workspace}`].filter(Boolean).join(' · ')}
+                {[jobModelLabel, job.workspace && `Project: ${job.workspace}`].filter(Boolean).join(' · ')}
               </p>
             )}
             {!!job.h3SegmentPlan?.segments.length && !isFailed && (
@@ -1394,6 +1491,9 @@ function JobPlaceholder({
                     const active = (job.windowCurrent || 0) === segment.index
                     const ref2va = segment.model_type === 'minimax_h3_ref2va'
                     const boundary = segment.boundary_from_previous?.type
+                    const boundaryLabel = visibleBoundaryName(boundary)
+                    const segmentModelLabel = visibleModelName(segment.model_type, models)
+                    const segmentPurpose = h3SegmentPurpose(segment.model_type)
                     const generatedFrames = segment.generated_frames ?? segment.frames
                     const publishedFrames = segment.published_frames ?? generatedFrames
                     const generatedSeconds = segment.generated_duration_seconds ?? segment.duration_seconds
@@ -1401,20 +1501,20 @@ function JobPlaceholder({
                     return (
                       <div
                         key={segment.index}
-                        title={`Segment ${segment.index}: ${ref2va ? 'Ref2VA' : 'FL2VA'} · ${publishedSeconds.toFixed(2)}s published (${publishedFrames}f)${generatedFrames !== publishedFrames ? ` · ${generatedSeconds.toFixed(2)}s generated (${generatedFrames}f)` : ''} · ${segment.model_reason}${boundary ? ` · ${boundary}` : ''}`}
+                        title={`Segment ${segment.index}: ${segmentModelLabel} · ${publishedSeconds.toFixed(2)}s published (${publishedFrames}f)${generatedFrames !== publishedFrames ? ` · ${generatedSeconds.toFixed(2)}s generated (${generatedFrames}f)` : ''} · ${segmentPurpose}${boundary ? ` · ${boundaryLabel}` : ''}`}
                         className={`min-w-[44px] rounded border px-1.5 py-1 text-center transition-colors ${
                           active ? 'border-white/70 ring-1 ring-white/30' : 'border-transparent'
                         } ${ref2va ? 'bg-violet-500/25 text-violet-200' : 'bg-sky-500/25 text-sky-200'}`}
                       >
                         <div className="text-[9px] font-semibold">{segment.index} · {ref2va ? 'REF' : 'FL'}</div>
-                        <div className="text-[8px] opacity-75">{boundary === 'precut' ? 'pre-cut' : boundary || 'start'}</div>
+                        <div className="text-[8px] opacity-75">{boundaryLabel}</div>
                       </div>
                     )
                   })}
                 </div>
                 {job.currentSegmentReason && (
                   <p className="mt-1.5 truncate text-[9px] text-text-muted">
-                    {job.currentSegmentModel?.endsWith('ref2va') ? 'Ref2VA' : 'FL2VA'}: {job.currentSegmentReason}
+                    {visibleModelName(job.currentSegmentModel, models) || 'Current model'}: {h3SegmentPurpose(job.currentSegmentModel)}
                   </p>
                 )}
               </div>
@@ -1425,11 +1525,11 @@ function JobPlaceholder({
                   {job.status === 'cancelled'
                     ? 'This generation was cancelled.'
                     : nativeRecoveryAvailable
-                      ? `Native generation succeeded. Maestro preserved it privately when ${deliveryTarget.toLowerCase()} ran out of VRAM${(job.oomInfo?.retry_count ?? 0) > 0 ? ' after one automatic retry' : ''}. Recovery status is shown below.`
+                      ? `Generation finished, but creating the ${deliveryTarget.toLowerCase()} ran out of GPU memory${(job.oomInfo?.retry_count ?? 0) > 0 ? ' after one automatic retry' : ''}. Maestro saved the original result privately; recovery options are below.`
                       : isDeliveryRecoveryChild
-                        ? 'A delivery-only recovery attempt failed. Refreshed options remain on the original failed generation card.'
+                        ? 'The delivery retry failed. Updated recovery options are on the original failed generation.'
                       : isDeliveryOom
-                        ? `${deliveryTarget} ran out of VRAM after native generation, but no preserved native result is available.`
+                        ? `Creating the ${deliveryTarget.toLowerCase()} ran out of GPU memory after generation, and the original result was not saved for recovery.`
                     : canOpenLog
                       ? 'Generation failed. Open technical details or event history for more information.'
                       : 'Generation failed before a server job was created. The technical details below contain the available error.'}
@@ -1440,7 +1540,7 @@ function JobPlaceholder({
                       <CopyableJobId jobId={failedChildJobId} label="Child job ID" />
                     </div>
                     {job.failedChildStatus && (
-                      <p><span className="text-text-muted">Child status:</span> {job.failedChildStatus}</p>
+                      <p><span className="text-text-muted">Child status:</span> {visibleJobStatus(job.failedChildStatus)}</p>
                     )}
                     {job.failedChildReason && (
                       <p><span className="text-text-muted">Reason:</span> <code className="font-mono">{job.failedChildReason}</code></p>
@@ -1453,7 +1553,7 @@ function JobPlaceholder({
                     )}
                   </div>
                 )}
-                {isDeliveryOom && !isDeliveryRecoveryChild && job.workspace && api.isBackendJobId(job.id) && (
+                {isDeliveryOom && !isDeliveryRecoveryChild && job.workspace && api.isBackendJobId(job.id) && canManageGeneration && (
                   <div className="mt-2">
                     <H3DeliveryRecoveryStatus
                       sourceJobId={job.id}
@@ -1492,16 +1592,16 @@ function JobPlaceholder({
       <div className="px-3 py-2 min-h-[40px] flex items-center justify-between">
         <div className="text-[11px] text-text-muted truncate flex-1">
           {recoveryBlocked
-            ? 'Recovery blocked · live queue position and ETA resume after recovery'
+            ? 'Recovery needs your choice · queue position and ETA will return afterward'
             : isFailed
             ? nativeRecoveryAvailable
-              ? 'Source delivery failed · recovery state shown above'
+              ? 'Output processing failed · recovery options are shown above'
               : isDeliveryRecoveryChild
-                ? 'Delivery recovery child failed · return to the original failed card'
+                ? 'Delivery retry failed · return to the original failed generation'
               : 'Click × to dismiss — the tile stays so you can see what failed'
             : queueWaitLabel || phase || 'Preparing...'}
         </div>
-        {!isFailed && (
+        {!isFailed && canManageGeneration && (
           <button
             type="button"
             onClick={onStop}
@@ -1529,7 +1629,7 @@ function JobPlaceholder({
           ) : logEvents.length === 0 ? 'No recorded events.' : logEvents.map((event, eventIndex) => (
             <div key={`${event.at}-${eventIndex}`} className="border-b border-border/40 py-1 last:border-0">
               <span className="text-text-secondary">{new Date(event.at * 1000).toLocaleTimeString()}</span>{' '}
-              <span>{event.status} · {event.progress}%</span>{' '}
+              <span>{visibleJobStatus(event.status)} · {event.progress}%</span>{' '}
               <span>{event.message || event.phase}</span>
               {event.total_steps > 0 && <span> · {event.step}/{event.total_steps}</span>}
             </div>
@@ -1545,7 +1645,7 @@ function queueSummaryLabel(summary: api.QueueState['summary']): string {
 }
 
 function queuePositionLabel(position: number | null, waiting: number): string {
-  if (position == null) return 'Registering with the scheduler'
+  if (position == null) return 'Adding to the queue'
   if (waiting < 1 || position > waiting) return 'Waiting in queue'
   if (position === 1) return waiting > 1 ? `Next in line · 1 of ${waiting}` : 'Next in line'
   const ahead = position - 1
@@ -1570,10 +1670,14 @@ function QueuePanel({
   refreshQueue: () => Promise<void>
 }) {
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
+  const workspaces = useStore(s => s.workspaces ?? [])
   const resumeJobRecovery = useStore(s => s.resumeJobRecovery)
   const retryJobRecovery = useStore(s => s.retryJobRecovery)
   const openH3PlanReview = useStore(s => s.openH3PlanReview)
   const planReviewError = useStore(s => s.h3PlanReviewError)
+  const projectPermissionsProjected = workspaces.some(
+    workspace => workspace.project_permissions !== undefined,
+  )
   const [error, setError] = useState<string | null>(null)
   const [countDrafts, setCountDrafts] = useState<Record<string, number>>({})
   const [logJobId, setLogJobId] = useState<string | null>(null)
@@ -1691,7 +1795,7 @@ function QueuePanel({
                   ? 'Paused — queued jobs will not start.'
                   : queue?.pause_after_current
                     ? 'Will pause after the current output.'
-                    : 'Running in priority order.'}
+                    : 'Ready jobs start by priority.'}
             </p>
             {queue && (
               <p className="mt-0.5 text-[10px] text-text-secondary">{queueSummaryLabel(projection.summary)}</p>
@@ -1701,10 +1805,10 @@ function QueuePanel({
                 How queue priority works
               </summary>
               <div className="mt-1.5 space-y-1 rounded-md border border-border bg-bg-primary/40 px-2.5 py-2 leading-relaxed">
-                <p>User-set priority is applied before queue-order and residency choices; work waits until compatible resources are available.</p>
-                <p>Reusing the exact loaded model can reorder otherwise eligible work.</p>
-                <p>A starvation guard can preserve queue order to prevent excessive delay. Recent-service fair share is planned but is not active in this build; each row's live reason is authoritative.</p>
-                <p>Only CPU work explicitly marked preemptible may be discarded and restarted from zero, and only when acceleration is predicted to deliver sooner.</p>
+                <p>Ready jobs start by priority. When priorities match, Maestro usually keeps their queue order.</p>
+                <p>A job may start sooner when it can reuse a model that is already loaded.</p>
+                <p>Jobs that have waited a long time keep their place so they are not repeatedly delayed.</p>
+                <p>Queued generations do not interrupt work already running. Only a restartable CPU text task may start over with GPU acceleration, and only when that is expected to finish sooner.</p>
               </div>
             </details>
           </div>
@@ -1736,7 +1840,7 @@ function QueuePanel({
         <PipelinePlaceholder />
         {queueError && !queue ? (
           <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-text-muted">
-            Queue contents are unavailable until a scheduler refresh succeeds.
+            The queue is unavailable. Maestro is retrying automatically.
           </div>
         ) : visibleJobs.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-text-muted">
@@ -1764,20 +1868,24 @@ function QueuePanel({
             : info?.wait_reason === 'waiting_for_plan_terms'
               ? 'Waiting for required model terms'
             : info?.wait_reason === 'resource_wait'
-              ? 'Waiting for generation resources'
+              ? 'Waiting for available GPU resources'
             : info?.wait_reason === 'waiting_for_active_generation'
               || info?.wait_reason === 'waiting_for_other_user'
               ? 'Waiting for another generation on this host'
               : null
           const resourceWaitTitle = info?.wait_reason === 'resource_wait' ? RESOURCE_WAIT_TITLE : undefined
           const resourcePresentation = describeResourceExecution(effectiveResourceDescriptor)
+          const canManageGeneration = !projectPermissionsProjected || workspaceAllowsPermission(
+            workspaces.find(workspace => workspace.name === job.workspace),
+            'project.generate',
+          )
           const residencyMessage = info?.status === 'running' && (
             info?.queue_reorder_reason === 'resident_base'
             || info?.queue_reorder_reason === 'resident_affinity'
           )
-            ? 'Reordered to reuse the loaded model'
+            ? 'Started sooner by reusing the loaded model'
             : info?.status === 'running' && info.queue_reorder_reason === 'starvation_guard'
-              ? 'Kept queue order to prevent long delays'
+              ? 'Kept its place after a long wait'
               : null
           return (
             <div key={job.id || `pending-${index}`} className="space-y-1.5">
@@ -1786,7 +1894,7 @@ function QueuePanel({
                   {info.recovery_blocked ? (
                     <>
                       <span className="text-amber-300">
-                        Recovery blocked · {info.recovery_reason_text || 'safe recovery input required'}
+                        Recovery needs your choice · {info.recovery_reason_text || 'choose how to continue'}
                       </span>
                       <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void toggleLog(job)}>Log</button>
                     </>
@@ -1815,19 +1923,21 @@ function QueuePanel({
                         </span>
                       )}
                       <div className="flex flex-wrap items-center gap-1">
-                        <span className="text-[9px]">Total</span>
-                        <input
-                          type="number"
-                          min={Math.max(1, info.produced_outputs)}
-                          max={25}
-                          value={countDrafts[schedulerJobId] ?? info.requested_outputs}
-                          onChange={event => setCountDrafts(values => ({ ...values, [schedulerJobId]: Number(event.target.value) }))}
-                          className="w-12 rounded border border-border bg-bg-primary px-1 py-0.5 text-center text-[10px] text-text-primary"
-                          aria-label="Requested output count"
-                        />
-                        <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void act(() => api.setQueueOutputCount(schedulerJobId, countDrafts[schedulerJobId] ?? info.requested_outputs))}>Set</button>
+                        {canManageGeneration && <>
+                          <span className="text-[9px]">Total</span>
+                          <input
+                            type="number"
+                            min={Math.max(1, info.produced_outputs)}
+                            max={25}
+                            value={countDrafts[schedulerJobId] ?? info.requested_outputs}
+                            onChange={event => setCountDrafts(values => ({ ...values, [schedulerJobId]: Number(event.target.value) }))}
+                            className="w-12 rounded border border-border bg-bg-primary px-1 py-0.5 text-center text-[10px] text-text-primary"
+                            aria-label="Requested output count"
+                          />
+                          <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void act(() => api.setQueueOutputCount(schedulerJobId, countDrafts[schedulerJobId] ?? info.requested_outputs))}>Set</button>
+                        </>}
                         <button className="rounded border border-border px-1.5 py-0.5 hover:bg-bg-hover" onClick={() => void toggleLog(effectiveJob)}>Log</button>
-                        {info.status === 'queued' && <>
+                        {canManageGeneration && info.status === 'queued' && <>
                           {machineControls && <>
                             <button className="rounded bg-accent-green/15 px-2 py-0.5 text-accent-green hover:bg-accent-green/25" onClick={() => void act(() => api.startQueueJobNext(schedulerJobId))}>
                               Start next
@@ -1839,7 +1949,7 @@ function QueuePanel({
                             {info.held ? 'Resume' : 'Hold'}
                           </button>
                         </>}
-                        {info.status === 'running' && (
+                        {canManageGeneration && info.status === 'running' && (
                           <button
                             className="rounded border border-border px-2 py-0.5 text-text-secondary hover:text-text-primary"
                             onClick={() => void act(() => info.hold_after_output ? api.resumeQueueJob(schedulerJobId) : api.holdQueueJob(schedulerJobId))}
@@ -1854,6 +1964,7 @@ function QueuePanel({
               )}
               <JobPlaceholder
                 job={job}
+                canManageGeneration={canManageGeneration}
                 referenceQuality={referenceQualityByJobId[job.id]}
                 onStop={() => onStop(job.id)}
                 onDismiss={() => onDismiss(job.id)}
@@ -1878,7 +1989,7 @@ function QueuePanel({
 function GalleryBulkToolbar() {
   const selected = useStore(s => s.selectedOutputKeys)
   const outputs = useStore(s => s.filteredOutputs())
-  const workspaces = useStore(s => s.workspaces)
+  const workspaces = useStore(s => s.workspaces) ?? []
   const activeWorkspace = useStore(s => s.activeWorkspace)
   const selectAll = useStore(s => s.selectAllLoadedOutputs)
   const clear = useStore(s => s.clearOutputSelection)
@@ -1890,8 +2001,25 @@ function GalleryBulkToolbar() {
   const [busy, setBusy] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [errors, setErrors] = useState<string[]>([])
+  const workspaceByName = new Map(workspaces.map(workspace => [workspace.name, workspace]))
+  const selectedOutputs = outputs.filter(output => selected.includes(`${output.workspace}\0${output.name}`))
+  const canMutateSelection = selected.length > 0
+    && selectedOutputs.length === selected.length
+    && selectedOutputs.every(output => workspaceAllowsPermission(
+      workspaceByName.get(output.workspace),
+      'project.mutate',
+    ))
+  const mutableTargets = workspaces.filter(workspace => (
+    workspace.name !== activeWorkspace
+    && workspace.unlocked !== false
+    && workspaceAllowsPermission(workspace, 'project.mutate')
+  ))
+  const canMoveSelection = canMutateSelection
+    && Boolean(target)
+    && workspaceAllowsPermission(workspaceByName.get(target), 'project.mutate')
 
-  const run = async (operation: () => Promise<string[]>) => {
+  const run = async (allowed: boolean, operation: () => Promise<string[]>) => {
+    if (!allowed) return
     setBusy(true)
     setErrors([])
     try {
@@ -1913,39 +2041,42 @@ function GalleryBulkToolbar() {
         </button>
         <button onClick={clear} disabled={busy} className="rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary hover:text-text-primary">Clear</button>
         <div className="mx-1 hidden h-5 w-px bg-border sm:block" />
-        <select
-          value={target}
-          onChange={event => setTarget(event.target.value)}
-          disabled={busy}
-          className="rounded-md border border-border bg-bg-secondary px-2 py-1 text-[10px] text-text-primary"
-        >
-          <option value="">Move to project…</option>
-          {workspaces.filter(workspace => workspace.name !== activeWorkspace && workspace.unlocked !== false).map(workspace => (
-            <option key={workspace.name} value={workspace.name}>{workspace.name}</option>
-          ))}
-        </select>
-        <button
-          onClick={() => void run(() => moveSelected(target))}
-          disabled={!selected.length || !target || busy}
-          className="flex items-center gap-1 rounded-md bg-accent-blue px-2 py-1 text-[10px] text-white disabled:opacity-40"
-        >
-          <FolderInput size={11} /> Move lineage
-        </button>
-        <button title="Blur selected gallery previews by default; project access is unchanged" onClick={() => void run(() => setPrivacy(true))} disabled={!selected.length || busy} className="flex items-center gap-1 rounded-md border border-violet-500/40 px-2 py-1 text-[10px] text-violet-200 disabled:opacity-40">
-          <EyeOff size={11} /> Blur previews
-        </button>
-        <button title="Show selected gallery previews normally; project access is unchanged" onClick={() => void run(() => setPrivacy(false))} disabled={!selected.length || busy} className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary disabled:opacity-40">
-          <Eye size={11} /> Show previews
-        </button>
-        <button
-          onClick={() => confirmDelete ? void run(deleteSelected) : setConfirmDelete(true)}
-          disabled={!selected.length || busy}
-          className="flex items-center gap-1 rounded-md border border-red-500/40 px-2 py-1 text-[10px] text-red-300 disabled:opacity-40"
-          title="Deletes selected finals and every sidecar-linked component, window, and temporary artifact"
-        >
-          <Trash2 size={11} /> {confirmDelete ? `Confirm delete ${selected.length}` : 'Delete + linked'}
-        </button>
-        <button onClick={() => setSelectionMode(false)} disabled={busy} className="ml-auto p-1 text-text-muted hover:text-text-primary"><X size={14} /></button>
+        {canMutateSelection && <>
+          <select
+            value={target}
+            onChange={event => setTarget(event.target.value)}
+            disabled={busy}
+            className="rounded-md border border-border bg-bg-secondary px-2 py-1 text-[10px] text-text-primary"
+          >
+            <option value="">Move to project…</option>
+            {mutableTargets.map(workspace => (
+              <option key={workspace.name} value={workspace.name}>{workspace.name}</option>
+            ))}
+          </select>
+          <button
+            onClick={() => void run(canMoveSelection, () => moveSelected(target))}
+            disabled={!canMoveSelection || busy}
+            className="flex items-center gap-1 rounded-md bg-accent-blue px-2 py-1 text-[10px] text-white disabled:opacity-40"
+            title="Move the selected outputs. Finished outputs bring their related parts, generation steps, and temporary files."
+          >
+            <FolderInput size={11} /> Move selected
+          </button>
+          <button title="Blur the selected previews by default and revoke their existing share links. This does not change who can open the project." onClick={() => void run(canMutateSelection, () => setPrivacy(true))} disabled={busy} className="flex items-center gap-1 rounded-md border border-violet-500/40 px-2 py-1 text-[10px] text-violet-200 disabled:opacity-40">
+            <EyeOff size={11} /> Blur previews
+          </button>
+          <button title="Show the selected previews by default and revoke their existing share links. This does not change who can open the project." onClick={() => void run(canMutateSelection, () => setPrivacy(false))} disabled={busy} className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary disabled:opacity-40">
+            <Eye size={11} /> Show previews
+          </button>
+          <button
+            onClick={() => confirmDelete ? void run(canMutateSelection, deleteSelected) : setConfirmDelete(true)}
+            disabled={busy}
+            className="flex items-center gap-1 rounded-md border border-red-500/40 px-2 py-1 text-[10px] text-red-300 disabled:opacity-40"
+            title="Delete the selected outputs. For each finished output, also delete its related parts, generation steps, and temporary files."
+          >
+            <Trash2 size={11} /> {confirmDelete ? `Delete ${selected.length} outputs and related files?` : 'Delete selected'}
+          </button>
+        </>}
+        <button type="button" aria-label="Close selection tools" title="Close selection tools" onClick={() => setSelectionMode(false)} disabled={busy} className="ml-auto p-1 text-text-muted hover:text-text-primary"><X size={14} /></button>
         {busy && <Loader2 size={13} className="animate-spin text-accent-blue" />}
       </div>
       {errors.length > 0 && <p className="mt-1 text-[10px] text-red-400">{errors.join(' · ')}</p>}
@@ -1957,6 +2088,9 @@ function PipelinePlaceholder() {
   const pipelineStatus = useStore(s => s.pipelineStatus)
   const pipelineId = useStore(s => s.pipelineId)
   const stopPipeline = useStore(s => s.stopPipeline)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const activeProject = useStore(s => (s.workspaces ?? []).find(workspace => workspace.name === s.activeWorkspace))
+  const canStopPipeline = Boolean(activeWorkspace) && projectActionVisibility(activeProject).generate
 
   if (!pipelineId || !pipelineStatus) return null
   if (pipelineStatus.status === 'completed' || pipelineStatus.status === 'failed' || pipelineStatus.status === 'cancelled') return null
@@ -2048,13 +2182,15 @@ function PipelinePlaceholder() {
         <div className="text-[11px] text-text-muted truncate flex-1">
           {phaseLabel || 'Preparing...'}
         </div>
-        <button
-          onClick={() => stopPipeline()}
+        {canStopPipeline && <button
+          onClick={() => {
+            if (canStopPipeline) void stopPipeline()
+          }}
           className="flex items-center gap-1 text-xs text-red-400 hover:text-red-300 transition-colors shrink-0 ml-2"
         >
           <Square size={11} />
           Stop
-        </button>
+        </button>}
       </div>
     </div>
   )
@@ -2071,6 +2207,8 @@ export function MainContent() {
   const setSelectedOutput = useStore(s => s.setSelectedOutput)
   const activeIndex = useStore(s => s.selectedOutput)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const activeProject = useStore(s => (s.workspaces ?? []).find(workspace => workspace.name === s.activeWorkspace))
+  const canMutateActiveProject = projectActionVisibility(activeProject).mutate
   const browsingUploads = useStore(s => s.browsingUploads)
   const mediaFilter = useStore(s => s.mediaFilter)
   const outputArtifactScope = useStore(s => s.outputArtifactScope)
@@ -2650,22 +2788,22 @@ export function MainContent() {
           )}
           {mainView === 'gallery' && activeWorkspace && !browsingUploads && <>
             <span id="private-preview-session-note" className="hidden text-[9px] text-text-muted xl:inline">
-              Browser-session preview only; project access unchanged.
+              This only changes previews in this browser. Project access does not change.
             </span>
             <button
               type="button"
               aria-pressed={privatePreviewActionPressed}
               aria-describedby="private-preview-session-note"
-              aria-label={`${privatePreviewActionLabel} private previews for project ${activeWorkspace}`}
+              aria-label={`${privatePreviewActionLabel} blurred previews for project ${activeWorkspace}`}
               onClick={togglePrivatePreviews}
-              title={`${privatePreviewActionLabel} private previews for this project in this browser session; project access is unchanged`}
+              title={`${privatePreviewActionLabel} blurred previews in this browser. This does not change who can open the project.`}
               className="flex min-h-11 items-center gap-1 rounded-md border border-violet-500/40 px-3 text-[10px] text-violet-200 transition-colors hover:bg-violet-500/10 md:min-h-0 md:px-2 md:py-1"
             >
               {privatePreviewRevealState === 'all' ? <EyeOff size={12} /> : <Eye size={12} />}
               {privatePreviewActionLabel}
             </button>
           </>}
-          {mainView === 'gallery' && <button
+          {mainView === 'gallery' && canMutateActiveProject && <button
             type="button"
             onClick={() => setGallerySelectionMode(!gallerySelectionMode)}
             className={`flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] transition-colors ${gallerySelectionMode ? 'border-accent-blue bg-accent-blue/15 text-accent-blue' : 'border-border text-text-secondary hover:text-text-primary'}`}

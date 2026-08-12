@@ -860,34 +860,34 @@ export function InputsPanel() {
       {h3StudioWorkflow && (
         <div className="mb-2 rounded-lg border border-amber-500/35 bg-amber-500/5 p-2 space-y-1.5">
           <div className="text-[11px] font-medium text-text-primary">
-            MiniMax H3 conditioning · {h3AdaptiveConditioning ? 'Adaptive FL2VA / Ref2VA' : dedicatedRef2VAMode ? 'Pinned Ref2VA' : 'Pinned FL2VA'}
+            MiniMax H3 input mode · {h3AdaptiveConditioning ? 'Automatic' : dedicatedRef2VAMode ? 'Reference media' : 'Start and end frames'}
           </div>
           <div className="rounded border border-border bg-bg-secondary px-2 py-1 text-[9px] text-text-secondary">
-            Selected checkpoint: <span className="font-medium text-text-primary">{activeModel?.name || params.model_type}</span><br />
+            Selected model: <span className="font-medium text-text-primary">{activeModel?.name || params.model_type}</span><br />
             {h3AdaptiveConditioning
-              ? 'Frame anchors stay on FL2VA edge segments; semantic references use non-distilled Ref2VA segments. The editable plan shows every model and transition before queueing.'
+              ? 'Start and end frames guide the edges of your video, while reference media guides its characters, setting, style, motion, or sound. Review the plan before adding the job to the queue.'
               : dedicatedRef2VAMode
-                ? 'Ref2VA is fixed: semantic references are accepted and frame anchors are incompatible.'
-                : 'FL2VA is fixed: frame anchors are accepted and semantic references are incompatible.'}
+                ? 'This model uses reference media and cannot use start or end frames.'
+                : 'This model uses start and end frames and cannot use reference media.'}
           </div>
           <p className="text-[9px] leading-relaxed text-text-muted">
-            References are character, object, setting, style, video, or audio context — never first/last-frame positions.
-            {h3AdaptiveConditioning && ' A supplied end frame is reserved for the final FL2VA segment.'}
-            {' '}Ref2VA allows up to 9 images, 3 videos, 3 audio clips, and 12 mixed files.
+            Reference media can guide characters, objects, settings, style, motion, or sound. It does not set the first or last frame.
+            {h3AdaptiveConditioning && ' An end frame always guides the end of the video.'}
+            {' '}You can add up to 9 images, 3 videos, 3 audio clips, and 12 files in total.
           </p>
           {!h3AdaptiveConditioning && !dedicatedRef2VAMode && h3HasSemanticInputs && (
             <p className="rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] text-red-200">
-              Incompatible fixed plan: pinned FL2VA cannot use the attached semantic references. Re-enable automatic model choice or remove them before generating.
+              This model choice cannot use the attached reference media. Turn Automatic back on or remove the references before generating.
             </p>
           )}
           {!h3AdaptiveConditioning && dedicatedRef2VAMode && (hasStart || hasEnd) && (
             <p className="rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] text-red-200">
-              Incompatible fixed plan: pinned Ref2VA cannot use the attached frame anchors. Re-enable automatic model choice or remove them before generating.
+              This model choice cannot use the attached start or end frames. Turn Automatic back on or remove those frames before generating.
             </p>
           )}
           <div className="flex flex-col items-stretch gap-2 text-[9px] leading-relaxed text-text-secondary sm:flex-row sm:items-start">
             <span className="flex-1">
-              {h3TermsAccepted ? 'MiniMax H3 Ref2VA model terms are accepted for this host. ' : `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
+              {h3TermsAccepted ? 'MiniMax H3 Ref2VA model terms are accepted for this Maestro installation. ' : `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
               <a href={HOST_TERM_NOTICES.minimax_h3_ref2va.href} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">{HOST_TERM_NOTICES.minimax_h3_ref2va.linkLabel}</a>.
             </span>
             {!h3TermsAccepted && hostTerms && (
@@ -897,7 +897,7 @@ export function InputsPanel() {
                 onClick={() => { void acceptHostTerm('minimax_h3_ref2va') }}
                 className="w-full shrink-0 rounded border border-accent-blue/50 px-2 py-1 text-accent-blue hover:bg-accent-blue/10 disabled:opacity-50 sm:w-auto sm:px-1.5 sm:py-0.5"
               >
-                Accept for this host
+                Accept for this Maestro installation
               </button>
             )}
           </div>
@@ -908,8 +908,8 @@ export function InputsPanel() {
             <button type="button" disabled={!h3TermsAccepted || h3DownloadStatus === 'downloading'} onClick={installH3Ref2VA}
               className="w-full rounded-md border border-accent-blue/50 bg-accent-blue/10 px-2 py-1 text-[10px] text-accent-blue hover:bg-accent-blue/20 disabled:opacity-45 disabled:cursor-not-allowed">
               {h3DownloadStatus === 'downloading' ? 'Installing MiniMax H3 Ref2VA…'
-                : h3DownloadStatus === 'failed' ? 'Retry correct Ref2VA checkpoint install'
-                  : 'Install correct Ref2VA checkpoint'}
+                : h3DownloadStatus === 'failed' ? 'Retry required reference model'
+                  : 'Install required reference model'}
             </button>
           )}
         </div>
@@ -965,20 +965,20 @@ export function InputsPanel() {
 
         {/* H3 Ref2VA media are semantic context, never timeline controls. */}
         {semanticReferenceMode && (h3TermsAccepted || h3HasSemanticInputs) && semanticVideoPaths.map((path, index) => (
-          <Tile key={`semantic-video-${path}`} role={`Video ref ${index + 1}`} filledIcon={<Film size={20} />} filledLabel={basename(path)}
+          <Tile key={`semantic-video-${path}`} role={`Reference video ${index + 1}`} filledIcon={<Film size={20} />} filledLabel={basename(path)}
             imgSrc={null} selected={selected === `semantic-video-${index}`} onClear={() => removeSemanticVideo(index)}
             onSelect={() => setSelected(selected === `semantic-video-${index}` ? null : `semantic-video-${index}`)} />
         ))}
         {semanticReferenceMode && canAttachSemanticReferences && h3TermsAccepted && semanticVideoPaths.length < H3_REF2VA_LIMITS.videos && semanticMixedCount < H3_REF2VA_LIMITS.mixed && (
-          <AddTile label="Video ref" icon={<Film size={18} />} onClick={() => pickFile('.mp4,.webm,.mkv,.mov', handleAddSemanticVideo)} onDropFile={handleAddSemanticVideo} dropAccept="video" />
+          <AddTile label="Reference video" icon={<Film size={18} />} onClick={() => pickFile('.mp4,.webm,.mkv,.mov', handleAddSemanticVideo)} onDropFile={handleAddSemanticVideo} dropAccept="video" />
         )}
         {semanticReferenceMode && (h3TermsAccepted || h3HasSemanticInputs) && semanticAudioPaths.map((path, index) => (
-          <Tile key={`semantic-audio-${path}`} role={`Audio ref ${index + 1}`} filledIcon={<Music size={20} />} filledLabel={basename(path)}
+          <Tile key={`semantic-audio-${path}`} role={`Reference audio ${index + 1}`} filledIcon={<Music size={20} />} filledLabel={basename(path)}
             imgSrc={null} selected={selected === `semantic-audio-${index}`} onClear={() => removeSemanticAudio(index)}
             onSelect={() => setSelected(selected === `semantic-audio-${index}` ? null : `semantic-audio-${index}`)} />
         ))}
         {semanticReferenceMode && canAttachSemanticReferences && h3TermsAccepted && semanticAudioPaths.length < H3_REF2VA_LIMITS.audio && semanticMixedCount < H3_REF2VA_LIMITS.mixed && (
-          <AddTile label={audioUploadTarget === 'semantic-audio' ? 'Uploading…' : 'Audio ref'} icon={<Music size={18} />}
+          <AddTile label={audioUploadTarget === 'semantic-audio' ? 'Uploading…' : 'Reference audio'} icon={<Music size={18} />}
             onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', handleAddSemanticAudio)} onDropFile={handleAddSemanticAudio}
             dropAccept="audio" disabled={audioUploadTarget !== null} />
         )}
@@ -1014,12 +1014,12 @@ export function InputsPanel() {
 
         {/* Voice reference (ID-LoRA) — keeps the speaker's voice consistent. */}
         {!semanticReferenceMode && voiceRefEnabled && (directorVoiceRef ? (
-          <Tile role="Voice ref" filledIcon={<Mic size={20} />} filledLabel={directorVoiceRef.name}
+          <Tile role="Voice sample" filledIcon={<Mic size={20} />} filledLabel={directorVoiceRef.name}
             imgSrc={null} selected={selected === 'voiceref'}
             onClear={() => { setAudioUploadError(null); setDirectorVoiceRef(null); if (selected === 'voiceref') setSelected(null) }}
             onSelect={() => setSelected(selected === 'voiceref' ? null : 'voiceref')} />
         ) : (
-          <AddTile label={audioUploadTarget === 'voice-reference' ? 'Attaching…' : 'Voice ref'} icon={<Mic size={18} />}
+          <AddTile label={audioUploadTarget === 'voice-reference' ? 'Attaching…' : 'Voice sample'} icon={<Mic size={18} />}
             onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', handleAddVoiceReference)} onDropFile={handleAddVoiceReference}
             dropAccept="audio" disabled={audioUploadTarget !== null} />
         ))}
@@ -1073,9 +1073,9 @@ export function InputsPanel() {
       )}
       {semanticReferenceMode && h3TermsAccepted && (
         <p className={`mt-1 text-[9px] ${semanticAudioPaths.length > semanticImageCount + semanticVideoPaths.length ? 'text-amber-400' : 'text-text-muted'}`}>
-          Semantic context: {semanticImageCount}/9 images · {semanticVideoPaths.length}/3 videos · {semanticAudioPaths.length}/3 audio · {semanticMixedCount}/12 mixed.
+          References: {semanticImageCount}/9 images · {semanticVideoPaths.length}/3 videos · {semanticAudioPaths.length}/3 audio clips · {semanticMixedCount}/12 total.
           {' '}Video {semanticVideoDurationTotal.toFixed(1)}/15s · audio {semanticAudioDurationTotal.toFixed(1)}/15s.
-          {' '}Audio references require at least the same number of visual references. Each video/audio clip must be 2–15s.
+          {' '}Add at least one image or video for each audio clip. Every video and audio clip must be 2–15 seconds long.
         </p>
       )}
 
@@ -1193,10 +1193,10 @@ export function InputsPanel() {
       {/* Option strip — voice reference: identity guidance scale */}
       {selected === 'voiceref' && directorVoiceRef && (
         <Strip>
-          <Row label="Identity scale" value={String(identityScale)} />
+          <Row label="Voice match strength" value={String(identityScale)} />
           <input type="range" min={0} max={10} step={0.5} value={identityScale}
             onChange={e => setIdentityScale(parseFloat(e.target.value))} className="w-full h-1 accent-accent-blue" />
-          <p className="text-[9px] text-text-muted">~5s voice sample. With an active ID-LoRA, keeps the speaker's voice consistent across clips.</p>
+          <p className="text-[9px] text-text-muted">A voice sample of about 5 seconds helps keep the speaker sounding consistent across clips.</p>
         </Strip>
       )}
 

@@ -19,7 +19,6 @@ import { useStore } from './stores/useStore'
 import { useIsMobile } from './lib/useIsMobile'
 import { POLL_INTERVAL_MS, useVisibilityPolling } from './lib/useVisibilityPolling'
 import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from './lib/branding'
-import * as api from './api/client'
 
 const BOOTSTRAP_TIMEOUT_MS = 15_000
 
@@ -43,6 +42,7 @@ function App() {
   const loadModels = useStore(s => s.loadModels)
   const loadAccessContext = useStore(s => s.loadAccessContext)
   const loadAccountContext = useStore(s => s.loadAccountContext)
+  const loadWorkspaces = useStore(s => s.loadWorkspaces)
   const loadOutputs = useStore(s => s.loadOutputs)
   const reconnectJobs = useStore(s => s.reconnectJobs)
   const loadSystemConfig = useStore(s => s.loadSystemConfig)
@@ -69,28 +69,27 @@ function App() {
   useEffect(() => {
     let cancelled = false
     void bootstrapWithin(
-      loadAccessContext(),
+      loadAccessContext(false),
       `${PRODUCT_NAME} did not respond while checking access.`,
     ).then(async context => {
-      const workspaceState = await bootstrapWithin(
-        api.fetchWorkspaces(),
+      if (context.accounts?.enabled === true) {
+        await bootstrapWithin(
+          loadAccountContext(false),
+          `${PRODUCT_NAME} did not respond while checking your account.`,
+        )
+      }
+      const workspacesLoaded = await bootstrapWithin(
+        loadWorkspaces(),
         `${PRODUCT_NAME} did not respond while loading projects.`,
       )
+      if (!workspacesLoaded) throw new Error(`${PRODUCT_NAME} could not load projects.`)
       if (cancelled) return
-      useStore.setState({
-        workspaces: workspaceState.workspaces,
-        activeWorkspace: workspaceState.active,
-        selectedOutputKeys: [],
-        gallerySelectionMode: false,
-      })
+      const workspaceState = useStore.getState()
       loadModels()
-      if (context.accounts?.enabled === true) {
-        void loadAccountContext().catch(() => undefined)
-      }
       loadServicesConfig()
       loadLlmStatus()
       reconnectJobs()
-      if (context.machine_controls || (context.remote && workspaceState.active)) {
+      if (context.machine_controls || (context.remote && workspaceState.activeWorkspace)) {
         loadOutputs()
       }
       if (context.machine_controls) {
@@ -105,7 +104,7 @@ function App() {
       setBootstrapState('error')
     })
     return () => { cancelled = true }
-  }, [bootstrapAttempt, loadAccessContext, loadAccountContext, loadModels, loadOutputs, loadSystemConfig, loadServicesConfig, loadLlmStatus, loadLlmModels, loadPipelineList, reconnectJobs])
+  }, [bootstrapAttempt, loadAccessContext, loadAccountContext, loadModels, loadOutputs, loadSystemConfig, loadServicesConfig, loadLlmStatus, loadLlmModels, loadPipelineList, loadWorkspaces, reconnectJobs])
 
   // Backend-driven load/enhance transitions stay responsive; steady state is
   // a low-rate safety refresh. Hidden tabs make no baseline LLM requests.

@@ -117,7 +117,7 @@ function NsfwToggleSection() {
             {isPublicProvider ? (
               <>Guidance is unavailable with {provider}; provider terms and privacy apply separately. Local generation remains content-neutral.</>
             ) : nsfwEnabled ? (
-              <>The host can add mature authoring guidance when a job is explicitly marked Explicit.</>
+              <>Maestro can add mature authoring guidance when you mark a job Explicit.</>
             ) : (
               <>Guidance is off. Maestro does not inspect or filter locally processed creative content.</>
             )}
@@ -137,11 +137,11 @@ function NsfwToggleSection() {
 
       {lawfulUse && !hasAccepted && (
         <div className="rounded border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-[10px] leading-relaxed text-text-muted">
-          {HOST_TERM_NOTICES.lawful_use.text} Enabling guidance accepts notice v{HOST_TERM_NOTICES.lawful_use.version} once for this host.
+          {HOST_TERM_NOTICES.lawful_use.text} Enabling guidance accepts notice v{HOST_TERM_NOTICES.lawful_use.version} once for this Maestro installation.
         </div>
       )}
       {lawfulUse?.accepted && (
-        <p className="text-[9px] text-text-muted">Host notice v{lawfulUse.accepted_version} accepted. Each job's Explicit choice remains separate.</p>
+        <p className="text-[9px] text-text-muted">Notice v{lawfulUse.accepted_version} accepted for this Maestro installation. You still choose Explicit separately for each job.</p>
       )}
       {(servicesConfigError || hostTermsError) && (
         <div className="flex items-start justify-between gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[10px] text-red-300">
@@ -182,6 +182,7 @@ export function ServicesSettingsPanel() {
   const isRemote = provider === 'remote'
   const isOpenAI = provider === 'openai'
   const isLocal = provider === 'local'
+  const providerLabel = isRemote ? 'your configured server' : isOpenAI ? 'OpenAI' : 'Anthropic'
 
   const handleRefreshModels = async () => {
     setRefreshing(true)
@@ -204,7 +205,7 @@ export function ServicesSettingsPanel() {
 
       {/* LLM Provider */}
       <div className="space-y-4">
-        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">LLM Configuration</h3>
+        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Writing Assistant</h3>
 
         <div className="flex items-center justify-between">
           <div className="min-w-0 flex-1 mr-3">
@@ -223,7 +224,7 @@ export function ServicesSettingsPanel() {
         {/* Provider selector */}
         <div>
           <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
-            LLM Provider
+            Where the assistant runs
           </label>
           <select
             value={provider}
@@ -240,14 +241,14 @@ export function ServicesSettingsPanel() {
             }}
             className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
           >
-            <option value="local">Local (llama-server)</option>
-            <option value="remote">Remote OpenAI-Compatible (LM Studio, etc.)</option>
+            <option value="local">On the computer running Maestro (llama-server)</option>
+            <option value="remote">Another compatible server (LM Studio, etc.)</option>
             <option value="openai">OpenAI API</option>
             <option value="anthropic">Anthropic API</option>
           </select>
           {!isLocal && (
             <p className="mt-1.5 rounded border border-amber-500/25 bg-amber-500/5 px-2 py-1.5 text-[9px] leading-relaxed text-text-muted">
-              External provider selected: prompt text and attached context used by LLM features may be sent to {provider}. That provider's terms and privacy policy apply separately from Maestro's host notice.
+              When Maestro uses {providerLabel}, your prompt text and any attached context may be sent there. Its terms and privacy policy apply separately from Maestro's notice.
             </p>
           )}
         </div>
@@ -277,7 +278,7 @@ export function ServicesSettingsPanel() {
         <div>
           <div className="flex items-center justify-between mb-1.5">
             <label className="text-[11px] text-text-muted uppercase tracking-wider">
-              LLM Model
+              Assistant model
             </label>
             {!isLocal && (
               <button
@@ -303,7 +304,7 @@ export function ServicesSettingsPanel() {
           </select>
           {isLocal && (
             <p className="text-[10px] text-text-muted mt-1">
-              Larger models produce more creative scene descriptions but use more RAM
+              Larger models can write richer scene descriptions, but use more memory.
             </p>
           )}
         </div>
@@ -312,7 +313,7 @@ export function ServicesSettingsPanel() {
         {isLocal && (
           <div>
             <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
-              LLM Device
+              Run the assistant on
             </label>
             <select
               value={servicesConfig.llm_device}
@@ -323,7 +324,7 @@ export function ServicesSettingsPanel() {
               <option value="cuda">CUDA (uses VRAM)</option>
             </select>
             <p className="text-[10px] text-text-muted mt-1">
-              CPU recommended to avoid conflicts with video generation
+              CPU is recommended so the video model can keep the graphics memory it needs.
             </p>
           </div>
         )}
@@ -338,22 +339,22 @@ export function ServicesSettingsPanel() {
 
       {/* Prompt Enhancer */}
       <div className="space-y-4">
-        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Studio Prompt Enhancer</h3>
+        <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Studio Prompt Helper</h3>
         <p className="text-[10px] text-text-muted">
-          The sparkle button in Studio mode. Uses model-specific prompt guides for best results.
-          Set a separate LLM here or leave empty to use the Director LLM above.
+          Controls the sparkle button in Studio. It adapts your prompt for the selected model.
+          Choose a separate writing model here, or leave it blank to use Director's model.
         </p>
 
         <div>
           <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
-            Enhance LLM Model
+            Prompt helper model
           </label>
           <select
             value={servicesConfig.enhance_llm_model_id || ''}
             onChange={e => updateConfig({ enhance_llm_model_id: e.target.value })}
             className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
           >
-            <option value="">Same as Director LLM</option>
+            <option value="">Same as Director</option>
             {llmModels.map(m => (
               <option key={m.id} value={m.id}>
                 {m.label} ({m.size_hint})
@@ -362,8 +363,8 @@ export function ServicesSettingsPanel() {
           </select>
           <p className="text-[10px] text-text-muted mt-1">
             {servicesConfig.enhance_llm_model_id
-              ? 'Separate LLM for Studio enhancement — lighter/faster than Director.'
-              : 'Using the Director LLM for enhancement (may be slower but more capable).'
+              ? 'Uses a separate model for Studio prompts, which can be smaller and faster.'
+              : 'Uses Director\'s writing model, which may be slower but more capable.'
             }
           </p>
         </div>
@@ -371,7 +372,7 @@ export function ServicesSettingsPanel() {
         {servicesConfig.enhance_llm_model_id && (
           <div>
             <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
-              Enhance LLM Device
+              Run the prompt helper on
             </label>
             <select
               value={servicesConfig.enhance_llm_device || 'cuda'}
@@ -431,7 +432,7 @@ export function ServicesSettingsPanel() {
               Director Planner <span className="text-[10px] text-text-muted font-normal">(recommended)</span>
             </div>
             <div className="text-[10px] text-text-muted mt-0.5">
-              Uses structured shot planning and prompt checks, including Podcast and Viral Video workflows. Turn off to use the previous planner.
+              Builds and checks your shot plan, including Podcast and Viral Video projects. Turn it off if you need the previous planner.
             </div>
           </div>
           <div
@@ -449,26 +450,26 @@ export function ServicesSettingsPanel() {
         {/* Prompt Polish Mode */}
         <div>
           <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
-            Director Prompt Polish
+            Adapt prompts for each model
           </label>
           <select
             value={servicesConfig.director_prompt_polish || 'third_pass'}
             onChange={e => updateConfig({ director_prompt_polish: e.target.value as 'off' | 'full_guide' | 'light_guide' | 'third_pass' })}
             className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
           >
-            <option value="third_pass">Third Pass (Model-aware) — recommended</option>
-            <option value="light_guide">Compact model guide</option>
-            <option value="full_guide">Full model guide</option>
+            <option value="third_pass">Automatic — recommended</option>
+            <option value="light_guide">Light guidance</option>
+            <option value="full_guide">Full guidance</option>
             <option value="off">Off</option>
           </select>
           <p className="text-[10px] text-text-muted mt-1">
             {servicesConfig.director_prompt_polish === 'full_guide'
-              ? 'Adds the complete model-specific guide before planning.'
+              ? 'Uses the complete guide for the selected model while planning.'
               : servicesConfig.director_prompt_polish === 'light_guide'
-              ? 'Adds a compact model-specific guide before planning.'
+              ? 'Uses a shorter guide for the selected model while planning.'
               : servicesConfig.director_prompt_polish === 'off'
-              ? 'Director uses its built-in prompting rules only. No model-specific optimization.'
-              : 'Default and model-aware. H3 keeps its native video prompts while generated image prompts may still be polished; other models use their dialect-specific enhance pipeline.'}
+              ? 'Uses Director\'s general prompt rules without adapting them to the selected model.'
+              : 'Automatically prepares prompts in the form each selected model works best with. H3 video prompts are kept in their original form.'}
           </p>
         </div>
 
@@ -511,11 +512,10 @@ export function ServicesSettingsPanel() {
         <label className="flex items-center justify-between cursor-pointer group">
           <div className="flex-1 mr-3">
             <div className="text-sm text-text-primary group-hover:text-accent-blue transition-colors">
-              Voice Reference (ID-LoRA)
+              Keep a voice consistent
             </div>
             <div className="text-[10px] text-text-muted mt-0.5">
-              Adds a voice-sample dropzone to Studio Video and Director for speaker identity preservation across clips.
-              Maestro loads the matching ID-LoRA when a reference is supplied. Enabled by default.
+              Lets you add a short voice sample in Studio Video or Director so the speaker sounds consistent across clips. Enabled by default.
             </div>
           </div>
           <div
@@ -540,11 +540,11 @@ export function ServicesSettingsPanel() {
       <div className="space-y-3">
         <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">FlashVSR Upscaling</h3>
         <p className="text-[10px] text-text-muted -mt-1">
-          DiT super-resolution. Pick it per generation in Post Processing → Spatial Upsampling. Maestro downloads ~4 GB of weights to the shared host cache if needed.
+          Makes finished video larger and sharper. Choose it for a generation under Post Processing → Spatial Upsampling. The first use may download about 4 GB of model files, which Maestro saves for later.
         </p>
 
         <div>
-          <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Model Variant</label>
+          <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Quality and memory use</label>
           <select
             value={servicesConfig.flashvsr_mode ?? 1}
             onChange={e => updateConfig({ flashvsr_mode: Number(e.target.value) })}
@@ -556,16 +556,16 @@ export function ServicesSettingsPanel() {
           </select>
           <p className="text-[10px] text-text-muted mt-1">
             {servicesConfig.flashvsr_mode === 2
-              ? 'Full uses the complete Wan2.1 VAE — sharpest detail and best temporal fidelity, highest VRAM.'
+              ? 'Produces the sharpest detail and most consistent motion, but uses the most graphics memory.'
               : servicesConfig.flashvsr_mode === 3
-              ? 'Tiny decoder tuned for long clips.'
-              : 'Lightweight decoder — fastest, lowest VRAM. Good default alongside the main model on a 24 GB card.'}
+              ? 'Uses less graphics memory and is tuned for long clips.'
+              : 'Fastest and lightest. A good default when the main video model is also using the graphics card.'}
           </p>
         </div>
 
         <div>
           <div className="flex items-center justify-between mb-1.5">
-            <label className="text-[11px] text-text-muted uppercase tracking-wider">Sparse Attention Top-K</label>
+            <label className="text-[11px] text-text-muted uppercase tracking-wider">Motion detail</label>
             <span className="text-xs text-text-secondary">{(servicesConfig.flashvsr_topk_ratio ?? 0).toFixed(2)}</span>
           </div>
           <input
@@ -577,23 +577,23 @@ export function ServicesSettingsPanel() {
             onChange={e => updateConfig({ flashvsr_topk_ratio: parseFloat(e.target.value) })}
           />
           <p className="text-[10px] text-text-muted mt-1">
-            Higher computes more attention → better motion fidelity, slower. 0 = sparsest (fastest).
+            Higher values preserve motion more carefully but take longer. 0 is fastest.
           </p>
         </div>
 
         <div>
-          <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Sparse Attention Backend</label>
+          <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Processing method</label>
           <select
             value={servicesConfig.flashvsr_backend || 'auto'}
             onChange={e => updateConfig({ flashvsr_backend: e.target.value })}
             className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
           >
-            <option value="auto">Auto (SpargeAttn if installed, else Triton)</option>
-            <option value="triton_sparse">Triton Sparse (bundled)</option>
-            <option value="sparge">SpargeAttn (best with motion — requires install)</option>
+            <option value="auto">Automatic (recommended)</option>
+            <option value="triton_sparse">Triton Sparse (included)</option>
+            <option value="sparge">SpargeAttn (best motion; separate install)</option>
           </select>
           <p className="text-[10px] text-text-muted mt-1">
-            SpargeAttn gives the best quality when there's motion but needs a separate install. Auto uses the bundled Triton kernels otherwise.
+            SpargeAttn can preserve motion best but must be installed separately. Automatic uses it when available, or the included Triton method otherwise.
           </p>
         </div>
       </div>
@@ -614,7 +614,7 @@ export function ServicesSettingsPanel() {
         {servicesConfig.show_experimental && (
           <>
             <p className="text-[10px] text-text-muted">
-              Required for their respective providers. Also used for external AI services in Director mode.
+              Add a key only for an external service you choose to use. Director may also use these services when configured to do so.
             </p>
 
             <ApiKeyField
@@ -678,7 +678,7 @@ export function ServicesSettingsPanel() {
             </div>
             <div className="text-[10px] text-text-muted mt-1 leading-relaxed">
               Currently gates: external LLM APIs (Google / OpenAI / Anthropic),
-              Studio Prompt Enhancer config, and the Inpaint edit mode.
+              Studio Prompt Helper settings, and the Inpaint edit mode.
             </div>
           </div>
           <div

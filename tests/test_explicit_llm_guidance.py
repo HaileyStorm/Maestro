@@ -206,7 +206,7 @@ class RequestGateTests(unittest.TestCase):
             _request_project_workspace=(
                 lambda _request, workspace: workspace or "default"
             ),
-            _require_project_access=lambda *_args: "default",
+            _require_project_access=lambda *_args, **_kwargs: "default",
             _resolve_authorized_request_media=lambda *_args: None,
             _resolve_prompt_enhancer_selection=(
                 lambda *_args, **_kwargs: ("", "", False)
@@ -413,7 +413,7 @@ class EnhancerPropagationTests(unittest.TestCase):
             _request_project_workspace=(
                 lambda _request, workspace: workspace or "default"
             ),
-            _require_project_access=lambda *_args: "default",
+            _require_project_access=lambda *_args, **_kwargs: "default",
             _resolve_authorized_request_media=lambda *_args: None,
             _configured_llm_selection=lambda: {},
             _run_llm_with_selection=(

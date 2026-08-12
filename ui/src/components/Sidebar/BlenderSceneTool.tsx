@@ -64,6 +64,12 @@ export function BlenderSceneTool({
   const sampleFrames = useMemo(() => [0, Math.round(endFrame / 2), endFrame], [endFrame])
   workspaceRef.current = workspace
   const resolvedReferenceName = referenceName?.trim() || 'Blender scene guide'
+  const blenderRecoveryMessage = (status: api.BlenderStatus | null): string => {
+    if (!status?.mcp_attested) return 'Blender support needs setup. In Pinokio, open Maestro, run “Verify / Repair Blender MCP Support,” then restart Maestro.'
+    if (!status.runtime_attested) return 'Blender needs setup. In Pinokio, open Maestro, run “Verify / Repair Blender Runtime,” then restart Maestro.'
+    if (!status.bridge_ready) return 'Maestro cannot connect to Blender. Stop and start Maestro in Pinokio, then try again.'
+    return 'Blender is not ready on this Maestro computer.'
+  }
   const isOperationCurrent = (operation: BlenderOperation | null): boolean => Boolean(
     mountedRef.current
       && operation
@@ -109,13 +115,15 @@ export function BlenderSceneTool({
       setMaxTotalFrames(status.max_total_frames || 7200)
       setMessage(status.ready
         ? `Blender ready · ${status.blender_version || 'installed'}`
-        : status.recovery_action)
+        : blenderRecoveryMessage(status))
     }).catch(error => {
       if (!active || request !== statusRequest.current || workspaceRef.current !== workspace) return
       setReadiness(null)
       setInstalled(false)
       setReady(false)
-      setMessage(error instanceof Error ? error.message : 'Blender is unavailable')
+      setMessage(error instanceof Error
+        ? 'Maestro could not check Blender. Try again, or open Pinokio to check the Blender setup.'
+        : 'Blender is unavailable right now.')
     })
     return () => { active = false }
   }, [workspace])
@@ -126,7 +134,7 @@ export function BlenderSceneTool({
     activeOperation.current = operation
     if (!ready) {
       activeOperation.current = null
-      setMessage(readiness?.recovery_action || 'Blender is not ready on the Maestro host.')
+      setMessage(blenderRecoveryMessage(readiness))
       return
     }
     setBusy(label)
@@ -135,9 +143,9 @@ export function BlenderSceneTool({
       await task()
       if (!isOperationCurrent(operation)) return
       setMessage(`${label} complete`)
-    } catch (error) {
+    } catch {
       if (!isOperationCurrent(operation)) return
-      setMessage(error instanceof Error ? error.message : `${label} failed`)
+      setMessage(`${label} could not finish. Check the scene settings and try again.`)
     } finally {
       if (isOperationCurrent(operation)) {
         setBusy('')
@@ -313,27 +321,38 @@ export function BlenderSceneTool({
         <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-text-muted"><Box size={12} /> Blender Motion Video</div>
         <span className={`text-[9px] ${ready ? 'text-accent-green' : 'text-amber-400'}`}>{installed == null ? 'checking' : ready ? 'ready' : installed ? 'not connected' : 'setup needed'}</span>
       </div>
-      <p className="text-[9px] leading-relaxed text-text-muted">Build a structured scene, preview its motion and camera work, then Keep the full video as a project candidate. Blender runs on the Maestro host; previews stay in the selected project and follow its access permissions.</p>
+      <p className="text-[9px] leading-relaxed text-text-muted">Build a scene, preview its motion and camera work, then keep the full video with your project. Blender runs on the Maestro computer, and previews stay in the selected project.</p>
       <p className="rounded border border-border/70 bg-bg-secondary/40 px-2 py-1 text-[8px] leading-relaxed text-text-muted">
-        Blender uses a separate reference contract: <span className="text-text-secondary">{resolvedReferenceName}</span> · {privateOutput ? 'private output' : 'project-visible output'}.
-        {referenceDescription?.trim() ? ' The Reference description remains on the authored pack; Blender uses its own scene metadata.' : ' The Reference description is kept on the authored pack.'}
+        Saved as <span className="text-text-secondary">{resolvedReferenceName}</span> · {privateOutput ? 'preview starts blurred' : 'preview shown normally'}.
+        {referenceDescription?.trim() ? ' Your Reference description stays with the original reference, while this Blender scene keeps its own description.' : ' Your Reference description stays with the original reference.'}
       </p>
       {readiness && (
         <div className="grid grid-cols-3 gap-1 text-center text-[8px] uppercase tracking-wide text-text-muted">
-          <span className={`rounded border px-1 py-1 ${readiness.mcp_attested ? 'border-accent-green/30 text-accent-green' : 'border-amber-400/30 text-amber-400'}`}>MCP {readiness.mcp_attested ? 'attested' : 'setup'}</span>
-          <span className={`rounded border px-1 py-1 ${readiness.runtime_attested ? 'border-accent-green/30 text-accent-green' : 'border-amber-400/30 text-amber-400'}`}>Runtime {readiness.runtime_attested ? 'attested' : 'setup'}</span>
-          <span className={`rounded border px-1 py-1 ${readiness.bridge_ready ? 'border-accent-green/30 text-accent-green' : 'border-amber-400/30 text-amber-400'}`}>Bridge {readiness.bridge_ready ? 'connected' : 'offline'}</span>
+          <span className={`rounded border px-1 py-1 ${readiness.mcp_attested ? 'border-accent-green/30 text-accent-green' : 'border-amber-400/30 text-amber-400'}`}>Blender add-on {readiness.mcp_attested ? 'ready' : 'needs setup'}</span>
+          <span className={`rounded border px-1 py-1 ${readiness.runtime_attested ? 'border-accent-green/30 text-accent-green' : 'border-amber-400/30 text-amber-400'}`}>Blender app {readiness.runtime_attested ? 'ready' : 'needs setup'}</span>
+          <span className={`rounded border px-1 py-1 ${readiness.bridge_ready ? 'border-accent-green/30 text-accent-green' : 'border-amber-400/30 text-amber-400'}`}>Maestro link {readiness.bridge_ready ? 'connected' : 'offline'}</span>
         </div>
       )}
       <div className="rounded-lg border border-accent-blue/20 bg-accent-blue/5 p-2">
-        <label className="text-[9px] uppercase tracking-wide text-text-muted">Director LLM scene plan</label>
-        <textarea value={directorPrompt} onChange={event => { setDirectorPrompt(event.target.value); setDirectorPlan(null) }} rows={compact ? 2 : 3} placeholder="Describe the blocking, subjects, props, movement, and camera-readable layout…" className="mt-1 w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
-        <button disabled={!ready || !!busy || !directorPrompt.trim()} onClick={runDirector} className="mt-1.5 w-full rounded bg-accent-blue px-2 py-1.5 text-[10px] text-white disabled:opacity-40">Run Director review → full video</button>
-        <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Director receives 2–8 temporally separated frames together, revises up to three times, then renders the full-FPS video for your review.</p>
-        {directorPlan && <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">{directorPlan.llm_model} · {directorPlan.review_frames.length} batched review frames · {directorPlan.notes || directorPlan.review_strategy}</p>}
+        <label className="text-[9px] uppercase tracking-wide text-text-muted">Director scene plan</label>
+        <textarea value={directorPrompt} onChange={event => { setDirectorPrompt(event.target.value); setDirectorPlan(null) }} rows={compact ? 2 : 3} placeholder="Describe the scene, subjects, props, movement, and camera layout…" className="mt-1 w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
+        <button disabled={!ready || !!busy || !directorPrompt.trim()} onClick={runDirector} className="mt-1.5 w-full rounded bg-accent-blue px-2 py-1.5 text-[10px] text-white disabled:opacity-40">Plan, review, and render</button>
+        <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Director checks 2–8 moments from the animation together, can revise the scene up to three times, then renders the smooth full video for you.</p>
+        {directorPlan && (
+          <div className="mt-1.5 text-[9px] leading-relaxed text-text-muted">
+            <p>Scene planned · {directorPlan.review_frames.length} moments selected for review</p>
+            <details className="mt-1">
+              <summary className="cursor-pointer text-text-secondary">Production details</summary>
+              <p className="mt-1">Model: {directorPlan.llm_model}</p>
+              {(directorPlan.notes || directorPlan.review_strategy) && (
+                <p><span className="font-medium">Director notes:</span> {directorPlan.notes || directorPlan.review_strategy}</p>
+              )}
+            </details>
+          </div>
+        )}
         {directorPlan?.semantic_mapping && (
           <div className="mt-2 space-y-2 rounded border border-border bg-bg-secondary/50 p-2">
-            <p className="text-[9px] font-medium text-text-secondary">Editable semantic control legend</p>
+            <p className="text-[9px] font-medium text-text-secondary">Object-to-scene guide</p>
             {directorPlan.semantic_mapping.legend.map((entry, index) => (
               <div key={entry.object_name} className="grid grid-cols-[auto_1fr] gap-1.5 rounded border border-border/70 p-1.5">
                 <div className="flex min-w-20 items-center gap-1 text-[8px] text-text-muted">
@@ -346,7 +365,7 @@ export function BlenderSceneTool({
                 </div>
               </div>
             ))}
-            <textarea value={directorPlan.semantic_mapping.conditioned_prompt} onChange={event => updateConditionedPrompt(event.target.value)} rows={3} placeholder="Conditioned generation prompt describing the shape-to-subject/action mapping…" className="w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[9px]" />
+            <textarea value={directorPlan.semantic_mapping.conditioned_prompt} onChange={event => updateConditionedPrompt(event.target.value)} rows={3} placeholder="Describe what each shape represents and how it should move…" className="w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[9px]" />
           </div>
         )}
       </div>
@@ -366,36 +385,36 @@ export function BlenderSceneTool({
             setDuration(value => Math.min(value, maxTotalFrames / nextFps))
           }} className="mt-0.5 w-full rounded border border-border bg-bg-tertiary px-1 py-1 text-xs" /></label>
         </div>
-        <div className="col-span-2 text-[9px] text-text-muted">{frameCount} full-rate frames (0–{endFrame}) · hosted limit {maxTotalFrames} frames / {maxDuration.toFixed(1)}s at {fps} fps</div>
-        <label className="col-span-2 text-[9px] text-text-muted">LTX-2.3 full-video control mode
+        <div className="col-span-2 text-[9px] text-text-muted">{frameCount} frames (0–{endFrame}) · Maestro limit: {maxTotalFrames} frames / {maxDuration.toFixed(1)}s at {fps} fps</div>
+        <label className="col-span-2 text-[9px] text-text-muted">How the Blender animation guides LTX-2.3
           <select value={controlMode} onChange={event => setControlMode(event.target.value as LtxControlMode)} className="mt-0.5 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-xs text-text-primary">
-            <option value="TVG">Temporal depth (recommended for Blender geometry)</option>
-            <option value="VG">Raw rendered scene / motion</option>
-            <option value="EVG">Canny edges</option>
-            <option value="PTVG">Motion + temporal depth</option>
-            <option value="TEVG">Temporal depth + edges</option>
+            <option value="TVG">Depth over time (recommended for Blender scenes)</option>
+            <option value="VG">Rendered scene and motion</option>
+            <option value="EVG">Object edges</option>
+            <option value="PTVG">Motion and depth over time</option>
+            <option value="TEVG">Depth and edges over time</option>
           </select>
-          <span className="mt-1 block leading-relaxed">The Director reviews samples; the full-frame-rate render drives motion conditioning. The final refinement pass may not use the control input.</span>
+          <span className="mt-1 block leading-relaxed">Director reviews sample moments, while the full animation guides the motion. The final polish may rely less on this guide.</span>
         </label>
       </div>
       <div className="grid grid-cols-2 gap-1.5">
         <button disabled={!ready || !!busy} onClick={create} className="rounded border border-border px-2 py-1.5 text-[10px] text-text-secondary disabled:opacity-40"><Box size={10} className="mr-1 inline" />Create / reset</button>
         <button disabled={!ready || !!busy} onClick={animate} className="rounded border border-border px-2 py-1.5 text-[10px] text-text-secondary disabled:opacity-40"><Play size={10} className="mr-1 inline" />Animate {endFrame}f</button>
         <button disabled={!ready || !!busy} onClick={inspect} className="rounded border border-border px-2 py-1.5 text-[10px] text-text-secondary disabled:opacity-40"><Eye size={10} className="mr-1 inline" />Inspect</button>
-        <button disabled={!ready || !!busy} onClick={runManualDirector} className="rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40"><Play size={10} className="mr-1 inline" />Director review + render</button>
+        <button disabled={!ready || !!busy} onClick={runManualDirector} className="rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40"><Play size={10} className="mr-1 inline" />Review and render</button>
       </div>
       {busy && <p className="flex items-center gap-1 text-[10px] text-accent-blue"><Loader2 size={10} className="animate-spin" />{busy}…</p>}
       {message && <p className="text-[9px] leading-relaxed text-text-muted">{message}</p>}
       {directorFinal && (
         <div className="space-y-2 rounded-lg border border-accent-green/30 bg-accent-green/5 p-2">
-          <p className="text-[10px] text-accent-green">Director approved after {directorFinal.director_reviews.length} batched review pass{directorFinal.director_reviews.length === 1 ? '' : 'es'} · {directorFinal.director_model}</p>
+          <p className="text-[10px] text-accent-green">Director finished {directorFinal.director_reviews.length} review round{directorFinal.director_reviews.length === 1 ? '' : 's'}</p>
           <video src={directorFinal.video.url} controls className="aspect-video w-full rounded bg-media-canvas object-contain" />
           <div className="flex gap-1.5">
             <button disabled={!!busy} onClick={() => void setFinalStatus('kept')} className="flex flex-1 items-center justify-center gap-1 rounded bg-accent-green/20 px-2 py-1.5 text-[10px] text-accent-green"><Check size={10} />Keep motion video</button>
             <button disabled={!!busy} onClick={() => void setFinalStatus('rejected')} className="flex items-center justify-center gap-1 rounded border border-border px-2 py-1.5 text-[10px] text-text-muted"><X size={10} />Reject</button>
           </div>
-          <textarea value={editPrompt} onChange={event => setEditPrompt(event.target.value)} rows={2} placeholder="Describe the edits Director should make, then it will re-review batched frames and render a new full video…" className="w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
-          <button disabled={!ready || !!busy || !editPrompt.trim()} onClick={requestEdits} className="flex w-full items-center justify-center gap-1 rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40"><RotateCcw size={10} />Request edits & re-review</button>
+          <textarea value={editPrompt} onChange={event => setEditPrompt(event.target.value)} rows={2} placeholder="Describe what Director should change, then it will review and render a new video…" className="w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
+          <button disabled={!ready || !!busy || !editPrompt.trim()} onClick={requestEdits} className="flex w-full items-center justify-center gap-1 rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40"><RotateCcw size={10} />Make changes and review again</button>
         </div>
       )}
     </div>

@@ -6,11 +6,12 @@ import { build } from 'esbuild'
 
 const source = relative => readFile(new URL(relative, import.meta.url), 'utf8')
 
-const [duration, profiles, resolution, prompt, models, inputs, css] = await Promise.all([
+const [duration, profiles, resolution, prompt, music, models, inputs, css] = await Promise.all([
   source('../src/components/Sidebar/DurationSlider.tsx'),
   source('../src/components/Sidebar/H3PerformanceProfiles.tsx'),
   source('../src/components/Sidebar/ResolutionPresets.tsx'),
   source('../src/components/Sidebar/PromptInput.tsx'),
+  source('../src/components/Sidebar/MusicControls.tsx'),
   source('../src/components/Sidebar/ModelSelector.tsx'),
   source('../src/components/Sidebar/InputsPanel.tsx'),
   source('../src/index.css'),
@@ -117,7 +118,11 @@ test('H3 duration controls retain planning callbacks and expose mobile targets',
   assert.match(duration, /checked=\{h3AdaptiveConditioning\}/)
   assert.match(duration, /onChange=\{event => setParam\('h3_adaptive_conditioning', event\.target\.checked\)\}/)
   assert.match(duration, /mb-1\.5 flex flex-wrap items-center justify-between/)
-  assert.match(duration, /Estimated segments \$\{estimatedSegmentLabel\}/)
+  assert.match(duration, /Estimated shots \$\{estimatedSegmentLabel\}/)
+  assert.match(duration, /Match each shot to its references automatically/)
+  assert.match(duration, /appears on its card immediately[\s\S]*pause briefly for plan review[\s\S]*continue automatically if you leave the plan unchanged and accept any required model terms/)
+  assert.match(duration, /Mode details[\s\S]*FL2VA or Ref2VA/)
+  assert.match(duration, /technical comparison profiles/)
 })
 
 test('performance profile and resolution selection remain exact at compact and narrow widths', () => {
@@ -130,6 +135,9 @@ test('performance profile and resolution selection remain exact at compact and n
   const nativeResolution = openingTag(resolution, 'select', 'value={resolution}')
   assertMobileTarget(nativeResolution, 'H3 resolution select')
   assert.match(nativeResolution, /onChange=\{event => setH3NativeResolution\(event\.target\.value\)\}/)
+  assert.match(resolution, /Loading supported creation sizes/)
+  assert.match(resolution, /choose a supported size/)
+  assert.match(resolution, /supported creation size/)
   assert.match(resolution, /max-w-full overflow-x-auto/)
   assert.match(resolution, /role="group" aria-label="Resolution presets"/)
   const preset = openingTag(resolution, 'button', 'onClick={() => setResolutionPreset(p)}')
@@ -143,16 +151,20 @@ test('performance profile and resolution selection remain exact at compact and n
   assert.ok(5 * 44 <= narrowUsableWidth, 'five preset controls retain a 44px floor at 320px')
 })
 
-test('workflow provenance and Enhance actions are reachable without changing request semantics', () => {
+test('creative-guide provenance and Enhance actions are reachable without changing request semantics', () => {
   const workflowSelect = openingTag(prompt, 'select', 'value={selection}')
   const workflowSource = openingTag(prompt, 'a', 'href={catalog.source}')
   const enhance = openingTag(prompt, 'button', 'onClick={() => enhancePrompt()}')
 
-  assertMobileTarget(workflowSelect, 'H3 workflow select')
+  assertMobileTarget(workflowSelect, 'creative guide select')
   assert.match(workflowSelect, /onChange=\{event => setSelection\(event\.target\.value\)\}/)
-  assertMobileTarget(workflowSource, 'official H3 workflow source')
+  assertMobileTarget(workflowSource, 'creative guide source')
   assert.match(workflowSource, /target="_blank"/)
   assert.match(workflowSource, /rel="noreferrer"/)
+  assert.match(prompt, /Creative guide/)
+  assert.match(prompt, /Choose an optional guide for pacing, framing, and finish/)
+  assert.match(prompt, /Source details[\s\S]*MiniMax H3 recipe library/)
+  assert.match(prompt, /Configured writing assistant/)
   assertMobileTarget(enhance, 'prompt Enhance button')
   assert.match(enhance, /aria-label="Enhance prompt with AI"/)
   assert.match(prompt, /mobile-control-target mt-1 flex cursor-pointer items-start/)
@@ -168,6 +180,12 @@ test('workflow provenance and Enhance actions are reachable without changing req
   for (const mode of ['monologue', 'monologue_fast', 'dialogue', 'dialogue_fast']) {
     assert.match(prompt, new RegExp(`runTtsEnhancement\\('${mode}'\\)`))
   }
+})
+
+test('song drafting copy leads with the creator goal instead of implementation jargon', () => {
+  assert.match(music, /configured AI writing assistant can draft the Style/)
+  assert.match(music, /Review and edit the draft below/)
+  assert.doesNotMatch(music, /Let the LLM write/)
 })
 
 test('model selection, terms, and manual-install actions retain authority and exact URLs', () => {
@@ -208,6 +226,8 @@ test('model selection, terms, and manual-install actions retain authority and ex
   assert.match(downloadLink, /rel="noreferrer"/)
   assert.match(models, /disabled=\{hostTermsLoading \|\| !hostTerms\}/)
   assert.match(models, /disabled=\{verifyingManualCheckpoint \|\| pendingRequirements\.length > 0\}/)
+  assert.match(models, /label: 'Reference media'/)
+  assert.match(models, /label: 'Reference images'/)
   assert.match(option, /aria-pressed=\{isSelected\}/)
   assert.match(models, /\[&_button\]:min-h-11/)
   assert.match(models, /md:\[&_button\]:min-h-0/)
@@ -218,6 +238,9 @@ test('model selection, terms, and manual-install actions retain authority and ex
   assert.match(h3Authorization, /rel="noreferrer"/)
   assert.match(h3Authorization, />\{HOST_TERM_NOTICES\.minimax_h3_ref2va\.linkLabel\}<\/a>/)
   assert.match(inputs, /void acceptHostTerm\('minimax_h3_ref2va'\)/)
+  assert.match(inputs, /MiniMax H3 input mode/)
+  assert.match(inputs, /Reference media can guide characters, objects, settings, style, motion, or sound/)
+  assert.doesNotMatch(inputs, />\s*Semantic context:/)
 })
 
 test('shared target contract ends below the 768px compact breakpoint', () => {

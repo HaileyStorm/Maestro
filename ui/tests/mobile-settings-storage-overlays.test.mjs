@@ -15,6 +15,7 @@ import {
 const settingsUrl = new URL('../src/components/SettingsDrawer/SettingsDrawer.tsx', import.meta.url)
 const storageUrl = new URL('../src/components/StorageDashboard/StorageDashboard.tsx', import.meta.url)
 const systemSettingsUrl = new URL('../src/components/SettingsDrawer/SystemSettingsPanel.tsx', import.meta.url)
+const servicesSettingsUrl = new URL('../src/components/SettingsDrawer/ServicesSettingsPanel.tsx', import.meta.url)
 
 class FakeDocument extends EventTarget {
   activeElement = null
@@ -325,6 +326,13 @@ test('Settings and Storage geometry, labels, and controls cover the narrow 200% 
   assert.match(storage, /z-\[70\]/)
   assert.match(storage, /md:flex-nowrap/)
   assert.match(storage, /aria-label=\{`\$\{confirmKey === key \? 'Confirm ' : ''\}\$\{label\} \$\{accessibleSubject\}`\}/)
+  assert.match(storage, /Duplicate files across installations/)
+  assert.match(storage, /Delete Maestro copy/)
+  assert.match(storage, /Recycle other copy/)
+  assert.match(storage, /from \$\{d\.linked_install\} to the Recycle Bin/)
+  assert.match(storage, /Windows Recycle Bin, where it can be restored/)
+  assert.match(storage, /This LoRA is stored in another installation, so it cannot be deleted here/)
+  assert.doesNotMatch(storage, /deleting Maestro's copy is free|Allow removing from linked installs|linked only/)
   assert.match(systemSettings, /aria-haspopup="dialog"/)
   assert.match(systemSettings, /aria-controls="storage-manager-dialog"/)
 
@@ -357,4 +365,15 @@ test('Settings and Storage geometry, labels, and controls cover the narrow 200% 
 
   const zoomedWidths = [640, 780, 860].map(width => width / 2)
   assert.deepEqual(zoomedWidths, [320, 390, 430], 'matrix covers 200% zoom CSS widths')
+})
+
+test('Services settings explain model location and external data use in plain language', async () => {
+  const services = await readFile(servicesSettingsUrl, 'utf8')
+  assert.match(services, /Writing Assistant/)
+  assert.match(services, /Where the assistant runs/)
+  assert.match(services, /const providerLabel = isRemote \? 'your configured server' : isOpenAI \? 'OpenAI' : 'Anthropic'/)
+  assert.match(services, /prompt text and any attached context may be sent there/)
+  assert.match(services, /terms and privacy policy apply separately/)
+  assert.match(services, /The first use may download about 4 GB of model files, which Maestro saves for later/)
+  assert.doesNotMatch(services, /dialect-specific enhance pipeline|shared host cache/)
 })

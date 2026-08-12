@@ -29,7 +29,6 @@ import {
   hasProjectReferenceLoraParameterSummary,
   getProjectReferenceRepairCopy,
   getProjectReferenceReviewerAction,
-  getProjectReferenceReviewerSetupCopy,
   getProjectReferenceRetrySettings,
   isProjectReferenceReviewMandatory,
   isProjectReferenceCharacterReplayReady,
@@ -1312,8 +1311,8 @@ test('Reference candidate cards consume only the closed public fidelity projecti
   assert.match(referenceTypes, /final_correction\?: \{/)
   assert.match(source, /const qualityPresentation = projectReferenceQualityPresentation\(packMetadata\)/)
   assert.match(source, />Recommended<\/span>/)
-  assert.match(source, /Preliminary recommendation · ungraded/)
-  assert.match(source, /Structured correction guidance is available for Retry or Edit\./)
+  assert.match(source, /Preliminary recommendation · not yet graded/)
+  assert.match(source, /Suggested fixes are available for Retry or Edit\./)
   assert.match(clientSource, /This candidate remains usable/)
   assert.doesNotMatch(source, /quality\.warning|rendered_brief|private_authored_settings/)
   const actions = source.slice(
@@ -1624,18 +1623,14 @@ test('required Paperscarecrow reviewer is queue-ready while installed but unload
   assert.equal(isProjectReferenceReviewerEligible(
     'uncensored_auto', base.resolved_model, 'remote', [], capabilities,
   ), false)
-  assert.equal(
-    getProjectReferenceReviewerSetupCopy(base),
-    'Paperscarecrow and its MMProj are installed. They will load automatically when local fidelity review starts.',
-  )
   assert.equal(getProjectReferenceReviewerAction(base.setup_state), null)
 
-  for (const [setup_state, patch, expected] of [
-    ['missing_model', { installed: false, queue_ready: false }, /checkpoint is not installed/],
-    ['missing_projector', { projector_available: false, queue_ready: false }, /required MMProj is missing/],
-    ['loading', { loading: true, loading_phase: 'loading projector', queue_ready: false }, /loading \(loading projector\)/],
-    ['loaded_without_vision', { resident: true, vision_available: false, queue_ready: false }, /MMProj did not initialize/],
-    ['ready_resident', { resident: true, vision_available: true, queue_ready: true }, /loaded with its MMProj/],
+  for (const [setup_state, patch] of [
+    ['missing_model', { installed: false, queue_ready: false }],
+    ['missing_projector', { projector_available: false, queue_ready: false }],
+    ['loading', { loading: true, loading_phase: 'loading projector', queue_ready: false }],
+    ['loaded_without_vision', { resident: true, vision_available: false, queue_ready: false }],
+    ['ready_resident', { resident: true, vision_available: true, queue_ready: true }],
   ]) {
     const contract = { ...base, ...patch, setup_state }
     assert.equal(isProjectReferenceReviewerEligible(
@@ -1643,17 +1638,10 @@ test('required Paperscarecrow reviewer is queue-ready while installed but unload
       [{ id: base.resolved_model, provider: 'local' }],
       { uncensored_auto_review: contract },
     ), contract.queue_ready)
-    assert.match(getProjectReferenceReviewerSetupCopy(contract), expected)
   }
-  assert.deepEqual(getProjectReferenceReviewerAction('missing_model'), {
-    kind: 'load', label: 'Install / load required reviewer',
-  })
-  assert.deepEqual(getProjectReferenceReviewerAction('missing_projector'), {
-    kind: 'load', label: 'Install / load required reviewer',
-  })
-  assert.deepEqual(getProjectReferenceReviewerAction('loaded_without_vision'), {
-    kind: 'reload', label: 'Reload required reviewer',
-  })
+  assert.equal(getProjectReferenceReviewerAction('missing_model')?.kind, 'load')
+  assert.equal(getProjectReferenceReviewerAction('missing_projector')?.kind, 'load')
+  assert.equal(getProjectReferenceReviewerAction('loaded_without_vision')?.kind, 'reload')
   assert.equal(getProjectReferenceReviewerAction('loading'), null)
   assert.equal(getProjectReferenceReviewerAction('ready_resident'), null)
 })
@@ -1804,6 +1792,46 @@ test('project reference display errors scrub arbitrary exception details', () =>
   )
 })
 
+test('Reference Studio status copy uses bounded labels and neutral unknown fallbacks', async () => {
+  const source = await readFile(componentUrl, 'utf8')
+  const helperStart = source.indexOf('const PROJECT_REFERENCE_PROVIDER_LABELS')
+  const helperEnd = source.indexOf('function referenceSheetStatus', helperStart)
+  assert.ok(helperStart >= 0 && helperEnd > helperStart)
+  const compiled = ts.transpileModule(`${source.slice(helperStart, helperEnd)}\nexport { projectReferenceProviderLabel, projectReferenceModelLabel, projectReferenceVariantStatusLabel, projectReferenceRouteStatusLabel, projectReferenceOperationLabel, projectReferenceLoraScopeLabel, projectReferencePendingPhaseLabel, projectReferenceReviewerLoadingLabel, projectReferenceReviewerSetupLabel, projectReferenceReviewerActionLabel }`, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const labels = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+
+  assert.equal(labels.projectReferenceProviderLabel('openai'), 'OpenAI')
+  assert.equal(labels.projectReferenceProviderLabel('new-provider-id'), 'External service')
+  assert.equal(labels.projectReferenceModelLabel('known-model', [{ id: 'known-model', label: 'Known Model' }]), 'Known Model')
+  assert.equal(labels.projectReferenceModelLabel('new-model-id'), 'Model unavailable')
+  assert.equal(labels.projectReferenceVariantStatusLabel('kept'), 'Kept')
+  assert.equal(labels.projectReferenceVariantStatusLabel('new-status'), 'Status unavailable')
+  assert.equal(labels.projectReferenceRouteStatusLabel('applied'), 'Adjusted for this model')
+  assert.equal(labels.projectReferenceRouteStatusLabel('new-route'), 'Status unavailable')
+  assert.equal(labels.projectReferenceOperationLabel('repair'), 'Automatic fixes')
+  assert.equal(labels.projectReferenceOperationLabel('new-operation'), 'Other step')
+  assert.equal(labels.projectReferenceLoraScopeLabel('editing'), 'Variations')
+  assert.equal(labels.projectReferenceLoraScopeLabel('new-scope'), 'Other use')
+  assert.equal(labels.projectReferencePendingPhaseLabel('Generating pack 1/2 sheet 2/3'), 'Creating pack sheets')
+  assert.equal(labels.projectReferencePendingPhaseLabel('publishing_approved_reference_packs'), 'Finishing your pack')
+  assert.equal(labels.projectReferencePendingPhaseLabel('new internal phase'), 'Status unavailable')
+  assert.equal(labels.projectReferenceReviewerLoadingLabel('loading projector'), 'Loading image understanding')
+  assert.equal(labels.projectReferenceReviewerLoadingLabel('downloading_projector'), 'Downloading image understanding')
+  assert.equal(labels.projectReferenceReviewerLoadingLabel('building-vision-projector'), 'Preparing image understanding')
+  assert.equal(labels.projectReferenceReviewerLoadingLabel('building_runtime'), 'Preparing visual review support')
+  assert.equal(labels.projectReferenceReviewerLoadingLabel('downloading_runtime'), 'Downloading visual review support')
+  assert.equal(labels.projectReferenceReviewerLoadingLabel('new loading phase'), 'Preparation status unavailable')
+  assert.equal(labels.projectReferenceReviewerSetupLabel({ setup_state: 'loading', loading_phase: 'new loading phase' }), 'Preparation status unavailable.')
+  assert.equal(labels.projectReferenceReviewerSetupLabel({ setup_state: 'new-state' }), 'Visual review setup is unavailable. Refresh its status and try again.')
+  assert.equal(labels.projectReferenceReviewerActionLabel('load'), 'Prepare visual review model')
+  assert.equal(labels.projectReferenceReviewerActionLabel('new-action'), 'Prepare visual review model')
+})
+
 test('Reference authoring controls expose 44px mobile targets and compact at 768px', async () => {
   const source = await readFile(componentUrl, 'utf8')
   const authoringStart = source.indexOf('Create reference candidates')
@@ -1893,14 +1921,14 @@ test('Reference authoring controls expose 44px mobile targets and compact at 768
   ]) assert.match(source, template)
 
   for (const copy of [
-    'Explicit convenience',
-    'Explicit output',
-    'Keep anatomy anchor private and blurred',
-    'Review exact terms',
+    'Create anatomy detail views',
+    'Allow explicit output',
+    'Keep the anatomy main image private and blurred',
+    'Review terms',
     'Open source page',
-    'Open exact manual download',
-    'Verify local checkpoint',
-    'Refresh reviewer status',
+    'Open required download',
+    'Verify model file',
+    'Refresh visual review status',
     'Automatic · unavailable',
     '>Off</button>',
     'Queue reference packs',
@@ -1960,21 +1988,21 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.doesNotMatch(clientSource, /detail_kind\?: ProjectReferenceDetailKind/)
 
   for (const copy of [
-    'Establishes one canonical anchor',
-    'targeted reference-guided edits',
-    'fast unanchored one-shot',
+    'Creates one main image',
+    'uses it to make focused variations',
+    'Creates each sheet independently for speed',
     'Candidate count creates alternatives',
-    'Draft creates each requested sheet as an unanchored one-shot and does not use panel repair',
-    'Canonical anchor:',
-    'Depth changes update untouched sections only',
-    'Subject and content LoRAs are never enabled automatically',
+    'Draft creates each sheet independently and does not use automatic fixes',
+    'Main image:',
+    'Changing reference depth updates only sections you have not customized',
+    'Subject and content LoRAs are never turned on automatically',
     'Wardrobe & underlayers',
-    'Explicit convenience',
-    'Anatomy / Nude anchor',
-    'Gender never selects anatomy or establishes age',
-    'does not scan or infer age from text, appearance, or gender',
-    'Uncensored-capable Auto',
-    'Auto never sends data remotely',
+    'Create anatomy detail views',
+    'Anatomy / Nude main image',
+    'Gender never chooses anatomy or sets age',
+    'does not guess age from text, appearance, or gender',
+    'Unrestricted local automatic',
+    'Automatic choices never send data remotely',
   ]) assert.match(source, new RegExp(copy))
 
   assert.match(source, /asset_id: asset\.id/)
@@ -2016,7 +2044,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /\['penis', 'Penis'\]/)
   assert.doesNotMatch(source, /cpref000000|breasts_front|breasts_profile|commitment_nonce|tombstoned/)
   assert.match(source, /aria-label="Editable reference sections"/)
-  assert.match(source, /Customized · pinned/)
+  assert.match(source, /· Customized/)
   assert.match(source, /section\.values\.some\(value => value\.id === item\.id\)/)
   assert.match(source, /changeDepth\(option\.value\)/)
   assert.match(source, /if \(section\.pinned\) return section/)
@@ -2026,12 +2054,12 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /authoritativeTypeCapabilities\?\.presets\.map\(option => \(/)
   assert.match(source, /authoritativeTypeCapabilities\.type_fields\.flatMap/)
   assert.match(source, /authoritativePreset\?\.ordered_roles/)
-  assert.match(source, /Authoritative ordered roles are unavailable; generation is disabled/)
+  assert.match(source, /The sheet plan is unavailable, so generation is disabled/)
   assert.match(source, /Anatomy \/ Nude/)
   assert.match(source, /underwear \/ underlayers/)
   assert.match(source, /individual garments/)
-  assert.match(source, /Keep anatomy anchor private and blurred/)
-  assert.match(source, /Exact intent never reconstructs absent identity detail/)
+  assert.match(source, /Keep the anatomy main image private and blurred/)
+  assert.match(source, /Follow my description will not invent a missing identity detail/)
   assert.match(source, /operation === 'reconstruct' && intent === 'exact_spec'/)
   assert.match(source, /crypto\.randomUUID\(\)\.replaceAll\('-', ''\)/)
   assert.match(source, /aria-label=\{`Edit custom detail:/)
@@ -2041,10 +2069,10 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /role="status" aria-live="polite"/)
   assert.match(source, /Source sheet/)
   assert.match(source, /breasts \(front\) and breasts \(profile\)/)
-  assert.match(source, /Source Sheet chooses the authored pack sheet to crop from/)
-  assert.match(source, /Operation chooses whether Maestro auto-selects, crops, enhances, or reconstructs/)
+  assert.match(source, /Source sheet chooses which image to use/)
+  assert.match(source, /Action chooses whether Maestro decides, crops, enhances, or rebuilds/)
   assert.match(source, /validDetailSourceRoles\.map/)
-  assert.match(source, /Draft does not create editor-dependent detail outputs/)
+  assert.match(source, /Draft does not create details that require the editor model/)
   assert.match(source, /detailCallouts\.length} detail/)
   assert.doesNotMatch(source, /function detailSourceRole/)
   assert.match(source, /const detailCallouts = sheetMode === 'draft' \? \[\] : authoredDetailCallouts/)
@@ -2061,16 +2089,18 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /manualInstallationDestination\(model\.manual_installation\)/)
   assert.match(source, /model\.manual_installation\.sha256/)
   assert.match(source, /model\.manual_installation\.local_verification_required/)
-  assert.match(source, /Local host only · required/)
-  assert.match(source, /Open exact manual download/)
-  assert.match(source, /Verification is intentionally unavailable from LAN sessions/)
+  assert.match(source, /Required at localhost/)
+  assert.match(source, /Open required download/)
+  assert.match(source, /Maestro cannot safely verify or use this model/)
+  assert.match(source, /required verification method is unavailable, so Maestro cannot safely use this model/)
+  assert.match(source, /Verification is unavailable from LAN sessions/)
   assert.match(source, /fetchLoraDetails\(referenceModelType\)/)
   assert.match(source, /parameter_schema_digest: schema\?\.schema_digest/)
   assert.match(source, /parameter_values: schema \? getLoraParameterDefaults\(schema\)/)
   assert.match(source, /<LoraParameterFields/)
   assert.match(source, /schema\.trigger_disclosure\.activation_phrases\.map/)
   assert.match(source, /Known activation phrases/)
-  assert.match(source, /LoRA multiplier remains a separate strength control/)
+  assert.match(source, /LoRA strength is controlled separately/)
   assert.match(source, /aria-invalid=\{fieldErrors\.length > 0\}/)
   assert.match(source, /const describedBy = \[parameter\.description \? helpId/)
   assert.match(source, /loraParameterSnapshots\.current\.set/)
@@ -2079,9 +2109,9 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /privateLora\.parameter_values_digest === recorded\.valuesDigest/)
   assert.match(source, /privateLora\.parameter_expansion_digest === recorded\.expansionDigest/)
   assert.match(source, /privateIds\.every\(\(id, index\) => id === recorded\.ids\[index\]\)/)
-  assert.match(source, /Retry private replay/)
-  assert.match(source, /its published parameter schema changed/)
-  assert.match(source, /values will not be guessed or migrated/)
+  assert.match(source, /Reload private settings/)
+  assert.match(source, /its available settings have changed/)
+  assert.match(source, /Maestro will not guess or change values/)
   assert.match(source, /aria-label="Reference planning model"/)
   assert.match(source, /aria-label="Reference visual review model"/)
   assert.match(source, /Auto \(local only\)/)
@@ -2111,26 +2141,30 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /isProjectReferenceReviewMandatory\(/)
   assert.match(source, /mandatoryReview && reviewModel === 'off'/)
   assert.match(source, /value="off" disabled=\{mandatoryReview\}/)
-  assert.match(source, /Vision fidelity review is required for unrestricted or explicit output and cannot be turned off/)
+  assert.match(source, /A visual quality check is required for unrestricted or explicit output and cannot be turned off/)
   assert.match(source, /model\.id === uncensoredReviewContract\?\.resolved_model/)
   assert.match(source, /\(model\.provider \?\? 'local'\) === uncensoredReviewContract\?\.resolved_provider/)
   assert.match(source, /intelligencePolicy === 'uncensored_auto'[\s\S]*?uncensoredReviewCatalogModel \? \[uncensoredReviewCatalogModel\] : \[\]/)
   assert.match(source, /!uncensoredReviewContract\?\.queue_ready \|\| !uncensoredReviewSelectionValid/)
   assert.match(source, /reviewModel !== 'auto_local' && reviewModel !== 'off' && !exactLocalSelection/)
   assert.match(source, /aria-label="Required visual reviewer setup"/)
-  assert.match(source, /MMProj: \{uncensoredReviewContract\.projector_available/)
-  assert.match(source, /not loaded; automatic load available/)
-  assert.match(source, /no generic or remote fallback/)
+  assert.match(source, /Image understanding: \{uncensoredReviewContract\.projector_available/)
+  assert.match(source, /projectReferenceReviewerLoadingLabel\(uncensoredReviewContract\.loading_phase\)/)
+  assert.match(source, /Ready to load automatically/)
+  assert.match(source, /No remote fallback/)
+  assert.match(source, />Technical details<\/summary>/)
+  assert.match(source, /Loading phase ID: \{uncensoredReviewContract\.loading_phase\}/)
   assert.match(source, /getProjectReferenceReviewerAction\(/)
   assert.match(source, /loadRequired && \(!machineControls \|\| !modelId\)/)
   assert.match(source, /await loadLlm\(\{ model_id: modelId, provider: 'local' \}\)/)
   assert.match(source, /Promise\.all\(\[\s*fetchLlmModels\(project\),\s*fetchProjectReferenceCapabilities\(project\)/)
   assert.match(source, /isProjectAssetOperationCurrent\(\s*submittedProject, epoch, currentProject\.current, projectEpoch\.current/)
-  assert.match(clientSource, /Install \/ load required reviewer/)
-  assert.match(clientSource, /Reload required reviewer/)
-  assert.match(source, /Refresh reviewer status/)
-  assert.match(source, /LAN sessions can refresh status but cannot change the local model runtime/)
-  assert.match(source, /Could not install or load the required reviewer/)
+  assert.match(source, /projectReferenceReviewerSetupLabel\(uncensoredReviewContract\)/)
+  assert.match(source, /projectReferenceReviewerActionLabel\(reviewerSetupAction\.kind\)/)
+  assert.doesNotMatch(source, /getProjectReferenceReviewerSetupCopy/)
+  assert.match(source, /Refresh visual review status/)
+  assert.match(source, /LAN sessions can refresh its status but cannot change models running on the host/)
+  assert.match(source, /Could not prepare the required visual review model/)
   assert.match(source, /intelligencePolicy === 'standard_auto' && selectedReviewModel/)
   assert.match(source, /const queueBlockers = getProjectReferenceQueueBlockers\(/)
   assert.match(source, /const visibleQueueBlockers = queueBlockers\.filter\(blocker => blocker\.id !== 'submitting'\)/)
@@ -2148,20 +2182,24 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   const freshRequest = source.slice(source.indexOf('const generate = async'), source.indexOf('const generateFromVariant = async'))
   assert.doesNotMatch(freshRequest, /managed_character_callouts:/)
   assert.match(source, /normalizeProjectReferenceAnchorPrivacy\(/)
-  assert.match(source, /Anchor privacy:/)
-  assert.match(source, /Operation routing:/)
-  assert.match(source, /route\.requested_model/)
-  assert.match(source, /route\.resolved_model/)
-  assert.match(source, /requested_capability/)
-  assert.match(source, /route\.schedule/)
-  assert.match(source, /route\.recipe_id/)
-  assert.match(source, /route\.verification_status/)
-  assert.match(source, /route\.reason/)
+  assert.match(source, /Main image visibility:/)
+  assert.match(source, /Processing:/)
+  assert.match(source, /projectReferenceOperationLabel\(operation\)/)
+  assert.match(source, /projectReferenceRouteStatusLabel\(route\.status\)/)
+  assert.match(source, /projectReferenceVariantStatusLabel\(variant\.status\)/)
+  assert.match(source, /projectReferencePendingPhaseLabel\(job\?\.phase\)/)
+  assert.match(source, /projectReferenceModelLabel\(planningModelId, llmCatalogModels\)/)
+  assert.match(source, /projectReferenceProviderLabel\(packMetadata\.planning\.resolved_provider\)/)
+  assert.match(source, /lora\.resolved_scope\.map\(projectReferenceLoraScopeLabel\)/)
+  assert.match(source, /packMetadata\.additional_loras\.skipped\.length} not used/)
+  assert.match(source, /Not used reason ID: \{lora\.reason\}/)
+  assert.doesNotMatch(source, />\{variant\.status\}<\/span>/)
+  assert.doesNotMatch(source, /Pack \{jobId\}:/)
   assert.match(source, /fetchLoraDetails\(referenceModelType\)/)
   assert.match(source, /fetchLoraDetails\(editorModelType\)/)
-  assert.match(source, /Auto compatible/)
-  assert.match(source, /Create \/ anchor/)
-  assert.match(source, /Edit \/ derivative/)
+  assert.match(source, /Best fit/)
+  assert.match(source, /Main image/)
+  assert.match(source, /Variations/)
   assert.doesNotMatch(source, /selectedModelPerMode/)
   assert.match(source, /aria-label=\{`Import media for \$\{asset\.name\}`\}/)
   assert.doesNotMatch(source, /accept="image\/\*,video\/\*"\s+className="hidden"/)
@@ -2183,12 +2221,12 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /response\.authored_settings\.character_profile/)
   assert.match(source, /response\.authored_settings\.explicit_convenience/)
   assert.doesNotMatch(source, /response\.authored_settings\.managed_character_callouts/)
-  assert.match(source, /Exact private authoring is unavailable for this candidate/)
+  assert.match(source, /The private creation settings for this candidate are unavailable/)
   assert.match(source, /disabled=\{Boolean\(pendingAction\) \|\| !exactRetryReady\}/)
   assert.match(source, /resolveProjectReferenceRetryReview\(/)
   assert.match(source, /if \(!retryReview\.ready\)/)
-  assert.match(source, /The recorded reviewer is unavailable; Retry or Edit will use the current compatible reviewer/)
-  assert.match(source, /style, profile, custom fields, and details are never silently dropped/)
+  assert.match(source, /The original visual review model is unavailable\. Retry or Edit will use the current compatible model/)
+  assert.match(source, /none of your style, profile, custom fields, or details are lost/)
   assert.match(source, /const sourcePreset = sourceAssetType === assetType/)
   assert.match(source, /asset_type: sourceSettings\.asset_type/)
   assert.match(source, /mode: sourceSettings\.mode/)
@@ -2211,7 +2249,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /aria-label="Dismiss project reference error"/)
   assert.match(source, /modelLoadError && <p role="status"/)
   assert.match(source, /source mode, model, privacy, and repair policy were preserved;/)
-  assert.match(source, /preserves recorded style, source mode, resolved model pair, privacy, repair, planning, and review policy/)
+  assert.match(source, /reuse the saved style, models, privacy, fixes, planning, and quality-check choices/)
   assert.doesNotMatch(source, /One bounded repair/)
   assert.equal(source.match(/setActionError\(''\)/g)?.length, 3)
   assert.doesNotMatch(source, /job\?\.error/)
@@ -2248,7 +2286,7 @@ test('Reference peer, catalog races, Moody cards, manifests, and Blender contrac
   assert.match(source, /catalogSequence !== catalogRequestSequence\.current/)
   assert.match(source, /if \(active && projectExplicitlyLocked\) setSidebarMode\(referenceReturnMode\)/)
   assert.doesNotMatch(source, /createPortal\(|installModalFocus\(|aria-haspopup="dialog"/)
-  assert.match(source, /create and manage reusable reference packs/)
+  assert.match(source, /create and manage reusable visual references/)
 
   const nameIndex = source.indexOf('id="project-reference-name"')
   const intentIndex = source.indexOf('>Intent</legend>')
@@ -2299,18 +2337,18 @@ test('Reference peer, catalog races, Moody cards, manifests, and Blender contrac
   assert.match(selector, /manualInstallationDestination\(currentModel\.manual_installation\)/)
   assert.match(manualInstallation, /formatManualInstallationBytes/)
   assert.match(manualInstallation, /manualInstallationDestination/)
-  assert.match(selector, /Open exact manual download/)
-  assert.match(selector, /Local-only verification:/)
+  assert.match(selector, /Download the required file/)
+  assert.match(selector, /Maestro will check its size and SHA-256 fingerprint on the computer where it runs/)
   assert.match(store, /manual_installation: m\.manual_installation/)
 
   assert.match(source, /aria-label="Reference creation method"/)
   assert.match(source, /Image Reference Pack/)
   assert.match(source, /Blender Motion Video/)
-  assert.match(source, /Create, preview, Keep, and apply a structured motion\/camera reference to Generate/)
+  assert.match(source, /Create, preview, keep, and use a motion and camera reference in Generate/)
   assert.match(source, /referenceName=\{name\}/)
   assert.match(source, /referenceDescription=\{description\}/)
   assert.match(source, /privateOutput=\{referenceExplicitOutput \|\| privateOutput\}/)
-  assert.match(source, /separate from the durable Character, Location, Wardrobe/)
+  assert.match(source, /Your reference category above stays the same/)
   assert.match(blender, /reference_name: resolvedReferenceName/)
   assert.match(blender, /private_output: privateOutput/)
   assert.match(blender, /statusRequest/)
@@ -2319,7 +2357,7 @@ test('Reference peer, catalog races, Moody cards, manifests, and Blender contrac
   assert.match(blender, /await refreshOutputs\(\)/)
   assert.match(blender, /setDirectorPlan\(null\)/)
   assert.match(blender, /workspaceRef\.current === operation\.workspace/)
-  assert.match(blender, /separate reference contract/)
+  assert.match(blender, /Blender keeps its own contract/)
   assert.match(blender, /Keep motion video/)
 })
 
@@ -2373,7 +2411,7 @@ test('Reference reviewer readiness auto-refresh is bounded, exact, and lifecycle
   assert.match(effect, /missing_model[\s\S]*?missing_projector[\s\S]*?ready_unloaded[\s\S]*?ready_resident/)
   assert.match(effect, /clearTimeout\(timeoutId\)/)
   assert.doesNotMatch(effect, /setReviewerAction\(|setReviewerActionError\(/)
-  assert.match(source, /Refresh reviewer status/)
+  assert.match(source, /Refresh visual review status/)
 })
 
 test('accepted Reference submissions retry read-only confirmation without duplicate POSTs or red busy copy', async () => {
@@ -2555,7 +2593,7 @@ test('Reference creation methods are reversible across every semantic type and s
   assert.match(source, /setCandidateKind\('image_pack'\)[\s\S]*?setAssetType\('character'\)/)
   assert.equal(source.match(/setCandidateKind\('image_pack'\)/g)?.length, 2, 'only project and lock resets canonicalize the method')
   assert.match(source, /setCandidateKind\(transition\.candidateKind\)\s+if \(!transition\.assetTypeChanged\) return/)
-  assert.match(source, /The visual fidelity reviewer checks identity, anatomy, layout, style adherence, and retry quality\./)
+  assert.match(source, /The visual quality check looks for consistent identity, anatomy, layout, and style\./)
   assert.match(source, /It does not classify or censor content or decide whether a request is allowed\./)
 })
 
@@ -2580,15 +2618,15 @@ test('Reference and Director expose style, skill, flow, and truthful Blender cho
   assert.match(reference, /style: sourceAuthoredSnapshot\?\.style/)
   assert.match(reference, /style: sourceSettings\.style \|\| undefined/)
   assert.match(reference, /isProjectReferenceStyleReplayReady\(/)
-  assert.match(reference, /Exact private style is unavailable or its commitment changed/)
-  assert.match(reference, /use Custom when your own freeform style should be authoritative/)
+  assert.match(reference, /The private style settings are unavailable or have changed/)
+  assert.match(reference, /select Custom to describe your own style/)
   assert.match(reference, /section\.values\.length >= 8/)
 
   assert.match(director, /Welcome to Maestro Director\. Choose a Skill below/)
   assert.match(director, /<fieldset aria-label="Director Skills"/)
   assert.match(director, /<legend[^>]*>Skills<\/legend>/)
   assert.match(director, /aria-label="Director visual style"/)
-  assert.match(director, /use Custom when your own freeform style should be authoritative/)
+  assert.match(director, /choose Custom to describe your own style/)
   assert.match(director, /<legend[^>]*>Additional references<\/legend>/)
   assert.match(director, /aria-label="Additional reference methods"/)
   assert.match(director, /Character photos/)

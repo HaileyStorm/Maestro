@@ -219,14 +219,14 @@ test('mounted Generate and Director controls use server catalog provenance and e
     const elements = flattenElements(tree)
     const select = elements.find(element => element.type === 'select')
     assert.ok(select)
-    assert.equal(select.props['aria-label'], `${surface} H3 style workflow`)
+    assert.equal(select.props['aria-label'], `${surface} creative guide`)
     assert.deepEqual(
       flattenElements(select.props.children).filter(element => element.type === 'option').map(element => element.props.value),
       ['', workflow.id],
     )
-    assert.match(elementText(tree), /Official MiniMax H3 Hub\/canvas workflow metadata, adapted by Maestro/)
-    assert.match(elementText(tree), /does not reproduce the complete upstream workflow/)
-    assert.match(elementText(tree), /Offline fallback catalog · source revision official-revision · Maestro-adapted brief/)
+    assert.match(elementText(tree), /Choose an optional guide for pacing, framing, and finish/)
+    assert.match(elementText(tree), /original recipe may include details this guide does not apply/)
+    assert.match(elementText(tree), /Source detailsMiniMax H3 recipe library · Offline fallback catalog · revision official-revision · Maestro interpretation/)
     assert.equal(elements.find(element => element.type === 'a')?.props.href, catalog().source)
     select.props.onChange({ target: { value: '' } })
     assert.equal(prompt, 'authored prompt bytes\n\nremain exact')
@@ -379,4 +379,22 @@ test('source removes client prefix authoring and wires catalog-gated requests on
   assert.match(store, /h3_style_workflow: h3WorkflowRequest\.h3_style_workflow/)
   assert.match(store, /H3_STYLE_PREFIX_MIGRATION_KEY/)
   assert.doesNotMatch(store, /prompt_brief:/)
+})
+
+test('Director image progress uses friendly known states and a neutral unknown fallback', async () => {
+  const director = await readFile(
+    new URL('../src/components/Sidebar/DirectorChat.tsx', import.meta.url),
+    'utf8',
+  )
+  for (const copy of [
+    "generating: 'Creating image'",
+    "polling: 'Waiting for image'",
+    "downloading: 'Saving image'",
+    "done: 'Image ready'",
+    "error: 'Image needs attention'",
+    "|| 'Working on image'",
+  ]) assert.match(director, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.match(director, /imageStatusCopy\(imageGenProgress\.status\)/)
+  assert.doesNotMatch(director, /` — \$\{imageGenProgress\.status\}`/)
+  assert.match(director, /<summary[^>]*>Technical details<\/summary>[\s\S]*?Reported state: \{imageGenProgress\.status\}/)
 })

@@ -1352,7 +1352,7 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
             prompt_ui = handle.read()
         self.assertIn("if (hasGlobalTimeline(prompt))", store)
         self.assertIn("params.multi_prompts_gen_type = 2", store)
-        self.assertIn("Global timeline detected", prompt_ui)
+        self.assertIn("Full-video timing detected", prompt_ui)
         self.assertIn("[00:00-00:10]", prompt_ui)
 
     def test_studio_enhancement_is_explicit_and_names_the_effective_model(self):
@@ -1428,7 +1428,6 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         timeline = Path(ROOT, "ui", "src", "lib", "timelinePrompt.ts").read_text(encoding="utf-8")
         self.assertIn("Window size", duration)
         self.assertIn("Automatic", duration)
-        self.assertIn("Effective aligned value for this model", duration)
         self.assertIn("if (!modelOptions?.sliding_window) return null", duration)
         self.assertIn("safeOverlapMax", duration)
         self.assertIn("alignStudioTotalFrames(Math.round(s * fps), options)", store)
@@ -1437,10 +1436,11 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("export function alignTotalFrames", timeline)
         self.assertIn("export function alignStudioTotalFrames", timeline)
         self.assertIn("export function usesStudioSegments", timeline)
-        self.assertIn("Maximum segment length", duration)
-        self.assertIn("Estimated segments", duration)
-        self.assertIn("not a target or average", duration)
-        self.assertIn("shorter, unequal prompt-driven shots", duration)
+        self.assertIn("Maximum shot length", duration)
+        self.assertIn("Maximum section length", duration)
+        self.assertIn("Estimated shots", duration)
+        self.assertIn("hard maximum", duration)
+        self.assertIn("shorter or uneven", duration)
 
     def test_automatic_h3_output_restore_returns_to_studio_semantics(self):
         store = Path(ROOT, "ui", "src", "stores", "useStore.ts").read_text(encoding="utf-8")
@@ -1460,7 +1460,7 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         ).read_text(encoding="utf-8")
         self.assertIn("checkpoint_options", dialog)
         self.assertIn("will auto-download", dialog)
-        self.assertIn("server-managed H3 catalog", dialog)
+        self.assertIn("Continuum’s built-in model list", dialog)
         self.assertIn("unavailable_reason", dialog)
         self.assertIn("disabled={Boolean(getModelBlockedReason", dialog)
 
@@ -1632,9 +1632,10 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         resolution = Path(
             ROOT, "ui", "src", "components", "Sidebar", "ResolutionPresets.tsx",
         ).read_text(encoding="utf-8")
-        self.assertIn("· native", resolution)
-        self.assertIn("learned upscale", resolution)
-        self.assertIn("exact delivery", resolution)
+        self.assertIn("creation size", resolution)
+        self.assertIn("FlashVSR", resolution)
+        self.assertIn("upscale", resolution)
+        self.assertIn("final export", resolution)
         self.assertIn("setH3NativeResolution(event.target.value)", resolution)
 
     def test_h3_delivery_selects_only_explicit_final_or_joined_video(self):

@@ -1,9 +1,8 @@
 """Focused source contracts for the project-scoped Chat branch UI."""
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHAT_UI = ROOT / "ui" / "src" / "components" / "LlmChat.tsx"
@@ -49,14 +48,20 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
             "pending.requiresFreshImage && pending.images.length === 0",
             self.source,
         )
-        self.assertIn("Reattach at least one image", self.source)
-        self.assertIn("Retry unavailable: this branch contains one-use images", self.source)
+        self.assertIn(
+            "Attach at least one image again before sending this message.",
+            self.source,
+        )
+        self.assertIn(
+            "Retry unavailable: this part of the conversation used temporary images.",
+            self.source,
+        )
 
     def test_streaming_status_is_scoped_accessible_and_not_persisted(self):
         self.assertIn("liveChatStatus.workspace === activeWorkspace", self.source)
         self.assertIn("liveChatStatus.projectInstance === projectInstance", self.source)
         self.assertIn('aria-label="Streaming assistant response"', self.source)
-        self.assertIn('aria-label="LLM request status"', self.source)
+        self.assertIn('aria-label="Language model response status"', self.source)
         self.assertIn('role="log"', self.source)
         self.assertIn('aria-atomic="false"', self.source)
         self.assertIn("activeLiveStatus.partial_text", self.source)
@@ -71,6 +76,79 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
         self.assertNotIn("latestStatus", persisted)
         self.assertNotIn("partial_text", persisted)
         self.assertNotIn("uploadedRefs", persisted)
+
+    def test_progress_steps_use_plain_language_and_have_a_safe_fallback(self):
+        progress_start = self.source.index("function chatProgressStep")
+        progress_end = self.source.index("function downloadProgress", progress_start)
+        progress_copy = self.source[progress_start:progress_end]
+        for mapping in (
+            "case 'queued': return 'Waiting to start'",
+            "case 'loading': return 'Preparing the model'",
+            "case 'inference':\n    case 'generating': return 'Writing the response'",
+            "case 'retrying': return 'Trying the response again'",
+            "case 'complete':\n    case 'completed': return 'Response complete'",
+            "case 'failed': return 'Response could not finish'",
+            "case 'cancelled': return 'Response stopped'",
+        ):
+            self.assertIn(mapping, progress_copy)
+        self.assertIn("default: return 'Working on your response'", progress_copy)
+
+    def test_progress_shows_friendly_steps_and_nests_reported_state(self):
+        render_start = self.source.index("{sending && (")
+        render_end = self.source.index("\n      <div data-chat-composer", render_start)
+        progress_render = self.source[render_start:render_end]
+        self.assertIn(
+            "Step: {chatProgressStep(activeLiveStatus.phase || requestPhase)}",
+            progress_render,
+        )
+        self.assertIn(
+            "<span>Step: {chatProgressStep(activeLiveStatus.phase)}",
+            progress_render,
+        )
+        self.assertNotIn("Step: {activeLiveStatus.phase", progress_render)
+        self.assertEqual(progress_render.count(">Technical details</summary>"), 2)
+        self.assertEqual(progress_render.count("Reported state:"), 2)
+
+        for reported_state in (
+            "Reported state: {activeLiveStatus.phase || requestPhase}",
+            "Reported state: {activeLiveStatus.phase}",
+        ):
+            reported_index = progress_render.index(reported_state)
+            technical_index = progress_render.rfind(
+                ">Technical details</summary>",
+                0,
+                reported_index,
+            )
+            self.assertGreater(technical_index, -1)
+
+    def test_model_details_lead_with_friendly_copy_and_nest_diagnostics(self):
+        technical_start = self.source.index("function modelTechnicalMeta")
+        technical_end = self.source.index("function chatProgressStep", technical_start)
+        technical_copy = self.source[technical_start:technical_end]
+        for diagnostic in (
+            "model.source",
+            "model.backend",
+            "model.loading_phase",
+            "profile.gpu_layers",
+            "model.projector_available",
+            "shared host cache",
+            "speedMeta(model)",
+        ):
+            self.assertIn(diagnostic, technical_copy)
+
+        details_start = self.source.index("{selectedModel && (")
+        details_end = self.source.index("\n      </div>\n\n      <div", details_start)
+        model_details = self.source[details_start:details_end]
+        status_index = model_details.index("modelStatusCopy(selectedModel)")
+        vision_index = model_details.index("modelVisionCopy(selectedModel)")
+        technical_index = model_details.index(">Technical details</summary>")
+        metadata_index = model_details.index("modelTechnicalMeta(selectedModel)")
+        speed_reason_index = model_details.index("selectedModel.speed.reason")
+        self.assertLess(status_index, technical_index)
+        self.assertLess(vision_index, technical_index)
+        self.assertLess(technical_index, metadata_index)
+        self.assertLess(technical_index, speed_reason_index)
+        self.assertEqual(model_details.count("modelTechnicalMeta(selectedModel)"), 1)
 
     def test_reload_during_preparation_keeps_committed_history_unchanged(self):
         submit_start = self.source.index("const submitBranch = async (")
@@ -93,8 +171,8 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
         self.assertIn("!event.nativeEvent.isComposing", self.source)
 
     def test_edit_and_retry_controls_have_names_and_edit_focus(self):
-        self.assertIn("aria-label={`Edit user turn ${index + 1}`}", self.source)
-        self.assertIn("aria-label={`Retry assistant turn ${index + 1}`}", self.source)
+        self.assertIn("aria-label={`Edit your message ${index + 1}`}", self.source)
+        self.assertIn("aria-label={`Retry response ${index + 1}`}", self.source)
         self.assertIn("textareaRef.current?.focus()", self.source)
 
     def test_assistant_copy_uses_exact_content_and_local_http_fallback(self):
@@ -111,14 +189,15 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
         self.assertNotIn("message.performance", copy_turn)
 
     def test_assistant_copy_is_per_turn_accessible_and_not_generation_locked(self):
-        self.assertIn("aria-label={`Copy assistant turn ${index + 1}`}", self.source)
+        self.assertIn("aria-label={`Copy response ${index + 1}`}", self.source)
+        self.assertIn("`Response ${index + 1} copied.`", self.source)
         self.assertIn('role="status" aria-live="polite" aria-atomic="true"', self.source)
         self.assertIn("assistantCopyNotice?.workspace === activeWorkspace", self.source)
         self.assertIn("assistantCopyNotice.projectInstance === projectInstance", self.source)
         self.assertIn("isAssistantCopyScopeCurrent(", self.source)
         copy_button = self.source[
-            self.source.index('aria-label={`Copy assistant turn ${index + 1}`}'):
-            self.source.index("</button>", self.source.index('aria-label={`Copy assistant turn ${index + 1}`}'))
+            self.source.index('aria-label={`Copy response ${index + 1}`}'):
+            self.source.index("</button>", self.source.index('aria-label={`Copy response ${index + 1}`}'))
         ]
         self.assertNotIn("disabled=", copy_button)
         self.assertIn("onClick={() => void copyAssistantTurn(index)}", copy_button)

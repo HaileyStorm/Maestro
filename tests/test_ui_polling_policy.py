@@ -147,7 +147,7 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertIn("retrying automatically", MAIN)
         self.assertIn("machineControls && queue &&", MAIN)
         self.assertIn("const queueDisplayJobs = queueTabDisplayJobs(queueTabSnapshot, jobs)", MAIN)
-        self.assertIn("Queue contents are unavailable until a scheduler refresh succeeds.", MAIN)
+        self.assertIn("The queue is unavailable. Maestro is retrying automatically.", MAIN)
         self.assertLess(
             MAIN.index("reconcileQueueState(next)"),
             MAIN.index("jobs: useStore.getState().jobs"),
@@ -263,9 +263,10 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertIn("scheduleNext()", recurring)
         self.assertIn("_recoveryJobPolls.set(jobId, poll)", recurring)
         self.assertEqual(
-            recurring.count("stopped || _recoveryJobPolls.get(jobId) !== poll"),
+            recurring.count("_recoveryJobPolls.get(jobId) !== poll"),
             2,
         )
+        self.assertIn("|| !_accountIdentityIsCurrent(accountIdentityEpoch)", recurring)
         self.assertNotIn("const pollInterval = setInterval(async", STORE)
         self.assertNotIn("status.status === 'running') get().refreshOutputs()", STORE)
         self.assertEqual(

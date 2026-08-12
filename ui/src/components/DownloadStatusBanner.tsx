@@ -98,10 +98,13 @@ export function DownloadStatusBanner() {
     const curPct = cur.total_bytes ? cur.downloaded_bytes / cur.total_bytes : 0
     return curPct > bestPct ? cur : best
   }, downloads[0])
-  const liveSummary = incomplete
-    ? 'A model download was interrupted. Re-run the request to finish it.'
-    : stalled
-      ? 'A model download is slow. Maestro is waiting to retry automatically.'
+  const featuredLabel = safeDownloadLabel(featured.filename)
+  const featuredIncomplete = featured.status === 'incomplete'
+  const featuredStalled = !featuredIncomplete && featured.seconds_since_progress > 30
+  const liveSummary = featuredIncomplete
+    ? `Model download interrupted for ${featuredLabel}. Automatic recovery stopped; re-run the request that needed this file to retry.`
+    : featuredStalled
+      ? `Model download is slow for ${featuredLabel}. Maestro will retry automatically.`
       : `Model download in progress. ${downloads.length} ${downloads.length === 1 ? 'file' : 'files'}.`
 
   return (
@@ -119,44 +122,44 @@ export function DownloadStatusBanner() {
           Border color switches to amber on stall to draw the eye
           without sacrificing contrast. */}
       <div className={`pointer-events-auto max-h-full w-full max-w-md overflow-y-auto overscroll-contain rounded-lg border bg-bg-secondary shadow-2xl ${
-        incomplete ? 'border-red-500/60' : stalled ? 'border-amber-500/60' : 'border-border'
+        featuredIncomplete ? 'border-red-500/60' : featuredStalled ? 'border-amber-500/60' : 'border-border'
       }`}>
         <div
           className="sr-only"
-          role={incomplete ? 'alert' : 'status'}
-          aria-live={incomplete ? 'assertive' : 'polite'}
+          role={featuredIncomplete ? 'alert' : 'status'}
+          aria-live={featuredIncomplete ? 'assertive' : 'polite'}
           aria-atomic="true"
         >
           {liveSummary}
         </div>
         {/* Interrupted download — red strip. The file is probably truncated;
             re-running the download/generation fetches the rest. */}
-        {incomplete && (
+        {featuredIncomplete && (
           <div className="flex flex-wrap items-center gap-2 border-b border-red-500/30 bg-red-500/15 px-4 py-2">
             <AlertTriangle size={14} aria-hidden="true" className="shrink-0 text-red-400" />
             <div className="text-xs font-medium text-text-primary">
-              A download was interrupted — re-run to finish it
+              Download interrupted — re-run the request that needed it
             </div>
           </div>
         )}
         {/* Optional amber accent strip on stall — semi-transparent
             tint over the solid backdrop, same pattern as OomRecoveryBanner. */}
-        {stalled && !incomplete && (
+        {featuredStalled && (
           <div className="flex flex-wrap items-center gap-2 border-b border-amber-500/30 bg-amber-500/15 px-4 py-2">
             <AlertTriangle size={14} aria-hidden="true" className="shrink-0 text-indicator-warning" />
             <div className="text-xs font-medium text-text-primary">
-              Download is slow — waiting for retry
+              Download is slow — Maestro will retry automatically
             </div>
           </div>
         )}
 
         <div className="px-4 py-3">
           <div className="flex items-start gap-2.5">
-            {!stalled && (
+            {!featuredStalled && !featuredIncomplete && (
               <Download size={16} aria-hidden="true" className="mt-0.5 shrink-0 animate-pulse text-accent-blue motion-reduce:animate-none" />
             )}
             <div className="flex-1 min-w-0">
-              {!stalled && (
+              {!featuredStalled && !featuredIncomplete && (
                 <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
                   <div className="text-xs font-medium text-text-primary">
                     Downloading model files
@@ -168,16 +171,27 @@ export function DownloadStatusBanner() {
                   )}
                 </div>
               )}
-              {stalled && downloads.length > 1 && (
+              {featuredStalled && downloads.length > 1 && (
                 <div className="text-[10px] text-text-muted text-right -mt-0.5 mb-0.5">
                   {downloads.length} files
                 </div>
               )}
-              <div className="break-all text-[10px] text-text-muted sm:truncate" title={featured.filename}>
-                {featured.filename}
+              <div className="break-all text-[10px] text-text-muted sm:truncate" title={featuredLabel}>
+                {featuredLabel}
               </div>
-              <DownloadProgressBar download={featured} stalled={!!stalled} />
-              {stalled && (
+              <DownloadProgressBar
+                download={featured}
+                interrupted={featuredIncomplete}
+                label={featuredLabel}
+                stalled={featuredStalled}
+              />
+              {featuredIncomplete && (
+                <div className="mt-1.5 text-[11px] leading-snug text-text-secondary">
+                  Automatic recovery stopped for this file. Re-run the request
+                  that needed it to retry the download.
+                </div>
+              )}
+              {featuredStalled && (
                 <div className="text-[11px] text-text-secondary mt-1.5 leading-snug">
                   No progress for {Math.round(featured.seconds_since_progress)}s.
                   The download will resume from where it left off as soon as
@@ -192,6 +206,11 @@ export function DownloadStatusBanner() {
   )
 }
 
+function safeDownloadLabel(filename: string): string {
+  const basename = filename.split(/[\\/]/).pop()?.split(/[?#]/, 1)[0]?.trim()
+  return basename ? basename.slice(0, 120) : 'model file'
+}
+
 function _formatBytes(n: number): string {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
@@ -201,9 +220,13 @@ function _formatBytes(n: number): string {
 
 function DownloadProgressBar({
   download,
+  interrupted,
+  label,
   stalled,
 }: {
   download: ActiveDownload
+  interrupted: boolean
+  label: string
   stalled: boolean
 }) {
   const pct = download.total_bytes
@@ -215,7 +238,7 @@ function DownloadProgressBar({
       <div
         className="h-1 overflow-hidden rounded-full bg-bg-tertiary"
         role="progressbar"
-        aria-label={`Download progress for ${download.filename}`}
+        aria-label={`Download progress for ${label}`}
         aria-valuemin={pct !== null ? 0 : undefined}
         aria-valuemax={pct !== null ? 100 : undefined}
         aria-valuenow={pct ?? undefined}
@@ -225,7 +248,7 @@ function DownloadProgressBar({
       >
         <div
           className={`h-full transition-all duration-500 motion-reduce:transition-none ${
-            stalled ? 'bg-indicator-warning' : 'bg-accent-blue'
+            interrupted ? 'bg-red-400' : stalled ? 'bg-indicator-warning' : 'bg-accent-blue'
           }`}
           aria-hidden="true"
           style={{ width: pct !== null ? `${pct}%` : '15%' }}

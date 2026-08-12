@@ -146,17 +146,12 @@ function speedMeta(model: LlmModelOption): string {
   return `${rates.join(' · ')} · ${basis}`
 }
 
-function modelPickerSpeedMeta(model: LlmModelOption): string {
-  const speed = model.speed
-  const format = (value: number | null | undefined) => {
-    if (!value || value <= 0) return '—'
-    return speed?.source === 'measured' ? value.toFixed(1) : `≈${Math.round(value)}`
-  }
-  return `P ${format(speed?.prompt_tokens_per_second)} · G ${format(speed?.generation_tokens_per_second)} TPS`
-}
-
 function modelPickerLabel(model: LlmModelOption): string {
-  return `${modelPickerSpeedMeta(model)} · ${model.label}`
+  const responseSpeed = model.speed?.generation_tokens_per_second
+  const speedLabel = responseSpeed && responseSpeed > 0
+    ? `${model.speed?.source === 'measured' ? responseSpeed.toFixed(1) : `about ${Math.round(responseSpeed)}`} tokens/s`
+    : 'speed unavailable'
+  return `${model.label} · ${speedLabel}`
 }
 
 function providerDisplayName(provider?: string): string {
@@ -164,7 +159,7 @@ function providerDisplayName(provider?: string): string {
     case 'openai': return 'OpenAI external provider'
     case 'anthropic': return 'Anthropic external provider'
     case 'remote': return 'configured external provider'
-    case 'local': return 'local provider on this machine'
+    case 'local': return 'local provider on the Maestro computer'
     default: return 'provider for the selected model'
   }
 }
@@ -191,7 +186,27 @@ function matchingVideoGuideId(
   return best?.id || ''
 }
 
-function modelMeta(model: LlmModelOption): string {
+function modelStatusCopy(model: LlmModelOption): string {
+  if (model.current || model.loaded) return 'Ready to use'
+  if (model.loading) return 'Preparing for use'
+  if (model.provider && model.provider !== 'local') return 'Ready through the selected provider'
+  if (model.downloaded === false) return 'Downloads when you first use it'
+  return 'Installed and ready to load'
+}
+
+function modelVisionCopy(model: LlmModelOption): string | null {
+  if (model.current && model.vision_capable && model.vision_available === false) {
+    return 'Image understanding is unavailable right now'
+  }
+  if (model.native_vision || model.vision_capable === true) {
+    return model.projector_available === false
+      ? 'Image understanding needs an additional download'
+      : 'Can read text and images'
+  }
+  return model.vision_capable === false ? 'Text only' : null
+}
+
+function modelTechnicalMeta(model: LlmModelOption): string {
   const runtime = model.current || model.loaded
     ? `${model.effective_device?.toUpperCase() || 'loaded'} · active`
     : model.loading
@@ -228,6 +243,21 @@ function modelMeta(model: LlmModelOption): string {
   ]
     .filter(Boolean)
     .join(' · ')
+}
+
+function chatProgressStep(phase: string): string {
+  switch (phase.trim().toLowerCase()) {
+    case 'queued': return 'Waiting to start'
+    case 'loading': return 'Preparing the model'
+    case 'inference':
+    case 'generating': return 'Writing the response'
+    case 'retrying': return 'Trying the response again'
+    case 'complete':
+    case 'completed': return 'Response complete'
+    case 'failed': return 'Response could not finish'
+    case 'cancelled': return 'Response stopped'
+    default: return 'Working on your response'
+  }
 }
 
 function downloadProgress(model?: LlmModelOption): string | null {
@@ -803,7 +833,7 @@ export function LlmChat() {
         setError(
           error instanceof api.LlmChatWaitError
             ? error.message
-            : 'Stopped waiting. The host may still be generating; resume to retrieve the result.',
+            : 'Stopped waiting. Maestro may still be generating; resume to retrieve the result.',
         )
         return
       }
@@ -856,15 +886,15 @@ export function LlmChat() {
     : !projectInstance
       ? 'Opening the project conversation…'
     : !effectiveModelId
-      ? 'Choose an LLM first.'
+      ? 'Choose a language model first.'
       : resumeAvailable
-        ? 'Resume the accepted request before starting another message.'
+        ? 'Resume the current response before starting another message.'
       : useGuide && !canonicalGuideId
-        ? 'Choose a video prompting target for this message.'
+        ? 'Choose which video model this prompting guide is for.'
       : freshImagesRequired && selectedImages.length === 0
-        ? 'Reattach at least one image before sending this image turn.'
+        ? 'Attach at least one image again before sending this message.'
       : selectedImages.length > 0 && !modelAcceptsImages
-        ? 'The selected LLM is text only. Remove the image attachment or choose a vision model.'
+        ? 'The selected language model cannot read images. Remove the image or choose a vision model.'
       : null
   const activeLiveStatus = liveChatStatus
     && liveChatStatus.workspace === activeWorkspace
@@ -1100,7 +1130,7 @@ export function LlmChat() {
           setError(
             err instanceof api.LlmChatWaitError
               ? err.message
-              : 'Stopped waiting. The host may still be generating; resume to retrieve the result.',
+              : 'Stopped waiting. Maestro may still be generating; resume to retrieve the result.',
           )
         } else {
           setMessages(pending.retainedHistory)
@@ -1161,7 +1191,7 @@ export function LlmChat() {
       ? editedChatBranch(messages, editingTurn.index, userMessage)
       : [...boundedChatHistory(messages), userMessage]
     if (!nextMessages) {
-      setError('This image-bearing branch cannot be edited without starting a new message and reattaching its images.')
+      setError('This part of the conversation uses temporary images. Start a new message and attach the images again.')
       return
     }
     await submitBranch(nextMessages, messages, requestImages, content, true)
@@ -1171,7 +1201,7 @@ export function LlmChat() {
     if (branchControlsLocked || refusalLiteralSaveRef.current) return
     const branch = retryChatBranch(messages, assistantIndex)
     if (!branch) {
-      setError('Retry is unavailable because this branch contains a one-use image. Start a new message and attach the image again.')
+      setError('Retry is unavailable because this part of the conversation used a temporary image. Start a new message and attach the image again.')
       return
     }
     await submitBranch(branch, messages, [], draft, false)
@@ -1182,7 +1212,7 @@ export function LlmChat() {
     const message = messages[userIndex]
     if (message?.role !== 'user') return
     if (messages.slice(0, userIndex).some(item => item.attachments?.length)) {
-      setError('Edit is unavailable because earlier context contains a one-use image. Start a new message and attach the image again.')
+      setError('Edit is unavailable because an earlier message used a temporary image. Start a new message and attach the image again.')
       return
     }
     setEditingTurn({
@@ -1194,7 +1224,7 @@ export function LlmChat() {
     setSelectedImages([])
     if (fileInputRef.current) fileInputRef.current.value = ''
     setError(message.attachments?.length
-      ? 'This turn used one-use images. Reattach fresh images before sending the edit.'
+      ? 'This message used temporary images. Attach them again before sending the edit.'
       : null)
     window.requestAnimationFrame(() => textareaRef.current?.focus())
   }
@@ -1331,7 +1361,7 @@ export function LlmChat() {
       setRefusalCapture(null)
       setRefusalCaptureNotice(
         `${result.added ? 'Added to' : 'Already in'} local refusal retries. `
-        + `${result.count} phrase${result.count === 1 ? '' : 's'} · revision ${result.revision}.`,
+        + `${result.count} saved phrase${result.count === 1 ? '' : 's'}.`,
       )
       window.getSelection()?.removeAllRanges()
       window.requestAnimationFrame(() => (
@@ -1361,7 +1391,7 @@ export function LlmChat() {
       <div className="max-h-[24%] shrink-0 overflow-y-auto overscroll-contain border-b border-border bg-bg-secondary px-3 py-2 md:px-6 md:py-3 lg:max-h-none lg:overflow-visible">
         <div className="mx-auto flex max-w-5xl flex-wrap items-end gap-2 md:gap-3">
           <label className="min-w-[10rem] flex-1 text-[10px] font-medium text-text-muted md:basis-[420px]">
-            LLM
+            Language model
             <select
               aria-label="Language model for Chat"
               aria-describedby="llm-model-details chat-data-disclosure"
@@ -1380,7 +1410,7 @@ export function LlmChat() {
                 if (!nextAcceptsImages && selectedImages.length) {
                   setSelectedImages([])
                   if (fileInputRef.current) fileInputRef.current.value = ''
-                  setError('Image attachments were removed because that LLM is text only.')
+                  setError('Image attachments were removed because that language model cannot read images.')
                 }
               }}
               disabled={loadingCatalog || interactionLocked}
@@ -1417,16 +1447,23 @@ export function LlmChat() {
         </div>
         <div id="llm-model-details" className="mx-auto mt-2 max-w-5xl truncate text-[10px] text-text-muted md:whitespace-normal">
           {selectedModel
-            ? `${selectedModel.label} · ${modelMeta(selectedModel) || selectedModel.id}`
+            ? `${selectedModel.label} · ${providerDisplayName(selectedModel.provider)}`
             : effectiveModelId
-              ? `${effectiveModelId} · will be located or downloaded when you send`
+              ? `${effectiveModelId} · Maestro will find or download it when you send`
               : 'Choose a model to begin.'}
           {downloadProgress(selectedModel) ? ` · ${downloadProgress(selectedModel)} downloaded` : ''}
         </div>
-        {selectedModel?.speed?.reason && (
-          <div className="mx-auto mt-1 max-w-5xl truncate text-[10px] text-text-muted md:whitespace-normal">
-            Speed basis: {selectedModel.speed.reason}
-          </div>
+        {selectedModel && (
+          <details className="mx-auto mt-1 max-w-5xl text-[10px] text-text-muted">
+            <summary className="cursor-pointer text-text-secondary">Model details</summary>
+            <p className="mt-1">{modelStatusCopy(selectedModel)}</p>
+            {modelVisionCopy(selectedModel) && <p>{modelVisionCopy(selectedModel)}</p>}
+            <details className="mt-1">
+              <summary className="cursor-pointer text-text-secondary">Technical details</summary>
+              <p className="mt-1 break-words">{modelTechnicalMeta(selectedModel) || selectedModel.id}</p>
+              {selectedModel.speed?.reason && <p className="mt-1 break-words">Speed estimate source: {selectedModel.speed.reason}</p>}
+            </details>
+          </details>
         )}
       </div>
 
@@ -1441,7 +1478,7 @@ export function LlmChat() {
         <div className="mx-auto flex max-w-4xl flex-col gap-3">
           {messages.length === 0 && (
             <div className="rounded-xl border border-dashed border-border bg-bg-secondary/60 p-8 text-center text-sm text-text-muted">
-              Start a project-scoped conversation with the selected LLM.
+              Start a conversation for this project with the selected language model.
             </div>
           )}
           {messages.map((message, index) => {
@@ -1481,14 +1518,17 @@ export function LlmChat() {
                     {message.content}
                   </div>
                   {message.role === 'assistant' && message.performance && (
-                    <div className="mt-2 text-[10px] leading-4 text-text-muted" aria-label="Final response performance">
-                      Final average: {message.performance.average_tps != null
-                        ? `${message.performance.average_tps.toFixed(1)} TPS`
-                        : 'unavailable'}
-                      {message.performance.generated_tokens_approx != null
-                        ? ` · approximately ${message.performance.generated_tokens_approx} generated tokens`
-                        : ''}
-                    </div>
+                    <details className="mt-2 text-[10px] leading-4 text-text-muted">
+                      <summary className="cursor-pointer text-text-secondary">Response details</summary>
+                      <div aria-label="Final response performance">
+                        Average speed: {message.performance.average_tps != null
+                          ? `${message.performance.average_tps.toFixed(1)} tokens per second`
+                          : 'unavailable'}
+                        {message.performance.generated_tokens_approx != null
+                          ? ` · approximately ${message.performance.generated_tokens_approx} generated tokens`
+                          : ''}
+                      </div>
+                    </details>
                   )}
                   {message.role === 'assistant'
                     && refusalCapture?.messageIndex === index && (
@@ -1504,7 +1544,7 @@ export function LlmChat() {
                         htmlFor={`refusal-literal-${index}`}
                         className="block text-[10px] font-medium text-text-secondary"
                       >
-                        Add this exact wording to local refusal retries
+                        Add the selected wording to local refusal retries
                       </label>
                       <textarea
                         ref={refusalLiteralInputRef}
@@ -1530,7 +1570,7 @@ export function LlmChat() {
                         className="mt-1 min-h-[72px] w-full resize-y rounded-md border border-border bg-bg-secondary px-2 py-1.5 text-xs leading-5 text-text-primary disabled:opacity-50"
                       />
                       <p id={`refusal-literal-help-${index}`} className="mt-1 text-[10px] leading-4 text-text-muted">
-                        Literal match only, stored on this host. Maximum {api.LLM_REFUSAL_LITERAL_MAX_CODE_POINTS} characters.
+                        Maestro will match only this text. It is stored on this computer. Maximum {api.LLM_REFUSAL_LITERAL_MAX_CODE_POINTS} characters.
                       </p>
                       {refusalCaptureError?.messageIndex === index && (
                         <p
@@ -1560,7 +1600,7 @@ export function LlmChat() {
                           className="flex min-h-11 items-center gap-1.5 rounded-md bg-accent-blue px-3 text-xs font-medium text-white disabled:opacity-40 md:min-h-9"
                         >
                           {savingRefusalLiteral && <Loader2 size={13} className="animate-spin" />}
-                          Confirm exact wording
+                          Save wording
                         </button>
                       </div>
                     </form>
@@ -1585,12 +1625,12 @@ export function LlmChat() {
                   {message.role === 'user' ? (
                     <button
                       type="button"
-                      aria-label={`Edit user turn ${index + 1}`}
+                      aria-label={`Edit your message ${index + 1}`}
                       title={editUnavailable
-                        ? 'Edit unavailable: earlier context contains one-use images. Start a new message and reattach them.'
+                        ? 'Edit unavailable: an earlier message used temporary images. Start a new message and attach them again.'
                         : message.attachments?.length
-                          ? 'Edit this turn; its one-use images must be attached again'
-                          : 'Edit this turn and replace its descendants'}
+                          ? 'Edit this message; its images must be attached again'
+                          : 'Edit this message and replace the later responses'}
                       onClick={() => editUserTurn(index)}
                       disabled={branchControlsLocked || editUnavailable}
                       className="flex h-11 w-11 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40 md:h-9 md:w-9"
@@ -1601,7 +1641,7 @@ export function LlmChat() {
                     <>
                       <button
                         type="button"
-                        aria-label={`Copy assistant turn ${index + 1}`}
+                        aria-label={`Copy response ${index + 1}`}
                         title={copyNoticeForTurn?.outcome === 'copied'
                           ? 'Copied response'
                           : copyNoticeForTurn?.outcome === 'failed'
@@ -1617,16 +1657,16 @@ export function LlmChat() {
                       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
                         {copyNoticeForTurn
                           ? copyNoticeForTurn.outcome === 'copied'
-                            ? `Assistant turn ${index + 1} copied.`
-                            : `Assistant turn ${index + 1} could not be copied.`
+                            ? `Response ${index + 1} copied.`
+                            : `Response ${index + 1} could not be copied.`
                           : ''}
                       </span>
                       <button
                         type="button"
-                        aria-label={`Retry assistant turn ${index + 1}`}
+                        aria-label={`Retry response ${index + 1}`}
                         title={retryUnavailable
-                          ? 'Retry unavailable: this branch contains one-use images. Start a new message and reattach them.'
-                          : 'Retry this response and replace its descendants'}
+                          ? 'Retry unavailable: this part of the conversation used temporary images. Start a new message and attach them again.'
+                          : 'Retry this response and replace the later responses'}
                         onClick={() => void retryAssistantTurn(index)}
                         disabled={branchControlsLocked || retryUnavailable}
                         className="flex h-11 w-11 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40 md:h-9 md:w-9"
@@ -1640,8 +1680,8 @@ export function LlmChat() {
                             else refusalCaptureTriggerRefs.current.delete(index)
                           }}
                           type="button"
-                          aria-label={`Add selected refusal wording from assistant turn ${index + 1}`}
-                          title="Select refusal wording in this response, then add the exact selection to local retries"
+                          aria-label={`Add selected refusal wording from response ${index + 1}`}
+                          title="Select refusal wording in this response, then add it to local retries"
                           onPointerDown={() => snapshotRefusalSelection(index)}
                           onPointerCancel={() => {
                             if (refusalSelectionSnapshotRef.current?.messageIndex === index) {
@@ -1682,41 +1722,48 @@ export function LlmChat() {
             </article>
           )}
           {sending && (
-            <div aria-label="LLM request status" className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-bg-secondary p-3 text-xs text-text-muted">
+            <div aria-label="Language model response status" className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-bg-secondary p-3 text-xs text-text-muted">
               <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
                 {requestPhase === 'uploading'
                   ? 'Uploading attached images.'
                   : requestPhase === 'queued'
-                    ? 'LLM request queued.'
+                    ? 'Your message is queued.'
                     : requestPhase === 'preparing'
-                      ? 'Preparing the selected LLM.'
-                      : 'The selected LLM is generating.'}
+                      ? 'Preparing the selected language model.'
+                      : 'The selected language model is responding.'}
               </span>
               <Loader2 size={14} className="animate-spin" />
               {uploadingImages
                 ? `Uploading ${selectedImages.length || 'attached'} image${selectedImages.length === 1 ? '' : 's'}…`
                 : requestPhase === 'queued'
-                  ? 'Queued for the selected LLM…'
+                  ? 'Waiting for the selected language model…'
                   : requestPhase === 'preparing'
-                    ? `Preparing ${selectedModel?.label || 'the selected LLM'}${downloadProgress(selectedModel) ? ` (${downloadProgress(selectedModel)})` : ''}…`
-                    : `Generating with ${selectedModel?.label || 'the selected LLM'}…`}
+                    ? `Preparing ${selectedModel?.label || 'the selected language model'}${downloadProgress(selectedModel) ? ` (${downloadProgress(selectedModel)})` : ''}…`
+                    : `${selectedModel?.label || 'The selected language model'} is responding…`}
               {activeLiveStatus && (
-                <span>
-                  Phase: {activeLiveStatus.phase || requestPhase}
+                <details className="basis-full text-[10px]">
+                  <summary className="cursor-pointer text-text-secondary">Response progress</summary>
+                  <span>
+                  Step: {chatProgressStep(activeLiveStatus.phase || requestPhase)}
                   {activeLiveStatus.attempt != null
-                    ? ` · Attempt ${activeLiveStatus.attempt}${activeLiveStatus.attempt_limit != null ? `/${activeLiveStatus.attempt_limit}` : ''}`
+                    ? ` · Try ${activeLiveStatus.attempt}${activeLiveStatus.attempt_limit != null ? `/${activeLiveStatus.attempt_limit}` : ''}`
                     : ''}
                   {activeLiveStatus.live_tps != null
-                    ? ` · Live ${activeLiveStatus.live_tps.toFixed(1)} TPS`
+                    ? ` · Current ${activeLiveStatus.live_tps.toFixed(1)} tokens/s`
                     : ''}
                   {activeLiveStatus.average_tps != null
-                    ? ` · Average ${activeLiveStatus.average_tps.toFixed(1)} TPS`
+                    ? ` · Average ${activeLiveStatus.average_tps.toFixed(1)} tokens/s`
                     : ''}
-                </span>
+                  </span>
+                  <details className="mt-1">
+                    <summary className="cursor-pointer text-text-secondary">Technical details</summary>
+                    <span>Reported state: {activeLiveStatus.phase || requestPhase}</span>
+                  </details>
+                </details>
               )}
               <button
                 type="button"
-                aria-label="Cancel waiting for this LLM request"
+                aria-label="Stop waiting for this language model response"
                 onClick={() => requestRef.current?.controller.abort()}
                 className="ml-auto min-h-11 rounded border border-border px-3 py-1 text-[10px] text-text-secondary md:min-h-0 md:px-2"
               >
@@ -1739,12 +1786,20 @@ export function LlmChat() {
             </div>
           )}
           {resumeAvailable && activeLiveStatus && (
-            <div role="status" aria-live="polite" aria-label="Paused LLM request status" className="rounded-md border border-border bg-bg-secondary px-3 py-2 text-[10px] text-text-muted">
-              Phase: {activeLiveStatus.phase}
-              {activeLiveStatus.attempt != null
-                ? ` · Attempt ${activeLiveStatus.attempt}${activeLiveStatus.attempt_limit != null ? `/${activeLiveStatus.attempt_limit}` : ''}`
-                : ''}
-              {activeLiveStatus.live_tps != null ? ` · Last live rate ${activeLiveStatus.live_tps.toFixed(1)} TPS` : ''}
+            <div role="status" aria-live="polite" aria-label="Paused language model response" className="rounded-md border border-border bg-bg-secondary px-3 py-2 text-[10px] text-text-muted">
+              Waiting is paused. Resume when you want to check for the response.
+              <details className="mt-1">
+                <summary className="cursor-pointer text-text-secondary">Response progress</summary>
+                <span>Step: {chatProgressStep(activeLiveStatus.phase)}
+                {activeLiveStatus.attempt != null
+                  ? ` · Try ${activeLiveStatus.attempt}${activeLiveStatus.attempt_limit != null ? `/${activeLiveStatus.attempt_limit}` : ''}`
+                  : ''}
+                {activeLiveStatus.live_tps != null ? ` · Last speed ${activeLiveStatus.live_tps.toFixed(1)} tokens/s` : ''}</span>
+                <details className="mt-1">
+                  <summary className="cursor-pointer text-text-secondary">Technical details</summary>
+                  <span>Reported state: {activeLiveStatus.phase}</span>
+                </details>
+              </details>
             </div>
           )}
         </div>
@@ -1755,8 +1810,8 @@ export function LlmChat() {
           {editingTurn && (
             <div className="mb-2 flex items-center gap-2 rounded-md border border-accent-blue/30 bg-accent-blue/5 px-3 py-2 text-xs text-text-secondary">
               <span>
-                Editing user turn {editingTurn.index + 1}. Sending replaces this turn and all descendants.
-                {editingTurn.requiresFreshImage ? ' Fresh images are required.' : ''}
+                Editing message {editingTurn.index + 1}. Sending will replace this message and everything after it.
+                {editingTurn.requiresFreshImage ? ' Attach the images again before sending.' : ''}
               </span>
               <button
                 type="button"
@@ -1830,7 +1885,7 @@ export function LlmChat() {
             <button
               type="button"
               aria-label="Attach images"
-              title={!modelAcceptsImages ? 'Vision is unavailable for this LLM' : 'Attach up to four images'}
+              title={!modelAcceptsImages ? 'This language model cannot read images' : 'Attach up to four images'}
               onClick={() => fileInputRef.current?.click()}
               disabled={interactionLocked || !effectiveModelId || !modelAcceptsImages || selectedImages.length >= MAX_IMAGE_ATTACHMENTS}
               className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-border text-text-secondary disabled:opacity-40 md:h-10 md:w-10"
@@ -1860,7 +1915,7 @@ export function LlmChat() {
               >
                 {!guideId && (
                   <option value="">
-                    {selectedVideoModel ? 'Choose a target for this video model' : 'Choose a video prompting target'}
+                    {selectedVideoModel ? 'Choose a guide for this video model' : 'Choose which video model the guide is for'}
                   </option>
                 )}
                 {videoGuides.map(guide => (
@@ -1870,10 +1925,10 @@ export function LlmChat() {
             </label>
             <span className="text-[10px] text-text-muted">
               {guideTargetOverridden.current
-                ? 'Target overridden for this draft'
+                ? 'Using your choice for this message'
                 : selectedVideoModel
-                  ? 'Following Studio / Director video model'
-                  : 'No Studio / Director video model selected'}
+                  ? 'Matched to the video model selected in Studio or Director'
+                  : 'Choose a video model in Studio or Director to match automatically'}
             </span>
             <button type="button" onClick={() => void send()} disabled={!draft.trim() || interactionLocked || !!unavailableReason} className="ml-auto flex h-11 items-center gap-2 rounded-lg bg-accent-blue px-4 text-xs font-medium text-white disabled:opacity-40 md:h-10">
               {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />} {editingTurn ? 'Send edit' : 'Send'}

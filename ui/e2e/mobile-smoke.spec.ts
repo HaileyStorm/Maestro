@@ -299,9 +299,9 @@ async function collectPrimaryTargetStates(page: Page) {
   const videoMode = generationModes.getByRole('button', { name: 'Video', exact: true })
   await videoMode.click()
   await expect(videoMode).toHaveAttribute('aria-pressed', 'true')
-  await expect(menu.getByText(/MiniMax H3 conditioning/).first()).toBeVisible()
+  await expect(menu.getByRole('link', { name: 'Review model terms', exact: true })).toBeVisible()
   findings.menuGenerateVideoInputs = await collectRenderedActionTargetViolations(menu)
-  const profileDisclosure = menu.getByRole('button', { name: /evaluated H3 engine \/ encoder profiles/ })
+  const profileDisclosure = menu.getByRole('button', { name: /technical comparison profiles/ })
   if (await profileDisclosure.isVisible()) {
     await profileDisclosure.click()
     findings.menuGenerateProfiles = await collectRenderedActionTargetViolations(menu)
@@ -667,10 +667,10 @@ for (const viewport of [
       await page.getByRole('button', { name: 'Open Generate, Director, and Reference menu' }).click()
     }
     await menu.getByRole('button', { name: 'Open Director', exact: true }).click()
-    await menu.getByRole('button', { name: 'Open Director pipeline dashboard' }).click()
+    await menu.getByRole('button', { name: 'Open Director production dashboard' }).click()
     const director = page.getByRole('dialog', { name: 'Director Dashboard' })
     await expect(director).toBeVisible()
-    await expect(director.getByRole('combobox')).toHaveValue('')
+    await expect(director.getByRole('combobox', { name: 'Select Director pipeline' })).toHaveValue('')
     await expectEveryRenderedActionMinimumTarget(director)
     await expectRenderedActionsReachable(director)
     await expectNoBlockingAxeFindings(page)
@@ -711,9 +711,8 @@ for (const viewport of [
     await menu.getByRole('button', { name: 'Open Generate', exact: true }).click()
     const generationModes = menu.getByRole('group', { name: 'Generation mode' })
     await generationModes.getByRole('button', { name: 'Video', exact: true }).click()
-    await expect(menu.getByText(/MiniMax H3 conditioning/).first()).toBeVisible()
-
     const termsLink = menu.getByRole('link', { name: 'Review model terms', exact: true })
+    await expect(termsLink).toBeVisible()
     const geometry = await termsLink.evaluate(element => {
       const box = element.getBoundingClientRect()
       const style = getComputedStyle(element)
@@ -831,7 +830,9 @@ test('accounts-disabled compatibility, local bootstrap, and remote bootstrap bou
   await opened.drawer.getByRole('tab', { name: 'Account' }).click()
   const bootstrap = opened.drawer.getByRole('heading', { name: 'Create the first owner account' })
     .locator('xpath=../..')
-  await expect(bootstrap).toContainText('server explicitly offered local bootstrap')
+  await expect(bootstrap).toContainText(
+    'For security, create the first owner account by opening Maestro directly on the computer where it is running.',
+  )
   await bootstrap.getByLabel('Username', { exact: true }).fill('Synthetic Owner')
   await bootstrap.getByLabel('Password', { exact: true }).fill('synthetic-bootstrap-password')
   await bootstrap.getByLabel('Device label', { exact: true }).fill('Synthetic browser')
@@ -864,10 +865,12 @@ test('accounts-disabled compatibility, local bootstrap, and remote bootstrap bou
   await opened.drawer.getByRole('tab', { name: 'Account' }).click()
   await expect(opened.drawer.getByRole('heading', { name: 'Create the first owner account' })).toHaveCount(0)
   await expect(opened.drawer.getByRole('heading', { name: 'Sign in' })).toBeVisible()
-  await expect(opened.drawer).toContainText('Project access stays separate from this account')
+  await expect(opened.drawer).toContainText(
+    'Existing project access may also depend on this browser or a project password.',
+  )
 })
 
-test('anonymous login, owner reauthentication, session revocation, and logout preserve project authority', async ({ page, browserName }) => {
+test('anonymous login, owner reauthentication, account-session sign-out, and logout preserve project authority', async ({ page, browserName }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await skipWelcome(page)
   api!.setAccountScenario('local-anonymous')
@@ -887,9 +890,9 @@ test('anonymous login, owner reauthentication, session revocation, and logout pr
 
   await expect(drawer.getByText('Signed in.', { exact: true })).toBeVisible()
   await expect(drawer.getByText('Confirmation needed for sensitive actions')).toBeVisible()
-  await expect(drawer.getByRole('heading', { name: 'Active sessions' })).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'Account sessions' })).toBeVisible()
   await expect(drawer.getByText('Synthetic tablet', { exact: false })).toBeVisible()
-  await expect(drawer.getByRole('button', { name: 'Revoke other sessions' })).toBeDisabled()
+  await expect(drawer.getByRole('button', { name: 'Sign out other account sessions' })).toBeDisabled()
 
   const confirmation = drawer.getByRole('heading', { name: 'Confirm your password' }).locator('xpath=..')
   await confirmation.getByLabel('Current password').fill('synthetic-owner-password')
@@ -898,19 +901,19 @@ test('anonymous login, owner reauthentication, session revocation, and logout pr
   await confirmPasswordAction.click()
   await expect(drawer.getByText('Sensitive account actions are temporarily unlocked.')).toBeVisible()
   await expect(drawer.getByText('Recently confirmed')).toBeVisible()
-  await expect(drawer.getByRole('heading', { name: 'User administration' })).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'Manage users' })).toBeVisible()
   if (browserName !== 'webkit') {
     await expectPrimaryActionContrast(drawer.getByRole('button', { name: 'Create user' }))
   }
 
   const otherSession = drawer.getByText('Synthetic tablet', { exact: false }).locator('xpath=../..')
-  await otherSession.getByRole('button', { name: 'Revoke' }).click()
-  await expect(drawer.getByText('Session revoked.')).toBeVisible()
+  await otherSession.getByRole('button', { name: 'Sign out' }).click()
+  await expect(drawer.getByText('That account session was signed out.')).toBeVisible()
   await expect(drawer.getByText('Synthetic tablet', { exact: false })).toHaveCount(0)
   await expect(drawer.getByText('Synthetic browser', { exact: false })).toBeVisible()
 
   await drawer.getByRole('button', { name: 'Sign out', exact: true }).last().click()
-  await expect(drawer.getByText('Signed out. Project and output access were not changed.')).toBeVisible()
+  await expect(drawer.getByText('Signed out. Any separate browser or project-password access remains unchanged.')).toBeVisible()
   await expect(drawer.getByRole('heading', { name: 'Sign in' })).toBeVisible()
   await expect(projectTrigger).toBeVisible()
 })
@@ -925,11 +928,13 @@ test('a normal account gets self-service without owner administration', async ({
   await drawer.getByRole('tab', { name: 'Account' }).click()
   await expect(drawer.getByText('Synthetic User', { exact: true }).first()).toBeVisible()
   await expect(drawer.getByText('user', { exact: true }).first()).toBeVisible()
-  await expect(drawer.getByRole('heading', { name: 'Active sessions' })).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'Account sessions' })).toBeVisible()
   await expect(drawer.getByRole('heading', { name: 'Password and recovery' })).toBeVisible()
-  await expect(drawer.getByRole('heading', { name: 'User administration' })).toHaveCount(0)
+  await expect(drawer.getByRole('heading', { name: 'Manage users' })).toHaveCount(0)
   await expect(drawer.getByRole('button', { name: 'Create user' })).toHaveCount(0)
-  await expect(drawer).toContainText('account cookie does not replace or mutate the browser session')
+  await expect(drawer).toContainText(
+    'Signing in identifies your account. Access to existing projects may still depend on this browser or a project password.',
+  )
 })
 
 test('unknown and external requests are blocked before leaving the fixture', async ({ page }) => {
