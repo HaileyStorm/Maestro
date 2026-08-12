@@ -14,6 +14,11 @@ _APP_DIR = os.path.abspath(os.path.join(_HERE, "..", "app"))
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
+from services.credit_accounting import (
+    CreditAccountingJournal,
+    CreditAccountingPolicy,
+    CreditSourceBalance,
+)
 from services.credit_runtime import (
     CreditRuntimePolicy,
     quote_reservation,
@@ -27,10 +32,19 @@ from services.job_lifecycle import (
     _reset_queue_state_for_tests,
     _select_next_waiter,
     apply_credit_queue_decision,
+    block_resource_admission_failure,
+    configure_credit_lifecycle_callback,
     configure_durability_hook,
     consume_credit_queue_reservation,
+    fail_preparation,
+    finish_job,
     promote_queued_job,
+    queue_position,
+    queue_wait_reason,
+    request_cancel,
+    restore_scheduler_state,
     snapshot_job,
+    try_start,
 )
 from services.queue_recovery import QueueRecoveryJournal
 from services.queue_recovery_adapter import QueueRecoveryCoordinator
@@ -48,6 +62,10 @@ _EXCLUDED_CAPABILITY = {
 }
 _ENFORCED = CreditRuntimePolicy(enforcement_enabled=True)
 _ALLOWANCE_REVISION = "a" * 64
+_ACCOUNTING_SECRET = b"synthetic-lifecycle-accounting-secret"
+_ACCOUNTING_ACCOUNT = "key_" + "a" * 64
+_ACCOUNTING_SOURCE = "key_" + "b" * 64
+_ACCOUNTING_RESERVATION = "reservation_" + "c" * 32
 
 
 def _allowance(units: int) -> dict:
@@ -137,6 +155,30 @@ class CreditRuntimeWiringTests(unittest.TestCase):
                 reservation=reservation,
             )
         )
+
+    def _stamp_v2(
+        self,
+        job: dict,
+        suffix: str,
+        *,
+        revision: int = 1,
+        accounting_reservation_id: str = "reservation_" + "1" * 32,
+    ):
+        quote = _quote()
+        reservation = reserve_quote(
+            quote,
+            reservation_id=f"reservation_runtime_{suffix}",
+        )
+        self.assertTrue(apply_credit_queue_decision(
+            job,
+            quote,
+            transition_id=f"transition_{suffix}",
+            allowance_revision=_ALLOWANCE_REVISION,
+            reservation=reservation,
+            accounting_reservation_id=accounting_reservation_id,
+            accounting_reservation_revision=revision,
+        ))
+        return quote, reservation
 
     def test_disabled_and_unmetered_quotes_leave_legacy_job_bytes_unchanged(self):
         for label, quote in (
@@ -726,6 +768,376 @@ class CreditRuntimeWiringTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(job, frozen)
+
+    def test_v2_accounting_callback_consumes_exact_current_revision(self):
+        job = _job("accounting-consume", created_at=1.0)
+        quote, reserved = self._stamp_v2(
+            job, "accounting_consume", revision=7,
+        )
+        events = []
+
+        def callback(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": "consumed",
+                "reservation_revision": event["expected_revision"] + 1,
+                "fully_funded": False,
+                "allocation_satisfied": True,
+                "terminal_satisfied": False,
+            }
+
+        configure_credit_lifecycle_callback(callback)
+        self.assertTrue(try_start(job))
+        self.assertTrue(consume_credit_queue_reservation(
+            job,
+            quote,
+            transition_id="transition_accounting_consume_running",
+            allowance_revision=_ALLOWANCE_REVISION,
+            reservation=transition_reservation(reserved, "consume"),
+        ))
+        self.assertEqual(job["credit_queue"]["reservation_state"], "consumed")
+        self.assertEqual(
+            job["credit_queue"]["accounting_reservation_revision"], 8,
+        )
+        self.assertEqual(set(events[0]), {
+            "action", "job_id", "accounting_reservation_id",
+            "expected_revision", "operation_id", "as_of",
+            "require_full_requested",
+        })
+        self.assertEqual(events[0]["action"], "consume")
+        self.assertEqual(events[0]["expected_revision"], 7)
+        self.assertTrue(events[0]["require_full_requested"])
+        self.assertNotIn("account", events[0])
+        self.assertNotIn("source", events[0])
+        self.assertNotIn("provider", events[0])
+
+    def test_callback_failure_aborts_consume_and_crash_retry_replays_operation(self):
+        job = _job("accounting-replay", created_at=1.0)
+        quote, reserved = self._stamp_v2(job, "accounting_replay")
+        self.assertTrue(try_start(job))
+        original = copy.deepcopy(job)
+        events = []
+
+        def callback(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": "consumed",
+                "reservation_revision": 2,
+                "fully_funded": False,
+                "allocation_satisfied": True,
+                "terminal_satisfied": False,
+            }
+
+        configure_credit_lifecycle_callback(callback)
+        configure_durability_hook(
+            lambda _transition: (_ for _ in ()).throw(RuntimeError("offline")),
+        )
+        with self.assertRaises(RuntimeError):
+            consume_credit_queue_reservation(
+                job,
+                quote,
+                transition_id="transition_accounting_replay_running",
+                allowance_revision=_ALLOWANCE_REVISION,
+                reservation=transition_reservation(reserved, "consume"),
+            )
+        self.assertEqual(job, original)
+        configure_durability_hook(None)
+        self.assertTrue(consume_credit_queue_reservation(
+            job,
+            quote,
+            transition_id="transition_accounting_replay_running",
+            allowance_revision=_ALLOWANCE_REVISION,
+            reservation=transition_reservation(reserved, "consume"),
+        ))
+        self.assertEqual(events[0], events[1])
+
+        failed = _job("accounting-failure", created_at=2.0)
+        failed_quote, failed_reserved = self._stamp_v2(
+            failed, "accounting_failure",
+        )
+        self.assertTrue(try_start(failed))
+        configure_credit_lifecycle_callback(None)
+        configure_credit_lifecycle_callback(
+            lambda _event: (_ for _ in ()).throw(RuntimeError("journal failed")),
+        )
+        frozen = copy.deepcopy(failed)
+        with self.assertRaises(RuntimeError):
+            consume_credit_queue_reservation(
+                failed,
+                failed_quote,
+                transition_id="transition_accounting_failure_running",
+                allowance_revision=_ALLOWANCE_REVISION,
+                reservation=transition_reservation(failed_reserved, "consume"),
+            )
+        self.assertEqual(failed, frozen)
+
+    def test_reserved_v2_releases_on_predispatch_terminal_paths_only_once(self):
+        events = []
+
+        def callback(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": (
+                    "consumed" if event["action"] == "consume" else "released"
+                ),
+                "reservation_revision": event["expected_revision"] + 1,
+                "fully_funded": False,
+                "allocation_satisfied": event["action"] == "consume",
+                "terminal_satisfied": event["action"] == "release",
+            }
+
+        configure_credit_lifecycle_callback(callback)
+
+        cancelled = _job("release-cancel", created_at=1.0)
+        self._stamp_v2(cancelled, "release_cancel")
+        self.assertTrue(request_cancel(cancelled).changed)
+
+        preparation = _job("release-preparation", created_at=2.0)
+        self._stamp_v2(preparation, "release_preparation")
+        preparation["status"] = "preparing"
+        self.assertTrue(fail_preparation(preparation))
+
+        blocked = _job("release-blocked", created_at=3.0)
+        self._stamp_v2(blocked, "release_blocked")
+        self.assertTrue(block_resource_admission_failure(blocked))
+
+        terminal = _job("release-terminal", created_at=4.0)
+        self._stamp_v2(terminal, "release_terminal")
+        terminal["status"] = "running"
+        self.assertTrue(finish_job(terminal, "failed"))
+
+        self.assertEqual([event["action"] for event in events], [
+            "release", "release", "release", "release",
+        ])
+        for job in (cancelled, preparation, blocked, terminal):
+            self.assertEqual(job["credit_queue"]["reservation_state"], "released")
+            self.assertEqual(
+                job["credit_queue"]["accounting_reservation_revision"], 2,
+            )
+
+    def test_consumed_reservation_is_never_released_on_cancel(self):
+        job = _job("consume-no-release", created_at=1.0)
+        quote, reserved = self._stamp_v2(job, "consume_no_release")
+        actions = []
+
+        def callback(event):
+            actions.append(event["action"])
+            return {
+                "reservation_status": (
+                    "consumed" if event["action"] == "consume" else "released"
+                ),
+                "reservation_revision": event["expected_revision"] + 1,
+                "fully_funded": False,
+                "allocation_satisfied": event["action"] == "consume",
+                "terminal_satisfied": event["action"] == "release",
+            }
+
+        configure_credit_lifecycle_callback(callback)
+        self.assertTrue(try_start(job))
+        self.assertTrue(consume_credit_queue_reservation(
+            job,
+            quote,
+            transition_id="transition_consume_no_release_running",
+            allowance_revision=_ALLOWANCE_REVISION,
+            reservation=transition_reservation(reserved, "consume"),
+        ))
+        self.assertTrue(request_cancel(job).changed)
+        self.assertEqual(actions, ["consume"])
+
+    def test_restored_priority_credit_is_fenced_until_server_revalidation(self):
+        restored = _job("restored-credit", created_at=1.0)
+        self._stamp(restored, _quote(), "restored_credit")
+        restore_scheduler_state([restored], {"queue_order": [restored["id"]]})
+        self.assertTrue(restored["_credit_revalidation_required"])
+        self.assertEqual(_credit_queue_band(restored), 0)
+        self.assertIsNone(queue_position(restored))
+        self.assertEqual(queue_wait_reason(restored), "credit_revalidation")
+        self.assertFalse(promote_queued_job(restored))
+
+        renewed_quote = _quote(as_of="2026-08-11T10:01:00Z")
+        renewed = reserve_quote(
+            renewed_quote, reservation_id="reservation_restored_renewed",
+        )
+        self.assertTrue(apply_credit_queue_decision(
+            restored,
+            renewed_quote,
+            transition_id="transition_restored_revalidated",
+            allowance_revision="b" * 64,
+            reservation=renewed,
+        ))
+        self.assertNotIn("_credit_revalidation_required", restored)
+
+    def test_restored_running_priority_credit_cannot_consume_while_fenced(self):
+        job = _job("restored-running-credit", created_at=1.0)
+        quote = _quote()
+        reserved = reserve_quote(
+            quote, reservation_id="reservation_restored_running_credit",
+        )
+        self.assertTrue(apply_credit_queue_decision(
+            job,
+            quote,
+            transition_id="transition_restored_running_reserved",
+            allowance_revision=_ALLOWANCE_REVISION,
+            reservation=reserved,
+        ))
+        job["status"] = "running"
+        restore_scheduler_state([job], {})
+        self.assertTrue(job["_credit_revalidation_required"])
+        self.assertFalse(consume_credit_queue_reservation(
+            job,
+            quote,
+            transition_id="transition_restored_running_consumed",
+            allowance_revision=_ALLOWANCE_REVISION,
+            reservation=transition_reservation(reserved, "consume"),
+        ))
+        self.assertTrue(job["_credit_revalidation_required"])
+        self.assertEqual(job["credit_queue"]["reservation_state"], "reserved")
+
+    def test_accounting_callback_is_not_called_when_history_is_full(self):
+        job = _job("accounting-history-cap", created_at=1.0)
+        self._stamp_v2(job, "accounting_history_cap")
+        history = job["credit_queue"]["transition_history"]
+        while len(history) < 32:
+            history.insert(0, [
+                f"transition_accounting_history_{len(history):03d}",
+                format(len(history) + 1, "064x"),
+            ])
+        calls = []
+        configure_credit_lifecycle_callback(
+            lambda event: calls.append(dict(event)) or {
+                "reservation_status": "released",
+                "reservation_revision": 2,
+                "fully_funded": False,
+                "allocation_satisfied": False,
+                "terminal_satisfied": True,
+            },
+        )
+        frozen = copy.deepcopy(job)
+        with self.assertRaises(CreditQueueTransitionConflict):
+            request_cancel(job)
+        self.assertEqual(calls, [])
+        self.assertEqual(job, frozen)
+
+    def test_real_accounting_journal_consume_receipt_satisfies_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = CreditAccountingJournal(
+                Path(directory) / "credit-accounting.json",
+                integrity_key=_ACCOUNTING_SECRET,
+                policy=CreditAccountingPolicy(enforcement_enabled=True),
+            )
+            journal.reconcile(
+                account_key=_ACCOUNTING_ACCOUNT,
+                operation_id="operation_" + "1" * 32,
+                unit="generation_credit",
+                sources=[CreditSourceBalance(_ACCOUNTING_SOURCE, 1)],
+                as_of="2026-08-11T10:00:00Z",
+            )
+            receipt = journal.reserve(
+                account_key=_ACCOUNTING_ACCOUNT,
+                reservation_id=_ACCOUNTING_RESERVATION,
+                operation_id="operation_" + "2" * 32,
+                requested_units=1,
+                as_of="2026-08-11T10:00:00Z",
+            )
+            job = _job("real-journal-consume", created_at=1.0)
+            quote, reserved = self._stamp_v2(
+                job,
+                "real_journal_consume",
+                revision=receipt.reservation_revision,
+                accounting_reservation_id=_ACCOUNTING_RESERVATION,
+            )
+            self.assertTrue(try_start(job))
+
+            def callback(event):
+                result = journal.consume(
+                    account_key=_ACCOUNTING_ACCOUNT,
+                    reservation_id=event["accounting_reservation_id"],
+                    operation_id=event["operation_id"],
+                    expected_revision=event["expected_revision"],
+                    as_of=event["as_of"],
+                )
+                return {
+                    "reservation_status": result.reservation_status,
+                    "reservation_revision": result.reservation_revision,
+                    "fully_funded": result.fully_funded,
+                    "allocation_satisfied": result.allocation_satisfied,
+                    "terminal_satisfied": result.terminal_satisfied,
+                }
+
+            configure_credit_lifecycle_callback(callback)
+            self.assertTrue(consume_credit_queue_reservation(
+                job,
+                quote,
+                transition_id="transition_real_journal_consume_running",
+                allowance_revision=_ALLOWANCE_REVISION,
+                reservation=transition_reservation(reserved, "consume"),
+            ))
+            self.assertEqual(job["credit_queue"]["reservation_state"], "consumed")
+            self.assertEqual(
+                job["credit_queue"]["accounting_reservation_revision"], 2,
+            )
+
+    def test_real_journal_stale_and_invalidated_release_is_terminal_satisfied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = CreditAccountingJournal(
+                Path(directory) / "credit-accounting.json",
+                integrity_key=_ACCOUNTING_SECRET,
+                policy=CreditAccountingPolicy(enforcement_enabled=True),
+            )
+            journal.reconcile(
+                account_key=_ACCOUNTING_ACCOUNT,
+                operation_id="operation_" + "3" * 32,
+                unit="generation_credit",
+                sources=[CreditSourceBalance(_ACCOUNTING_SOURCE, 2)],
+                as_of="2026-08-11T10:00:00Z",
+            )
+            journal.reserve(
+                account_key=_ACCOUNTING_ACCOUNT,
+                reservation_id=_ACCOUNTING_RESERVATION,
+                operation_id="operation_" + "4" * 32,
+                requested_units=1,
+                as_of="2026-08-11T10:00:00Z",
+            )
+            invalidated = journal.revalidate_reservation(
+                account_key=_ACCOUNTING_ACCOUNT,
+                reservation_id=_ACCOUNTING_RESERVATION,
+                operation_id="operation_" + "5" * 32,
+                unit="generation_credit",
+                sources=[CreditSourceBalance(_ACCOUNTING_SOURCE, 0)],
+                as_of="2026-08-11T10:01:00Z",
+            )
+            self.assertEqual(invalidated.reservation_status, "invalidated")
+            job = _job("real-journal-release", created_at=1.0)
+            self._stamp_v2(
+                job,
+                "real_journal_release",
+                revision=1,
+                accounting_reservation_id=_ACCOUNTING_RESERVATION,
+            )
+
+            def callback(event):
+                result = journal.release(
+                    account_key=_ACCOUNTING_ACCOUNT,
+                    reservation_id=event["accounting_reservation_id"],
+                    operation_id=event["operation_id"],
+                    expected_revision=event["expected_revision"],
+                    as_of=event["as_of"],
+                )
+                return {
+                    "reservation_status": result.reservation_status,
+                    "reservation_revision": result.reservation_revision,
+                    "fully_funded": result.fully_funded,
+                    "allocation_satisfied": result.allocation_satisfied,
+                    "terminal_satisfied": result.terminal_satisfied,
+                }
+
+            configure_credit_lifecycle_callback(callback)
+            self.assertTrue(request_cancel(job).changed)
+            self.assertEqual(job["credit_queue"]["reservation_state"], "released")
+            self.assertEqual(
+                job["credit_queue"]["accounting_reservation_revision"],
+                invalidated.reservation_revision,
+            )
 
 
 if __name__ == "__main__":

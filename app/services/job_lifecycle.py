@@ -87,7 +87,6 @@ RESOURCE_STATES = frozenset({
     "released",
 })
 MAX_EXECUTION_ATTEMPT = 1_000_000
-_CREDIT_QUEUE_SCHEMA_VERSION = 1
 _CREDIT_QUEUE_BANDS = frozenset({-1, 0, 1})
 _CREDIT_QUEUE_DECISIONS = frozenset({
     "unmetered_realm",
@@ -99,8 +98,14 @@ _CREDIT_RESERVATION_STATES = frozenset({"reserved", "released", "consumed"})
 _CREDIT_REVALIDATION_STATES = frozenset({"valid", "downgraded", "released"})
 _CREDIT_TRANSITION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{7,127}\Z")
 _CREDIT_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}\Z")
+_CREDIT_ACCOUNTING_RESERVATION_RE = re.compile(
+    r"reservation_[0-9a-f]{32,64}\Z",
+)
 _MAX_CREDIT_TRANSITION_HISTORY = 32
 _durability_hook: Callable[["DurableTransition"], None] | None = None
+_credit_lifecycle_callback: Callable[
+    [Mapping[str, Any]], Mapping[str, Any]
+] | None = None
 
 # Any transition that changes both scheduler-visible queue membership and job
 # lifecycle state acquires these locks in this order: ``_queue_condition``
@@ -124,6 +129,10 @@ class CreditQueueTransitionConflict(ValueError):
     """Raised when a credit transition ID is replayed with different state."""
 
 
+class CreditLifecycleCallbackError(RuntimeError):
+    """Raised when the optional accounting lifecycle seam rejects an event."""
+
+
 def configure_durability_hook(
     hook: Callable[[DurableTransition], None] | None,
 ) -> None:
@@ -143,6 +152,29 @@ def configure_durability_hook(
         ):
             raise RuntimeError("durability hook is already configured")
         _durability_hook = hook
+
+
+def configure_credit_lifecycle_callback(
+    callback: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
+) -> None:
+    """Bind the optional journal-agnostic accounting lifecycle seam.
+
+    Production leaves this unset while enforcement is hard-off. The callback
+    receives only opaque reservation/job/operation identifiers, integer
+    revisions, one timestamp, and transition flags; account/source/provider
+    identities never cross this module boundary.
+    """
+    global _credit_lifecycle_callback
+    if callback is not None and not callable(callback):
+        raise TypeError("credit lifecycle callback must be callable or None")
+    with _queue_condition, _lifecycle_lock:
+        if (
+            _credit_lifecycle_callback is not None
+            and callback is not None
+            and callback != _credit_lifecycle_callback
+        ):
+            raise RuntimeError("credit lifecycle callback is already configured")
+        _credit_lifecycle_callback = callback
 
 
 def _copy_job_for_transition(job: Mapping[str, Any]) -> dict[str, Any]:
@@ -276,6 +308,15 @@ def restore_scheduler_state(
     with _queue_condition, _lifecycle_lock:
         _queue_waiters.clear()
         _queue_sequence = 0
+        for job in candidates.values():
+            credit_queue = job.get("credit_queue")
+            if (
+                job.get("status") not in TERMINAL_STATUSES
+                and isinstance(credit_queue, Mapping)
+                and credit_queue.get("queue_band") == 1
+                and credit_queue.get("schema_version") in {1, 2}
+            ):
+                job["_credit_revalidation_required"] = True
         restored_ids: set[str] = set()
         for index, job_id in enumerate(order, start=1):
             job = candidates.get(str(job_id))
@@ -488,7 +529,10 @@ class CancelResult:
 
 def _validated_credit_queue_metadata(value: Any) -> dict[str, Any]:
     """Return one exact content-free scheduler envelope or raise."""
-    if not isinstance(value, Mapping) or set(value) != {
+    if not isinstance(value, Mapping):
+        raise TypeError("credit queue metadata schema is invalid")
+    schema_version = value.get("schema_version")
+    expected = {
         "schema_version",
         "realm",
         "enforcement_enabled",
@@ -503,9 +547,14 @@ def _validated_credit_queue_metadata(value: Any) -> dict[str, Any]:
         "allowance_observed_at",
         "transition_id",
         "transition_history",
-    }:
+    }
+    if schema_version == 2:
+        expected.update({
+            "accounting_reservation_id",
+            "accounting_reservation_revision",
+        })
+    if set(value) != expected:
         raise ValueError("credit queue metadata schema is invalid")
-    schema_version = value["schema_version"]
     enforcement_enabled = value["enforcement_enabled"]
     metering_applied = value["metering_applied"]
     decision = value["decision"]
@@ -520,7 +569,7 @@ def _validated_credit_queue_metadata(value: Any) -> dict[str, Any]:
     transition_history = value["transition_history"]
     if (
         type(schema_version) is not int
-        or schema_version != _CREDIT_QUEUE_SCHEMA_VERSION
+        or schema_version not in {1, 2}
         or not isinstance(value["realm"], str)
         or value["realm"] not in {"local", "lan", "hosted"}
         or type(enforcement_enabled) is not bool
@@ -561,6 +610,21 @@ def _validated_credit_queue_metadata(value: Any) -> dict[str, Any]:
         or not 1 <= len(transition_history) <= _MAX_CREDIT_TRANSITION_HISTORY
     ):
         raise ValueError("credit queue metadata is invalid")
+    if schema_version == 2:
+        accounting_reservation_id = value["accounting_reservation_id"]
+        accounting_reservation_revision = value[
+            "accounting_reservation_revision"
+        ]
+        if (
+            not isinstance(accounting_reservation_id, str)
+            or _CREDIT_ACCOUNTING_RESERVATION_RE.fullmatch(
+                accounting_reservation_id,
+            ) is None
+            or type(accounting_reservation_revision) is not int
+            or accounting_reservation_revision < 1
+            or reservation_state is None
+        ):
+            raise ValueError("credit queue accounting linkage is invalid")
 
     seen_transition_ids: set[str] = set()
     for item in transition_history:
@@ -656,6 +720,13 @@ def _credit_queue_fingerprint(value: Mapping[str, Any]) -> str:
             "allowance_observed_at",
         )
     }
+    if value["schema_version"] == 2:
+        payload.update({
+            "accounting_reservation_id": value["accounting_reservation_id"],
+            "accounting_reservation_revision": value[
+                "accounting_reservation_revision"
+            ],
+        })
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -676,6 +747,136 @@ def _credit_allowance_observed_at(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _credit_lifecycle_operation_id(
+    job: Mapping[str, Any],
+    credit_queue: Mapping[str, Any],
+    action: str,
+) -> str:
+    """Return the stable idempotency key for one accounting transition."""
+    payload = {
+        "action": action,
+        "job_id": str(job.get("id") or ""),
+        "accounting_reservation_id": credit_queue[
+            "accounting_reservation_id"
+        ],
+        "expected_revision": credit_queue[
+            "accounting_reservation_revision"
+        ],
+    }
+    return "operation_" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+            "ascii",
+        ),
+    ).hexdigest()
+
+
+def _apply_credit_lifecycle_action_unlocked(
+    candidate: MutableMapping[str, Any],
+    action: str,
+) -> bool:
+    """Apply one optional accounting callback before prospective mutation.
+
+    The callback is deliberately journal-agnostic. Its stable operation ID
+    makes a callback-success/process-crash/persistence-retry sequence safe.
+    """
+    callback = _credit_lifecycle_callback
+    if callback is None:
+        return False
+    if action not in {"consume", "release"}:
+        raise ValueError("credit lifecycle action is invalid")
+    raw = candidate.get("credit_queue")
+    if raw is None:
+        return False
+    credit_queue = _validated_credit_queue_metadata(raw)
+    if (
+        credit_queue["schema_version"] != 2
+        or credit_queue["reservation_state"] != "reserved"
+    ):
+        return False
+    if len(credit_queue["transition_history"]) >= _MAX_CREDIT_TRANSITION_HISTORY:
+        raise CreditQueueTransitionConflict(
+            "credit transition history capacity is exhausted",
+        )
+    if action == "consume" and (
+        candidate.get("status") != "running"
+        or is_cancel_requested(candidate)
+        or credit_queue["queue_band"] != 1
+        or candidate.get("_credit_revalidation_required") is True
+    ):
+        return False
+    event = {
+        "action": action,
+        "job_id": str(candidate.get("id") or ""),
+        "accounting_reservation_id": credit_queue[
+            "accounting_reservation_id"
+        ],
+        "expected_revision": credit_queue[
+            "accounting_reservation_revision"
+        ],
+        "operation_id": _credit_lifecycle_operation_id(
+            candidate, credit_queue, action,
+        ),
+        "as_of": credit_queue["allowance_observed_at"],
+        "require_full_requested": action == "consume",
+    }
+    result = callback(event)
+    if not isinstance(result, Mapping) or set(result) != {
+        "reservation_status",
+        "reservation_revision",
+        "fully_funded",
+        "allocation_satisfied",
+        "terminal_satisfied",
+    }:
+        raise CreditLifecycleCallbackError(
+            "credit lifecycle callback result schema is invalid",
+        )
+    reservation_status = result["reservation_status"]
+    revision = result["reservation_revision"]
+    if (
+        type(revision) is not int
+        or revision < event["expected_revision"]
+        or type(result["fully_funded"]) is not bool
+        or type(result["allocation_satisfied"]) is not bool
+        or type(result["terminal_satisfied"]) is not bool
+        or (
+            action == "consume"
+            and (
+                reservation_status != "consumed"
+                or revision != event["expected_revision"] + 1
+                or result["allocation_satisfied"] is not True
+                or result["terminal_satisfied"] is not False
+            )
+        )
+        or (
+            action == "release"
+            and (
+                reservation_status not in {"released", "invalidated"}
+                or result["allocation_satisfied"] is not False
+                or result["terminal_satisfied"] is not True
+            )
+        )
+    ):
+        raise CreditLifecycleCallbackError(
+            "credit lifecycle callback result is inconsistent",
+        )
+    target = dict(credit_queue)
+    target["reservation_state"] = (
+        "consumed" if action == "consume" else "released"
+    )
+    target["accounting_reservation_revision"] = revision
+    if action == "release":
+        target["queue_band"] = -1
+        target["revalidation_state"] = "released"
+    transition_id = event["operation_id"]
+    target["transition_id"] = transition_id
+    target_fingerprint = _credit_queue_fingerprint(target)
+    history = list(target["transition_history"])
+    history.append([transition_id, target_fingerprint])
+    target["transition_history"] = history
+    candidate["credit_queue"] = _validated_credit_queue_metadata(target)
+    return True
+
+
 def _credit_queue_metadata_from_quote(
     quote: CreditReservationQuote,
     *,
@@ -683,6 +884,8 @@ def _credit_queue_metadata_from_quote(
     allowance_revision: str,
     reservation: CreditReservationState | None,
     revalidation: CreditRevalidationResult | None,
+    accounting_reservation_id: str | None = None,
+    accounting_reservation_revision: int | None = None,
 ) -> dict[str, Any]:
     if (
         not isinstance(transition_id, str)
@@ -730,8 +933,22 @@ def _credit_queue_metadata_from_quote(
         queue_band = -1
     else:
         queue_band = 0
+    durable_linked = (
+        accounting_reservation_id is not None
+        or accounting_reservation_revision is not None
+    )
+    if durable_linked and (
+        reservation_state is None
+        or not isinstance(accounting_reservation_id, str)
+        or _CREDIT_ACCOUNTING_RESERVATION_RE.fullmatch(
+            accounting_reservation_id,
+        ) is None
+        or type(accounting_reservation_revision) is not int
+        or accounting_reservation_revision < 1
+    ):
+        raise ValueError("durable accounting reservation linkage is invalid")
     metadata = {
-        "schema_version": _CREDIT_QUEUE_SCHEMA_VERSION,
+        "schema_version": 2 if durable_linked else 1,
         "realm": projection["realm"],
         "enforcement_enabled": projection["policy_enforcement_enabled"],
         "metering_applied": projection["metering_applied"],
@@ -746,6 +963,11 @@ def _credit_queue_metadata_from_quote(
         "transition_id": transition_id,
         "transition_history": [],
     }
+    if durable_linked:
+        metadata.update({
+            "accounting_reservation_id": accounting_reservation_id,
+            "accounting_reservation_revision": accounting_reservation_revision,
+        })
     metadata["transition_history"] = [[
         transition_id,
         _credit_queue_fingerprint(metadata),
@@ -761,6 +983,8 @@ def apply_credit_queue_decision(
     allowance_revision: str,
     reservation: CreditReservationState | None = None,
     revalidation: CreditRevalidationResult | None = None,
+    accounting_reservation_id: str | None = None,
+    accounting_reservation_revision: int | None = None,
 ) -> bool:
     """Durably stamp one server-owned queue band before admission.
 
@@ -774,6 +998,8 @@ def apply_credit_queue_decision(
         allowance_revision=allowance_revision,
         reservation=reservation,
         revalidation=revalidation,
+        accounting_reservation_id=accounting_reservation_id,
+        accounting_reservation_revision=accounting_reservation_revision,
     )
     return _apply_credit_queue_transition(job, target, running_consume=False)
 
@@ -785,6 +1011,8 @@ def consume_credit_queue_reservation(
     transition_id: str,
     allowance_revision: str,
     reservation: CreditReservationState,
+    accounting_reservation_id: str | None = None,
+    accounting_reservation_revision: int | None = None,
 ) -> bool:
     """Durably consume the current reservation after runtime admission.
 
@@ -798,6 +1026,8 @@ def consume_credit_queue_reservation(
         allowance_revision=allowance_revision,
         reservation=reservation,
         revalidation=None,
+        accounting_reservation_id=accounting_reservation_id,
+        accounting_reservation_revision=accounting_reservation_revision,
     )
     return _apply_credit_queue_transition(job, target, running_consume=True)
 
@@ -827,7 +1057,13 @@ def _apply_credit_queue_transition(
             ]]
             target = _validated_credit_queue_metadata(target)
         target_fingerprint = _credit_queue_fingerprint(target)
-        if current is not None:
+        callback_consume = bool(
+            running_consume
+            and current is not None
+            and current["schema_version"] == 2
+            and _credit_lifecycle_callback is not None
+        )
+        if current is not None and not callback_consume:
             previous = next(
                 (
                     item[1]
@@ -844,7 +1080,6 @@ def _apply_credit_queue_transition(
                 )
         if running_consume:
             comparable_fields = (
-                "schema_version",
                 "realm",
                 "enforcement_enabled",
                 "metering_applied",
@@ -856,14 +1091,37 @@ def _apply_credit_queue_transition(
                 "allowance_revision",
                 "allowance_observed_at",
             )
+            durable_revision_matches = True
+            if current is not None and current["schema_version"] == 2:
+                if callback_consume:
+                    durable_revision_matches = target["schema_version"] in {1, 2}
+                    if target["schema_version"] == 2:
+                        durable_revision_matches = bool(
+                            target["accounting_reservation_id"]
+                            == current["accounting_reservation_id"]
+                        )
+                else:
+                    durable_revision_matches = bool(
+                        target["schema_version"] == 2
+                        and target["accounting_reservation_id"]
+                        == current["accounting_reservation_id"]
+                        and target["accounting_reservation_revision"]
+                        == current["accounting_reservation_revision"] + 1
+                    )
             if (
                 current is None
                 or job.get("status") != "running"
                 or is_cancel_requested(job)
+                or job.get("_credit_revalidation_required") is True
                 or current["reservation_state"] != "reserved"
                 or target["reservation_state"] != "consumed"
                 or current["queue_band"] != 1
                 or target["queue_band"] != 1
+                or (
+                    not callback_consume
+                    and target["schema_version"] != current["schema_version"]
+                )
+                or not durable_revision_matches
                 or any(current[key] != target[key] for key in comparable_fields)
             ):
                 return False
@@ -891,18 +1149,23 @@ def _apply_credit_queue_transition(
                     "credit allowance revision is stale or conflicting",
                 )
         candidate = _copy_job_for_transition(job)
-        history = (
-            []
-            if current is None
-            else list(current["transition_history"])
-        )
-        if len(history) >= _MAX_CREDIT_TRANSITION_HISTORY:
-            raise CreditQueueTransitionConflict(
-                "credit transition history capacity is exhausted",
+        if callback_consume:
+            if not _apply_credit_lifecycle_action_unlocked(candidate, "consume"):
+                return False
+        else:
+            history = (
+                []
+                if current is None
+                else list(current["transition_history"])
             )
-        history.append([transition_id, target_fingerprint])
-        target["transition_history"] = history
-        candidate["credit_queue"] = target
+            if len(history) >= _MAX_CREDIT_TRANSITION_HISTORY:
+                raise CreditQueueTransitionConflict(
+                    "credit transition history capacity is exhausted",
+                )
+            history.append([transition_id, target_fingerprint])
+            target["transition_history"] = history
+            candidate["credit_queue"] = target
+        candidate.pop("_credit_revalidation_required", None)
         expected_status = "running" if running_consume else "queued"
         _persist_prospective_unlocked(
             "credit_reservation_consumed" if running_consume else "credit_queue",
@@ -921,6 +1184,8 @@ def _apply_credit_queue_transition(
 
 
 def _credit_queue_band(job: Mapping[str, Any]) -> int:
+    if job.get("_credit_revalidation_required") is True:
+        return 0
     raw = job.get("credit_queue")
     if raw is None:
         return 0
@@ -998,6 +1263,7 @@ def _eligible_queue_entries() -> list[tuple[int, MutableMapping[str, Any]]]:
         entry for entry in _queue_waiters.values()
         if entry[1].get("status") == "queued"
         and not entry[1].get("queue_held", False)
+        and entry[1].get("_credit_revalidation_required") is not True
         and not is_cancel_requested(entry[1])
     ]
 
@@ -1334,7 +1600,11 @@ def promote_queued_job(job: MutableMapping[str, Any]) -> bool:
     """
     global _queue_paused, _pause_after_current, _queue_manual_order_sequence
     with _queue_condition, _lifecycle_lock:
-        if job.get("status") != "queued" or is_cancel_requested(job):
+        if (
+            job.get("status") != "queued"
+            or is_cancel_requested(job)
+            or job.get("_credit_revalidation_required") is True
+        ):
             return False
         candidate = _copy_job_for_transition(job)
         next_manual_order = _queue_manual_order_sequence + 1
@@ -1384,6 +1654,8 @@ def queue_wait_reason(
             )
         if job.get("status") != "queued" or is_cancel_requested(job):
             return None
+        if job.get("_credit_revalidation_required") is True:
+            return "credit_revalidation"
         if job.get("queue_held", False):
             return "held"
         if _queue_paused:
@@ -1552,6 +1824,8 @@ def queue_scheduler_snapshot(
                 )
             elif status != "queued" or state.get("cancel_requested", False):
                 reason = None
+            elif state.get("_credit_revalidation_required") is True:
+                reason = "credit_revalidation"
             elif state.get("queue_held", False):
                 reason = "held"
             elif _queue_paused:
@@ -1752,7 +2026,7 @@ def _reset_queue_state_for_tests() -> None:
     global _queue_sequence, _queue_manual_order_sequence
     global _queue_paused, _pause_after_current
     global _resident_base_key, _resident_affinity_key
-    global _durability_hook
+    global _durability_hook, _credit_lifecycle_callback
     with _queue_condition:
         _queue_waiters.clear()
         _queue_sequence = 0
@@ -1762,6 +2036,7 @@ def _reset_queue_state_for_tests() -> None:
         _resident_base_key = None
         _resident_affinity_key = None
         _durability_hook = None
+        _credit_lifecycle_callback = None
         _queue_condition.notify_all()
 
 
@@ -2380,6 +2655,7 @@ def block_resource_admission_failure(
             phase="resource_admission_failed",
             message=message,
         )
+        _apply_credit_lifecycle_action_unlocked(candidate, "release")
         persisted = True
         try:
             _persist_prospective_unlocked(
@@ -2434,6 +2710,7 @@ def fail_preparation(
             candidate["preemption_mode"] = PREEMPTION_MODE_NONE
         candidate.setdefault("finished_at", time.time())
         _append_job_event_unlocked(candidate, status="failed", **updates)
+        _apply_credit_lifecycle_action_unlocked(candidate, "release")
         _persist_prospective_unlocked(
             "preparation_failed",
             jobs=(candidate,),
@@ -2481,6 +2758,7 @@ def try_start(
                 if candidate.get("resource_intent") in _RESOURCE_INTENTS:
                     candidate["resource_state"] = "released"
                     candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+                _apply_credit_lifecycle_action_unlocked(candidate, "release")
                 _persist_prospective_unlocked(
                     "start_cancelled",
                     jobs=(candidate,),
@@ -2557,6 +2835,7 @@ def _try_requeue_unlocked(
         if candidate.get("resource_intent") in _RESOURCE_INTENTS:
             candidate["resource_state"] = "released"
             candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+        _apply_credit_lifecycle_action_unlocked(candidate, "release")
         _persist_prospective_unlocked(
             "requeue_cancelled",
             jobs=(candidate,),
@@ -2783,6 +3062,7 @@ def request_cancel(
         _append_job_event_unlocked(
             candidate, status="cancelled", message="Cancelled",
         )
+        _apply_credit_lifecycle_action_unlocked(candidate, "release")
         _persist_prospective_unlocked(
             "cancel",
             jobs=(candidate,),
@@ -2839,6 +3119,7 @@ def finish_job(
             if candidate.get("resource_intent") in _RESOURCE_INTENTS:
                 candidate["resource_state"] = "released"
                 candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+            _apply_credit_lifecycle_action_unlocked(candidate, "release")
             _persist_prospective_unlocked(
                 "finish_cancelled",
                 jobs=(candidate,),
@@ -2867,6 +3148,7 @@ def finish_job(
             candidate["resource_state"] = "released"
             candidate["preemption_mode"] = PREEMPTION_MODE_NONE
         _append_job_event_unlocked(candidate, status=status, **updates)
+        _apply_credit_lifecycle_action_unlocked(candidate, "release")
         _persist_prospective_unlocked(
             "finish",
             jobs=(candidate,),

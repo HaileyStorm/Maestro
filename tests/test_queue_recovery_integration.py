@@ -86,9 +86,10 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
         reservation_state="reserved",
         revalidation_state=None,
         transition_id="transition_recovery_0001",
+        accounting=False,
     ):
         result = {
-            "schema_version": 1,
+            "schema_version": 2 if accounting else 1,
             "realm": "hosted",
             "enforcement_enabled": True,
             "metering_applied": True,
@@ -105,10 +106,12 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             "transition_id": transition_id,
             "transition_history": [],
         }
-        fingerprint = hashlib.sha256(json.dumps(
-            {
-                key: result[key]
-                for key in (
+        if accounting:
+            result.update({
+                "accounting_reservation_id": "reservation_" + "1" * 32,
+                "accounting_reservation_revision": 1,
+            })
+        fingerprint_fields = [
                     "schema_version",
                     "realm",
                     "enforcement_enabled",
@@ -121,8 +124,14 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
                     "revalidation_state",
                     "allowance_revision",
                     "allowance_observed_at",
-                )
-            },
+        ]
+        if accounting:
+            fingerprint_fields.extend([
+                "accounting_reservation_id",
+                "accounting_reservation_revision",
+            ])
+        fingerprint = hashlib.sha256(json.dumps(
+            {key: result[key] for key in fingerprint_fields},
             sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii")).hexdigest()
@@ -167,11 +176,27 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             active["credit_queue"],
         )
         self.assertEqual(recovered.global_state["queue_order"], [
-            active["id"],
             standard["id"],
+            active["id"],
             depleted["id"],
         ])
+        self.assertTrue(
+            recovered.jobs[active["id"]]["_credit_revalidation_required"],
+        )
         self.assertFalse(recovered.jobs[depleted["id"]]["queue_held"])
+
+    def test_credit_queue_v2_round_trips_only_opaque_accounting_linkage(self):
+        credit_queue = self._credit_queue(accounting=True)
+        job = self._job("accounting-credit", credit_queue=credit_queue)
+        self._register(job)
+
+        restored = QueueRecoveryCoordinator(self.journal).restore().jobs[job["id"]]
+        self.assertEqual(restored["credit_queue"], credit_queue)
+        self.assertTrue(restored["_credit_revalidation_required"])
+        encoded = json.dumps(restored["credit_queue"], sort_keys=True)
+        self.assertNotIn("account_id", encoded)
+        self.assertNotIn("source", encoded)
+        self.assertNotIn("provider", encoded)
 
     def test_credit_queue_recovery_rejects_unknown_or_inconsistent_metadata(self):
         variants = []

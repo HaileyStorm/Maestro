@@ -121,6 +121,9 @@ _CREDIT_QUEUE_DECISIONS = frozenset({
 })
 _CREDIT_RESERVATION_STATES = frozenset({"reserved", "released", "consumed"})
 _CREDIT_REVALIDATION_STATES = frozenset({"valid", "downgraded", "released"})
+_CREDIT_ACCOUNTING_RESERVATION_RE = re.compile(
+    r"reservation_[0-9a-f]{32,64}\Z",
+)
 
 
 class QueueRecoveryAdapterError(RuntimeError):
@@ -699,6 +702,9 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
 
 def _safe_credit_queue(value: Any) -> dict[str, Any]:
     """Validate the exact content-free scheduler decision envelope."""
+    if not isinstance(value, Mapping):
+        raise QueueRecoveryAdapterError("job.credit_queue schema is invalid.")
+    schema_version = value.get("schema_version")
     expected = {
         "schema_version",
         "realm",
@@ -715,7 +721,12 @@ def _safe_credit_queue(value: Any) -> dict[str, Any]:
         "transition_id",
         "transition_history",
     }
-    if not isinstance(value, Mapping) or set(value) != expected:
+    if schema_version == 2:
+        expected.update({
+            "accounting_reservation_id",
+            "accounting_reservation_revision",
+        })
+    if set(value) != expected:
         raise QueueRecoveryAdapterError("job.credit_queue schema is invalid.")
     decision = value["decision"]
     requested_units_positive = value["requested_units_positive"]
@@ -728,8 +739,8 @@ def _safe_credit_queue(value: Any) -> dict[str, Any]:
     transition_id = value["transition_id"]
     transition_history = value["transition_history"]
     if (
-        type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
+        type(schema_version) is not int
+        or schema_version not in {1, 2}
         or not isinstance(value["realm"], str)
         or value["realm"] not in {"local", "lan", "hosted"}
         or type(value["enforcement_enabled"]) is not bool
@@ -770,6 +781,23 @@ def _safe_credit_queue(value: Any) -> dict[str, Any]:
         or not 1 <= len(transition_history) <= _MAX_CREDIT_TRANSITION_HISTORY
     ):
         raise QueueRecoveryAdapterError("job.credit_queue is invalid.")
+    if schema_version == 2:
+        accounting_reservation_id = value["accounting_reservation_id"]
+        accounting_reservation_revision = value[
+            "accounting_reservation_revision"
+        ]
+        if (
+            not isinstance(accounting_reservation_id, str)
+            or _CREDIT_ACCOUNTING_RESERVATION_RE.fullmatch(
+                accounting_reservation_id,
+            ) is None
+            or type(accounting_reservation_revision) is not int
+            or accounting_reservation_revision < 1
+            or reservation_state is None
+        ):
+            raise QueueRecoveryAdapterError(
+                "job.credit_queue accounting linkage is invalid.",
+            )
 
     seen_transition_ids: set[str] = set()
     for item in transition_history:
@@ -864,6 +892,13 @@ def _safe_credit_queue(value: Any) -> dict[str, Any]:
             "allowance_observed_at",
         )
     }
+    if schema_version == 2:
+        fingerprint_payload.update({
+            "accounting_reservation_id": value["accounting_reservation_id"],
+            "accounting_reservation_revision": value[
+                "accounting_reservation_revision"
+            ],
+        })
     fingerprint = hashlib.sha256(
         json.dumps(
             fingerprint_payload,
@@ -1237,6 +1272,13 @@ def _validated_recovered_state(
             clean["preemption_mode"] = "none"
             clean["resource_state"] = "queued"
             clean.setdefault("execution_attempt", 1)
+            credit_queue = clean.get("credit_queue")
+            if (
+                isinstance(credit_queue, Mapping)
+                and credit_queue.get("schema_version") in {1, 2}
+                and credit_queue.get("queue_band") == 1
+            ):
+                clean["_credit_revalidation_required"] = True
         elif "resource_intent" in clean:
             clean["resource_execution"] = "standard"
             clean["preemption_mode"] = "none"
@@ -1282,7 +1324,9 @@ def _durable_order_key(
         created = 0.0
     credit_queue = snapshot.get("credit_queue")
     credit_band = (
-        int(credit_queue.get("queue_band", 0))
+        0
+        if snapshot.get("_credit_revalidation_required") is True
+        else int(credit_queue.get("queue_band", 0))
         if isinstance(credit_queue, Mapping)
         else 0
     )

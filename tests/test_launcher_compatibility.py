@@ -239,6 +239,36 @@ Promise.resolve(launcher.menu({}, info))
             )
             self.assertEqual(malformed.read_text(encoding="utf-8"), before)
 
+    def test_readme_documents_deliberate_account_bootstrap_reset(self):
+        readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Deleting only the account store does not reopen owner setup",
+            readme,
+        )
+        self.assertIn("Prefer restoring a known-good backup", readme)
+        self.assertIn("stop Maestro first", readme)
+        self.assertIn(
+            "both the account store and its sibling `.bootstrap-complete` marker",
+            readme,
+        )
+        self.assertIn(
+            "Remove the session secret only when you also intend to invalidate all "
+            "sealed account state",
+            readme,
+        )
+        self.assertIn("then re-enable bootstrap", readme)
+        self.assertIn("direct local loopback Web UI", readme)
+        self.assertIn(
+            "destructive reset removes account sessions and recovery state",
+            readme,
+        )
+        self.assertIn("no automatic reset or CLI", readme)
+        self.assertIn(
+            "Never put credentials, recovery codes, or secret values in commands or logs",
+            readme,
+        )
+
     def test_start_registers_pinokios_live_tunnel_url_with_local_ui(self):
         start = (_ROOT / "start.js").read_text(encoding="utf-8")
         helper = (_ROOT / "app" / "scripts" / "register_share_url.py").read_text(encoding="utf-8")

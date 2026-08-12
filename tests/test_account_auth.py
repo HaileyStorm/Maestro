@@ -97,6 +97,22 @@ class AccountAuthStoreTests(unittest.TestCase):
             remote=False,
         )
 
+    @property
+    def marker_path(self):
+        return Path(self.store.bootstrap_marker_path)
+
+    def test_pristine_store_is_bootstrapable_without_completion_marker(self):
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.marker_path.exists())
+        self.assertFalse(self.store.has_accounts())
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.marker_path.exists())
+
+        self._nonce("bootstrap")
+        self.assertTrue(self.path.exists())
+        self.assertFalse(self.marker_path.exists())
+        self.assertFalse(self.store.has_accounts())
+
     def test_bootstrap_is_sealed_private_and_restart_persistent(self):
         result = self._bootstrap()
         principal = self.store.resolve_session(result["account_session_id"])
@@ -107,12 +123,18 @@ class AccountAuthStoreTests(unittest.TestCase):
         self.assertFalse(principal["passkey_authentication_available"])
         self.assertEqual(len(result["recovery_codes"]), 10)
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+        self.assertTrue(self.marker_path.is_file())
+        self.assertEqual(stat.S_IMODE(self.marker_path.stat().st_mode), 0o600)
 
         raw = self.path.read_text(encoding="utf-8")
         self.assertNotIn(PASSWORD, raw)
         self.assertNotIn(result["account_session_id"], raw)
         self.assertNotIn(result["recovery_codes"][0], raw)
         self.assertNotIn("owner@example.test".split("@")[0] + "@example.test", json.dumps(result))
+        marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(marker["version"], 1)
+        self.assertEqual(marker["owner_id"], result["account"]["id"])
+        self.assertNotIn(str(self.path), json.dumps(marker))
 
         restarted = self._new_store()
         self.assertEqual(
@@ -127,6 +149,103 @@ class AccountAuthStoreTests(unittest.TestCase):
                 device_label="Browser",
                 nonce_session_id="b" * 32,
                 nonce=restarted.issue_nonce("b" * 32, "bootstrap")["nonce"],
+                remote=False,
+            )
+        self.assertEqual(duplicate.exception.code, "bootstrap_complete")
+
+    def test_legacy_nonempty_store_creates_missing_completion_marker(self):
+        result = self._bootstrap()
+        self.marker_path.unlink()
+        self.assertFalse(self.marker_path.exists())
+
+        restarted = self._new_store()
+        self.assertTrue(restarted.has_accounts())
+        self.assertTrue(self.marker_path.is_file())
+        marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(marker["owner_id"], result["account"]["id"])
+
+    def test_store_deletion_after_bootstrap_never_reopens_bootstrap(self):
+        self._bootstrap()
+        self.path.unlink()
+
+        for operation in (
+            self.store.has_accounts,
+            lambda: self.store.issue_nonce(self.browser_session, "bootstrap"),
+        ):
+            with self.subTest(operation=operation), self.assertRaises(
+                AccountStoreCorruptError,
+            ) as unavailable:
+                operation()
+            self.assertEqual(unavailable.exception.code, "account_store_unavailable")
+        self.assertTrue(self.marker_path.exists())
+
+    def test_completion_marker_tamper_links_and_store_binding_fail_closed(self):
+        self._bootstrap()
+        encoded = self.marker_path.read_bytes()
+
+        marker = json.loads(encoded.decode("utf-8"))
+        marker["owner_id"] = "f" * 32
+        self.marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(self.marker_path, 0o600)
+        with self.assertRaises(AccountStoreCorruptError):
+            self.store.has_accounts()
+
+        self.marker_path.write_bytes(encoded)
+        if os.name != "nt":
+            os.chmod(self.marker_path, 0o600)
+        linked = self.marker_path.with_suffix(".linked")
+        try:
+            os.link(self.marker_path, linked)
+        except (OSError, NotImplementedError):
+            linked = None
+        if linked is not None:
+            with self.assertRaises(AccountStoreCorruptError):
+                self.store.has_accounts()
+            linked.unlink()
+
+        copied_store_path = self.path.with_name("copied-account-auth.json")
+        copied_store_path.write_bytes(self.path.read_bytes())
+        copied = AccountAuthStore(
+            str(copied_store_path), self.secret, clock=self.clock, password_n=1024,
+        )
+        Path(copied.bootstrap_marker_path).write_bytes(encoded)
+        with self.assertRaises(AccountStoreCorruptError):
+            copied.has_accounts()
+
+        target = self.marker_path.with_suffix(".target")
+        target.write_bytes(encoded)
+        self.marker_path.unlink()
+        try:
+            self.marker_path.symlink_to(target)
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            with self.assertRaises(AccountStoreCorruptError):
+                self.store.has_accounts()
+
+    def test_completion_marker_write_failure_leaves_bootstrap_closed(self):
+        with patch.object(
+            self.store, "_save_bootstrap_marker",
+            side_effect=AccountStoreCorruptError(),
+        ):
+            with self.assertRaises(AccountStoreCorruptError) as unavailable:
+                self._bootstrap()
+            self.assertEqual(unavailable.exception.code, "account_store_unavailable")
+            persisted = json.loads(self.path.read_text(encoding="utf-8"))
+            self.assertEqual(len(persisted["accounts"]), 1)
+            with self.assertRaises(AccountStoreCorruptError):
+                self.store.has_accounts()
+
+        restarted = self._new_store()
+        self.assertTrue(restarted.has_accounts())
+        self.assertTrue(self.marker_path.exists())
+        browser = "b" * 32
+        with self.assertRaises(AccountAuthError) as duplicate:
+            restarted.bootstrap_owner(
+                username="Other", password=PASSWORD, email="",
+                device_label="Browser", nonce_session_id=browser,
+                nonce=restarted.issue_nonce(browser, "bootstrap")["nonce"],
                 remote=False,
             )
         self.assertEqual(duplicate.exception.code, "bootstrap_complete")
@@ -723,18 +842,23 @@ class AccountAuthStoreTests(unittest.TestCase):
                 self.assertFalse(self.store.has_accounts())
 
     def test_malformed_and_tampered_stores_fail_closed(self):
-        self.path.write_text("{}", encoding="utf-8")
+        malformed = b"{}"
+        self.path.write_bytes(malformed)
         with self.assertRaises(AccountStoreCorruptError):
             self.store.has_accounts()
+        self.assertEqual(self.path.read_bytes(), malformed)
+        self.assertFalse(self.marker_path.exists())
 
         self.path.unlink()
         boot = self._bootstrap()
+        marker = self.marker_path.read_bytes()
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         payload["accounts"][0]["role"] = "owner"
         payload["accounts"][0]["username"] = "Tampered"
         self.path.write_text(json.dumps(payload), encoding="utf-8")
         with self.assertRaises(AccountStoreCorruptError):
             self.store.resolve_session(boot["account_session_id"])
+        self.assertEqual(self.marker_path.read_bytes(), marker)
 
     def test_two_processes_serialize_full_load_modify_save(self):
         if os.name == "nt":

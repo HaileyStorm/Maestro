@@ -23,7 +23,7 @@ from typing import Any, ClassVar
 
 from services.entitlements import exclusive_file_lease
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 MAX_STATE_BYTES = 8 * 1024 * 1024
 MAX_ACCOUNTS = 10_000
 MAX_SOURCES_PER_ACCOUNT = 1_024
@@ -37,6 +37,18 @@ _UTC_TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z",
 )
 _STATUSES = frozenset({"pending", "consumed", "released", "invalidated"})
+_RECEIPT_STATES = frozenset({
+    "reconciled", "reserved", "revalidated",
+    "consumed", "released", "terminal_satisfied",
+})
+_RECEIPT_STATE_STATUSES = {
+    "reconciled": frozenset({None}),
+    "reserved": frozenset({"pending", "invalidated"}),
+    "revalidated": _STATUSES,
+    "consumed": frozenset({"consumed"}),
+    "released": frozenset({"released"}),
+    "terminal_satisfied": frozenset({"released", "invalidated"}),
+}
 
 
 class CreditAccountingError(ValueError):
@@ -82,6 +94,10 @@ class CreditAccountingReceipt:
     reservation_status: str | None
     requested_units: int
     affected_units: int
+    reservation_revision: int | None
+    fully_funded: bool | None
+    allocation_satisfied: bool | None
+    terminal_satisfied: bool | None
     clock_high_water: str
 
 
@@ -147,6 +163,33 @@ def _empty_state() -> dict[str, Any]:
         "accounts": {},
         "operations": {},
     }
+
+
+def _normalize_source_balances(
+    sources: Sequence[CreditSourceBalance],
+) -> list[dict[str, Any]]:
+    if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
+        raise CreditAccountingError("sources must be a sequence")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in sources:
+        if not isinstance(source, CreditSourceBalance):
+            raise CreditAccountingError("source balance is invalid")
+        source_key = _opaque(source.source_key, _KEY_RE, "source key")
+        if source_key in seen:
+            raise CreditAccountingError("source key is duplicated")
+        seen.add(source_key)
+        normalized.append({
+            "source_key": source_key,
+            "effective_units": _units(source.effective_units, "effective units"),
+            "expires_at": (
+                None if source.expires_at is None else _iso(source.expires_at)
+            ),
+        })
+    if len(normalized) > MAX_SOURCES_PER_ACCOUNT:
+        raise CreditAccountingError("source bound reached")
+    normalized.sort(key=lambda item: item["source_key"])
+    return normalized
 
 
 class CreditAccountingJournal:
@@ -362,7 +405,8 @@ class CreditAccountingJournal:
                 for reservation_key, reservation in reservations.items():
                     _opaque(reservation_key, _RESERVATION_RE, "reservation id")
                     if not isinstance(reservation, dict) or set(reservation) != {
-                        "status", "created_sequence", "allocations",
+                        "status", "created_sequence", "requested_units",
+                        "revision", "allocations",
                     }:
                         raise ValueError
                     if reservation["status"] not in _STATUSES:
@@ -374,6 +418,14 @@ class CreditAccountingJournal:
                     if sequence in sequence_values:
                         raise ValueError
                     sequence_values.add(sequence)
+                    requested = _units(
+                        reservation["requested_units"],
+                        "reservation requested units", positive=True,
+                    )
+                    _units(
+                        reservation["revision"],
+                        "reservation revision", positive=True,
+                    )
                     allocations = reservation["allocations"]
                     if not isinstance(allocations, list):
                         raise TypeError
@@ -401,6 +453,8 @@ class CreditAccountingJournal:
                     if reservation["status"] == "invalidated" and allocations:
                         raise ValueError
                     if reservation["status"] in {"consumed", "released"} and not allocations:
+                        raise ValueError
+                    if sum(item["units"] for item in allocations) > requested:
                         raise ValueError
                 for source_key, source in sources.items():
                     if consumed_by_source[source_key] != source["consumed_units"]:
@@ -431,18 +485,60 @@ class CreditAccountingJournal:
     def _receipt_from_mapping(value: Any) -> CreditAccountingReceipt:
         if not isinstance(value, Mapping) or set(value) != {
             "state", "reservation_status", "requested_units",
-            "affected_units", "clock_high_water",
+            "affected_units", "reservation_revision", "fully_funded",
+            "allocation_satisfied", "terminal_satisfied", "clock_high_water",
         }:
             raise CreditAccountingError("operation receipt is invalid")
-        if not isinstance(value["state"], str) or value["reservation_status"] not in (
+        if value["state"] not in _RECEIPT_STATES or value["reservation_status"] not in (
             _STATUSES | {None}
         ):
             raise CreditAccountingError("operation receipt state is invalid")
+        revision = value["reservation_revision"]
+        if revision is not None:
+            revision = _units(revision, "reservation revision", positive=True)
+        fully_funded = value["fully_funded"]
+        if fully_funded is not None and type(fully_funded) is not bool:
+            raise CreditAccountingError("fully funded state is invalid")
+        allocation_satisfied = value["allocation_satisfied"]
+        if allocation_satisfied is not None and type(allocation_satisfied) is not bool:
+            raise CreditAccountingError("allocation satisfied state is invalid")
+        terminal_satisfied = value["terminal_satisfied"]
+        if terminal_satisfied is not None and type(terminal_satisfied) is not bool:
+            raise CreditAccountingError("terminal satisfied state is invalid")
+        requested_units = _units(value["requested_units"], "requested units")
+        affected_units = _units(value["affected_units"], "affected units")
+        status = value["reservation_status"]
+        if status not in _RECEIPT_STATE_STATUSES[value["state"]]:
+            raise CreditAccountingError("operation receipt state is inconsistent")
+        if (status is None) is not (revision is None):
+            raise CreditAccountingError("reservation status and revision are inconsistent")
+        if status is None:
+            if any(item is not None for item in (
+                fully_funded, allocation_satisfied, terminal_satisfied,
+            )):
+                raise CreditAccountingError("reservation receipt signals are invalid")
+        else:
+            if requested_units <= 0 or affected_units > requested_units:
+                raise CreditAccountingError("reservation receipt units are inconsistent")
+            if (
+                fully_funded
+                is not (status == "pending" and affected_units == requested_units)
+                or allocation_satisfied
+                is not (status == "consumed" and affected_units == requested_units)
+                or terminal_satisfied is not (status in {"released", "invalidated"})
+            ):
+                raise CreditAccountingError(
+                    "reservation receipt signals are inconsistent",
+                )
         return CreditAccountingReceipt(
             state=value["state"],
-            reservation_status=value["reservation_status"],
-            requested_units=_units(value["requested_units"], "requested units"),
-            affected_units=_units(value["affected_units"], "affected units"),
+            reservation_status=status,
+            requested_units=requested_units,
+            affected_units=affected_units,
+            reservation_revision=revision,
+            fully_funded=fully_funded,
+            allocation_satisfied=allocation_satisfied,
+            terminal_satisfied=terminal_satisfied,
             clock_high_water=_iso(value["clock_high_water"]),
         )
 
@@ -453,6 +549,10 @@ class CreditAccountingJournal:
             "reservation_status": receipt.reservation_status,
             "requested_units": receipt.requested_units,
             "affected_units": receipt.affected_units,
+            "reservation_revision": receipt.reservation_revision,
+            "fully_funded": receipt.fully_funded,
+            "allocation_satisfied": receipt.allocation_satisfied,
+            "terminal_satisfied": receipt.terminal_satisfied,
             "clock_high_water": receipt.clock_high_water,
         }
 
@@ -493,6 +593,8 @@ class CreditAccountingJournal:
         for reservation in ordered:
             if reservation["status"] != "pending":
                 continue
+            previous_allocations = reservation["allocations"]
+            previous_status = reservation["status"]
             kept: list[dict[str, Any]] = []
             for allocation in reservation["allocations"]:
                 source_key = allocation["source_key"]
@@ -503,6 +605,11 @@ class CreditAccountingJournal:
             reservation["allocations"] = kept
             if not kept:
                 reservation["status"] = "invalidated"
+            if (
+                reservation["allocations"] != previous_allocations
+                or reservation["status"] != previous_status
+            ):
+                reservation["revision"] += 1
 
     def _replay_or_conflict(
         self, state: Mapping[str, Any], operation_id: str, fingerprint: str,
@@ -530,6 +637,60 @@ class CreditAccountingJournal:
             "receipt": self._receipt_mapping(receipt),
         }
 
+    @staticmethod
+    def _require_operation_capacity(state: Mapping[str, Any]) -> None:
+        if len(state["operations"]) >= MAX_OPERATIONS:
+            raise CreditAccountingError("accounting operation bound reached")
+
+    def _apply_source_reconciliation(
+        self,
+        account: dict[str, Any],
+        normalized: Sequence[Mapping[str, Any]],
+        high_water: str,
+    ) -> None:
+        prior_sources = account["sources"]
+        for current in prior_sources.values():
+            current["effective_units"] = 0
+        now = _utc(high_water, "clock high-water")
+        for source in normalized:
+            existing = prior_sources.get(source["source_key"])
+            if existing is None:
+                existing = {
+                    "effective_units": 0,
+                    "expires_at": None,
+                    "consumed_units": 0,
+                }
+                prior_sources[source["source_key"]] = existing
+            effective = source["effective_units"]
+            expiry = source["expires_at"]
+            if expiry is not None and _utc(expiry, "source expiry") <= now:
+                effective = 0
+            existing["effective_units"] = effective
+            existing["expires_at"] = expiry
+        self._trim_pending(account)
+
+    @staticmethod
+    def _reservation_receipt(
+        state_name: str,
+        reservation: Mapping[str, Any],
+        high_water: str,
+    ) -> CreditAccountingReceipt:
+        affected = sum(
+            allocation["units"] for allocation in reservation["allocations"]
+        )
+        requested = reservation["requested_units"]
+        return CreditAccountingReceipt(
+            state_name,
+            reservation["status"],
+            requested,
+            affected,
+            reservation["revision"],
+            reservation["status"] == "pending" and affected == requested,
+            reservation["status"] == "consumed" and affected == requested,
+            reservation["status"] in {"released", "invalidated"},
+            high_water,
+        )
+
     def reconcile(
         self,
         *,
@@ -545,32 +706,10 @@ class CreditAccountingJournal:
         operation_id = _opaque(operation_id, _OPERATION_RE, "operation id")
         if not isinstance(unit, str) or _UNIT_RE.fullmatch(unit) is None:
             raise CreditAccountingError("unit is invalid")
-        if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
-            raise CreditAccountingError("sources must be a sequence")
-        normalized: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for source in sources:
-            if not isinstance(source, CreditSourceBalance):
-                raise CreditAccountingError("source balance is invalid")
-            source_key = _opaque(source.source_key, _KEY_RE, "source key")
-            if source_key in seen:
-                raise CreditAccountingError("source key is duplicated")
-            seen.add(source_key)
-            normalized.append({
-                "source_key": source_key,
-                "effective_units": _units(
-                    source.effective_units, "effective units",
-                ),
-                "expires_at": (
-                    None if source.expires_at is None else _iso(source.expires_at)
-                ),
-            })
-        if len(normalized) > MAX_SOURCES_PER_ACCOUNT:
-            raise CreditAccountingError("source bound reached")
-        normalized.sort(key=lambda item: item["source_key"])
+        normalized = _normalize_source_balances(sources)
         if not self.policy.enforcement_enabled:
             return CreditAccountingReceipt(
-                "disabled", None, 0, 0, _iso(as_of),
+                "disabled", None, 0, 0, None, None, None, None, _iso(as_of),
             )
         payload = {
             "kind": "reconcile", "account_key": account_key,
@@ -594,32 +733,14 @@ class CreditAccountingJournal:
                     accounts[account_key] = account
                 elif account["unit"] != unit:
                     raise CreditAccountingConflict("account unit cannot change")
-                prior_sources = account["sources"]
-                for current in prior_sources.values():
-                    current["effective_units"] = 0
-                now = _utc(high_water, "clock high-water")
-                for source in normalized:
-                    existing = prior_sources.get(source["source_key"])
-                    if existing is None:
-                        existing = {
-                            "effective_units": 0,
-                            "expires_at": None,
-                            "consumed_units": 0,
-                        }
-                        prior_sources[source["source_key"]] = existing
-                    effective = source["effective_units"]
-                    expiry = source["expires_at"]
-                    if expiry is not None and _utc(expiry, "source expiry") <= now:
-                        effective = 0
-                    existing["effective_units"] = effective
-                    existing["expires_at"] = expiry
-                self._trim_pending(account)
+                self._apply_source_reconciliation(account, normalized, high_water)
                 affected = sum(
                     max(0, source["effective_units"] - source["consumed_units"])
-                    for source in prior_sources.values()
+                    for source in account["sources"].values()
                 )
                 receipt = CreditAccountingReceipt(
-                    "reconciled", None, 0, affected, high_water,
+                    "reconciled", None, 0, affected, None, None, None, None,
+                    high_water,
                 )
                 self._record_operation(state, operation_id, fingerprint, receipt)
                 write = True
@@ -647,7 +768,8 @@ class CreditAccountingJournal:
         normalized_as_of = _iso(as_of)
         if not self.policy.enforcement_enabled:
             return CreditAccountingReceipt(
-                "disabled", None, requested, 0, normalized_as_of,
+                "disabled", None, requested, 0, None, None, None, None,
+                normalized_as_of,
             )
         payload = {
             "kind": "reserve", "account_key": account_key,
@@ -706,11 +828,73 @@ class CreditAccountingJournal:
                 account["reservations"][reservation_id] = {
                     "status": status,
                     "created_sequence": sequence,
+                    "requested_units": requested,
+                    "revision": 1,
                     "allocations": allocations,
                 }
                 reserved = requested - remaining
                 receipt = CreditAccountingReceipt(
-                    "reserved", status, requested, reserved, high_water,
+                    "reserved", status, requested, reserved, 1,
+                    reserved == requested, False, status == "invalidated",
+                    high_water,
+                )
+                self._record_operation(state, operation_id, fingerprint, receipt)
+                write = True
+                return receipt
+            finally:
+                self._close_locked_state(lease, state, write=write)
+
+    def revalidate_reservation(
+        self,
+        *,
+        account_key: str,
+        reservation_id: str,
+        operation_id: str,
+        unit: str,
+        sources: Sequence[CreditSourceBalance],
+        as_of: datetime | str,
+    ) -> CreditAccountingReceipt:
+        """Atomically reconcile source truth and report one reservation state."""
+
+        account_key = _opaque(account_key, _KEY_RE, "account key")
+        reservation_id = _opaque(
+            reservation_id, _RESERVATION_RE, "reservation id",
+        )
+        operation_id = _opaque(operation_id, _OPERATION_RE, "operation id")
+        if not isinstance(unit, str) or _UNIT_RE.fullmatch(unit) is None:
+            raise CreditAccountingError("unit is invalid")
+        normalized = _normalize_source_balances(sources)
+        normalized_as_of = _iso(as_of)
+        if not self.policy.enforcement_enabled:
+            return CreditAccountingReceipt(
+                "disabled", None, 0, 0, None, None, None, None,
+                normalized_as_of,
+            )
+        payload = {
+            "kind": "revalidate", "account_key": account_key,
+            "reservation_id": reservation_id, "unit": unit,
+            "sources": normalized, "as_of": normalized_as_of,
+        }
+        fingerprint = _fingerprint(payload)
+        with self._thread_lock:
+            lease, state = self._locked_state()
+            write = False
+            try:
+                replay = self._replay_or_conflict(state, operation_id, fingerprint)
+                if replay is not None:
+                    return replay
+                high_water = self._advance_clock(state, as_of)
+                account = state["accounts"].get(account_key)
+                if account is None:
+                    raise CreditAccountingError("account has not been reconciled")
+                if account["unit"] != unit:
+                    raise CreditAccountingConflict("account unit cannot change")
+                reservation = account["reservations"].get(reservation_id)
+                if reservation is None:
+                    raise CreditAccountingError("reservation does not exist")
+                self._apply_source_reconciliation(account, normalized, high_water)
+                receipt = self._reservation_receipt(
+                    "revalidated", reservation, high_water,
                 )
                 self._record_operation(state, operation_id, fingerprint, receipt)
                 write = True
@@ -726,20 +910,29 @@ class CreditAccountingJournal:
         reservation_id: str,
         operation_id: str,
         as_of: datetime | str,
+        expected_revision: int | None = None,
     ) -> CreditAccountingReceipt:
         account_key = _opaque(account_key, _KEY_RE, "account key")
         reservation_id = _opaque(
             reservation_id, _RESERVATION_RE, "reservation id",
         )
         operation_id = _opaque(operation_id, _OPERATION_RE, "operation id")
+        if kind in {"consume", "release"}:
+            expected_revision = _units(
+                expected_revision, "expected reservation revision", positive=True,
+            )
+        else:
+            raise CreditAccountingError("transition is invalid")
         normalized_as_of = _iso(as_of)
         if not self.policy.enforcement_enabled:
             return CreditAccountingReceipt(
-                "disabled", None, 0, 0, normalized_as_of,
+                "disabled", None, 0, 0, None, None, None, None,
+                normalized_as_of,
             )
         payload = {
             "kind": kind, "account_key": account_key,
             "reservation_id": reservation_id, "as_of": normalized_as_of,
+            "expected_revision": expected_revision,
         }
         fingerprint = _fingerprint(payload)
         with self._thread_lock:
@@ -750,6 +943,9 @@ class CreditAccountingJournal:
                 if replay is not None:
                     return replay
                 high_water = self._advance_clock(state, as_of)
+                # Clock/expiry observations are authoritative even when the
+                # requested transition is subsequently rejected.
+                write = True
                 account = state["accounts"].get(account_key)
                 reservation = (
                     None if account is None
@@ -757,9 +953,28 @@ class CreditAccountingJournal:
                 )
                 if reservation is None:
                     raise CreditAccountingError("reservation does not exist")
-                if reservation["status"] != "pending":
+                current_revision = reservation["revision"]
+                if kind == "release":
+                    if expected_revision > current_revision:
+                        raise CreditAccountingConflict(
+                            "reservation revision is ahead of durable state",
+                        )
+                    if reservation["status"] == "consumed":
+                        raise CreditAccountingConflict(
+                            "consumed reservation cannot be released",
+                        )
+                    if reservation["status"] in {"released", "invalidated"}:
+                        self._require_operation_capacity(state)
+                        receipt = self._reservation_receipt(
+                            "terminal_satisfied", reservation, high_water,
+                        )
+                        self._record_operation(
+                            state, operation_id, fingerprint, receipt,
+                        )
+                        return receipt
+                elif reservation["status"] != "pending":
                     raise CreditAccountingConflict(
-                        f"{kind} requires a pending reservation",
+                        "consume requires a pending reservation",
                     )
                 affected = sum(
                     allocation["units"]
@@ -769,18 +984,27 @@ class CreditAccountingJournal:
                     raise CreditAccountingConflict(
                         f"{kind} requires a funded pending reservation",
                     )
+                self._require_operation_capacity(state)
                 if kind == "consume":
+                    if reservation["revision"] != expected_revision:
+                        raise CreditAccountingConflict(
+                            "reservation revision is stale",
+                        )
+                    if affected != reservation["requested_units"]:
+                        raise CreditAccountingConflict(
+                            "reservation is not fully funded",
+                        )
                     for allocation in reservation["allocations"]:
                         account["sources"][allocation["source_key"]][
                             "consumed_units"
                         ] += allocation["units"]
                     reservation["status"] = "consumed"
+                    reservation["revision"] += 1
                 elif kind == "release":
                     reservation["status"] = "released"
-                else:
-                    raise CreditAccountingError("transition is invalid")
-                receipt = CreditAccountingReceipt(
-                    kind + "d", reservation["status"], 0, affected, high_water,
+                    reservation["revision"] += 1
+                receipt = self._reservation_receipt(
+                    kind + "d", reservation, high_water,
                 )
                 self._record_operation(state, operation_id, fingerprint, receipt)
                 write = True
@@ -788,15 +1012,45 @@ class CreditAccountingJournal:
             finally:
                 self._close_locked_state(lease, state, write=write)
 
-    def consume(self, **kwargs: Any) -> CreditAccountingReceipt:
-        """Consume a currently pending reservation exactly once."""
+    def consume(
+        self,
+        *,
+        account_key: str,
+        reservation_id: str,
+        operation_id: str,
+        as_of: datetime | str,
+        expected_revision: int,
+    ) -> CreditAccountingReceipt:
+        """Consume a fully funded pending reservation at an exact revision."""
 
-        return self._transition(kind="consume", **kwargs)
+        return self._transition(
+            kind="consume",
+            account_key=account_key,
+            reservation_id=reservation_id,
+            operation_id=operation_id,
+            as_of=as_of,
+            expected_revision=expected_revision,
+        )
 
-    def release(self, **kwargs: Any) -> CreditAccountingReceipt:
-        """Release a currently pending reservation back to its exact lots."""
+    def release(
+        self,
+        *,
+        account_key: str,
+        reservation_id: str,
+        operation_id: str,
+        as_of: datetime | str,
+        expected_revision: int,
+    ) -> CreditAccountingReceipt:
+        """Release a pending reservation back to its exact lots."""
 
-        return self._transition(kind="release", **kwargs)
+        return self._transition(
+            kind="release",
+            account_key=account_key,
+            reservation_id=reservation_id,
+            operation_id=operation_id,
+            as_of=as_of,
+            expected_revision=expected_revision,
+        )
 
     def public_projection(self, account_key: str) -> dict[str, Any]:
         """Return aggregate content-free accounting state without opaque IDs."""

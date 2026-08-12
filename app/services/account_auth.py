@@ -69,6 +69,10 @@ _MAX_PASSKEYS_PER_ACCOUNT = 32
 _MAX_RECOVERY_CODES_PER_ACCOUNT = 32
 _GLOBAL_KDF_FREE_FAILURES = 12
 _STORE_SEAL_DOMAIN = b"maestro-account-store-v1\0"
+_BOOTSTRAP_MARKER_VERSION = 1
+_BOOTSTRAP_MARKER_MAX_BYTES = 4096
+_BOOTSTRAP_MARKER_SEAL_DOMAIN = b"maestro-account-bootstrap-marker-v1\0"
+_BOOTSTRAP_MARKER_BINDING_DOMAIN = b"maestro-account-bootstrap-store-v1\0"
 _SESSION_DIGEST_DOMAIN = b"maestro-account-session-v1\0"
 _NONCE_DIGEST_DOMAIN = b"maestro-account-nonce-v1\0"
 _SESSION_BINDING_DOMAIN = b"maestro-account-session-binding-v1\0"
@@ -320,6 +324,93 @@ def _ensure_private_directory(path: str) -> None:
         raise AccountStoreCorruptError() from error
 
 
+def _read_private_file(path: str, *, max_bytes: int) -> bytes | None:
+    """Read one owner-only regular file without following or racing links."""
+    try:
+        before = os.lstat(path)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise AccountStoreCorruptError()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise AccountStoreCorruptError() from error
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise AccountStoreCorruptError() from error
+    try:
+        info = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or not os.path.samestat(info, current)
+            or info.st_nlink != 1
+            or info.st_size > max_bytes
+            or not _portable_owner_matches(info)
+        ):
+            raise AccountStoreCorruptError()
+        if os.name != "nt" and info.st_mode & 0o077:
+            os.fchmod(descriptor, 0o600)
+            if os.fstat(descriptor).st_mode & 0o077:
+                raise AccountStoreCorruptError()
+        if os.name == "nt":
+            _tighten_windows_acl(path, directory=False)
+        chunks = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise AccountStoreCorruptError()
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise AccountStoreCorruptError()
+        return b"".join(chunks)
+    except AccountAuthError:
+        raise
+    except OSError as error:
+        raise AccountStoreCorruptError() from error
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_replace_private_file(path: str, encoded: bytes) -> None:
+    """Durably replace one owner-only file within its private directory."""
+    directory = os.path.dirname(path)
+    _ensure_private_directory(directory)
+    temporary = os.path.join(
+        directory, f".{os.path.basename(path)}.{secrets.token_hex(8)}.tmp",
+    )
+    descriptor = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        if os.name == "nt":
+            _tighten_windows_acl(path, directory=False)
+        _fsync_directory(directory)
+    except AccountAuthError:
+        raise
+    except OSError as error:
+        raise AccountStoreCorruptError() from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
 class _AccountStoreLock:
     """Thread and process lock pinned to one never-unlinked lock inode."""
 
@@ -569,6 +660,7 @@ class AccountAuthStore:
         if not 1024 <= int(max_store_bytes) <= _MAX_STORE_BYTES:
             raise ValueError("account store size limit is invalid")
         self._max_store_bytes = int(max_store_bytes)
+        self.bootstrap_marker_path = self.path + ".bootstrap-complete"
         self._lock = _AccountStoreLock(self.path)
         self._kdf_lock = _AccountStoreLock(self.path + ".kdf-work")
         dummy_salt = hmac.new(
@@ -606,6 +698,79 @@ class AccountAuthStore:
             _STORE_SEAL_DOMAIN + _canonical_json(unsigned),
             hashlib.sha256,
         ).hexdigest()
+
+    def _bootstrap_marker_store_binding(self) -> str:
+        return hmac.new(
+            self._secret,
+            _BOOTSTRAP_MARKER_BINDING_DOMAIN + os.fsencode(os.path.normcase(self.path)),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _seal_bootstrap_marker(self, payload: Mapping[str, Any]) -> str:
+        unsigned = {key: value for key, value in payload.items() if key != "seal"}
+        return hmac.new(
+            self._secret,
+            _BOOTSTRAP_MARKER_SEAL_DOMAIN + _canonical_json(unsigned),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _load_bootstrap_marker(self) -> dict[str, Any] | None:
+        encoded = _read_private_file(
+            self.bootstrap_marker_path, max_bytes=_BOOTSTRAP_MARKER_MAX_BYTES,
+        )
+        if encoded is None:
+            return None
+        try:
+            payload = json.loads(encoded.decode("utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"version", "store_binding", "owner_id", "seal"}
+                or payload.get("version") != _BOOTSTRAP_MARKER_VERSION
+                or not self._valid_hex(payload.get("store_binding"), 64)
+                or not self._valid_hex(payload.get("owner_id"), 32)
+                or not self._valid_hex(payload.get("seal"), 64)
+                or not hmac.compare_digest(
+                    payload["store_binding"], self._bootstrap_marker_store_binding(),
+                )
+                or not hmac.compare_digest(
+                    payload["seal"], self._seal_bootstrap_marker(payload),
+                )
+            ):
+                raise AccountStoreCorruptError()
+            return payload
+        except AccountStoreCorruptError:
+            raise
+        except (
+            UnicodeDecodeError, ValueError, TypeError, RecursionError, OverflowError,
+        ) as error:
+            raise AccountStoreCorruptError() from error
+
+    def _save_bootstrap_marker(self, owner_id: str) -> None:
+        payload = {
+            "version": _BOOTSTRAP_MARKER_VERSION,
+            "store_binding": self._bootstrap_marker_store_binding(),
+            "owner_id": owner_id,
+        }
+        payload["seal"] = self._seal_bootstrap_marker(payload)
+        encoded = json.dumps(
+            payload, indent=2, ensure_ascii=True, allow_nan=False,
+        ).encode("utf-8")
+        _atomic_replace_private_file(self.bootstrap_marker_path, encoded)
+
+    def _ensure_bootstrap_marker(self, payload: Mapping[str, Any]) -> None:
+        accounts = payload.get("accounts")
+        marker = self._load_bootstrap_marker()
+        if not accounts:
+            if marker is not None:
+                raise AccountStoreCorruptError()
+            return
+        owner_id = next(
+            account["id"] for account in accounts if account["role"] == "owner"
+        )
+        if marker is None:
+            self._save_bootstrap_marker(owner_id)
+        elif not hmac.compare_digest(marker["owner_id"], owner_id):
+            raise AccountStoreCorruptError()
 
     @staticmethod
     def _empty_payload() -> dict[str, Any]:
@@ -907,53 +1072,19 @@ class AccountAuthStore:
         )
 
     def _load(self) -> dict[str, Any]:
-        try:
-            before = os.lstat(self.path)
-            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        encoded = _read_private_file(self.path, max_bytes=self._max_store_bytes)
+        if encoded is None:
+            if self._load_bootstrap_marker() is not None:
                 raise AccountStoreCorruptError()
-        except FileNotFoundError:
             return self._empty_payload()
-        except OSError as error:
+        try:
+            payload = json.loads(encoded.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError) as error:
             raise AccountStoreCorruptError() from error
         try:
-            descriptor = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except OSError as error:
-            raise AccountStoreCorruptError() from error
-        try:
-            info = os.fstat(descriptor)
-            current = os.lstat(self.path)
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or stat.S_ISLNK(current.st_mode)
-                or not os.path.samestat(info, current)
-                or info.st_nlink != 1
-                or info.st_size > self._max_store_bytes
-                or not _portable_owner_matches(info)
-            ):
-                raise AccountStoreCorruptError()
-            if os.name != "nt" and info.st_mode & 0o077:
-                os.fchmod(descriptor, 0o600)
-                if os.fstat(descriptor).st_mode & 0o077:
-                    raise AccountStoreCorruptError()
-            if os.name == "nt":
-                _tighten_windows_acl(self.path, directory=False)
-            chunks = []
-            remaining = info.st_size
-            while remaining:
-                chunk = os.read(descriptor, min(1024 * 1024, remaining))
-                if not chunk:
-                    raise AccountStoreCorruptError()
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            if os.read(descriptor, 1):
-                raise AccountStoreCorruptError()
-            payload = json.loads(b"".join(chunks).decode("utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError, TypeError, RecursionError) as error:
-            raise AccountStoreCorruptError() from error
-        finally:
-            os.close(descriptor)
-        try:
-            return self._validate_payload(payload)
+            payload = self._validate_payload(payload)
+            self._ensure_bootstrap_marker(payload)
+            return payload
         except AccountStoreCorruptError:
             raise
         except (OverflowError, RecursionError, TypeError, ValueError) as error:
@@ -970,38 +1101,8 @@ class AccountAuthStore:
         encoded = json.dumps(payload, indent=2, ensure_ascii=True, allow_nan=False).encode("utf-8")
         if len(encoded) > self._max_store_bytes:
             raise AccountStoreCapacityError()
-        directory = os.path.dirname(self.path)
-        _ensure_private_directory(directory)
-        temporary = os.path.join(
-            directory, f".{os.path.basename(self.path)}.{secrets.token_hex(8)}.tmp",
-        )
-        descriptor = None
-        try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "wb") as handle:
-                descriptor = None
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
-            if os.name == "nt":
-                _tighten_windows_acl(self.path, directory=False)
-            _fsync_directory(directory)
-        except AccountAuthError:
-            raise
-        except OSError as error:
-            raise AccountStoreCorruptError() from error
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            try:
-                os.remove(temporary)
-            except OSError:
-                pass
+        _atomic_replace_private_file(self.path, encoded)
+        self._ensure_bootstrap_marker(payload)
 
     @staticmethod
     def _monotonic_event_time(

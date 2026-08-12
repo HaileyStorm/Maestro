@@ -60,6 +60,50 @@ def _process_reserve(path: str, index: int, gate, results) -> None:
         results.put(type(error).__name__)
 
 
+def _process_revalidate(path: str, gate, results) -> None:
+    journal = CreditAccountingJournal(
+        path,
+        integrity_key=SECRET,
+        policy=CreditAccountingPolicy(enforcement_enabled=True),
+    )
+    gate.wait()
+    try:
+        receipt = journal.revalidate_reservation(
+            account_key=ACCOUNT,
+            reservation_id=reservation(1),
+            operation_id=operation(201),
+            unit="compute_seconds",
+            sources=[CreditSourceBalance(SOURCE_A, 5)],
+            as_of="2026-08-11T10:02:00Z",
+        )
+        results.put((
+            "revalidate", receipt.reservation_status,
+            receipt.affected_units, receipt.reservation_revision,
+        ))
+    except (CreditAccountingError, OSError) as error:  # pragma: no cover
+        results.put(("revalidate_error", type(error).__name__))
+
+
+def _process_consume(path: str, gate, results) -> None:
+    journal = CreditAccountingJournal(
+        path,
+        integrity_key=SECRET,
+        policy=CreditAccountingPolicy(enforcement_enabled=True),
+    )
+    gate.wait()
+    try:
+        receipt = journal.consume(
+            account_key=ACCOUNT,
+            reservation_id=reservation(1),
+            operation_id=operation(202),
+            expected_revision=1,
+            as_of="2026-08-11T10:02:00Z",
+        )
+        results.put(("consume", receipt.affected_units, receipt.reservation_revision))
+    except (CreditAccountingError, OSError) as error:  # pragma: no cover
+        results.put(("consume_error", type(error).__name__))
+
+
 class CreditAccountingJournalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -91,11 +135,38 @@ class CreditAccountingJournalTests(unittest.TestCase):
             as_of=at,
         )
 
-    def transition(self, kind: str, index: int, op: int, *, at="2026-08-11T10:02:00Z"):
-        return getattr(self.enabled, kind)(
+    def transition(
+        self,
+        kind: str,
+        index: int,
+        op: int,
+        *,
+        at="2026-08-11T10:02:00Z",
+        expected_revision: int = 1,
+    ):
+        arguments = {
+            "account_key": ACCOUNT,
+            "reservation_id": reservation(index),
+            "operation_id": operation(op),
+            "as_of": at,
+        }
+        arguments["expected_revision"] = expected_revision
+        return getattr(self.enabled, kind)(**arguments)
+
+    def revalidate(
+        self,
+        index: int,
+        sources,
+        *,
+        op: int,
+        at="2026-08-11T10:02:00Z",
+    ):
+        return self.enabled.revalidate_reservation(
             account_key=ACCOUNT,
             reservation_id=reservation(index),
             operation_id=operation(op),
+            unit="compute_seconds",
+            sources=sources,
             as_of=at,
         )
 
@@ -179,6 +250,285 @@ class CreditAccountingJournalTests(unittest.TestCase):
                 requested_units=7,
                 as_of="2026-08-11T10:01:00Z",
             )
+
+    def test_unchanged_revalidation_is_fully_funded_revision_stable_and_idempotent(self):
+        sources = [CreditSourceBalance(SOURCE_A, 10)]
+        self.reconcile(sources)
+        reserved = self.reserve(1, 10)
+        self.assertEqual(reserved.reservation_revision, 1)
+        self.assertTrue(reserved.fully_funded)
+
+        current = self.revalidate(1, sources, op=40)
+        self.assertEqual(current.reservation_status, "pending")
+        self.assertEqual(current.requested_units, 10)
+        self.assertEqual(current.affected_units, 10)
+        self.assertEqual(current.reservation_revision, 1)
+        self.assertTrue(current.fully_funded)
+        self.assertEqual(self.revalidate(1, sources, op=40), current)
+        with self.assertRaises(CreditAccountingConflict):
+            self.revalidate(
+                1,
+                [CreditSourceBalance(SOURCE_A, 9)],
+                op=40,
+            )
+
+    def test_partial_full_refund_and_expiry_revalidation_revisions(self):
+        self.reconcile([CreditSourceBalance(SOURCE_A, 10)])
+        self.reserve(1, 10)
+        partial = self.revalidate(
+            1, [CreditSourceBalance(SOURCE_A, 6)], op=41,
+        )
+        self.assertEqual(
+            (
+                partial.reservation_status, partial.requested_units,
+                partial.affected_units, partial.reservation_revision,
+                partial.fully_funded,
+            ),
+            ("pending", 10, 6, 2, False),
+        )
+        with self.assertRaises(CreditAccountingConflict):
+            self.transition("consume", 1, 42, expected_revision=1)
+        with self.assertRaises(CreditAccountingConflict):
+            self.transition("consume", 1, 43, expected_revision=2)
+
+        refunded = self.revalidate(
+            1, [CreditSourceBalance(SOURCE_A, 0)], op=44,
+        )
+        self.assertEqual(
+            (
+                refunded.reservation_status, refunded.affected_units,
+                refunded.reservation_revision, refunded.fully_funded,
+            ),
+            ("invalidated", 0, 3, False),
+        )
+
+        self.reconcile([CreditSourceBalance(SOURCE_A, 10)], op=45)
+        self.reserve(2, 10)
+        expired = self.revalidate(
+            2,
+            [CreditSourceBalance(
+                SOURCE_A, 10, "2026-08-11T10:04:00Z",
+            )],
+            op=46,
+            at="2026-08-11T10:04:00Z",
+        )
+        self.assertEqual(
+            (
+                expired.reservation_status, expired.affected_units,
+                expired.reservation_revision, expired.fully_funded,
+            ),
+            ("invalidated", 0, 2, False),
+        )
+
+    def test_current_revision_consumes_after_restart_and_stale_revision_rejects(self):
+        sources = [CreditSourceBalance(SOURCE_A, 10)]
+        self.reconcile(sources)
+        self.reserve(1, 10)
+        current = self.revalidate(1, sources, op=47)
+
+        restarted = CreditAccountingJournal(
+            self.path,
+            integrity_key=SECRET,
+            policy=CreditAccountingPolicy(enforcement_enabled=True),
+        )
+        with self.assertRaises(CreditAccountingConflict):
+            restarted.consume(
+                account_key=ACCOUNT,
+                reservation_id=reservation(1),
+                operation_id=operation(48),
+                expected_revision=current.reservation_revision + 1,
+                as_of="2026-08-11T10:03:00Z",
+            )
+        consumed = restarted.consume(
+            account_key=ACCOUNT,
+            reservation_id=reservation(1),
+            operation_id=operation(49),
+            expected_revision=current.reservation_revision,
+            as_of="2026-08-11T10:03:00Z",
+        )
+        self.assertEqual(consumed.reservation_status, "consumed")
+        self.assertEqual(consumed.reservation_revision, 2)
+        self.assertEqual(consumed.affected_units, consumed.requested_units)
+        self.assertFalse(consumed.fully_funded)
+        self.assertTrue(consumed.allocation_satisfied)
+        self.assertFalse(consumed.terminal_satisfied)
+
+    def test_expired_consume_persists_clock_and_backdated_retry_stays_rejected(self):
+        expiring = [
+            CreditSourceBalance(SOURCE_A, 10, "2026-08-11T10:05:00Z"),
+        ]
+        self.reconcile(expiring)
+        self.reserve(1, 10)
+        with self.assertRaises(CreditAccountingConflict):
+            self.transition(
+                "consume", 1, 53,
+                at="2026-08-11T10:05:00Z",
+                expected_revision=1,
+            )
+        with self.assertRaises(CreditAccountingConflict):
+            self.transition(
+                "consume", 1, 54,
+                at="2026-08-11T10:04:00Z",
+                expected_revision=2,
+            )
+        projection = self.enabled.public_projection(ACCOUNT)
+        self.assertEqual(projection["clock_high_water"], "2026-08-11T10:05:00Z")
+        self.assertEqual(projection["reserved_units"], 0)
+
+    def test_operation_bound_failure_preserves_pending_consume_and_release(self):
+        self.reconcile([CreditSourceBalance(SOURCE_A, 20)])
+        self.reserve(1, 10)
+        self.reserve(2, 10)
+        with patch("services.credit_accounting.MAX_OPERATIONS", 3):
+            with self.assertRaises(CreditAccountingError):
+                self.transition("consume", 1, 60)
+            with self.assertRaises(CreditAccountingError):
+                self.transition("release", 2, 61)
+        projection = self.enabled.public_projection(ACCOUNT)
+        self.assertEqual(projection["consumed_units"], 0)
+        self.assertEqual(projection["reserved_units"], 20)
+        self.assertEqual(projection["pending_reservations"], 2)
+
+    def test_schema_v2_state_fails_as_explicitly_incompatible(self):
+        legacy_state = {
+            "schema_version": 2,
+            "clock_high_water": None,
+            "next_sequence": 1,
+            "accounts": {},
+            "operations": {},
+        }
+        envelope = {
+            "state": legacy_state,
+            "state_hmac": self.enabled._seal(legacy_state),
+        }
+        self.path.write_text(json.dumps(envelope), encoding="utf-8")
+        with self.assertRaises(CreditAccountingIntegrityError):
+            self.enabled.public_projection(ACCOUNT)
+
+    def test_release_is_terminal_idempotent_after_revision_drift(self):
+        self.reconcile([CreditSourceBalance(SOURCE_A, 10)])
+        self.reserve(1, 10)
+        partial = self.revalidate(
+            1, [CreditSourceBalance(SOURCE_A, 6)], op=70,
+        )
+        self.assertEqual(partial.reservation_revision, 2)
+
+        released = self.enabled.release(
+            account_key=ACCOUNT,
+            reservation_id=reservation(1),
+            operation_id=operation(71),
+            expected_revision=1,
+            as_of="2026-08-11T10:03:00Z",
+        )
+        self.assertEqual(released.reservation_status, "released")
+        self.assertEqual(released.reservation_revision, 3)
+        self.assertTrue(released.terminal_satisfied)
+        self.assertFalse(released.allocation_satisfied)
+        self.assertFalse(released.fully_funded)
+        self.assertEqual(
+            self.enabled.release(
+                account_key=ACCOUNT,
+                reservation_id=reservation(1),
+                operation_id=operation(71),
+                expected_revision=1,
+                as_of="2026-08-11T10:03:00Z",
+            ),
+            released,
+        )
+        with self.assertRaises(CreditAccountingConflict):
+            self.enabled.release(
+                account_key=ACCOUNT,
+                reservation_id=reservation(1),
+                operation_id=operation(71),
+                expected_revision=2,
+                as_of="2026-08-11T10:03:00Z",
+            )
+        already_terminal = self.enabled.release(
+            account_key=ACCOUNT,
+            reservation_id=reservation(1),
+            operation_id=operation(72),
+            expected_revision=1,
+            as_of="2026-08-11T10:04:00Z",
+        )
+        self.assertEqual(already_terminal.reservation_status, "released")
+        self.assertEqual(already_terminal.reservation_revision, 3)
+        self.assertTrue(already_terminal.terminal_satisfied)
+
+    def test_release_satisfies_expired_invalidated_and_rejects_consumed_or_future(self):
+        expiring = [
+            CreditSourceBalance(SOURCE_A, 10, "2026-08-11T10:05:00Z"),
+        ]
+        self.reconcile(expiring)
+        self.reserve(1, 10)
+        invalidated = self.revalidate(
+            1, expiring, op=73, at="2026-08-11T10:05:00Z",
+        )
+        self.assertEqual(invalidated.reservation_status, "invalidated")
+        satisfied = self.enabled.release(
+            account_key=ACCOUNT,
+            reservation_id=reservation(1),
+            operation_id=operation(74),
+            expected_revision=1,
+            as_of="2026-08-11T10:06:00Z",
+        )
+        self.assertEqual(satisfied.reservation_status, "invalidated")
+        self.assertEqual(satisfied.reservation_revision, 2)
+        self.assertTrue(satisfied.terminal_satisfied)
+
+        self.reconcile([CreditSourceBalance(SOURCE_B, 10)], op=75)
+        self.reserve(2, 10)
+        self.transition("consume", 2, 76)
+        with self.assertRaises(CreditAccountingConflict):
+            self.enabled.release(
+                account_key=ACCOUNT,
+                reservation_id=reservation(2),
+                operation_id=operation(77),
+                expected_revision=1,
+                as_of="2026-08-11T10:07:00Z",
+            )
+        with self.assertRaises(CreditAccountingConflict):
+            self.enabled.release(
+                account_key=ACCOUNT,
+                reservation_id=reservation(1),
+                operation_id=operation(78),
+                expected_revision=99,
+                as_of="2026-08-11T10:07:00Z",
+            )
+
+    def test_terminal_revalidation_uses_consistent_current_funding_semantics(self):
+        sources = [CreditSourceBalance(SOURCE_A, 10)]
+        self.reconcile(sources)
+        self.reserve(1, 10)
+        consumed = self.transition("consume", 1, 55)
+        revalidated_consumed = self.revalidate(1, sources, op=56)
+        self.assertFalse(consumed.fully_funded)
+        self.assertFalse(revalidated_consumed.fully_funded)
+
+        self.reconcile([CreditSourceBalance(SOURCE_B, 10)], op=57)
+        self.reserve(2, 10)
+        released = self.transition("release", 2, 58)
+        revalidated_released = self.revalidate(
+            2, [CreditSourceBalance(SOURCE_B, 10)], op=59,
+        )
+        self.assertFalse(released.fully_funded)
+        self.assertFalse(revalidated_released.fully_funded)
+
+    def test_consumed_units_never_resurrect_after_refund_and_regrant(self):
+        self.reconcile([CreditSourceBalance(SOURCE_A, 10)])
+        self.reserve(1, 10)
+        self.transition("consume", 1, 50)
+        refunded = self.revalidate(
+            1, [CreditSourceBalance(SOURCE_A, 0)], op=51,
+        )
+        self.assertEqual(refunded.reservation_status, "consumed")
+        self.assertEqual(refunded.affected_units, 10)
+        regranted = self.revalidate(
+            1, [CreditSourceBalance(SOURCE_A, 10)], op=52,
+        )
+        self.assertEqual(regranted.reservation_status, "consumed")
+        projection = self.enabled.public_projection(ACCOUNT)
+        self.assertEqual(projection["consumed_units"], 10)
+        self.assertEqual(projection["available_units"], 0)
 
     def test_consume_and_release_require_pending_and_release_restores_exact_lots(self):
         self.reconcile([
@@ -311,6 +661,45 @@ class CreditAccountingJournalTests(unittest.TestCase):
         self.assertEqual(projection["reserved_units"], 10)
         self.assertEqual(projection["available_units"], 0)
 
+    def test_concurrent_revalidate_and_guarded_consume_serialize_safely(self):
+        self.reconcile([CreditSourceBalance(SOURCE_A, 10)])
+        self.reserve(1, 10)
+        context = multiprocessing.get_context("spawn")
+        gate = context.Barrier(2)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_process_revalidate,
+                args=(str(self.path), gate, results),
+            ),
+            context.Process(
+                target=_process_consume,
+                args=(str(self.path), gate, results),
+            ),
+        ]
+        for process in processes:
+            process.start()
+        values = [results.get(timeout=20) for _ in processes]
+        for process in processes:
+            process.join(timeout=20)
+            self.assertEqual(process.exitcode, 0)
+
+        projection = self.enabled.public_projection(ACCOUNT)
+        consume = next(item for item in values if item[0].startswith("consume"))
+        revalidated = next(
+            item for item in values if item[0].startswith("revalidate")
+        )
+        if consume[0] == "consume":
+            self.assertEqual(consume[1:], (10, 2))
+            self.assertEqual(revalidated[1], "consumed")
+            self.assertEqual(projection["consumed_units"], 10)
+            self.assertEqual(projection["reserved_units"], 0)
+        else:
+            self.assertEqual(consume, ("consume_error", "CreditAccountingConflict"))
+            self.assertEqual(revalidated[1:], ("pending", 5, 2))
+            self.assertEqual(projection["consumed_units"], 0)
+            self.assertEqual(projection["reserved_units"], 5)
+
     def test_corruption_unsafe_paths_bounds_and_lock_failure_fail_closed(self):
         self.reconcile([CreditSourceBalance(SOURCE_A, 10)])
         payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -370,6 +759,35 @@ class CreditAccountingJournalTests(unittest.TestCase):
         self.path.write_text(json.dumps(payload), encoding="utf-8")
         with self.assertRaises(CreditAccountingIntegrityError):
             self.enabled.public_projection(ACCOUNT)
+
+    def test_authenticated_impossible_operation_receipts_fail_closed(self):
+        self.reconcile([CreditSourceBalance(SOURCE_A, 10)])
+        self.reserve(1, 10)
+        original = json.loads(self.path.read_text(encoding="utf-8"))
+        operation_entry = original["state"]["operations"][operation(11)][
+            "receipt"
+        ]
+        mutations = (
+            {"reservation_revision": None},
+            {"reservation_status": None},
+            {"affected_units": 11},
+            {"requested_units": 0},
+            {"state": "invented_state"},
+            {"state": "consumed"},
+            {"state": "disabled"},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                payload = json.loads(json.dumps(original))
+                receipt = payload["state"]["operations"][operation(11)][
+                    "receipt"
+                ]
+                self.assertEqual(receipt, operation_entry)
+                receipt.update(mutation)
+                payload["state_hmac"] = self.enabled._seal(payload["state"])
+                self.path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(CreditAccountingIntegrityError):
+                    self.enabled.public_projection(ACCOUNT)
 
     def test_timestamp_precision_beyond_microseconds_is_rejected(self):
         for timestamp in (
