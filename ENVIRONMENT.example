@@ -23,6 +23,17 @@ TORCH_HOME=./cache/TORCH_HOME
 PINOKIO_SHARE_LOCAL=false
 PINOKIO_SHARE_LOCAL_PORT=
 
+# Optional public Support links. Each option is disabled unless explicitly
+# enabled; an enabled option also needs a valid URL before it is available.
+# These are passive external links only: they do not enable payment ingestion,
+# webhooks, hosted compute, account benefits, or credit enforcement.
+MAESTRO_SUPPORT_BUY_ME_A_COFFEE_ENABLED=false
+MAESTRO_SUPPORT_BUY_ME_A_COFFEE_URL=
+MAESTRO_SUPPORT_PATREON_ENABLED=false
+MAESTRO_SUPPORT_PATREON_URL=
+MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED=false
+MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL=
+
 # Optional host accounts are disabled by default. Creating the first owner is
 # a temporary, direct-loopback-only operation: opt in to both flags, restart,
 # create the owner in Maestro's local Account UI, then set bootstrap back to

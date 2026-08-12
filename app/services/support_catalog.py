@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,6 +25,22 @@ DEFAULT_LOCAL_CONFIG = (
     Path(__file__).resolve().parents[1] / "settings" / "support.json"
 )
 _PUBLIC_CONFIG_KEYS = frozenset({"enabled", "support_url"})
+_DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+_DIRECT_COMPUTE_RESERVED_SUFFIXES = (
+    "arpa",
+    "corp",
+    "example",
+    "home",
+    "internal",
+    "invalid",
+    "lan",
+    "local",
+    "localdomain",
+    "localhost",
+    "onion",
+    "private",
+    "test",
+)
 
 
 class SupportCatalogError(ValueError):
@@ -34,9 +52,10 @@ class SupportProviderDefinition:
     provider_id: str
     display_name: str
     funding_modes: tuple[str, ...]
-    public_home_url: str
+    public_home_url: str | None
     allowed_support_hosts: tuple[str, ...]
     description: str
+    requires_public_dns_host: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,22 +100,6 @@ class SupportCatalog:
 
 PROVIDER_DEFINITIONS = (
     SupportProviderDefinition(
-        provider_id="github_sponsors",
-        display_name="GitHub Sponsors",
-        funding_modes=("one_time", "recurring"),
-        public_home_url="https://github.com/sponsors",
-        allowed_support_hosts=("github.com",),
-        description="Support ongoing open development through GitHub Sponsors.",
-    ),
-    SupportProviderDefinition(
-        provider_id="patreon",
-        display_name="Patreon",
-        funding_modes=("recurring",),
-        public_home_url="https://www.patreon.com/",
-        allowed_support_hosts=("patreon.com", "www.patreon.com"),
-        description="Recurring support through an operator-configured Patreon page.",
-    ),
-    SupportProviderDefinition(
         provider_id="buy_me_a_coffee",
         display_name="Buy Me a Coffee",
         funding_modes=("one_time", "recurring"),
@@ -108,12 +111,21 @@ PROVIDER_DEFINITIONS = (
         description="One-time or recurring support through Buy Me a Coffee.",
     ),
     SupportProviderDefinition(
-        provider_id="stripe",
-        display_name="Card or wallet",
-        funding_modes=("one_time", "recurring"),
-        public_home_url="https://stripe.com/",
-        allowed_support_hosts=("buy.stripe.com",),
-        description="An operator-configured Stripe-hosted support page.",
+        provider_id="patreon",
+        display_name="Patreon",
+        funding_modes=("recurring",),
+        public_home_url="https://www.patreon.com/",
+        allowed_support_hosts=("patreon.com", "www.patreon.com"),
+        description="Recurring support through an operator-configured Patreon page.",
+    ),
+    SupportProviderDefinition(
+        provider_id="direct_compute_sponsorship",
+        display_name="Direct compute sponsorship",
+        funding_modes=("one_time",),
+        public_home_url=None,
+        allowed_support_hosts=(),
+        description="Sponsor Continuum compute directly.",
+        requires_public_dns_host=True,
     ),
 )
 PROVIDER_BY_ID = MappingProxyType({
@@ -133,14 +145,56 @@ def _parse_enabled(value: Any, *, source: str) -> bool:
     raise SupportCatalogError(f"{source} must be a boolean")
 
 
+def _is_public_dns_hostname(hostname: str) -> bool:
+    """Recognize a public-looking DNS name without resolving it."""
+
+    if (
+        not hostname
+        or len(hostname) > 253
+        or hostname.endswith(".")
+        or "." not in hostname
+    ):
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        return False
+    labels = hostname.split(".")
+    if (
+        any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels)
+        or all(label.isdigit() for label in labels)
+        or not labels[-1].isalpha()
+        or len(labels[-1]) < 2
+    ):
+        return False
+    return not any(
+        hostname == suffix or hostname.endswith(f".{suffix}")
+        for suffix in _DIRECT_COMPUTE_RESERVED_SUFFIXES
+    )
+
+
 def _public_support_url(provider_id: str, value: Any) -> str | None:
     if value is None or value == "":
         return None
-    if not isinstance(value, str) or len(value) > 2_048:
+    if not isinstance(value, str) or not value or len(value) > 2_048:
         raise SupportCatalogError(f"{provider_id} support_url must be a public URL")
-    parsed = urlsplit(value.strip())
+    if (
+        value != value.strip()
+        or "\\" in value
+        or any(character.isspace() or ord(character) < 32 or ord(character) == 127
+               for character in value)
+    ):
+        raise SupportCatalogError(f"{provider_id} support_url must be a public URL")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as error:
+        raise SupportCatalogError(
+            f"{provider_id} support_url is malformed"
+        ) from error
     definition = PROVIDER_BY_ID[provider_id]
-    hostname = (parsed.hostname or "").lower().rstrip(".")
+    hostname = (parsed.hostname or "").lower()
     try:
         port = parsed.port
     except ValueError as error:
@@ -153,12 +207,21 @@ def _public_support_url(provider_id: str, value: Any) -> str | None:
         or parsed.username is not None
         or parsed.password is not None
         or port not in (None, 443)
-        or hostname not in definition.allowed_support_hosts
+        or parsed.query
+        or parsed.fragment
+        or (
+            definition.requires_public_dns_host
+            and not _is_public_dns_hostname(hostname)
+        )
+        or (
+            not definition.requires_public_dns_host
+            and hostname not in definition.allowed_support_hosts
+        )
     ):
         raise SupportCatalogError(
             f"{provider_id} support_url must use an approved HTTPS provider host"
         )
-    return value.strip()
+    return value
 
 
 def _load_local_public_config(path: Path | None) -> dict[str, dict[str, Any]]:
@@ -238,6 +301,6 @@ def load_support_catalog(
 
 
 def public_support_catalog(**kwargs: Any) -> dict[str, Any]:
-    """Convenience wire object for a later HTTP route."""
+    """Return the validated public-only catalog wire object."""
 
     return load_support_catalog(**kwargs).public_projection()

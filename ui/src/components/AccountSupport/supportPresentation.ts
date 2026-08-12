@@ -8,6 +8,23 @@ import type {
 
 export type AccountSupportTab = 'support' | 'account'
 
+function safeSupportUrl(value: string | null): string | null {
+  if (typeof value !== 'string') return null
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:'
+      && url.username === ''
+      && url.password === ''
+      && (url.port === '' || url.port === '443')
+      && url.search === ''
+      && url.hash === ''
+      ? value
+      : null
+  } catch {
+    return null
+  }
+}
+
 export function nextAccountSupportTab(
   current: AccountSupportTab,
   key: string,
@@ -29,25 +46,18 @@ export function responsibleUseIsAccepted(
     && projection.status.content_sha256 === projection.notice.content_sha256
 }
 
-export function availableSupportProviders(
+export function visibleSupportProviders(
   catalog: SupportPublicProjection | null,
-): Array<SupportProvider & { support_url: string }> {
-  return (catalog?.provider_catalog.providers || []).filter(
-    (provider): provider is SupportProvider & { support_url: string } => {
-      if (provider.state !== 'available' || typeof provider.support_url !== 'string') return false
-      try {
-        const url = new URL(provider.support_url)
-        return url.protocol === 'https:'
-          && url.username === ''
-          && url.password === ''
-          && (url.port === '' || url.port === '443')
-          && url.search === ''
-          && url.hash === ''
-      } catch {
-        return false
-      }
-    },
-  )
+): SupportProvider[] {
+  return (catalog?.provider_catalog.providers || []).map(provider => {
+    const supportUrl = provider.state === 'available'
+      ? safeSupportUrl(provider.support_url)
+      : null
+    return {
+      ...provider,
+      support_url: supportUrl,
+    }
+  })
 }
 
 export function affectedPriorityNotice(

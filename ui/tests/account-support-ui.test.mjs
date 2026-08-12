@@ -28,9 +28,9 @@ import {
 import { createAccountDrawerLifecycle } from '../src/components/AccountSupport/accountDrawerLifecycle.ts'
 import {
   affectedPriorityNotice,
-  availableSupportProviders,
   nextAccountSupportTab,
   responsibleUseIsAccepted,
+  visibleSupportProviders,
 } from '../src/components/AccountSupport/supportPresentation.ts'
 
 const componentUrl = new URL('../src/components/AccountSupport/AccountSupportDrawer.tsx', import.meta.url)
@@ -488,12 +488,16 @@ const publicSupport = {
     schema_version: 1,
     provider_neutral: true,
     providers: [{
-      provider_id: 'configured', display_name: 'Configured support', funding_modes: ['one_time'],
-      description: 'Server-approved support.', enabled: true, configured: true,
-      state: 'available', support_url: 'https://support.example.test/maestro',
+      provider_id: 'buy_me_a_coffee', display_name: 'Buy Me a Coffee', funding_modes: ['one_time', 'recurring'],
+      description: 'One-time or recurring support.', enabled: true, configured: true,
+      state: 'available', support_url: 'https://buymeacoffee.com/maestro',
     }, {
-      provider_id: 'disabled', display_name: 'Disabled support', funding_modes: ['recurring'],
-      description: 'Not configured.', enabled: false, configured: false,
+      provider_id: 'patreon', display_name: 'Patreon', funding_modes: ['recurring'],
+      description: 'Recurring support.', enabled: true, configured: true,
+      state: 'available', support_url: 'https://www.patreon.com/maestro',
+    }, {
+      provider_id: 'direct_compute_sponsorship', display_name: 'Direct compute sponsorship', funding_modes: ['one_time'],
+      description: 'Sponsor Continuum compute directly.', enabled: false, configured: false,
       state: 'disabled', support_url: null,
     }],
   },
@@ -1039,6 +1043,26 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
 
   const tree = expandElement(SupportPanel())
   const text = elementText(tree)
+  assert.match(text, /hundreds already spent on Codex while building Maestro/)
+  assert.match(text, /After support becomes sustainable, it will fund hosting Maestro Continuum with more compute/)
+  assert.match(text, /offers no guarantees or perks/)
+  assert.match(text, /Buy Me a Coffee/)
+  assert.match(text, /Patreon/)
+  assert.match(text, /Direct compute sponsorship/)
+  const supportLinks = findElements(tree, node => node.type === 'a' && String(node.props?.href || '').includes('maestro'))
+  assert.deepEqual(supportLinks.map(node => node.props.href), [
+    'https://buymeacoffee.com/maestro',
+    'https://www.patreon.com/maestro',
+  ])
+  for (const link of supportLinks) {
+    assert.equal(link.props.target, '_blank')
+    assert.equal(link.props.rel, 'noopener noreferrer')
+    assert.match(link.props.className, /\bmin-h-11\b/)
+    assert.equal(link.props.onClick, undefined)
+  }
+  const unavailableSupport = findElements(tree, node => node.props?.['aria-disabled'] === 'true')
+  assert.equal(unavailableSupport.length, 1)
+  assert.match(unavailableSupport[0].props.className, /\bmin-h-11\b/)
   assert.match(text, /Current recorded allowance/)
   assert.match(text, /460 compute seconds/)
   assert.match(text, /Recorded only as of/)
@@ -1257,12 +1281,23 @@ test('Support trigger stays discoverable with accounts off and describes optiona
 
 test('Support links require an available server HTTPS URL and priority copy requires an affected record', async () => {
   const catalog = structuredClone(publicSupport)
-  catalog.provider_catalog.providers.push(
-    { ...catalog.provider_catalog.providers[0], provider_id: 'query', support_url: 'https://support.example.test/maestro?contact=private' },
-    { ...catalog.provider_catalog.providers[0], provider_id: 'http', support_url: 'http://support.example.test/maestro' },
-    { ...catalog.provider_catalog.providers[0], provider_id: 'unconfigured', state: 'unconfigured' },
+  catalog.provider_catalog.providers[0].support_url = 'https://buymeacoffee.com/maestro?contact=private'
+  catalog.provider_catalog.providers[1].support_url = 'http://www.patreon.com/maestro'
+  assert.deepEqual(
+    visibleSupportProviders(catalog).map(provider => [provider.provider_id, provider.support_url]),
+    [
+      ['buy_me_a_coffee', null],
+      ['patreon', null],
+      ['direct_compute_sponsorship', null],
+    ],
   )
-  assert.deepEqual(availableSupportProviders(catalog).map(provider => provider.provider_id), ['configured'])
+  assert.deepEqual(visibleSupportProviders(catalog).filter(provider => provider.support_url), [])
+
+  const safeCatalog = structuredClone(publicSupport)
+  assert.deepEqual(
+    visibleSupportProviders(safeCatalog).filter(provider => provider.support_url).map(provider => provider.provider_id),
+    ['buy_me_a_coffee', 'patreon'],
+  )
 
   const policy = {
     ...publicSupport.support_priority,
@@ -1326,6 +1361,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
   let adminErrorStatus = 0
   let deferSelf = false
   let deferAcceptance = false
+  let catalogPayload = publicSupport
   let nextAccountContext = null
   let nextAccessAccounts = null
   const pendingSelf = []
@@ -1393,7 +1429,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
       classic_ui: false, cloudflare_enabled: false, share_url: '', share_flow: '',
       accounts: nextAccessAccounts,
     })
-    if (url.endsWith('/support/catalog')) return jsonResponse(publicSupport)
+    if (url.endsWith('/support/catalog')) return jsonResponse(catalogPayload)
     if (url.endsWith('/account/context') && nextAccountContext) {
       if (deferAccountContext) return new Promise(resolve => pendingAccountContexts.push(resolve))
       return jsonResponse(nextAccountContext)
@@ -1468,10 +1504,31 @@ test('Support store loads public catalog with accounts off and gates self and ad
     accountUsers: [account],
     accountDrawerOpen: true,
   })
-  await useStore.getState().loadSupportSelf()
+  deferSelf = true
+  const olderSelf = useStore.getState().loadSupportSelf()
+  assert.equal(pendingSelf.length, 1)
+  catalogPayload = {
+    ...publicSupport,
+    provider_catalog: {
+      ...publicSupport.provider_catalog,
+      providers: publicSupport.provider_catalog.providers.map(provider => ({
+        ...provider,
+        description: `${provider.description} Current catalog.`,
+      })),
+    },
+  }
+  await useStore.getState().loadSupportCatalog()
+  pendingSelf.shift().resolve(jsonResponse(selfPayload(1)))
+  await olderSelf
+  deferSelf = false
+  assert.match(
+    useStore.getState().supportCatalog.provider_catalog.providers[0].description,
+    /Current catalog/,
+    'an older self projection must not overwrite the newer public catalog',
+  )
   await assert.rejects(useStore.getState().loadSupportAdmin(account.id), /selection changed|server-returned account/)
   assert.deepEqual(calls.map(call => call.url), [
-    '/api/v1/support/catalog', '/api/v1/support/self', '/api/v1/account/context',
+    '/api/v1/support/catalog', '/api/v1/support/self', '/api/v1/support/catalog', '/api/v1/account/context',
   ])
 
   const fullOwnerContext = {
@@ -1680,8 +1737,9 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(scrollRegion, /tabIndex=\{0\}/)
   assert.match(supportSource, /rel="noopener noreferrer"/)
   assert.match(supportSource, /This is an acknowledgement[^]*not moderation, classification, or permission/)
-  assert.match(supportSource, /already spent hundreds on Codex/)
-  assert.match(supportSource, /When support is sufficient, I will host Maestro \/ Continuum with more compute/)
+  assert.match(supportSource, /hundreds already spent on Codex while building Maestro/)
+  assert.match(supportSource, /After support becomes sustainable, it will fund hosting Maestro Continuum with more compute/)
+  assert.match(supportSource, /offers no guarantees or perks/)
   assert.match(supportSource, /not enforced yet/)
   assert.doesNotMatch(supportSource, /localStorage|sessionStorage|console\.|subject_key|source_event_key|account_id|email|customer|invoice|payment_method|credential|secret|@|\$600|tax|end-to-end|passkey/i)
   assert.doesNotMatch(supportSource, /['"]SLA['"]/)

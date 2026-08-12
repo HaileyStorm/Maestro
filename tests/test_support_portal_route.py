@@ -100,7 +100,7 @@ class _Portal:
         return {
             "provider_catalog": {
                 "providers": [{
-                    "provider_id": "github_sponsors",
+                    "provider_id": "buy_me_a_coffee",
                     "state": "disabled",
                     "support_url": None,
                 }],
@@ -409,11 +409,13 @@ class SupportPortalRouteTests(unittest.TestCase):
             {"detail": "Account changes require this app's exact origin"},
         )
 
-    def test_public_catalog_middleware_creates_no_browser_or_account_session(self):
+    def test_public_catalog_middleware_is_sessionless_and_transport_identical(self):
         module, path = _launch_nodes("_maestro_session_middleware")
         namespace = {
             "Request": object,
-            "_request_is_cloudflare_remote": lambda _request: True,
+            "_request_is_cloudflare_remote": lambda request: (
+                request.headers.get("x-test-transport") == "cloudflare"
+            ),
             "_research_local_only_denial": lambda _request: None,
             "_local_recovery_control_denial": lambda _request: None,
             "_reject_cross_origin_mutation": lambda _request: None,
@@ -426,37 +428,54 @@ class SupportPortalRouteTests(unittest.TestCase):
             ),
         }
         exec(compile(module, str(path), "exec"), namespace)
-        request = _Request()
-        request.url.path = "/api/v1/support/catalog"
-        observed = {}
-
-        async def call_next(actual_request):
-            observed["browser"] = actual_request.state.maestro_session_id
-            observed["account"] = actual_request.state.maestro_account_session_id
-            observed["principal"] = actual_request.state.maestro_account_principal
-            return _Response({"ok": True})
-
         async def _call_next_and_stamp(actual_request, downstream):
             response = await downstream(actual_request)
             response.headers["Cache-Control"] = "private, no-store"
             response.headers["Pragma"] = "no-cache"
             return response
 
-        response = asyncio.run(
-            namespace["_maestro_session_middleware"](request, call_next)
-        )
-        self.assertEqual(response.body, {"ok": True})
-        self.assertEqual(observed, {
-            "browser": "",
-            "account": "",
-            "principal": None,
-        })
-        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
-        self.assertEqual(response.headers["Pragma"], "no-cache")
+        responses = []
+        for transport in ("loopback", "lan", "cloudflare"):
+            request = _Request()
+            request.url.path = "/api/v1/support/catalog"
+            request.headers = {"x-test-transport": transport}
+            observed = {}
+
+            async def call_next(actual_request):
+                observed["browser"] = actual_request.state.maestro_session_id
+                observed["account"] = (
+                    actual_request.state.maestro_account_session_id
+                )
+                observed["principal"] = (
+                    actual_request.state.maestro_account_principal
+                )
+                return _Response({"catalog": "same"})
+
+            response = asyncio.run(
+                namespace["_maestro_session_middleware"](request, call_next)
+            )
+            self.assertEqual(observed, {
+                "browser": "",
+                "account": "",
+                "principal": None,
+            })
+            self.assertEqual(
+                response.headers["Cache-Control"], "private, no-store",
+            )
+            self.assertEqual(response.headers["Pragma"], "no-cache")
+            self.assertNotIn("Set-Cookie", response.headers)
+            responses.append((
+                response.status_code,
+                response.body,
+                dict(response.headers),
+            ))
+        self.assertEqual(responses[1:], [responses[0], responses[0]])
 
         async def error_response(_actual_request):
             return _Response({"detail": "unavailable"}, status_code=503)
 
+        request = _Request()
+        request.url.path = "/api/v1/support/catalog"
         response = asyncio.run(
             namespace["_maestro_session_middleware"](request, error_response)
         )
@@ -573,7 +592,13 @@ class SupportPortalRouteTests(unittest.TestCase):
             portal = namespace["_support_portal"]()
         self.assertIs(portal, namespace["_support_portal_value"])
         self.assertIs(captured["portal"]["account_store"], account_store)
-        self.assertEqual(captured["portal"]["catalog"], "catalog")
+        self.assertNotIn("catalog", captured["portal"])
+        self.assertIs(
+            captured["portal"]["catalog_loader"],
+            namespace["_load_server_support_catalog"],
+        )
+        self.assertEqual(captured["portal"]["catalog_loader"](), "catalog")
+        self.assertEqual(captured["catalog_kwargs"], {})
         keys = {
             captured["ledger_key"],
             captured["acceptance_key"],
@@ -679,15 +704,21 @@ class SupportPortalRouteTests(unittest.TestCase):
             })
             available = project_with_env({
                 **base_env,
-                "MAESTRO_SUPPORT_GITHUB_SPONSORS_ENABLED": "true",
-                "MAESTRO_SUPPORT_GITHUB_SPONSORS_URL": (
-                    "https://github.com/sponsors/example"
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": (
+                    "true"
+                ),
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
+                    "https://support.operator.com/maestro"
                 ),
             })
             malformed_env = {
                 **base_env,
-                "MAESTRO_SUPPORT_GITHUB_SPONSORS_ENABLED": "true",
-                "MAESTRO_SUPPORT_GITHUB_SPONSORS_URL": "https://[bad",
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": (
+                    "true"
+                ),
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
+                    "https://[bad"
+                ),
             }
             with self.assertRaises(HTTPException) as malformed:
                 project_with_env(malformed_env)
@@ -697,9 +728,11 @@ class SupportPortalRouteTests(unittest.TestCase):
                 env={
                     key: value for key, value in {
                         **base_env,
-                        "MAESTRO_SUPPORT_GITHUB_SPONSORS_ENABLED": "true",
-                        "MAESTRO_SUPPORT_GITHUB_SPONSORS_URL": (
-                            "https://github.com/sponsors/example"
+                        "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": (
+                            "true"
+                        ),
+                        "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
+                            "https://support.operator.com/maestro"
                         ),
                     }.items()
                     if key != "MAESTRO_ACCOUNTS_ENABLED"
@@ -730,12 +763,24 @@ class SupportPortalRouteTests(unittest.TestCase):
                 if item["provider_id"] == provider_id
             )
 
-        self.assertEqual(provider(disabled, "github_sponsors")["state"], "disabled")
-        self.assertEqual(provider(unconfigured, "patreon")["state"], "unconfigured")
-        github = provider(available, "github_sponsors")
-        self.assertEqual(github["state"], "available")
         self.assertEqual(
-            github["support_url"], "https://github.com/sponsors/example",
+            [
+                item["provider_id"]
+                for item in disabled["provider_catalog"]["providers"]
+            ],
+            [
+                "buy_me_a_coffee",
+                "patreon",
+                "direct_compute_sponsorship",
+            ],
+        )
+        self.assertEqual(
+            provider(unconfigured, "patreon")["state"], "unconfigured",
+        )
+        direct = provider(available, "direct_compute_sponsorship")
+        self.assertEqual(direct["state"], "available")
+        self.assertEqual(
+            direct["support_url"], "https://support.operator.com/maestro",
         )
         self.assertFalse(available["benefit_availability"][
             "scheduler_enforcement_enabled"

@@ -11,8 +11,8 @@ import type {
 } from '../../types'
 import {
   affectedPriorityNotice,
-  availableSupportProviders,
   responsibleUseIsAccepted,
+  visibleSupportProviders,
 } from './supportPresentation'
 
 function supportErrorMessage(error: unknown): string {
@@ -583,16 +583,16 @@ export function SupportPanel() {
   const selectedAdminAccountId = selectedUserIndex === ''
     ? null
     : users[Number(selectedUserIndex)]?.id ?? null
-  const availableProviders = useMemo(() => availableSupportProviders(catalog), [catalog])
+  const visibleProviders = useMemo(() => visibleSupportProviders(catalog), [catalog])
   const currentResponsibleUse = responsibleUse || self?.responsible_use || null
   const responsibleUseAccepted = responsibleUseIsAccepted(currentResponsibleUse)
   const selfPriorityNotice = affectedPriorityNotice(
     self?.account || null,
-    self?.public.support_priority || null,
+    catalog?.support_priority || null,
   )
   const adminPriorityNotice = affectedPriorityNotice(
     admin?.account || null,
-    admin?.support_priority || null,
+    catalog?.support_priority || null,
   )
 
   useEffect(() => {
@@ -715,10 +715,10 @@ export function SupportPanel() {
           <div>
             <h3 className="text-sm font-semibold text-text-primary">Support Maestro</h3>
             <p className="mt-1 text-[10px] leading-relaxed text-text-secondary">
-              General support funds development, hosting, compute, and ML research. I have already spent hundreds on Codex and intend to recoup those costs before net support funds expand this work. When support is sufficient, I will host Maestro / Continuum with more compute.
+              Support first helps recoup the hundreds already spent on Codex while building Maestro. After support becomes sustainable, it will fund hosting Maestro Continuum with more compute.
             </p>
             <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
-              Support is optional. Payment never authorizes prohibited use or changes anyone&apos;s responsibilities.
+              Support is optional and offers no guarantees or perks. It does not change access or anyone&apos;s responsibilities.
             </p>
           </div>
         </div>
@@ -729,23 +729,41 @@ export function SupportPanel() {
           <h3 id="support-options-heading" className="flex-1 text-xs font-semibold text-text-primary">Support options</h3>
           {(catalogLoading || detailsLoading) && <Loader2 size={13} className="animate-spin text-text-muted" aria-label="Refreshing Support" />}
         </div>
-        {availableProviders.length > 0 ? (
+        {visibleProviders.length > 0 ? (
           <div className="mt-3 grid gap-2 sm:grid-cols-2">
-            {availableProviders.map(provider => (
-              <a
-                key={provider.provider_id}
-                href={provider.support_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="rounded-lg border border-border bg-bg-primary/40 p-3 transition-colors hover:border-border-light hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-              >
-                <span className="flex items-center gap-2 text-[11px] font-semibold text-text-primary">
-                  {provider.display_name}
-                  <ExternalLink size={12} aria-hidden="true" />
-                </span>
-                <span className="mt-1 block text-[9px] leading-relaxed text-text-muted">{provider.description}</span>
-              </a>
-            ))}
+            {visibleProviders.map(provider => {
+              const content = (
+                <>
+                  <span className="flex items-center gap-2 text-[11px] font-semibold text-text-primary">
+                    {provider.display_name}
+                    {provider.support_url && <ExternalLink size={12} aria-hidden="true" />}
+                  </span>
+                  <span className="mt-1 block text-[9px] leading-relaxed text-text-muted">{provider.description}</span>
+                  {!provider.support_url && (
+                    <span className="mt-1 block text-[9px] font-medium text-text-muted">Not available in this session</span>
+                  )}
+                </>
+              )
+              return provider.support_url ? (
+                <a
+                  key={provider.provider_id}
+                  href={provider.support_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="min-h-11 rounded-lg border border-border bg-bg-primary/40 p-3 transition-colors hover:border-border-light hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+                >
+                  {content}
+                </a>
+              ) : (
+                <div
+                  key={provider.provider_id}
+                  aria-disabled="true"
+                  className="min-h-11 rounded-lg border border-border bg-bg-primary/20 p-3 opacity-70"
+                >
+                  {content}
+                </div>
+              )
+            })}
           </div>
         ) : (
           <p className="mt-2 rounded-lg bg-bg-primary/40 px-3 py-2 text-[10px] leading-relaxed text-text-muted">

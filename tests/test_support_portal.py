@@ -181,7 +181,14 @@ class SupportPortalTests(unittest.TestCase):
     def test_default_public_catalog_is_truthfully_disabled_and_has_no_links(self):
         projection = self.portal.public_catalog_projection()
         providers = projection["provider_catalog"]["providers"]
-        self.assertTrue(providers)
+        self.assertEqual(
+            [item["provider_id"] for item in providers],
+            [
+                "buy_me_a_coffee",
+                "patreon",
+                "direct_compute_sponsorship",
+            ],
+        )
         self.assertEqual({item["state"] for item in providers}, {"disabled"})
         self.assertTrue(all(item["support_url"] is None for item in providers))
         self.assertFalse(
@@ -196,9 +203,9 @@ class SupportPortalTests(unittest.TestCase):
 
     def test_only_server_approved_available_provider_gets_actionable_link(self):
         catalog = load_support_catalog(env={
-            "MAESTRO_SUPPORT_GITHUB_SPONSORS_ENABLED": "true",
-            "MAESTRO_SUPPORT_GITHUB_SPONSORS_URL": (
-                "https://github.com/sponsors/example"
+            "MAESTRO_SUPPORT_BUY_ME_A_COFFEE_ENABLED": "true",
+            "MAESTRO_SUPPORT_BUY_ME_A_COFFEE_URL": (
+                "https://buymeacoffee.com/example"
             ),
             "MAESTRO_SUPPORT_PATREON_ENABLED": "true",
         }, local_config_path=None)
@@ -212,36 +219,53 @@ class SupportPortalTests(unittest.TestCase):
         providers = portal.public_catalog_projection()["provider_catalog"][
             "providers"
         ]
-        github = next(item for item in providers if item["provider_id"] == "github_sponsors")
-        patreon = next(item for item in providers if item["provider_id"] == "patreon")
-        self.assertEqual(github["state"], "available")
+        coffee = next(
+            item for item in providers
+            if item["provider_id"] == "buy_me_a_coffee"
+        )
+        patreon = next(
+            item for item in providers
+            if item["provider_id"] == "patreon"
+        )
+        self.assertEqual(coffee["state"], "available")
         self.assertEqual(
-            github["support_url"], "https://github.com/sponsors/example",
+            coffee["support_url"], "https://buymeacoffee.com/example",
         )
         self.assertEqual(patreon["state"], "unconfigured")
         self.assertIsNone(patreon["support_url"])
         self.assertTrue(all("public_home_url" not in item for item in providers))
 
-    def test_provider_query_or_fragment_data_fails_closed_at_public_facade(self):
-        for suffix in ("?email=private@example.test&token=secret", "#secret"):
-            with self.subTest(suffix=suffix):
-                catalog = load_support_catalog(env={
-                    "MAESTRO_SUPPORT_GITHUB_SPONSORS_ENABLED": "true",
-                    "MAESTRO_SUPPORT_GITHUB_SPONSORS_URL": (
-                        "https://github.com/sponsors/example" + suffix
-                    ),
-                }, local_config_path=None)
-                portal = SupportPortal(
-                    account_store=self.account_store,
-                    ledger=self.ledger,
-                    acceptance_store=self.store,
-                    identity_key=IDENTITY_KEY,
-                    catalog=catalog,
-                )
-                with self.assertRaisesRegex(
-                    ValueError, "query or fragment",
-                ):
-                    portal.public_catalog_projection()
+    def test_catalog_loader_refreshes_public_and_self_projection_together(self):
+        current = [load_support_catalog(env={}, local_config_path=None)]
+        portal = SupportPortal(
+            account_store=self.account_store,
+            ledger=self.ledger,
+            acceptance_store=self.store,
+            identity_key=IDENTITY_KEY,
+            catalog_loader=lambda: current[0],
+        )
+        before = portal.public_catalog_projection()["provider_catalog"]
+        current[0] = load_support_catalog(env={
+            "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": "true",
+            "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
+                "https://support.operator.com/maestro"
+            ),
+        }, local_config_path=None)
+        public = portal.public_catalog_projection()["provider_catalog"]
+        authenticated = portal.self_projection(
+            self.user_session, remote=True,
+        )["provider_catalog"]
+        self.assertNotEqual(before, public)
+        self.assertEqual(authenticated, public)
+        direct = next(
+            item for item in public["providers"]
+            if item["provider_id"] == "direct_compute_sponsorship"
+        )
+        self.assertEqual(direct["state"], "available")
+        self.assertEqual(
+            direct["support_url"],
+            "https://support.operator.com/maestro",
+        )
 
     def test_self_projection_is_principal_bound_and_private(self):
         self.add_contribution(self.user_id, "mine")

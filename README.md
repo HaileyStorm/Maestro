@@ -576,6 +576,47 @@ After clicking **Start**, the launcher shows an **Open Web UI** button once the 
 - **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, mature prompt guidance, theme)
 - **Pinokio menu** — Update, Reset, Install Inpaint Support, LoRA folder shortcuts
 
+## Optional Support links
+
+Maestro can show three operator-configured ways to support the project: **Buy Me a Coffee**, **Patreon**, and **direct compute sponsorship**. Support first helps recoup the hundreds spent on Codex while building Maestro; when that becomes sustainable, it can help fund hosting Maestro Continuum with more compute. These are passive links to external pages, not payment integrations: Maestro does not call provider APIs, receive webhooks, process billing, or automatically activate hosting, benefits, allowances, queue priority, or credits. Any recorded allowances or benefits remain `recorded_not_enforced`.
+
+All three options default to `disabled`. Enabling an option without a URL makes it truthfully `unconfigured`; a malformed or disallowed URL makes the catalog configuration fail closed. Only an enabled option with a valid URL is `available` and actionable. Configure the links in Pinokio's per-app **Configure** tab:
+
+```dotenv
+MAESTRO_SUPPORT_BUY_ME_A_COFFEE_ENABLED=true
+MAESTRO_SUPPORT_BUY_ME_A_COFFEE_URL=https://buymeacoffee.com/YOUR_PAGE
+MAESTRO_SUPPORT_PATREON_ENABLED=true
+MAESTRO_SUPPORT_PATREON_URL=https://www.patreon.com/YOUR_PAGE
+MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED=true
+MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL=https://support.YOURDOMAIN.com/maestro
+```
+
+Buy Me a Coffee URLs must use exactly `buymeacoffee.com` or `www.buymeacoffee.com`; Patreon URLs must use exactly `patreon.com` or `www.patreon.com`. A direct-compute URL may use an operator-controlled, public-looking DNS hostname with valid labels, at least one dot, and an alphabetic top-level label of at least two characters. It cannot use an IP address, an all-numeric address, or a hostname ending in `.arpa`, `.corp`, `.example`, `.home`, `.internal`, `.invalid`, `.lan`, `.local`, `.localdomain`, `.localhost`, `.onion`, `.private`, or `.test`. Every URL must be at most 2,048 characters, use HTTPS, contain no credentials, whitespace, query string, fragment, control characters, or backslashes, and use no explicit port other than 443. Validation is syntactic and does not perform a DNS lookup or contact the destination.
+
+As an alternative to environment values, create the ignored local file `app/settings/support.json` with this exact public-only schema:
+
+```json
+{
+  "schema_version": 1,
+  "providers": {
+    "buy_me_a_coffee": {
+      "enabled": true,
+      "support_url": "https://buymeacoffee.com/YOUR_PAGE"
+    },
+    "patreon": {
+      "enabled": true,
+      "support_url": "https://www.patreon.com/YOUR_PAGE"
+    },
+    "direct_compute_sponsorship": {
+      "enabled": true,
+      "support_url": "https://support.YOURDOMAIN.com/maestro"
+    }
+  }
+}
+```
+
+Only `enabled` and `support_url` are accepted for each provider; do not put credentials, webhook secrets, customer data, or payment metadata in this file. Environment values override the JSON file independently for each field. Maestro reloads the ignored JSON file for each catalog request, so saved file changes appear on the next refresh. Pinokio **Configure** changes normally require restarting Maestro so the process receives the updated environment.
+
 ## Remote and local-network sharing
 
 Cloudflare sharing is enabled by default through `PINOKIO_SHARE_CLOUDFLARE=true`. After Maestro starts, the live URL appears both in Pinokio and as **Cloudflare · Copy link** in Maestro's top bar. Give another person that URL; their first visit immediately opens the project chooser, where they can unlock an existing project or create a new password-protected project (minimum 8 characters).

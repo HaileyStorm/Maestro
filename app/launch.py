@@ -375,6 +375,9 @@ class _PublicSupportCatalogProjectionAdapter:
     def __init__(self, catalog) -> None:
         self._catalog = catalog
 
+    def _catalog_snapshot(self):
+        return self._catalog
+
     @staticmethod
     def _priority_policy() -> dict:
         return SupportPortal._priority_policy()
@@ -424,7 +427,7 @@ def _support_portal() -> SupportPortal | None:
                         integrity_key=_support_domain_key("responsible-use"),
                     ),
                     identity_key=_support_domain_key("account-identity"),
-                    catalog=_load_server_support_catalog(),
+                    catalog_loader=_load_server_support_catalog,
                 )
     return _support_portal_value
 

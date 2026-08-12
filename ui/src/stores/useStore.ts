@@ -8315,8 +8315,6 @@ export const useStore = create<AppState>((set, get) => ({
       }
       set({
         supportSelf: projection,
-        supportCatalog: projection.public,
-        supportCatalogUnavailable: false,
         supportDetailsLoading: false,
       })
       return projection

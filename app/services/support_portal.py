@@ -15,12 +15,11 @@ import os
 import re
 import tempfile
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from .account_auth import (
     AccountAuthError,
@@ -337,16 +336,34 @@ class SupportPortal:
         acceptance_store: ResponsibleUseAcceptanceStore,
         identity_key: bytes | str,
         catalog: SupportCatalog | None = None,
+        catalog_loader: Callable[[], SupportCatalog] | None = None,
     ) -> None:
         if not isinstance(account_store, AccountAuthStore):
             raise SupportPortalError("A server account store is required")
+        if catalog is not None and catalog_loader is not None:
+            raise SupportPortalError(
+                "Provide a Support catalog or catalog loader, not both"
+            )
         self._account_store = account_store
         self._ledger = ledger
         self._acceptance_store = acceptance_store
         self._identity_key = _secret_bytes(
             identity_key, name="support account identity key"
         )
-        self._catalog = catalog or load_support_catalog()
+        self._catalog = catalog
+        self._catalog_loader = catalog_loader
+        if self._catalog is None and self._catalog_loader is None:
+            self._catalog = load_support_catalog()
+
+    def _catalog_snapshot(self) -> SupportCatalog:
+        catalog = (
+            self._catalog_loader()
+            if self._catalog_loader is not None
+            else self._catalog
+        )
+        if not isinstance(catalog, SupportCatalog):
+            raise SupportPortalError("Support catalog is unavailable")
+        return catalog
 
     def _subject_key(self, account_id: str) -> str:
         if not isinstance(account_id, str) or _ACCOUNT_ID_RE.fullmatch(account_id) is None:
@@ -392,16 +409,11 @@ class SupportPortal:
         }
 
     def public_catalog_projection(self) -> dict[str, Any]:
+        catalog = self._catalog_snapshot()
         providers = []
-        for status in self._catalog.providers:
+        for status in catalog.providers:
             item = status.public_projection()
             support_url = item["support_url"]
-            if support_url is not None:
-                parsed = urlsplit(support_url)
-                if parsed.query or parsed.fragment:
-                    raise SupportPortalError(
-                        "Public support URLs may not contain query or fragment data"
-                    )
             providers.append({
                 "provider_id": item["provider_id"],
                 "display_name": item["display_name"],
@@ -421,7 +433,7 @@ class SupportPortal:
         return {
             "schema_version": SUPPORT_PORTAL_SCHEMA_VERSION,
             "provider_catalog": {
-                "schema_version": self._catalog.schema_version,
+                "schema_version": catalog.schema_version,
                 "provider_neutral": True,
                 "providers": providers,
             },

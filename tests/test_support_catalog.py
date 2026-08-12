@@ -26,7 +26,14 @@ from services.support_catalog import (  # noqa: E402
 class SupportCatalogTests(unittest.TestCase):
     def test_tracked_catalog_is_frozen_disabled_and_unconfigured(self):
         catalog = load_support_catalog(env={}, local_config_path=None)
-        self.assertTrue(catalog.providers)
+        self.assertEqual(
+            [item.definition.provider_id for item in catalog.providers],
+            [
+                "buy_me_a_coffee",
+                "patreon",
+                "direct_compute_sponsorship",
+            ],
+        )
         self.assertEqual(
             {item.state for item in catalog.providers}, {"disabled"},
         )
@@ -42,22 +49,22 @@ class SupportCatalogTests(unittest.TestCase):
 
     def test_environment_enables_only_an_approved_public_destination(self):
         env = {
-            "MAESTRO_SUPPORT_GITHUB_SPONSORS_ENABLED": "true",
-            "MAESTRO_SUPPORT_GITHUB_SPONSORS_URL": (
-                "https://github.com/sponsors/example"
+            "MAESTRO_SUPPORT_BUY_ME_A_COFFEE_ENABLED": "true",
+            "MAESTRO_SUPPORT_BUY_ME_A_COFFEE_URL": (
+                "https://buymeacoffee.com/example"
             ),
-            "MAESTRO_SUPPORT_GITHUB_SPONSORS_WEBHOOK_SECRET": "do-not-leak",
+            "MAESTRO_SUPPORT_BUY_ME_A_COFFEE_WEBHOOK_SECRET": "do-not-leak",
             "UNRELATED_SECRET": "also-do-not-leak",
         }
         projection = public_support_catalog(env=env, local_config_path=None)
-        github = next(
+        coffee = next(
             item for item in projection["providers"]
-            if item["provider_id"] == "github_sponsors"
+            if item["provider_id"] == "buy_me_a_coffee"
         )
-        self.assertEqual(github["state"], "available")
-        self.assertTrue(github["configured"])
+        self.assertEqual(coffee["state"], "available")
+        self.assertTrue(coffee["configured"])
         self.assertEqual(
-            github["support_url"], "https://github.com/sponsors/example",
+            coffee["support_url"], "https://buymeacoffee.com/example",
         )
         serialized = json.dumps(projection, sort_keys=True)
         self.assertNotIn("do-not-leak", serialized)
@@ -78,7 +85,7 @@ class SupportCatalogTests(unittest.TestCase):
         self.assertEqual(patreon.state, "unconfigured")
         self.assertIsNone(patreon.public_projection()["support_url"])
 
-    def test_local_public_config_is_ignored_path_compatible_and_env_wins(self):
+    def test_local_public_config_is_ignored_and_env_wins_per_field(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "support.json"
             path.write_text(json.dumps({
@@ -91,7 +98,12 @@ class SupportCatalogTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
             catalog = load_support_catalog(
-                env={"MAESTRO_SUPPORT_BUY_ME_A_COFFEE_ENABLED": "false"},
+                env={
+                    "MAESTRO_SUPPORT_BUY_ME_A_COFFEE_ENABLED": "false",
+                    "MAESTRO_SUPPORT_BUY_ME_A_COFFEE_URL": (
+                        "https://www.buymeacoffee.com/replacement"
+                    ),
+                },
                 local_config_path=path,
             )
         status = next(
@@ -101,15 +113,72 @@ class SupportCatalogTests(unittest.TestCase):
         self.assertFalse(status.enabled)
         self.assertTrue(status.configured)
         self.assertEqual(status.state, "disabled")
+        self.assertEqual(
+            status.support_url,
+            "https://www.buymeacoffee.com/replacement",
+        )
         self.assertIsNone(status.public_projection()["support_url"])
 
-    def test_catalog_rejects_secret_fields_credentials_and_wrong_hosts(self):
+    def test_empty_environment_url_clears_local_destination(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "support.json"
             path.write_text(json.dumps({
                 "schema_version": 1,
                 "providers": {
-                    "stripe": {
+                    "patreon": {
+                        "enabled": True,
+                        "support_url": "https://www.patreon.com/example",
+                    },
+                },
+            }), encoding="utf-8")
+            catalog = load_support_catalog(env={
+                "MAESTRO_SUPPORT_PATREON_URL": "",
+            }, local_config_path=path)
+        patreon = next(
+            item for item in catalog.providers
+            if item.definition.provider_id == "patreon"
+        )
+        self.assertTrue(patreon.enabled)
+        self.assertFalse(patreon.configured)
+        self.assertEqual(patreon.state, "unconfigured")
+
+    def test_catalog_accepts_exact_provider_hosts_and_public_compute_dns(self):
+        accepted = {
+            "buy_me_a_coffee": (
+                "https://buymeacoffee.com/example",
+                "https://www.buymeacoffee.com/example",
+            ),
+            "patreon": (
+                "https://patreon.com/example",
+                "https://www.patreon.com/example",
+            ),
+            "direct_compute_sponsorship": (
+                "https://support.operator.com/maestro",
+                "https://continuum.compute.example.org:443/sponsor",
+            ),
+        }
+        for provider_id, values in accepted.items():
+            for value in values:
+                with self.subTest(provider_id=provider_id, value=value):
+                    prefix = f"MAESTRO_SUPPORT_{provider_id.upper()}"
+                    catalog = load_support_catalog(env={
+                        f"{prefix}_ENABLED": "true",
+                        f"{prefix}_URL": value,
+                    }, local_config_path=None)
+                    status = next(
+                        item for item in catalog.providers
+                        if item.definition.provider_id == provider_id
+                    )
+                    self.assertEqual(status.state, "available")
+                    self.assertEqual(status.support_url, value)
+
+    def test_catalog_rejects_secret_fields_credentials_and_unsafe_urls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "support.json"
+            path.write_text(json.dumps({
+                "schema_version": 1,
+                "providers": {
+                    "patreon": {
                         "enabled": True,
                         "webhook_secret": "tracked-secret",
                     },
@@ -119,20 +188,60 @@ class SupportCatalogTests(unittest.TestCase):
                 SupportCatalogError, "public settings only",
             ):
                 load_support_catalog(env={}, local_config_path=path)
-        rejected = (
-            "http://github.com/sponsors/example",
-            "https://user:password@github.com/sponsors/example",
-            "https://evil.example/sponsors/example",
-            "https://github.com:444/sponsors/example",
-        )
-        for value in rejected:
-            with self.subTest(value=value), self.assertRaises(
-                SupportCatalogError,
-            ):
-                load_support_catalog(env={
-                    "MAESTRO_SUPPORT_GITHUB_SPONSORS_ENABLED": "true",
-                    "MAESTRO_SUPPORT_GITHUB_SPONSORS_URL": value,
-                }, local_config_path=None)
+        rejected = {
+            "buy_me_a_coffee": (
+                "http://buymeacoffee.com/example",
+                "https://user:password@buymeacoffee.com/example",
+                "https://coffee.buymeacoffee.com/example",
+                "https://buymeacoffee.com:444/example",
+                "https://buymeacoffee.com/example?private=value",
+                "https://buymeacoffee.com/example#private",
+                "https://buymeacoffee.com\\@evil.example/example",
+                "https://buymeacoffee.com/example\n",
+            ),
+            "patreon": (
+                "https://creator.patreon.com/example",
+                "https://patreon.com./example",
+            ),
+            "direct_compute_sponsorship": (
+                "https://127.0.0.1/maestro",
+                "https://[::1]/maestro",
+                "https://127.1/maestro",
+                "https://localhost/maestro",
+                "https://compute/maestro",
+                "https://compute.local/maestro",
+                "https://compute.localhost/maestro",
+                "https://compute.internal/maestro",
+                "https://compute.lan/maestro",
+                "https://compute.home.arpa/maestro",
+                "https://compute.test/maestro",
+                "https://compute.example/maestro",
+                "https://compute.invalid/maestro",
+                "https://compute.onion/maestro",
+                "https://-bad.operator.com/maestro",
+                "https://operator.123/maestro",
+                "https://[bad/maestro",
+            ),
+        }
+        for provider_id, values in rejected.items():
+            for value in values:
+                with (
+                    self.subTest(provider_id=provider_id, value=value),
+                    self.assertRaises(SupportCatalogError),
+                ):
+                    prefix = f"MAESTRO_SUPPORT_{provider_id.upper()}"
+                    load_support_catalog(env={
+                        f"{prefix}_ENABLED": "true",
+                        f"{prefix}_URL": value,
+                    }, local_config_path=None)
+
+        with self.assertRaises(SupportCatalogError):
+            load_support_catalog(env={
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": "true",
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
+                    "https://support.operator.com/" + "x" * 2_049
+                ),
+            }, local_config_path=None)
 
 
 if __name__ == "__main__":
