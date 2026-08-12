@@ -566,6 +566,28 @@ Click **Update** in the launcher menu. This pulls the latest launcher scripts an
 
 Click **Reset** to wipe the install and start over. Removes `app/env/`, `ui/node_modules/`, `ui/dist/`, the pinned Blender MCP checkout, and the SAM venv if installed. Model checkpoints in `app/ckpts/` are NOT removed by default — delete them manually if you want a true fresh start.
 
+### Continuing development work
+
+Continuation is repository-rooted, not machine-path-rooted. Resolve the Git root
+and require both `AGENTS.md` and `.beads/`; then run `bd where`, `bd prime`,
+`bd show ISSUE_ID`, and `git status --short --branch`, and inspect `.working`
+before editing. Preserve every pre-existing dirty path and keep one writer per
+file or symbol cluster.
+
+For coordinated restarts, use `app/scripts/restart_status.py` to set and show a
+bounded public notice under one untracked generation value. Clear only that
+exact generation after the intended local service is healthy and, when claimed,
+the stable access surface has been exercised successfully; show the status once
+more to confirm it. Never put operator secrets, private runtime identifiers, or
+checkout-specific host paths in tracked files or logs.
+
+Before handoff, run the full applicable tests and all CI-equivalent checks.
+Report source/static, mocked, local-runtime, live-access, and human-acceptance
+evidence separately. After the intended work is committed, perform
+`git pull --rebase`, `bd sync`, `git push`, and the final Git status serially.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the exact continuation, verification,
+and closure procedure.
+
 ## Usage
 
 After clicking **Start**, the launcher shows an **Open Web UI** button once the server is up.

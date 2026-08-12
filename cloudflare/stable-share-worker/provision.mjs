@@ -13,7 +13,11 @@ import { fileURLToPath } from "node:url"
 import { randomBytes } from "node:crypto"
 import { spawnSync } from "node:child_process"
 
-import { extractAccountId, extractNamespaceId } from "./provision_helpers.mjs"
+import {
+  extractNamespaceId,
+  extractWhoamiAccountId,
+  isWhoamiLoggedOut,
+} from "./provision_helpers.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repository = dirname(dirname(here))
@@ -128,13 +132,15 @@ const baseConfig = () => ({
 
 try {
   if (oauthLane) {
-    const identity = wrangler(["whoami"])
+    const identity = wrangler(["whoami", "--json"])
     if (identity.status !== 0) {
       throw new Error("Wrangler OAuth is not authenticated; run `npx wrangler@4 login` first")
     }
     oauthAuthenticated = true
-    const authenticatedAccount = extractAccountId(commandOutput(identity))
-    if (!authenticatedAccount) throw new Error("Wrangler OAuth did not report an account id")
+    const authenticatedAccount = extractWhoamiAccountId(commandOutput(identity), accountId)
+    if (!authenticatedAccount) {
+      throw new Error("Wrangler OAuth did not report exactly one matching account id")
+    }
     if (accountId && accountId.toLowerCase() !== authenticatedAccount.toLowerCase()) {
       throw new Error("CLOUDFLARE_ACCOUNT_ID does not match the Wrangler OAuth account")
     }
@@ -187,8 +193,8 @@ try {
   if (oauthLane) {
     const loggedOut = wrangler(["logout"])
     if (loggedOut.status !== 0) throw new Error("Worker deployed, but Wrangler OAuth logout failed")
-    const verification = wrangler(["whoami"])
-    if (extractAccountId(commandOutput(verification))) {
+    const verification = wrangler(["whoami", "--json"])
+    if (verification.status === 0 || !isWhoamiLoggedOut(commandOutput(verification))) {
       throw new Error("Worker deployed, but Wrangler OAuth still appears authenticated")
     }
     oauthLogoutVerified = true
@@ -200,8 +206,12 @@ try {
 } finally {
   if (oauthAuthenticated && !oauthLogoutVerified) {
     const logoutRetry = wrangler(["logout"])
-    const verification = wrangler(["whoami"])
-    if (logoutRetry.status !== 0 || extractAccountId(commandOutput(verification))) {
+    const verification = wrangler(["whoami", "--json"])
+    if (
+      logoutRetry.status !== 0
+      || verification.status === 0
+      || !isWhoamiLoggedOut(commandOutput(verification))
+    ) {
       process.stderr.write("Wrangler OAuth cleanup could not be verified; run `npx wrangler@4 logout` now.\n")
       process.exitCode = 1
     }

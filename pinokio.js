@@ -17,6 +17,7 @@ module.exports = {
     let installed = info.exists("app/env")
     let running = {
       install: info.running("install.js"),
+      restart: info.running("restart.js"),
       start: info.running("start.js"),
       start_classic: info.running("start_classic.js"),
       update: info.running("update.js"),
@@ -30,7 +31,14 @@ module.exports = {
         href: "install.js",
       }]
     } else if (installed) {
-      if (running.start) {
+      if (running.restart) {
+        return [{
+          default: true,
+          icon: "fa-solid fa-rotate",
+          text: "Restarting Maestro",
+          href: "restart.js",
+        }]
+      } else if (running.start) {
         let local = info.local("start.js")
         if (local && local.url) {
           const stable = local.share_kind === "stable" ? local.share_url : undefined
@@ -74,6 +82,13 @@ module.exports = {
               icon: "fa-brands fa-cloudflare",
               text: "Cloudflare tunnel is starting…",
               href: "start.js",
+            })
+          }
+          if (info.ready("start.js") && local.share_kind === "stable") {
+            menu.push({
+              icon: "fa-solid fa-rotate",
+              text: "Restart Maestro",
+              href: "restart.js",
             })
           }
           return menu

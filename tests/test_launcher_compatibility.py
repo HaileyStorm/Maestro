@@ -14,13 +14,14 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestPinokioGpuCompatibility(unittest.TestCase):
-    def _render_launcher_menu(self, *, running, locals_by_script):
+    def _render_launcher_menu(self, *, running, locals_by_script, ready=None):
         loader = r"""
 const launcher = require('./pinokio.js');
 const state = JSON.parse(process.argv[1]);
 const info = {
   exists: (filepath) => filepath === 'app/env',
   running: (filepath) => Boolean(state.running[filepath]),
+  ready: (filepath) => Boolean(state.ready[filepath]),
   local: (filepath) => state.locals[filepath] || {},
 };
 Promise.resolve(launcher.menu({}, info))
@@ -30,7 +31,11 @@ Promise.resolve(launcher.menu({}, info))
         completed = subprocess.run(
             [
                 "node", "-e", loader,
-                json.dumps({"running": running, "locals": locals_by_script}),
+                json.dumps({
+                    "running": running,
+                    "ready": running if ready is None else ready,
+                    "locals": locals_by_script,
+                }),
             ],
             cwd=_ROOT,
             check=True,
@@ -165,6 +170,178 @@ Promise.resolve(launcher.menu({}, info))
         self.assertEqual(classic_menu[0]["href"], local_url)
         self.assertEqual(classic_menu[0]["text"], "Open Classic UI")
         self.assertTrue(classic_menu[0]["default"])
+
+    def test_restart_action_requires_ready_stable_share_state(self):
+        local_url = "http://127.0.0.1:7860"
+        cases = (
+            (
+                "stable_ready",
+                True,
+                {
+                    "url": local_url,
+                    "share_kind": "stable",
+                    "share_url": "https://maestro.example.workers.dev",
+                },
+                True,
+            ),
+            (
+                "stable_not_ready",
+                False,
+                {
+                    "url": local_url,
+                    "share_kind": "stable",
+                    "share_url": "https://maestro.example.workers.dev",
+                },
+                False,
+            ),
+            (
+                "quick_ready",
+                True,
+                {
+                    "url": local_url,
+                    "share_kind": "quick",
+                    "share_url": "https://current-session.trycloudflare.com",
+                },
+                False,
+            ),
+            (
+                "local_ready",
+                True,
+                {"url": local_url, "share_kind": "local"},
+                False,
+            ),
+            (
+                "missing_share_kind_ready",
+                True,
+                {
+                    "url": local_url,
+                    "share_url": "https://maestro.example.workers.dev",
+                },
+                False,
+            ),
+        )
+        for name, ready, local, expected in cases:
+            with self.subTest(name=name):
+                menu = self._render_launcher_menu(
+                    running={"start.js": True},
+                    ready={"start.js": ready},
+                    locals_by_script={"start.js": local},
+                )
+                actions = [item for item in menu if item.get("href") == "restart.js"]
+                self.assertEqual(bool(actions), expected)
+                if actions:
+                    self.assertEqual(actions[0]["text"], "Restart Maestro")
+                self.assertIn("start.js", [item.get("href") for item in menu])
+
+    def test_restart_script_publishes_before_restart_with_one_opaque_generation(self):
+        loader = r"""
+const build = require('./restart.js');
+Promise.resolve(build())
+  .then((definition) => process.stdout.write(JSON.stringify(definition)))
+  .catch((error) => { console.error(error); process.exit(1); });
+"""
+        completed = subprocess.run(
+            ["node", "-e", loader],
+            cwd=_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        definition = json.loads(completed.stdout)
+        self.assertEqual(
+            [step["method"] for step in definition["run"]],
+            ["shell.run", "script.restart"],
+        )
+        publish, restart = definition["run"]
+        command = publish["params"]["message"][0]
+        generation_match = re.search(r"--generation ([A-Za-z0-9_-]{16,64})$", command)
+        self.assertIsNotNone(generation_match)
+        generation = generation_match.group(1)
+        self.assertRegex(generation, r"^[0-9a-f]{48}$")
+        self.assertIn("--state restarting", command)
+        self.assertIn("--reason restart", command)
+        self.assertIn("--ttl-seconds 900", command)
+        self.assertIn(
+            '--message "Maestro is restarting. Please try again shortly."', command,
+        )
+        self.assertLessEqual(len("Maestro is restarting. Please try again shortly."), 240)
+        self.assertEqual(publish["params"]["path"], "app")
+        self.assertEqual(publish["params"]["venv"], "env")
+        self.assertEqual(publish["params"]["env"]["CLOUDFLARE_API_TOKEN"], "")
+        self.assertNotIn("PINOKIO_STABLE_SHARE_UPDATE_SECRET", publish["params"]["env"])
+        self.assertEqual(
+            publish["params"]["on"],
+            [{"event": "/MAESTRO_RESTART_STATUS_SET restarting/", "kill": True}],
+        )
+        self.assertEqual(restart["params"]["uri"], "start.js")
+        self.assertEqual(restart["params"]["params"], {"restart_generation": generation})
+        self.assertNotIn("script.stop", [step["method"] for step in definition["run"]])
+
+    def test_restart_startup_health_and_generation_clear_ordering(self):
+        definition = self._load_start_with_environment(
+            "PINOKIO_SHARE_CLOUDFLARE=true\n"
+            "PINOKIO_STABLE_SHARE_URL=https://maestro.example.workers.dev\n",
+            {},
+        )
+        steps = definition["run"]
+        capture_index = next(
+            index for index, step in enumerate(steps)
+            if step.get("method") == "shell.run"
+            and step.get("params", {}).get("on", [{}])[0].get("event")
+            == "/(http://[0-9.:]+)/"
+        )
+        local_url_index = next(
+            index for index, step in enumerate(steps)
+            if step.get("method") == "local.set"
+            and step.get("params", {}).get("url") == "{{input.event[1]}}"
+        )
+        health_indexes = [
+            index for index, step in enumerate(steps)
+            if step.get("method") == "process.wait"
+            and step.get("params", {}).get("url") == "{{local.url}}/health"
+        ]
+        register_index = next(
+            index for index, step in enumerate(steps)
+            if "register_share_url.py" in " ".join(
+                step.get("params", {}).get("message", []),
+            )
+        )
+        clear_index = next(
+            index for index, step in enumerate(steps)
+            if "restart_status.py clear" in " ".join(
+                step.get("params", {}).get("message", []),
+            )
+        )
+
+        self.assertEqual(local_url_index, capture_index + 1)
+        self.assertEqual(health_indexes[0], local_url_index + 1)
+        self.assertLess(health_indexes[0], register_index)
+        self.assertLess(register_index, health_indexes[1])
+        self.assertEqual(clear_index, health_indexes[1] + 1)
+        clear = steps[clear_index]
+        self.assertIn("args.restart_generation", clear["when"])
+        self.assertIn("[A-Za-z0-9_-]{16,64}", clear["when"])
+        self.assertIn("local.share_kind === 'stable'", clear["when"])
+        self.assertIn("--generation {{args.restart_generation}}", clear["params"]["message"][0])
+        self.assertEqual(clear["params"]["env"]["CLOUDFLARE_API_TOKEN"], "")
+        self.assertNotIn("PINOKIO_STABLE_SHARE_UPDATE_SECRET", clear["params"]["env"])
+
+        handler = clear["params"]["on"][0]
+        self.assertTrue(handler["kill"])
+        event = re.compile(handler["event"][1:-1])
+        for output in (
+            "MAESTRO_RESTART_STATUS_CLEARED",
+            "MAESTRO_RESTART_STATUS_NOT_CLEARED",
+            "Maestro restart-status request failed",
+        ):
+            self.assertIsNotNone(event.fullmatch(output))
+        result_step = steps[clear_index + 1]
+        status_log = steps[clear_index + 2]
+        self.assertEqual(result_step["params"]["restart_status_clear_result"], "{{input.event[1]}}")
+        self.assertIn("expire automatically", status_log["params"]["text"])
+        self.assertIn("no matching generation", status_log["params"]["text"])
+        self.assertIn("MAESTRO_RESTART_STATUS_CLEAR_FAILED", status_log["params"]["text"])
 
     def test_install_materializes_safe_defaults_without_overriding_choices(self):
         installer = (_ROOT / "install.js").read_text(encoding="utf-8")
@@ -590,7 +767,10 @@ const files = JSON.parse(process.argv[1]);
             command = " ".join(step.get("params", {}).get("message", []))
             environment = step.get("params", {}).get("env", {})
             self.assertEqual(environment.get("CLOUDFLARE_API_TOKEN"), "")
-            if "register_share_url.py" not in command:
+            if not any(
+                helper in command
+                for helper in ("register_share_url.py", "restart_status.py")
+            ):
                 self.assertEqual(
                     environment.get("PINOKIO_STABLE_SHARE_UPDATE_SECRET"), "",
                 )

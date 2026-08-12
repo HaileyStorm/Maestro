@@ -603,11 +603,19 @@ class StableShareSourceContracts(unittest.TestCase):
         source = (
             ROOT / "cloudflare" / "stable-share-worker" / "provision.mjs"
         ).read_text(encoding="utf-8")
+        helpers = (
+            ROOT / "cloudflare" / "stable-share-worker" / "provision_helpers.mjs"
+        ).read_text(encoding="utf-8")
         self.assertIn('const oauthLane = !apiToken', source)
-        self.assertIn('wrangler(["whoami"])', source)
+        self.assertIn('wrangler(["whoami", "--json"])', source)
+        self.assertNotIn('wrangler(["whoami"])', source)
         self.assertIn('wrangler(["logout"])', source)
+        self.assertIn("isWhoamiLoggedOut(commandOutput(verification))", source)
         self.assertIn("oauthLogoutVerified = true", source)
         self.assertIn("if (oauthAuthenticated && !oauthLogoutVerified)", source)
+        self.assertIn("parsed.loggedIn !== true", helpers)
+        self.assertIn("Array.isArray(parsed.accounts)", helpers)
+        self.assertNotIn("parsed.memberships", helpers)
 
     def test_application_process_does_not_inherit_cloudflare_provisioning_token(self):
         mask = (ROOT / "launcher_secret_env.js").read_text(encoding="utf-8")

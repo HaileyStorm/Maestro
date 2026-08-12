@@ -1,7 +1,7 @@
 """Bounded operator client for the stable-share restart status endpoint.
 
-This Stage 1 helper authenticates only with the operator secret. Account-auth
-audit and automatic restart wiring remain future issue-94 stages.
+The client provides strict payload construction plus authenticated show, set,
+and exact-generation clear operations for coordinated restart workflows.
 """
 
 from __future__ import annotations

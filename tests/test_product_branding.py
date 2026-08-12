@@ -1,6 +1,5 @@
 """Focused source contracts for Maestro Continuum branding and provenance."""
 from pathlib import Path
-import hashlib
 import unittest
 
 
@@ -49,17 +48,14 @@ class ProductBrandingTests(unittest.TestCase):
         self.assertIn("{PRODUCT_PROVENANCE}", APP)
         self.assertIn("{PRODUCT_PROVENANCE}", SIDEBAR)
 
-    def test_launcher_changes_metadata_without_changing_schema_or_menu(self):
+    def test_launcher_preserves_schema_branding_and_provenance(self):
         self.assertIn('version: "8.0"', PINOKIO)
         self.assertIn('title: "Maestro // Continuum"', PINOKIO)
         self.assertIn("fs.readFileSync(path.join(__dirname, 'CONTINUUM_VERSION')", PINOKIO)
         self.assertIn("fs.readFileSync(path.join(__dirname, 'VERSION')", PINOKIO)
-        self.assertIn("menu: async (kernel, info) =>", PINOKIO)
-        menu = PINOKIO[PINOKIO.index("  menu: async"):]
-        self.assertEqual(
-            hashlib.sha256(menu.encode("utf-8")).hexdigest(),
-            "d504c528d95acef16c9125d6a6cc77e476652421d24084a82df24d9e48e729a7",
-        )
+        self.assertIn("Maestro Continuum v${continuumVersion}", PINOKIO)
+        self.assertIn("Built on Maestro ${maestroBaseVersion}", PINOKIO)
+        self.assertIn('icon: "maestro_simplified_icon_alpha.png"', PINOKIO)
 
     def test_welcome_remains_scrollable_with_reachable_primary_action(self):
         self.assertIn("h-[100vh]", WELCOME)

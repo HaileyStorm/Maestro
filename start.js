@@ -111,6 +111,12 @@ module.exports = async (kernel) => {
         }
       },
       {
+        method: "process.wait",
+        params: {
+          url: "{{local.url}}/health"
+        }
+      },
+      {
         id: "wait-for-cloudflare",
         when: cloudflareEnabled
           ? "{{!(local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url])}}"
@@ -175,6 +181,50 @@ module.exports = async (kernel) => {
           share_url: "{{input.event[1]}}",
           share_kind: "{{input.event[2]}}",
           sharing: "Cloudflare {{input.event[2]}}: {{input.event[1]}}"
+        }
+      },
+      {
+        when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind === 'stable'}}",
+        method: "process.wait",
+        params: {
+          url: "{{local.url}}/health"
+        }
+      },
+      {
+        when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind === 'stable'}}",
+        method: "shell.run",
+        params: {
+          venv: "env",
+          path: "app",
+          env: shareHelperSecretEnv,
+          message: [
+            "python scripts/restart_status.py clear --generation {{args.restart_generation}}"
+          ],
+          on: [{
+            event: "/(MAESTRO_RESTART_STATUS_CLEARED|MAESTRO_RESTART_STATUS_NOT_CLEARED|Maestro restart-status request failed)/",
+            kill: true
+          }]
+        }
+      },
+      {
+        when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind === 'stable'}}",
+        method: "local.set",
+        params: {
+          restart_status_clear_result: "{{input.event[1]}}"
+        }
+      },
+      {
+        when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind === 'stable'}}",
+        method: "log",
+        params: {
+          text: "{{local.restart_status_clear_result === 'MAESTRO_RESTART_STATUS_CLEARED' ? 'MAESTRO_RESTART_STATUS_CLEARED after direct local health verification.' : (local.restart_status_clear_result === 'MAESTRO_RESTART_STATUS_NOT_CLEARED' ? 'MAESTRO_RESTART_STATUS_RETAINED because no matching generation was active; any existing status remains unchanged.' : 'MAESTRO_RESTART_STATUS_CLEAR_FAILED; the published status remains truthful and will expire automatically.')}}"
+        }
+      },
+      {
+        when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind !== 'stable'}}",
+        method: "log",
+        params: {
+          text: "MAESTRO_RESTART_STATUS_RETAINED because this launch did not verify the stable route; any matching published status will expire automatically."
         }
       }
     ]

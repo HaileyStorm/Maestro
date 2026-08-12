@@ -6,7 +6,11 @@ import worker, {
   paths,
   validatedRestartStatus,
 } from "./worker.mjs"
-import { extractNamespaceId } from "./provision_helpers.mjs"
+import {
+  extractNamespaceId,
+  extractWhoamiAccountId,
+  isWhoamiLoggedOut,
+} from "./provision_helpers.mjs"
 
 const secret = "test-secret-that-is-long-enough-for-tests"
 
@@ -66,6 +70,57 @@ test("provisioner parses Wrangler JSONC and TOML namespace output", () => {
   const id = "0123456789abcdef0123456789abcdef"
   assert.equal(extractNamespaceId(`{ "binding": "TARGETS", "id": "${id}" }`), id)
   assert.equal(extractNamespaceId(`binding = "TARGETS"\nid = "${id}"`), id)
+})
+
+test("provisioner accepts bounded current Wrangler whoami JSON", () => {
+  const id = "0123456789abcdef0123456789abcdef"
+  assert.equal(extractWhoamiAccountId(JSON.stringify({
+    loggedIn: true,
+    authType: "OAuth Token",
+    email: "person@example.test",
+    accounts: [{ id, name: "Sanitized account" }],
+    tokenPermissions: ["workers:write"],
+  })), id)
+})
+
+test("provisioner rejects malformed or ambiguous Wrangler whoami JSON", () => {
+  const first = "0123456789abcdef0123456789abcdef"
+  const second = "fedcba9876543210fedcba9876543210"
+  const multiple = JSON.stringify({
+    loggedIn: true,
+    accounts: [{ id: first }, { id: second }],
+  })
+  assert.equal(extractWhoamiAccountId(multiple), "")
+  assert.equal(extractWhoamiAccountId(multiple, second), second)
+  assert.equal(extractWhoamiAccountId(multiple, "a".repeat(32)), "")
+  assert.equal(extractWhoamiAccountId(JSON.stringify({
+    loggedIn: true,
+    accounts: [{ id: first }],
+  }), second), first)
+
+  for (const value of [
+    "not json",
+    JSON.stringify({ loggedIn: false }),
+    JSON.stringify({ loggedIn: true, accounts: [{ id: "short" }] }),
+    JSON.stringify({ loggedIn: true, accounts: [{ account: { id: first } }] }),
+    JSON.stringify({
+      memberships: [{ account: { id: first } }],
+    }),
+    JSON.stringify({ loggedIn: true, accounts: Array(101).fill({ id: first }) }),
+    " ".repeat(64 * 1024 + 1),
+    `{"loggedIn":false,"loggedIn":true,"accounts":[{"id":"${first}"}]}`,
+    `{"loggedIn":true,"accounts":[{"id":"${first}"}],"accounts":[{"id":"${second}"}]}`,
+    `{"loggedIn":true,"accounts":[{"id":"${first}","\\u0069d":"${first}"}]}`,
+  ]) assert.equal(extractWhoamiAccountId(value), "")
+})
+
+test("provisioner verifies only Wrangler's structured logged-out identity", () => {
+  assert.equal(isWhoamiLoggedOut('{"loggedIn":false}'), true)
+  assert.equal(isWhoamiLoggedOut('{"loggedIn":true,"accounts":[]}'), false)
+  assert.equal(isWhoamiLoggedOut('{"loggedIn":false,"accounts":[]}'), false)
+  assert.equal(isWhoamiLoggedOut('{"loggedIn":false,"reason":"expired"}'), false)
+  assert.equal(isWhoamiLoggedOut('{"loggedIn":true,"loggedIn":false}'), false)
+  assert.equal(isWhoamiLoggedOut("Wrangler is not logged in"), false)
 })
 
 test("accepts only canonical HTTPS Quick Tunnel origins", () => {
