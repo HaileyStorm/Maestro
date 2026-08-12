@@ -465,6 +465,131 @@ Promise.resolve(build())
         self.assertIn("local.$share.cloudflare[local.url]", start)
         self.assertNotIn("envs.PINOKIO_SHARE_CLOUDFLARE", start)
 
+    def test_start_refreshes_explicit_backend_overrides_on_each_invocation(self):
+        source = (_ROOT / "start.js").read_text(encoding="utf-8")
+        first_environment = "\n".join([
+            'MAESTRO_ACCOUNTS_ENABLED="true" # double-quoted flag',
+            "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED='true' # single-quoted flag",
+            'PINOKIO_SHARE_CLOUDFLARE="true" # cloudflare policy',
+            "PINOKIO_SHARE_LOCAL='true' # local policy",
+            'PINOKIO_STABLE_SHARE_URL="https://first.example.workers.dev/# release one" # stable policy',
+            "MAESTRO_ENVIRONMENT_SENTINEL=app-first",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true",
+            "CLOUDFLARE_API_TOKEN=app-first-token",
+            "PINOKIO_STABLE_SHARE_UPDATE_SECRET=app-first-secret",
+            "SERVER_PORT=1111",
+            "",
+        ])
+        second_environment = "\n".join([
+            "MAESTRO_ACCOUNTS_ENABLED='false' # explicit local false",
+            'MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED="" # explicit local empty',
+            'PINOKIO_SHARE_CLOUDFLARE="false" # explicit local false',
+            "PINOKIO_SHARE_LOCAL='' # explicit local empty",
+            'PINOKIO_STABLE_SHARE_URL="" # explicit local empty',
+            "MAESTRO_ENVIRONMENT_SENTINEL=app-second",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true",
+            "CLOUDFLARE_API_TOKEN=app-second-token",
+            "PINOKIO_STABLE_SHARE_UPDATE_SECRET=app-second-secret",
+            "SERVER_PORT=2222",
+            "",
+        ])
+        global_environment = {
+            "MAESTRO_ACCOUNTS_ENABLED": "true",
+            "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED": "true",
+            "PINOKIO_SHARE_CLOUDFLARE": "true",
+            "PINOKIO_SHARE_LOCAL": "true",
+            "PINOKIO_STABLE_SHARE_URL": "https://global.example.workers.dev",
+            "MAESTRO_ENVIRONMENT_SENTINEL": "global",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED": "true",
+            "CLOUDFLARE_API_TOKEN": "global-token",
+            "PINOKIO_STABLE_SHARE_UPDATE_SECRET": "global-secret",
+            "SERVER_PORT": "3333",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "start.js").write_text(source, encoding="utf-8")
+            (root / "launcher_secret_env.js").write_text(
+                (_ROOT / "launcher_secret_env.js").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            loader = r"""
+const fs = require('fs');
+const build = require('./start.js');
+const state = JSON.parse(process.argv[1]);
+const kernel = {port: async () => 49152, envs: state.globalEnvironment};
+const explicitBackendEnvironment = (definition) => {
+  const step = definition.run.find((candidate) =>
+    candidate.method === 'shell.run' &&
+    (candidate.params.message || []).some((message) => message.includes('python launch.py'))
+  );
+  if (!step) throw new Error('backend launch step not found');
+  return step.params.env;
+};
+(async () => {
+  fs.writeFileSync('ENVIRONMENT', state.firstEnvironment, 'utf8');
+  const first = explicitBackendEnvironment(await build(kernel));
+  fs.writeFileSync('ENVIRONMENT', state.secondEnvironment, 'utf8');
+  const second = explicitBackendEnvironment(await build(kernel));
+  process.stdout.write(JSON.stringify({first, second}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+            completed = subprocess.run(
+                [
+                    "node", "-e", loader,
+                    json.dumps({
+                        "firstEnvironment": first_environment,
+                        "secondEnvironment": second_environment,
+                        "globalEnvironment": global_environment,
+                    }),
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        captured = json.loads(completed.stdout)
+        expected_params_env_keys = {
+            "MAESTRO_ACCOUNTS_ENABLED",
+            "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED",
+            "PINOKIO_SHARE_CLOUDFLARE",
+            "PINOKIO_SHARE_LOCAL",
+            "PINOKIO_STABLE_SHARE_URL",
+            "CLOUDFLARE_API_TOKEN",
+            "PINOKIO_STABLE_SHARE_UPDATE_SECRET",
+            "SERVER_PORT",
+        }
+        # This is the explicit params.env overlay. Pinokio can still inherit
+        # additional ENVIRONMENT values into the eventual child process.
+        self.assertEqual(set(captured["first"]), expected_params_env_keys)
+        self.assertEqual(set(captured["second"]), expected_params_env_keys)
+        self.assertEqual(captured["first"]["MAESTRO_ACCOUNTS_ENABLED"], "true")
+        self.assertEqual(captured["first"]["MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"], "true")
+        self.assertEqual(captured["first"]["PINOKIO_SHARE_CLOUDFLARE"], "true")
+        self.assertEqual(captured["first"]["PINOKIO_SHARE_LOCAL"], "true")
+        self.assertEqual(
+            captured["first"]["PINOKIO_STABLE_SHARE_URL"],
+            "https://first.example.workers.dev/# release one",
+        )
+        self.assertEqual(captured["second"]["MAESTRO_ACCOUNTS_ENABLED"], "false")
+        self.assertEqual(captured["second"]["MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"], "")
+        self.assertEqual(captured["second"]["PINOKIO_SHARE_CLOUDFLARE"], "false")
+        self.assertEqual(captured["second"]["PINOKIO_SHARE_LOCAL"], "")
+        self.assertEqual(captured["second"]["PINOKIO_STABLE_SHARE_URL"], "")
+        for params_environment in captured.values():
+            self.assertNotIn("MAESTRO_ENVIRONMENT_SENTINEL", params_environment)
+            self.assertNotIn(
+                "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED",
+                params_environment,
+            )
+            self.assertEqual(params_environment["CLOUDFLARE_API_TOKEN"], "")
+            self.assertEqual(
+                params_environment["PINOKIO_STABLE_SHARE_UPDATE_SECRET"],
+                "",
+            )
+            self.assertEqual(params_environment["SERVER_PORT"], 49152)
+
     def _load_start_with_environment(self, app_environment, global_environment):
         source = (_ROOT / "start.js").read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as directory:

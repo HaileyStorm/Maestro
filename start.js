@@ -2,6 +2,48 @@ const fs = require("fs")
 const path = require("path")
 const { runtimeSecretEnv, shareHelperSecretEnv } = require("./launcher_secret_env")
 
+const parseEnvironmentValue = (rawValue) => {
+  let quote = ""
+  let escaped = false
+  let commentIndex = -1
+  for (let index = 0; index < rawValue.length; index += 1) {
+    const character = rawValue[index]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (quote === '"' && character === "\\") {
+      escaped = true
+      continue
+    }
+    if (quote) {
+      if (character === quote) quote = ""
+      continue
+    }
+    if (character === '"' || character === "'") {
+      quote = character
+      continue
+    }
+    if (
+      character === "#" &&
+      (index === 0 || /\s/.test(rawValue[index - 1]))
+    ) {
+      commentIndex = index
+      break
+    }
+  }
+
+  let value = (commentIndex >= 0 ? rawValue.slice(0, commentIndex) : rawValue).trim()
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    value = value.slice(1, -1)
+  }
+  return value
+}
+
 const readAppEnvironment = () => {
   let contents
   try {
@@ -16,17 +58,7 @@ const readAppEnvironment = () => {
   for (const line of contents.split(/\r?\n/)) {
     const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/)
     if (!match) continue
-    let value = match[2]
-    if (
-      value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'")))
-    ) {
-      value = value.slice(1, -1)
-    } else {
-      value = value.replace(/\s+#.*$/, "").trim()
-    }
-    values[match[1]] = value
+    values[match[1]] = parseEnvironmentValue(match[2])
   }
   return values
 }
@@ -39,20 +71,24 @@ module.exports = async (kernel) => {
       ? appEnvironment[key]
       : String((kernel.envs && kernel.envs[key]) || "")
   )
-  const cloudflareEnabled = effectiveEnvironmentValue("PINOKIO_SHARE_CLOUDFLARE")
+  const backendEnvironment = {
+    MAESTRO_ACCOUNTS_ENABLED: effectiveEnvironmentValue("MAESTRO_ACCOUNTS_ENABLED"),
+    MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED: effectiveEnvironmentValue("MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"),
+    PINOKIO_SHARE_CLOUDFLARE: effectiveEnvironmentValue("PINOKIO_SHARE_CLOUDFLARE"),
+    PINOKIO_SHARE_LOCAL: effectiveEnvironmentValue("PINOKIO_SHARE_LOCAL"),
+    PINOKIO_STABLE_SHARE_URL: effectiveEnvironmentValue("PINOKIO_STABLE_SHARE_URL"),
+  }
+  const cloudflareEnabled = backendEnvironment.PINOKIO_SHARE_CLOUDFLARE
     .trim().toLowerCase() === "true"
-  const localSharingEnabled = effectiveEnvironmentValue("PINOKIO_SHARE_LOCAL")
+  const localSharingEnabled = backendEnvironment.PINOKIO_SHARE_LOCAL
     .trim().toLowerCase() === "true"
   const stableShareConfigured = Boolean(
-    effectiveEnvironmentValue("PINOKIO_STABLE_SHARE_URL").trim()
+    backendEnvironment.PINOKIO_STABLE_SHARE_URL.trim()
   )
   // SERVER_NAME is intentionally NOT set here. The host-binding
-  // decision lives in launch.py, which reads PINOKIO_SHARE_LOCAL
-  // from the merged shell env (per-app ENVIRONMENT overrides global
-  // there). kernel.envs in this start.js context only exposes the
-  // global ENVIRONMENT, so a per-app override of PINOKIO_SHARE_LOCAL
-  // wouldn't be visible if we made the decision here. See launch.py
-  // bottom for the full priority chain.
+  // decision lives in launch.py, which reads PINOKIO_SHARE_LOCAL from
+  // the freshly picked backend environment below. See launch.py bottom
+  // for the full priority chain.
   return {
     requires: {
       bundle: "ai",
@@ -83,6 +119,7 @@ module.exports = async (kernel) => {
         params: {
           venv: "env",
           env: {
+            ...backendEnvironment,
             ...runtimeSecretEnv,
             SERVER_PORT: port,
           },

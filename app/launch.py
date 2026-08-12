@@ -59558,14 +59558,11 @@ if __name__ == "__main__":
     port = int(os.environ.get("SERVER_PORT", "7860"))
 
     # Bind-host resolution priority:
-    #   1. PINOKIO_SHARE_LOCAL — Pinokio's per-app + global ENVIRONMENT
-    #      var. "true" → 0.0.0.0 (LAN-accessible), anything else
-    #      → 127.0.0.1 (loopback only). This is the primary Pinokio path
-    #      and CRITICALLY: per-app ENVIRONMENT overrides global here
-    #      because os.environ reflects the merged shell env. (start.js's
-    #      kernel.envs only sees global, which is why we can't make this
-    #      decision in start.js — Pinokio doesn't merge per-app into
-    #      kernel.envs as of 2026-05-04.)
+    #   1. PINOKIO_SHARE_LOCAL — start.js freshly reads the per-app
+    #      ENVIRONMENT and explicitly overlays this selected policy value
+    #      after the global fallback. "true" → 0.0.0.0 (LAN-accessible),
+    #      anything else → 127.0.0.1 (loopback only). This is the primary
+    #      Pinokio path; kernel.envs alone exposes only the global value.
     #   2. SERVER_NAME — manual override for direct python launches
     #      outside Pinokio. Lets devs force a bind without going through
     #      the env-var dance.
