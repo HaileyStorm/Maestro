@@ -586,6 +586,19 @@ For a reusable address without buying a domain, Maestro includes a minimal Cloud
 
 Remote access is deliberately not an administration surface. It exposes the app but denies Classic UI, system/storage/model-source settings, arbitrary model links/paths, and service load/unload. New remote projects require a password. A browser may keep several projects unlocked at once. An explicit `device` unlock is cached server-side across ordinary reloads and Maestro restarts for at most 30 days locally (7 days idle) or 7 days remotely (24 hours idle); `session` grants are shorter and process-local. Deliberate project selection and authorized project mutations slide the idle deadline without moving its absolute cap. Read-only listing, media, gallery, queue, job, and status polls validate grants but never extend them, so a tab left polling cannot stay unlocked forever. Relocking, password changes/removal, project deletion/recreation, expiry, or invalid grant data revokes access. The owner-only cache contains HMAC identities and expiry metadata, never passwords, raw session cookies, or bearer credentials. LAN binding remains disabled by default.
 
+### Optional host accounts
+
+Host accounts are disabled by default and remain separate from project passwords and browser project sessions. Maestro ships no default account or password, and passkey authentication is not available. Enabling accounts does not activate any external provider.
+
+To create the first owner account:
+
+1. In Pinokio's per-app **Configure** tab, set `MAESTRO_ACCOUNTS_ENABLED=true` and `MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=true`, then restart Maestro.
+2. Open Maestro through its direct local loopback Web UI, open **Support**, select the **Account** tab, and create the first owner. Bootstrap is not offered through LAN or Cloudflare access.
+3. Save the one-time recovery codes offline before dismissing them. Do not place passwords, recovery codes, account-store data, or signing secrets in the repository or `ENVIRONMENT` files.
+4. Set `MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false` and restart Maestro again. Leave `MAESTRO_ACCOUNTS_ENABLED=true` to keep sign-in and existing accounts available.
+
+Explicitly setting either flag is preserved by later installs and updates. A partial configuration receives only the missing safe default; existing values are not rewritten.
+
 Lawful-use, separately licensed Ref2VA, and applicable BFL/Krea model-license notices are versioned once per Maestro host, not per browser, project, or device. Any current local project user or password-unlocked remote project user may record the exact displayed version; doing so grants no project or machine-control capability. A notice version change requires a fresh acceptance, and any required manual-review commitment is user-confirmed before the selected model or paired recipe can run. Mature prompt guidance is a separate host setting and is applied only when the current Generate or Director job is explicitly marked **Explicit**. Maestro does not inspect local prompts or outputs to make that choice. External LLM providers remain separately disclosed and subject to their own terms and privacy policies.
 
 Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to `false` (in the per-app or global ENVIRONMENT file) to bind the server to loopback only; set to `true` for LAN access. Pinokio's own daemon proxy is a separate concern that may also need to honor the variable depending on your setup.

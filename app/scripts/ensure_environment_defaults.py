@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 
 def ensure_default(path: Path, key: str, value: str) -> bool:
@@ -37,7 +37,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", default="ENVIRONMENT")
     args = parser.parse_args()
-    ensure_default(Path(args.file), "PINOKIO_SHARE_CLOUDFLARE", "true")
+    path = Path(args.file)
+    ensure_default(path, "PINOKIO_SHARE_CLOUDFLARE", "true")
+    ensure_default(path, "MAESTRO_ACCOUNTS_ENABLED", "false")
+    ensure_default(path, "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED", "false")
     return 0
 
 

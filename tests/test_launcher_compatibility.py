@@ -5,6 +5,7 @@ import importlib.util
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -165,7 +166,7 @@ Promise.resolve(launcher.menu({}, info))
         self.assertEqual(classic_menu[0]["text"], "Open Classic UI")
         self.assertTrue(classic_menu[0]["default"])
 
-    def test_install_materializes_cloudflare_default_without_overriding_choice(self):
+    def test_install_materializes_safe_defaults_without_overriding_choices(self):
         installer = (_ROOT / "install.js").read_text(encoding="utf-8")
         updater = (_ROOT / "update.js").read_text(encoding="utf-8")
         helper_path = _ROOT / "app" / "scripts" / "ensure_environment_defaults.py"
@@ -174,18 +175,69 @@ Promise.resolve(launcher.menu({}, info))
         self.assertIn('id: "uptodate"', updater)
         self.assertIn('id: "build"', updater)
 
-        spec = importlib.util.spec_from_file_location("ensure_environment_defaults", helper_path)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as directory:
             environment = Path(directory) / "ENVIRONMENT"
-            self.assertTrue(module.ensure_default(environment, "PINOKIO_SHARE_CLOUDFLARE", "true"))
-            self.assertIn("PINOKIO_SHARE_CLOUDFLARE=true", environment.read_text(encoding="utf-8"))
-            environment.write_text("PINOKIO_SHARE_CLOUDFLARE=false\n", encoding="utf-8")
-            self.assertFalse(module.ensure_default(environment, "PINOKIO_SHARE_CLOUDFLARE", "true"))
-            self.assertEqual(environment.read_text(encoding="utf-8"), "PINOKIO_SHARE_CLOUDFLARE=false\n")
+            subprocess.run(
+                [sys.executable, str(helper_path), "--file", str(environment)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                {
+                    line for line in environment.read_text(encoding="utf-8").splitlines()
+                    if line
+                },
+                {
+                    "PINOKIO_SHARE_CLOUDFLARE=true",
+                    "MAESTRO_ACCOUNTS_ENABLED=false",
+                    "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false",
+                },
+            )
+
+            explicit = Path(directory) / "EXPLICIT_ENVIRONMENT"
+            explicit.write_text(
+                "PINOKIO_SHARE_CLOUDFLARE=false\n"
+                "MAESTRO_ACCOUNTS_ENABLED=true\n"
+                "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=true\n",
+                encoding="utf-8",
+            )
+            before = explicit.read_text(encoding="utf-8")
+            subprocess.run(
+                [sys.executable, str(helper_path), "--file", str(explicit)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(explicit.read_text(encoding="utf-8"), before)
+
+            partial = Path(directory) / "PARTIAL_ENVIRONMENT"
+            partial.write_text("MAESTRO_ACCOUNTS_ENABLED=true\n", encoding="utf-8")
+            subprocess.run(
+                [sys.executable, str(helper_path), "--file", str(partial)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            partial_text = partial.read_text(encoding="utf-8")
+            self.assertIn("MAESTRO_ACCOUNTS_ENABLED=true\n", partial_text)
+            self.assertIn("MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false\n", partial_text)
+
+            malformed = Path(directory) / "MALFORMED_ENVIRONMENT"
+            malformed.write_text(
+                "PINOKIO_SHARE_CLOUDFLARE=false\n"
+                "MAESTRO_ACCOUNTS_ENABLED=maybe\n"
+                "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=\n",
+                encoding="utf-8",
+            )
+            before = malformed.read_text(encoding="utf-8")
+            subprocess.run(
+                [sys.executable, str(helper_path), "--file", str(malformed)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(malformed.read_text(encoding="utf-8"), before)
 
     def test_start_registers_pinokios_live_tunnel_url_with_local_ui(self):
         start = (_ROOT / "start.js").read_text(encoding="utf-8")

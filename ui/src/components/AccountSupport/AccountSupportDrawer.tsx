@@ -743,7 +743,7 @@ export function AccountSupportDrawer() {
                           <div key={user.id} className="flex items-center gap-2 rounded-lg border border-border/80 bg-bg-primary/40 p-2.5">
                             <div className="min-w-0 flex-1">
                               <p className="truncate text-[10px] font-semibold text-text-primary">{user.username}</p>
-                              <p className="text-[9px] text-text-muted">{user.role}{user.has_email ? ' · recovery email recorded' : ''}</p>
+                              <p className="text-[9px] text-text-muted">{user.role}{user.has_email ? ' · email recorded' : ''}</p>
                             </div>
                             <button
                               type="button"

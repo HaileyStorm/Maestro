@@ -1204,6 +1204,8 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(source, /Maestro will not show this set again/)
   assert.match(source, /context\.capabilities\.includes\('accounts\.admin'\)/)
   assert.match(source, /context\.bootstrap_available === true/)
+  assert.match(source, /user\.has_email \? ' · email recorded' : ''/)
+  assert.doesNotMatch(source, /recovery email recorded/)
   assert.match(source, /role="tablist"/)
   assert.match(source, /tabIndex=\{activeTab === 'support' \? 0 : -1\}/)
   assert.match(source, /onKeyDown=\{event => handleTabKeyDown\(event, 'account'\)\}/)

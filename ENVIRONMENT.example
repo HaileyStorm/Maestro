@@ -22,3 +22,11 @@ HF_HOME=
 TORCH_HOME=./cache/TORCH_HOME
 PINOKIO_SHARE_LOCAL=false
 PINOKIO_SHARE_LOCAL_PORT=
+
+# Optional host accounts are disabled by default. Creating the first owner is
+# a temporary, direct-loopback-only operation: opt in to both flags, restart,
+# create the owner in Maestro's local Account UI, then set bootstrap back to
+# false and restart. Never put passwords, recovery codes, account-store data,
+# or signing secrets in this file.
+MAESTRO_ACCOUNTS_ENABLED=false
+MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false
