@@ -200,6 +200,12 @@ from services.entitlements import (
     opaque_key,
     support_priority_capability_marker,
 )
+from services.credit_accounting import (
+    CreditAccountingError,
+    CreditAccountingJournal,
+    CreditAccountingPolicy,
+    CreditSourceBalance,
+)
 from services.credit_runtime import (
     CreditRuntimeError,
     CreditRuntimePolicy,
@@ -1180,6 +1186,7 @@ def _safe_join(base: str, *parts: str) -> str | None:
 
 # --- Generation job tracking ---
 from services.job_lifecycle import (
+    CreditLifecycleCallbackError,
     _credit_queue_metadata_from_quote,
     apply_credit_queue_decision,
     authorized_logical_queue_projection,
@@ -1188,6 +1195,7 @@ from services.job_lifecycle import (
     block_generation_recovery,
     block_resource_admission_failure,
     complete_preparation,
+    configure_credit_lifecycle_callback,
     consume_credit_queue_reservation,
     DurableTransition,
     GENERATED_MEDIA_EXTENSIONS,
@@ -1454,17 +1462,30 @@ def _stamp_job_origin(job: dict) -> dict:
 
 _CREDIT_ACCOUNT_PARAM = "_maestro_credit_account_id"
 _CREDIT_REALM_PARAM = "_maestro_credit_execution_realm"
+_CREDIT_BASELINE_PARAM = "_maestro_credit_accounting_baseline"
+_CREDIT_CLEANUP_PARAM = "_maestro_credit_accounting_cleanup"
 _CREDIT_INTERNAL_PARAMS = frozenset({
     _CREDIT_ACCOUNT_PARAM,
     _CREDIT_REALM_PARAM,
+    _CREDIT_BASELINE_PARAM,
+    _CREDIT_CLEANUP_PARAM,
 })
 _CREDIT_EXEMPT_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice"})
+_CREDIT_LINEAGE_JOB_KINDS = frozenset({
+    "director_pipeline",
+    "director_preparation",
+    "studio_generation_preparation",
+    "studio_project_asset_preparation",
+})
 # Runtime credit enforcement is intentionally unavailable until Maestro has
 # one durable account/source debit ledger and a validated nonzero policy.  An
 # environment flag alone must never contradict the recorded_not_enforced API.
 _CREDIT_RUNTIME_ACCOUNTING_DURABLE = False
 _CREDIT_RUNTIME_VALIDATED_POLICY_UNITS = 0
 _credit_admission_evaluations: dict[str, tuple] = {}
+_credit_accounting_lock = threading.RLock()
+_credit_accounting_value: CreditAccountingJournal | None = None
+_credit_accounting_reservation_accounts: dict[str, str] = {}
 
 
 def _credit_runtime_policy() -> CreditRuntimePolicy:
@@ -1487,6 +1508,79 @@ def _credit_server_execution_realm() -> str:
         os.environ.get("MAESTRO_COMPUTE_EXECUTION_REALM") or "local"
     ).strip().lower()
     return realm if realm in {"local", "lan", "hosted"} else "local"
+
+
+def _credit_accounting_enabled() -> bool:
+    """Require the complete hosted opt-in before touching durable state."""
+    return bool(
+        _credit_runtime_policy().enforcement_enabled
+        and _credit_server_execution_realm() == "hosted"
+    )
+
+
+def _credit_accounting_journal() -> CreditAccountingJournal | None:
+    """Lazily bind the journal and lifecycle seam only behind the hard gate."""
+    global _credit_accounting_value
+    if not _credit_accounting_enabled():
+        configure_credit_lifecycle_callback(None)
+        return None
+    with _credit_accounting_lock:
+        if _credit_accounting_value is None:
+            try:
+                _credit_accounting_value = CreditAccountingJournal(
+                    os.path.join(
+                        _app_dir, "storage", "credit-accounting.json",
+                    ),
+                    integrity_key=_support_domain_key("credit-accounting"),
+                    policy=CreditAccountingPolicy(enforcement_enabled=True),
+                )
+            except (CreditAccountingError, OSError):
+                configure_credit_lifecycle_callback(None)
+                return None
+        configure_credit_lifecycle_callback(
+            _credit_accounting_lifecycle_callback,
+        )
+        return _credit_accounting_value
+
+
+def _credit_accounting_existing_journal() -> CreditAccountingJournal | None:
+    """Open prior accounting state only to settle an existing v2 hold."""
+    global _credit_accounting_value
+    with _credit_accounting_lock:
+        if _credit_accounting_value is not None:
+            return _credit_accounting_value
+        path = os.path.join(_app_dir, "storage", "credit-accounting.json")
+        if not os.path.isfile(path) or os.path.islink(path):
+            return None
+        try:
+            _credit_accounting_value = CreditAccountingJournal(
+                path,
+                integrity_key=_support_domain_key("credit-accounting"),
+                policy=CreditAccountingPolicy(enforcement_enabled=True),
+            )
+        except (CreditAccountingError, OSError):
+            return None
+        return _credit_accounting_value
+
+
+def _credit_accounting_operation_id(kind: str, *parts) -> str:
+    encoded = json.dumps(
+        [kind, *(str(part or "") for part in parts)],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "operation_" + hashlib.sha256(encoded).hexdigest()
+
+
+def _credit_accounting_reservation_id(job: dict) -> str:
+    payload = ":".join((
+        str(job.get("id") or ""),
+        str(job.get("workspace") or "default"),
+        str(job.get("created_at") or ""),
+        str(job.get("_credit_accounting_attempt") or 0),
+    ))
+    return "reservation_" + hashlib.sha256(
+        payload.encode("utf-8"),
+    ).hexdigest()
 
 
 def _credit_account_id(job: dict, *, persisted: bool = True) -> str:
@@ -1540,6 +1634,132 @@ def _credit_recorded_allowance(job: dict) -> dict:
             "refund_state": "not_applicable",
         }],
     }
+
+
+def _credit_accounting_account_key(job: dict) -> str:
+    account_id = _credit_account_id(job)
+    if not account_id:
+        return ""
+    return opaque_key(
+        "maestro_credit_account",
+        account_id,
+        _support_domain_key("credit-account-identity"),
+    )
+
+
+def _credit_accounting_sources(recorded_allowance: dict) -> tuple:
+    """Convert private allowance lots to journal-safe opaque balances."""
+    balances = []
+    raw_sources = recorded_allowance.get("sources")
+    sources = raw_sources if isinstance(raw_sources, list) else []
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        try:
+            units = max(0, int(source.get("effective_allowance") or 0))
+        except (TypeError, ValueError):
+            units = 0
+        source_identity = str(source.get("source_event_id") or "")
+        if not source_identity:
+            source_identity = ":".join((
+                str(source.get("source") or "unknown"),
+                str(source.get("expires_at") or "never"),
+                str(index),
+            ))
+        balances.append(CreditSourceBalance(
+            source_key=opaque_key(
+                "maestro_credit_source",
+                source_identity,
+                _support_domain_key("credit-source-identity"),
+            ),
+            effective_units=units,
+            expires_at=source.get("expires_at"),
+        ))
+    return tuple(balances)
+
+
+def _credit_accounting_context(job: dict) -> tuple:
+    recorded_allowance = _credit_recorded_allowance(job)
+    return (
+        _credit_accounting_account_key(job),
+        recorded_allowance,
+        _credit_accounting_sources(recorded_allowance),
+        str(recorded_allowance.get("as_of") or ""),
+    )
+
+
+def _credit_accounting_receipt_projection(receipt) -> dict:
+    return {
+        "reservation_status": receipt.reservation_status,
+        "reservation_revision": receipt.reservation_revision,
+        "fully_funded": bool(receipt.fully_funded),
+        "allocation_satisfied": bool(receipt.allocation_satisfied),
+        "terminal_satisfied": bool(receipt.terminal_satisfied),
+    }
+
+
+def _credit_accounting_hydrate_job(job: dict) -> bool:
+    """Recover the private reservation/account association server-side."""
+    credit_queue = job.get("credit_queue")
+    if not isinstance(credit_queue, dict) or credit_queue.get(
+        "schema_version"
+    ) != 2:
+        return False
+    reservation_id = str(
+        credit_queue.get("accounting_reservation_id") or ""
+    )
+    account_key = _credit_accounting_account_key(job)
+    if not reservation_id or not account_key:
+        return False
+    with _credit_accounting_lock:
+        _credit_accounting_reservation_accounts[reservation_id] = account_key
+    return True
+
+
+def _credit_accounting_lifecycle_callback(event: dict) -> dict:
+    """Bridge the opaque lifecycle event to the private durable journal."""
+    journal = _credit_accounting_journal()
+    if journal is None:
+        raise CreditAccountingError("credit accounting is unavailable")
+    reservation_id = str(event.get("accounting_reservation_id") or "")
+    with _credit_accounting_lock:
+        account_key = _credit_accounting_reservation_accounts.get(
+            reservation_id, "",
+        )
+    if not account_key:
+        job = _jobs.get(str(event.get("job_id") or ""))
+        if isinstance(job, dict) and _credit_accounting_hydrate_job(job):
+            with _credit_accounting_lock:
+                account_key = _credit_accounting_reservation_accounts.get(
+                    reservation_id, "",
+                )
+    if not account_key:
+        raise CreditAccountingError("credit account association is unavailable")
+    action = str(event.get("action") or "")
+    if action not in {"consume", "release"}:
+        raise CreditAccountingError("credit lifecycle action is invalid")
+    try:
+        receipt = getattr(journal, action)(
+            account_key=account_key,
+            reservation_id=reservation_id,
+            operation_id=str(event.get("operation_id") or ""),
+            expected_revision=event.get("expected_revision"),
+            as_of=str(event.get("as_of") or ""),
+        )
+    except OSError as error:
+        raise CreditAccountingError(
+            "credit accounting is unavailable"
+        ) from error
+    if (
+        action == "consume" and receipt.allocation_satisfied is True
+    ) or (
+        action == "release" and receipt.terminal_satisfied is True
+    ):
+        with _credit_accounting_lock:
+            _credit_accounting_reservation_accounts.pop(
+                reservation_id, None,
+            )
+    return _credit_accounting_receipt_projection(receipt)
 
 
 def _credit_allowance_revision(recorded_allowance: dict) -> str:
@@ -1629,6 +1849,259 @@ def _credit_evaluation(job: dict):
     return quote, _credit_allowance_revision(recorded_allowance)
 
 
+def _credit_accounting_reserve(job: dict, quote, allowance_revision: str):
+    """Reconcile and reserve before the recovery journal sees the job."""
+    if not quote.reservation_required:
+        return None
+    journal = _credit_accounting_journal()
+    if journal is None:
+        return None
+    account_key, recorded, sources, as_of = _credit_accounting_context(job)
+    if not account_key:
+        return None
+    unit = str(recorded.get("unit") or "")
+    journal.reconcile(
+        account_key=account_key,
+        operation_id=_credit_accounting_operation_id(
+            "reconcile", account_key, allowance_revision, as_of,
+        ),
+        unit=unit,
+        sources=sources,
+        as_of=as_of,
+    )
+    reservation_id = _credit_accounting_reservation_id(job)
+    receipt = journal.reserve(
+        account_key=account_key,
+        reservation_id=reservation_id,
+        operation_id=_credit_accounting_operation_id(
+            "reserve", reservation_id, allowance_revision,
+        ),
+        requested_units=quote.requested_units,
+        as_of=as_of,
+    )
+    if (
+        receipt.reservation_status != "pending"
+        or receipt.fully_funded is not True
+        or receipt.affected_units != quote.requested_units
+        or type(receipt.reservation_revision) is not int
+    ):
+        if receipt.reservation_status == "pending":
+            journal.release(
+                account_key=account_key,
+                reservation_id=reservation_id,
+                operation_id=_credit_accounting_operation_id(
+                    "partial-release", reservation_id,
+                    receipt.reservation_revision,
+                ),
+                expected_revision=receipt.reservation_revision,
+                as_of=as_of,
+            )
+        return None
+    with _credit_accounting_lock:
+        _credit_accounting_reservation_accounts[reservation_id] = account_key
+    return reservation_id, receipt.reservation_revision
+
+
+def _credit_accounting_revalidate(job: dict, allowance_revision: str):
+    """Reconcile one queued v2 reservation against current source truth."""
+    current = job.get("credit_queue")
+    if not isinstance(current, dict) or current.get("schema_version") != 2:
+        return None
+    journal = _credit_accounting_journal()
+    if journal is None:
+        return None
+    account_key, recorded, sources, as_of = _credit_accounting_context(job)
+    reservation_id = str(current.get("accounting_reservation_id") or "")
+    if not account_key or not reservation_id:
+        return None
+    with _credit_accounting_lock:
+        _credit_accounting_reservation_accounts[reservation_id] = account_key
+    return journal.revalidate_reservation(
+        account_key=account_key,
+        reservation_id=reservation_id,
+        operation_id=_credit_accounting_operation_id(
+            "revalidate", reservation_id, allowance_revision, as_of,
+        ),
+        unit=str(recorded.get("unit") or ""),
+        sources=sources,
+        as_of=as_of,
+    )
+
+
+def _credit_baseline_quote(job: dict, recorded_allowance: dict):
+    return quote_reservation(
+        realm=_credit_server_execution_realm(),
+        requested_units=_credit_requested_units(job),
+        recorded_allowance=recorded_allowance,
+        capability_priority=_credit_capability_priority(job),
+        policy=CreditRuntimePolicy(),
+    )
+
+
+def _credit_release_accounting(
+    job: dict,
+    *,
+    persist_baseline: bool,
+    defer_cleanup_baseline: bool = False,
+) -> bool:
+    """Best-effort release, then restore ordinary queue eligibility."""
+    current = job.get("credit_queue")
+    linked_v2 = bool(
+        isinstance(current, dict)
+        and current.get("schema_version") == 2
+        and current.get("reservation_state") == "reserved"
+    )
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    cleanup = params.get(_CREDIT_CLEANUP_PARAM)
+    if linked_v2:
+        reservation_id = str(current.get("accounting_reservation_id") or "")
+        expected_revision = current.get("accounting_reservation_revision")
+        observed_at = str(current.get("allowance_observed_at") or "")
+    elif (
+        isinstance(cleanup, dict)
+        and set(cleanup) == {"reservation_id", "reservation_revision", "as_of"}
+        and isinstance(cleanup.get("reservation_id"), str)
+        and type(cleanup.get("reservation_revision")) is int
+        and isinstance(cleanup.get("as_of"), str)
+    ):
+        reservation_id = cleanup["reservation_id"]
+        expected_revision = cleanup["reservation_revision"]
+        observed_at = cleanup["as_of"]
+    else:
+        return False
+    released = False
+    try:
+        journal = _credit_accounting_existing_journal()
+        account_key = _credit_accounting_account_key(job)
+        if journal is not None and account_key and reservation_id:
+            receipt = journal.release(
+                account_key=account_key,
+                reservation_id=reservation_id,
+                operation_id=_credit_accounting_operation_id(
+                    "rollback-release",
+                    reservation_id,
+                    expected_revision,
+                ),
+                expected_revision=expected_revision,
+                as_of=observed_at,
+            )
+            released = receipt.terminal_satisfied is True
+    except (CreditAccountingError, EntitlementError, OSError):
+        released = False
+    if not released and not (
+        linked_v2 and persist_baseline and defer_cleanup_baseline
+    ):
+        return False
+    if released:
+        with _credit_accounting_lock:
+            _credit_accounting_reservation_accounts.pop(reservation_id, None)
+        params.pop(_CREDIT_CLEANUP_PARAM, None)
+        job["_credit_accounting_attempt"] = max(
+            0, int(job.get("_credit_accounting_attempt") or 0),
+        ) + 1
+    if not persist_baseline:
+        if linked_v2:
+            job.pop("credit_queue", None)
+        return released
+    if not linked_v2:
+        return released
+    try:
+        recorded = _credit_recorded_allowance(job)
+        baseline = _credit_baseline_quote(job, recorded)
+        allowance_revision = _credit_allowance_revision(recorded)
+        transition_id = _credit_transition_id(
+            job, "baseline", baseline, "none", allowance_revision,
+        )
+        baseline_metadata = _credit_queue_metadata_from_quote(
+            baseline,
+            transition_id=transition_id,
+            allowance_revision=allowance_revision,
+            reservation=None,
+            revalidation=None,
+        )
+        if str(job.get("status") or "") == "running":
+            update_job(job, credit_queue=baseline_metadata)
+        else:
+            apply_credit_queue_decision(
+                job,
+                baseline,
+                transition_id=transition_id,
+                allowance_revision=allowance_revision,
+                reservation=None,
+            )
+    except (CreditAccountingError, CreditRuntimeError, EntitlementError, ValueError):
+        pass
+    return released
+
+
+def _credit_reconcile_unregistered_cleanup_manifests(
+    projects: dict[str, tuple[str, str]],
+    snapshots,
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Settle private credit holds left before queue registration committed."""
+    referenced = {
+        path
+        for snapshot in snapshots
+        if isinstance(snapshot, dict)
+        for pointer in (snapshot.get("request_manifest"),)
+        if isinstance(pointer, dict)
+        for path in (pointer.get("path"),)
+        if isinstance(path, str)
+    }
+    retained: dict[str, list[str]] = {}
+    cleanup_blocked: set[str] = set()
+    for workspace, (project_dir, _project_digest) in projects.items():
+        try:
+            entries = discover_request_manifest_pointers(project_dir)
+        except (QueueRecoveryRuntimeError, OSError):
+            cleanup_blocked.add(workspace)
+            continue
+        for entry in entries:
+            job_id = str(entry.get("job_id") or "")
+            pointer = entry.get("pointer")
+            path = pointer.get("path") if isinstance(pointer, dict) else None
+            if not isinstance(path, str) or path in referenced:
+                continue
+            try:
+                manifest = load_request_manifest(
+                    project_dir, pointer, expected_job_id=job_id,
+                )
+            except (QueueRecoveryRuntimeError, OSError):
+                cleanup_blocked.add(workspace)
+                continue
+            params = manifest.get("params")
+            if (
+                not isinstance(params, dict)
+                or not isinstance(params.get(_CREDIT_CLEANUP_PARAM), dict)
+            ):
+                continue
+            cleanup_job = {
+                "id": job_id,
+                "status": "failed",
+                "workspace": workspace,
+                "params": dict(params),
+            }
+            credit_release = globals().get("_credit_release_accounting")
+            try:
+                released = bool(
+                    callable(credit_release)
+                    and credit_release(cleanup_job, persist_baseline=False)
+                )
+            except (
+                CreditAccountingError,
+                CreditRuntimeError,
+                EntitlementError,
+                OSError,
+                ValueError,
+            ):
+                released = False
+            if released:
+                remove_request_manifest(project_dir, pointer)
+            else:
+                retained.setdefault(workspace, []).append(path)
+    return retained, cleanup_blocked
+
+
 def _credit_quote(job: dict):
     """Compatibility projection for tests and diagnostics."""
     return _credit_evaluation(job)[0]
@@ -1674,8 +2147,12 @@ def _credit_job_exempt(job: dict) -> bool:
     return str(job.get("kind") or "") in _CREDIT_EXEMPT_JOB_KINDS
 
 
-def _credit_prepare_submission(job: dict) -> bool:
-    """Atomically add the first hosted envelope before journal registration."""
+def _credit_job_lineage_only(job: dict) -> bool:
+    return str(job.get("kind") or "") in _CREDIT_LINEAGE_JOB_KINDS
+
+
+def _credit_prepare_submission_manifest(job: dict) -> bool:
+    """Seal exact private cleanup identity before any journal reservation."""
     if _credit_job_exempt(job):
         return False
     params = job.get("params") if isinstance(job.get("params"), dict) else None
@@ -1686,6 +2163,8 @@ def _credit_prepare_submission(job: dict) -> bool:
     # request manifest when hosted enforcement is explicitly active.
     params.pop(_CREDIT_ACCOUNT_PARAM, None)
     params.pop(_CREDIT_REALM_PARAM, None)
+    params.pop(_CREDIT_BASELINE_PARAM, None)
+    params.pop(_CREDIT_CLEANUP_PARAM, None)
     policy = _credit_runtime_policy()
     realm = _credit_server_execution_realm()
     if not policy.enforcement_enabled or realm != "hosted":
@@ -1694,8 +2173,77 @@ def _credit_prepare_submission(job: dict) -> bool:
     if account_id:
         params[_CREDIT_ACCOUNT_PARAM] = account_id
     params[_CREDIT_REALM_PARAM] = realm
+    if not account_id:
+        return False
+    lineage_only = globals().get("_credit_job_lineage_only")
+    if callable(lineage_only) and lineage_only(job):
+        return True
     quote, allowance_revision = _credit_evaluation(job)
+    job["_credit_submission_preflight"] = (quote, allowance_revision)
+    if quote.reservation_required:
+        params[_CREDIT_CLEANUP_PARAM] = {
+            "reservation_id": _credit_accounting_reservation_id(job),
+            "reservation_revision": 1,
+            "as_of": str(quote.snapshot_as_of or ""),
+        }
+    return True
+
+
+def _credit_prepare_submission(job: dict) -> bool:
+    """Atomically add the first hosted envelope before queue registration."""
+    preflight = job.pop("_credit_submission_preflight", None)
+    if not (
+        isinstance(preflight, tuple)
+        and len(preflight) == 2
+        and isinstance(job.get("params"), dict)
+    ):
+        if not _credit_prepare_submission_manifest(job):
+            return False
+        preflight = job.pop("_credit_submission_preflight", None)
+    if not isinstance(preflight, tuple) or len(preflight) != 2:
+        # Lineage-only orchestration parents never reserve.
+        return True
+    quote, allowance_revision = preflight
+    params = job["params"]
     reservation = _credit_reservation(job, quote, consumed=False)
+    accounting_reserve = globals().get("_credit_accounting_reserve")
+    accounting = None
+    try:
+        if callable(accounting_reserve):
+            accounting = accounting_reserve(
+                job, quote, allowance_revision,
+            )
+    except (CreditAccountingError, EntitlementError, OSError):
+        accounting = None
+    if (
+        quote.reservation_required
+        and callable(accounting_reserve)
+        and accounting is None
+    ):
+        params.pop(_CREDIT_CLEANUP_PARAM, None)
+        params[_CREDIT_BASELINE_PARAM] = True
+        baseline = _credit_baseline_quote(job, _credit_recorded_allowance(job))
+        job["credit_queue"] = _credit_queue_metadata_from_quote(
+            baseline,
+            transition_id=_credit_transition_id(
+                job, "submit-baseline", baseline, "none",
+                allowance_revision,
+            ),
+            allowance_revision=allowance_revision,
+            reservation=None,
+            revalidation=None,
+        )
+        return True
+    if accounting is not None:
+        actual_cleanup = {
+            "reservation_id": accounting[0],
+            "reservation_revision": accounting[1],
+            "as_of": str(quote.snapshot_as_of or ""),
+        }
+        if params.get(_CREDIT_CLEANUP_PARAM) != actual_cleanup:
+            raise CreditRuntimeError(
+                "credit cleanup identity changed after manifest preflight"
+            )
     transition_id = _credit_transition_id(
         job, "submit", quote,
         "reserved" if reservation is not None else "none",
@@ -1707,6 +2255,12 @@ def _credit_prepare_submission(job: dict) -> bool:
         allowance_revision=allowance_revision,
         reservation=reservation,
         revalidation=None,
+        accounting_reservation_id=(
+            None if accounting is None else accounting[0]
+        ),
+        accounting_reservation_revision=(
+            None if accounting is None else accounting[1]
+        ),
     )
     return True
 
@@ -1724,9 +2278,98 @@ def _credit_prepare_admission(job: dict) -> bool:
     ):
         return False
     quote, allowance_revision = _credit_evaluation(job)
+    current = job.get("credit_queue")
+    if params.get(_CREDIT_BASELINE_PARAM) is True:
+        baseline = _credit_baseline_quote(job, _credit_recorded_allowance(job))
+        changed = apply_credit_queue_decision(
+            job,
+            baseline,
+            transition_id=_credit_transition_id(
+                job, "admission-baseline", baseline, "none",
+                allowance_revision,
+            ),
+            allowance_revision=allowance_revision,
+            reservation=None,
+        )
+        _credit_admission_evaluations[job_id] = (
+            baseline, allowance_revision, None,
+        )
+        return changed
+    if isinstance(current, dict) and current.get("schema_version") == 2:
+        if (
+            not _credit_accounting_enabled()
+            or quote.realm != "hosted"
+            or not quote.reservation_required
+        ):
+            _credit_release_accounting(
+                job,
+                persist_baseline=True,
+                defer_cleanup_baseline=True,
+            )
+            downgraded = job.get("credit_queue")
+            if (
+                isinstance(downgraded, dict)
+                and downgraded.get("schema_version") == 2
+                and downgraded.get("reservation_state") == "reserved"
+            ):
+                raise CreditRuntimeError(
+                    "credit baseline transition could not be persisted"
+                )
+            return True
+        try:
+            receipt = _credit_accounting_revalidate(
+                job, allowance_revision,
+            )
+        except (CreditAccountingError, EntitlementError, OSError):
+            receipt = None
+        if (
+            receipt is None
+            or receipt.reservation_status != "pending"
+            or receipt.fully_funded is not True
+            or receipt.affected_units != quote.requested_units
+            or type(receipt.reservation_revision) is not int
+        ):
+            _credit_release_accounting(
+                job,
+                persist_baseline=True,
+                defer_cleanup_baseline=True,
+            )
+            downgraded = job.get("credit_queue")
+            if (
+                isinstance(downgraded, dict)
+                and downgraded.get("schema_version") == 2
+                and downgraded.get("reservation_state") == "reserved"
+            ):
+                raise CreditRuntimeError(
+                    "credit baseline transition could not be persisted"
+                )
+            return True
+        reservation = _credit_reservation(job, quote, consumed=False)
+        transition_id = _credit_transition_id(
+            job, "admission", quote, "reserved", allowance_revision,
+        )
+        changed = apply_credit_queue_decision(
+            job,
+            quote,
+            transition_id=transition_id,
+            allowance_revision=allowance_revision,
+            reservation=reservation,
+            accounting_reservation_id=str(
+                current.get("accounting_reservation_id") or ""
+            ),
+            accounting_reservation_revision=receipt.reservation_revision,
+        )
+        _credit_admission_evaluations[job_id] = (
+            quote,
+            allowance_revision,
+            reservation,
+            str(current.get("accounting_reservation_id") or ""),
+            receipt.reservation_revision,
+        )
+        return changed
     was_consumed = (
-        isinstance(job.get("credit_queue"), dict)
-        and job["credit_queue"].get("reservation_state") == "consumed"
+        isinstance(current, dict)
+        and current.get("reservation_state") == "consumed"
     )
     reservation = _credit_reservation(job, quote, consumed=was_consumed)
     transition_id = _credit_transition_id(
@@ -1761,11 +2404,11 @@ def _credit_prepare_dispatch(job: dict) -> bool:
         "reserved"
     ):
         return False
-    if not isinstance(evaluation, tuple) or len(evaluation) != 3:
+    if not isinstance(evaluation, tuple) or len(evaluation) not in {3, 5}:
         raise CreditRuntimeError(
             "credit admission evaluation is unavailable after admission"
         )
-    quote, allowance_revision, reserved = evaluation
+    quote, allowance_revision, reserved = evaluation[:3]
     if reserved is None:
         raise CreditRuntimeError(
             "credit admission reservation is unavailable after admission"
@@ -1774,13 +2417,32 @@ def _credit_prepare_dispatch(job: dict) -> bool:
     transition_id = _credit_transition_id(
         job, "dispatch", quote, "consumed", allowance_revision,
     )
-    consumed = consume_credit_queue_reservation(
-        job,
-        quote,
-        transition_id=transition_id,
-        allowance_revision=allowance_revision,
-        reservation=reservation,
-    )
+    try:
+        consumed = consume_credit_queue_reservation(
+            job,
+            quote,
+            transition_id=transition_id,
+            allowance_revision=allowance_revision,
+            reservation=reservation,
+            accounting_reservation_id=(
+                None if len(evaluation) == 3 else evaluation[3]
+            ),
+            accounting_reservation_revision=(
+                None if len(evaluation) == 3 else evaluation[4] + 1
+            ),
+        )
+    except (
+        CreditAccountingError,
+        CreditLifecycleCallbackError,
+        OSError,
+    ):
+        # A valid admitted generation must not be denied because the optional
+        # accounting store became unavailable after queue revalidation.
+        if not _credit_release_accounting(job, persist_baseline=True):
+            # Retain the durable v2 cleanup obligation on the job, but prevent
+            # the same unavailable callback from poisoning terminalization.
+            configure_credit_lifecycle_callback(None)
+        return False
     if not consumed and not is_cancel_requested(job):
         raise CreditRuntimeError(
             "credit reservation could not be consumed after admission"
@@ -2447,7 +3109,7 @@ def _queue_recovery_register_and_publish(
     ):
         _seal_h3_offload_plan_for_job(job.get("params"), job=job)
     prepared = _jobs.prepare(_stamp_job_origin(job))
-    _credit_prepare_submission(prepared)
+    prepared["kind"] = str(recovery_kind or "studio_generation")
     prepared_params = prepared.get("params")
     if isinstance(prepared_params, dict):
         # These are worker-authored native staging controls. HTTP payloads and
@@ -2455,7 +3117,6 @@ def _queue_recovery_register_and_publish(
         prepared_params.pop("_recovery_output_directory", None)
         prepared_params.pop("_recovery_output_prefix", None)
         _stamp_h3_lightx2v_recovery_identity(prepared_params)
-    prepared["kind"] = str(recovery_kind or "studio_generation")
     job_id = str(prepared.get("id") or "")
     workspace = str(prepared.get("workspace") or "default")
     project_dir = str(prepared.get("out_dir") or "")
@@ -2474,15 +3135,39 @@ def _queue_recovery_register_and_publish(
         # allowed to retain raw parameters or absolute input paths. The
         # machine-owned journal and every public response receive only its
         # project-relative pointer, schema, size, and SHA-256.
-        request_manifest = atomic_write_request_manifest(
-            project_dir,
-            job_id=job_id,
-            params=prepared.get("params") or {},
-            inputs=_queue_recovery_input_descriptors(prepared, owner_digest),
-        )
-        if prepared.get("status") == "queued":
-            _stamp_requested_generation_residency(prepared)
+        request_manifest = None
         try:
+            credit_manifest_preflight = globals().get(
+                "_credit_prepare_submission_manifest"
+            )
+            if callable(credit_manifest_preflight):
+                credit_manifest_preflight(prepared)
+            else:
+                _credit_prepare_submission(prepared)
+            request_manifest = atomic_write_request_manifest(
+                project_dir,
+                job_id=job_id,
+                params=prepared.get("params") or {},
+                inputs=_queue_recovery_input_descriptors(
+                    prepared, owner_digest,
+                ),
+            )
+            manifest_params = dict(prepared.get("params") or {})
+            if callable(credit_manifest_preflight):
+                _credit_prepare_submission(prepared)
+            if prepared.get("params") != manifest_params:
+                # A fail-open baseline has no cleanup obligation. Replace the
+                # preflight manifest before the queue can publish it.
+                request_manifest = atomic_write_request_manifest(
+                    project_dir,
+                    job_id=job_id,
+                    params=prepared.get("params") or {},
+                    inputs=_queue_recovery_input_descriptors(
+                        prepared, owner_digest,
+                    ),
+                )
+            if prepared.get("status") == "queued":
+                _stamp_requested_generation_residency(prepared)
             _queue_recovery_with_bounded_compaction(
                 lambda: _queue_recovery_coordinator.register_job(
                     prepared,
@@ -2492,13 +3177,34 @@ def _queue_recovery_register_and_publish(
                     global_state=durable_queue_state(additions=(prepared,)),
                 ),
             )
+            prepared["_recovery_owner_digest"] = owner_digest
+            prepared["_recovery_project_digest"] = project_digest
+            prepared["_recovery_manifest_pointer"] = dict(request_manifest)
+            _jobs.publish_prepared(job_id, prepared)
         except Exception:
-            remove_request_manifest(project_dir, request_manifest)
+            credit_release = globals().get("_credit_release_accounting")
+            cleanup_required = bool(
+                isinstance(prepared.get("params"), dict)
+                and isinstance(
+                    prepared["params"].get(globals().get(
+                        "_CREDIT_CLEANUP_PARAM",
+                        "_maestro_credit_accounting_cleanup",
+                    )),
+                    dict,
+                )
+            )
+            released = not cleanup_required
+            if callable(credit_release):
+                released = bool(credit_release(
+                    prepared, persist_baseline=False,
+                ))
+                released = released or not cleanup_required
+                job["_credit_accounting_attempt"] = prepared.get(
+                    "_credit_accounting_attempt", 0,
+                )
+            if request_manifest is not None and released:
+                remove_request_manifest(project_dir, request_manifest)
             raise
-        prepared["_recovery_owner_digest"] = owner_digest
-        prepared["_recovery_project_digest"] = project_digest
-        prepared["_recovery_manifest_pointer"] = dict(request_manifest)
-        _jobs.publish_prepared(job_id, prepared)
     worker = worker or _run_generation
     thread = threading.Thread(
         target=worker,
@@ -2509,6 +3215,9 @@ def _queue_recovery_register_and_publish(
     try:
         thread.start()
     except Exception as error:
+        credit_release = globals().get("_credit_release_accounting")
+        if callable(credit_release):
+            credit_release(prepared, persist_baseline=True)
         restart_worker = _queue_recovery_worker(prepared)
         blocked_state = (
             "blocked_preparation" if restart_worker is None else "blocked"
@@ -4686,13 +5395,27 @@ def _restore_queue_recovery_on_startup() -> None:
     global _queue_recovery_workers_started
     if _queue_recovery_workers_started:
         return
+    credit_journal = globals().get("_credit_accounting_journal")
+    if callable(credit_journal):
+        credit_journal()
     projects = _queue_recovery_existing_projects()
+    credit_orphan_cleanup = globals().get(
+        "_credit_reconcile_unregistered_cleanup_manifests"
+    )
+    orphan_credit_manifests, credit_cleanup_blocked = (
+        credit_orphan_cleanup(
+            projects, _queue_recovery_restored.jobs.values(),
+        )
+        if callable(credit_orphan_cleanup)
+        else ({}, set())
+    )
     restored_jobs: list[dict] = []
     resumable: list[dict] = []
     director_parents: list[dict] = []
     director_preparations: list[dict] = []
     director_resumable: list[str] = []
     director_legacy_payloads = False
+    unsettled_terminal_credit = False
     for snapshot in _queue_recovery_restored.jobs.values():
         if snapshot.get("kind") == "director_pipeline":
             director_parents.append(snapshot)
@@ -4709,6 +5432,39 @@ def _restore_queue_recovery_on_startup() -> None:
             )
             continue
         job, auto_resume = _queue_recovery_materialize_job(snapshot, projects)
+        credit_hydrate = globals().get("_credit_accounting_hydrate_job")
+        if callable(credit_hydrate):
+            credit_hydrate(job)
+        credit_queue = job.get("credit_queue")
+        cleanup = (
+            job.get("params", {}).get(_CREDIT_CLEANUP_PARAM)
+            if isinstance(job.get("params"), dict)
+            else None
+        )
+        if (
+            str(job.get("status") or "").casefold()
+            in {"completed", "failed", "cancelled", "canceled"}
+            and isinstance(credit_queue, dict)
+            and credit_queue.get("schema_version") == 2
+            and credit_queue.get("reservation_state") == "reserved"
+        ):
+            credit_release = globals().get("_credit_release_accounting")
+            if not callable(credit_release) or not credit_release(
+                job, persist_baseline=True,
+            ):
+                unsettled_terminal_credit = True
+        elif (
+            isinstance(cleanup, dict)
+            and (
+                not isinstance(credit_queue, dict)
+                or credit_queue.get("schema_version") != 2
+            )
+        ):
+            credit_release = globals().get("_credit_release_accounting")
+            if not callable(credit_release) or not credit_release(
+                job, persist_baseline=True,
+            ):
+                unsettled_terminal_credit = True
         # Persist running->interrupted/blocked conversion before publication.
         if (
             job.get("status") not in {"completed", "failed", "cancelled"}
@@ -4755,18 +5511,26 @@ def _restore_queue_recovery_on_startup() -> None:
     if retire_old_preparations is not None:
         retire_old_preparations(projects)
     terminal_statuses = {"cancelled", "canceled", "completed", "failed"}
-    if director_legacy_payloads or any(
-        str(snapshot.get("status") or "").casefold() in terminal_statuses
-        and snapshot.get("kind") != "director_child"
-        for snapshot in _queue_recovery_restored.jobs.values()
+    if not unsettled_terminal_credit and (
+        director_legacy_payloads or any(
+            str(snapshot.get("status") or "").casefold() in terminal_statuses
+            and snapshot.get("kind") != "director_child"
+            for snapshot in _queue_recovery_restored.jobs.values()
+        )
     ):
         # One bounded atomic replacement retires terminal queue snapshots and
         # their old revision fences before any recovered worker starts.
         _queue_recovery_coordinator.compact()
-    live_manifests: dict[str, list[str]] = {}
+    live_manifests: dict[str, list[str]] = {
+        workspace: list(paths)
+        for workspace, paths in orphan_credit_manifests.items()
+    }
     live_staging_jobs: dict[str, list[str]] = {}
     for snapshot in _queue_recovery_restored.jobs.values():
-        if str(snapshot.get("status") or "").casefold() in terminal_statuses:
+        if (
+            str(snapshot.get("status") or "").casefold() in terminal_statuses
+            and not unsettled_terminal_credit
+        ):
             continue
         snapshot_workspace = str(snapshot.get("workspace") or "default")
         snapshot_job_id = snapshot.get("id")
@@ -4810,7 +5574,7 @@ def _restore_queue_recovery_on_startup() -> None:
     preserve_local_candidates = globals().get(
         "_preserve_local_h3_recovery_evidence"
     )
-    recovery_cleanup_blocked: set[str] = set()
+    recovery_cleanup_blocked: set[str] = set(credit_cleanup_blocked)
     if callable(preserve_local_candidates):
         for workspace, (project_dir, _project_digest) in projects.items():
             if not preserve_local_candidates(
@@ -33082,6 +33846,19 @@ def _generation_enhancement_request(body: dict, workspace: str) -> dict:
 def _start_generation_worker(job: dict, *, name_prefix: str) -> None:
     """Start the ordinary GPU worker after a durable queued transition."""
     _require_h3_offload_plan_parity(job)
+    if "credit_queue" not in job:
+        if _credit_prepare_submission(job) and isinstance(
+            job.get("credit_queue"), dict,
+        ):
+            try:
+                _queue_recovery_checkpoint(
+                    job, credit_queue=dict(job["credit_queue"]),
+                )
+            except Exception:
+                credit_release = globals().get("_credit_release_accounting")
+                if callable(credit_release):
+                    credit_release(job, persist_baseline=False)
+                raise
     thread = threading.Thread(
         target=_run_generation,
         args=(str(job.get("id") or ""),),
@@ -33091,6 +33868,9 @@ def _start_generation_worker(job: dict, *, name_prefix: str) -> None:
     try:
         thread.start()
     except Exception as error:
+        credit_release = globals().get("_credit_release_accounting")
+        if callable(credit_release):
+            credit_release(job, persist_baseline=True)
         job["_recovery_reason_code"] = "worker_start_failed"
         _queue_recovery_checkpoint(
             job,

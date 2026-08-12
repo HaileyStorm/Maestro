@@ -2213,6 +2213,218 @@ class AccountCapabilityTests(unittest.TestCase):
         )
         self.assertEqual(deny(request(set(), True)).status_code, 403)
 
+    def test_remote_owner_route_matrix_denies_before_body_or_side_effects(self):
+        route_matrix = (
+            ("PUT", "/api/v1/model-visibility"),
+            ("POST", "/api/v1/models/reload"),
+            ("POST", "/api/v1/llm/unload"),
+            ("POST", "/api/v1/queue/pause-after-output"),
+            ("POST", "/api/v1/queue/resume"),
+        )
+        expected_handlers = {
+            ("PUT", "/api/v1/model-visibility"): "update_model_visibility",
+            ("POST", "/api/v1/models/reload"): "reload_model_definitions",
+            ("POST", "/api/v1/llm/unload"): "llm_unload",
+            ("POST", "/api/v1/queue/pause-after-output"): "pause_queue_after_output",
+            ("POST", "/api/v1/queue/resume"): "resume_generation_queue",
+        }
+        module, path = self._launch_subset(
+            "_env_flag_enabled",
+            "_accounts_enabled",
+            "_account_auth_store",
+            "_attach_account_request_state",
+            "_request_has_account_capability",
+            "_request_has_recent_account_reauth",
+            "_remote_local_only_denial",
+            "_maestro_session_middleware",
+            constants=(
+                "_TRUE_ENV_VALUES",
+                "_REMOTE_LOCAL_ONLY_PREFIXES",
+                "_REMOTE_LOCAL_ONLY_EXACT",
+                "_REMOTE_OWNER_REAUTH_ALLOWED_EXACT",
+            ),
+        )
+
+        class _Request:
+            def __init__(self, scope, receive, account_session_id):
+                self.scope = scope
+                self._receive = receive
+                self.method = scope["method"]
+                self.url = types.SimpleNamespace(path=scope["path"])
+                self.client = types.SimpleNamespace(host=scope["client"][0])
+                self.cookies = {}
+                if account_session_id:
+                    self.cookies[ACCOUNT_SESSION_COOKIE_NAME] = account_session_id
+                self.state = types.SimpleNamespace()
+
+            async def json(self):
+                event = await self._receive()
+                return json.loads(event.get("body", b"{}").decode("utf-8"))
+
+        class _Response:
+            def __init__(self, body, status_code=200):
+                self.body = body
+                self.status_code = status_code
+
+        principals = {
+            "owner-fresh": {
+                "id": "owner", "role": "owner", "disabled": False,
+                "recently_reauthenticated": True,
+            },
+            "owner-stale": {
+                "id": "owner", "role": "owner", "disabled": False,
+                "recently_reauthenticated": False,
+            },
+            "user-fresh": {
+                "id": "user", "role": "user", "disabled": False,
+                "recently_reauthenticated": True,
+            },
+        }
+
+        class _Store:
+            @staticmethod
+            def resolve_session(account_session_id):
+                return principals.get(account_session_id)
+
+        async def call_next_with_no_store(request, call_next):
+            return await call_next(request)
+
+        namespace = {
+            "contextvars": contextvars,
+            "uuid": __import__("uuid"),
+            "Request": _Request,
+            "JSONResponse": _Response,
+            "SESSION_COOKIE_NAME": SESSION_COOKIE_NAME,
+            "ACCOUNT_SESSION_COOKIE_NAME": ACCOUNT_SESSION_COOKIE_NAME,
+            "AccountAuthStore": AccountAuthStore,
+            "AccountStoreCorruptError": AccountStoreCorruptError,
+            "resolve_account_capabilities": resolve_account_capabilities,
+            "os": os,
+            "_app_dir": str(APP),
+            "_account_auth_value": None,
+            "_account_auth_lock": threading.Lock(),
+            "decode_session_cookie": lambda _cookie, _secret: "b" * 32,
+            "decode_account_session_cookie": lambda cookie, _secret: cookie,
+            "_session_secret": lambda: b"route-matrix-secret",
+            "_request_is_cloudflare_remote": lambda request: (
+                request.client.host != "127.0.0.1"
+            ),
+            "_research_local_only_denial": lambda _request: None,
+            "_local_recovery_control_denial": lambda _request: None,
+            "_reject_cross_origin_mutation": lambda _request: None,
+            "_stamp_recovery_no_store_response": lambda _request, response: response,
+            "_call_next_with_recovery_no_store": call_next_with_no_store,
+            "_request_session_id": contextvars.ContextVar("matrix_session"),
+            "_request_remote": contextvars.ContextVar("matrix_remote"),
+            "_request_account_id": contextvars.ContextVar(
+                "matrix_account", default="",
+            ),
+        }
+        exec(compile(module, str(path), "exec"), namespace)
+        production_account_auth_store = namespace["_account_auth_store"]
+
+        registered_handlers = {}
+        launch_tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in launch_tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and isinstance(decorator.func.value, ast.Name)
+                    and decorator.func.value.id == "api"
+                    and decorator.func.attr in {"put", "post"}
+                    and decorator.args
+                    and isinstance(decorator.args[0], ast.Constant)
+                    and isinstance(decorator.args[0].value, str)
+                ):
+                    continue
+                registered_handlers[
+                    (decorator.func.attr.upper(), decorator.args[0].value)
+                ] = node.name
+        self.assertEqual(
+            {route: registered_handlers.get(route) for route in route_matrix},
+            expected_handlers,
+        )
+        self.assertEqual(
+            set(route_matrix), namespace["_REMOTE_OWNER_REAUTH_ALLOWED_EXACT"],
+        )
+
+        async def request(
+            method, route, account_session_id, *, remote, valid_body,
+            accounts_enabled=True,
+        ):
+            body = b'{"probe": true}' if valid_body else b"{not-json"
+            receive_count = 0
+            dispatch_count = 0
+
+            async def receive():
+                nonlocal receive_count
+                receive_count += 1
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            incoming = _Request(
+                {
+                    "method": method,
+                    "path": route,
+                    "client": (
+                        "192.0.2.10" if remote else "127.0.0.1", 42000,
+                    ),
+                },
+                receive,
+                account_session_id,
+            )
+
+            async def dispatch(actual_request):
+                nonlocal dispatch_count
+                dispatch_count += 1
+                await actual_request.json()
+                return _Response({"status": "dispatched"})
+
+            if accounts_enabled:
+                namespace["_account_auth_store"] = lambda: _Store()
+                response = await namespace["_maestro_session_middleware"](
+                    incoming, dispatch,
+                )
+            else:
+                namespace["_account_auth_store"] = production_account_auth_store
+                namespace["_account_auth_value"] = None
+                with patch.dict(os.environ, {}, clear=True):
+                    self.assertFalse(namespace["_accounts_enabled"]())
+                    response = await namespace["_maestro_session_middleware"](
+                        incoming, dispatch,
+                    )
+            return response, receive_count, dispatch_count
+
+        async def exercise():
+            for method, route in route_matrix:
+                with self.subTest(method=method, route=route, identity="owner-fresh"):
+                    response, reads, side_effects = await request(
+                        method, route, "owner-fresh", remote=True, valid_body=True,
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual((reads, side_effects), (1, 1))
+
+                for identity in ("owner-stale", "user-fresh", ""):
+                    with self.subTest(method=method, route=route, identity=identity or "anonymous"):
+                        response, reads, side_effects = await request(
+                            method, route, identity, remote=True, valid_body=False,
+                        )
+                        self.assertEqual(response.status_code, 403)
+                        self.assertEqual((reads, side_effects), (0, 0))
+
+            for method, route in route_matrix:
+                with self.subTest(method=method, route=route, identity="local-disabled"):
+                    response, reads, side_effects = await request(
+                        method, route, "", remote=False, valid_body=True,
+                        accounts_enabled=False,
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual((reads, side_effects), (1, 1))
+
+        asyncio.run(exercise())
+
     def test_access_context_truthfully_bounds_remote_owner_controls(self):
         module, path = self._launch_subset(
             "get_access_context",
