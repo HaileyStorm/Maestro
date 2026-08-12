@@ -20,6 +20,7 @@ if str(APP) not in sys.path:
 from services.account_auth import AccountAuthStore
 from services.entitlements import (
     SUPPORT_PRIORITY_IDENTITY_CONTRACTS,
+    ContributionConflict,
     ContributionEventDraft,
     ContributionLedger,
     opaque_key,
@@ -36,6 +37,7 @@ from services.support_portal import (
     ResponsibleUseStoreIntegrityError,
     SupportAuthorizationError,
     SupportPortal,
+    SupportPortalError,
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -404,6 +406,113 @@ class SupportPortalTests(unittest.TestCase):
                 remote=True,
                 target_account_id="e" * 32,
             )
+
+    def test_owner_fulfillment_transition_is_server_derived_and_idempotent(self):
+        self.add_contribution(self.user_id, "admin-fulfillment")
+        target = self.ledger.events()[0]
+        request = {
+            "remote": True,
+            "target_account_id": self.user_id,
+            "target_event_id": target.event_id,
+            "item": "one_time_credit_grant",
+            "status": "pending",
+            "idempotency_key": opaque_key(
+                "fulfillment_request", "request-1", IDENTITY_KEY,
+            ),
+            "proof_reference": opaque_key(
+                "fulfillment_proof", "proof-1", IDENTITY_KEY,
+            ),
+        }
+        projection = self.portal.transition_owner_fulfillment(
+            self.owner_session, **request,
+        )
+        self.assertEqual(
+            projection["account_support"]["recorded"]["fulfillment"][0][
+                "status"
+            ],
+            "pending",
+        )
+        before = self.ledger.events()
+        replay = self.portal.transition_owner_fulfillment(
+            self.owner_session, **request,
+        )
+        self.assertEqual(replay, projection)
+        self.assertEqual(self.ledger.events(), before)
+        event = before[-1]
+        self.assertEqual(event.provider, target.provider)
+        self.assertEqual(event.subject_key, self.subject(self.user_id))
+        self.assertEqual(event.related_event_key, target.source_event_key)
+        self.assertRegex(event.source_event_key, r"^key_[0-9a-f]{64}$")
+        self.assertRegex(event.actor_key or "", r"^key_[0-9a-f]{64}$")
+        self.assertEqual(event.contract_key, request["proof_reference"])
+        stored = self.ledger_path.read_text(encoding="utf-8")
+        self.assertNotIn("request-1", stored)
+        self.assertNotIn("proof-1", stored)
+        self.assertNotIn(self.owner_id, stored)
+        self.assertNotIn(self.user_id, json.dumps(projection))
+        with self.assertRaises(ContributionConflict):
+            self.portal.transition_owner_fulfillment(
+                self.owner_session,
+                **{**request, "status": "fulfilled"},
+            )
+
+    def test_owner_fulfillment_revalidates_authority_and_target_account(self):
+        self.add_contribution(self.user_id, "admin-fulfillment-auth")
+        target = self.ledger.events()[0]
+        request = {
+            "remote": True,
+            "target_account_id": self.user_id,
+            "target_event_id": target.event_id,
+            "item": "one_time_credit_grant",
+            "status": "pending",
+            "idempotency_key": opaque_key(
+                "fulfillment_request", "request-auth", IDENTITY_KEY,
+            ),
+            "proof_reference": None,
+        }
+        with self.assertRaises(SupportAuthorizationError):
+            self.portal.transition_owner_fulfillment(
+                self.user_session, **request,
+            )
+        self.clock.advance(91)
+        with self.assertRaises(SupportAuthorizationError):
+            self.portal.transition_owner_fulfillment(
+                self.owner_session, **request,
+            )
+        self.assertEqual(len(self.ledger.events()), 1)
+
+    def test_owner_fulfillment_rejects_malformed_or_cross_account_target(self):
+        self.add_contribution(self.other_id, "other-fulfillment")
+        other_target = self.ledger.events()[0]
+        base = {
+            "remote": True,
+            "target_account_id": self.user_id,
+            "target_event_id": other_target.event_id,
+            "item": "one_time_credit_grant",
+            "status": "pending",
+            "idempotency_key": opaque_key(
+                "fulfillment_request", "request-cross", IDENTITY_KEY,
+            ),
+            "proof_reference": None,
+        }
+        with self.assertRaises(ContributionConflict):
+            self.portal.transition_owner_fulfillment(
+                self.owner_session, **base,
+            )
+        for replacement in (
+            {"item": "Private free text"},
+            {"status": "complete"},
+            {"idempotency_key": "contains spaces"},
+            {"proof_reference": "not-an-opaque-key"},
+            {"proof_reference": {"private": "object"}},
+        ):
+            with self.subTest(replacement=replacement), self.assertRaises(
+                SupportPortalError,
+            ):
+                self.portal.transition_owner_fulfillment(
+                    self.owner_session, **{**base, **replacement},
+                )
+        self.assertEqual(len(self.ledger.events()), 1)
 
     def test_responsible_use_acceptance_is_self_bound_and_restart_durable(self):
         before = self.portal.self_projection(

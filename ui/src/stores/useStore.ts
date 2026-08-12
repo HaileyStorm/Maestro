@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { StoreApi } from 'zustand'
-import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportPublicProjection, SupportSelfProjection } from '../types'
+import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportPublicProjection, SupportSelfProjection } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
@@ -2408,6 +2408,10 @@ interface AppState {
   loadResponsibleUse: () => Promise<ResponsibleUseProjection | null>
   acceptResponsibleUse: (documentVersion: number, contentSha256: string) => Promise<void>
   loadSupportAdmin: (accountId: string) => Promise<SupportAdminProjection>
+  transitionSupportFulfillment: (
+    accountId: string,
+    input: SupportFulfillmentMutationInput,
+  ) => Promise<SupportAdminProjection>
   clearSupportAdmin: () => void
   systemConfig: SystemConfig | null
   systemConfigLoading: boolean
@@ -8463,6 +8467,69 @@ export const useStore = create<AppState>((set, get) => ({
           supportAdmin: null,
           supportDetailsLoading: false,
         })
+      }
+      throw error
+    }
+  },
+  transitionSupportFulfillment: async (accountId, input) => {
+    const invocationSequence = ++_supportAdminRequestSequence
+    try {
+      await get().loadAccountContext()
+    } catch {
+      if (invocationSequence === _supportAdminRequestSequence) {
+        _supportAdminRequestSequence += 1
+        set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
+      }
+      throw new Error('Recent owner access could not be confirmed for fulfillment follow-up.')
+    }
+    if (invocationSequence !== _supportAdminRequestSequence) {
+      throw new Error('Support account selection changed before fulfillment follow-up was confirmed.')
+    }
+    const context = get().accountContext
+    const eligible = context?.authenticated === true
+      && context.account?.role === 'owner'
+      && context.reauthenticated === true
+      && context.capabilities.includes('account.self')
+      && context.capabilities.includes('accounts.admin')
+      && context.capabilities.includes('services.admin')
+      && get().accountDrawerOpen
+      && get().accountUsers.some(account => account.id === accountId)
+      && get().supportAdminAccountId === accountId
+      && get().supportAdmin !== null
+    if (!eligible) {
+      _supportAdminRequestSequence += 1
+      set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
+      throw new Error('Choose a server-returned account after confirming owner access.')
+    }
+    try {
+      const projection = await api.transitionAdminAccountFulfillment(accountId, input)
+      const current = get()
+      const stillEligible = invocationSequence === _supportAdminRequestSequence
+        && current.supportAdminAccountId === accountId
+        && current.accountContext?.authenticated === true
+        && current.accountContext.account?.role === 'owner'
+        && current.accountContext.reauthenticated === true
+        && current.accountContext.capabilities.includes('account.self')
+        && current.accountContext.capabilities.includes('accounts.admin')
+        && current.accountContext.capabilities.includes('services.admin')
+        && current.accountDrawerOpen
+        && current.accountUsers.some(account => account.id === accountId)
+      if (!stillEligible) {
+        throw new Error('Owner access or Support selection changed while fulfillment follow-up was saving.')
+      }
+      set({ supportAdmin: projection, supportDetailsLoading: false })
+      return projection
+    } catch (error) {
+      if (invocationSequence === _supportAdminRequestSequence) {
+        const accountError = error instanceof api.AccountApiError ? error : null
+        if (accountError && (accountError.status === 401 || accountError.status === 403)) {
+          _supportAdminRequestSequence += 1
+          set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
+        } else if (accountError?.status === 409) {
+          await get().loadSupportAdmin(accountId).catch(() => {
+            set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
+          })
+        }
       }
       throw error
     }

@@ -2,7 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Check, ExternalLink, HeartHandshake, Loader2, ShieldCheck } from 'lucide-react'
 import { AccountApiError } from '../../api/client'
 import { useStore } from '../../stores/useStore'
-import type { SupportAccountSummary, SupportAdminAudit, SupportAdminEventKind } from '../../types'
+import type {
+  SupportAccountSummary,
+  SupportAdminAudit,
+  SupportAdminEventKind,
+  SupportFulfillmentMutationInput,
+  SupportFulfillmentStatus,
+} from '../../types'
 import {
   affectedPriorityNotice,
   availableSupportProviders,
@@ -21,6 +27,16 @@ function adminSupportErrorMessage(error: unknown): string {
     return `Private support audit could not be refreshed. Try again in about ${error.retryAfter} seconds.`
   }
   return 'Private support audit could not be refreshed. Confirm recent owner access and try again.'
+}
+
+function fulfillmentErrorMessage(error: unknown): string {
+  if (error instanceof AccountApiError) {
+    if (error.status === 409) return 'Fulfillment changed on the server. The private audit was refreshed; review it and choose again.'
+    if (error.status === 401 || error.status === 403) return 'Recent owner access is required before fulfillment can be recorded.'
+    if (error.status === 404) return 'That fulfillment target is no longer available. Refresh the account audit and choose again.'
+    if (error.retryAfter > 0) return `Fulfillment could not be recorded. Retry in about ${error.retryAfter} seconds.`
+  }
+  return 'Fulfillment could not be recorded. Review the current audit and try again.'
 }
 
 const allowanceSourceLabels = {
@@ -45,6 +61,30 @@ const allowanceRefundLabels = {
 } as const
 
 const PRIVATE_SUPPORT_AUDIT_DISPLAY_TTL_MS = 4 * 60 * 1000
+const OPAQUE_SUPPORT_REFERENCE = /^key_[0-9a-f]{64}$/
+const FULFILLMENT_ITEM = /^[a-z][a-z0-9_]{1,63}$/
+
+const fulfillmentStatusLabels: Record<SupportFulfillmentStatus, string> = {
+  pending: 'Pending',
+  in_progress: 'In progress',
+  fulfilled: 'Fulfilled',
+  declined: 'Declined',
+  reversed: 'Reversed',
+}
+
+const nextFulfillmentStatuses: Record<SupportFulfillmentStatus, SupportFulfillmentStatus[]> = {
+  pending: ['in_progress', 'fulfilled', 'declined'],
+  in_progress: ['fulfilled', 'declined'],
+  fulfilled: ['reversed'],
+  declined: [],
+  reversed: [],
+}
+
+function fulfillmentIdempotencyKey(): string {
+  const bytes = new Uint8Array(32)
+  globalThis.crypto.getRandomValues(bytes)
+  return `key_${Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('')}`
+}
 
 function allowanceUnits(value: number, unit: string): string {
   const label = unit === 'compute_seconds'
@@ -86,22 +126,114 @@ function minorUnits(value: number, currency: string): string {
   return `${value.toLocaleString()} ${currency} minor unit${value === 1 ? '' : 's'}`
 }
 
-function AdminSupportAudit({ audit }: { audit: SupportAdminAudit }) {
+function AdminSupportAudit({
+  audit,
+  onTransition,
+}: {
+  audit: SupportAdminAudit
+  onTransition: (input: SupportFulfillmentMutationInput) => Promise<void>
+}) {
+  const [fulfillmentLimit, setFulfillmentLimit] = useState(20)
+  const [fundingEventLimit, setFundingEventLimit] = useState(40)
+  const [proofByTask, setProofByTask] = useState<Record<string, string>>({})
+  const [newTarget, setNewTarget] = useState('')
+  const [newItem, setNewItem] = useState('')
+  const [newProof, setNewProof] = useState('')
+  const [busyKey, setBusyKey] = useState<string | null>(null)
+  const [transitionNotice, setTransitionNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
+  const retryRef = useRef<{ fingerprint: string; idempotencyKey: string } | null>(null)
   const totals = Object.entries(audit.currency_totals_minor)
   const visibleEvents = audit.events.slice(-40).reverse()
   const hiddenEventCount = audit.events.length - visibleEvents.length
   const visibleDiscrepancies = audit.discrepancies.slice(0, 20)
   const hiddenDiscrepancyCount = audit.discrepancies.length - visibleDiscrepancies.length
-  const visibleFulfillment = audit.fulfillment.slice(0, 20)
+  const fulfillmentByActionability = [...audit.fulfillment].sort((left, right) => {
+    const leftActionable = nextFulfillmentStatuses[left.status].length > 0 ? 0 : 1
+    const rightActionable = nextFulfillmentStatuses[right.status].length > 0 ? 0 : 1
+    return leftActionable - rightActionable || right.changed_at.localeCompare(left.changed_at)
+  })
+  const visibleFulfillment = fulfillmentByActionability.slice(0, fulfillmentLimit)
   const hiddenFulfillmentCount = audit.fulfillment.length - visibleFulfillment.length
+  const fundingEvents = audit.events.filter(event => (
+    event.kind === 'one_time_contribution'
+    || event.kind === 'recurring_started'
+    || event.kind === 'recurring_renewed'
+  )).reverse()
+  const visibleFundingEvents = fundingEvents.slice(0, fundingEventLimit)
+
+  const recordTransition = async (
+    targetEventId: string,
+    item: string,
+    status: SupportFulfillmentStatus,
+    proofReference: string,
+    taskKey: string,
+  ) => {
+    if (busyKey !== null) return
+    const normalizedItem = item.trim()
+    const normalizedProof = proofReference.trim()
+    if (!FULFILLMENT_ITEM.test(normalizedItem)) {
+      setTransitionNotice({ kind: 'error', text: 'Use a 2–64 character lowercase fulfillment item key.' })
+      return
+    }
+    if (normalizedProof !== '' && !OPAQUE_SUPPORT_REFERENCE.test(normalizedProof)) {
+      setTransitionNotice({ kind: 'error', text: 'Proof must be an opaque key_ reference or left blank.' })
+      return
+    }
+    const fingerprint = JSON.stringify([targetEventId, normalizedItem, status, normalizedProof])
+    const idempotencyKey = retryRef.current?.fingerprint === fingerprint
+      ? retryRef.current.idempotencyKey
+      : fulfillmentIdempotencyKey()
+    retryRef.current = { fingerprint, idempotencyKey }
+    setBusyKey(taskKey)
+    setTransitionNotice(null)
+    try {
+      await onTransition({
+        target_event_id: targetEventId,
+        item: normalizedItem,
+        status,
+        idempotency_key: idempotencyKey,
+        proof_reference: normalizedProof || null,
+      })
+      retryRef.current = null
+      setTransitionNotice({
+        kind: 'success',
+        text: `${fulfillmentStatusLabels[status]} was recorded. This is an audit update only; benefits remain not enforced.`,
+      })
+      if (taskKey === 'new') {
+        setNewItem('')
+        setNewProof('')
+      }
+    } catch (error) {
+      if (
+        error instanceof AccountApiError
+        && [400, 401, 403, 404, 409].includes(error.status)
+      ) retryRef.current = null
+      setTransitionNotice({ kind: 'error', text: fulfillmentErrorMessage(error) })
+    } finally {
+      setBusyKey(null)
+    }
+  }
+
   return (
     <section aria-labelledby="private-support-audit-heading" className="rounded-xl border border-border bg-bg-primary/30 p-3">
       <h4 id="private-support-audit-heading" className="text-[11px] font-semibold text-text-primary">
         Private contribution and fulfillment audit
       </h4>
       <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-        Read-only records shown after recent owner confirmation. State is recorded_not_enforced: this view does not process payments, activate providers, or enforce benefits.
+        Private records and owner fulfillment controls shown after recent owner confirmation. State is recorded_not_enforced: updates record follow-up only and do not process payments, activate providers, or enforce benefits.
       </p>
+      {transitionNotice && (
+        <p
+          className={`mt-2 rounded-md border px-2 py-2 text-[9px] leading-relaxed ${
+            transitionNotice.kind === 'error'
+              ? 'border-chip-red/50 bg-chip-red/10 text-chip-red'
+              : 'border-indicator-success/50 bg-indicator-success/10 text-indicator-success'
+          }`}
+          role={transitionNotice.kind === 'error' ? 'alert' : 'status'}
+        >
+          {transitionNotice.text}
+        </p>
+      )}
       {audit.incomplete && (
         <p className="mt-2 rounded-md border border-indicator-warning/40 bg-indicator-warning/5 px-2 py-1 text-[9px] leading-relaxed text-text-secondary" role="status">
           Some audit data was unavailable or invalid and was not displayed. Empty sections below are not proof that no records exist.
@@ -195,7 +327,7 @@ function AdminSupportAudit({ audit }: { audit: SupportAdminAudit }) {
             {visibleFulfillment.map(row => (
               <li key={row.audit_event_id} className="rounded-md border border-border/70 bg-bg-tertiary/20 p-2 text-[9px] leading-relaxed text-text-secondary">
                 <span className="font-semibold text-text-primary">{auditLabel(row.item)}</span>
-                {' · '}{auditLabel(row.status)}
+                {' · '}{fulfillmentStatusLabels[row.status]}
                 {' · '}<time dateTime={row.changed_at}>{allowanceDate(row.changed_at)} UTC</time>
                 <details className="mt-1 text-text-muted">
                   <summary className="cursor-pointer select-none">Opaque fulfillment references</summary>
@@ -203,8 +335,56 @@ function AdminSupportAudit({ audit }: { audit: SupportAdminAudit }) {
                     <p>Audit event: {row.audit_event_id}</p>
                     {row.target_event_id && <p>Target event: {row.target_event_id}</p>}
                     <p>Actor: {row.actor_reference}</p>
+                    {row.proof_reference && <p>Proof: {row.proof_reference}</p>}
                   </div>
                 </details>
+                {row.target_event_id && nextFulfillmentStatuses[row.status].length > 0 && (
+                  <details className="mt-2 rounded-md border border-border/70 bg-bg-primary/30 px-2 text-text-muted">
+                    <summary className="flex min-h-11 cursor-pointer select-none items-center font-medium text-text-secondary">
+                      Record next status
+                    </summary>
+                    <label className="block pb-2">
+                      <span>Optional opaque proof reference</span>
+                      <input
+                        type="text"
+                        value={proofByTask[`${row.target_event_id}:${row.item}`] || ''}
+                        onChange={event => setProofByTask(previous => ({
+                          ...previous,
+                          [`${row.target_event_id}:${row.item}`]: event.target.value,
+                        }))}
+                        placeholder="key_…"
+                        autoComplete="off"
+                        spellCheck={false}
+                        className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 font-mono text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
+                      />
+                    </label>
+                    <div className="grid grid-cols-1 gap-2 pb-2 sm:grid-cols-2">
+                      {nextFulfillmentStatuses[row.status].map(status => {
+                        const taskKey = `${row.target_event_id}:${row.item}`
+                        return (
+                          <button
+                            key={status}
+                            type="button"
+                            disabled={busyKey !== null}
+                            onClick={() => void recordTransition(
+                              row.target_event_id || '',
+                              row.item,
+                              status,
+                              proofByTask[taskKey] || '',
+                              taskKey,
+                            )}
+                            className="min-h-11 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-[10px] font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-50"
+                          >
+                            {busyKey === taskKey ? 'Recording…' : `Mark ${fulfillmentStatusLabels[status].toLowerCase()}`}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </details>
+                )}
+                {nextFulfillmentStatuses[row.status].length === 0 && (
+                  <p className="mt-1 text-text-muted">This recorded status is terminal.</p>
+                )}
               </li>
             ))}
           </ul>
@@ -214,7 +394,86 @@ function AdminSupportAudit({ audit }: { audit: SupportAdminAudit }) {
           </p>
         )}
         {hiddenFulfillmentCount > 0 && (
-          <p className="mt-1 text-[9px] text-text-muted">{hiddenFulfillmentCount.toLocaleString()} additional fulfillment rows are hidden.</p>
+          <button
+            type="button"
+            onClick={() => setFulfillmentLimit(limit => limit + 20)}
+            className="mt-2 min-h-11 w-full rounded-md border border-border px-3 py-2 text-[9px] font-medium text-text-secondary hover:bg-bg-hover"
+          >
+            Show 20 more fulfillment rows ({hiddenFulfillmentCount.toLocaleString()} remaining)
+          </button>
+        )}
+        {fundingEvents.length > 0 && (
+          <details className="mt-2 rounded-md border border-border/70 bg-bg-primary/30 px-2 text-[9px] text-text-muted">
+            <summary className="flex min-h-11 cursor-pointer select-none items-center font-medium text-text-secondary">
+              Start a pending follow-up
+            </summary>
+            <div className="space-y-2 pb-2">
+              <label className="block">
+                <span>Contribution event</span>
+                <select
+                  value={newTarget || fundingEvents[0]?.event_id || ''}
+                  onChange={event => setNewTarget(event.target.value)}
+                  className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
+                >
+                  {visibleFundingEvents.map(event => (
+                    <option key={event.event_id} value={event.event_id}>
+                      {auditEventLabels[event.kind]} · {auditLabel(event.provider)} · sequence {event.sequence}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span>Fulfillment item key</span>
+                <input
+                  type="text"
+                  value={newItem}
+                  onChange={event => setNewItem(event.target.value)}
+                  placeholder="one_time_credit_grant"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 font-mono text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
+                />
+              </label>
+              <label className="block">
+                <span>Optional opaque proof reference</span>
+                <input
+                  type="text"
+                  value={newProof}
+                  onChange={event => setNewProof(event.target.value)}
+                  placeholder="key_…"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 font-mono text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
+                />
+              </label>
+              <button
+                type="button"
+                disabled={busyKey !== null}
+                onClick={() => void recordTransition(
+                  newTarget || fundingEvents[0]?.event_id || '',
+                  newItem,
+                  'pending',
+                  newProof,
+                  'new',
+                )}
+                className="min-h-11 w-full rounded-md bg-accent-blue px-3 py-2 text-[10px] font-semibold text-white hover:opacity-90 disabled:opacity-50"
+              >
+                {busyKey === 'new' ? 'Recording…' : 'Record pending follow-up'}
+              </button>
+              <p className="leading-relaxed">
+                This appends an audited operational state only. It does not grant credit, enforce a benefit, contact a provider, or process a payment.
+              </p>
+              {visibleFundingEvents.length < fundingEvents.length && (
+                <button
+                  type="button"
+                  onClick={() => setFundingEventLimit(limit => limit + 40)}
+                  className="min-h-11 w-full rounded-md border border-border px-3 py-2 font-medium text-text-secondary hover:bg-bg-hover"
+                >
+                  Show 40 more contribution events ({(fundingEvents.length - visibleFundingEvents.length).toLocaleString()} remaining)
+                </button>
+              )}
+            </div>
+          </details>
         )}
       </section>
     </section>
@@ -305,6 +564,7 @@ export function SupportPanel() {
   const loadResponsibleUse = useStore(state => state.loadResponsibleUse)
   const acceptNotice = useStore(state => state.acceptResponsibleUse)
   const loadAdmin = useStore(state => state.loadSupportAdmin)
+  const transitionFulfillment = useStore(state => state.transitionSupportFulfillment)
   const clearAdmin = useStore(state => state.clearSupportAdmin)
   const [selectedUserIndex, setSelectedUserIndex] = useState('')
   const adminSelectionEpochRef = useRef(0)
@@ -424,6 +684,13 @@ export function SupportPanel() {
         setNotice({ kind: 'error', text: adminSupportErrorMessage(error) })
       }
     }
+  }
+
+  const recordFulfillment = async (input: SupportFulfillmentMutationInput) => {
+    if (!ownerSupport || adminAccountId === null || adminAccountId !== selectedAdminAccountId) {
+      throw new Error('Owner access or Support selection changed.')
+    }
+    await transitionFulfillment(adminAccountId, input)
   }
 
   return (
@@ -569,7 +836,7 @@ export function SupportPanel() {
             && (
             <div className="mt-3 space-y-2">
               <RecordedSupport summary={admin.account} />
-              <AdminSupportAudit audit={admin.audit} />
+              <AdminSupportAudit audit={admin.audit} onTransition={recordFulfillment} />
               {adminPriorityNotice && (
                 <p className="rounded-lg border border-indicator-warning/40 bg-indicator-warning/5 px-3 py-2 text-[10px] leading-relaxed text-text-secondary">
                   {adminPriorityNotice}

@@ -27,6 +27,7 @@ if str(APP) not in sys.path:
 from fastapi import HTTPException
 from services.account_auth import AccountAuthError, AccountAuthStore
 from services.entitlements import (
+    ContributionConflict,
     ContributionLedger,
     EntitlementError,
     LedgerIntegrityError,
@@ -146,6 +147,31 @@ class _Portal:
             },
         }
 
+    def transition_owner_fulfillment(
+        self,
+        session_id,
+        *,
+        remote,
+        target_account_id,
+        target_event_id,
+        item,
+        status,
+        idempotency_key,
+        proof_reference,
+    ):
+        self.calls.append((
+            "fulfillment", session_id, remote, target_account_id,
+            target_event_id, item, status, idempotency_key, proof_reference,
+        ))
+        return {
+            "account_support": {
+                "recorded": {
+                    "subject_key": "key_" + "f" * 64,
+                    "fulfillment": [{"status": status}],
+                },
+            },
+        }
+
 
 class SupportPortalRouteTests(unittest.TestCase):
     @staticmethod
@@ -158,6 +184,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "get_account_responsible_use",
             "accept_account_responsible_use",
             "get_admin_account_support",
+            "transition_admin_account_fulfillment",
         )
         module, path = _launch_nodes(*names)
         namespace = {
@@ -186,6 +213,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "get_account_responsible_use",
             "accept_account_responsible_use",
             "get_admin_account_support",
+            "transition_admin_account_fulfillment",
         )
         module, path = _launch_nodes(*names, decorators=True)
 
@@ -223,6 +251,11 @@ class SupportPortalRouteTests(unittest.TestCase):
                 "GET", "/api/v1/support/admin/accounts/{account_id}",
                 "get_admin_account_support",
             ),
+            (
+                "POST",
+                "/api/v1/support/admin/accounts/{account_id}/fulfillment",
+                "transition_admin_account_fulfillment",
+            ),
         })
 
     def test_route_envelopes_use_only_live_account_session_and_preserve_browser(self):
@@ -241,6 +274,18 @@ class SupportPortalRouteTests(unittest.TestCase):
             namespace["accept_account_responsible_use"](request)
         )
         admin = namespace["get_admin_account_support"]("2" * 32, request)
+        request._body = {
+            "target_event_id": "evt_" + "3" * 32,
+            "item": "one_time_credit_grant",
+            "status": "pending",
+            "idempotency_key": "key_" + "9" * 64,
+            "proof_reference": None,
+        }
+        fulfillment = asyncio.run(
+            namespace["transition_admin_account_fulfillment"](
+                "2" * 32, request,
+            )
+        )
 
         self.assertEqual(catalog["provider_catalog"]["providers"][0]["state"], "disabled")
         self.assertEqual(self_projection["account_support"]["recorded"]["event_count"], 0)
@@ -250,6 +295,12 @@ class SupportPortalRouteTests(unittest.TestCase):
             admin["account_support"]["recorded"]["subject_key"],
             r"^key_[0-9a-f]{64}$",
         )
+        self.assertEqual(
+            fulfillment["account_support"]["recorded"]["fulfillment"][0][
+                "status"
+            ],
+            "pending",
+        )
         self.assertEqual(request.state.maestro_session_id, browser_session)
         self.assertEqual(portal.calls, [
             ("catalog",),
@@ -257,7 +308,35 @@ class SupportPortalRouteTests(unittest.TestCase):
             ("self", "a" * 32, True),
             ("accept", "a" * 32, True, 1, "d" * 64),
             ("admin", "a" * 32, True, "2" * 32),
+            (
+                "fulfillment", "a" * 32, True, "2" * 32,
+                "evt_" + "3" * 32, "one_time_credit_grant", "pending",
+                "key_" + "9" * 64, None,
+            ),
         ])
+
+    def test_fulfillment_body_is_exact_and_rejects_client_derived_fields(self):
+        portal = _Portal()
+        namespace = self._route_namespace(portal)
+        valid = {
+            "target_event_id": "evt_" + "3" * 32,
+            "item": "one_time_credit_grant",
+            "status": "pending",
+            "idempotency_key": "key_" + "9" * 64,
+            "proof_reference": None,
+        }
+        for body in (
+            {key: value for key, value in valid.items() if key != "proof_reference"},
+            {**valid, "provider": "client_provider"},
+            {**valid, "actor_key": "key_" + "f" * 64},
+            {**valid, "notes": "private text"},
+        ):
+            with self.subTest(body=body), self.assertRaises(HTTPException) as raised:
+                asyncio.run(namespace["transition_admin_account_fulfillment"](
+                    "2" * 32, _Request(body),
+                ))
+            self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(portal.calls, [])
 
     def test_acceptance_body_is_exact_and_rejects_client_subjects(self):
         portal = _Portal()
@@ -309,6 +388,16 @@ class SupportPortalRouteTests(unittest.TestCase):
         self.assertEqual(request.json_calls, 0)
         request.headers = {"origin": "https://maestro.example"}
         self.assertIsNone(reject(request))
+
+        fulfillment_request = _Request({"notes": "must-not-be-read"})
+        fulfillment_request.method = "POST"
+        fulfillment_request.url.path = (
+            "/api/v1/support/admin/accounts/" + "1" * 32 + "/fulfillment"
+        )
+        fulfillment_request.headers = {"origin": "https://evil.example"}
+        fulfillment_denial = reject(fulfillment_request)
+        self.assertEqual(fulfillment_denial.status_code, 403)
+        self.assertEqual(fulfillment_request.json_calls, 0)
 
         account_request = _Request()
         account_request.method = "POST"
@@ -407,6 +496,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "HTTPException": HTTPException,
             "AccountAuthError": AccountAuthError,
             "EntitlementError": EntitlementError,
+            "ContributionConflict": ContributionConflict,
             "LedgerIntegrityError": LedgerIntegrityError,
             "ResponsibleUseError": ResponsibleUseError,
             "StaleResponsibleUseNoticeError": StaleResponsibleUseNoticeError,
@@ -421,8 +511,10 @@ class SupportPortalRouteTests(unittest.TestCase):
             (SupportAuthorizationError("Recent owner authentication is required"), 403),
             (StaleResponsibleUseNoticeError("private notice detail"), 409),
             (ResponsibleUseStoreIntegrityError("/private/store/path"), 503),
+            (OSError("/private/store/path"), 503),
             (SupportCatalogError("private@example.test?token=secret"), 503),
             (SupportPortalError("private malformed value"), 400),
+            (ContributionConflict("private conflict detail"), 409),
         )
         for error, status in cases:
             with self.subTest(error=type(error).__name__), self.assertRaises(
@@ -538,6 +630,7 @@ class SupportPortalRouteTests(unittest.TestCase):
                 "ResponsibleUseAcceptanceStore": forbidden,
                 "HTTPException": HTTPException,
                 "AccountAuthError": AccountAuthError,
+                "ContributionConflict": ContributionConflict,
                 "EntitlementError": EntitlementError,
                 "LedgerIntegrityError": LedgerIntegrityError,
                 "ResponsibleUseError": ResponsibleUseError,

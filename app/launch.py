@@ -193,6 +193,7 @@ from services.account_auth import (
     resolve_account_capabilities,
 )
 from services.entitlements import (
+    ContributionConflict,
     ContributionLedger,
     EntitlementError,
     LedgerIntegrityError,
@@ -18704,7 +18705,9 @@ def _raise_support_http_error(error: Exception) -> None:
                 "message": "Review the current responsible-use notice.",
             },
         ) from error
-    if isinstance(error, (ResponsibleUseStoreIntegrityError, LedgerIntegrityError)):
+    if isinstance(error, (
+        ResponsibleUseStoreIntegrityError, LedgerIntegrityError, OSError,
+    )):
         raise HTTPException(
             status_code=503,
             detail={
@@ -18718,6 +18721,14 @@ def _raise_support_http_error(error: Exception) -> None:
             detail={
                 "code": "invalid_responsible_use_acceptance",
                 "message": "Responsible-use acceptance is invalid.",
+            },
+        ) from error
+    if isinstance(error, ContributionConflict):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "fulfillment_transition_conflict",
+                "message": "Fulfillment state changed; refresh and try again.",
             },
         ) from error
     if isinstance(error, (SupportCatalogError, EntitlementError)):
@@ -18824,6 +18835,40 @@ def get_admin_account_support(account_id: str, request: Request):
             target_account_id=account_id,
         )
     except (AccountAuthError, EntitlementError, ResponsibleUseError,
+            SupportCatalogError, SupportPortalError) as error:
+        _raise_support_http_error(error)
+
+
+@api.post("/api/v1/support/admin/accounts/{account_id}/fulfillment")
+async def transition_admin_account_fulfillment(
+    account_id: str,
+    request: Request,
+):
+    portal = _require_support_portal(request)
+    actor_session_id, remote = _support_request_context(request)
+    body = await _account_request_body(request)
+    expected = {
+        "target_event_id", "item", "status", "idempotency_key",
+        "proof_reference",
+    }
+    if set(body) != expected:
+        raise HTTPException(
+            status_code=400,
+            detail="Expected fulfillment transition fields only",
+        )
+    try:
+        return await asyncio.to_thread(
+            portal.transition_owner_fulfillment,
+            actor_session_id,
+            remote=remote,
+            target_account_id=account_id,
+            target_event_id=body["target_event_id"],
+            item=body["item"],
+            status=body["status"],
+            idempotency_key=body["idempotency_key"],
+            proof_reference=body["proof_reference"],
+        )
+    except (AccountAuthError, EntitlementError, OSError, ResponsibleUseError,
             SupportCatalogError, SupportPortalError) as error:
         _raise_support_http_error(error)
 

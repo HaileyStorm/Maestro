@@ -42,6 +42,7 @@ import type {
   ResponsibleUseProjection,
   ResponsibleUseStatus,
   SupportAccountSummary,
+  SupportFulfillmentMutationInput,
   SupportAdminProjection,
   SupportPublicProjection,
   SupportSelfProjection,
@@ -1288,7 +1289,14 @@ const SUPPORT_FUNDING_EVENT_KINDS = new Set(['one_time_contribution', 'recurring
 const SUPPORT_ADJUSTMENT_EVENT_KINDS = new Set(['refund', 'chargeback'])
 const SUPPORT_RECURRING_EVENT_KINDS = new Set(['recurring_started', 'recurring_renewed', 'recurring_canceled'])
 const SUPPORT_ACCOUNT_LINK_EVENT_KINDS = new Set(['account_link_verified', 'account_link_revoked'])
-const SUPPORT_FULFILLMENT_STATUSES = new Set(['pending', 'complete', 'declined'])
+const SUPPORT_FULFILLMENT_STATUSES = new Set([
+  'pending',
+  'in_progress',
+  'fulfilled',
+  'declined',
+  'reversed',
+  'complete',
+])
 const SUPPORT_DISCREPANCY_REASONS = new Set([
   'unresolved_or_mismatched_adjustment',
   'adjustments_exceed_contribution',
@@ -1317,6 +1325,11 @@ function safeSupportAuditTimestamp(value: unknown): string | null {
   return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().replace('.000Z', 'Z') === value
     ? value
     : null
+}
+
+function supportFulfillmentStatus(value: unknown): SupportAdminProjection['audit']['fulfillment'][number]['status'] | undefined {
+  if (typeof value !== 'string' || !SUPPORT_FULFILLMENT_STATUSES.has(value)) return undefined
+  return value === 'complete' ? 'fulfilled' : value as SupportAdminProjection['audit']['fulfillment'][number]['status']
 }
 
 function supportAdminEventContractIsValid(input: {
@@ -1388,9 +1401,7 @@ function supportAdminAudit(recorded: Record<string, unknown>): SupportAdminProje
         : undefined
     const fulfillmentStatus = event.fulfillment_status === null
       ? null
-      : typeof event.fulfillment_status === 'string' && SUPPORT_FULFILLMENT_STATUSES.has(event.fulfillment_status)
-        ? event.fulfillment_status
-        : undefined
+      : supportFulfillmentStatus(event.fulfillment_status)
     const amount = safeAllowanceNumber(event.amount_minor)
     const kind = typeof event.kind === 'string' && SUPPORT_ADMIN_EVENT_KINDS.has(event.kind)
       ? event.kind
@@ -1456,15 +1467,19 @@ function supportAdminAudit(recorded: Record<string, unknown>): SupportAdminProje
     const targetEventId = row.target_event_id === null ? null : safeSupportEventId(row.target_event_id)
     const auditEventId = safeSupportEventId(row.audit_event_id)
     const actorReference = safeOpaqueSupportReference(row.actor_key)
+    const status = supportFulfillmentStatus(row.status)
+    const proofReference = row.proof_reference === undefined || row.proof_reference === null
+      ? null
+      : safeOpaqueSupportReference(row.proof_reference)
     const changedAt = safeSupportAuditTimestamp(row.changed_at)
     if (
       (row.target_event_id !== null && targetEventId === null)
       || typeof row.item !== 'string'
       || !/^[a-z][a-z0-9_]{1,63}$/.test(row.item)
-      || typeof row.status !== 'string'
-      || !SUPPORT_FULFILLMENT_STATUSES.has(row.status)
+      || status === undefined
       || auditEventId === null
       || actorReference === null
+      || (row.proof_reference !== undefined && row.proof_reference !== null && proofReference === null)
       || changedAt === null
     ) {
       incomplete = true
@@ -1473,9 +1488,10 @@ function supportAdminAudit(recorded: Record<string, unknown>): SupportAdminProje
     return [{
       target_event_id: targetEventId,
       item: row.item,
-      status: row.status as SupportAdminProjection['audit']['fulfillment'][number]['status'],
+      status,
       audit_event_id: auditEventId,
       actor_reference: actorReference,
+      proof_reference: proofReference,
       changed_at: changedAt,
     }]
   }) : []
@@ -1627,6 +1643,14 @@ export async function fetchAdminAccountSupport(accountId: string): Promise<Suppo
     responsible_use: ResponsibleUseStatus
     support_priority: SupportAdminProjection['support_priority']
   }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}`)
+  return supportAdminProjection(raw)
+}
+
+function supportAdminProjection(raw: {
+  account_support?: RawSupportAccountProjection
+  responsible_use: ResponsibleUseStatus
+  support_priority: SupportAdminProjection['support_priority']
+}): SupportAdminProjection {
   const recorded = raw.account_support?.recorded || {}
   return {
     account: supportAccountSummary(raw.account_support),
@@ -1634,6 +1658,21 @@ export async function fetchAdminAccountSupport(accountId: string): Promise<Suppo
     responsible_use: raw.responsible_use,
     support_priority: raw.support_priority,
   }
+}
+
+export async function transitionAdminAccountFulfillment(
+  accountId: string,
+  input: SupportFulfillmentMutationInput,
+): Promise<SupportAdminProjection> {
+  const raw = await accountRequest<{
+    account_support?: RawSupportAccountProjection
+    responsible_use: ResponsibleUseStatus
+    support_priority: SupportAdminProjection['support_priority']
+  }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}/fulfillment`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  return supportAdminProjection(raw)
 }
 
 export interface Workspace {

@@ -56,7 +56,19 @@ ADJUSTMENT_KINDS = frozenset({"refund", "chargeback"})
 RECURRING_KINDS = frozenset({
     "recurring_started", "recurring_renewed", "recurring_canceled",
 })
-FULFILLMENT_STATES = frozenset({"pending", "complete", "declined"})
+FULFILLMENT_STATES = frozenset({
+    "pending", "in_progress", "fulfilled", "declined", "reversed",
+})
+LEGACY_FULFILLMENT_STATES = frozenset({"complete"})
+_FULFILLMENT_TRANSITIONS = MappingProxyType({
+    None: frozenset({"pending"}),
+    "pending": frozenset({"in_progress", "fulfilled", "declined"}),
+    "in_progress": frozenset({"fulfilled", "declined"}),
+    "fulfilled": frozenset({"reversed"}),
+    "complete": frozenset({"reversed"}),
+    "declined": frozenset(),
+    "reversed": frozenset(),
+})
 ACCOUNT_LINK_KINDS = frozenset({
     "account_link_verified", "account_link_revoked",
 })
@@ -74,6 +86,10 @@ class LedgerIntegrityError(EntitlementError):
 
 
 class ContributionConflict(EntitlementError):
+    pass
+
+
+class FulfillmentTransitionConflict(ContributionConflict):
     pass
 
 
@@ -420,7 +436,11 @@ def _validate_opaque(value: str | None, *, name: str, required: bool) -> None:
         raise EntitlementError(f"{name} must be an opaque key")
 
 
-def _normalize_draft(draft: ContributionEventDraft) -> dict[str, Any]:
+def _normalize_draft(
+    draft: ContributionEventDraft,
+    *,
+    allow_legacy_fulfillment: bool = False,
+) -> dict[str, Any]:
     if not isinstance(draft, ContributionEventDraft):
         raise EntitlementError("contribution event must use the frozen draft schema")
     if (
@@ -472,7 +492,13 @@ def _normalize_draft(draft: ContributionEventDraft) -> dict[str, Any]:
         if (
             not isinstance(draft.fulfillment_item, str)
             or _ITEM_RE.fullmatch(draft.fulfillment_item) is None
-            or draft.fulfillment_status not in FULFILLMENT_STATES
+            or (
+                draft.fulfillment_status not in FULFILLMENT_STATES
+                and not (
+                    allow_legacy_fulfillment
+                    and draft.fulfillment_status in LEGACY_FULFILLMENT_STATES
+                )
+            )
             or draft.related_event_key is None
             or draft.actor_key is None
         ):
@@ -903,7 +929,7 @@ class ContributionLedger:
                     fulfillment_item=event.fulfillment_item,
                     fulfillment_status=event.fulfillment_status,
                     actor_key=event.actor_key,
-                ))
+                ), allow_legacy_fulfillment=True)
             except EntitlementError as error:
                 raise LedgerIntegrityError("stored contribution event is malformed") from error
             expected_id = "evt_" + hashlib.sha256(
@@ -996,43 +1022,151 @@ class ContributionLedger:
         received = _iso_utc(received_at or datetime.now(timezone.utc))
         with self._locked():
             events = list(self._read_unlocked())
-            for existing in events:
-                if (
-                    existing.provider == normalized["provider"]
-                    and existing.source_event_key == normalized["source_event_key"]
+            return self._append_normalized_unlocked(events, normalized, received)
+
+    def _append_normalized_unlocked(
+        self,
+        events: list[ContributionEvent],
+        normalized: Mapping[str, Any],
+        received: str,
+    ) -> ContributionEvent:
+        for existing in events:
+            if (
+                existing.provider == normalized["provider"]
+                and existing.source_event_key == normalized["source_event_key"]
+            ):
+                if all(
+                    getattr(existing, key) == value
+                    for key, value in normalized.items()
                 ):
-                    if all(
-                        getattr(existing, key) == value
-                        for key, value in normalized.items()
-                    ):
-                        return existing
-                    raise ContributionConflict(
-                        "provider event key was reused with different contribution data"
-                    )
-            if len(events) >= MAX_EVENTS:
-                raise EntitlementError("contribution ledger event bound reached")
-            sequence = len(events) + 1
-            previous = events[-1].event_hmac if events else GENESIS_HMAC
-            event_id = "evt_" + hashlib.sha256(
-                f"{normalized['provider']}\0{normalized['source_event_key']}".encode(
-                    "ascii"
+                    return existing
+                raise ContributionConflict(
+                    "provider event key was reused with different contribution data"
                 )
-            ).hexdigest()[:32]
-            unsigned = {
-                "sequence": sequence,
-                "event_id": event_id,
-                **normalized,
-                "received_at": received,
-                "previous_hmac": previous,
-            }
-            event = ContributionEvent(
-                **unsigned,
-                event_hmac=self._event_hmac(unsigned),
+        if len(events) >= MAX_EVENTS:
+            raise EntitlementError("contribution ledger event bound reached")
+        sequence = len(events) + 1
+        previous = events[-1].event_hmac if events else GENESIS_HMAC
+        event_id = "evt_" + hashlib.sha256(
+            f"{normalized['provider']}\0{normalized['source_event_key']}".encode(
+                "ascii"
             )
-            events.append(event)
-            _validate_link_transitions(events)
-            self._write_unlocked(events)
-            return event
+        ).hexdigest()[:32]
+        unsigned = {
+            "sequence": sequence,
+            "event_id": event_id,
+            **normalized,
+            "received_at": received,
+            "previous_hmac": previous,
+        }
+        event = ContributionEvent(
+            **unsigned,
+            event_hmac=self._event_hmac(unsigned),
+        )
+        events.append(event)
+        _validate_link_transitions(events)
+        self._write_unlocked(events)
+        return event
+
+    def transition_fulfillment(
+        self,
+        *,
+        subject_key: str,
+        target_event_id: str,
+        item: str,
+        status: str,
+        source_event_key: str,
+        actor_key: str,
+        contract_key: str | None = None,
+        occurred_at: datetime | str | None = None,
+        received_at: datetime | str | None = None,
+    ) -> ContributionEvent:
+        """Validate and append one owner fulfillment transition atomically."""
+
+        _validate_opaque(subject_key, name="subject", required=True)
+        _validate_opaque(source_event_key, name="source event", required=True)
+        _validate_opaque(actor_key, name="actor", required=True)
+        _validate_opaque(contract_key, name="contract", required=False)
+        if not isinstance(target_event_id, str) or re.fullmatch(
+            r"evt_[0-9a-f]{32}", target_event_id,
+        ) is None:
+            raise FulfillmentTransitionConflict("fulfillment target is unavailable")
+        if not isinstance(item, str) or _ITEM_RE.fullmatch(item) is None:
+            raise EntitlementError("fulfillment item is invalid")
+        if status not in FULFILLMENT_STATES:
+            raise EntitlementError("fulfillment status is invalid")
+        received = _iso_utc(received_at or datetime.now(timezone.utc))
+        requested_time = _as_utc(occurred_at or datetime.now(timezone.utc))
+        with self._locked():
+            events = list(self._read_unlocked())
+            authorization_time = datetime.now(timezone.utc)
+            effective_events = _events_for_subject(
+                events, subject_key, as_of=authorization_time,
+            )
+            target = next((
+                event for event in effective_events
+                if event.event_id == target_event_id
+                and event.kind in FUNDING_KINDS
+            ), None)
+            if target is None:
+                raise FulfillmentTransitionConflict(
+                    "fulfillment target is unavailable"
+                )
+            related = target.source_event_key
+            existing_idempotency = next((
+                event for event in events
+                if event.source_event_key == source_event_key
+            ), None)
+            if existing_idempotency is not None:
+                if (
+                    existing_idempotency.kind == "fulfillment_set"
+                    and existing_idempotency.provider == target.provider
+                    and existing_idempotency.subject_key == target.subject_key
+                    and existing_idempotency.related_event_key == related
+                    and existing_idempotency.fulfillment_item == item
+                    and existing_idempotency.fulfillment_status == status
+                    and existing_idempotency.actor_key == actor_key
+                    and existing_idempotency.contract_key == contract_key
+                ):
+                    return existing_idempotency
+                raise FulfillmentTransitionConflict(
+                    "fulfillment idempotency key conflicts"
+                )
+            current = max(
+                (
+                    event for event in events
+                    if event.kind == "fulfillment_set"
+                    and event.provider == target.provider
+                    and event.subject_key == target.subject_key
+                    and event.related_event_key == related
+                    and event.fulfillment_item == item
+                ),
+                key=lambda event: (
+                    _as_utc(event.occurred_at), event.sequence,
+                ),
+                default=None,
+            )
+            current_status = None if current is None else current.fulfillment_status
+            if status not in _FULFILLMENT_TRANSITIONS[current_status]:
+                raise FulfillmentTransitionConflict(
+                    "fulfillment transition is not allowed"
+                )
+            if current is not None:
+                requested_time = max(requested_time, _as_utc(current.occurred_at))
+            normalized = _normalize_draft(ContributionEventDraft(
+                provider=target.provider,
+                source_event_key=source_event_key,
+                subject_key=target.subject_key,
+                kind="fulfillment_set",
+                occurred_at=requested_time,
+                currency=target.currency,
+                contract_key=contract_key,
+                related_event_key=related,
+                fulfillment_item=item,
+                fulfillment_status=status,
+                actor_key=actor_key,
+            ))
+            return self._append_normalized_unlocked(events, normalized, received)
 
     def privacy_safe_user_projection(
         self,
@@ -1175,12 +1309,17 @@ def _project_events(
         projected = {
             "target_event_id": target.event_id if target else None,
             "item": item,
-            "status": event.fulfillment_status,
+            "status": (
+                "fulfilled"
+                if event.fulfillment_status == "complete"
+                else event.fulfillment_status
+            ),
         }
         if admin:
             projected.update({
                 "audit_event_id": event.event_id,
                 "actor_key": event.actor_key,
+                "proof_reference": event.contract_key,
                 "changed_at": event.occurred_at,
             })
         fulfillment.append(projected)

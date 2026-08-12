@@ -320,6 +320,37 @@ class ContributionLedgerTests(unittest.TestCase):
         self.assertEqual(mine["currency_totals_minor"], {})
         self.assertEqual(other["currency_totals_minor"], {"USD": 2_500})
         self.assertNotIn(provider_subject, json.dumps(other))
+        linked_fulfillment = self.ledger.transition_fulfillment(
+            subject_key=other_subject,
+            target_event_id=stored_funding.event_id,
+            item="one_time_credit_grant",
+            status="pending",
+            source_event_key=keyed(
+                "fulfillment_request", "linked-provider-subject",
+            ),
+            actor_key=keyed("admin_actor", "owner-1"),
+            occurred_at="2026-08-11T08:32:00Z",
+            received_at="2026-08-11T08:32:01Z",
+        )
+        self.assertEqual(linked_fulfillment.subject_key, provider_subject)
+        self.assertEqual(linked_fulfillment.provider, stored_funding.provider)
+        self.assertEqual(
+            linked_fulfillment.related_event_key,
+            stored_funding.source_event_key,
+        )
+        linked_completed = self.ledger.transition_fulfillment(
+            subject_key=other_subject,
+            target_event_id=stored_funding.event_id,
+            item="one_time_credit_grant",
+            status="fulfilled",
+            source_event_key=keyed(
+                "fulfillment_request", "linked-provider-subject-complete",
+            ),
+            actor_key=keyed("admin_actor", "owner-1"),
+            occurred_at="2026-08-11T08:33:00Z",
+            received_at="2026-08-11T08:33:01Z",
+        )
+        self.assertEqual(linked_completed.fulfillment_status, "fulfilled")
 
         before_rejected_transitions = self.path.read_bytes()
         with self.assertRaisesRegex(EntitlementError, "current owner"):
@@ -367,6 +398,19 @@ class ContributionLedgerTests(unittest.TestCase):
             other_subject, as_of=NOW,
         )
         self.assertEqual(revoked["currency_totals_minor"], {})
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(
+                subject_key=other_subject,
+                target_event_id=stored_funding.event_id,
+                item="retention_follow_up",
+                status="pending",
+                source_event_key=keyed(
+                    "fulfillment_request", "revoked-provider-subject",
+                ),
+                actor_key=keyed("admin_actor", "owner-1"),
+                occurred_at="2026-08-11T08:45:00Z",
+                received_at="2026-08-11T08:45:01Z",
+            )
         self.assertEqual(self.ledger.events()[0], stored_funding)
         self.ledger.append(ContributionEventDraft(
             provider="fake_support",
@@ -381,6 +425,84 @@ class ContributionLedgerTests(unittest.TestCase):
             self.subject, as_of=NOW,
         )
         self.assertEqual(transferred["currency_totals_minor"], {"USD": 2_500})
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(
+                subject_key=other_subject,
+                target_event_id=stored_funding.event_id,
+                item="retention_follow_up",
+                status="pending",
+                source_event_key=keyed(
+                    "fulfillment_request", "transferred-away-provider-subject",
+                ),
+                actor_key=keyed("admin_actor", "owner-1"),
+                occurred_at="2026-08-11T08:55:00Z",
+                received_at="2026-08-11T08:55:01Z",
+            )
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(
+                subject_key=other_subject,
+                target_event_id=stored_funding.event_id,
+                item="backdated_follow_up",
+                status="pending",
+                source_event_key=keyed(
+                    "fulfillment_request", "backdated-former-owner",
+                ),
+                actor_key=keyed("admin_actor", "owner-1"),
+                occurred_at="2026-08-11T08:30:00Z",
+                received_at="2026-08-11T08:55:02Z",
+            )
+        former_owner = self.ledger.reauthenticated_admin_projection(
+            other_subject, as_of=NOW,
+        )
+        self.assertEqual(former_owner["fulfillment"], [])
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(
+                subject_key=self.subject,
+                target_event_id=stored_funding.event_id,
+                item="one_time_credit_grant",
+                status="pending",
+                source_event_key=keyed(
+                    "fulfillment_request", "transferred-same-item-reset",
+                ),
+                actor_key=keyed("admin_actor", "owner-1"),
+                occurred_at="2026-08-11T08:56:00Z",
+                received_at="2026-08-11T08:56:01Z",
+            )
+        transferred_projection = self.ledger.reauthenticated_admin_projection(
+            self.subject, as_of=NOW,
+        )
+        transferred_task = next(
+            row for row in transferred_projection["fulfillment"]
+            if row["item"] == "one_time_credit_grant"
+        )
+        self.assertEqual(transferred_task["status"], "fulfilled")
+        self.assertEqual(transferred_task["target_event_id"], stored_funding.event_id)
+        transferred_reversal = self.ledger.transition_fulfillment(
+            subject_key=self.subject,
+            target_event_id=stored_funding.event_id,
+            item="one_time_credit_grant",
+            status="reversed",
+            source_event_key=keyed(
+                "fulfillment_request", "transferred-same-item-reversal",
+            ),
+            actor_key=keyed("admin_actor", "owner-1"),
+            occurred_at="2026-08-11T08:56:30Z",
+            received_at="2026-08-11T08:56:31Z",
+        )
+        self.assertEqual(transferred_reversal.fulfillment_status, "reversed")
+        transferred_fulfillment = self.ledger.transition_fulfillment(
+            subject_key=self.subject,
+            target_event_id=stored_funding.event_id,
+            item="retention_follow_up",
+            status="pending",
+            source_event_key=keyed(
+                "fulfillment_request", "transferred-provider-subject",
+            ),
+            actor_key=keyed("admin_actor", "owner-1"),
+            occurred_at="2026-08-11T08:57:00Z",
+            received_at="2026-08-11T08:57:01Z",
+        )
+        self.assertEqual(transferred_fulfillment.subject_key, provider_subject)
         admin = self.ledger.reauthenticated_admin_projection(
             self.subject, as_of=NOW,
         )
@@ -534,25 +656,45 @@ class ContributionLedgerTests(unittest.TestCase):
         self.ledger.append(self.draft(
             "gift", "one_time_contribution", amount=2_500,
         ), received_at=NOW)
-        self.ledger.append(self.draft(
-            "fulfill-1", "fulfillment_set", related="gift",
-            item="one_time_credit_grant", state="complete", actor="owner-1",
-        ), received_at="2026-08-11T09:01:00Z")
+        # Reproduce a schema-v1 record written before ``complete`` was retired.
+        with mock.patch.object(
+            entitlements,
+            "FULFILLMENT_STATES",
+            frozenset({*entitlements.FULFILLMENT_STATES, "complete"}),
+        ):
+            self.ledger.append(self.draft(
+                "fulfill-1", "fulfillment_set", related="gift",
+                item="one_time_credit_grant", state="complete", actor="owner-1",
+            ), received_at="2026-08-11T09:01:00Z")
         user = self.ledger.privacy_safe_user_projection(self.subject)
         self.assertEqual(user["fulfillment"], [{
             "target_event_id": self.ledger.events()[0].event_id,
             "item": "one_time_credit_grant",
-            "status": "complete",
+            "status": "fulfilled",
         }])
         serialized_user = json.dumps(user, sort_keys=True)
         self.assertNotIn(self.subject, serialized_user)
         self.assertNotIn("actor_key", serialized_user)
+        self.assertNotIn("proof_reference", serialized_user)
         self.assertNotIn("source_event_key", serialized_user)
         self.assertNotIn("private-user@example.test", self.path.read_text(encoding="utf-8"))
         admin = self.ledger.reauthenticated_admin_projection(self.subject)
         self.assertEqual(admin["subject_key"], self.subject)
         self.assertRegex(admin["fulfillment"][0]["actor_key"], r"^key_[0-9a-f]{64}$")
+        self.assertIsNone(admin["fulfillment"][0]["proof_reference"])
+        self.assertEqual(admin["audit"][1]["fulfillment_status"], "complete")
         self.assertNotIn("owner-1", json.dumps(admin))
+        reversed_event = self.ledger.transition_fulfillment(
+            subject_key=self.subject,
+            target_event_id=self.ledger.events()[0].event_id,
+            item="one_time_credit_grant",
+            status="reversed",
+            source_event_key=keyed("fulfillment_request", "reverse-legacy"),
+            actor_key=keyed("admin_actor", "owner-1"),
+            occurred_at="2026-08-11T09:02:00Z",
+            received_at="2026-08-11T09:02:01Z",
+        )
+        self.assertEqual(reversed_event.fulfillment_status, "reversed")
 
     def test_delayed_older_fulfillment_does_not_replace_newer_status(self):
         self.ledger.append(self.draft(
@@ -560,7 +702,7 @@ class ContributionLedgerTests(unittest.TestCase):
         ), received_at=NOW)
         self.ledger.append(self.draft(
             "fulfilled-new", "fulfillment_set", related="gift",
-            item="one_time_credit_grant", state="complete", actor="owner-1",
+            item="one_time_credit_grant", state="fulfilled", actor="owner-1",
             occurred_at="2026-08-11T08:30:00Z",
         ), received_at="2026-08-11T09:01:00Z")
         self.ledger.append(self.draft(
@@ -569,7 +711,162 @@ class ContributionLedgerTests(unittest.TestCase):
             occurred_at="2026-08-11T08:15:00Z",
         ), received_at="2026-08-11T09:02:00Z")
         projection = self.ledger.privacy_safe_user_projection(self.subject)
-        self.assertEqual(projection["fulfillment"][0]["status"], "complete")
+        self.assertEqual(projection["fulfillment"][0]["status"], "fulfilled")
+
+    def test_fulfillment_transition_graph_and_idempotency_are_atomic(self):
+        funding = self.ledger.append(self.draft(
+            "gift", "one_time_contribution", amount=2_500,
+        ), received_at=NOW)
+        kwargs = {
+            "subject_key": self.subject,
+            "target_event_id": funding.event_id,
+            "item": "one_time_credit_grant",
+            "source_event_key": keyed("fulfillment_request", "pending-1"),
+            "actor_key": keyed("admin_actor", "owner-1"),
+            "contract_key": keyed("fulfillment_proof", "proof-1"),
+            "occurred_at": "2026-08-11T09:02:00Z",
+            "received_at": "2026-08-11T09:02:01Z",
+        }
+        pending = self.ledger.transition_fulfillment(status="pending", **kwargs)
+        self.assertEqual(
+            self.ledger.transition_fulfillment(status="pending", **kwargs),
+            pending,
+        )
+        self.assertEqual(len(self.ledger.events()), 2)
+        admin_pending = self.ledger.reauthenticated_admin_projection(self.subject)
+        self.assertEqual(
+            admin_pending["fulfillment"][0]["proof_reference"],
+            kwargs["contract_key"],
+        )
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(status="fulfilled", **kwargs)
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(
+                **{**kwargs, "source_event_key": keyed(
+                    "fulfillment_request", "pending-2",
+                )},
+                status="pending",
+            )
+        progressed = self.ledger.transition_fulfillment(
+            **{**kwargs, "source_event_key": keyed(
+                "fulfillment_request", "progress-1",
+            )},
+            status="in_progress",
+        )
+        fulfilled = self.ledger.transition_fulfillment(
+            **{**kwargs, "source_event_key": keyed(
+                "fulfillment_request", "fulfilled-1",
+            )},
+            status="fulfilled",
+        )
+        reversed_event = self.ledger.transition_fulfillment(
+            **{**kwargs, "source_event_key": keyed(
+                "fulfillment_request", "reversed-1",
+            )},
+            status="reversed",
+        )
+        self.assertEqual(
+            [progressed.fulfillment_status, fulfilled.fulfillment_status,
+             reversed_event.fulfillment_status],
+            ["in_progress", "fulfilled", "reversed"],
+        )
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(
+                **{**kwargs, "source_event_key": keyed(
+                    "fulfillment_request", "terminal-1",
+                )},
+                status="fulfilled",
+            )
+        branch_cases = (
+            ("direct-fulfilled", ("pending", "fulfilled")),
+            ("pending-declined", ("pending", "declined")),
+            ("progress-declined", ("pending", "in_progress", "declined")),
+        )
+        for offset, (label, states) in enumerate(branch_cases, start=1):
+            branch_funding = self.ledger.append(self.draft(
+                f"gift-{label}", "one_time_contribution", amount=500,
+            ), received_at=f"2026-08-11T09:1{offset}:00Z")
+            for step, branch_status in enumerate(states):
+                self.ledger.transition_fulfillment(
+                    subject_key=self.subject,
+                    target_event_id=branch_funding.event_id,
+                    item="one_time_credit_grant",
+                    status=branch_status,
+                    source_event_key=keyed(
+                        "fulfillment_request", f"{label}-{branch_status}",
+                    ),
+                    actor_key=keyed("admin_actor", "owner-1"),
+                    occurred_at=f"2026-08-11T09:1{offset}:0{step + 1}Z",
+                    received_at=f"2026-08-11T09:1{offset}:1{step + 1}Z",
+                )
+            projected = self.ledger.privacy_safe_user_projection(self.subject)
+            selected = next(
+                row for row in projected["fulfillment"]
+                if row["target_event_id"] == branch_funding.event_id
+            )
+            self.assertEqual(selected["status"], states[-1])
+
+    def test_fulfillment_targets_only_same_subject_funding(self):
+        funding = self.ledger.append(self.draft(
+            "gift", "one_time_contribution", amount=2_500,
+        ), received_at=NOW)
+        common = {
+            "target_event_id": funding.event_id,
+            "item": "one_time_credit_grant",
+            "status": "pending",
+            "source_event_key": keyed("fulfillment_request", "wrong-subject"),
+            "actor_key": keyed("admin_actor", "owner-1"),
+        }
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(
+                subject_key=keyed("test_subject", "other"), **common,
+            )
+        adjustment = self.ledger.append(self.draft(
+            "refund", "refund", amount=100, related="gift",
+        ), received_at=NOW)
+        with self.assertRaises(ContributionConflict):
+            self.ledger.transition_fulfillment(
+                subject_key=self.subject,
+                target_event_id=adjustment.event_id,
+                **{key: value for key, value in common.items()
+                   if key != "target_event_id"},
+            )
+
+    def test_competing_initial_fulfillment_transitions_serialize(self):
+        funding = self.ledger.append(self.draft(
+            "gift", "one_time_contribution", amount=2_500,
+        ), received_at=NOW)
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def transition(label):
+            barrier.wait()
+            try:
+                event = self.ledger.transition_fulfillment(
+                    subject_key=self.subject,
+                    target_event_id=funding.event_id,
+                    item="one_time_credit_grant",
+                    status="pending",
+                    source_event_key=keyed("fulfillment_request", label),
+                    actor_key=keyed("admin_actor", "owner-1"),
+                )
+                outcomes.append(("ok", event.event_id))
+            except ContributionConflict:
+                outcomes.append(("conflict", label))
+
+        threads = [
+            threading.Thread(target=transition, args=(label,))
+            for label in ("race-a", "race-b")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(sorted(result[0] for result in outcomes), [
+            "conflict", "ok",
+        ])
+        self.assertEqual(len(self.ledger.events()), 2)
 
     def test_malformed_events_and_orphan_adjustments_are_bounded(self):
         with self.assertRaises(EntitlementError):

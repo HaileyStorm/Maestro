@@ -832,7 +832,12 @@ export type SupportAdminEventKind =
   | 'account_link_verified'
   | 'account_link_revoked'
 
-export type SupportFulfillmentStatus = 'pending' | 'complete' | 'declined'
+export type SupportFulfillmentStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'fulfilled'
+  | 'declined'
+  | 'reversed'
 
 export interface SupportAdminAuditEvent {
   sequence: number
@@ -857,7 +862,16 @@ export interface SupportAdminFulfillment {
   status: SupportFulfillmentStatus
   audit_event_id: string
   actor_reference: string
+  proof_reference: string | null
   changed_at: string
+}
+
+export interface SupportFulfillmentMutationInput {
+  target_event_id: string
+  item: string
+  status: SupportFulfillmentStatus
+  idempotency_key: string
+  proof_reference: string | null
 }
 
 export interface SupportAdminDiscrepancy {

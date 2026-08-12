@@ -17,7 +17,7 @@ import tempfile
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -28,6 +28,7 @@ from .account_auth import (
     resolve_account_capabilities,
 )
 from .entitlements import (
+    FULFILLMENT_STATES,
     SUPPORT_PRIORITY_IDENTITY_CONTRACTS,
     ContributionLedger,
     exclusive_file_lease,
@@ -51,6 +52,9 @@ MAX_RESPONSIBLE_USE_ACCOUNTS = 512
 _SUBJECT_NAMESPACE = "maestro_account_support"
 _SUBJECT_RE = re.compile(r"key_[0-9a-f]{64}\Z")
 _ACCOUNT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+_EVENT_ID_RE = re.compile(r"evt_[0-9a-f]{32}\Z")
+_FULFILLMENT_ITEM_RE = re.compile(r"[a-z][a-z0-9_]{1,63}\Z")
+_FULFILLMENT_REFERENCE_RE = re.compile(r"key_[0-9a-f]{64}\Z")
 _STORE_SEAL_DOMAIN = b"maestro-support-responsible-use-store-v1\0"
 _ADMIN_CAPABILITIES = frozenset({"accounts.admin", "services.admin"})
 _STORE_KEYS = frozenset({"schema_version", "generation", "records", "seal"})
@@ -495,6 +499,20 @@ class SupportPortal:
         or provider identity from the request.
         """
 
+        _, subject_key = self._resolve_owner_target(
+            actor_session_id,
+            remote=remote,
+            target_account_id=target_account_id,
+        )
+        return self._admin_projection_for_subject(subject_key)
+
+    def _resolve_owner_target(
+        self,
+        actor_session_id: str,
+        *,
+        remote: bool,
+        target_account_id: str,
+    ) -> tuple[dict[str, Any], str]:
         actor, capabilities = self._resolve_access(
             actor_session_id, remote=remote,
         )
@@ -520,7 +538,9 @@ class SupportPortal:
             ) from error
         if not any(account.get("id") == target_account_id for account in accounts):
             raise SupportAuthorizationError("The target account is unavailable")
-        subject_key = self._subject_key(target_account_id)
+        return actor, self._subject_key(target_account_id)
+
+    def _admin_projection_for_subject(self, subject_key: str) -> dict[str, Any]:
         recorded = self._ledger.reauthenticated_admin_projection(subject_key)
         return {
             "schema_version": SUPPORT_PORTAL_SCHEMA_VERSION,
@@ -535,6 +555,63 @@ class SupportPortal:
             "responsible_use": self._acceptance_store.status(subject_key),
             "support_priority": self._priority_policy(),
         }
+
+    def transition_owner_fulfillment(
+        self,
+        actor_session_id: str,
+        *,
+        remote: bool,
+        target_account_id: str,
+        target_event_id: Any,
+        item: Any,
+        status: Any,
+        idempotency_key: Any,
+        proof_reference: Any,
+    ) -> dict[str, Any]:
+        """Append one server-derived fulfillment transition and refresh audit."""
+
+        actor, subject_key = self._resolve_owner_target(
+            actor_session_id,
+            remote=remote,
+            target_account_id=target_account_id,
+        )
+        if (
+            not isinstance(target_event_id, str)
+            or _EVENT_ID_RE.fullmatch(target_event_id) is None
+            or not isinstance(item, str)
+            or _FULFILLMENT_ITEM_RE.fullmatch(item) is None
+            or not isinstance(status, str)
+            or status not in FULFILLMENT_STATES
+            or not isinstance(idempotency_key, str)
+            or _FULFILLMENT_REFERENCE_RE.fullmatch(idempotency_key) is None
+            or (
+                proof_reference is not None
+                and (
+                    not isinstance(proof_reference, str)
+                    or _FULFILLMENT_REFERENCE_RE.fullmatch(proof_reference) is None
+                )
+            )
+        ):
+            raise SupportPortalError("Fulfillment transition is invalid")
+        self._ledger.transition_fulfillment(
+            subject_key=subject_key,
+            target_event_id=target_event_id,
+            item=item,
+            status=status,
+            source_event_key=opaque_key(
+                "fulfillment_idempotency", idempotency_key, self._identity_key,
+            ),
+            actor_key=opaque_key(
+                "fulfillment_actor", actor["id"], self._identity_key,
+            ),
+            contract_key=(
+                None
+                if proof_reference is None
+                else proof_reference
+            ),
+            occurred_at=datetime.now(timezone.utc),
+        )
+        return self._admin_projection_for_subject(subject_key)
 
 
 __all__ = [
