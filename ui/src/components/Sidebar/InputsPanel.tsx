@@ -1,10 +1,11 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { X, Upload, Plus, Music, Film, Mic } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry } from '../../lib/timelinePrompt'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 import { DOWNLOAD_REFRESH_EVENT } from '../../lib/useVisibilityPolling'
+import { cancelFileSelection, consumeFileSelection } from '../shared/FileUploadZone'
 
 // Unified, media-driven "Inputs" panel for Studio Frames mode (image_mode 0).
 //
@@ -19,7 +20,7 @@ import { DOWNLOAD_REFRESH_EVENT } from '../../lib/useVisibilityPolling'
 //              model's soundtrack audio_prompt_type + audio_guide; adding a
 //              control video sets "K" + video_guide. AudioModeSection's dropdown
 //              is hidden in Frames mode (Sidebar) — the tiles route it instead.
-// Next: voice-ref, references, then one unified drop zone + role auto-detect.
+//   slice 3  — voice and semantic reference tiles, including H3 audio/video.
 //
 // Existing params stay the source of truth, so Load Settings restore keeps
 // working (tiles are derived from params).
@@ -71,6 +72,27 @@ const snapToOffsetPreset = (pct: number): string => {
 }
 
 const basename = (p: string) => p.replace(/\\/g, '/').split('/').pop() || p
+
+const MEDIA_EXTENSIONS = {
+  image: /\.(png|jpe?g|webp|bmp)$/i,
+  audio: /\.(wav|mp3|flac|ogg|m4a)$/i,
+  video: /\.(mp4|webm|mkv|mov|avi|m4v)$/i,
+} as const
+
+const matchesMediaKind = (file: File, kind: keyof typeof MEDIA_EXTENSIONS): boolean => (
+  file.type.startsWith(`${kind}/`) || MEDIA_EXTENSIONS[kind].test(file.name)
+)
+
+const uploadErrorMessage = (label: string, error: unknown): string => {
+  const category = error instanceof Error ? error.message.toLowerCase() : ''
+  if (/too large|size limit|500\s*mb/.test(category)) {
+    return `${label} exceeds the upload limit. Choose a smaller file and try again.`
+  }
+  if (/format|extension|decode|audio track|convert/.test(category)) {
+    return `${label} is not a supported readable file. Choose another file and try again.`
+  }
+  return `${label} could not be uploaded. Check the connection, then try again.`
+}
 
 const getMediaDuration = (file: File): Promise<number | null> => {
   const isVid = file.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(file.name)
@@ -190,7 +212,19 @@ export function InputsPanel() {
   const [frameDragOverKey, setFrameDragOverKey] = useState<string | null>(null)
   const [semanticRefDurations, setSemanticRefDurations] = useState<Record<string, number>>({})
   const [h3DownloadStatus, setH3DownloadStatus] = useState<'idle' | 'downloading' | 'failed'>('idle')
+  const [audioUploadTarget, setAudioUploadTarget] = useState<string | null>(null)
+  const [audioUploadError, setAudioUploadError] = useState<string | null>(null)
+  const filePickerRef = useRef<HTMLInputElement>(null)
+  const pendingFilePickRef = useRef<((files: File[]) => void) | null>(null)
   const h3TermsAccepted = hostTerms?.minimax_h3_ref2va.accepted === true
+
+  useEffect(() => {
+    const input = filePickerRef.current
+    if (!input) return
+    const handleCancel = () => cancelFileSelection(input, pendingFilePickRef)
+    input.addEventListener('cancel', handleCancel)
+    return () => input.removeEventListener('cancel', handleCancel)
+  }, [])
 
   useEffect(() => {
     if (activeWorkspace && !hostTerms && !hostTermsLoading) void loadHostTerms()
@@ -368,17 +402,32 @@ export function InputsPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [semanticReferenceMode, semanticPathsKey])
 
+  const openFilePicker = (accept: string, onFiles: (files: File[]) => void, multiple = false) => {
+    const input = filePickerRef.current
+    if (!input) {
+      setAudioUploadError('The file picker is unavailable. Refresh the page and try again.')
+      return
+    }
+    pendingFilePickRef.current = onFiles
+    input.accept = accept
+    input.multiple = multiple
+    input.value = ''
+    input.click()
+  }
+
+  const pickFile = (accept: string, onFile: (file: File) => void) => {
+    openFilePicker(accept, files => {
+      const file = files[0]
+      if (file) onFile(file)
+    })
+  }
+  const pickImage = (onFile: (file: File) => void) => pickFile('image/*', onFile)
+
   const pickReferences = () => {
-    const input = document.createElement('input')
-    input.type = 'file'
-    input.accept = '.png,.jpg,.jpeg,.webp,.bmp'
-    input.multiple = true
-    input.onchange = () => {
-      const files = Array.from(input.files || [])
+    openFilePicker('.png,.jpg,.jpeg,.webp,.bmp', files => {
       const room = maxRefs == null ? files.length : Math.max(0, maxRefs - semanticImageCount)
       files.slice(0, room).forEach(addImageRef)
-    }
-    input.click()
+    }, true)
   }
 
   // Extend mode: the source video to continue from.
@@ -422,18 +471,6 @@ export function InputsPanel() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.video_prompt_type, params.image_refs, params.frames_positions])
-
-  const pickFile = (accept: string, onFile: (f: File) => void) => {
-    const input = document.createElement('input')
-    input.type = 'file'
-    input.accept = accept
-    input.onchange = e => {
-      const f = (e.target as HTMLInputElement).files?.[0]
-      if (f) onFile(f)
-    }
-    input.click()
-  }
-  const pickImage = (onFile: (f: File) => void) => pickFile('image/*', onFile)
 
   // ── Inject handlers ────────────────────────────────────────────────
   const syncFrameParams = (frames: InjectedFrame[]) => {
@@ -638,6 +675,8 @@ export function InputsPanel() {
 
   // ── Audio / control-video handlers ─────────────────────────────────
   const handleAddSoundtrack = async (file: File) => {
+    setAudioUploadTarget('soundtrack')
+    setAudioUploadError(null)
     try {
       const result = await api.uploadAudio(file)
       setParam('audio_guide', result.path)
@@ -646,10 +685,13 @@ export function InputsPanel() {
       const dur = await getMediaDuration(file)
       if (dur && dur > 0) setDurationSeconds(Math.round(dur * 10) / 10)
     } catch (e) {
-      console.error('Soundtrack upload failed:', e)
+      setAudioUploadError(uploadErrorMessage('Soundtrack', e))
+    } finally {
+      setAudioUploadTarget(null)
     }
   }
   const removeSoundtrack = () => {
+    setAudioUploadError(null)
     setParam('audio_guide', undefined)
     setAudioGuideFilename(null)
     if (audioBase.includes('A')) {
@@ -749,25 +791,44 @@ export function InputsPanel() {
   }
   const handleAddSemanticAudio = async (file: File) => {
     if (!h3TermsAccepted || semanticAudioPaths.length >= H3_REF2VA_LIMITS.audio || semanticMixedCount >= H3_REF2VA_LIMITS.mixed) return
-    const duration = await getMediaDuration(file)
-    if (duration == null || duration < 2 || duration > 15) {
-      window.alert('Each MiniMax H3 reference audio clip must be between 2 and 15 seconds.')
-      return
-    }
-    const knownTotal = semanticAudioPaths.reduce((sum, path) => sum + (semanticRefDurations[path] || 0), 0)
-    if (knownTotal + duration > 15.01) {
-      window.alert('MiniMax H3 reference audio may total at most 15 seconds.')
-      return
-    }
+    setAudioUploadTarget('semantic-audio')
+    setAudioUploadError(null)
     try {
+      const duration = await getMediaDuration(file)
+      if (duration == null || duration < 2 || duration > 15) {
+        setAudioUploadError('Reference audio must be a readable clip between 2 and 15 seconds. Choose another file and try again.')
+        return
+      }
+      const knownTotal = semanticAudioPaths.reduce((sum, path) => sum + (semanticRefDurations[path] || 0), 0)
+      if (knownTotal + duration > 15.01) {
+        setAudioUploadError('Reference audio may total at most 15 seconds. Remove or shorten a clip, then try again.')
+        return
+      }
       const result = await api.uploadAudio(file)
       setSemanticRefDurations(current => ({ ...current, [result.path]: duration }))
       syncSemanticAudioRefs([...semanticAudioPaths, result.path])
     } catch (e) {
-      console.error('Semantic reference audio upload failed:', e)
+      setAudioUploadError(uploadErrorMessage('Reference audio', e))
+    } finally {
+      setAudioUploadTarget(null)
+    }
+  }
+  const handleAddVoiceReference = async (file: File) => {
+    setAudioUploadTarget('voice-reference')
+    setAudioUploadError(null)
+    try {
+      // Yield once so mobile users see that their selection was accepted. The
+      // file remains browser-local until the existing generation path uploads it.
+      await new Promise<void>(resolve => window.setTimeout(resolve, 0))
+      setDirectorVoiceRef(file)
+    } catch (error) {
+      setAudioUploadError(uploadErrorMessage('Voice reference', error))
+    } finally {
+      setAudioUploadTarget(null)
     }
   }
   const removeSemanticAudio = (index: number) => {
+    setAudioUploadError(null)
     const removed = semanticAudioPaths[index]
     syncSemanticAudioRefs(semanticAudioPaths.filter((_, itemIndex) => itemIndex !== index))
     setSemanticRefDurations(current => {
@@ -784,6 +845,17 @@ export function InputsPanel() {
 
   return (
     <div>
+      <input
+        id="inputs-panel-file-picker"
+        ref={filePickerRef}
+        type="file"
+        className="sr-only"
+        tabIndex={-1}
+        aria-hidden="true"
+        onChange={event => {
+          consumeFileSelection(event.currentTarget, pendingFilePickRef)
+        }}
+      />
       <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Inputs</label>
       {h3StudioWorkflow && (
         <div className="mb-2 rounded-lg border border-amber-500/35 bg-amber-500/5 p-2 space-y-1.5">
@@ -816,7 +888,7 @@ export function InputsPanel() {
           <div className="flex flex-col items-stretch gap-2 text-[9px] leading-relaxed text-text-secondary sm:flex-row sm:items-start">
             <span className="flex-1">
               {h3TermsAccepted ? 'MiniMax H3 Ref2VA model terms are accepted for this host. ' : `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
-              <a href={HOST_TERM_NOTICES.minimax_h3_ref2va.href} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">{HOST_TERM_NOTICES.minimax_h3_ref2va.linkLabel}</a>.
+              <a href={HOST_TERM_NOTICES.minimax_h3_ref2va.href} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">{HOST_TERM_NOTICES.minimax_h3_ref2va.linkLabel}</a>.
             </span>
             {!h3TermsAccepted && hostTerms && (
               <button
@@ -906,7 +978,9 @@ export function InputsPanel() {
             onSelect={() => setSelected(selected === `semantic-audio-${index}` ? null : `semantic-audio-${index}`)} />
         ))}
         {semanticReferenceMode && canAttachSemanticReferences && h3TermsAccepted && semanticAudioPaths.length < H3_REF2VA_LIMITS.audio && semanticMixedCount < H3_REF2VA_LIMITS.mixed && (
-          <AddTile label="Audio ref" icon={<Music size={18} />} onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', handleAddSemanticAudio)} onDropFile={handleAddSemanticAudio} dropAccept="audio" />
+          <AddTile label={audioUploadTarget === 'semantic-audio' ? 'Uploading…' : 'Audio ref'} icon={<Music size={18} />}
+            onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', handleAddSemanticAudio)} onDropFile={handleAddSemanticAudio}
+            dropAccept="audio" disabled={audioUploadTarget !== null} />
         )}
 
         {/* Soundtrack (audio) */}
@@ -915,7 +989,9 @@ export function InputsPanel() {
             imgSrc={null} selected={selected === 'audio'} onClear={removeSoundtrack}
             onSelect={() => setSelected(selected === 'audio' ? null : 'audio')} />
         ) : supportsSoundtrack && (
-          <AddTile label="Soundtrack" icon={<Music size={18} />} onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a,.mp4,.mov,.mkv,.webm', handleAddSoundtrack)} onDropFile={handleAddSoundtrack} />
+          <AddTile label={audioUploadTarget === 'soundtrack' ? 'Uploading…' : 'Soundtrack'} icon={<Music size={18} />}
+            onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a,.mp4,.mov,.mkv,.webm', handleAddSoundtrack)} onDropFile={handleAddSoundtrack}
+            disabled={audioUploadTarget !== null} />
         ))}
 
         {/* Control video */}
@@ -940,10 +1016,12 @@ export function InputsPanel() {
         {!semanticReferenceMode && voiceRefEnabled && (directorVoiceRef ? (
           <Tile role="Voice ref" filledIcon={<Mic size={20} />} filledLabel={directorVoiceRef.name}
             imgSrc={null} selected={selected === 'voiceref'}
-            onClear={() => { setDirectorVoiceRef(null); if (selected === 'voiceref') setSelected(null) }}
+            onClear={() => { setAudioUploadError(null); setDirectorVoiceRef(null); if (selected === 'voiceref') setSelected(null) }}
             onSelect={() => setSelected(selected === 'voiceref' ? null : 'voiceref')} />
         ) : (
-          <AddTile label="Voice ref" icon={<Mic size={18} />} onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', setDirectorVoiceRef)} onDropFile={setDirectorVoiceRef} dropAccept="audio" />
+          <AddTile label={audioUploadTarget === 'voice-reference' ? 'Attaching…' : 'Voice ref'} icon={<Mic size={18} />}
+            onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', handleAddVoiceReference)} onDropFile={handleAddVoiceReference}
+            dropAccept="audio" disabled={audioUploadTarget !== null} />
         ))}
 
         {/* Reference images (ordered; first = main subject/landscape). Drag to reorder. */}
@@ -985,6 +1063,14 @@ export function InputsPanel() {
           if (canAddRef && (!semanticReferenceMode || semanticMixedCount < H3_REF2VA_LIMITS.mixed)) addImageRef(file)
         }} dropAccept="image" />}
       </div>
+      {audioUploadTarget && (
+        <p role="status" className="mt-1 text-[9px] text-text-muted">Audio selection accepted; processing…</p>
+      )}
+      {audioUploadError && (
+        <p role="alert" className="mt-1 rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] text-red-200">
+          {audioUploadError}
+        </p>
+      )}
       {semanticReferenceMode && h3TermsAccepted && (
         <p className={`mt-1 text-[9px] ${semanticAudioPaths.length > semanticImageCount + semanticVideoPaths.length ? 'text-amber-400' : 'text-text-muted'}`}>
           Semantic context: {semanticImageCount}/9 images · {semanticVideoPaths.length}/3 videos · {semanticAudioPaths.length}/3 audio · {semanticMixedCount}/12 mixed.
@@ -1152,22 +1238,23 @@ function Row({ label, value }: { label: string; value: string }) {
   )
 }
 
-function AddTile({ label, icon, onClick, onDropFile, dropAccept }: {
+function AddTile({ label, icon, onClick, onDropFile, dropAccept, disabled = false }: {
   label: string; icon?: React.ReactNode; onClick: () => void
   onDropFile?: (f: File) => void; dropAccept?: 'image' | 'audio' | 'video'
+  disabled?: boolean
 }) {
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault()
     const f = e.dataTransfer.files[0]
-    if (!f || !onDropFile) return
-    if (dropAccept && !f.type.startsWith(`${dropAccept}/`)) return
+    if (disabled || !f || !onDropFile) return
+    if (dropAccept && !matchesMediaKind(f, dropAccept)) return
     onDropFile(f)
   }
   return (
-    <button onClick={onClick}
+    <button type="button" onClick={onClick} disabled={disabled} aria-busy={disabled}
       onDrop={onDropFile ? handleDrop : undefined}
       onDragOver={onDropFile ? (e => e.preventDefault()) : undefined}
-      className="w-[90px] h-[90px] shrink-0 rounded-xl border border-dashed border-border hover:border-accent-blue flex flex-col items-center justify-center gap-1 text-text-muted hover:text-text-primary transition-colors">
+      className="w-[90px] h-[90px] shrink-0 rounded-xl border border-dashed border-border hover:border-accent-blue flex flex-col items-center justify-center gap-1 text-text-muted hover:text-text-primary transition-colors disabled:cursor-wait disabled:opacity-60">
       {icon ?? <Plus size={18} />}
       <span className="text-[10px] text-center px-1">{label}</span>
     </button>

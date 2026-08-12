@@ -113,6 +113,12 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
   const [cleaningComponents, setCleaningComponents] = useState(false)
   const [cleanupError, setCleanupError] = useState('')
   const [showSaveRecipe, setShowSaveRecipe] = useState(false)
+  const saveRecipeTriggerRef = useRef<HTMLButtonElement>(null)
+  const saveRecipeEpochRef = useRef(0)
+  const closeSaveRecipeDialog = useCallback(() => {
+    saveRecipeEpochRef.current += 1
+    setShowSaveRecipe(false)
+  }, [])
   const confirmRef = useRef(false)
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const [copied, setCopied] = useState(false)
@@ -603,12 +609,16 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
         <div className={`w-full h-full flex items-center justify-center transition-[filter] duration-200 ${
           privateBlurred ? 'blur-2xl' : ''
         }`} inert={privateBlurred}>
-        {file.type === 'video' ? (
+        {privateBlurred ? (
+          <div className="flex h-full w-full items-center justify-center bg-bg-active text-text-muted">
+            <EyeOff size={24} aria-hidden="true" />
+          </div>
+        ) : file.type === 'video' ? (
           <video
             ref={setVideoElement}
-            key={file.url}
-            src={privateBlurred ? undefined : file.url}
-            preload={privateBlurred ? 'none' : 'metadata'}
+            key={privateRevealKey}
+            src={file.url}
+            preload="metadata"
             controls
             loop
             className="w-full h-full object-contain"
@@ -620,10 +630,10 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
               <Play size={24} className="text-text-muted" />
             </div>
             <p className="text-xs text-text-muted mb-2">{file.name}</p>
-            <audio key={file.url} src={file.url} controls className="w-64" />
+            <audio key={privateRevealKey} src={file.url} controls className="w-64" />
           </div>
         ) : (
-          <RetryImage key={file.url} url={file.url} alt={file.name} />
+          <RetryImage key={privateRevealKey} url={file.url} alt={file.name} />
         )}
         </div>
         {privateBlurred && (
@@ -729,8 +739,17 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
           {params && (
             <>
               <button
-                onClick={(e) => { e.stopPropagation(); setShowSaveRecipe(true) }}
-                className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-accent-blue transition-colors"
+                ref={saveRecipeTriggerRef}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  saveRecipeEpochRef.current += 1
+                  setShowSaveRecipe(true)
+                }}
+                type="button"
+                aria-haspopup="dialog"
+                aria-expanded={showSaveRecipe}
+                aria-label="Save as Recipe — reuse this look with one click"
+                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-accent-blue md:min-h-0 md:min-w-0"
                 title="Save as Recipe — reuse this look with one click"
               >
                 <BookMarked size={13} />
@@ -752,8 +771,14 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
               {file.type === 'video' && (
                 <>
                   <button
-                    onClick={() => openRetakeDialog(file.name)}
-                    className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-indicator-warning transition-colors"
+                    onClick={event => {
+                      event.currentTarget.focus()
+                      openRetakeDialog(file.name)
+                    }}
+                    type="button"
+                    aria-haspopup="dialog"
+                    aria-label="Retake — regenerate a time region"
+                    className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-indicator-warning md:min-h-0 md:min-w-0"
                     title="Retake — regenerate a time region"
                   >
                     <Scissors size={13} />
@@ -956,10 +981,12 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
       </div>
       {showSaveRecipe && (
         <SaveRecipeDialog
-          onCancel={() => setShowSaveRecipe(false)}
+          onCancel={closeSaveRecipeDialog}
+          restoreFocusRef={saveRecipeTriggerRef}
           onSave={async (name, description, nsfw) => {
+            const requestEpoch = saveRecipeEpochRef.current
             await saveRecipeFromOutput(file.name, name, description, nsfw)
-            setShowSaveRecipe(false)
+            if (saveRecipeEpochRef.current === requestEpoch) closeSaveRecipeDialog()
           }}
         />
       )}

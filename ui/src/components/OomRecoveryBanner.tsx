@@ -1,9 +1,18 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { AlertTriangle, X } from 'lucide-react'
 import { useStore } from '../stores/useStore'
 import type { OomInfo } from '../types'
 import { H3DeliveryRecoveryStatus } from './H3DeliveryRecoveryStatus'
 import { selectRecoverySourceIndex } from '../lib/h3DeliveryRecoveryContract'
+
+const safeViewportPadding = {
+  paddingTop: 'max(1rem, env(safe-area-inset-top, 0px))',
+  paddingRight: 'max(1rem, env(safe-area-inset-right, 0px))',
+  paddingBottom: 'max(1rem, env(safe-area-inset-bottom, 0px))',
+  paddingLeft: 'max(1rem, env(safe-area-inset-left, 0px))',
+}
+
+const APPLY_FAILURE_MESSAGE = 'System settings could not be updated. Check the connection and try again.'
 
 /** Surface structured recovery state for generation and H3 delivery OOMs. */
 export function OomRecoveryBanner() {
@@ -16,8 +25,9 @@ export function OomRecoveryBanner() {
   // failure key until this component is remounted. Failed cards themselves
   // may be restored by the normal job reconnection flow.
   const [dismissed, setDismissed] = useState<Set<string>>(new Set())
-  const [applying, setApplying] = useState(false)
-  const [appliedToast, setAppliedToast] = useState<string | null>(null)
+  const [applyingKey, setApplyingKey] = useState<string | null>(null)
+  const [applyError, setApplyError] = useState<{ key: string; message: string } | null>(null)
+  const [appliedToast, setAppliedToast] = useState<{ key: string; message: string } | null>(null)
 
   // Find the most relevant OOM failure to show. Studio jobs and the
   // pipeline are independent surfaces — if both have OOM failures
@@ -65,6 +75,35 @@ export function OomRecoveryBanner() {
     }
     return null
   }, [jobs, pipelineStatus])
+  const activeOomKey = activeOom?.key ?? null
+  const applying = applyingKey === activeOomKey
+  const mountedRef = useRef(false)
+  const applySequenceRef = useRef(0)
+  const applyingRef = useRef(false)
+  const applyAbortControllerRef = useRef<AbortController | null>(null)
+  const activeOomKeyRef = useRef<string | null>(activeOomKey)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      applyingRef.current = false
+      applyAbortControllerRef.current?.abort()
+      applyAbortControllerRef.current = null
+      applySequenceRef.current += 1
+    }
+  }, [])
+
+  useEffect(() => {
+    activeOomKeyRef.current = activeOomKey
+    applySequenceRef.current += 1
+    applyingRef.current = false
+    applyAbortControllerRef.current?.abort()
+    applyAbortControllerRef.current = null
+    setApplyingKey(current => current === activeOomKey ? current : null)
+    setApplyError(current => current?.key === activeOomKey ? current : null)
+    setAppliedToast(current => current?.key === activeOomKey ? current : null)
+  }, [activeOomKey])
 
   // Auto-clear the toast after 3 seconds.
   useEffect(() => {
@@ -75,31 +114,79 @@ export function OomRecoveryBanner() {
 
   const handleDismiss = useCallback(() => {
     if (activeOom) {
+      applySequenceRef.current += 1
+      applyingRef.current = false
+      applyAbortControllerRef.current?.abort()
+      applyAbortControllerRef.current = null
+      setApplyingKey(current => current === activeOom.key ? null : current)
+      setApplyError(current => current?.key === activeOom.key ? null : current)
+      setAppliedToast(current => current?.key === activeOom.key ? null : current)
       setDismissed(d => new Set(d).add(activeOom.key))
     }
   }, [activeOom])
 
   const handleApply = useCallback(async () => {
-    if (!activeOom?.oom.suggested_coefficient) return
-    setApplying(true)
+    const suggestedCoefficient = activeOom?.oom.suggested_coefficient
+    if (!activeOom || suggestedCoefficient == null || applyingRef.current) return
+    const oomKey = activeOom.key
+    const sequence = ++applySequenceRef.current
+    const controller = new AbortController()
+    applyAbortControllerRef.current?.abort()
+    applyAbortControllerRef.current = controller
+    applyingRef.current = true
+    setApplyingKey(oomKey)
+    const isCurrent = () => (
+      mountedRef.current
+      && applySequenceRef.current === sequence
+      && activeOomKeyRef.current === oomKey
+    )
     try {
-      await updateSystemConfig({ vram_safety_coefficient: activeOom.oom.suggested_coefficient })
-      setAppliedToast(`VRAM headroom lowered to ${activeOom.oom.suggested_coefficient.toFixed(2)} — try the generation again`)
-      setDismissed(d => new Set(d).add(activeOom.key))
-    } catch (e) {
-      console.error('apply coefficient failed:', e)
+      const result = await updateSystemConfig(
+        { vram_safety_coefficient: suggestedCoefficient },
+        controller.signal,
+      )
+      if (!isCurrent()) return
+      if (!result.ok) {
+        setApplyError({ key: oomKey, message: result.message })
+        return
+      }
+      setApplyError(null)
+      setAppliedToast({
+        key: oomKey,
+        message: `VRAM headroom lowered to ${suggestedCoefficient.toFixed(2)} — try the generation again`,
+      })
+      setDismissed(d => new Set(d).add(oomKey))
+    } catch {
+      if (isCurrent()) setApplyError({ key: oomKey, message: APPLY_FAILURE_MESSAGE })
     } finally {
-      setApplying(false)
+      if (isCurrent()) {
+        applyingRef.current = false
+        setApplyingKey(current => current === oomKey ? null : current)
+      }
+      if (applyAbortControllerRef.current === controller) {
+        applyAbortControllerRef.current = null
+      }
     }
   }, [activeOom, updateSystemConfig])
 
+  const visibleAppliedToast = appliedToast?.key === activeOomKey ? appliedToast.message : null
+  const visibleApplyError = applyError?.key === activeOomKey ? applyError.message : null
+
   // Toast stays visible for 3s after apply; banner hides as soon as
   // it's dismissed (the OOM key is in the dismissed set).
-  if (appliedToast) {
+  if (visibleAppliedToast) {
     return (
-      <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-md">
-        <div className="bg-green-500/90 text-white text-sm rounded-lg shadow-xl px-4 py-2.5">
-          {appliedToast}
+      <div
+        className="pointer-events-none fixed inset-0 z-[60] flex max-h-[100vh] items-start justify-center supports-[height:100dvh]:max-h-[100dvh]"
+        style={safeViewportPadding}
+      >
+        <div
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="pointer-events-auto max-h-full max-w-md overflow-y-auto overscroll-contain rounded-lg bg-green-500/90 px-4 py-2.5 text-sm text-white shadow-xl"
+        >
+          {visibleAppliedToast}
         </div>
       </div>
     )
@@ -114,13 +201,20 @@ export function OomRecoveryBanner() {
   const canLower = !isDeliveryOom && machineControls && oom.suggested_coefficient !== null
   const deliveryTarget = oom.requested_target ? `Exact ${oom.requested_target} delivery` : 'Exact delivery'
   const retriedDelivery = (oom.retry_count ?? 0) > 0
+  const alertSummary = `${isDeliveryOom ? 'Delivery' : 'Generation'} ran out of VRAM. ${context}`
 
   return (
-    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-xl w-[calc(100%-2rem)]">
-      <div className="bg-bg-secondary border border-amber-500/40 rounded-lg shadow-2xl overflow-hidden">
+    <div
+      className="pointer-events-none fixed inset-0 z-[60] flex max-h-[100vh] items-start justify-center supports-[height:100dvh]:max-h-[100dvh]"
+      style={safeViewportPadding}
+    >
+      <div className="pointer-events-auto max-h-full w-full max-w-xl overflow-y-auto overscroll-contain rounded-lg border border-amber-500/40 bg-bg-secondary shadow-2xl">
+        <div className="sr-only" role="alert" aria-live="assertive" aria-atomic="true">
+          {alertSummary}
+        </div>
         {/* Header strip */}
         <div className="flex items-start gap-2.5 px-4 py-3 bg-amber-500/10">
-          <AlertTriangle size={18} className="text-indicator-warning shrink-0 mt-0.5" />
+          <AlertTriangle size={18} aria-hidden="true" className="mt-0.5 shrink-0 text-indicator-warning" />
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium text-text-primary">
               {isDeliveryOom ? 'Delivery ran out of VRAM' : 'Generation ran out of VRAM'}
@@ -130,11 +224,12 @@ export function OomRecoveryBanner() {
             </div>
           </div>
           <button
+            type="button"
             onClick={handleDismiss}
-            className="text-text-muted hover:text-text-primary p-0.5 rounded transition-colors shrink-0"
-            title="Dismiss"
+            className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded text-text-muted transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary motion-reduce:transition-none"
+            aria-label="Dismiss out-of-memory recovery notice"
           >
-            <X size={14} />
+            <X size={16} aria-hidden="true" />
           </button>
         </div>
 
@@ -159,10 +254,12 @@ export function OomRecoveryBanner() {
           )}
 
           {isDeliveryOom && activeOom.sourceJobId && activeOom.workspace && (
-            <H3DeliveryRecoveryStatus
-              sourceJobId={activeOom.sourceJobId}
-              workspace={activeOom.workspace}
-            />
+            <div className="[&_button]:min-h-11 [&_button]:min-w-11 [&_button]:transition-colors [&_button]:focus-visible:outline-none [&_button]:focus-visible:ring-2 [&_button]:focus-visible:ring-accent-blue [&_button]:focus-visible:ring-offset-2 [&_button]:focus-visible:ring-offset-bg-secondary [&_button]:motion-reduce:transition-none">
+              <H3DeliveryRecoveryStatus
+                sourceJobId={activeOom.sourceJobId}
+                workspace={activeOom.workspace}
+              />
+            </div>
           )}
 
           {canLower ? (
@@ -172,17 +269,29 @@ export function OomRecoveryBanner() {
                 <span className="font-mono text-indicator-warning">{oom.suggested_coefficient!.toFixed(2)}</span> to reserve more memory for generation spikes
                 (long videos, VAE decode). About ~5% slower per generation.
               </div>
-              <div className="flex items-center gap-2">
+              {visibleApplyError && (
+                <div
+                  role="alert"
+                  aria-live="assertive"
+                  aria-atomic="true"
+                  className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-[12px] leading-snug text-red-200"
+                >
+                  {visibleApplyError}
+                </div>
+              )}
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                 <button
+                  type="button"
                   onClick={handleApply}
                   disabled={applying}
-                  className="flex-1 px-3 py-2 rounded-md bg-amber-500 hover:bg-amber-400 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-wait"
+                  className="min-h-11 w-full flex-1 rounded-md bg-amber-500 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-200 focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary disabled:cursor-wait disabled:opacity-50 motion-reduce:transition-none sm:w-auto"
                 >
                   {applying ? 'Applying...' : `Lower headroom to ${oom.suggested_coefficient!.toFixed(2)}`}
                 </button>
                 <button
+                  type="button"
                   onClick={handleDismiss}
-                  className="px-3 py-2 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-tertiary text-sm transition-colors"
+                  className="min-h-11 min-w-11 w-full rounded-md px-3 py-2 text-sm text-text-secondary transition-colors hover:bg-bg-tertiary hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary motion-reduce:transition-none sm:w-auto"
                 >
                   Dismiss
                 </button>
@@ -199,8 +308,9 @@ export function OomRecoveryBanner() {
               </div>
               <div className="flex justify-end">
                 <button
+                  type="button"
                   onClick={handleDismiss}
-                  className="px-3 py-2 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-tertiary text-sm transition-colors"
+                  className="min-h-11 min-w-11 rounded-md px-3 py-2 text-sm text-text-secondary transition-colors hover:bg-bg-tertiary hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary motion-reduce:transition-none"
                 >
                   Dismiss
                 </button>
@@ -209,8 +319,9 @@ export function OomRecoveryBanner() {
           ) : (
             <div className="flex justify-end">
               <button
+                type="button"
                 onClick={handleDismiss}
-                className="px-3 py-2 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-tertiary text-sm transition-colors"
+                className="min-h-11 min-w-11 rounded-md px-3 py-2 text-sm text-text-secondary transition-colors hover:bg-bg-tertiary hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary motion-reduce:transition-none"
               >
                 Dismiss
               </button>
@@ -219,7 +330,7 @@ export function OomRecoveryBanner() {
 
           {machineControls && (
             <details className="text-[10px] text-text-muted">
-              <summary className="cursor-pointer hover:text-text-secondary">Show error details</summary>
+              <summary className="inline-flex min-h-11 cursor-pointer items-center rounded hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary">Show error details</summary>
               <div className="mt-1 font-mono text-[10px] bg-bg-primary/40 rounded px-2 py-1.5 break-all">
                 {oom.message}
               </div>

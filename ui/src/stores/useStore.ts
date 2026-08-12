@@ -1257,6 +1257,7 @@ const _PRIMARY_MODEL_DEFAULT_FIELDS: ReadonlyArray<string> = [
 // most recently requested model's options may touch the store.
 let _modelOptionsSeq = 0
 let _modelDefaultsSeq = 0
+let _directorResolutionOptionsSeq = 0
 let _loraLoadSeq = 0
 let _recipesLoadSeq = 0
 let _h3EstimateSeq = 0
@@ -1563,8 +1564,10 @@ const ENABLED_MODELS_KEY = 'maestro_enabled_models'
 let _modelVisibilityHydrated = false
 let _modelVisibilityDefaultsVersion = 1
 let _modelVisibilitySaveTask: Promise<void> = Promise.resolve()
+let _modelVisibilitySaveGeneration = 0
 
-function _saveEnabledModels(models: Set<string>) {
+function _saveEnabledModels(models: Set<string>): Promise<void> {
+  _modelVisibilitySaveGeneration += 1
   try {
     localStorage.setItem(ENABLED_MODELS_KEY, JSON.stringify([...models]))
   } catch { /* quota exceeded */ }
@@ -1581,6 +1584,72 @@ function _saveEnabledModels(models: Set<string>) {
         console.warn('Failed to persist model visibility:', error)
       }
     })
+  return _modelVisibilitySaveTask
+}
+
+async function _refreshDirectorModelAdmissionCatalog(
+  refreshCatalog: () => Promise<void>,
+): Promise<void> {
+  while (true) {
+    const generation = _modelVisibilitySaveGeneration
+    await _modelVisibilitySaveTask
+    await refreshCatalog()
+    await _modelVisibilitySaveTask
+    if (_modelVisibilitySaveGeneration === generation) return
+  }
+}
+
+interface DirectorReferenceRowsResult {
+  paths: string[]
+  labels: string[]
+}
+
+async function _resolveDirectorReferenceRows(
+  files: File[],
+  existingPaths: string[],
+  labels: string[],
+  component: 'character_reference' | 'location_reference',
+  upload: (file: File) => Promise<{ path: string }>,
+  assertCurrent: () => void = () => undefined,
+): Promise<DirectorReferenceRowsResult> {
+  // A shorter legacy path array may have been compacted after an upload
+  // failure, so it cannot safely identify which selected file it belongs to.
+  // Re-upload that selection instead of guessing and binding a path to the
+  // wrong label. Complete aligned arrays remain reusable by exact index.
+  const reusablePaths = files.length === 0 || existingPaths.length === files.length
+    ? existingPaths
+    : []
+  const rowCount = files.length > 0 ? files.length : reusablePaths.length
+  const rows = Array.from({ length: rowCount }, (_, index) => ({
+    index,
+    file: files[index],
+    path: reusablePaths[index] || '',
+    label: labels[index] || '',
+  }))
+  const settled = await Promise.allSettled(rows.map(async row => {
+    if (row.path) return row
+    if (!row.file) {
+      throw new api.DirectorRequestError('director_reference_unavailable', component, row.index)
+    }
+    assertCurrent()
+    try {
+      const uploaded = await upload(row.file)
+      assertCurrent()
+      return { ...row, path: uploaded.path }
+    } catch (error) {
+      if (_isBrowserAbort(error)) throw error
+      throw new api.DirectorRequestError('director_reference_unavailable', component, row.index)
+    }
+  }))
+  const failed = settled.find(
+    (result): result is PromiseRejectedResult => result.status === 'rejected',
+  )
+  if (failed) throw failed.reason
+  const resolved = settled.map(result => (result as PromiseFulfilledResult<typeof rows[number]>).value)
+  return {
+    paths: resolved.map(row => row.path),
+    labels: resolved.map(row => row.label),
+  }
 }
 
 function _loadEnabledModels(): Set<string> | null {
@@ -1708,6 +1777,21 @@ function getDefaultModelForMode(mode: GenerationMode, families: ModelFamily[], m
   }
   return ''
 }
+
+export type SystemConfigUpdateResult =
+  | { ok: true; updated: Record<string, unknown> }
+  | {
+      ok: false
+      code: 'cancelled' | 'request_failed' | 'timeout'
+      message: string
+    }
+
+const SYSTEM_CONFIG_UPDATE_TIMEOUT_MS = 15_000
+const SYSTEM_CONFIG_UPDATE_FAILURE_MESSAGE = 'System settings could not be updated. Check the connection and try again.'
+const SYSTEM_CONFIG_UPDATE_TIMEOUT_MESSAGE = 'System settings took too long to update. Check the connection and try again.'
+const SYSTEM_CONFIG_UPDATE_CANCELLED_MESSAGE = 'System settings update was interrupted. Try again.'
+let _systemConfigUpdateSequence = 0
+let _systemConfigUpdateController: AbortController | null = null
 
 interface AppState {
   // Generation mode (top-level: image/video/audio/avatar)
@@ -2328,7 +2412,10 @@ interface AppState {
   systemConfig: SystemConfig | null
   systemConfigLoading: boolean
   loadSystemConfig: () => Promise<void>
-  updateSystemConfig: (partial: Partial<SystemConfig>) => Promise<void>
+  updateSystemConfig: (
+    partial: Partial<SystemConfig>,
+    signal?: AbortSignal,
+  ) => Promise<SystemConfigUpdateResult>
 
   // Hardware detect — populated lazily when Settings → System opens.
   // Shared between AutoPerformanceCard (the readout) and the rest of
@@ -2466,6 +2553,7 @@ interface AppState {
    *  "Analyzing audio..." in the UI when null. */
   directorLoadingMessage: string | null
   directorError: string | null
+  directorComponentError: api.DirectorComponentFailure | null
   directorReferenceImage: File | null
   directorReferenceImagePath: string | null
   directorCharacterRefs: File[]
@@ -2491,6 +2579,10 @@ interface AppState {
   directorSkill: DirectorSkill | null
   directorResolution: ResolutionPreset
   directorAspectRatio: AspectRatio
+  directorResolutionModelType: string | null
+  directorResolutionOptions: ModelOptions | null
+  directorResolutionOptionsLoading: boolean
+  directorResolutionOptionsError: string | null
   directorCapabilities: api.DirectorCapabilities | null
   directorCapabilitiesExplicitOutput: boolean | null
   directorCapabilitiesLoading: boolean
@@ -2511,6 +2603,7 @@ interface AppState {
   setDirectorSkill: (skill: DirectorSkill) => void
   setDirectorResolution: (preset: ResolutionPreset) => void
   setDirectorAspectRatio: (ratio: AspectRatio) => void
+  loadDirectorResolutionOptions: (modelType: string) => Promise<ModelOptions | null>
   loadDirectorCapabilities: (options?: {
     explicitOutput?: boolean
     force?: boolean
@@ -2816,7 +2909,7 @@ const BLANK_VIDEO_INPUT_PARAMS: Partial<GenerateParams> = {
   input_video_strength: undefined,
 }
 
-const resolutionMap: Record<ResolutionPreset, Record<AspectRatio, string>> = {
+const resolutionMap: Partial<Record<ResolutionPreset, Record<AspectRatio, string>>> = {
   'auto': {
     'auto': 'auto',
     '16:9': 'auto',
@@ -2870,6 +2963,16 @@ export function resolveResolution(
     || resolutionMap[preset]?.[ratio]
     || resolutionMap[preset]?.['16:9']
     || '1280x720'
+}
+
+export function resolveDeclaredResolution(
+  modelOptions: ModelOptions | null,
+  preset: ResolutionPreset,
+  ratio: AspectRatio,
+): string | null {
+  if (!modelOptions?.resolution_preset_order?.includes(preset)) return null
+  if (ratio === 'auto' && modelOptions.supports_auto_aspect !== true) return null
+  return modelOptions.resolution_presets?.[preset]?.values?.[ratio] || null
 }
 
 // Memoization cache for filteredOutputs — ensures stable references
@@ -2962,18 +3065,29 @@ async function _captureDirectorImageRoleRequest(
   const editorOverride = state.directorImageEditorModelOverride.trim()
   const effectiveCreator = creatorOverride || capabilities.image_roles.creator.resolved_model
   const effectiveEditor = editorOverride || capabilities.image_roles.editor.resolved_model
-  if (!effectiveCreator || !effectiveEditor) {
-    throw new Error('A Director image role default is unavailable in this session. Select an authorized model or use Maestro locally.')
-  }
+  if (!effectiveCreator) throw new api.DirectorRequestError(
+    'director_model_unavailable',
+    'image_creator_model',
+  )
+  if (!effectiveEditor) throw new api.DirectorRequestError(
+    'director_model_unavailable',
+    'continuity_editor_model',
+  )
   const roleModels = [
     ['creator', effectiveCreator, capabilities.image_roles.creator.candidates] as const,
     ['editor', effectiveEditor, capabilities.image_roles.editor.candidates] as const,
   ]
   for (const [role, modelType, candidates] of roleModels) {
     const candidate = candidates.find(item => item.model_type === modelType)
-    if (!candidate) throw new Error(`The selected Director image ${role} is not visible in this session.`)
+    const component = role === 'creator' ? 'image_creator_model' : 'continuity_editor_model'
+    if (!candidate) throw new api.DirectorRequestError('director_model_unavailable', component)
     if (!candidate.compatible || !candidate.ready) {
-      throw new Error(`The selected Director image ${role} is not ready: ${candidate.reasons.join(', ') || 'unavailable'}.`)
+      const code = candidate.reasons.includes('model_terms_required')
+        ? 'director_model_terms_required'
+        : candidate.reasons.includes('model_unavailable')
+          ? 'director_model_unavailable'
+          : 'director_model_not_ready'
+      throw new api.DirectorRequestError(code, component)
     }
   }
   const creatorLoras = state.directorImageRoleLoras.creator
@@ -2983,10 +3097,21 @@ async function _captureDirectorImageRoleRequest(
     ['editor', effectiveEditor, editorLoras] as const,
   ]) {
     if (selections.length === 0) continue
-    const catalog = await api.fetchLoraDetails(modelType)
+    let catalog: Awaited<ReturnType<typeof api.fetchLoraDetails>>
+    try {
+      catalog = await api.fetchLoraDetails(modelType)
+    } catch {
+      throw new api.DirectorRequestError(
+        'director_role_lora_unavailable',
+        role === 'creator' ? 'image_creator_lora' : 'continuity_editor_lora',
+      )
+    }
     const errors = api.validateDirectorImageRoleLoraSelections(selections, catalog.loras)
     if (errors.length > 0) {
-      throw new Error(`Director ${role} LoRAs need attention: ${errors.join(' ')}`)
+      throw new api.DirectorRequestError(
+        'director_role_lora_unavailable',
+        role === 'creator' ? 'image_creator_lora' : 'continuity_editor_lora',
+      )
     }
   }
   return {
@@ -3012,6 +3137,23 @@ let _supportCatalogRequestSequence = 0
 let _supportSelfRequestSequence = 0
 let _responsibleUseRequestSequence = 0
 let _responsibleUseAcceptanceSequence = 0
+let _accountContextRequestSequence = 0
+let _accountSessionsRequestSequence = 0
+let _accountUsersRequestSequence = 0
+let _accountMutationRequestSequence = 0
+let _accessContextRequestSequence = 0
+
+function _invalidateAccountRequests(): void {
+  _accessContextRequestSequence += 1
+  _accountContextRequestSequence += 1
+  _accountSessionsRequestSequence += 1
+  _accountUsersRequestSequence += 1
+}
+
+function _beginAccountMutation(): number {
+  _invalidateAccountRequests()
+  return ++_accountMutationRequestSequence
+}
 
 export const useStore = create<AppState>((set, get) => ({
   // Generation mode
@@ -4749,8 +4891,9 @@ export const useStore = create<AppState>((set, get) => ({
 
       // Hydrate persisted per-mode settings from localStorage.
       //
-      // Deliberately PARTIAL: only the last generation mode and the
-      // per-mode model selections survive a page refresh. The working
+      // Deliberately PARTIAL: the last generation mode and per-mode model
+      // selections survive a page refresh; video is also seeded below so
+      // Director never displays a model that is absent from its state. The working
       // state — prompt text and Advanced settings (seed, steps, LoRA
       // selection, …) — starts fresh from the model's defaults on every
       // load. The per-mode snapshots (savedParamsPerMode /
@@ -4770,13 +4913,23 @@ export const useStore = create<AppState>((set, get) => ({
       }
       let mode = get().generationMode
       let initialModelType: string
+      const savedVideoModel = (saved?.selectedModelPerMode?.video || '').trim()
+      const initialVideoModelType = savedVideoModel && models.some(model => (
+        model.model_type === savedVideoModel
+        && getModelMode(model.model_type, model.family) === 'video'
+      ))
+        ? savedVideoModel
+        : getDefaultModelForMode('video', families, models)
 
       if (saved) {
         // Restore saved generation mode
         mode = saved.generationMode || mode
         // Validate saved model for this mode still exists
         const savedModel = saved.selectedModelPerMode?.[mode]
-        initialModelType = savedModel && models.some(m => m.model_type === savedModel)
+        initialModelType = savedModel && models.some(model => (
+          model.model_type === savedModel
+          && getModelMode(model.model_type, model.family) === mode
+        ))
           ? savedModel
           : getDefaultModelForMode(mode, families, models)
         const bootedIntoRecast = mode === 'avatar'
@@ -4797,7 +4950,11 @@ export const useStore = create<AppState>((set, get) => ({
           // Seed the VALIDATED boot model into the map (the saved entry
           // may point at a removed model) — _applyModelDefaults' race
           // guard compares against selectedModelPerMode[mode].
-          selectedModelPerMode: { ...(saved.selectedModelPerMode || {}), [mode]: initialModelType },
+          selectedModelPerMode: {
+            ...(saved.selectedModelPerMode || {}),
+            video: initialVideoModelType,
+            [mode]: initialModelType,
+          },
           // Mode-shaping mirrored from setGenerationMode: booting into
           // image mode needs image_mode 1 + Auto resolution. These used
           // to arrive via the restored params snapshot.
@@ -4814,7 +4971,7 @@ export const useStore = create<AppState>((set, get) => ({
           families,
           models,
           modelsLoaded: true,
-          selectedModelPerMode: { [mode]: initialModelType },
+          selectedModelPerMode: { video: initialVideoModelType, [mode]: initialModelType },
           ...(mode === 'image' ? { resolutionPreset: 'auto' as ResolutionPreset, aspectRatio: 'auto' as AspectRatio } : {}),
           params: {
             ...s.params,
@@ -7735,21 +7892,34 @@ export const useStore = create<AppState>((set, get) => ({
   // System config
   accessContext: null,
   loadAccessContext: async () => {
+    const requestSequence = ++_accessContextRequestSequence
+    const accountProjectionSequence = _accountContextRequestSequence
     const context = await api.fetchAccessContext()
+    if (requestSequence !== _accessContextRequestSequence) return context
     const previous = get().accountContext
-    const next = context.accounts ?? null
+    const accountProjectionCurrent = accountProjectionSequence === _accountContextRequestSequence
+    const next = accountProjectionCurrent ? context.accounts ?? null : previous
+    const projectedAccessContext = accountProjectionCurrent
+      ? context
+      : { ...context, accounts: next ?? undefined }
     const supportIdentityChanged = previous?.account?.id !== next?.account?.id
       || previous?.capabilities.includes('account.self') !== next?.capabilities.includes('account.self')
     if (supportIdentityChanged) {
+      _accountSessionsRequestSequence += 1
+      _accountUsersRequestSequence += 1
       _supportSelfRequestSequence += 1
       _responsibleUseRequestSequence += 1
       _responsibleUseAcceptanceSequence += 1
       _supportAdminRequestSequence += 1
     }
     set({
-      accessContext: context,
+      accessContext: projectedAccessContext,
       accountContext: next,
+      accountContextLoading: false,
       ...(supportIdentityChanged ? {
+        accountSessions: [],
+        accountUsers: [],
+        accountDetailsLoading: false,
         supportSelf: null,
         responsibleUse: null,
         supportAdminAccountId: null,
@@ -7785,7 +7955,14 @@ export const useStore = create<AppState>((set, get) => ({
         })
   },
   loadAccountContext: async () => {
-    if (get().accessContext?.accounts?.enabled !== true) {
+    const accessAccounts = get().accessContext?.accounts
+    if (accessAccounts?.enabled !== true) {
+      // A null access bootstrap is still in flight; do not supersede its
+      // account projection merely because the drawer opened early. An
+      // explicit accounts-disabled projection does invalidate older loads.
+      if (accessAccounts) _accountContextRequestSequence += 1
+      _accountSessionsRequestSequence += 1
+      _accountUsersRequestSequence += 1
       _supportSelfRequestSequence += 1
       _responsibleUseRequestSequence += 1
       _responsibleUseAcceptanceSequence += 1
@@ -7803,13 +7980,17 @@ export const useStore = create<AppState>((set, get) => ({
       })
       return get().accessContext?.accounts ?? null
     }
+    const requestSequence = ++_accountContextRequestSequence
     set({ accountContextLoading: true })
     try {
       const context = await api.fetchAccountContext()
+      if (requestSequence !== _accountContextRequestSequence) return null
       const previous = get().accountContext
       const supportIdentityChanged = previous?.account?.id !== context.account?.id
         || previous?.capabilities.includes('account.self') !== context.capabilities.includes('account.self')
       if (supportIdentityChanged) {
+        _accountSessionsRequestSequence += 1
+        _accountUsersRequestSequence += 1
         _supportSelfRequestSequence += 1
         _responsibleUseRequestSequence += 1
         _responsibleUseAcceptanceSequence += 1
@@ -7828,6 +8009,7 @@ export const useStore = create<AppState>((set, get) => ({
           ...(identityChanged || selfUnavailable ? {
             accountSessions: [],
             accountUsers: [],
+            accountDetailsLoading: false,
             supportSelf: null,
             responsibleUse: null,
             supportAdminAccountId: null,
@@ -7845,13 +8027,18 @@ export const useStore = create<AppState>((set, get) => ({
       })
       return context
     } catch (error) {
-      set({ accountContextLoading: false })
+      if (requestSequence === _accountContextRequestSequence) {
+        set({ accountContextLoading: false })
+      }
       throw error
     }
   },
   bootstrapAccount: async (input) => {
+    const mutationSequence = _beginAccountMutation()
     const result = await api.bootstrapAccount(input)
+    if (mutationSequence !== _accountMutationRequestSequence) return result
     await get().loadAccountContext().catch(() => null)
+    if (mutationSequence !== _accountMutationRequestSequence) return result
     await Promise.all([
       get().loadAccountSessions().catch(() => undefined),
       get().loadAccountUsers().catch(() => undefined),
@@ -7859,8 +8046,11 @@ export const useStore = create<AppState>((set, get) => ({
     return result
   },
   loginAccount: async (input) => {
+    const mutationSequence = _beginAccountMutation()
     const result = await api.loginAccount(input)
+    if (mutationSequence !== _accountMutationRequestSequence) return result
     await get().loadAccountContext().catch(() => null)
+    if (mutationSequence !== _accountMutationRequestSequence) return result
     await Promise.all([
       get().loadAccountSessions().catch(() => undefined),
       get().loadAccountUsers().catch(() => undefined),
@@ -7868,7 +8058,9 @@ export const useStore = create<AppState>((set, get) => ({
     return result
   },
   logoutAccount: async () => {
+    const mutationSequence = _beginAccountMutation()
     await api.logoutAccount()
+    if (mutationSequence !== _accountMutationRequestSequence) return
     _supportSelfRequestSequence += 1
     _responsibleUseRequestSequence += 1
     _responsibleUseAcceptanceSequence += 1
@@ -7885,6 +8077,8 @@ export const useStore = create<AppState>((set, get) => ({
         : null,
       accountSessions: [],
       accountUsers: [],
+      accountContextLoading: false,
+      accountDetailsLoading: false,
       supportSelf: null,
       responsibleUse: null,
       supportAdminAccountId: null,
@@ -7894,12 +8088,17 @@ export const useStore = create<AppState>((set, get) => ({
     await get().loadAccountContext().catch(() => null)
   },
   reauthenticateAccount: async (password) => {
+    const mutationSequence = _beginAccountMutation()
     await api.reauthenticateAccount(password)
+    if (mutationSequence !== _accountMutationRequestSequence) return
     await get().loadAccountContext().catch(() => null)
   },
   recoverAccount: async (input) => {
+    const mutationSequence = _beginAccountMutation()
     const result = await api.recoverAccount(input)
+    if (mutationSequence !== _accountMutationRequestSequence) return result
     await get().loadAccountContext().catch(() => null)
+    if (mutationSequence !== _accountMutationRequestSequence) return result
     await Promise.all([
       get().loadAccountSessions().catch(() => undefined),
       get().loadAccountUsers().catch(() => undefined),
@@ -7907,7 +8106,9 @@ export const useStore = create<AppState>((set, get) => ({
     return result
   },
   changeAccountPassword: async (newPassword) => {
+    const mutationSequence = _beginAccountMutation()
     await api.changeAccountPassword(newPassword)
+    if (mutationSequence !== _accountMutationRequestSequence) return
     await Promise.all([
       get().loadAccountContext().catch(() => null),
       get().loadAccountSessions().catch(() => undefined),
@@ -7918,20 +8119,38 @@ export const useStore = create<AppState>((set, get) => ({
     return result.recovery_codes
   },
   loadAccountSessions: async () => {
-    if (!get().accountContext?.capabilities.includes('account.self')) {
-      set({ accountSessions: [] })
+    const requestSequence = ++_accountSessionsRequestSequence
+    const context = get().accountContext
+    const accountId = context?.authenticated === true ? context.account?.id : null
+    if (!accountId || !context?.capabilities.includes('account.self')) {
+      set({ accountSessions: [], accountDetailsLoading: false })
       return
     }
     set({ accountDetailsLoading: true })
     try {
       const result = await api.fetchAccountSessions()
+      const current = get().accountContext
+      if (
+        requestSequence !== _accountSessionsRequestSequence
+        || current?.authenticated !== true
+        || current.account?.id !== accountId
+        || !current.capabilities.includes('account.self')
+      ) return
       set({ accountSessions: result.sessions, accountDetailsLoading: false })
     } catch (error) {
-      set({ accountDetailsLoading: false })
+      const current = get().accountContext
+      if (
+        requestSequence === _accountSessionsRequestSequence
+        && current?.authenticated === true
+        && current.account?.id === accountId
+      ) {
+        set({ accountDetailsLoading: false })
+      }
       throw error
     }
   },
   revokeAccountSession: async (sessionHandle) => {
+    _invalidateAccountRequests()
     const result = await api.revokeAccountSession(sessionHandle)
     if (result.current) {
       set({ accountSessions: [], accountUsers: [] })
@@ -7942,6 +8161,7 @@ export const useStore = create<AppState>((set, get) => ({
     return result.current
   },
   revokeAllAccountSessions: async (retainCurrent) => {
+    _invalidateAccountRequests()
     const result = await api.revokeAllAccountSessions(retainCurrent)
     if (result.current_revoked) {
       set({ accountSessions: [], accountUsers: [] })
@@ -7952,21 +8172,45 @@ export const useStore = create<AppState>((set, get) => ({
     return result.revoked
   },
   loadAccountUsers: async () => {
+    const requestSequence = ++_accountUsersRequestSequence
     const context = get().accountContext
+    const accountId = context?.authenticated === true ? context.account?.id : null
     if (
-      context?.reauthenticated !== true
+      !accountId
+      || context?.reauthenticated !== true
       || !context.capabilities.includes('accounts.admin')
       || !context.capabilities.includes('services.admin')
     ) {
-      set({ accountUsers: [], supportAdminAccountId: null, supportAdmin: null })
+      set({
+        accountUsers: [],
+        accountDetailsLoading: false,
+        supportAdminAccountId: null,
+        supportAdmin: null,
+      })
       return
     }
     set({ accountDetailsLoading: true })
     try {
       const result = await api.fetchServerAccounts()
+      const current = get().accountContext
+      if (
+        requestSequence !== _accountUsersRequestSequence
+        || current?.authenticated !== true
+        || current.account?.id !== accountId
+        || current.reauthenticated !== true
+        || !current.capabilities.includes('accounts.admin')
+        || !current.capabilities.includes('services.admin')
+      ) return
       set({ accountUsers: result.accounts, accountDetailsLoading: false })
     } catch (error) {
-      set({ accountDetailsLoading: false })
+      const current = get().accountContext
+      if (
+        requestSequence === _accountUsersRequestSequence
+        && current?.authenticated === true
+        && current.account?.id === accountId
+      ) {
+        set({ accountDetailsLoading: false })
+      }
       throw error
     }
   },
@@ -8178,15 +8422,73 @@ export const useStore = create<AppState>((set, get) => ({
       set({ systemConfigLoading: false })
     }
   },
-  updateSystemConfig: async (partial) => {
+  updateSystemConfig: async (partial, signal) => {
+    const updateSequence = ++_systemConfigUpdateSequence
+    _systemConfigUpdateController?.abort()
+    const controller = new AbortController()
+    _systemConfigUpdateController = controller
+    const abortFromCaller = () => controller.abort()
+    if (signal?.aborted) controller.abort()
+    else signal?.addEventListener('abort', abortFromCaller, { once: true })
+    let timedOut = false
+    let timeoutId: number | undefined
     try {
-      await api.updateSystemConfig(partial)
+      const response = await Promise.race([
+        api.updateSystemConfig(partial, controller.signal),
+        new Promise<never>((_, reject) => {
+          timeoutId = window.setTimeout(() => {
+            timedOut = true
+            controller.abort()
+            reject(new Error('system config update timed out'))
+          }, SYSTEM_CONFIG_UPDATE_TIMEOUT_MS)
+        }),
+      ])
+      if (controller.signal.aborted) throw new DOMException('System config update aborted', 'AbortError')
       set(s => ({
         systemConfig: s.systemConfig ? { ...s.systemConfig, ...partial } : null,
       }))
+      if (updateSequence === _systemConfigUpdateSequence) {
+        set({ systemConfigLoading: false })
+      }
+      return { ok: true, updated: response.updated }
     } catch (e) {
-      console.error('Failed to update system config:', e)
-      get().loadSystemConfig()
+      const cancelled = controller.signal.aborted && !timedOut
+      if (cancelled) {
+        if (updateSequence === _systemConfigUpdateSequence) {
+          set({ systemConfigLoading: false })
+        }
+      } else {
+        console.error('Failed to update system config:', e)
+        if (updateSequence === _systemConfigUpdateSequence) {
+          set({ systemConfigLoading: true })
+        }
+        void api.fetchSystemConfig()
+          .then(config => {
+            if (updateSequence !== _systemConfigUpdateSequence) return
+            set({ systemConfig: config, systemConfigLoading: false })
+          })
+          .catch(error => {
+            console.error('Failed to reconcile system config:', error)
+            if (updateSequence === _systemConfigUpdateSequence) {
+              set({ systemConfigLoading: false })
+            }
+          })
+      }
+      return {
+        ok: false,
+        code: timedOut ? 'timeout' : cancelled ? 'cancelled' : 'request_failed',
+        message: timedOut
+          ? SYSTEM_CONFIG_UPDATE_TIMEOUT_MESSAGE
+          : cancelled
+            ? SYSTEM_CONFIG_UPDATE_CANCELLED_MESSAGE
+            : SYSTEM_CONFIG_UPDATE_FAILURE_MESSAGE,
+      }
+    } finally {
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+      signal?.removeEventListener('abort', abortFromCaller)
+      if (_systemConfigUpdateController === controller) {
+        _systemConfigUpdateController = null
+      }
     }
   },
 
@@ -8498,6 +8800,7 @@ export const useStore = create<AppState>((set, get) => ({
   directorLoading: false,
   directorLoadingMessage: null,
   directorError: null,
+  directorComponentError: null,
   directorReferenceImage: null,
   directorReferenceImagePath: null,
   directorCharacterRefs: [],
@@ -8570,6 +8873,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
   directorResolution: '720p' as ResolutionPreset,
   directorAspectRatio: '16:9' as AspectRatio,
+  directorResolutionModelType: null,
+  directorResolutionOptions: null,
+  directorResolutionOptionsLoading: false,
+  directorResolutionOptionsError: null,
   directorCapabilities: null,
   directorCapabilitiesExplicitOutput: null,
   directorCapabilitiesLoading: false,
@@ -8618,6 +8925,49 @@ export const useStore = create<AppState>((set, get) => ({
   },
   setDirectorResolution: (preset) => set({ directorResolution: preset }),
   setDirectorAspectRatio: (ratio) => set({ directorAspectRatio: ratio }),
+  loadDirectorResolutionOptions: async (modelType) => {
+    const target = modelType.trim()
+    const seq = ++_directorResolutionOptionsSeq
+    if (!target) {
+      set({
+        directorResolutionModelType: null,
+        directorResolutionOptions: null,
+        directorResolutionOptionsLoading: false,
+        directorResolutionOptionsError: null,
+      })
+      return null
+    }
+    set({
+      directorResolutionModelType: target,
+      directorResolutionOptions: null,
+      directorResolutionOptionsLoading: true,
+      directorResolutionOptionsError: null,
+    })
+    try {
+      const options = await api.fetchModelOptions(target)
+      if (seq !== _directorResolutionOptionsSeq) return null
+      if (options.model_type !== target) {
+        throw new Error('The server returned resolution options for a different model.')
+      }
+      set({
+        directorResolutionModelType: target,
+        directorResolutionOptions: options,
+        directorResolutionOptionsLoading: false,
+        directorResolutionOptionsError: null,
+      })
+      return options
+    } catch (error) {
+      if (seq !== _directorResolutionOptionsSeq) return null
+      set({
+        directorResolutionOptions: null,
+        directorResolutionOptionsLoading: false,
+        directorResolutionOptionsError: error instanceof Error
+          ? error.message
+          : 'Could not load Director resolution options.',
+      })
+      return null
+    }
+  },
   setDirectorVideoInferenceSteps: (modelType, steps) => set(s => {
     const next = { ...s.directorVideoInferenceStepsByModel }
     if (steps == null || !Number.isFinite(steps)) delete next[modelType]
@@ -8703,19 +9053,22 @@ export const useStore = create<AppState>((set, get) => ({
 
   setDirectorImageRoleModel: (role, modelType) => {
     set(role === 'creator'
-      ? { directorImageCreatorModelOverride: modelType }
-      : { directorImageEditorModelOverride: modelType })
+      ? { directorImageCreatorModelOverride: modelType, directorComponentError: null, directorError: null }
+      : { directorImageEditorModelOverride: modelType, directorComponentError: null, directorError: null })
     get().activateDirectorImageRoles()
   },
 
   setDirectorImageRoleLoras: (role, selections) => {
     set(s => ({
       directorImageRoleLoras: { ...s.directorImageRoleLoras, [role]: selections },
+      directorComponentError: null,
+      directorError: null,
     }))
     get().activateDirectorImageRoles()
   },
 
   selectDirectorVideoModel: async (modelType) => {
+    set({ directorComponentError: null, directorError: null })
     if (get().generationMode === 'video') {
       await get().selectModel(modelType)
       return
@@ -9145,7 +9498,10 @@ export const useStore = create<AppState>((set, get) => ({
     set({ directorStep: 'style', directorLoading: false })
   },
 
-  directorSetReferenceImage: (file) => set({ directorReferenceImage: file }),
+  directorSetReferenceImage: (file) => set({
+    directorReferenceImage: file,
+    directorReferenceImagePath: null,
+  }),
   directorAddCharacterRef: (file) => set(s => ({
     directorCharacterRefs: [...s.directorCharacterRefs, file],
     directorCharacterRefLabels: [...s.directorCharacterRefLabels, ''],
@@ -9432,7 +9788,23 @@ export const useStore = create<AppState>((set, get) => ({
     const requestExplicitOutput = initialState.explicitOutput
     const requestPrivateOutput = initialState.privateOutput
     const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
-    const directorRes = resolveResolution(null, directorResolution, directorAspectRatio)
+    const imageResolutionOptions = new Map<string, Promise<ModelOptions>>()
+
+    const exactImageResolution = async (modelType: string): Promise<string> => {
+      let request = imageResolutionOptions.get(modelType)
+      if (!request) {
+        request = api.fetchModelOptions(modelType)
+        imageResolutionOptions.set(modelType, request)
+      }
+      const options = await request
+      const resolution = resolveDeclaredResolution(
+        options, directorResolution, directorAspectRatio,
+      )
+      if (!resolution) {
+        throw new Error('The selected resolution is unavailable for this Director image role.')
+      }
+      return resolution
+    }
 
     // Submit one image generation through the shared queue-aware job tracker,
     // then download the terminal result as a File.
@@ -9440,6 +9812,7 @@ export const useStore = create<AppState>((set, get) => ({
       const effectiveModel = refs.length > 0
         ? imageRoleRequest.effective_editor_model
         : imageRoleRequest.effective_creator_model
+      const directorRes = await exactImageResolution(effectiveModel)
       const genParams = {
         ...imageRoleRequest.wire,
         prompt,
@@ -9593,8 +9966,16 @@ export const useStore = create<AppState>((set, get) => ({
             selectedModelPerMode, savedParamsPerMode, savedLoraPerMode } = get()
     if (!directorClipPlans.length) return
 
-    // Use saved video-mode settings if available
-    const videoModel = selectedModelPerMode.video || 'ltx2_22B_distilled_1_1'
+    // Use the authoritative video-mode selection seeded during model hydration.
+    const videoModel = (selectedModelPerMode.video || '').trim()
+    if (!videoModel) {
+      const error = new api.DirectorRequestError('director_model_unavailable', 'video_model')
+      set({
+        directorError: error.message,
+        directorComponentError: { code: error.code, component: error.component, message: error.message },
+      })
+      return
+    }
     const savedVideoParams = savedParamsPerMode.video
     const videoParams = savedVideoParams?.model_type === videoModel
       ? { ...savedVideoParams }
@@ -9670,10 +10051,31 @@ export const useStore = create<AppState>((set, get) => ({
             selectedModelPerMode, savedParamsPerMode, savedLoraPerMode } = get()
     if (!directorClipPlans.length) return
 
-    // Use saved video-mode settings if available, override resolution with director's choice
-    const videoModel = selectedModelPerMode.video || 'ltx2_22B_distilled_1_1'
-    const directorVideoOptions = get().modelOptions?.model_type === videoModel ? get().modelOptions : null
-    const directorRes = resolveResolution(directorVideoOptions, directorResolution, directorAspectRatio)
+    // Use the authoritative video-mode selection, then override resolution
+    // with Director's choice.
+    const videoModel = (selectedModelPerMode.video || '').trim()
+    if (!videoModel) {
+      const error = new api.DirectorRequestError('director_model_unavailable', 'video_model')
+      set({
+        directorError: error.message,
+        directorComponentError: { code: error.code, component: error.component, message: error.message },
+      })
+      return
+    }
+    const resolutionState = get()
+    const directorVideoOptions = (
+      resolutionState.directorResolutionModelType === videoModel
+      && resolutionState.directorResolutionOptions?.model_type === videoModel
+    ) ? resolutionState.directorResolutionOptions : null
+    const directorRes = resolveDeclaredResolution(
+      directorVideoOptions, directorResolution, directorAspectRatio,
+    )
+    if (!directorRes) {
+      set({
+        directorError: 'The selected resolution is unavailable for this Director video model.',
+      })
+      return
+    }
     const savedVideoParams = savedParamsPerMode.video || {}
     const matchingVideoParams = savedVideoParams.model_type === videoModel ? savedVideoParams : {}
     const defaultSteps = directorVideoOptions?.default_num_inference_steps ?? 8
@@ -9687,7 +10089,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     const videoLora = savedLoraPerMode.video
 
-    const fps = get().modelOptions?.fps ?? 16
+    const fps = directorVideoOptions?.fps ?? 16
     const totalDuration = directorAnalysis?.duration ?? 180
     const totalDurationCapped = Math.min(totalDuration, 300)
 
@@ -9759,6 +10161,7 @@ export const useStore = create<AppState>((set, get) => ({
     _stopDirectorPreparationPoll()
     _storeDirectorPreparation(null, null)
     _directorPipelineLifecycleToken = null
+    ++_directorResolutionOptionsSeq
     set({
       sidebarMode: 'studio' as const,
       directorStep: 'upload',
@@ -9773,6 +10176,11 @@ export const useStore = create<AppState>((set, get) => ({
       directorCustomVisualStyle: '',
       directorLoading: false,
       directorError: null,
+      directorComponentError: null,
+      directorResolutionModelType: null,
+      directorResolutionOptions: null,
+      directorResolutionOptionsLoading: false,
+      directorResolutionOptionsError: null,
       directorReferenceImage: null,
       directorReferenceImagePath: null,
       directorCharacterRefs: [],
@@ -11618,15 +12026,23 @@ export const useStore = create<AppState>((set, get) => ({
 
     // Derive resolution preset and aspect ratio
     const res = newParams.resolution || '1280x720'
-    for (const [preset, ratioMap] of Object.entries(resolutionMap)) {
+    const declaredResolutionMaps = Object.entries(
+      get().modelOptions?.resolution_presets || {},
+    ).map(([preset, definition]) => [preset, definition?.values || {}] as const)
+    const legacyResolutionMaps = Object.entries(resolutionMap)
+    let restoredResolutionSelection = false
+    for (const [preset, ratioMap] of [...declaredResolutionMaps, ...legacyResolutionMaps]) {
       for (const [ratio, value] of Object.entries(ratioMap)) {
         if (value === res) {
           set({
             resolutionPreset: preset as ResolutionPreset,
             aspectRatio: ratio as AspectRatio,
           })
+          restoredResolutionSelection = true
+          break
         }
       }
+      if (restoredResolutionSelection) break
     }
 
     // Restore start/end images from upload URLs as File objects. Prefer
@@ -12024,26 +12440,147 @@ export const useStore = create<AppState>((set, get) => ({
             shortFilmPath, shortFilmCharacters, shortFilmTargetDuration,
             shortFilmNarrative } = state
 
+    set({ directorError: null, directorComponentError: null })
     const lifecycle = _beginDirectorPipelineLifecycle(requestWorkspace)
     try {
+    // Model visibility writes are serialized. Await the current tail before
+    // and after the catalog refresh so an immediate Director submission
+    // cannot race a just-enabled exact recipe or a one-time visibility write.
+    await _refreshDirectorModelAdmissionCatalog(() => get().loadModels())
+    if (!lifecycle.ownsWorkspace()) return
     await _ensureSelectedH3StyleWorkflowReady(get)
     const imageRoleRequest = await _captureDirectorImageRoleRequest(get, state.explicitOutput)
-    const selectedImageCreatorModel = imageRoleRequest.effective_creator_model
     const workflowRequestState = get()
+    const selectedVideoPreference = (workflowRequestState.selectedModelPerMode.video || '').trim()
+    if (!selectedVideoPreference) {
+      throw new api.DirectorRequestError('director_model_unavailable', 'video_model')
+    }
     const h3WorkflowRequest = captureH3StyleWorkflowRequest(
       workflowRequestState.h3StyleWorkflowCatalog,
-      workflowRequestState.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1',
+      selectedVideoPreference,
       workflowRequestState.h3StyleWorkflow,
     )
     const selectedVideoModel = h3WorkflowRequest.video_model
-    const [videoModelDefaults, imageCreatorModelOptions, videoModelOptions] = await Promise.all([
+    const pipelineType: api.DirectorPipelineType = shortFilmPath === 'story'
+      ? 'short_film_story'
+      : shortFilmPath === 'audio'
+        ? 'short_film_audio'
+        : 'music_video'
+
+    // Resolve every selected local reference before claiming its presence to
+    // preflight. All uploads settle, but paths and labels are committed only
+    // when the complete indexed selection succeeds.
+    const assertCurrent = () => {
+      if (!lifecycle.ownsWorkspace()) {
+        throw new DOMException('The browser stopped waiting', 'AbortError')
+      }
+    }
+    const referenceUploads = await Promise.allSettled([
+      (async () => {
+        if (directorReferenceImagePath) return directorReferenceImagePath
+        if (!state.directorReferenceImage) return null
+        assertCurrent()
+        try {
+          const uploaded = await api.uploadImage(state.directorReferenceImage)
+          assertCurrent()
+          return uploaded.path
+        } catch (error) {
+          if (_isBrowserAbort(error)) throw error
+          throw new api.DirectorRequestError('director_reference_unavailable', 'starting_image')
+        }
+      })(),
+      _resolveDirectorReferenceRows(
+        state.directorCharacterRefs,
+        state.directorCharacterRefPaths,
+        state.directorCharacterRefLabels,
+        'character_reference',
+        api.uploadImage,
+        assertCurrent,
+      ),
+      _resolveDirectorReferenceRows(
+        state.directorLocationRefs,
+        state.directorLocationRefPaths,
+        state.directorLocationRefLabels,
+        'location_reference',
+        api.uploadImage,
+        assertCurrent,
+      ),
+    ])
+    if (!lifecycle.ownsWorkspace()) return
+    const failedReferenceUpload = referenceUploads.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    )
+    if (failedReferenceUpload) throw failedReferenceUpload.reason
+    const refImagePath = (
+      referenceUploads[0] as PromiseFulfilledResult<string | null>
+    ).value
+    const characterReferences = (
+      referenceUploads[1] as PromiseFulfilledResult<DirectorReferenceRowsResult>
+    ).value
+    const locationReferences = (
+      referenceUploads[2] as PromiseFulfilledResult<DirectorReferenceRowsResult>
+    ).value
+    const charPaths = characterReferences.paths
+    const charLabels = characterReferences.labels
+    const locPaths = locationReferences.paths
+    const locLabels = locationReferences.labels
+    set({
+      directorReferenceImagePath: refImagePath,
+      directorCharacterRefPaths: charPaths,
+      directorLocationRefPaths: locPaths,
+    })
+
+    const directorPreflight = await api.preflightDirectorPipeline({
+      pipeline_type: pipelineType,
+      explicit_output: state.explicitOutput,
+      video_model: selectedVideoModel,
+      image_creator_model: imageRoleRequest.effective_creator_model,
+      ...(imageRoleRequest.wire.image_creator_loras ? {
+        image_creator_loras: imageRoleRequest.wire.image_creator_loras,
+      } : {}),
+      continuity_editor_model: imageRoleRequest.effective_editor_model,
+      ...(imageRoleRequest.wire.image_editor_loras ? {
+        continuity_editor_loras: imageRoleRequest.wire.image_editor_loras,
+      } : {}),
+      director_resolution_preset: directorResolution,
+      director_aspect_ratio: directorAspectRatio,
+      reference_presence: {
+        starting_image: Boolean(refImagePath),
+        character: charPaths.length > 0,
+        location: locPaths.length > 0,
+      },
+    })
+    if (directorPreflight.resolved.pipeline_type !== pipelineType) {
+      throw new api.DirectorRequestError('director_model_unavailable', 'video_model')
+    }
+    if (directorPreflight.resolved.video_model !== selectedVideoModel) {
+      throw new api.DirectorRequestError('director_model_unavailable', 'video_model')
+    }
+    if (directorPreflight.resolved.image_creator_model !== imageRoleRequest.effective_creator_model) {
+      throw new api.DirectorRequestError('director_model_unavailable', 'image_creator_model')
+    }
+    if (directorPreflight.resolved.continuity_editor_model !== imageRoleRequest.effective_editor_model) {
+      throw new api.DirectorRequestError('director_model_unavailable', 'continuity_editor_model')
+    }
+    if (
+      directorPreflight.resolved.director_resolution_preset !== directorResolution
+      || directorPreflight.resolved.director_aspect_ratio !== directorAspectRatio
+    ) {
+      throw new Error('Director resolution preflight returned a different selection.')
+    }
+    if (!directorPreflight.resolved.video_resolution) {
+      throw new Error('Director resolution preflight did not resolve the selected video canvas.')
+    }
+    if (!directorPreflight.resolved.image_resolution) {
+      throw new Error('Director resolution preflight did not resolve the selected image canvas.')
+    }
+    const [videoModelDefaults, videoModelOptions] = await Promise.all([
       api.fetchDefaults(selectedVideoModel).catch(() => ({})),
-      api.fetchModelOptions(selectedImageCreatorModel).catch(() => null),
       api.fetchModelOptions(selectedVideoModel).catch(() => null),
     ])
     if (!lifecycle.ownsWorkspace()) return
-    const directorImageResolution = resolveResolution(imageCreatorModelOptions, directorResolution, directorAspectRatio)
-    const directorVideoResolution = resolveResolution(videoModelOptions, directorResolution, directorAspectRatio)
+    const directorImageResolution = directorPreflight.resolved.image_resolution
+    const directorVideoResolution = directorPreflight.resolved.video_resolution
     const fps = videoModelOptions?.fps ?? 16
     const savedVideoParams = savedParamsPerMode.video || {}
     const matchingVideoParams = savedVideoParams.model_type === selectedVideoModel ? savedVideoParams : {}
@@ -12062,58 +12599,6 @@ export const useStore = create<AppState>((set, get) => ({
       : (configuredVideoSteps ?? defaultVideoSteps)
     const directorMaxShotFrames = directorVideoMaxShotFramesByModel[selectedVideoModel]
 
-    // Upload all reference images (main + character + location) if not already uploaded
-    let refImagePath = directorReferenceImagePath
-    if (!refImagePath && state.directorReferenceImage) {
-      try {
-        if (!lifecycle.ownsWorkspace()) return
-        const uploaded = await api.uploadImage(state.directorReferenceImage)
-        if (!lifecycle.ownsWorkspace()) return
-        refImagePath = uploaded.path
-        set({ directorReferenceImagePath: refImagePath })
-      } catch (e) {
-        if (!lifecycle.ownsWorkspace()) return
-        console.error('Failed to upload reference image for pipeline:', e)
-      }
-    }
-    // Upload character refs that haven't been uploaded yet
-    const charPaths = [...state.directorCharacterRefPaths]
-    for (let i = charPaths.length; i < state.directorCharacterRefs.length; i++) {
-      try {
-        if (!lifecycle.ownsWorkspace()) return
-        const uploaded = await api.uploadImage(state.directorCharacterRefs[i])
-        if (!lifecycle.ownsWorkspace()) return
-        charPaths.push(uploaded.path)
-      } catch {
-        if (!lifecycle.ownsWorkspace()) return
-        /* skip failed uploads */
-      }
-    }
-    if (
-      lifecycle.ownsWorkspace()
-      && charPaths.length > state.directorCharacterRefPaths.length
-    ) {
-      set({ directorCharacterRefPaths: charPaths })
-    }
-    // Upload location refs that haven't been uploaded yet
-    const locPaths = [...state.directorLocationRefPaths]
-    for (let i = locPaths.length; i < state.directorLocationRefs.length; i++) {
-      try {
-        if (!lifecycle.ownsWorkspace()) return
-        const uploaded = await api.uploadImage(state.directorLocationRefs[i])
-        if (!lifecycle.ownsWorkspace()) return
-        locPaths.push(uploaded.path)
-      } catch {
-        if (!lifecycle.ownsWorkspace()) return
-        /* skip failed uploads */
-      }
-    }
-    if (
-      lifecycle.ownsWorkspace()
-      && locPaths.length > state.directorLocationRefPaths.length
-    ) {
-      set({ directorLocationRefPaths: locPaths })
-    }
     const selectedVideoDefinition = state.models.find(
       model => model.model_type === selectedVideoModel,
     )
@@ -12134,11 +12619,6 @@ export const useStore = create<AppState>((set, get) => ({
         /* skip */
       }
     }
-
-    // Determine pipeline type
-    let pipelineType = 'music_video'
-    if (shortFilmPath === 'story') pipelineType = 'short_film_story'
-    else if (shortFilmPath === 'audio') pipelineType = 'short_film_audio'
 
     const directorVideoParams: Record<string, unknown> = {
       ...videoModelDefaults,
@@ -12171,9 +12651,9 @@ export const useStore = create<AppState>((set, get) => ({
       audio_path: directorAudioPath,
       reference_image_path: refImagePath,
       character_ref_paths: charPaths.length > 0 ? charPaths : undefined,
-      character_ref_labels: state.directorCharacterRefLabels.length > 0 ? state.directorCharacterRefLabels : undefined,
+      character_ref_labels: charLabels.length > 0 ? charLabels : undefined,
       location_ref_paths: locPaths.length > 0 ? locPaths : undefined,
-      location_ref_labels: state.directorLocationRefLabels.length > 0 ? state.directorLocationRefLabels : undefined,
+      location_ref_labels: locLabels.length > 0 ? locLabels : undefined,
       planned_clips: directorPlannedClips,
       seamless: directorSeamless,
       shot_image_guidance: directorShotImageGuidance,
@@ -12200,9 +12680,17 @@ export const useStore = create<AppState>((set, get) => ({
       target_duration: shortFilmTargetDuration,
       narrative_mode: shortFilmNarrative,
 
-      // New Director image roles. Null is the exact automatic-creator
-      // sentinel; the server resolves and seals each role independently.
-      ...imageRoleRequest.wire,
+      // Preflight resolves every role independently. Start sends those exact
+      // sealed model IDs (plus the already validated role-local LoRAs), so a
+      // vanished recipe cannot be silently substituted between the checks.
+      image_creator_model: directorPreflight.resolved.image_creator_model,
+      image_editor_model: directorPreflight.resolved.continuity_editor_model,
+      ...(imageRoleRequest.wire.image_creator_loras ? {
+        image_creator_loras: imageRoleRequest.wire.image_creator_loras,
+      } : {}),
+      ...(imageRoleRequest.wire.image_editor_loras ? {
+        image_editor_loras: imageRoleRequest.wire.image_editor_loras,
+      } : {}),
       // Only deliberate common overrides cross this boundary. Each role's
       // model-specific steps/guidance come from authoritative server defaults.
       image_params: {
@@ -12242,6 +12730,7 @@ export const useStore = create<AppState>((set, get) => ({
         directorStep: 'plan',
         directorLoading: true,
         directorError: null,
+        directorComponentError: null,
         directorRequestId: null,
         directorRequestWorkspace: null,
         directorPreparationStatus: null,
@@ -12250,7 +12739,17 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       if (!lifecycle.ownsWorkspace()) return
       const msg = e instanceof Error ? e.message : 'Pipeline failed to start'
-      set({ directorError: msg })
+      set({
+        directorError: msg,
+        directorComponentError: e instanceof api.DirectorRequestError
+          ? {
+              code: e.code,
+              component: e.component,
+              message: e.message,
+              ...(e.reference_index !== undefined ? { reference_index: e.reference_index } : {}),
+            }
+          : null,
+      })
     } finally {
       lifecycle.dispose()
     }

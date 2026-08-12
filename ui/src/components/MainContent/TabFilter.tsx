@@ -26,7 +26,7 @@ const savedViews: { value: MediaFilter; label: string; icon: 'heart' | 'film' | 
 ]
 
 function facetButton(active: boolean, emphasized = false): string {
-  return `flex items-center justify-center gap-1 rounded-md border px-2 py-1.5 text-[10px] font-medium transition-colors ${
+  return `flex min-h-11 min-w-11 items-center justify-center gap-1 rounded-md border px-2 py-1.5 text-[10px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 ${
     active
       ? emphasized
         ? 'border-amber-500/50 bg-amber-500/15 text-amber-300'
@@ -50,6 +50,7 @@ export function TabFilter() {
   const [filters, setFilters] = useState<OutputSearchFilters>(initialSearch.filters)
   const searchRef = useRef<HTMLInputElement>(null)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const searchTriggerRef = useRef<HTMLButtonElement>(null)
   const filterTriggerRef = useRef<HTMLButtonElement>(null)
   const filterDialogRef = useRef<HTMLDivElement>(null)
 
@@ -145,6 +146,7 @@ export function TabFilter() {
     setSearchOpen(false)
     setDraftSearch('')
     setSearchQuery(buildOutputSearchQuery('', filters))
+    window.requestAnimationFrame(() => searchTriggerRef.current?.focus())
   }
 
   const closeFilterPopover = () => {
@@ -162,34 +164,46 @@ export function TabFilter() {
   return (
     <div className="relative flex min-w-0 max-w-full flex-1 basis-[24rem] items-center gap-1">
       {searchOpen ? (
-        <div className="flex min-w-0 items-center gap-1 rounded-lg border border-border bg-bg-tertiary px-2 py-0.5">
+        <div id="gallery-search-controls" role="search" aria-label="Search Gallery" className="flex min-w-0 flex-1 items-center gap-1 rounded-lg border border-border bg-bg-tertiary px-2 py-0.5">
           <Search size={12} className="shrink-0 text-text-muted" />
           <input
             ref={searchRef}
             type="text"
+            aria-label="Search Gallery"
             value={draftSearch}
             onChange={event => handleSearchChange(event.target.value)}
+            onKeyDown={event => {
+              if (event.key !== 'Escape') return
+              event.preventDefault()
+              event.stopPropagation()
+              closeSearch()
+            }}
             placeholder="Prompt or filename..."
-            className="w-28 min-w-0 bg-transparent text-xs text-text-primary placeholder:text-text-muted focus:outline-none md:w-44"
+            className="min-h-11 w-28 min-w-0 flex-1 bg-transparent text-xs text-text-primary placeholder:text-text-muted focus:outline-none md:min-h-0 md:w-44"
           />
-          <button onClick={closeSearch} className="text-text-muted hover:text-text-secondary" aria-label="Clear search text and close search">
+          <button type="button" onClick={closeSearch} className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded text-text-muted hover:bg-bg-hover hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 md:p-1" aria-label="Clear search text and close search">
             <X size={12} />
           </button>
         </div>
       ) : (
         <button
+          ref={searchTriggerRef}
+          type="button"
           onClick={() => setSearchOpen(true)}
-          className={`rounded-lg p-1.5 transition-colors ${searchQuery ? 'bg-accent-blue/10 text-accent-blue' : 'text-text-muted hover:bg-bg-hover hover:text-text-secondary'}`}
+          className={`flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-lg p-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 ${searchQuery ? 'bg-accent-blue/10 text-accent-blue' : 'text-text-muted hover:bg-bg-hover hover:text-text-secondary'}`}
           title="Search outputs"
           aria-label="Search Gallery"
+          aria-expanded={false}
+          aria-controls="gallery-search-controls"
         >
           <Search size={14} />
         </button>
       )}
       <button
         ref={filterTriggerRef}
+        type="button"
         onClick={() => filtersOpen ? closeFilterPopover() : setFiltersOpen(true)}
-        className={`relative flex min-w-0 items-center gap-1.5 rounded-lg border px-2 py-1 text-[10px] transition-colors ${activeFilterCount ? 'border-accent-blue/40 bg-accent-blue/10 text-accent-blue' : 'border-border text-text-muted hover:bg-bg-hover hover:text-text-secondary'}`}
+        className={`relative flex min-h-11 min-w-11 items-center gap-1.5 rounded-lg border px-2 py-1 text-[10px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 ${activeFilterCount ? 'border-accent-blue/40 bg-accent-blue/10 text-accent-blue' : 'border-border text-text-muted hover:bg-bg-hover hover:text-text-secondary'}`}
         title="Filter Gallery"
         aria-expanded={filtersOpen}
         aria-haspopup="dialog"
@@ -210,20 +224,21 @@ export function TabFilter() {
           ref={filterDialogRef}
           role="dialog"
           aria-labelledby="gallery-filter-title"
-          className="fixed left-2 right-2 top-16 z-[80] max-h-[calc(100vh-5rem)] overflow-y-auto rounded-lg border border-border bg-bg-secondary p-3 shadow-2xl sm:absolute sm:left-0 sm:right-auto sm:top-full sm:mt-2 sm:w-[440px]"
+          aria-describedby="gallery-filter-description"
+          className="fixed inset-x-2 bottom-[max(0.5rem,env(safe-area-inset-bottom))] top-[max(4rem,env(safe-area-inset-top))] z-[80] overflow-y-auto overscroll-contain rounded-lg border border-border bg-bg-secondary p-3 shadow-2xl [-webkit-overflow-scrolling:touch] lg:absolute lg:inset-x-auto lg:bottom-auto lg:left-0 lg:right-auto lg:top-full lg:mt-2 lg:max-h-[min(32rem,calc(100dvh-5rem))] lg:w-[min(440px,calc(100vw-1rem))]"
         >
           <div className="mb-3 flex items-start justify-between gap-2">
             <div>
               <p id="gallery-filter-title" className="text-xs font-medium text-text-primary">Gallery filters</p>
-              <p className="text-[9px] text-text-muted">Media, artifact, and metadata selections all combine.</p>
+              <p id="gallery-filter-description" className="text-[9px] text-text-muted">Media, artifact, and metadata selections all combine.</p>
             </div>
             <div className="flex items-center gap-1">
               {hasAnyGalleryFilter && (
-                <button onClick={resetAllFilters} className="rounded px-2 py-1 text-[10px] text-text-muted hover:bg-bg-hover hover:text-text-primary">
+                <button type="button" onClick={resetAllFilters} className="min-h-11 min-w-11 rounded px-2 py-1 text-[10px] text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0">
                   Reset all
                 </button>
               )}
-              <button onClick={closeFilterPopover} className="rounded p-1 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label="Close Gallery filters">
+              <button type="button" onClick={closeFilterPopover} className="flex min-h-11 min-w-11 items-center justify-center rounded p-1 text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0" aria-label="Close Gallery filters">
                 <X size={13} />
               </button>
             </div>
@@ -295,7 +310,7 @@ export function TabFilter() {
             <div className="mb-2 flex items-center justify-between gap-2">
               <p className="text-[9px] font-medium uppercase tracking-wide text-text-muted">Generation metadata</p>
               {metadataFilterCount > 0 && (
-                <button onClick={clearStructuredFilters} className="rounded px-2 py-1 text-[10px] text-text-muted hover:bg-bg-hover hover:text-text-primary">
+                <button type="button" onClick={clearStructuredFilters} className="min-h-11 min-w-11 rounded px-2 py-1 text-[10px] text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0">
                   Clear metadata
                 </button>
               )}
@@ -307,7 +322,7 @@ export function TabFilter() {
                   value={filters.model || ''}
                   onChange={event => updateFilter('model', event.target.value)}
                   placeholder="e.g. minimax_h3"
-                  className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none"
+                  className="min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0"
                 />
               </label>
               <label className="space-y-1 text-[9px] uppercase tracking-wide text-text-muted">
@@ -316,7 +331,7 @@ export function TabFilter() {
                   value={filters.lora || ''}
                   onChange={event => updateFilter('lora', event.target.value)}
                   placeholder="filename or style"
-                  className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none"
+                  className="min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0"
                 />
               </label>
               <label className="space-y-1 text-[9px] uppercase tracking-wide text-text-muted">
@@ -326,7 +341,7 @@ export function TabFilter() {
                   value={filters.seed || ''}
                   onChange={event => updateFilter('seed', event.target.value.replace(/[^0-9-]/g, ''))}
                   placeholder="exact seed"
-                  className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none"
+                  className="min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0"
                 />
               </label>
               <label className="space-y-1 text-[9px] uppercase tracking-wide text-text-muted">
@@ -334,7 +349,7 @@ export function TabFilter() {
                 <select
                   value={filters.reference || ''}
                   onChange={event => updateFilter('reference', event.target.value)}
-                  className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none"
+                  className="min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0"
                 >
                   <option value="">Any</option>
                   <option value="with">With references</option>
@@ -347,7 +362,7 @@ export function TabFilter() {
                   type="date"
                   value={filters.after || ''}
                   onChange={event => updateFilter('after', event.target.value)}
-                  className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none"
+                  className="min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0"
                 />
               </label>
               <label className="space-y-1 text-[9px] uppercase tracking-wide text-text-muted">
@@ -356,7 +371,7 @@ export function TabFilter() {
                   type="date"
                   value={filters.before || ''}
                   onChange={event => updateFilter('before', event.target.value)}
-                  className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none"
+                  className="min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs normal-case tracking-normal text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0"
                 />
               </label>
             </div>

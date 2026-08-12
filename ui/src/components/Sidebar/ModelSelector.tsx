@@ -34,17 +34,34 @@ export function ModelSelector() {
   const [manualVerificationError, setManualVerificationError] = useState('')
   const [w4a8Capability, setW4a8Capability] = useState<{ available: boolean; reason: string } | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const popupRef = useRef<HTMLDivElement>(null)
 
-  // Close on click outside
+  // Treat the model list as a non-modal dialog: move focus into it, close on
+  // Escape/outside press, and restore focus when keyboard selection closes it.
   useEffect(() => {
     if (!open) return
+    const focusFrame = window.requestAnimationFrame(() => {
+      popupRef.current?.querySelector<HTMLElement>('button:not([disabled]), a[href]')?.focus()
+    })
     function handleClick(e: MouseEvent) {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
         setOpen(false)
       }
     }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setOpen(false)
+      window.requestAnimationFrame(() => triggerRef.current?.focus())
+    }
     document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.cancelAnimationFrame(focusFrame)
+      document.removeEventListener('mousedown', handleClick)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
   }, [open])
 
   const h3CompatibilitySignature = useStore(s => JSON.stringify([
@@ -149,9 +166,14 @@ export function ModelSelector() {
     <div className="relative flex-1 min-w-0" ref={containerRef}>
       {/* Trigger button */}
       <button
+        ref={triggerRef}
+        type="button"
         onClick={() => setOpen(!open)}
         title={currentModel?.selector_help || currentModel?.description}
-        className="w-full flex items-center gap-1.5 bg-bg-tertiary border border-border rounded-lg px-2.5 py-2 text-left hover:border-border-light transition-colors"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-controls="model-selector-menu"
+        className="mobile-control-target flex w-full items-center gap-1.5 rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-left transition-colors hover:border-border-light focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
       >
         <span className="flex-1 min-w-0 truncate text-xs text-text-primary">
           {currentModel?.name ?? 'Select model'}
@@ -162,13 +184,13 @@ export function ModelSelector() {
       {pendingRequirements.map(requirement => (
         <div key={requirement.term} role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
           <p>{requirement.notice}</p>
-          <div className="mt-1 flex items-center gap-2">
-            <a href={requirement.license_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Review exact terms</a>
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            <a href={requirement.license_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Review exact terms</a>
             <button
               type="button"
               disabled={hostTermsLoading || !hostTerms}
               onClick={() => { void acceptHostTerm(requirement.term) }}
-              className="rounded border border-amber-400/40 px-1.5 py-0.5 text-[9px] font-medium text-amber-100 disabled:opacity-40"
+              className="mobile-control-target rounded border border-amber-400/40 px-2 py-0.5 text-[9px] font-medium text-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40"
             >
               Accept for this host
             </button>
@@ -193,9 +215,9 @@ export function ModelSelector() {
             </dl>
           )}
           {currentModel.manual_installation && (
-            <div className="mb-1 flex flex-wrap gap-x-2 gap-y-0.5">
-              <a href={currentModel.manual_installation.source_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Open source page</a>
-              <a href={currentModel.manual_installation.download_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Open exact manual download</a>
+            <div className="mb-1 flex flex-wrap gap-2">
+              <a href={currentModel.manual_installation.source_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Open source page</a>
+              <a href={currentModel.manual_installation.download_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Open exact manual download</a>
             </div>
           )}
           {currentModel.manual_checkpoint_verified ? (
@@ -208,7 +230,7 @@ export function ModelSelector() {
                   type="button"
                   disabled={verifyingManualCheckpoint || pendingRequirements.length > 0}
                   onClick={() => { void verifyCurrentManualCheckpoint() }}
-                  className="mt-1 inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5 font-medium text-amber-100 disabled:opacity-40"
+                  className="mobile-control-target mt-1 inline-flex items-center gap-1 rounded border border-amber-400/40 px-2 py-0.5 font-medium text-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40"
                 >
                   {verifyingManualCheckpoint ? <Loader2 size={9} className="animate-spin" /> : <HardDrive size={9} />}
                   {verifyingManualCheckpoint ? 'Verifying local checkpoint…' : 'Verify local checkpoint'}
@@ -228,20 +250,27 @@ export function ModelSelector() {
 
       {/* Dropdown (opens upward) */}
       {open && (
-        <div className="absolute bottom-full left-0 mb-1 w-[360px] max-w-[90vw] bg-bg-secondary border border-border rounded-lg shadow-xl overflow-hidden z-50">
+        <div
+          ref={popupRef}
+          id="model-selector-menu"
+          role="dialog"
+          aria-label="Models"
+          className="absolute left-0 top-0 z-50 flex max-h-[min(404px,calc(100dvh-2rem))] w-[360px] max-w-[calc(100vw-2rem)] -translate-y-[calc(100%+0.25rem)] flex-col overflow-hidden rounded-lg border border-border bg-bg-secondary shadow-xl"
+        >
           {/* Enable-more entry — sits above the enabled model list; opens
               Settings → Enabled Models expanded to this mode. */}
           {disabledCount > 0 && (
             <button
+              type="button"
               onClick={() => { openModelVisibility(generationMode); setOpen(false) }}
-              className="w-full flex items-center gap-2 px-3 py-2 text-left border-b border-border text-text-secondary hover:bg-bg-hover hover:text-accent-blue transition-colors"
+              className="mobile-control-target flex w-full items-center gap-2 border-b border-border px-3 py-2 text-left text-text-secondary transition-colors hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
             >
               <Plus size={13} className="shrink-0" />
               <span className="flex-1 text-xs">Enable more models</span>
               <span className="text-[10px] text-text-muted shrink-0">{disabledCount} available</span>
             </button>
           )}
-          <div className="max-h-[360px] overflow-y-auto py-1">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain py-1">
             {groups.map(({ family, models: famModels }) => (
               <div key={family.id}>
                 {/* Family header */}
@@ -276,16 +305,21 @@ export function ModelSelector() {
                       }`}
                     >
                       <button
+                        type="button"
                         disabled={w4a8Unavailable}
+                        aria-pressed={isSelected}
                         title={
                           w4a8Unavailable
                             ? (w4a8Capability?.reason || 'Checking W4A8 runtime support…')
                             : pinkReconciliationLabel || model.selector_help || model.description
                         }
                         onClick={async () => {
-                          if (await selectModel(model.model_type)) setOpen(false)
+                          if (await selectModel(model.model_type)) {
+                            setOpen(false)
+                            window.requestAnimationFrame(() => triggerRef.current?.focus())
+                          }
                         }}
-                        className="min-w-0 flex-1 px-3 py-1.5 flex items-center gap-2 text-left disabled:cursor-not-allowed disabled:opacity-45"
+                        className="mobile-control-target flex min-w-0 flex-1 flex-wrap items-center gap-2 px-3 py-1.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-45"
                       >
                         <span className="flex-1 min-w-0 text-xs truncate">{model.name}</span>
                         <ModelBadges model={model} />
@@ -296,7 +330,7 @@ export function ModelSelector() {
                         {isSelected && <Check size={12} className="shrink-0 text-accent-blue" />}
                       </button>
                       {(model.selector_help || model.description) && (
-                        <span className="pr-2 shrink-0">
+                        <span className="shrink-0 pr-1 [&_button]:min-h-11 [&_button]:min-w-11 [&_button]:focus-visible:outline-none [&_button]:focus-visible:ring-2 [&_button]:focus-visible:ring-accent-blue md:pr-2 md:[&_button]:min-h-0 md:[&_button]:min-w-0">
                           <InfoTooltip text={model.selector_help || model.description || ''} />
                         </span>
                       )}
@@ -334,7 +368,7 @@ function ModelBadges({ model }: {
   })
   if (badges.length === 0) return null
   return (
-    <span className="flex gap-0.5 shrink-0">
+    <span className="flex shrink-0 flex-wrap justify-end gap-0.5">
       {badges.map(b => (
         <span key={b.label} title={b.title} className="text-[9px] px-1 py-0.5 rounded bg-bg-tertiary text-text-muted leading-none">
           {b.label}

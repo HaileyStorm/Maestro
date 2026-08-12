@@ -7,8 +7,10 @@ import { build } from 'esbuild'
 
 import {
   createDirectorImageRoleLoraSelection,
+  DirectorRequestError,
   fetchDirectorCapabilities,
   getDirectorHostActionAccessState,
+  preflightDirectorPipeline,
   startPipeline,
   toDirectorImageRoleLoraWire,
   validateDirectorImageRoleLoraSelections,
@@ -159,7 +161,7 @@ function loadStoreHelper() {
   storeHelperPromise = readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8')
     .then(source => build({
       stdin: {
-        contents: `${source}\nexport { _captureDirectorImageRoleRequest }\n`,
+        contents: `${source}\nexport { _captureDirectorImageRoleRequest, _refreshDirectorModelAdmissionCatalog, _resolveDirectorReferenceRows }\n`,
         resolveDir: fileURLToPath(new URL('../src/stores/', import.meta.url)),
         loader: 'ts',
       },
@@ -172,6 +174,24 @@ function loadStoreHelper() {
     }))
     .then(result => import(asDataModule(result.outputFiles[0].text)))
   return storeHelperPromise
+}
+
+async function loadFreshStoreHelper(tag) {
+  const source = await readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8')
+  const result = await build({
+    stdin: {
+      contents: source,
+      resolveDir: fileURLToPath(new URL('../src/stores/', import.meta.url)),
+      loader: 'ts',
+    },
+    bundle: true,
+    format: 'esm',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+  })
+  return import(`${asDataModule(result.outputFiles[0].text)}#${tag}`)
 }
 
 let roleSelectorPromise
@@ -329,6 +349,136 @@ test('capabilities query and pipeline transport preserve the exact new-role wire
   assert.equal(body._director_request_id, undefined)
 })
 
+test('Director transport distinguishes structured model roles from legacy media failures', async t => {
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  globalThis.fetch = async () => Response.json({ detail: 'Model not found' }, { status: 404 })
+  await assert.rejects(startPipeline({}), error => {
+    assert.match(error.message, /selected Director model is unavailable/i)
+    assert.doesNotMatch(error.message, /selected reference/i)
+    return true
+  })
+
+  globalThis.fetch = async () => Response.json({
+    detail: 'Unauthorized media: selected reference not found',
+  }, { status: 404 })
+  await assert.rejects(startPipeline({}), /could not access a selected reference/i)
+
+  globalThis.fetch = async () => Response.json({
+    code: 'director_model_unavailable',
+    component: 'image_creator_model',
+    message: 'private catalog membership must not be reflected',
+  }, { status: 404 })
+  await assert.rejects(startPipeline({}), error => {
+    assert.ok(error instanceof DirectorRequestError)
+    assert.equal(error.code, 'director_model_unavailable')
+    assert.equal(error.component, 'image_creator_model')
+    assert.match(error.message, /Image creator is unavailable in this session/)
+    assert.doesNotMatch(error.message, /private catalog membership/)
+    return true
+  })
+})
+
+test('Director preflight sends only the exact content-free PinkCherry, Moody, and Qwen roles', async t => {
+  const originalFetch = globalThis.fetch
+  let call
+  globalThis.fetch = async (input, init = {}) => {
+    call = { url: String(input), init }
+    return Response.json({
+      status: 'ready',
+      resolved: {
+        pipeline_type: 'short_film_story',
+        video_model: 'minimax_h3_pinkcherry_fl2va',
+        image_creator_model: 'krea2_moody_mix_v7_fp8',
+        continuity_editor_model: 'qwen_image_edit_2511_nsfw',
+        director_resolution_preset: '720p',
+        director_aspect_ratio: '16:9',
+        video_resolution: '1280x704',
+        image_resolution: '1280x720',
+      },
+      components: [
+        { component: 'video_model', status: 'ready' },
+        { component: 'image_creator_model', status: 'ready' },
+        { component: 'continuity_editor_model', status: 'ready' },
+        { component: 'image_creator_lora', status: 'not_required' },
+        { component: 'continuity_editor_lora', status: 'ready' },
+      ],
+    })
+  }
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  const editorLora = { id: 'qwen-image-edit-uncensored.safetensors', multiplier: 1 }
+  const result = await preflightDirectorPipeline({
+    pipeline_type: 'short_film_story',
+    explicit_output: true,
+    video_model: 'minimax_h3_pinkcherry_fl2va',
+    image_creator_model: 'krea2_moody_mix_v7_fp8',
+    continuity_editor_model: 'qwen_image_edit_2511_nsfw',
+    continuity_editor_loras: [editorLora],
+    director_resolution_preset: '720p',
+    director_aspect_ratio: '16:9',
+    reference_presence: { starting_image: true, character: true, location: false },
+  })
+  assert.equal(result.status, 'ready')
+  assert.equal(call.url, '/api/v1/director/preflight')
+  assert.equal(call.init.cache, 'no-store')
+  assert.equal(call.init.credentials, 'same-origin')
+  assert.deepEqual(JSON.parse(String(call.init.body)), {
+    pipeline_type: 'short_film_story',
+    explicit_output: true,
+    video_model: 'minimax_h3_pinkcherry_fl2va',
+    image_creator_model: 'krea2_moody_mix_v7_fp8',
+    continuity_editor_model: 'qwen_image_edit_2511_nsfw',
+    continuity_editor_loras: [editorLora],
+    director_resolution_preset: '720p',
+    director_aspect_ratio: '16:9',
+    reference_presence: { starting_image: true, character: true, location: false },
+  })
+  for (const forbidden of ['filename', 'path', 'prompt', 'media']) {
+    assert.doesNotMatch(String(call.init.body), new RegExp(forbidden, 'i'))
+  }
+})
+
+test('Director preflight preserves every closed failing role without exposing server catalog text', async t => {
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+  const request = {
+    pipeline_type: 'music_video',
+    explicit_output: true,
+    video_model: 'minimax_h3_pinkcherry_fl2va',
+    image_creator_model: 'krea2_moody_mix_v7_fp8',
+    continuity_editor_model: 'qwen_image_edit_2511_nsfw',
+    director_resolution_preset: '720p',
+    director_aspect_ratio: '16:9',
+    reference_presence: { starting_image: true, character: true, location: true },
+  }
+  const failures = [
+    ['director_model_unavailable', 'video_model', 404],
+    ['director_model_not_ready', 'image_creator_model', 409],
+    ['director_model_terms_required', 'continuity_editor_model', 409],
+    ['director_role_lora_unavailable', 'image_creator_lora', 404],
+    ['director_role_lora_unavailable', 'continuity_editor_lora', 409],
+    ['director_reference_unavailable', 'character_reference', 404],
+    ['director_reference_unavailable', 'location_reference', 404],
+    ['director_reference_unavailable', 'starting_image', 403],
+  ]
+  for (const [code, component, status] of failures) {
+    globalThis.fetch = async () => Response.json({
+      code,
+      component,
+      message: 'server-private membership detail',
+    }, { status })
+    await assert.rejects(preflightDirectorPipeline(request), error => {
+      assert.ok(error instanceof DirectorRequestError)
+      assert.equal(error.code, code)
+      assert.equal(error.component, component)
+      assert.doesNotMatch(error.message, /server-private membership/)
+      return true
+    })
+  }
+})
+
 test('store restore and requested-Explicit snapshots survive overlapping force loads', async () => {
   const originalLocalStorage = globalThis.localStorage
   const originalWindow = globalThis.window
@@ -387,7 +537,7 @@ test('store restore and requested-Explicit snapshots survive overlapping force l
     })
     await assert.rejects(
       _captureDirectorImageRoleRequest(() => state, true),
-      /default is unavailable in this session/,
+      /Image creator is unavailable in this session/,
     )
 
     const originalFetch = globalThis.fetch
@@ -454,6 +604,39 @@ test('store restore and requested-Explicit snapshots survive overlapping force l
       await pending
       assert.equal(useStore.getState().directorCapabilities, null)
 
+      const modelA = deferred()
+      const modelB = deferred()
+      globalThis.fetch = async input => {
+        const url = String(input)
+        if (url.endsWith('/api/v1/model-options/model-a')) return modelA.promise
+        if (url.endsWith('/api/v1/model-options/model-b')) return modelB.promise
+        throw new Error(`Unexpected request ${url}`)
+      }
+      useStore.getState().setDirectorResolution('1080p')
+      const loadA = useStore.getState().loadDirectorResolutionOptions('model-a')
+      const loadB = useStore.getState().loadDirectorResolutionOptions('model-b')
+      modelB.resolve(Response.json({
+        model_type: 'model-b',
+        resolution_preset_order: ['720p'],
+        resolution_presets: {
+          '720p': { label: 'Native', values: { '16:9': '1280x704' } },
+        },
+        supports_auto_aspect: false,
+      }))
+      await loadB
+      modelA.resolve(Response.json({
+        model_type: 'model-a',
+        resolution_preset_order: ['1080p'],
+        resolution_presets: {
+          '1080p': { label: 'Old', values: { '16:9': '1920x1088' } },
+        },
+        supports_auto_aspect: false,
+      }))
+      await loadA
+      assert.equal(useStore.getState().directorResolutionModelType, 'model-b')
+      assert.equal(useStore.getState().directorResolutionOptions?.model_type, 'model-b')
+      assert.equal(useStore.getState().directorResolution, '1080p')
+
       let settingsRefreshes = 0
       globalThis.fetch = async input => {
         assert.equal(String(input), '/api/v1/director/capabilities?explicit_output=false')
@@ -474,6 +657,135 @@ test('store restore and requested-Explicit snapshots survive overlapping force l
     globalThis.window = originalWindow
     globalThis.document = originalDocument
   }
+})
+
+test('Director reference uploads settle by stable selection index and report the failing row', async () => {
+  const { _resolveDirectorReferenceRows } = await loadStoreHelper()
+  const files = ['alpha.png', 'beta.png', 'gamma.png'].map(name => ({ name }))
+  const pending = new Map()
+  const upload = file => {
+    const request = deferred()
+    pending.set(file.name, request)
+    return request.promise
+  }
+  const resolving = _resolveDirectorReferenceRows(
+    files,
+    [],
+    ['Alpha', 'Beta', 'Gamma'],
+    'character_reference',
+    upload,
+  )
+  while (pending.size < 3) await Promise.resolve()
+  pending.get('gamma.png').resolve({ path: '/uploads/gamma.png' })
+  pending.get('beta.png').resolve({ path: '/uploads/beta.png' })
+  pending.get('alpha.png').resolve({ path: '/uploads/alpha.png' })
+  assert.deepEqual(await resolving, {
+    paths: ['/uploads/alpha.png', '/uploads/beta.png', '/uploads/gamma.png'],
+    labels: ['Alpha', 'Beta', 'Gamma'],
+  })
+
+  const failedPending = new Map()
+  const failing = _resolveDirectorReferenceRows(
+    files,
+    ['/legacy/compacted-first.png'],
+    ['Alpha', 'Beta', 'Gamma'],
+    'location_reference',
+    file => {
+      const request = deferred()
+      failedPending.set(file.name, request)
+      return request.promise
+    },
+  )
+  while (failedPending.size < 3) await Promise.resolve()
+  failedPending.get('gamma.png').resolve({ path: '/uploads/gamma.png' })
+  failedPending.get('beta.png').reject(new Error('bounded upload failure'))
+  failedPending.get('alpha.png').resolve({ path: '/uploads/alpha.png' })
+  await assert.rejects(failing, error => {
+    assert.equal(error.name, 'DirectorRequestError')
+    assert.equal(error.code, 'director_reference_unavailable')
+    assert.equal(error.component, 'location_reference')
+    assert.equal(error.reference_index, 1)
+    assert.match(error.message, /Location reference 2 could not be accessed/)
+    assert.doesNotMatch(error.message, /bounded upload failure/)
+    return true
+  })
+  assert.deepEqual([...failedPending.keys()], ['alpha.png', 'beta.png', 'gamma.png'])
+})
+
+test('model hydration seeds the authoritative video default and preserves a valid saved choice', async t => {
+  const originalLocalStorage = globalThis.localStorage
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalFetch = globalThis.fetch
+  const stored = new Map()
+  globalThis.localStorage = {
+    getItem(key) { return stored.get(key) ?? null },
+    setItem(key, value) { stored.set(key, String(value)) },
+    removeItem(key) { stored.delete(key) },
+  }
+  globalThis.window = Object.assign(new EventTarget(), { setTimeout, clearTimeout, setInterval, clearInterval, alert() {} })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  const families = [
+    { id: 'flux2', label: 'Flux 2', order: 1 },
+    { id: 'minimax', label: 'MiniMax', order: 2 },
+    { id: 'ltx2', label: 'LTX 2', order: 3 },
+  ]
+  const model = (model_type, family, image = false) => ({
+    model_type,
+    name: model_type,
+    family,
+    architecture: family,
+    is_i2v: !image,
+    is_t2v: !image,
+    guidance_max_phases: 1,
+    fps: 16,
+    image_outputs: image,
+  })
+  const models = [
+    model('flux2_klein_9b', 'flux2', true),
+    model('minimax_h3', 'minimax'),
+    model('ltx2_22B_distilled_1_1', 'ltx2'),
+  ]
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url === '/api/v1/models') return Response.json({ families, models })
+    if (url === '/api/v1/model-visibility' && (init.method || 'GET') === 'GET') {
+      return Response.json({ configured: true, enabled_models: models.map(item => item.model_type), defaults_version: 9 })
+    }
+    if (url.includes('/api/v1/loras/installed')) return Response.json({ loras: [] })
+    if (url.includes('/api/v1/loras/')) return Response.json({ loras: [] })
+    if (url.includes('/api/v1/models/') && url.endsWith('/options')) return Response.json({})
+    if (url.includes('/api/v1/defaults/')) return Response.json({})
+    throw new Error(`Unexpected model hydration request: ${url}`)
+  }
+  t.after(() => {
+    globalThis.localStorage = originalLocalStorage
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.fetch = originalFetch
+  })
+
+  stored.set('maestro_mode_settings', JSON.stringify({
+    generationMode: 'image',
+    selectedModelPerMode: { image: 'flux2_klein_9b', video: '' },
+    savedParamsPerMode: {},
+    savedLoraPerMode: {},
+    savedPromptPerMode: {},
+  }))
+  const { useStore } = await loadFreshStoreHelper('video-default-seed')
+  await useStore.getState().loadModels()
+  assert.equal(useStore.getState().generationMode, 'image')
+  assert.equal(useStore.getState().selectedModelPerMode.video, 'minimax_h3')
+
+  stored.set('maestro_mode_settings', JSON.stringify({
+    generationMode: 'image',
+    selectedModelPerMode: { image: 'flux2_klein_9b', video: 'ltx2_22B_distilled_1_1' },
+    savedParamsPerMode: {},
+    savedLoraPerMode: {},
+    savedPromptPerMode: {},
+  }))
+  await useStore.getState().loadModels()
+  assert.equal(useStore.getState().selectedModelPerMode.video, 'ltx2_22B_distilled_1_1')
 })
 
 test('model download polling emits progress, reaches terminal state, and cancels before fetch', async t => {
@@ -507,6 +819,50 @@ test('model download polling emits progress, reaches terminal state, and cancels
     wait: async () => {},
   }), { status: 'cancelled', error: null })
   assert.equal(calls, 3)
+})
+
+test('Director admission refresh waits for the latest enabled-model persistence', async t => {
+  const originalFetch = globalThis.fetch
+  const visibilityWrites = [deferred(), deferred()]
+  let writeIndex = 0
+  globalThis.fetch = async (input, init = {}) => {
+    assert.equal(String(input), '/api/v1/model-visibility')
+    assert.equal(init.method, 'PUT')
+    const write = visibilityWrites[writeIndex]
+    writeIndex += 1
+    if (!write) throw new Error('Unexpected extra visibility write')
+    return write.promise
+  }
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  const { _refreshDirectorModelAdmissionCatalog, useStore } = await loadStoreHelper()
+  useStore.getState().toggleModelEnabled('minimax_h3_pinkcherry_fl2va')
+  const phases = []
+  const refresh = _refreshDirectorModelAdmissionCatalog(async () => {
+    phases.push('catalog')
+    if (phases.length === 1) useStore.getState().toggleModelEnabled('krea2_moody_mix_v7_fp8')
+  })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(phases, [])
+  visibilityWrites[0].resolve(Response.json({
+    configured: true,
+    enabled_models: [...useStore.getState().enabledModels],
+    defaults_version: 9,
+  }))
+  while (writeIndex < 2) await new Promise(resolve => setTimeout(resolve, 0))
+  assert.deepEqual(phases, ['catalog'])
+  let settled = false
+  void refresh.then(() => { settled = true })
+  await Promise.resolve()
+  assert.equal(settled, false)
+  visibilityWrites[1].resolve(Response.json({
+    configured: true,
+    enabled_models: [...useStore.getState().enabledModels],
+    defaults_version: 9,
+  }))
+  await refresh
+  assert.deepEqual(phases, ['catalog', 'catalog'])
 })
 
 test('Director host actions distinguish loading, local authority, and LAN sessions', () => {
@@ -625,4 +981,93 @@ test('Director source keeps image roles explicit and one final-video post-proces
   assert.match(director, /Loading host permissions…/)
   assert.match(director, /waitForModelDownloadTerminal/)
   assert.match(director, /openDirectorModelVisibility/)
+  assert.match(store, /_refreshDirectorModelAdmissionCatalog\(\(\) => get\(\)\.loadModels\(\)\)/)
+  assert.match(store, /preflightDirectorPipeline\(\{/)
+  assert.match(store, /pipeline_type: pipelineType/)
+  assert.match(store, /director_resolution_preset: directorResolution/)
+  assert.match(store, /director_aspect_ratio: directorAspectRatio/)
+  assert.match(store, /directorPreflight\.resolved\.video_resolution/)
+  assert.match(store, /directorPreflight\.resolved\.image_resolution/)
+  assert.match(previewSource, /resolveDeclaredResolution\(/)
+  assert.doesNotMatch(previewSource, /resolveResolution\(null/)
+  assert.ok(store.indexOf('const referenceUploads = await Promise.allSettled') < store.indexOf('const directorPreflight = await api.preflightDirectorPipeline'))
+  assert.match(store, /character_ref_labels: charLabels\.length > 0 \? charLabels : undefined/)
+  assert.match(store, /location_ref_labels: locLabels\.length > 0 \? locLabels : undefined/)
+  assert.doesNotMatch(store.slice(store.indexOf('startDirectorPipeline: async () =>'), store.indexOf('continuePipeline:', store.indexOf('startDirectorPipeline: async () =>'))), /skip failed uploads|Failed to upload reference image for pipeline/)
+  assert.match(store, /continuity_editor_model: imageRoleRequest\.effective_editor_model/)
+  assert.doesNotMatch(director, /const fallbackModel = compatibleModels/)
+  assert.doesNotMatch(director, /selectedModelPerMode\.video \|\| 'ltx2_22B_distilled_1_1'/)
+  assert.match(store, /video: initialVideoModelType/)
+  for (const component of ['video_model', 'character_reference', 'location_reference', 'starting_image']) {
+    assert.match(director, new RegExp(`data-director-component=(?:"|\\{)${component}`))
+  }
+  assert.match(director, /data-director-component=\{modelComponent\}/)
+  assert.match(director, /data-director-component=\{loraComponent\}/)
+  assert.match(director, /role === 'creator'\s*\? 'image_creator_model' : 'continuity_editor_model'/)
+  assert.match(director, /role === 'creator'\s*\? 'image_creator_lora' : 'continuity_editor_lora'/)
+  assert.match(director, /componentError && !isShortFilm && DIRECTOR_MODEL_COMPONENTS\.has\(componentError\.component\)/)
+  assert.match(director, /aria-label="Director model recovery"/)
+  assert.match(director, /clearDirectorComponentError\('starting_image'\)/)
+  assert.match(director, /clearDirectorComponentError\(type === 'char' \? 'character_reference' : 'location_reference'\)/)
+  assert.match(director, /scrollIntoView\(\{ behavior: 'smooth', block: 'center' \}\)/)
+  assert.match(director, /select:not\(:disabled\)/)
+  assert.match(director, /:not\(\.hidden\):not\(\.sr-only\):not\(\[hidden\]\)/)
+  assert.match(director, /\.focus\(\{ preventScroll: true \}\)/)
+})
+
+test('Director mobile dashboard and output selectors keep accessible targets without horizontal overflow', async () => {
+  const [director, css, sidebar] = await Promise.all([
+    readFile(new URL('../src/components/Sidebar/DirectorChat.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../src/index.css', import.meta.url), 'utf8'),
+    readFile(new URL('../src/components/Sidebar/Sidebar.tsx', import.meta.url), 'utf8'),
+  ])
+  const dashboardStart = director.indexOf('onClick={() => useStore.getState().setDashboardOpen(true)}')
+  const dashboardEnd = director.indexOf('</button>', dashboardStart)
+  const aspectStart = director.indexOf('function DirectorAspectRatioSelector()')
+  const aspectEnd = director.indexOf('function DirectorResolutionSelector()', aspectStart)
+  const resolutionStart = aspectEnd
+  const resolutionEnd = director.indexOf('function SkillSelector(', resolutionStart)
+
+  assert.ok(dashboardStart >= 0 && dashboardEnd > dashboardStart)
+  assert.ok(aspectStart >= 0 && aspectEnd > aspectStart)
+  assert.ok(resolutionStart >= 0 && resolutionEnd > resolutionStart)
+
+  const dashboard = director.slice(dashboardStart, dashboardEnd)
+  const aspect = director.slice(aspectStart, aspectEnd)
+  const resolution = director.slice(resolutionStart, resolutionEnd)
+
+  assert.match(dashboard, /aria-haspopup="dialog"/)
+  assert.match(dashboard, /aria-label="Open Director pipeline dashboard"/)
+  assert.match(dashboard, /mobile-control-target/)
+  assert.match(dashboard, /focus-visible:ring-2/)
+
+  assert.match(aspect, /role="radiogroup" aria-label="Director aspect ratio"/)
+  assert.match(aspect, /grid-cols-2[^"`]*sm:grid-cols-5/)
+  assert.match(aspect, /role="radio"/)
+  assert.match(aspect, /aria-checked=\{ratio === p\.value\}/)
+  assert.match(aspect, /tabIndex=\{ratio === p\.value \? 0 : -1\}/)
+  assert.match(aspect, /mobile-control-target min-w-0/)
+  assert.match(aspect, /focus-visible:ring-2/)
+  assert.match(aspect, /event\.key === 'ArrowRight'/)
+
+  assert.match(resolution, /role="radiogroup" aria-label="Director resolution"/)
+  assert.match(resolution, /grid-cols-2[^"`]*sm:grid-cols-4/)
+  assert.match(resolution, /role="radio"/)
+  assert.match(resolution, /aria-checked=\{resolution === p\}/)
+  assert.match(resolution, /selectedPresetAvailable = availablePresets\.includes\(resolution\)/)
+  assert.match(resolution, /aria-disabled=\{!available\}/)
+  assert.match(resolution, /disabled=\{!available\}/)
+  assert.match(resolution, /tabIndex=\{available && \(resolution === p \|\| \(!selectedPresetAvailable && index === 1\)\) \? 0 : -1\}/)
+  assert.match(resolution, /Loading exact model resolutions/)
+  assert.match(resolution, /carried selection is unavailable/)
+  assert.doesNotMatch(resolution, /\['480p', '540p', '720p', '1080p'\]/)
+  assert.match(resolution, /mobile-control-target min-w-0/)
+  assert.match(resolution, /focus-visible:ring-2/)
+  assert.match(resolution, /setResolution\(nextPreset\)/)
+
+  const mobileCss = css.slice(css.indexOf('@media (max-width: 767px)'))
+  assert.match(mobileCss, /\.mobile-control-target\s*\{[^}]*min-width:\s*44px;[^}]*min-height:\s*44px;/s)
+  assert.doesNotMatch(css, /@media \(max-width: 768px\)[\s\S]*\.mobile-control-target/)
+  assert.match(sidebar, /w-\[380px\] max-w-\[85vw\]/)
+  assert.ok((320 * 0.85) - 32 >= (2 * 44) + 6, 'two 44px controls and their gap fit the 320px drawer content box')
 })

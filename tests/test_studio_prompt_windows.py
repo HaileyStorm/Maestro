@@ -478,7 +478,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         body = {
             "model_type": "minimax_h3_w4a8_fl2va",
             "video_length": 700,
-            "prompt": "[0-30s] Preserve the subject through the sequence.",
+            "prompt": "[0-29.167s] Preserve the subject through the sequence.",
             "image_start": "first.png",
             "image_refs": ["subject.png"],
         }
@@ -633,7 +633,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                     "model_type": selected,
                     "explicit_output": True,
                     "video_length": 700,
-                    "prompt": "[0-30s] Preserve the subject through the sequence.",
+                    "prompt": "[0-29.167s] Preserve the subject through the sequence.",
                     "image_start": "first.png",
                     "image_refs": ["subject.png"],
                 }
@@ -869,7 +869,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         body = {
             "model_type": "minimax_h3_ref2va",
             "video_length": 700,
-            "prompt": "[0-30s] Preserve the referenced character.",
+            "prompt": "[0-29.167s] Preserve the referenced character.",
             "image_start": "stale-anchor.png",
             "image_end": "stale-end.png",
             "image_refs": ["character.png"],
@@ -903,7 +903,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                     "model_type": "minimax_h3",
                     "video_length": 700,
                     "sliding_window_size": requested,
-                    "prompt": "[0-30s] One continuous action.",
+                    "prompt": "[0-29.167s] One continuous action.",
                 }
                 plan = prepare(body)
                 self.assertEqual(plan["segment_frames_maximum"], 192)
@@ -1049,12 +1049,24 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                 )
                 self.assertEqual(cut_boundary["at_seconds"], 15.0)
                 self.assertEqual(cut_boundary["source"], "explicit_cut")
-                self.assertEqual(
-                    body["per_clip_prompts"], [prompt] * expected_clips,
-                )
+                self.assertEqual(len(body["per_clip_prompts"]), expected_clips)
+                self.assertGreater(len(set(body["per_clip_prompts"])), 1)
+                events = plan["shot_plan"]["event_ownership"]
+                for event_text in ("crosses the hangar", "cut to the cockpit"):
+                    event = next(
+                        item for item in events
+                        if event_text in item["executable_payload"]
+                    )
+                    self.assertEqual(
+                        sum(
+                            event_text in item
+                            for item in body["per_clip_prompts"]
+                        ),
+                        1 + len(event["continuation_slices"]),
+                    )
                 semantic = plan["shot_plan"]["semantic_shots"]
                 self.assertEqual(len(semantic), 1)
-                self.assertFalse(
+                self.assertTrue(
                     semantic[0]["prompt_rewrite_for_physical_split"],
                 )
                 self.assertEqual(

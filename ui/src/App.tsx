@@ -13,7 +13,7 @@ import { PreflightBanner } from './components/PreflightBanner'
 import { WelcomeModal } from './components/WelcomeModal'
 import { H3GenerationPlanDialog } from './components/H3GenerationPlanDialog'
 import { RecipesOverlay } from './components/Recipes/RecipesOverlay'
-import { WhatsNewButton } from './components/WhatsNewDialog'
+import { WhatsNewButton, WhatsNewDialogHost } from './components/WhatsNewDialog'
 import { AccountSupportButton, AccountSupportDrawer } from './components/AccountSupport/AccountSupportDrawer'
 import { useStore } from './stores/useStore'
 import { useIsMobile } from './lib/useIsMobile'
@@ -174,13 +174,13 @@ function App() {
           {!remoteProjectRequired ? <button
             type="button"
             onClick={toggleSidebar}
-            className="p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             aria-label={sidebarOpen ? 'Close creative workspace menu' : 'Open Generate, Director, and Reference menu'}
             aria-expanded={sidebarOpen}
             aria-controls="maestro-mobile-sidebar"
           >
-            <Menu size={20} />
-          </button> : <span className="w-9" aria-hidden="true" />}
+            <Menu aria-hidden="true" size={20} />
+          </button> : <span className="h-11 w-11 shrink-0" aria-hidden="true" />}
           <div className="mx-1 flex min-w-0 items-center gap-2">
             <div aria-hidden="true" className="w-7 h-7 shrink-0 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
               M
@@ -198,12 +198,12 @@ function App() {
               <button
                 type="button"
                 onClick={() => { setSidebarOpen(false); toggleSettings() }}
-                className="p-2 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                 aria-label="Open machine settings"
               >
-                <Settings size={20} />
+                <Settings aria-hidden="true" size={20} />
               </button>
-            ) : <span className="w-9" aria-hidden="true" />}
+            ) : <span className="h-11 w-11 shrink-0" aria-hidden="true" />}
           </div>
         </header>
       )}
@@ -217,6 +217,7 @@ function App() {
       <RecipesOverlay />
       <RetakeDialog />
       <H3GenerationPlanDialog />
+      <WhatsNewDialogHost />
       {!isMobile && (
         <div className="fixed right-3 top-3 z-40">
           <AccountSupportButton />

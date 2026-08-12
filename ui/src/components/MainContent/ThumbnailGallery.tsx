@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { EyeOff, Film, Music, PanelRightClose, PanelRightOpen, X } from 'lucide-react'
+import { createPortal } from 'react-dom'
+import { Eye, EyeOff, Film, Music, PanelRightClose, PanelRightOpen, X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { requestThumbnail } from '../../lib/thumbnailCache'
 import { useIsMobile } from '../../lib/useIsMobile'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import {
   privatePreviewIdentity,
   privatePreviewWasRevealed,
@@ -46,9 +48,14 @@ function VideoThumbnail({ src, name, cacheKey }: { src: string; name: string; ca
 interface Props {
   activeIndex: number
   onThumbnailClick: (index: number) => void
+  privatePreviewControl?: {
+    workspace: string
+    state: 'none' | 'some' | 'all'
+    onToggle: () => void
+  }
 }
 
-function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick }: Props & { onMobileClick?: () => void }) {
+function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick }: Props & { onMobileClick?: () => boolean }) {
   const outputs = useStore(s => s.filteredOutputs())
   const containerRef = useRef<HTMLDivElement>(null)
   const [scrollTop, setScrollTop] = useState(0)
@@ -142,12 +149,14 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
                 ? 'Click, tap, or press Enter to Reveal this blurred preview'
                 : file.name}
               onClick={() => {
+                // A retained handler from a covered mobile dialog must not
+                // reveal or select anything beneath the actual top modal.
+                if (onMobileClick && !onMobileClick()) return
                 if (file.private && !privateRevealed) {
                   revealPrivatePreview(privateIdentity)
                   refreshPrivateReveal(value => value + 1)
                 }
                 onThumbnailClick(idx)
-                onMobileClick?.()
               }}
               className={`absolute left-0 right-0 rounded-lg border overflow-hidden transition-all ${
                 activeIndex === idx
@@ -201,12 +210,37 @@ function VirtualizedThumbnailList({ activeIndex, onThumbnailClick, onMobileClick
   )
 }
 
-export function ThumbnailGallery({ activeIndex, onThumbnailClick }: Props) {
+export function ThumbnailGallery({ activeIndex, onThumbnailClick, privatePreviewControl }: Props) {
   const outputs = useStore(s => s.filteredOutputs())
   const outputsLoading = useStore(s => s.outputsLoading)
   const isMobile = useIsMobile()
   const [collapsed, setCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
+  const mobileOpenerRef = useRef<HTMLButtonElement | null>(null)
+  const mobileCloseRef = useRef<HTMLButtonElement | null>(null)
+  const mobileDialogRef = useRef<HTMLElement | null>(null)
+
+  const closeMobilePanel = useCallback(() => {
+    return closeModalIfTop(document, mobileDialogRef.current, () => setMobileOpen(false))
+  }, [])
+
+  useEffect(() => {
+    if (
+      !isMobile
+      || !mobileOpen
+      || !mobileDialogRef.current
+      || !mobileCloseRef.current
+    ) return
+    return installModalFocus({
+      document,
+      dialog: mobileDialogRef.current,
+      initialFocus: mobileCloseRef.current,
+      restoreFocus: mobileOpenerRef.current,
+      appRoot: document.getElementById('root'),
+      onClose: closeMobilePanel,
+      priority: 70,
+    })
+  }, [closeMobilePanel, isMobile, mobileOpen])
 
   if (outputs.length === 0 && !outputsLoading) return null
 
@@ -216,42 +250,84 @@ export function ThumbnailGallery({ activeIndex, onThumbnailClick }: Props) {
       <>
         {/* Toggle button - fixed in bottom-right */}
         <button
+          ref={mobileOpenerRef}
+          type="button"
+          aria-controls="mobile-thumbnail-panel"
+          aria-expanded={mobileOpen}
+          aria-label="Show thumbnails"
           onClick={() => setMobileOpen(true)}
-          className="fixed bottom-4 right-4 z-30 w-10 h-10 rounded-full bg-bg-secondary border border-border shadow-lg flex items-center justify-center text-text-secondary hover:text-text-primary transition-colors"
+          className="fixed bottom-4 right-4 z-30 min-h-11 min-w-11 rounded-full bg-bg-secondary border border-border shadow-lg flex items-center justify-center text-text-secondary hover:text-text-primary transition-colors"
           title="Show thumbnails"
         >
           <PanelRightOpen size={18} />
         </button>
 
-        {/* Overlay backdrop */}
-        {mobileOpen && (
-          <div
-            className="fixed inset-0 bg-black/40 z-40"
-            onClick={() => setMobileOpen(false)}
-          />
-        )}
+        {createPortal(
+          <>
+            {/* Overlay backdrop */}
+            {mobileOpen && (
+              <button
+                type="button"
+                tabIndex={-1}
+                aria-label="Close thumbnail history"
+                className="fixed inset-0 z-40 appearance-none border-0 bg-black/40 p-0"
+                onClick={closeMobilePanel}
+              />
+            )}
 
-        {/* Slide-in panel from right */}
-        <aside className={`fixed top-0 right-0 h-full w-[100px] bg-bg-secondary border-l border-border z-50 flex flex-col transform transition-transform duration-300 ease-in-out ${
-          mobileOpen ? 'translate-x-0' : 'translate-x-full'
-        }`}>
-          <div className="px-2 py-2 border-b border-border flex items-center justify-between">
-            <span className="text-[10px] text-text-muted uppercase tracking-wider">History</span>
-            <button
-              onClick={() => setMobileOpen(false)}
-              className="p-1 rounded hover:bg-bg-hover text-text-secondary"
+            {/* Keep the drawer mounted for its transition and scroll state. */}
+            <aside
+              ref={mobileDialogRef}
+              id="mobile-thumbnail-panel"
+              role="dialog"
+              aria-modal={mobileOpen ? true : undefined}
+              aria-label="Thumbnail history"
+              aria-hidden={!mobileOpen}
+              inert={!mobileOpen}
+              className={`fixed top-0 right-0 h-full w-[168px] bg-bg-secondary border-l border-border z-50 flex flex-col transform transition-transform duration-300 ease-in-out ${
+              mobileOpen ? 'translate-x-0' : 'translate-x-full'
+            }`}
             >
-              <X size={14} />
-            </button>
-          </div>
-          {mobileOpen && (
-            <VirtualizedThumbnailList
-              activeIndex={activeIndex}
-              onThumbnailClick={onThumbnailClick}
-              onMobileClick={() => setMobileOpen(false)}
-            />
-          )}
-        </aside>
+              <div className="px-2 py-2 border-b border-border flex items-center justify-between">
+                <span className="text-[10px] text-text-muted uppercase tracking-wider">History</span>
+                <button
+                  ref={mobileCloseRef}
+                  type="button"
+                  aria-label="Hide thumbnails"
+                  onClick={closeMobilePanel}
+                  className="min-h-11 min-w-11 rounded hover:bg-bg-hover text-text-secondary flex items-center justify-center"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+              {privatePreviewControl && (
+                <button
+                  type="button"
+                  aria-pressed={privatePreviewControl.state === 'some'
+                    ? 'mixed'
+                    : privatePreviewControl.state === 'all'}
+                  aria-label={`${privatePreviewControl.state === 'all' ? 'Blur all' : privatePreviewControl.state === 'some' ? 'Reveal all remaining' : 'Reveal all'} private previews for project ${privatePreviewControl.workspace}`}
+                  title="Browser-session preview only; project access unchanged."
+                  onClick={privatePreviewControl.onToggle}
+                  className="mx-2 my-2 flex min-h-11 items-center justify-center gap-1 rounded-md border border-violet-500/40 px-2 text-[10px] text-violet-200 hover:bg-violet-500/10"
+                >
+                  {privatePreviewControl.state === 'all' ? <EyeOff size={14} /> : <Eye size={14} />}
+                  {privatePreviewControl.state === 'all'
+                    ? 'Blur all'
+                    : privatePreviewControl.state === 'some' ? 'Reveal all remaining' : 'Reveal all'}
+                </button>
+              )}
+              {mobileOpen && (
+                <VirtualizedThumbnailList
+                  activeIndex={activeIndex}
+                  onThumbnailClick={onThumbnailClick}
+                  onMobileClick={closeMobilePanel}
+                />
+              )}
+            </aside>
+          </>,
+          document.body,
+        )}
       </>
     )
   }

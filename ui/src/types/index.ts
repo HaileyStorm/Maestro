@@ -970,7 +970,7 @@ export type MediaFilter = 'all' | 'images' | 'videos' | 'audio' | 'avatars' | 'm
 export type ArtifactClass = 'final' | 'component' | 'window' | 'temporary'
 export type OutputArtifactScope = 'final' | 'all' | 'components' | 'component' | 'window' | 'temporary'
 export type AspectRatio = 'auto' | '16:9' | '9:16' | '1:1' | '4:3' | '3:4'
-export type ResolutionPreset = 'auto' | '480p' | '540p' | '720p' | '1080p'
+export type ResolutionPreset = 'auto' | '480p' | '540p' | '720p' | '768p' | '1080p'
 export type ScailResolutionProfile = '480p' | '512p' | '704p'
 /** Backward-compatible name for saved Recast/API callers. */
 export type RecastResolutionProfile = ScailResolutionProfile

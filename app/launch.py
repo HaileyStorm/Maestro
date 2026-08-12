@@ -1201,6 +1201,7 @@ from services.job_lifecycle import (
     set_queue_paused,
     stamp_job_residency,
     try_requeue,
+    try_resource_retry,
     try_start,
     transition_resource_execution,
     unregister_abort_state,
@@ -3809,6 +3810,37 @@ def _queue_recovery_materialize_job(
         _h3_incomplete_recovery_prefix(runtime)
         if snapshot.get("queue_held", False) else None
     )
+    durable_h3_resource_retry = (
+        runtime.get("resource_retry_phase") == "generation"
+        and runtime.get("resource_retry_reason") == "generation_oom"
+        and type(runtime.get("resource_retry_attempt")) is int
+        and type(runtime.get("resource_retry_limit")) is int
+        and 1 <= runtime["resource_retry_attempt"]
+        <= runtime["resource_retry_limit"] <= _MAX_AUTOMATIC_RESOURCE_RETRIES
+    )
+    durable_h3_prefix = (
+        _h3_dependency_closed_recovery_prefix(runtime)
+        if snapshot.get("queue_held", False)
+        and durable_h3_resource_retry else None
+    )
+    h3_reason = str(runtime.get("_recovery_reason_code") or "")
+    if durable_h3_prefix is not None and h3_reason in {
+        "h3_resource_retry_pending_replan",
+        "h3_generation_oom_replanned",
+    }:
+        pending_replan = h3_reason == "h3_resource_retry_pending_replan"
+        runtime.update({
+            "queue_held": pending_replan,
+            "recovery_state": "retrying",
+            "reruns_denoise": True,
+            "message": (
+                "Preparing a safer final H3 segment retry"
+                if pending_replan else "Queued for calibrated H3 recovery"
+            ),
+        })
+        # Pending work is prepared before worker start. A fully resealed plan
+        # can restart immediately. Neither path consumes another retry.
+        return runtime, True
     if held_h3_prefix is not None:
         # A held, dependency-closed H3 prefix is a recovery authorization
         # state, not an ordinary manual queue hold. Generic restoration used
@@ -3816,7 +3848,6 @@ def _queue_recovery_materialize_job(
         # unreachable after restart. Preserve only reviewed H3 reasons; an
         # empty/legacy reason regains explicit owner authorization and never
         # consumes an automatic attempt or calibration decision.
-        h3_reason = str(runtime.get("_recovery_reason_code") or "")
         if h3_reason not in {
             "h3_generation_recovery_authorization_required",
             "h3_peak_calibration_required",
@@ -4422,6 +4453,12 @@ def _restore_queue_recovery_on_startup() -> None:
     for pid in director_resumable:
         start_restored_pipeline(pid)
     for job in resumable:
+        if (
+            job.get("_recovery_reason_code")
+            == "h3_resource_retry_pending_replan"
+            and not _prepare_pending_h3_resource_retry(job)
+        ):
+            continue
         publication_recovery = globals().get(
             "_project_reference_publication_recovery_requested"
         )
@@ -5411,11 +5448,23 @@ def _h3_segment_recovery_settings(clip_info: dict) -> dict:
         # This identity is versioned and present only on newly replanned
         # units. Legacy sealed prefix units retain their original unit IDs.
         result["peak_recovery_identity"] = copy.deepcopy(peak_identity)
-    if clip_info.get("semantic_physical_contract_version") == 1:
+    raw_contract_version = clip_info.get(
+        "semantic_physical_contract_version"
+    )
+    if raw_contract_version is not None:
+        if (
+            isinstance(raw_contract_version, bool)
+            or not isinstance(raw_contract_version, int)
+            or raw_contract_version not in {1, 2}
+        ):
+            raise QueueRecoveryRuntimeError(
+                "H3 semantic execution recovery version is unsupported."
+            )
+        contract_version = raw_contract_version
         execution_slice = clip_info.get("execution_slice")
         try:
             execution = {
-                "version": 1,
+                "version": contract_version,
                 "semantic_shot_index": int(
                     clip_info.get("semantic_shot_index")
                 ),
@@ -5465,21 +5514,50 @@ def _h3_execution_shots_for_dispatch(
 ) -> list[dict] | None:
     """Validate and return the semantic-to-physical child contract."""
     shot_plan = longform.get("shot_plan") if isinstance(longform, dict) else None
-    if not isinstance(shot_plan, dict) or shot_plan.get(
-        "semantic_physical_contract_version"
-    ) != 1:
+    if not isinstance(shot_plan, dict):
         return None
+    raw_contract_version = shot_plan.get(
+        "semantic_physical_contract_version"
+    )
+    if raw_contract_version is None:
+        return None
+    if (
+        isinstance(raw_contract_version, bool)
+        or not isinstance(raw_contract_version, int)
+        or raw_contract_version not in {1, 2}
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 semantic execution contract version is unsupported."
+        )
+    contract_version = raw_contract_version
+    if contract_version == 2:
+        from services.h3_shot_planner import validate_h3_shot_plan_seal
+
+        try:
+            validate_h3_shot_plan_seal(shot_plan)
+        except ValueError as exc:
+            raise QueueRecoveryRuntimeError(str(exc)) from exc
     shots = shot_plan.get("shots")
     semantic = shot_plan.get("semantic_shots")
+    source_contracts = shot_plan.get("source_contracts")
     if (
         not isinstance(shots, list) or len(shots) != clip_count
         or not isinstance(semantic, list) or not semantic
         or len(prompt_lines) != clip_count
+        or (
+            contract_version == 2
+            and (
+                source_contracts != semantic
+                or shot_plan.get("clip_prompts") != prompt_lines
+            )
+        )
     ):
         raise QueueRecoveryRuntimeError(
             "H3 semantic execution slice count is invalid."
         )
     partition = []
+    nested_events = []
+    mappings = {}
     for contract in semantic:
         if not isinstance(contract, dict):
             raise QueueRecoveryRuntimeError(
@@ -5490,13 +5568,27 @@ def _h3_execution_shots_for_dispatch(
         if (
             not isinstance(indices, list) or not isinstance(slices, list)
             or len(indices) != len(slices) or not indices
-            or contract.get("prompt_rewrite_for_physical_split") is not False
+            or any(type(value) is not int for value in indices)
+            or contract.get("prompt_rewrite_for_physical_split")
+                is not (contract_version == 2)
+            or (
+                contract_version == 2
+                and contract.get("physical_prompt_compiler_version") != 2
+            )
         ):
             raise QueueRecoveryRuntimeError(
                 "H3 semantic execution contract is invalid."
             )
         cursor = 0
         semantic_prompt = str(contract.get("semantic_prompt"))
+        prompt_digests = contract.get("executable_prompt_sha256")
+        if contract_version == 2 and (
+            not isinstance(prompt_digests, list)
+            or len(prompt_digests) != len(indices)
+        ):
+            raise QueueRecoveryRuntimeError(
+                "H3 semantic execution prompt evidence is invalid."
+            )
         for physical_index, (segment_index, execution_slice) in enumerate(
             zip(indices, slices)
         ):
@@ -5504,12 +5596,25 @@ def _h3_execution_shots_for_dispatch(
                 segment_index = int(segment_index)
                 valid = (
                     isinstance(execution_slice, dict)
+                    and all(
+                        type(execution_slice.get(field)) is int
+                        for field in (
+                            "segment_index", "physical_segment_index",
+                            "start_frame", "end_frame_exclusive",
+                        )
+                    )
                     and int(execution_slice.get("segment_index")) == segment_index
                     and int(execution_slice.get("physical_segment_index"))
                         == physical_index
                     and int(execution_slice.get("start_frame")) == cursor
                     and int(execution_slice.get("end_frame_exclusive")) > cursor
-                    and prompt_lines[segment_index] == semantic_prompt
+                    and (
+                        prompt_lines[segment_index] == semantic_prompt
+                        if contract_version == 1 else
+                        prompt_digests[physical_index] == hashlib.sha256(
+                            prompt_lines[segment_index].encode("utf-8")
+                        ).hexdigest()
+                    )
                 )
                 cursor = int(execution_slice.get("end_frame_exclusive"))
             except (IndexError, TypeError, ValueError):
@@ -5519,9 +5624,93 @@ def _h3_execution_shots_for_dispatch(
                     "H3 semantic execution slice is invalid."
                 )
             partition.append(segment_index)
+            mappings[segment_index] = (
+                contract, physical_index, execution_slice,
+            )
+        if contract_version == 2:
+            events = contract.get("event_ownership")
+            if not isinstance(events, list):
+                raise QueueRecoveryRuntimeError(
+                    "H3 semantic event ownership is invalid."
+                )
+            for event in events:
+                try:
+                    owner = event.get("owner_segment_index")
+                    local_owner = event.get(
+                        "owner_physical_segment_index"
+                    )
+                    payload = event.get("executable_payload")
+                    valid = (
+                        isinstance(event, dict)
+                        and type(owner) is int
+                        and type(local_owner) is int
+                        and 0 <= local_owner < len(indices)
+                        and int(indices[local_owner]) == owner
+                        and isinstance(payload, str)
+                        and payload.strip()
+                        and payload in prompt_lines[owner]
+                        and event.get("owner_physical_segment_id") == (
+                            f"{contract.get('authored_shot_id')}:segment-"
+                            f"{local_owner + 1}"
+                        )
+                        and (
+                            event.get("kind") != "final_blocking"
+                            or local_owner == len(indices) - 1
+                        )
+                    )
+                    owner_slice = slices[local_owner]
+                    source_start = event.get("source_start_frame")
+                    source_end = event.get("source_end_frame_exclusive")
+                    if source_start is None and source_end is None:
+                        valid = valid and all(
+                            event.get(field) is None
+                            for field in (
+                                "local_start_frame",
+                                "local_end_frame_exclusive",
+                            )
+                        )
+                    elif (
+                        type(source_start) is int
+                        and type(source_end) is int
+                    ):
+                        valid = valid and (
+                            int(owner_slice.get("start_frame"))
+                            <= source_start
+                            < int(owner_slice.get("end_frame_exclusive"))
+                            and source_end > source_start
+                            and event.get("local_start_frame") == (
+                                source_start
+                                - int(owner_slice.get("start_frame"))
+                            )
+                            and event.get("local_end_frame_exclusive") == (
+                                min(
+                                    source_end,
+                                    int(owner_slice.get(
+                                        "end_frame_exclusive"
+                                    )),
+                                )
+                                - int(owner_slice.get("start_frame"))
+                            )
+                        )
+                    else:
+                        valid = False
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    raise QueueRecoveryRuntimeError(
+                        "H3 semantic event ownership is invalid."
+                    )
+            nested_events.extend(events)
     if sorted(partition) != list(range(clip_count)) or len(set(partition)) != clip_count:
         raise QueueRecoveryRuntimeError(
             "H3 semantic execution slices do not partition the children."
+        )
+    if (
+        contract_version == 2
+        and shot_plan.get("event_ownership") != nested_events
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 semantic event ownership copies disagree."
         )
     for index, shot in enumerate(shots):
         if not isinstance(shot, dict):
@@ -5530,9 +5719,18 @@ def _h3_execution_shots_for_dispatch(
             )
         predecessor = shots[index - 1] if index else None
         try:
+            contract, physical_index, execution_slice = mappings[index]
             valid = (
                 int(shot.get("index")) == index
                 and str(shot.get("prompt")) == prompt_lines[index]
+                and int(shot.get("source_index"))
+                    == int(contract.get("source_index"))
+                and int(shot.get("physical_segment_index"))
+                    == physical_index
+                and shot.get("execution_slice") == execution_slice
+                and int(shot.get("published_frames"))
+                    == int(execution_slice.get("end_frame_exclusive"))
+                    - int(execution_slice.get("start_frame"))
                 and int(shot.get("execution_cursor_frame"))
                     == int((shot.get("execution_slice") or {}).get("start_frame"))
                 and (
@@ -5556,8 +5754,8 @@ def _h3_execution_shots_for_dispatch(
     return [copy.deepcopy(shot) for shot in shots]
 
 
-def _h3_incomplete_recovery_prefix(job: dict) -> int | None:
-    """Return the exact sealed prefix length for one unfinished H3 chain."""
+def _h3_dependency_closed_recovery_prefix(job: dict) -> int | None:
+    """Return a contiguous verified H3 prefix before concat/delivery."""
     params = job.get("params")
     params = params if isinstance(params, dict) else {}
     longform = params.get("_h3_longform")
@@ -5574,21 +5772,43 @@ def _h3_incomplete_recovery_prefix(job: dict) -> int | None:
     if any(unit.get("kind") in {"h3_concat", "h3_delivery"} for unit in units):
         return None
     indices = set()
+    segment_units = 0
     try:
         for unit in units:
-            if (
-                unit.get("kind") == "h3_segment"
-                and int(unit.get("variant", 0) or 0) == 0
-            ):
-                indices.add(int(unit.get("index", -1)))
+            if unit.get("kind") != "h3_segment":
+                continue
+            segment_units += 1
+            if int(unit.get("variant", 0) or 0) != 0:
+                return None
+            indices.add(int(unit.get("index", -1)))
     except (TypeError, ValueError):
         return None
     prefix = 0
     while prefix in indices:
         prefix += 1
-    if indices != set(range(prefix)) or prefix != clip_count - 1:
+    if (
+        indices != set(range(prefix))
+        or segment_units != len(indices)
+        or prefix >= clip_count
+    ):
         return None
     return prefix
+
+
+def _h3_incomplete_recovery_prefix(job: dict) -> int | None:
+    """Return the exact sealed prefix when only the final segment is absent."""
+    prefix = _h3_dependency_closed_recovery_prefix(job)
+    if prefix is None:
+        return None
+    try:
+        clip_count = int(
+            ((job.get("params") or {}).get("_h3_longform") or {}).get(
+                "clip_count"
+            ) or 0
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return prefix if prefix == clip_count - 1 else None
 
 
 def _replan_h3_final_segment_for_peak(
@@ -5602,6 +5822,8 @@ def _replan_h3_final_segment_for_peak(
         infer_h3_profile_id,
         plan_h3_clip_frames,
         plan_h3_native_shots,
+        seal_h3_shot_plan,
+        validate_h3_shot_plan_seal,
     )
     from shared.utils.prompt_parser import classify_timeline_clip_boundaries
 
@@ -5708,10 +5930,34 @@ def _replan_h3_final_segment_for_peak(
         list(original_shot_plan.get("semantic_shots") or [])
         if isinstance(original_shot_plan, dict) else []
     )
-    original_has_semantic_contract = bool(
-        original_shot_plan.get("semantic_physical_contract_version") == 1
-        if isinstance(original_shot_plan, dict) else False
+    raw_contract_version = (
+        original_shot_plan.get("semantic_physical_contract_version")
+        if isinstance(original_shot_plan, dict) else None
     )
+    if raw_contract_version is not None and (
+        isinstance(raw_contract_version, bool)
+        or not isinstance(raw_contract_version, int)
+        or raw_contract_version not in {1, 2}
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery semantic contract version is unsupported."
+        )
+    contract_version = int(raw_contract_version or 0)
+    original_has_semantic_contract = contract_version in {1, 2}
+    if contract_version == 2:
+        try:
+            validate_h3_shot_plan_seal(original_shot_plan)
+        except ValueError as exc:
+            raise QueueRecoveryRuntimeError(str(exc)) from exc
+        if (
+            str(original_shot_plan.get("global_prompt") or "")
+            != str(longform.get("global_prompt") or "")
+            or list(original_shot_plan.get("clip_prompts") or []) != prompts
+        ):
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery global prompt provenance changed."
+            )
+    source_compiler_inputs = None
     if original_has_semantic_contract:
         if (
             len(original_shots) != completed_prefix + 1
@@ -5720,21 +5966,51 @@ def _replan_h3_final_segment_for_peak(
             raise QueueRecoveryRuntimeError(
                 "H3 recovery semantic source contract is incomplete."
             )
-        source_prompts = [
-            str(contract.get("semantic_prompt"))
-            for contract in original_semantic
-        ]
+        source_prompts = []
+        structured_shots = []
+        source_compiler_inputs = [] if contract_version == 2 else None
+        for contract in original_semantic:
+            if not isinstance(contract, dict):
+                raise QueueRecoveryRuntimeError(
+                    "H3 recovery semantic source contract is incomplete."
+                )
+            source_prompt_field = (
+                "authored_prompt" if contract_version == 2
+                else "semantic_prompt"
+            )
+            source_prompts.append(str(
+                contract.get(source_prompt_field) or ""
+            ))
+            if contract_version == 2:
+                source_compiler_inputs.append({
+                    "version": 1,
+                    "authored_shot_id": contract.get("authored_shot_id"),
+                    "visual_context": contract.get("visual_context"),
+                    "opening_blocking": contract.get("opening_blocking"),
+                    "final_blocking": contract.get("final_blocking"),
+                    "structured_dialogue_blocks": copy.deepcopy(
+                        contract.get("structured_dialogue_blocks")
+                    ),
+                })
+            else:
+                # Retain the committed v1 compiler input shape byte-for-byte;
+                # only v2 adopts the closed replay-input contract above.
+                structured_shot = copy.deepcopy(contract)
+                structured_shot["shot_id"] = str(
+                    contract.get("authored_shot_id") or ""
+                )
+                structured_shots.append(structured_shot)
+        if not all(source_prompts) or not all(
+            shot.get("shot_id") for shot in structured_shots
+        ):
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery semantic source contract is incomplete."
+            )
         final_source_index = int(original_shots[-1].get("source_index"))
         source_indices = [
             int(shot.get("source_index"))
             for shot in original_shots[:completed_prefix]
         ] + [final_source_index] * len(replacement_frames)
-        structured_shots = copy.deepcopy(original_semantic)
-        for contract in structured_shots:
-            if isinstance(contract, dict):
-                contract["shot_id"] = str(
-                    contract.get("authored_shot_id") or ""
-                )
     else:
         # Legacy plans predate the semantic/physical contract but their
         # per-clip prompts are already sealed worker inputs. Treat each
@@ -5760,7 +6036,10 @@ def _replan_h3_final_segment_for_peak(
         },
         source_prompts=source_prompts,
         source_indices=source_indices,
-        structured_shots=structured_shots,
+        structured_shots=(
+            structured_shots if contract_version != 2 else None
+        ),
+        source_compiler_inputs=source_compiler_inputs,
     )
     if original_semantic:
         original_by_source = {
@@ -5783,14 +6062,18 @@ def _replan_h3_final_segment_for_peak(
                 raise QueueRecoveryRuntimeError(
                     "H3 recovery changed a sealed semantic prompt."
                 )
-            # Geometry is newly planned; authored metadata remains the exact
-            # sealed semantic contract, including reference associations.
-            preserved = copy.deepcopy(original_contract)
+            # Geometry-owned fields are recomputed for the unfinished suffix.
+            # Semantic provenance is immutable across calibrated recovery.
+            preserved = copy.deepcopy(rebuilt)
             for field in (
-                "segment_indices", "execution_slices",
-                "prompt_rewrite_for_physical_split",
+                "authored_prompt", "semantic_prompt", "reference_labels",
+                "visual_context", "opening_blocking", "final_blocking",
+                "authored_final_blocking",
             ):
-                preserved[field] = copy.deepcopy(rebuilt.get(field))
+                if field in original_contract:
+                    preserved[field] = copy.deepcopy(
+                        original_contract.get(field)
+                    )
             rebuilt_contracts.append(preserved)
         if len(rebuilt_contracts) != len(original_semantic):
             raise QueueRecoveryRuntimeError(
@@ -5800,25 +6083,194 @@ def _replan_h3_final_segment_for_peak(
         full_shot_plan["semantic_shots"] = copy.deepcopy(rebuilt_contracts)
 
         original_dialogue = original_shot_plan.get("dialogue_manifest")
-        if not isinstance(original_dialogue, list) or any(
-            not isinstance(item, dict) for item in original_dialogue
+        rebuilt_dialogue = full_shot_plan.get("dialogue_manifest")
+        if (
+            not isinstance(original_dialogue, list)
+            or not isinstance(rebuilt_dialogue, list)
+            or len(original_dialogue) != len(rebuilt_dialogue)
         ):
             raise QueueRecoveryRuntimeError(
                 "H3 recovery dialogue manifest is invalid."
             )
-        full_shot_plan["dialogue_manifest"] = copy.deepcopy(original_dialogue)
-        for shot in full_shot_plan.get("shots") or []:
-            shot["dialogue_manifest_indices"] = []
-        for manifest_index, item in enumerate(original_dialogue):
-            try:
-                segment_index = int(item.get("segment_index"))
-                full_shot_plan["shots"][segment_index][
-                    "dialogue_manifest_indices"
-                ].append(manifest_index)
-            except (IndexError, TypeError, ValueError):
+        remaining_dialogue = [
+            copy.deepcopy(item) for item in original_dialogue
+            if isinstance(item, dict)
+        ]
+        preserved_dialogue = []
+        for rebuilt_item in rebuilt_dialogue:
+            if not isinstance(rebuilt_item, dict):
                 raise QueueRecoveryRuntimeError(
-                    "H3 recovery dialogue association is invalid."
+                    "H3 recovery dialogue manifest is invalid."
+                )
+            match_index = next((
+                index for index, original_item in enumerate(
+                    remaining_dialogue
+                )
+                if original_item.get("exact_block")
+                    == rebuilt_item.get("exact_block")
+                and original_item.get("authored_shot_id")
+                    == rebuilt_item.get("authored_shot_id")
+            ), None)
+            if match_index is None:
+                raise QueueRecoveryRuntimeError(
+                    "H3 recovery dialogue provenance changed."
+                )
+            preserved_item = remaining_dialogue.pop(match_index)
+            preserved_item["segment_index"] = rebuilt_item.get(
+                "segment_index"
+            )
+            preserved_dialogue.append(preserved_item)
+        if remaining_dialogue:
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery dialogue provenance changed."
+            )
+        full_shot_plan["dialogue_manifest"] = preserved_dialogue
+        for contract in full_shot_plan["source_contracts"]:
+            contract["dialogue_manifest"] = [
+                copy.deepcopy(item) for item in preserved_dialogue
+                if item.get("source_index") == contract.get("source_index")
+            ]
+        full_shot_plan["semantic_shots"] = copy.deepcopy(
+            full_shot_plan["source_contracts"]
+        )
+        for index, shot in enumerate(full_shot_plan.get("shots") or []):
+            shot["dialogue_manifest_indices"] = [
+                manifest_index
+                for manifest_index, item in enumerate(preserved_dialogue)
+                if item.get("segment_index") == index
+            ]
+
+    if contract_version == 2:
+        full_prompts = list(full_shot_plan.get("clip_prompts") or [])
+        if full_prompts[:completed_prefix] != prompts[:completed_prefix]:
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery changed a completed segment-local prompt."
+            )
+        immutable_prefix_fields = (
+            "index", "source_index", "authored_shot_id",
+            "semantic_shot_index", "physical_segment_id",
+            "physical_segment_index", "predecessor_segment_index",
+            "predecessor_physical_segment_id",
+            "predecessor_authored_shot_id", "execution_cursor_frame",
+            "execution_slice", "frames", "start_frame", "end_frame",
+            "published_frames", "published_start_frame",
+            "published_end_frame", "published_end_frame_exclusive",
+            "trim_tail_frames", "continuity_mode", "boundary_before",
+            "prompt", "dialogue_manifest_indices",
+        )
+        for index in range(completed_prefix):
+            original_shot = original_shots[index]
+            rebuilt_shot = full_shot_plan["shots"][index]
+            if any(
+                rebuilt_shot.get(field) != original_shot.get(field)
+                for field in immutable_prefix_fields
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "H3 recovery changed completed segment geometry."
+                )
+        try:
+            def completed_event_projection(event: dict) -> dict:
+                continuations = event.get("continuation_slices")
+                if not isinstance(continuations, list):
+                    raise TypeError
+                projected = copy.deepcopy(event)
+                projected["continuation_slices"] = []
+                for item in continuations:
+                    if (
+                        not isinstance(item, dict)
+                        or type(item.get("segment_index")) is not int
+                    ):
+                        raise TypeError
+                    if item["segment_index"] < completed_prefix:
+                        projected["continuation_slices"].append(
+                            copy.deepcopy(item)
+                        )
+                return projected
+
+            original_prefix_events = {
+                str(event.get("event_id")): completed_event_projection(event)
+                for event in original_shot_plan.get("event_ownership") or []
+                if isinstance(event, dict)
+                and int(event.get("owner_segment_index", -1))
+                    < completed_prefix
+            }
+            rebuilt_prefix_events = {
+                str(event.get("event_id")): completed_event_projection(event)
+                for event in full_shot_plan.get("event_ownership") or []
+                if isinstance(event, dict)
+                and int(event.get("owner_segment_index", -1))
+                    < completed_prefix
+            }
+        except (TypeError, ValueError):
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery event ownership is invalid."
+            ) from None
+        if rebuilt_prefix_events != original_prefix_events:
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery changed completed event ownership."
+            )
+        if "h3_style_workflow" in original_shot_plan:
+            full_shot_plan["h3_style_workflow"] = copy.deepcopy(
+                original_shot_plan.get("h3_style_workflow")
+            )
+    else:
+        # Preserve committed v1 replay semantics. The v2 planner is used only
+        # as a deterministic geometry builder; completed v1 children are never
+        # migrated to segment-local prompts during a partial-chain recovery.
+        v1_prompts = [""] * len(full_shot_plan.get("shots") or [])
+        for contract in full_shot_plan.get("source_contracts") or []:
+            semantic_prompt = str(contract.get("semantic_prompt") or "")
+            for position in contract.get("segment_indices") or []:
+                v1_prompts[int(position)] = semantic_prompt
+            contract["prompt_rewrite_for_physical_split"] = False
+            for field in (
+                "physical_prompt_compiler_version", "event_ownership",
+                "executable_prompt_sha256",
+            ):
+                contract.pop(field, None)
+        if not all(v1_prompts):
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery v1 prompt mapping is incomplete."
+            )
+        full_shot_plan["semantic_physical_contract_version"] = 1
+        full_shot_plan["clip_prompts"] = v1_prompts
+        full_shot_plan.pop("event_ownership", None)
+        full_shot_plan.pop("prompt_contract_seal", None)
+        for item in full_shot_plan.get("dialogue_manifest") or []:
+            try:
+                source = int(item.get("source_index"))
+                item["segment_index"] = int(
+                    full_shot_plan["source_contracts"][source][
+                        "segment_indices"
+                    ][0]
+                )
+            except (AttributeError, IndexError, TypeError, ValueError):
+                raise QueueRecoveryRuntimeError(
+                    "H3 recovery v1 dialogue association is invalid."
                 ) from None
+        for contract in full_shot_plan.get("source_contracts") or []:
+            contract["dialogue_manifest"] = [
+                copy.deepcopy(item)
+                for item in full_shot_plan.get("dialogue_manifest") or []
+                if item.get("source_index") == contract.get("source_index")
+            ]
+        full_shot_plan["semantic_shots"] = copy.deepcopy(
+            full_shot_plan.get("source_contracts") or []
+        )
+        for index, shot in enumerate(full_shot_plan.get("shots") or []):
+            shot["prompt"] = v1_prompts[index]
+            shot["dialogue_manifest_indices"] = [
+                manifest_index
+                for manifest_index, item in enumerate(
+                    full_shot_plan.get("dialogue_manifest") or []
+                )
+                if item.get("segment_index") == index
+            ]
+        full_prompts = v1_prompts
+        if full_prompts[:completed_prefix] != prompts[:completed_prefix]:
+            raise QueueRecoveryRuntimeError(
+                "H3 recovery changed a completed v1 prompt."
+            )
     if (
         list(full_shot_plan.get("clip_prompts") or []) != full_prompts
         or list(full_shot_plan.get("clip_published_frames") or [])
@@ -5875,6 +6327,23 @@ def _replan_h3_final_segment_for_peak(
         "per_clip_prompts": full_prompts,
         "prompt": _MULTI_CLIP_SEPARATOR.join(full_prompts),
     })
+    try:
+        full_source_indices = [
+            int(shot.get("source_index"))
+            for shot in full_shot_plan.get("shots") or []
+            if isinstance(shot, dict)
+        ]
+    except (TypeError, ValueError):
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery source mapping is invalid."
+        ) from None
+    if (
+        len(full_source_indices) != len(full_frames)
+        or len(full_models) != len(full_frames)
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 recovery source/model mapping is incomplete."
+        )
     longform.update({
         "clip_count": len(full_frames),
         "clip_frames": full_frames,
@@ -5883,6 +6352,10 @@ def _replan_h3_final_segment_for_peak(
         "clip_prompt_previews": [value[:240] for value in full_prompts],
         "clip_boundaries": full_boundaries,
         "segment_models": full_models,
+        "segment_source_indices": full_source_indices,
+        "segment_policy": copy.deepcopy(
+            full_shot_plan.get("segment_policy") or {}
+        ),
         "planned_frames": sum(full_frames),
         "final_trim_frames": sum(full_trims),
         "segment_frames_maximum": ceiling,
@@ -5897,6 +6370,16 @@ def _replan_h3_final_segment_for_peak(
         "recovery_shot_plan": shot_plan,
         "recovery_segment_policy": segment_policy,
     })
+    if contract_version == 2:
+        original_runtime_contract = original_shot_plan.get(
+            "director_runtime_contract"
+        )
+        if isinstance(original_runtime_contract, dict):
+            full_shot_plan["director_runtime_contract"] = {
+                field: copy.deepcopy(longform.get(field))
+                for field in original_runtime_contract
+            }
+        seal_h3_shot_plan(full_shot_plan)
     if sum(full_published) != int(longform.get("published_frames") or 0):
         raise QueueRecoveryRuntimeError(
             "H3 recovery changed the job publication contract."
@@ -8939,6 +9422,7 @@ _DIRECTOR_LEGACY_IMAGE_FIELDS = frozenset({"image_model", "image_loras"})
 _DIRECTOR_IMAGE_ROLE_INTERNAL_FIELDS = frozenset({
     "_director_image_role", "_director_image_role_loras",
     "_director_image_role_selection", "_director_image_role_base_prompt",
+    "_director_component_errors",
 })
 _DIRECTOR_SAFE_IMAGE_MODEL = "flux2_klein_9b"
 _DIRECTOR_DEFAULT_EDITOR_MODEL = "flux2_klein_9b"
@@ -8946,6 +9430,95 @@ _DIRECTOR_EXPLICIT_CREATOR_MODELS = (
     "krea2_moody_mix_v7_fp8",
     "krea2_moody_cutie_v4_fp8",
 )
+_DIRECTOR_FAILURE_CODES = frozenset({
+    "director_model_unavailable",
+    "director_model_not_ready",
+    "director_model_terms_required",
+    "director_role_lora_unavailable",
+    "director_reference_unavailable",
+})
+_DIRECTOR_FAILURE_COMPONENTS = frozenset({
+    "video_model",
+    "image_creator_model",
+    "continuity_editor_model",
+    "image_creator_lora",
+    "continuity_editor_lora",
+    "character_reference",
+    "location_reference",
+    "starting_image",
+})
+
+
+def _director_component_error(
+    *,
+    status_code: int,
+    code: str,
+    component: str,
+    message: str,
+) -> None:
+    """Raise one closed, content-free Director admission failure."""
+    if (
+        code not in _DIRECTOR_FAILURE_CODES
+        or component not in _DIRECTOR_FAILURE_COMPONENTS
+    ):
+        raise RuntimeError("Invalid Director component failure contract")
+    raise HTTPException(
+        status_code=status_code,
+        detail={"code": code, "component": component, "message": message},
+    )
+
+
+def _director_component_error_response(error: HTTPException):
+    """Project only the closed Director error object at the HTTP top level."""
+    detail = getattr(error, "detail", None)
+    if not isinstance(detail, dict) or set(detail) != {
+        "code", "component", "message",
+    }:
+        return None
+    if (
+        detail.get("code") not in _DIRECTOR_FAILURE_CODES
+        or detail.get("component") not in _DIRECTOR_FAILURE_COMPONENTS
+        or not isinstance(detail.get("message"), str)
+    ):
+        return None
+    return JSONResponse(detail, status_code=error.status_code)
+
+
+def _director_require_visible_model(
+    request: Request,
+    model_type: str,
+    component: str,
+) -> None:
+    """Apply the shared remote allowlist without revealing hidden membership."""
+    try:
+        _require_remote_visible_models(request, [model_type])
+    except HTTPException as error:
+        if error.status_code != 404:
+            raise
+        _director_component_error(
+            status_code=404,
+            code="director_model_unavailable",
+            component=component,
+            message="Selected Director model is unavailable in this session.",
+        )
+
+
+def _director_validate_workflow_or_raise(body: dict) -> None:
+    """Apply Director's exact video workflow contract without starting work."""
+    from services.director_pipeline import (
+        DirectorModelCompatibilityError,
+        _validate_director_models,
+    )
+
+    try:
+        _validate_director_models(body, stages=("video",))
+    except DirectorModelCompatibilityError:
+        _director_component_error(
+            status_code=404,
+            code="director_model_unavailable",
+            component="video_model",
+            message="Selected Director model is unavailable for this workflow.",
+        )
 
 
 def _director_image_role_wire_mode(body: dict) -> str:
@@ -9124,32 +9697,105 @@ def _director_role_lora_request(
     ]
 
 
-def _director_model_ready_or_raise(model_type: str, *, image_role: str = "") -> None:
+def _director_model_ready_or_raise(
+    model_type: str,
+    *,
+    image_role: str = "",
+    video_role: bool = False,
+    component: str = "",
+) -> None:
     """Require compatibility, terms, manual verification, and local weights."""
-    from services.director_model_compat import assess_director_model
+    from services.director_model_compat import (
+        DIRECTOR_PIPELINE_TYPES,
+        assess_director_model,
+    )
+    from services.model_terms import model_terms_manifest_valid
 
     model_def = wgp.get_model_def(model_type)
     if not isinstance(model_def, dict):
+        if component:
+            _director_component_error(
+                status_code=404,
+                code="director_model_unavailable",
+                component=component,
+                message="Selected Director model is unavailable in this session.",
+            )
         raise HTTPException(status_code=409, detail="Director model is unavailable")
-    if image_role:
+    if image_role or video_role:
         assessment = assess_director_model(
             model_type,
             model_def,
             family=wgp.get_model_family(model_type, for_ui=True),
             architecture=wgp.get_base_model_type(model_type),
         )
+    if video_role and not any(
+        assessment["video"][pipeline_type]["compatible"]
+        for pipeline_type in DIRECTOR_PIPELINE_TYPES
+    ):
+        if component:
+            _director_component_error(
+                status_code=404,
+                code="director_model_unavailable",
+                component=component,
+                message="Selected Director model is unavailable in this session.",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="Director video model is incompatible",
+        )
+    if image_role:
         if not assessment["image"][image_role]["compatible"]:
+            if component:
+                _director_component_error(
+                    status_code=404,
+                    code="director_model_unavailable",
+                    component=component,
+                    message="Selected Director model is unavailable in this session.",
+                )
             raise HTTPException(
                 status_code=409,
                 detail=f"Director image {image_role} model is incompatible",
             )
         if not _director_image_model_enabled(model_type):
+            if component:
+                _director_component_error(
+                    status_code=404,
+                    code="director_model_unavailable",
+                    component=component,
+                    message="Selected Director model is unavailable in this session.",
+                )
             raise HTTPException(
                 status_code=409,
                 detail=f"Director image {image_role} model is disabled",
             )
-    _require_model_recipe_terms([model_type])
+    if component and not model_terms_manifest_valid(
+        model_type, wgp.models_def,
+    ):
+        _director_component_error(
+            status_code=404,
+            code="director_model_unavailable",
+            component=component,
+            message="Selected Director model is unavailable in this session.",
+        )
+    try:
+        _require_model_recipe_terms([model_type])
+    except HTTPException:
+        if component:
+            _director_component_error(
+                status_code=409,
+                code="director_model_terms_required",
+                component=component,
+                message="Selected Director model requires accepted terms.",
+            )
+        raise
     if not _check_model_downloaded(model_type):
+        if component:
+            _director_component_error(
+                status_code=409,
+                code="director_model_not_ready",
+                component=component,
+                message="Selected Director model is not ready on this host.",
+            )
         raise HTTPException(
             status_code=409,
             detail="Director model is not ready on this host",
@@ -9159,8 +9805,13 @@ def _director_model_ready_or_raise(model_type: str, *, image_role: str = "") -> 
 def _resolve_director_image_role_request(
     request: Request,
     body: dict,
+    *,
+    component_errors: bool = False,
 ) -> str:
     """Resolve and seal Director's legacy or explicit two-role image wire."""
+    component_errors = bool(
+        component_errors or body.get("_director_component_errors") is True
+    )
     _migrate_director_final_video_postprocess(body)
     mode = _director_image_role_wire_mode(body)
     if mode == "legacy":
@@ -9172,6 +9823,8 @@ def _resolve_director_image_role_request(
         for model_type in models:
             if str(model_type or "").strip():
                 _director_model_ready_or_raise(str(model_type))
+        if component_errors:
+            _director_validate_workflow_or_raise(body)
         return mode
 
     sealed_selection = body.get("_director_image_role_selection")
@@ -9218,24 +9871,70 @@ def _resolve_director_image_role_request(
         "creator": creator_source,
         "editor": editor_source,
     }
-    models = [body.get("video_model"), creator_model, editor_model]
-    _require_remote_visible_models(request, models)
-    _director_model_ready_or_raise(creator_model, image_role="creator")
-    _director_model_ready_or_raise(editor_model, image_role="editor")
-    if str(body.get("video_model") or "").strip():
-        _director_model_ready_or_raise(str(body["video_model"]))
-    body["_director_image_role_loras"] = {
-        "creator": _director_role_lora_request(
+    video_model = str(body.get("video_model") or "").strip()
+    models = [video_model, creator_model, editor_model]
+    if component_errors:
+        for model_type, component in (
+            (video_model, "video_model"),
+            (creator_model, "image_creator_model"),
+            (editor_model, "continuity_editor_model"),
+        ):
+            if model_type:
+                _director_require_visible_model(request, model_type, component)
+    else:
+        _require_remote_visible_models(request, models)
+    _director_model_ready_or_raise(
+        creator_model,
+        image_role="creator",
+        component="image_creator_model" if component_errors else "",
+    )
+    _director_model_ready_or_raise(
+        editor_model,
+        image_role="editor",
+        component="continuity_editor_model" if component_errors else "",
+    )
+    if video_model:
+        _director_model_ready_or_raise(
+            video_model,
+            video_role=component_errors,
+            component="video_model" if component_errors else "",
+        )
+    try:
+        creator_loras = _director_role_lora_request(
             body.get("image_creator_loras"),
             model_type=creator_model,
             scope="generation",
-        ),
-        "editor": _director_role_lora_request(
+        )
+    except HTTPException as error:
+        if not component_errors:
+            raise
+        _director_component_error(
+            status_code=error.status_code,
+            code="director_role_lora_unavailable",
+            component="image_creator_lora",
+            message="Selected Director role LoRA is unavailable.",
+        )
+    try:
+        editor_loras = _director_role_lora_request(
             body.get("image_editor_loras"),
             model_type=editor_model,
             scope="editing",
-        ),
+        )
+    except HTTPException as error:
+        if not component_errors:
+            raise
+        _director_component_error(
+            status_code=error.status_code,
+            code="director_role_lora_unavailable",
+            component="continuity_editor_lora",
+            message="Selected Director role LoRA is unavailable.",
+        )
+    body["_director_image_role_loras"] = {
+        "creator": creator_loras,
+        "editor": editor_loras,
     }
+    if component_errors:
+        _director_validate_workflow_or_raise(body)
     return mode
 
 
@@ -9344,21 +10043,45 @@ def _require_job_runtime_model_admission(job: dict) -> None:
         _require_job_model_recipe_terms(job)
 
 
-def _authorize_director_media_inputs(request: Request, body: dict) -> str:
+def _authorize_director_media_inputs(
+    request: Request,
+    body: dict,
+    *,
+    component_errors: bool = False,
+) -> str:
     """Authorize every Director reference before an LLM/provider sees it."""
+    component_errors = bool(
+        component_errors or body.get("_director_component_errors") is True
+    )
     workspace = body.get("workspace") or _get_active_workspace()
     _require_project_access(request, workspace)
-    _require_remote_visible_models(
-        request,
-        [
-            body.get("video_model"), body.get("image_model"),
-            body.get("image_creator_model"), body.get("image_editor_model"),
-        ],
-    )
+    if component_errors and _director_image_role_wire_mode(body) == "roles":
+        for model_type, component in (
+            (body.get("video_model"), "video_model"),
+            (body.get("image_creator_model"), "image_creator_model"),
+            (body.get("image_editor_model"), "continuity_editor_model"),
+        ):
+            if str(model_type or "").strip():
+                _director_require_visible_model(
+                    request, str(model_type).strip(), component,
+                )
+    else:
+        _require_remote_visible_models(
+            request,
+            [
+                body.get("video_model"), body.get("image_model"),
+                body.get("image_creator_model"), body.get("image_editor_model"),
+            ],
+        )
     fields = (
         "reference_image_path", "character_ref_paths", "location_ref_paths",
         "audio_path", "voice_reference", "voice_ref_paths",
     )
+    reference_components = {
+        "reference_image_path": "starting_image",
+        "character_ref_paths": "character_reference",
+        "location_ref_paths": "location_reference",
+    }
     def resolve(value, field):
         if value is None or value == "":
             return value
@@ -9368,6 +10091,14 @@ def _authorize_director_media_inputs(request: Request, body: dict) -> str:
             raise HTTPException(status_code=400, detail=f"{field} must be a media path or list")
         authorized = _resolve_authorized_request_media(request, value, workspace)
         if not authorized:
+            component = reference_components.get(field)
+            if component_errors and component:
+                _director_component_error(
+                    status_code=404,
+                    code="director_reference_unavailable",
+                    component=component,
+                    message="Selected Director reference is unavailable.",
+                )
             raise HTTPException(status_code=404, detail=f"Unauthorized media: {field}")
         return authorized
     for field in fields:
@@ -14860,6 +15591,90 @@ async def scan_and_generate_guides(request: Request):
 
     return {"scan_id": scan_id, "total": len(to_process), "status": "running"}
 
+_DEFAULT_RESOLUTION_PRESETS = {
+    "480p": {
+        "label": "480p",
+        "values": {
+            "16:9": "848x480", "9:16": "480x848", "1:1": "672x672",
+            "4:3": "736x544", "3:4": "544x736",
+        },
+    },
+    "540p": {
+        "label": "540p",
+        "values": {
+            "16:9": "960x544", "9:16": "544x960", "1:1": "736x736",
+            "4:3": "832x608", "3:4": "608x832",
+        },
+    },
+    "720p": {
+        "label": "720p",
+        "values": {
+            "16:9": "1280x720", "9:16": "720x1280", "1:1": "1024x1024",
+            "4:3": "1104x832", "3:4": "832x1104",
+        },
+    },
+    "1080p": {
+        "label": "1080p",
+        "values": {
+            "16:9": "1920x1088", "9:16": "1088x1920", "1:1": "1024x1024",
+            "4:3": "1920x1088", "3:4": "1088x1920",
+        },
+    },
+}
+_DEFAULT_RESOLUTION_PRESET_ORDER = ["480p", "540p", "720p", "1080p"]
+_RESOLUTION_ASPECT_VALUES = frozenset({"auto", "16:9", "9:16", "1:1", "4:3", "3:4"})
+
+
+def _model_resolution_contract(model_def: dict) -> dict:
+    """Return one validated, server-authored resolution contract."""
+    declared_presets = model_def.get("resolution_presets")
+    declared_order = model_def.get("resolution_preset_order")
+    uses_declared = declared_presets is not None or declared_order is not None
+    presets = declared_presets if uses_declared else _DEFAULT_RESOLUTION_PRESETS
+    order = declared_order if uses_declared else _DEFAULT_RESOLUTION_PRESET_ORDER
+    if not isinstance(presets, dict) or not isinstance(order, (list, tuple)) or not order:
+        raise HTTPException(status_code=500, detail="Invalid model resolution metadata")
+
+    normalized_presets = {}
+    for preset, definition in presets.items():
+        if not isinstance(preset, str) or not preset or not isinstance(definition, dict):
+            raise HTTPException(status_code=500, detail="Invalid model resolution metadata")
+        values = definition.get("values")
+        if not isinstance(values, dict) or not values:
+            raise HTTPException(status_code=500, detail="Invalid model resolution metadata")
+        normalized_values = {}
+        for aspect, resolution in values.items():
+            if (
+                aspect not in _RESOLUTION_ASPECT_VALUES
+                or not isinstance(resolution, str)
+                or not resolution
+            ):
+                raise HTTPException(status_code=500, detail="Invalid model resolution metadata")
+            normalized_values[aspect] = resolution
+        normalized = {
+            "label": str(definition.get("label") or preset),
+            "values": normalized_values,
+        }
+        if definition.get("experimental") is True:
+            normalized["experimental"] = True
+        if isinstance(definition.get("hint"), str) and definition["hint"]:
+            normalized["hint"] = definition["hint"]
+        normalized_presets[preset] = normalized
+
+    normalized_order = []
+    for preset in order:
+        if (
+            not isinstance(preset, str)
+            or preset not in normalized_presets
+            or preset in normalized_order
+        ):
+            raise HTTPException(status_code=500, detail="Invalid model resolution metadata")
+        normalized_order.append(preset)
+    return {
+        "resolution_presets": normalized_presets,
+        "resolution_preset_order": normalized_order,
+        "supports_auto_aspect": model_def.get("supports_auto_aspect") is True,
+    }
 
 
 @api.get("/api/v1/model-options/{model_type}")
@@ -14924,6 +15739,7 @@ def get_model_options(model_type: str, request: Request):
         ]
     else:
         native_resolutions = None
+    resolution_contract = _model_resolution_contract(md)
 
     return {
         "model_type": model_type,
@@ -15000,6 +15816,7 @@ def get_model_options(model_type: str, request: Request):
         "default_video_length": md.get("video_length") or _ui_defaults.get("video_length"),
         "default_sliding_window_size": md.get("sliding_window_size") or _ui_defaults.get("sliding_window_size"),
         "hide_resolution_presets": md.get("hide_resolution_presets", False),
+        **resolution_contract,
         "resolutions": native_resolutions,
 
         # Image/video conditioning strength
@@ -27010,9 +27827,56 @@ async def upload_audio(
     audio track; the source video is deleted afterwards. The response
     shape is identical regardless of input format — callers always
     receive a WAV path."""
+    from services.audio_upload_validation import (
+        AudioUploadStorageError,
+        WavUploadValidationError,
+        record_pending_audio_cleanup,
+        retry_pending_audio_cleanup,
+        validate_wav_upload,
+        write_regular_upload,
+    )
+    from services.output_access import upload_access_sidecar_path
+    from services.win_safe_files import safe_delete
+
     AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
     VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
     ALLOWED_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+
+    def cleanup_upload_artifacts(stamp_private_upload, *paths):
+        pending = []
+        for path in paths:
+            if not path:
+                continue
+            for candidate in (upload_access_sidecar_path(path), path):
+                result = safe_delete(candidate, retries=1)
+                if (
+                    not result.get("deleted")
+                    and result.get("reason") != "not_found"
+                ):
+                    pending.append(candidate)
+        if not pending:
+            return True
+        # A persistently locked media file remains fail-closed and private
+        # while its content-free cleanup marker survives process restart.
+        for path in paths:
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                stamp_private_upload(
+                    path,
+                    request.state.maestro_session_id,
+                    private=True,
+                )
+                sidecar = upload_access_sidecar_path(path)
+                if os.path.isfile(sidecar):
+                    pending.append(sidecar)
+            except Exception:
+                pass
+        try:
+            record_pending_audio_cleanup(upload_dir, tuple(set(pending)))
+        except AudioUploadStorageError:
+            return False
+        return False
 
     ext = os.path.splitext(file.filename or "audio.wav")[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -27033,17 +27897,37 @@ async def upload_audio(
     if cl and cl.isdigit() and int(cl) > MAX_AUDIO_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 500 MB)")
 
-    upload_dir = os.path.join(os.getcwd(), "uploads", "audio")
-    os.makedirs(upload_dir, exist_ok=True)
-
-    unique_name = f"{uuid.uuid4().hex[:8]}{ext}"
-    filepath = os.path.join(upload_dir, unique_name)
-
-    content = await file.read()
+    content = await file.read(MAX_AUDIO_UPLOAD_BYTES + 1)
     if len(content) > MAX_AUDIO_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 500 MB)")
-    with open(filepath, "wb") as f:
-        f.write(content)
+
+    # A .wav extension is only a claim.  Parse the bounded RIFF container
+    # before creating a directory, path, file, access sidecar, job, or model.
+    # The validator is content-neutral: it inspects structural audio metadata
+    # only, and an empty/missing MIME declaration does not affect admission.
+    validated_wav = None
+    if ext == ".wav":
+        try:
+            validated_wav = validate_wav_upload(
+                content,
+                max_bytes=MAX_AUDIO_UPLOAD_BYTES,
+            )
+        except WavUploadValidationError as error:
+            raise HTTPException(
+                status_code=400,
+                detail=error.public_message,
+            ) from None
+
+    upload_dir = os.path.join(os.getcwd(), "uploads", "audio")
+    retry_pending_audio_cleanup(upload_dir, safe_delete)
+    unique_name = f"{uuid.uuid4().hex[:8]}{ext}"
+    try:
+        filepath = write_regular_upload(upload_dir, unique_name, content)
+    except AudioUploadStorageError:
+        raise HTTPException(
+            status_code=500,
+            detail="Audio upload could not be stored.",
+        ) from None
 
     # libsndfile (soundfile) supports wav/flac/ogg natively but NOT the
     # compressed formats users commonly have (mp3, m4a, aac). Downstream code
@@ -27057,12 +27941,16 @@ async def upload_audio(
     is_video = ext in VIDEO_EXTENSIONS
     needs_transcode = ext in (".mp3", ".m4a", ".aac") or is_video
     if needs_transcode:
-        wav_name = f"{os.path.splitext(unique_name)[0]}.wav"
-        wav_path = os.path.join(upload_dir, wav_name)
+        wav_name = f"{uuid.uuid4().hex[:8]}.wav"
+        wav_path = None
         source_original = filepath
         transcode_ok = False
         try:
             import ffmpeg as _ffmpeg
+            # Reserve the final basename exclusively before handing it to
+            # ffmpeg.  Its overwrite flag can now replace only this request's
+            # empty placeholder, never another session's upload.
+            wav_path = write_regular_upload(upload_dir, wav_name, b"")
             output_kwargs = {"acodec": "pcm_s16le"}
             if is_video:
                 # `-vn`: explicitly drop video stream. The .wav container
@@ -27077,55 +27965,57 @@ async def upload_audio(
                 .overwrite_output()
                 .run(quiet=True)
             )
+            source_delete = safe_delete(source_original)
+            if not source_delete.get("deleted") and source_delete.get(
+                "reason"
+            ) != "not_found":
+                raise OSError("uploaded source could not be retired")
             transcode_ok = True
-            os.remove(source_original)
             filepath = wav_path
             unique_name = wav_name
             if is_video:
                 print(
-                    f"[upload-audio] Extracted audio track from "
-                    f"{file.filename!r} ({ext}) → {wav_name}. Source "
-                    f"video deleted."
+                    "[upload-audio] Extracted an audio track from the "
+                    "uploaded video; the source video was deleted."
                 )
-        except _ffmpeg.Error as err:
-            stderr = getattr(err, "stderr", b"") or b""
-            if isinstance(stderr, (bytes, bytearray)):
-                stderr = stderr.decode("utf-8", errors="ignore")
-            detail_prefix = (
-                "Failed to extract audio from video"
-                if is_video else f"Failed to decode {ext} audio"
-            )
+        except _ffmpeg.Error:
             raise HTTPException(
                 status_code=400,
-                detail=f"{detail_prefix}: {(stderr or str(err)).strip()[:300]}",
-            ) from err
-        except Exception as err:
+                detail="Uploaded media could not be decoded as audio.",
+            ) from None
+        except Exception:
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "Audio extraction failed" if is_video
-                    else "Audio transcode failed"
-                ) + f": {err}",
-            ) from err
+                detail="Audio upload could not be processed.",
+            ) from None
         finally:
             # If transcode/extract bombed (either branch above raised),
             # clean up the partial wav AND the original upload so orphans
             # don't pile up in uploads/audio/ on repeated failures.
             if not transcode_ok:
-                for stale in (wav_path, source_original):
-                    if stale and os.path.isfile(stale):
-                        try:
-                            os.remove(stale)
-                        except OSError:
-                            pass
+                cleanup_upload_artifacts(
+                    write_upload_access_sidecar,
+                    wav_path,
+                    source_original,
+                )
 
-    if bool(getattr(request.state, "maestro_remote", False)):
-        private = True
-    access = write_upload_access_sidecar(
-        filepath,
-        request.state.maestro_session_id,
-        private=private,
-    )
+    # Uploaded audio is source/input media, not a publishable output. Keep it
+    # private for local and remote callers even if an older client explicitly
+    # supplies private=false; generated outputs have their own policy path.
+    private = True
+    try:
+        access = write_upload_access_sidecar(
+            filepath,
+            request.state.maestro_session_id,
+            private=private,
+        )
+        output_policy = public_output_policy(access)
+    except Exception:
+        cleanup_upload_artifacts(write_upload_access_sidecar, filepath)
+        raise HTTPException(
+            status_code=500,
+            detail="Audio upload could not be published.",
+        ) from None
     return {
         "filename": unique_name,
         "path": (
@@ -27134,8 +28024,12 @@ async def upload_audio(
             else filepath
         ),
         "url": f"/api/v1/uploads/audio/{unique_name}",
-        "duration_seconds": _probe_audio_duration(filepath),
-        **public_output_policy(access),
+        "duration_seconds": (
+            validated_wav.duration_seconds
+            if validated_wav is not None
+            else _probe_audio_duration(filepath)
+        ),
+        **output_policy,
     }
 
 
@@ -28689,6 +29583,292 @@ def director_capabilities(
         },
     }
 
+
+def _director_preflight_admission_body(body) -> tuple[dict, dict]:
+    """Validate the exact content-free wire and adapt continuity field names."""
+    from services.director_model_compat import DIRECTOR_PIPELINE_TYPES
+
+    required = {
+        "explicit_output",
+        "pipeline_type",
+        "video_model",
+        "image_creator_model",
+        "continuity_editor_model",
+        "director_resolution_preset",
+        "director_aspect_ratio",
+        "reference_presence",
+    }
+    optional = {"image_creator_loras", "continuity_editor_loras"}
+    if not isinstance(body, dict) or set(body) - required - optional:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Director preflight request",
+        )
+    if not required.issubset(body) or not isinstance(body["explicit_output"], bool):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Director preflight request",
+        )
+
+    def model_id(value, *, nullable: bool = False):
+        if nullable and value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= 200
+            or value != value.strip()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Director preflight request",
+            )
+        return value
+
+    references = body.get("reference_presence")
+    reference_keys = {"starting_image", "character", "location"}
+    if (
+        not isinstance(references, dict)
+        or set(references) != reference_keys
+        or any(not isinstance(references[key], bool) for key in reference_keys)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Director preflight request",
+        )
+    pipeline_type = model_id(body["pipeline_type"])
+    if pipeline_type not in DIRECTOR_PIPELINE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Director preflight request",
+        )
+    admission = {
+        "explicit_output": body["explicit_output"],
+        "pipeline_type": pipeline_type,
+        "video_model": model_id(body["video_model"]),
+        "image_creator_model": model_id(
+            body["image_creator_model"], nullable=True,
+        ),
+        "image_editor_model": model_id(body["continuity_editor_model"]),
+        "director_resolution_preset": model_id(
+            body["director_resolution_preset"],
+        ),
+        "director_aspect_ratio": model_id(body["director_aspect_ratio"]),
+    }
+    if "image_creator_loras" in body:
+        admission["image_creator_loras"] = body["image_creator_loras"]
+    if "continuity_editor_loras" in body:
+        admission["image_editor_loras"] = body["continuity_editor_loras"]
+    return admission, dict(references)
+
+
+def _director_model_resolution(
+    model_type: str,
+    preset: str,
+    aspect_ratio: str,
+) -> str:
+    """Resolve one Director canvas only through the selected model contract."""
+    model_def = wgp.get_model_def(model_type)
+    if not isinstance(model_def, dict):
+        raise HTTPException(status_code=404, detail="Model not found")
+    contract = _model_resolution_contract(model_def)
+    presets = contract["resolution_presets"]
+    if preset not in contract["resolution_preset_order"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Director resolution selection",
+        )
+    values = presets[preset]["values"]
+    if (
+        aspect_ratio == "auto"
+        and contract["supports_auto_aspect"] is not True
+    ) or aspect_ratio not in values:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Director resolution selection",
+        )
+    return values[aspect_ratio]
+
+
+def _director_validate_resolution_request(
+    body: dict,
+    *,
+    require_selection: bool,
+    require_resolved_values: bool,
+) -> dict | None:
+    """Validate the same Director selection at preflight and start.
+
+    Old recovered/start payloads may carry only a concrete native resolution.
+    They remain accepted when the model still declares that canvas, but never
+    acquire a guessed preset/aspect tuple.
+    """
+    preset = body.get("director_resolution_preset")
+    aspect_ratio = body.get("director_aspect_ratio")
+    video_model = body.get("video_model")
+    if not isinstance(video_model, str) or not video_model:
+        if require_selection:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Director resolution selection",
+            )
+        return None
+
+    if preset is None and aspect_ratio is None and not require_selection:
+        video_params = body.get("video_params")
+        legacy_resolution = (
+            video_params.get("resolution")
+            if isinstance(video_params, dict)
+            else None
+        )
+        if legacy_resolution is None:
+            return None
+        model_def = wgp.get_model_def(video_model)
+        if not isinstance(model_def, dict):
+            raise HTTPException(status_code=404, detail="Model not found")
+        contract = _model_resolution_contract(model_def)
+        supported = {
+            value
+            for definition in contract["resolution_presets"].values()
+            for value in definition["values"].values()
+        }
+        for item in model_def.get("resolutions") or ():
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                supported.add(str(item[1]))
+        if not isinstance(legacy_resolution, str) or legacy_resolution not in supported:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Director resolution selection",
+            )
+        return {
+            "preset": None,
+            "aspect_ratio": None,
+            "video_resolution": legacy_resolution,
+            "image_resolution": None,
+            "legacy": True,
+        }
+
+    if not isinstance(preset, str) or not isinstance(aspect_ratio, str):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Director resolution selection",
+        )
+    video_resolution = _director_model_resolution(
+        video_model, preset, aspect_ratio,
+    )
+    image_model = body.get("image_creator_model")
+    creator_resolution = (
+        _director_model_resolution(image_model, preset, aspect_ratio)
+        if isinstance(image_model, str) and image_model
+        else None
+    )
+    editor_model = body.get("image_editor_model")
+    editor_resolution = (
+        _director_model_resolution(editor_model, preset, aspect_ratio)
+        if isinstance(editor_model, str) and editor_model
+        else None
+    )
+    if (
+        creator_resolution is not None
+        and editor_resolution is not None
+        and creator_resolution != editor_resolution
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Selected Director image roles require different resolutions",
+        )
+    image_resolution = creator_resolution or editor_resolution
+
+    if require_resolved_values:
+        video_params = body.get("video_params")
+        image_params = body.get("image_params")
+        if (
+            not isinstance(video_params, dict)
+            or video_params.get("resolution") != video_resolution
+            or (
+                image_resolution is not None
+                and (
+                    not isinstance(image_params, dict)
+                    or image_params.get("resolution") != image_resolution
+                )
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Director resolution selection",
+            )
+    return {
+        "preset": preset,
+        "aspect_ratio": aspect_ratio,
+        "video_resolution": video_resolution,
+        "image_resolution": image_resolution,
+        "legacy": False,
+    }
+
+
+@api.post("/api/v1/director/preflight")
+async def director_preflight(request: Request):
+    """Check exact Director model admission without touching jobs or media."""
+    try:
+        admission, references = _director_preflight_admission_body(
+            await request.json(),
+        )
+        _resolve_director_image_role_request(
+            request,
+            admission,
+            component_errors=True,
+        )
+        resolution = _director_validate_resolution_request(
+            admission,
+            require_selection=True,
+            require_resolved_values=False,
+        )
+    except HTTPException as error:
+        response = _director_component_error_response(error)
+        if response is not None:
+            return response
+        raise
+
+    components = [
+        {"component": "video_model", "status": "ready"},
+        {"component": "image_creator_model", "status": "ready"},
+        {"component": "continuity_editor_model", "status": "ready"},
+        {
+            "component": "image_creator_lora",
+            "status": (
+                "ready" if admission.get("image_creator_loras")
+                else "not_required"
+            ),
+        },
+        {
+            "component": "continuity_editor_lora",
+            "status": (
+                "ready" if admission.get("image_editor_loras")
+                else "not_required"
+            ),
+        },
+    ]
+    components.extend({
+        "component": component,
+        "status": "ready" if references[presence] else "not_required",
+    } for presence, component in (
+        ("starting_image", "starting_image"),
+        ("character", "character_reference"),
+        ("location", "location_reference"),
+    ))
+    return {
+        "status": "ready",
+        "resolved": {
+            "pipeline_type": admission["pipeline_type"],
+            "video_model": admission["video_model"],
+            "image_creator_model": admission["image_creator_model"],
+            "continuity_editor_model": admission["image_editor_model"],
+            "director_resolution_preset": resolution["preset"],
+            "director_aspect_ratio": resolution["aspect_ratio"],
+            "video_resolution": resolution["video_resolution"],
+            "image_resolution": resolution["image_resolution"],
+        },
+        "components": components,
+    }
+
 @api.post("/api/v1/director/pipeline/start")
 async def director_pipeline_start(request: Request):
     """Start a Director pipeline (LLM planning → image gen → video gen).
@@ -28702,11 +29882,25 @@ async def director_pipeline_start(request: Request):
     # This private recovery bit is server-owned. start_pipeline recomputes it
     # from the authoritative consent/provider policy and literal request flag.
     body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
-    _reject_client_director_image_role_internals(body)
-    workspace = _authorize_director_media_inputs(request, body)
-    body["workspace"] = workspace
-    _resolve_director_image_role_request(request, body)
-    _resolve_h3_style_workflow_request(body, model_field="video_model")
+    try:
+        _reject_client_director_image_role_internals(body)
+        body["_director_component_errors"] = True
+        workspace = _authorize_director_media_inputs(request, body)
+        body["workspace"] = workspace
+        _resolve_director_image_role_request(request, body)
+        _resolve_h3_style_workflow_request(body, model_field="video_model")
+        if body.get("video_model"):
+            _director_validate_resolution_request(
+                body,
+                require_selection=False,
+                require_resolved_values=True,
+            )
+    except HTTPException as error:
+        response = _director_component_error_response(error)
+        if response is not None:
+            return response
+        raise
+    body.pop("_director_component_errors", None)
     # Only the public, server-validated chain id may link a preparation to a
     # new pipeline. Never honor the internal child-generation field from an
     # untrusted request body.
@@ -45079,6 +46273,231 @@ def _safe_failure_updates(error, job: dict, *, stage=None, code=None) -> dict:
     return updates
 
 
+_MAX_AUTOMATIC_RESOURCE_RETRIES = 2
+
+
+def _current_model_residency_evidence_context() -> dict | None:
+    """Return WGP's opaque content-free runtime key when one is active."""
+    getter = getattr(wgp, "get_current_model_residency_evidence_context", None)
+    if not callable(getter):
+        return None
+    try:
+        context = getter()
+    except Exception:
+        return None
+    return dict(context) if isinstance(context, dict) else None
+
+
+def _record_model_residency_runtime_outcome(
+    outcome: str,
+    *,
+    phase: str,
+    evidence_context: dict | None = None,
+) -> bool:
+    """Feed one content-free runtime outcome back to WGP, fail-open."""
+    recorder = getattr(wgp, "record_model_residency_runtime_outcome", None)
+    if not callable(recorder):
+        return False
+    try:
+        return bool(recorder(
+            outcome,
+            phase=phase,
+            required_margin_gib=(1.0 if outcome == "oom" else 0.0),
+            evidence_context=evidence_context,
+        ))
+    except Exception:
+        return False
+
+
+def _h3_resource_retry_boundary(job: dict) -> str | None:
+    """Return the smallest verified H3 boundary safe for automatic replay."""
+    if _queue_recovery_delivery_pending(job) is not None:
+        return "finalization"
+    if _h3_dependency_closed_recovery_prefix(job) is not None:
+        return "generation"
+    params = job.get("params")
+    params = params if isinstance(params, dict) else {}
+    longform = params.get("_h3_longform")
+    if not isinstance(longform, dict):
+        return None
+    try:
+        clip_count = int(longform.get("clip_count") or 0)
+        requested_outputs = int(job.get("requested_outputs") or 1)
+        completed = {
+            int(unit.get("index", -1))
+            for unit in _queue_recovery_units(job)
+            if unit.get("kind") == "h3_segment"
+            and int(unit.get("variant", 0) or 0) == 0
+        }
+    except (TypeError, ValueError):
+        return None
+    if clip_count < 2 or requested_outputs != 1:
+        return None
+    if completed != set(range(clip_count)):
+        return None
+    # With every segment sealed, finalization can replay from either the
+    # segment set or an already-sealed concat. Never rerun denoising merely
+    # because concat finished before a later mux/delivery OOM.
+    return "finalization"
+
+
+def _release_model_for_resource_retry(job: dict) -> None:
+    """Best-effort release after a safe unit so retry must re-admit/reload."""
+    params = job.get("params")
+    params = params if isinstance(params, dict) else {}
+    try:
+        if (
+            str(params.get("model_type") or "").startswith("minimax_h3")
+            or isinstance(params.get("_h3_longform"), dict)
+        ):
+            _release_h3_delivery_vram()
+        else:
+            wgp.release_model()
+    except Exception:
+        # WGP invalidates loaded identity before fallible release work. The
+        # durable requeue remains authoritative even when cleanup objects.
+        pass
+
+
+def _prepare_pending_h3_resource_retry(job: dict) -> bool:
+    """Reseal and unhold one already-counted H3 generation retry."""
+    try:
+        prepared = _prepare_h3_peak_recovery(job)
+    except Exception:
+        job["_recovery_reason_code"] = "h3_resource_retry_prepare_failed"
+        try:
+            _queue_recovery_checkpoint(
+                job,
+                queue_held=True,
+                recovery_state="blocked",
+                reruns_denoise=False,
+                message="Calibrated H3 recovery could not be prepared",
+            )
+        except Exception:
+            # The earlier resource-retry transition is still the durable
+            # source of truth and remains held/pending for startup recovery.
+            job["_recovery_reason_code"] = (
+                "h3_resource_retry_pending_replan"
+            )
+        return False
+    finally:
+        # Preparation may fail before the ordinary retry release boundary.
+        # Invalidate/release residency without replacing the original safe
+        # OOM diagnosis or granting another attempt.
+        _release_model_for_resource_retry(job)
+    if not prepared:
+        return False
+    try:
+        unheld = _queue_recovery_checkpoint(
+            job,
+            status="queued",
+            queue_held=False,
+            recovery_state="retrying",
+            reruns_denoise=True,
+            message="Queued for calibrated H3 recovery",
+        )
+    except Exception:
+        # Prospective durability leaves the prior held/replanned checkpoint
+        # authoritative. Startup can retry this unhold without re-planning or
+        # consuming another resource attempt.
+        return False
+    if not unheld:
+        return False
+    try:
+        scheduled = update_queue_job(job, held=False)
+    except Exception:
+        # The durable checkpoint is already unheld. It is safe to start the
+        # same worker unless cancellation/finality won after publication.
+        return (
+            str(job.get("status") or "") == "queued"
+            and not is_cancel_requested(job)
+        )
+    return bool(scheduled)
+
+
+def _try_automatic_resource_retry(
+    job: dict,
+    failure_updates: dict,
+    *,
+    retryable: bool | None = None,
+) -> bool:
+    """Durably re-admit one exact job, or leave unsafe work terminal/held."""
+    details = failure_updates.get("failure_details")
+    if not isinstance(details, dict):
+        return False
+    code = str(details.get("code") or "")
+    is_host_pressure = (
+        str(details.get("stage") or "") == "model_load"
+        and code == "insufficient_host_memory"
+    )
+    needs_peak_replan = False
+    if is_host_pressure:
+        # False is authoritative proof that the model's required bytes exceed
+        # total host RAM. Missing classification remains safe only because the
+        # same-job retry counter below is durable and strictly bounded.
+        if retryable is False:
+            return False
+        phase = "model_load"
+        reason = "host_memory_pressure"
+        reruns_denoise = True
+    elif details.get("is_oom") is True:
+        phase = _h3_resource_retry_boundary(job)
+        if phase is None:
+            return False
+        reason = (
+            "finalization_oom" if phase == "finalization"
+            else "generation_oom"
+        )
+        reruns_denoise = phase == "generation"
+        needs_peak_replan = (
+            phase == "generation"
+            and _h3_incomplete_recovery_prefix(job) is not None
+        )
+    else:
+        return False
+
+    attempt = try_resource_retry(
+        job,
+        phase=phase,
+        reason=reason,
+        limit=_MAX_AUTOMATIC_RESOURCE_RETRIES,
+        error=None,
+        failure_details=details,
+        oom_info=failure_updates.get("oom_info"),
+        _recovery_reason_code=(
+            "h3_resource_retry_pending_replan"
+            if needs_peak_replan else ""
+        ),
+        # A generation OOM must not become scheduler-visible until its
+        # calibrated suffix recovery plan has been durably resealed below.
+        queue_held=needs_peak_replan,
+        recovery_state="retrying",
+        reruns_denoise=reruns_denoise,
+        message=(
+            "Retrying after transient host-memory pressure"
+            if is_host_pressure else
+            "Retrying the protected finalization boundary"
+            if phase == "finalization" else
+            "Preparing a safer final H3 segment retry"
+        ),
+    )
+    if attempt is None:
+        return False
+
+    if needs_peak_replan:
+        if not _prepare_pending_h3_resource_retry(job):
+            return True
+    else:
+        _release_model_for_resource_retry(job)
+    try:
+        _start_generation_worker(job, name_prefix="studio-resource-retry")
+    except QueueRecoveryRuntimeError:
+        # _start_generation_worker durably parks the same job. Startup/manual
+        # recovery can start it later without granting another resource try.
+        return True
+    return True
+
+
 # ============================================================================
 # Standalone post-processing "Tools" — apply FlashVSR upscale or SeedVC
 # revoice to ANY existing clip (a gallery output or an uploaded file),
@@ -46747,8 +48166,15 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                                 "peak_recovery_identity"
                             ] = copy.deepcopy(peak_identities[i])
                         if execution_shot is not None:
+                            execution_contract_version = int(
+                                (h3_longform.get("shot_plan") or {}).get(
+                                    "semantic_physical_contract_version"
+                                )
+                            )
                             clip_params["multi_clip_info"].update({
-                                "semantic_physical_contract_version": 1,
+                                "semantic_physical_contract_version": (
+                                    execution_contract_version
+                                ),
                                 "semantic_shot_index": int(
                                     execution_shot["semantic_shot_index"]
                                 ),
@@ -46972,6 +48398,8 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
             cancelled = False
             first_task_error = None
             first_failure_details = None
+            first_resource_retryable = None
+            last_residency_context = None
             allocation_success_observations: list[tuple[dict, str]] = []
             clip_output_files: dict[int, str] = {}
             join_output_file = None
@@ -48129,6 +49557,7 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 com_stream = AsyncStream()
                 send_cmd = com_stream.output_queue.push
                 _h3_call_timing = {}
+                task_resource_failure = {}
 
                 def make_error_handler(task, params, send_cmd):
                     def error_handler():
@@ -48160,6 +49589,12 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                         except Exception as e:
                             print(f"\n  [ERROR] {e}")
                             traceback.print_exc()
+                            if getattr(e, "code", None) == (
+                                "insufficient_host_memory"
+                            ):
+                                task_resource_failure["retryable"] = getattr(
+                                    e, "retryable", None,
+                                )
                             send_cmd(
                                 "error",
                                 _safe_failure_updates(e, job)[
@@ -48285,6 +49720,9 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                         if first_task_error is None:
                             first_failure_details = task_failure_details
                             first_task_error = task_failure_details["detail"]
+                            first_resource_retryable = (
+                                task_resource_failure.get("retryable")
+                            )
                         update_job(job, **failure_updates)
                     elif cmd == "progress":
                         if isinstance(data, list) and len(data) >= 2:
@@ -48434,6 +49872,35 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                     elif cmd == "info":
                         print(f"\n  [INFO] {data}")
                         in_status_line = False
+
+                task_residency_context = (
+                    _current_model_residency_evidence_context()
+                )
+                last_residency_context = task_residency_context
+                if task_error and isinstance(task_failure_details, dict):
+                    if task_failure_details.get("is_oom") is True:
+                        failure_stage = str(
+                            task_failure_details.get("stage") or "generation"
+                        )
+                        evidence_phase = (
+                            "finalization"
+                            if failure_stage in {
+                                "concat", "audio_mux", "postprocess",
+                                "flashvsr", "delivery", "publication",
+                            }
+                            else "generation"
+                        )
+                        _record_model_residency_runtime_outcome(
+                            "oom",
+                            phase=evidence_phase,
+                            evidence_context=task_residency_context,
+                        )
+                elif not task_error:
+                    _record_model_residency_runtime_outcome(
+                        "success",
+                        phase="generation",
+                        evidence_context=task_residency_context,
+                    )
 
                 # WGP may emit several cumulative sliding-window files for a
                 # single clip. Bind only the latest file from this task to its
@@ -49686,6 +51153,18 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                             )
                             if delivery_error.oom_info:
                                 failure_updates["oom_info"] = delivery_error.oom_info
+                            if failure_updates["failure_details"].get(
+                                "is_oom"
+                            ) is True:
+                                _record_model_residency_runtime_outcome(
+                                    "oom",
+                                    phase="finalization",
+                                    evidence_context=last_residency_context,
+                                )
+                            if _try_automatic_resource_retry(
+                                job, failure_updates,
+                            ):
+                                return False
                             finish_job(job, "failed", **failure_updates)
                             return False
                     else:
@@ -49829,42 +51308,50 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                     **deferred_updates,
                 )
 
-            if (
-                not success
-                and isinstance(first_failure_details, dict)
-                and first_failure_details.get("is_oom") is True
-                and _h3_incomplete_recovery_prefix(job) is not None
-            ):
-                # A generation OOM with a dependency-closed prefix is not
-                # terminal. Park it before publication; owner-scoped retry
-                # must calibrate and reseal a different peak identity first.
-                try:
-                    clean_episode, contamination = (
-                        _h3_allocation_outcome_is_clean(job)
-                    )
-                    _get_h3_allocation_ledger().record(
-                        _h3_allocation_scenario(
-                            task_params,
-                            frame_count=int(
-                                task_params.get("video_length") or 0
+            if not success and isinstance(first_failure_details, dict):
+                if (
+                    first_failure_details.get("is_oom") is True
+                    and _h3_incomplete_recovery_prefix(job) is not None
+                ):
+                    # Preserve condition-specific allocation evidence before
+                    # resealing only the missing final H3 segment.
+                    try:
+                        clean_episode, contamination = (
+                            _h3_allocation_outcome_is_clean(job)
+                        )
+                        _get_h3_allocation_ledger().record(
+                            _h3_allocation_scenario(
+                                task_params,
+                                frame_count=int(
+                                    task_params.get("video_length") or 0
+                                ),
                             ),
-                        ),
-                        "clean_oom" if clean_episode else "contaminated_oom",
-                        contamination_reason=contamination,
-                    )
-                except Exception:
-                    # Adaptive evidence must never prevent the immediate
-                    # no-unchanged-retry safety transition for this job.
-                    pass
-                block_generation_recovery(
+                            (
+                                "clean_oom"
+                                if clean_episode else "contaminated_oom"
+                            ),
+                            contamination_reason=contamination,
+                        )
+                    except Exception:
+                        # Evidence refinement is advisory; the exact durable
+                        # prefix remains authoritative even if storage fails.
+                        pass
+                retry_updates = {
+                    "failure_details": first_failure_details,
+                    "error": first_task_error,
+                    "message": first_task_error or "Generation failed",
+                }
+                if (
+                    isinstance(job.get("oom_info"), dict)
+                    and job["oom_info"].get("is_oom") is True
+                ):
+                    retry_updates["oom_info"] = dict(job["oom_info"])
+                if _try_automatic_resource_retry(
                     job,
-                    _recovery_reason_code="h3_peak_calibration_required",
-                    recovery_state="blocked",
-                    reruns_denoise=False,
-                    message="Calibrated H3 recovery capacity is required",
-                    error=None,
-                )
-                return False
+                    retry_updates,
+                    retryable=first_resource_retryable,
+                ):
+                    return False
 
             published = finish_job(
                 job,
@@ -49919,7 +51406,26 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
 
         except Exception as e:
             traceback.print_exc()
-            finish_job(job, "failed", **_safe_failure_updates(e, job))
+            failure_updates = _safe_failure_updates(e, job)
+            if failure_updates["failure_details"].get("is_oom") is True:
+                _record_model_residency_runtime_outcome(
+                    "oom",
+                    phase=(
+                        "finalization"
+                        if _h3_resource_retry_boundary(job) == "finalization"
+                        else "generation"
+                    ),
+                    evidence_context=locals().get(
+                        "last_residency_context"
+                    ),
+                )
+            if _try_automatic_resource_retry(
+                job,
+                failure_updates,
+                retryable=getattr(e, "retryable", None),
+            ):
+                return False
+            finish_job(job, "failed", **failure_updates)
             return False
         finally:
             if job.get("_h3_delivery_publication"):

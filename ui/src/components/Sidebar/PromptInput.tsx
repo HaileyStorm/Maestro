@@ -43,7 +43,7 @@ export function H3StyleWorkflowField({
     return (
       <div className="rounded border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-[9px] leading-relaxed text-amber-200">
         <p role="status">{error}</p>
-        <button type="button" onClick={() => void loadCatalog(true)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5 text-[8px]">Retry H3 catalog</button>
+        <button type="button" onClick={() => void loadCatalog(true)} className="mobile-control-target mt-1 rounded border border-amber-400/40 px-2 py-0.5 text-[8px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry H3 catalog</button>
       </div>
     )
   }
@@ -59,7 +59,7 @@ export function H3StyleWorkflowField({
         value={selection}
         disabled={loading}
         onChange={event => setSelection(event.target.value)}
-        className="w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50"
+        className="mobile-control-target w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
       >
         <option value="">No H3 workflow</option>
         {catalog?.styles.map(style => <option key={style.id} value={style.id}>{style.label}</option>)}
@@ -69,7 +69,7 @@ export function H3StyleWorkflowField({
         Official MiniMax H3 Hub/canvas workflow metadata, adapted by Maestro as server-owned guidance. This does not reproduce the complete upstream workflow, and it stays separate from Visual style.
       </p>
       <p className="mt-1 text-[8px] leading-relaxed text-text-muted">
-        {catalog && <><a href={catalog.source} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Official source</a> · </>}
+        {catalog && <><a href={catalog.source} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Official source</a> · </>}
         {catalog ? h3StyleWorkflowCatalogStateLabel(catalog) : 'Loading server catalog'} · source revision {sourceRevision}
         {provenance?.prompt_brief_provenance === 'maestro_adapted' ? ' · Maestro-adapted brief' : ''}
         {catalog?.update_error ? ' · last refresh unavailable' : ''}
@@ -77,7 +77,7 @@ export function H3StyleWorkflowField({
       {error && (
         <div className="mt-1 text-[8px] leading-relaxed text-amber-200">
           <p role="status">{error}</p>
-          <button type="button" onClick={() => void loadCatalog(true)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5">Retry H3 catalog</button>
+          <button type="button" onClick={() => void loadCatalog(true)} className="mobile-control-target mt-1 rounded border border-amber-400/40 px-2 py-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry H3 catalog</button>
         </div>
       )}
     </fieldset>
@@ -199,6 +199,8 @@ export function PromptInput() {
   const migrateLegacyH3StylePrompt = useStore(s => s.migrateLegacyH3StylePrompt)
   const [ttsMenuOpen, setTtsMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const ttsMenuTriggerRef = useRef<HTMLButtonElement>(null)
+  const ttsPopupRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     migrateLegacyH3StylePrompt()
@@ -275,15 +277,36 @@ export function PromptInput() {
       ? 'Describe the finished video...'
       : (placeholders[generationMode] || 'Describe your content...')
 
-  // Close TTS menu on outside click
+  // The split-button disclosure owns focus while open and returns it to its
+  // trigger on Escape or a completed keyboard/pointer choice.
   useEffect(() => {
     if (!ttsMenuOpen) return
+    const focusFrame = window.requestAnimationFrame(() => {
+      ttsPopupRef.current?.querySelector<HTMLButtonElement>('button:not([disabled])')?.focus()
+    })
     const handler = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setTtsMenuOpen(false)
     }
+    const keyHandler = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setTtsMenuOpen(false)
+      window.requestAnimationFrame(() => ttsMenuTriggerRef.current?.focus())
+    }
     document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
+    document.addEventListener('keydown', keyHandler)
+    return () => {
+      window.cancelAnimationFrame(focusFrame)
+      document.removeEventListener('mousedown', handler)
+      document.removeEventListener('keydown', keyHandler)
+    }
   }, [ttsMenuOpen])
+
+  const runTtsEnhancement = (mode: 'monologue' | 'monologue_fast' | 'dialogue' | 'dialogue_fast') => {
+    ttsMenuTriggerRef.current?.focus()
+    setTtsMenuOpen(false)
+    enhancePrompt(mode)
+  }
 
   // grow shrink-0: fill spare vertical space when the sidebar is roomy, but
   // never shrink below the textarea's min-height. Dropping the old
@@ -319,7 +342,7 @@ export function PromptInput() {
         placeholder={usesWindows
           ? `Describe the whole video; add [00:00-00:10] timed beats for ${windowCount} automatic windows`
           : modePlaceholder}
-        className="w-full flex-1 bg-bg-tertiary border border-border rounded-lg px-3 py-2 pr-10 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue transition-colors"
+        className="w-full flex-1 rounded-lg border border-border bg-bg-tertiary px-3 py-2 pr-14 text-sm text-text-primary placeholder:text-text-muted transition-colors focus:border-accent-blue focus:outline-none md:pr-10"
         style={{ resize: 'none', minHeight: 112 }}
       />
       {usesWindows && (
@@ -331,7 +354,7 @@ export function PromptInput() {
       )}
       {enhancerFooter && (
         <label
-          className="mt-1 flex cursor-pointer items-start gap-2 rounded-md px-1 py-1 text-[10px] text-text-muted"
+          className="mobile-control-target mt-1 flex cursor-pointer items-start gap-2 rounded-md px-1 py-1 text-[10px] text-text-muted"
           title={`Enhance once before generation with ${enhancerModelLabel}`}
         >
           <input
@@ -343,7 +366,7 @@ export function PromptInput() {
           />
           <span className="min-w-0 leading-tight">
             <span className="block text-text-secondary">Enhance before Generate</span>
-            <span className="block truncate">
+            <span className="block break-words md:truncate">
               {usesGlobalTimeline ? `Model: ${enhancerModelLabel} · global timeline is preserved as authored (timestamps locked)` : `Model: ${enhancerModelLabel}`}
             </span>
           </span>
@@ -362,35 +385,46 @@ export function PromptInput() {
           <div ref={menuRef} className={`absolute right-2 ${usesWindows ? 'bottom-7' : 'bottom-2'}`}>
             <div className="flex items-center">
               <button
+                type="button"
                 onClick={() => enhancePrompt(defaultMode)}
                 disabled={isEnhancing}
                 title={isMultiVoice
                   ? `Write ${voiceCount}-person dialogue (use dropdown to switch to speech)`
                   : 'Write a speech (use dropdown to switch to dialogue)'}
-                className="p-1.5 rounded-l-md text-text-muted hover:text-accent-blue hover:bg-bg-hover transition-colors disabled:opacity-50"
+                aria-label={isMultiVoice
+                  ? `Write ${voiceCount}-person dialogue (use dropdown to switch to speech)`
+                  : 'Write a speech (use dropdown to switch to dialogue)'}
+                className="mobile-control-target flex items-center justify-center rounded-l-md p-1.5 text-text-muted transition-colors hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
               >
                 {isEnhancing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
               </button>
               <button
+                ref={ttsMenuTriggerRef}
+                type="button"
                 onClick={() => setTtsMenuOpen(!ttsMenuOpen)}
                 disabled={isEnhancing}
-                className="p-1.5 rounded-r-md text-text-muted hover:text-accent-blue hover:bg-bg-hover transition-colors disabled:opacity-50 border-l border-border"
+                aria-label="Choose prompt enhancement mode"
+                aria-expanded={ttsMenuOpen}
+                aria-controls="prompt-enhancement-menu"
+                className="mobile-control-target flex items-center justify-center rounded-r-md border-l border-border p-1.5 text-text-muted transition-colors hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
               >
                 <ChevronUp size={10} />
               </button>
             </div>
             {ttsMenuOpen && (
-              <div className="absolute bottom-full right-0 mb-1 bg-bg-secondary border border-border rounded-lg shadow-lg overflow-hidden min-w-[220px] z-50">
+              <div ref={ttsPopupRef} id="prompt-enhancement-menu" className="absolute bottom-full right-0 z-50 mb-1 min-w-[220px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-lg border border-border bg-bg-secondary shadow-lg">
                 <button
-                  onClick={() => { setTtsMenuOpen(false); enhancePrompt('monologue') }}
-                  className="w-full text-left px-3 py-2 text-[11px] text-text-secondary hover:bg-bg-hover transition-colors"
+                  type="button"
+                  onClick={() => runTtsEnhancement('monologue')}
+                  className="mobile-control-target w-full px-3 py-2 text-left text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
                 >
                   Write Speech
                   <span className="block text-[9px] text-text-muted">Single speaker, with thinking</span>
                 </button>
                 <button
-                  onClick={() => { setTtsMenuOpen(false); enhancePrompt('monologue_fast') }}
-                  className="w-full text-left px-3 py-2 text-[11px] text-text-secondary hover:bg-bg-hover transition-colors border-t border-border"
+                  type="button"
+                  onClick={() => runTtsEnhancement('monologue_fast')}
+                  className="mobile-control-target w-full border-t border-border px-3 py-2 text-left text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
                 >
                   Write Speech
                   <span className="block text-[9px] text-text-muted">Single speaker, faster</span>
@@ -398,15 +432,17 @@ export function PromptInput() {
                 {supportsDialogue && (
                   <>
                     <button
-                      onClick={() => { setTtsMenuOpen(false); enhancePrompt('dialogue') }}
-                      className="w-full text-left px-3 py-2 text-[11px] text-text-secondary hover:bg-bg-hover transition-colors border-t border-border"
+                      type="button"
+                      onClick={() => runTtsEnhancement('dialogue')}
+                      className="mobile-control-target w-full border-t border-border px-3 py-2 text-left text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
                     >
                       {voiceCount >= 2 ? `Write ${voiceCount}-Person Dialogue` : 'Write Dialogue (2 speakers)'}
                       <span className="block text-[9px] text-text-muted">With thinking — more creative</span>
                     </button>
                     <button
-                      onClick={() => { setTtsMenuOpen(false); enhancePrompt('dialogue_fast') }}
-                      className="w-full text-left px-3 py-2 text-[11px] text-text-secondary hover:bg-bg-hover transition-colors border-t border-border"
+                      type="button"
+                      onClick={() => runTtsEnhancement('dialogue_fast')}
+                      className="mobile-control-target w-full border-t border-border px-3 py-2 text-left text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
                     >
                       {voiceCount >= 2 ? `Write ${voiceCount}-Person Dialogue` : 'Write Dialogue (2 speakers)'}
                       <span className="block text-[9px] text-text-muted">No thinking — faster</span>
@@ -418,10 +454,12 @@ export function PromptInput() {
           </div>
         ) : (
           <button
+            type="button"
             onClick={() => enhancePrompt()}
             disabled={isEnhancing}
             title="Enhance prompt with AI"
-            className={`absolute right-2 ${usesWindows ? 'bottom-12' : 'bottom-7'} p-1.5 rounded-md text-text-muted hover:text-accent-blue hover:bg-bg-hover transition-colors disabled:opacity-50`}
+            aria-label="Enhance prompt with AI"
+            className={`mobile-control-target absolute right-2 ${usesWindows ? 'bottom-[72px] md:bottom-12' : 'bottom-[52px] md:bottom-7'} flex items-center justify-center rounded-md p-1.5 text-text-muted transition-colors hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50`}
           >
             {isEnhancing ? (
               <Loader2 size={14} className="animate-spin" />

@@ -72,10 +72,10 @@ export function H3EstimateBadge({
   return (
     <span
       title={estimateTitle(estimate)}
-      className={`inline-flex items-center gap-1 text-[10px] whitespace-nowrap ${color}`}
+      className={`inline-flex min-w-0 flex-wrap items-center justify-end gap-1 text-right text-[10px] ${color}`}
     >
       <Clock3 size={10} />
-      <span>{loading && !estimate ? 'calibrating' : estimateLabel(estimate)}</span>
+      <span className="break-words">{loading && !estimate ? 'calibrating' : estimateLabel(estimate)}</span>
       {downloadRequired && <span className="text-text-muted">+ model/adapter download</span>}
     </span>
   )
@@ -149,13 +149,15 @@ export function H3PerformanceProfiles() {
 
   return (
     <div className="rounded-lg border border-border bg-bg-tertiary/35 p-3 space-y-2">
-      <div className="flex items-center justify-between gap-2">
-        <label className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-text-muted">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <label htmlFor="h3-performance-profile" className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-text-muted">
           <Gauge size={12} /> H3 performance
         </label>
         <H3EstimateBadge estimate={currentEstimate} loading={loading} />
       </div>
       <select
+        id="h3-performance-profile"
+        aria-label="H3 performance profile"
         value={visibleSelection}
         disabled={profiles.length === 0}
         onChange={event => {
@@ -163,7 +165,7 @@ export function H3PerformanceProfiles() {
             void applyProfile(event.target.value as H3PerformanceProfileId)
           }
         }}
-        className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-2 text-xs text-text-primary disabled:opacity-60"
+        className="mobile-control-target w-full rounded-lg border border-border bg-bg-primary px-2.5 py-2 text-xs text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-60"
       >
         <option value="custom">Custom · {estimateLabel(currentEstimate)}</option>
         {profiles.map(profile => (

@@ -3520,6 +3520,202 @@ export interface PipelineStatus extends DirectorRecoveryMetadata {
   lora_warnings?: string[]
 }
 
+export type DirectorFailureCode =
+  | 'director_model_unavailable'
+  | 'director_model_not_ready'
+  | 'director_model_terms_required'
+  | 'director_role_lora_unavailable'
+  | 'director_reference_unavailable'
+
+export type DirectorFailureComponent =
+  | 'video_model'
+  | 'image_creator_model'
+  | 'continuity_editor_model'
+  | 'image_creator_lora'
+  | 'continuity_editor_lora'
+  | 'character_reference'
+  | 'location_reference'
+  | 'starting_image'
+
+export interface DirectorComponentFailure {
+  code: DirectorFailureCode
+  component: DirectorFailureComponent
+  message: string
+  /** Zero-based selection index for a client-local multi-reference upload failure. */
+  reference_index?: number
+}
+
+const DIRECTOR_FAILURE_CODES = new Set<DirectorFailureCode>([
+  'director_model_unavailable',
+  'director_model_not_ready',
+  'director_model_terms_required',
+  'director_role_lora_unavailable',
+  'director_reference_unavailable',
+])
+
+const DIRECTOR_FAILURE_COMPONENTS = new Set<DirectorFailureComponent>([
+  'video_model',
+  'image_creator_model',
+  'continuity_editor_model',
+  'image_creator_lora',
+  'continuity_editor_lora',
+  'character_reference',
+  'location_reference',
+  'starting_image',
+])
+
+const DIRECTOR_COMPONENT_LABELS: Record<DirectorFailureComponent, string> = {
+  video_model: 'Video model',
+  image_creator_model: 'Image creator',
+  continuity_editor_model: 'Continuity editor',
+  image_creator_lora: 'Creator LoRA',
+  continuity_editor_lora: 'Editor LoRA',
+  character_reference: 'Character reference',
+  location_reference: 'Location reference',
+  starting_image: 'Starting image',
+}
+
+function directorFailureMessage(
+  code: DirectorFailureCode,
+  component: DirectorFailureComponent,
+  referenceIndex?: number,
+): string {
+  const label = referenceIndex !== undefined
+    && (component === 'character_reference' || component === 'location_reference')
+    ? `${DIRECTOR_COMPONENT_LABELS[component]} ${referenceIndex + 1}`
+    : DIRECTOR_COMPONENT_LABELS[component]
+  if (code === 'director_model_unavailable') {
+    return `${label} is unavailable in this session. Select an authorized exact model or use Maestro locally.`
+  }
+  if (code === 'director_model_not_ready') {
+    return `${label} is not ready on this host. Complete its setup and try again.`
+  }
+  if (code === 'director_model_terms_required') {
+    return `Review and accept the terms required for ${label.toLowerCase()}, then try again.`
+  }
+  if (code === 'director_role_lora_unavailable') {
+    return `${label} is unavailable or no longer matches the selected role model. Review the exact LoRA selection and try again.`
+  }
+  return `${label} could not be accessed. Remove or replace that reference and try again.`
+}
+
+export class DirectorRequestError extends Error {
+  readonly code: DirectorFailureCode
+  readonly component: DirectorFailureComponent
+  readonly reference_index?: number
+
+  constructor(code: DirectorFailureCode, component: DirectorFailureComponent, referenceIndex?: number) {
+    const normalizedReferenceIndex = Number.isInteger(referenceIndex) && Number(referenceIndex) >= 0
+      ? Number(referenceIndex)
+      : undefined
+    super(directorFailureMessage(code, component, normalizedReferenceIndex))
+    this.name = 'DirectorRequestError'
+    this.code = code
+    this.component = component
+    this.reference_index = normalizedReferenceIndex
+  }
+}
+
+function directorStructuredFailure(payload: unknown): DirectorRequestError | null {
+  if (!payload || typeof payload !== 'object') return null
+  const candidate = payload as { code?: unknown; component?: unknown; message?: unknown }
+  if (
+    typeof candidate.code !== 'string'
+    || !DIRECTOR_FAILURE_CODES.has(candidate.code as DirectorFailureCode)
+    || typeof candidate.component !== 'string'
+    || !DIRECTOR_FAILURE_COMPONENTS.has(candidate.component as DirectorFailureComponent)
+    || typeof candidate.message !== 'string'
+  ) return null
+  // The closed code/component pair authors the visible copy. In particular,
+  // model-unavailable responses deliberately do not reveal whether an exact
+  // catalog ID is unknown or hidden from this session.
+  return new DirectorRequestError(
+    candidate.code as DirectorFailureCode,
+    candidate.component as DirectorFailureComponent,
+  )
+}
+
+async function throwDirectorRequestFailure(
+  res: Response,
+  fallback: string,
+): Promise<never> {
+  const payload = await res.json().catch(() => ({})) as { detail?: unknown; error?: unknown }
+  const structured = directorStructuredFailure(payload)
+  if (structured) throw structured
+  const detail = typeof payload.detail === 'string'
+    ? payload.detail
+    : typeof payload.error === 'string'
+      ? payload.error
+      : ''
+  if (res.status === 404 && (!detail || detail === 'Not Found')) {
+    throw new Error('Director is not available in the running Maestro backend. Restart Maestro and try again.')
+  }
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`Director access was denied${detail ? `: ${detail}` : '.'}`)
+  }
+  if (res.status === 423) {
+    throw new Error(`Unlock the selected Director project first${detail ? `: ${detail}` : '.'}`)
+  }
+  if (res.status === 404 && /unauthorized media|(?:character|location|starting image|reference|media).*(?:not found|unavailable)|(?:not found|unavailable).*(?:reference|media)/i.test(detail)) {
+    throw new Error(`Director could not access a selected reference${detail ? `: ${detail}` : '.'}`)
+  }
+  if (res.status === 404 && /\bmodel\b.*\bnot found\b|\bnot found\b.*\bmodel\b/i.test(detail)) {
+    throw new Error('A selected Director model is unavailable in this session. Review the exact Video, Creator, and Editor selections or use Maestro locally.')
+  }
+  throw new Error(detail || `${fallback} (HTTP ${res.status})`)
+}
+
+export type DirectorPipelineType = 'music_video' | 'short_film_story' | 'short_film_audio'
+
+export interface DirectorPreflightRequest {
+  pipeline_type: DirectorPipelineType
+  explicit_output: boolean
+  video_model: string
+  image_creator_model: string | null
+  image_creator_loras?: DirectorImageRoleLoraSelection[]
+  continuity_editor_model: string
+  continuity_editor_loras?: DirectorImageRoleLoraSelection[]
+  director_resolution_preset: import('../types').ResolutionPreset
+  director_aspect_ratio: import('../types').AspectRatio
+  reference_presence: {
+    starting_image: boolean
+    character: boolean
+    location: boolean
+  }
+}
+
+export interface DirectorPreflightResponse {
+  status: 'ready'
+  resolved: {
+    pipeline_type: DirectorPipelineType
+    video_model: string
+    image_creator_model: string
+    continuity_editor_model: string
+    director_resolution_preset: import('../types').ResolutionPreset
+    director_aspect_ratio: import('../types').AspectRatio
+    video_resolution: string
+    image_resolution: string | null
+  }
+  components: Array<{
+    component: DirectorFailureComponent
+    status: 'ready' | 'not_required'
+  }>
+}
+
+export async function preflightDirectorPipeline(
+  params: DirectorPreflightRequest,
+): Promise<DirectorPreflightResponse> {
+  const res = await fetch(`${BASE}/api/v1/director/preflight`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+    cache: 'no-store',
+    credentials: 'same-origin',
+  })
+  if (!res.ok) await throwDirectorRequestFailure(res, 'Director preflight failed')
+  return res.json()
+}
+
 export async function startPipeline(params: Record<string, unknown>): Promise<{ pipeline_id: string }> {
   // Internal child-job linkage is server-authored. Only the public durable
   // preparation id may cross this client boundary.
@@ -3531,25 +3727,7 @@ export async function startPipeline(params: Record<string, unknown>): Promise<{ 
     body: JSON.stringify(publicParams),
   })
   if (!res.ok) {
-    const payload = await res.json().catch(() => ({})) as { detail?: unknown; error?: unknown }
-    const detail = typeof payload.detail === 'string'
-      ? payload.detail
-      : typeof payload.error === 'string'
-        ? payload.error
-        : ''
-    if (res.status === 404 && (!detail || detail === 'Not Found')) {
-      throw new Error('Director is not available in the running Maestro backend. Restart Maestro and try again.')
-    }
-    if (res.status === 401 || res.status === 403) {
-      throw new Error(`Director access was denied${detail ? `: ${detail}` : '.'}`)
-    }
-    if (res.status === 423) {
-      throw new Error(`Unlock the selected Director project first${detail ? `: ${detail}` : '.'}`)
-    }
-    if (res.status === 404 && /unauthorized media|not found/i.test(detail)) {
-      throw new Error(`Director could not access a selected reference${detail ? `: ${detail}` : '.'}`)
-    }
-    throw new Error(detail || `Failed to start Director pipeline (HTTP ${res.status})`)
+    await throwDirectorRequestFailure(res, 'Failed to start Director pipeline')
   }
   return res.json()
 }
@@ -4586,12 +4764,14 @@ export async function scanModelFolders(): Promise<{ candidates: import('../types
 }
 
 export async function updateSystemConfig(
-  partial: Partial<import('../types').SystemConfig>
+  partial: Partial<import('../types').SystemConfig>,
+  signal?: AbortSignal,
 ): Promise<{ status: string; updated: Record<string, unknown> }> {
   const res = await fetch(`${BASE}/api/v1/system-config`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(partial),
+    signal,
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Update failed' }))
@@ -6121,7 +6301,7 @@ export interface ActiveDownload {
   total_bytes: number | null
   status: 'downloading' | 'stalled' | 'retrying' | 'done' | 'incomplete'
   /** Seconds since the byte counter last advanced. UI uses this to
-   *  flag stalled downloads (e.g. `> 15` → show "slow / retrying"). */
+   *  flag stalled downloads (e.g. `> 30` → show "slow / retrying"). */
   seconds_since_progress: number
 }
 

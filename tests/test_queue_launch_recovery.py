@@ -102,6 +102,42 @@ def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dic
     return namespace
 
 
+def _committed_v1_h3_plan(plan: dict) -> dict:
+    """Project a synthetic planner result into the committed v1 replay shape."""
+    result = copy.deepcopy(plan)
+    result["semantic_physical_contract_version"] = 1
+    result.pop("prompt_contract_seal", None)
+    result.pop("event_ownership", None)
+    prompts = [""] * len(result["shots"])
+    for contract in result["source_contracts"]:
+        contract["prompt_rewrite_for_physical_split"] = False
+        for field in (
+            "physical_prompt_compiler_version", "event_ownership",
+            "executable_prompt_sha256",
+        ):
+            contract.pop(field, None)
+        for position in contract["segment_indices"]:
+            prompts[position] = contract["semantic_prompt"]
+    for item in result["dialogue_manifest"]:
+        contract = result["source_contracts"][item["source_index"]]
+        item["segment_index"] = contract["segment_indices"][0]
+    for contract in result["source_contracts"]:
+        contract["dialogue_manifest"] = [
+            copy.deepcopy(item) for item in result["dialogue_manifest"]
+            if item["source_index"] == contract["source_index"]
+        ]
+    result["semantic_shots"] = copy.deepcopy(result["source_contracts"])
+    result["clip_prompts"] = prompts
+    for index, shot in enumerate(result["shots"]):
+        shot["prompt"] = prompts[index]
+        shot["dialogue_manifest_indices"] = [
+            manifest_index
+            for manifest_index, item in enumerate(result["dialogue_manifest"])
+            if item["segment_index"] == index
+        ]
+    return result
+
+
 class QueueRecoveryRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1616,7 +1652,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 }],
             }],
         )
-        sealed_prompt = original_shot_plan["clip_prompts"][0]
+        sealed_prompts = list(original_shot_plan["clip_prompts"])
         params = {
             "model_type": "minimax_h3_ref2va",
             "resolution": "1344x768",
@@ -1627,7 +1663,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "h3_sol_dense_steps": 10,
                 "h3_sol_dense_blocks": 2,
             },
-            "per_clip_prompts": [sealed_prompt] * 5,
+            "per_clip_prompts": sealed_prompts,
             "_h3_longform": {
                 "fps": 24,
                 "global_prompt": semantic_source,
@@ -1683,6 +1719,278 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(
             plan["shot_plan"]["semantic_shots"][0]["visual_context"],
             original_shot_plan["semantic_shots"][0]["visual_context"],
+        )
+        for compiler_field in (
+            "authored_prompt", "visual_context", "opening_blocking",
+            "final_blocking", "structured_dialogue_blocks",
+        ):
+            self.assertEqual(
+                plan["shot_plan"]["source_contracts"][0][compiler_field],
+                original_shot_plan["source_contracts"][0][compiler_field],
+            )
+        self.assertEqual(
+            replanned["per_clip_prompts"][:4], sealed_prompts[:4],
+        )
+        for index in range(4):
+            for field in (
+                "physical_segment_id", "execution_cursor_frame",
+                "execution_slice", "frames", "published_frames",
+                "published_start_frame", "published_end_frame_exclusive",
+                "prompt", "dialogue_manifest_indices",
+            ):
+                self.assertEqual(
+                    plan["shot_plan"]["shots"][index][field],
+                    original_shot_plan["shots"][index][field],
+                )
+        self.assertEqual(
+            plan["shot_plan"]["global_prompt"], semantic_source,
+        )
+        self.assertEqual(
+            plan["shot_plan"]["semantic_physical_contract_version"], 2,
+        )
+        from services.h3_shot_planner import (
+            seal_h3_shot_plan,
+            validate_h3_shot_plan_seal,
+        )
+        validate_h3_shot_plan_seal(plan["shot_plan"])
+
+        canonical_duration = (
+            sum(prefix_published) + 292
+        ) / 24
+        canonical_prompt = (
+            "subject_definitions: <Subject 1> is an adult archivist.\n\n"
+            "integrated_multimodal_description:\n"
+            f"[Shot 1] [0s-{canonical_duration:.10f}s] "
+            "shot_name: Archive | "
+            "audiovisual_description: <Subject 1> studies a ledger. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        opening_action = (
+            "the cabinet stays locked. The warning lamp flickers twice!"
+        )
+        final_action = "the archivist closes the ledger"
+        canonical_plan = plan_h3_native_shots(
+            global_prompt=canonical_prompt,
+            clip_frame_counts=prefix_frames + [294],
+            clip_requested_frames=prefix_published + [292],
+            fps=24,
+            clip_boundaries=[
+                {"type": "continuous", "source": "model_grid"}
+                for _ in range(4)
+            ],
+            source_prompts=[canonical_prompt],
+            source_indices=[0] * 5,
+            structured_shots=[{
+                "shot_id": "canonical-archive",
+                "spatial_setup": opening_action,
+                "closing_blocking": final_action,
+            }],
+        )
+        canonical_plan["director_runtime_contract"] = {
+            "clip_count": 5,
+            "segment_policy": {"clip_requested_frames": [
+                *prefix_published, 292,
+            ]},
+            "segment_models": copy.deepcopy(
+                params["_h3_longform"]["segment_models"]
+            ),
+            "segment_source_indices": [0] * 5,
+        }
+        seal_h3_shot_plan(canonical_plan)
+        canonical_params = {
+            **params,
+            "per_clip_prompts": list(canonical_plan["clip_prompts"]),
+            "_h3_longform": {
+                **params["_h3_longform"],
+                "global_prompt": canonical_prompt,
+                "segment_policy": copy.deepcopy(
+                    canonical_plan["director_runtime_contract"][
+                        "segment_policy"
+                    ]
+                ),
+                "segment_source_indices": [0] * 5,
+                "shot_plan": canonical_plan,
+            },
+        }
+        canonical_replanned = namespace[
+            "_replan_h3_final_segment_for_peak"
+        ](
+            canonical_params,
+            completed_prefix=4,
+            choice={
+                "frame_ceiling": 192,
+                "offload_profile": 4,
+                "allocation_revision": 1,
+                "allocation_snapshot": "e" * 64,
+            },
+        )
+        canonical_replanned_plan = canonical_replanned[
+            "_h3_longform"
+        ]["shot_plan"]
+        self.assertEqual(
+            canonical_replanned_plan["source_contracts"][0][
+                "opening_blocking"
+            ],
+            opening_action,
+        )
+        self.assertEqual(
+            canonical_replanned_plan["source_contracts"][0][
+                "authored_prompt"
+            ],
+            canonical_plan["source_contracts"][0]["authored_prompt"],
+        )
+        self.assertEqual(
+            sum(
+                opening_action in prompt
+                for prompt in canonical_replanned["per_clip_prompts"]
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                "The warning lamp flickers twice!" in prompt
+                for prompt in canonical_replanned["per_clip_prompts"]
+            ),
+            1,
+        )
+        self.assertIn(
+            opening_action, canonical_replanned["per_clip_prompts"][0],
+        )
+        closing_events = [
+            event for event in canonical_replanned_plan["event_ownership"]
+            if event["kind"] == "final_blocking"
+        ]
+        self.assertEqual(len(closing_events), 1)
+        self.assertEqual(closing_events[0]["executable_payload"], final_action)
+        self.assertEqual(
+            closing_events[0]["owner_segment_index"],
+            len(canonical_replanned_plan["shots"]) - 1,
+        )
+        original_range_event = next(
+            event for event in canonical_plan["event_ownership"]
+            if event["kind"] == "range"
+        )
+        rebuilt_range_event = next(
+            event for event in canonical_replanned_plan["event_ownership"]
+            if event["kind"] == "range"
+        )
+        self.assertEqual(
+            [
+                item for item in rebuilt_range_event["continuation_slices"]
+                if item["segment_index"] < 4
+            ],
+            [
+                item for item in original_range_event["continuation_slices"]
+                if item["segment_index"] < 4
+            ],
+        )
+        self.assertEqual(
+            [
+                item["segment_index"]
+                for item in rebuilt_range_event["continuation_slices"]
+                if item["segment_index"] >= 4
+            ],
+            [4, 5],
+        )
+        self.assertEqual(
+            sum(
+                final_action in prompt
+                for prompt in canonical_replanned["per_clip_prompts"]
+            ),
+            1,
+        )
+        self.assertEqual(
+            canonical_replanned["per_clip_prompts"][:4],
+            canonical_plan["clip_prompts"][:4],
+        )
+        validate_h3_shot_plan_seal(canonical_replanned_plan)
+        self.assertEqual(
+            canonical_replanned["_h3_longform"]["segment_source_indices"],
+            [0] * len(canonical_replanned["per_clip_prompts"]),
+        )
+        self.assertEqual(
+            canonical_replanned_plan["director_runtime_contract"][
+                "segment_source_indices"
+            ],
+            canonical_replanned["_h3_longform"][
+                "segment_source_indices"
+            ],
+        )
+        self.assertEqual(
+            canonical_replanned_plan["director_runtime_contract"][
+                "clip_count"
+            ],
+            len(canonical_replanned["per_clip_prompts"]),
+        )
+        self.assertEqual(
+            canonical_replanned["_h3_longform"]["segment_policy"],
+            canonical_replanned_plan["segment_policy"],
+        )
+        self.assertEqual(
+            canonical_replanned_plan["director_runtime_contract"][
+                "segment_policy"
+            ],
+            canonical_replanned_plan["segment_policy"],
+        )
+
+        tampered_params = copy.deepcopy(canonical_params)
+        tampered_plan = tampered_params["_h3_longform"]["shot_plan"]
+        for contracts_field in ("source_contracts", "semantic_shots"):
+            tampered_plan[contracts_field][0]["visual_context"] = (
+                "VISUAL CONTINUITY (world, cast, and setting only): "
+                "setting: altered archive."
+            )
+        seal_h3_shot_plan(tampered_plan)
+        with self.assertRaisesRegex(
+            RecoveryError, "changed a sealed semantic prompt",
+        ):
+            namespace["_replan_h3_final_segment_for_peak"](
+                tampered_params,
+                completed_prefix=4,
+                choice={
+                    "frame_ceiling": 192,
+                    "offload_profile": 4,
+                    "allocation_revision": 1,
+                    "allocation_snapshot": "f" * 64,
+                },
+            )
+
+        committed_v1 = _committed_v1_h3_plan(original_shot_plan)
+        v1_params = {
+            **params,
+            "per_clip_prompts": list(committed_v1["clip_prompts"]),
+            "_h3_longform": {
+                **params["_h3_longform"],
+                "shot_plan": committed_v1,
+            },
+        }
+        v1_replanned = namespace[
+            "_replan_h3_final_segment_for_peak"
+        ](
+            v1_params,
+            completed_prefix=4,
+            choice={
+                "frame_ceiling": 192,
+                "offload_profile": 4,
+                "allocation_revision": 1,
+                "allocation_snapshot": "d" * 64,
+            },
+        )
+        self.assertEqual(
+            v1_replanned["_h3_longform"]["shot_plan"][
+                "semantic_physical_contract_version"
+            ],
+            1,
+        )
+        self.assertEqual(
+            v1_replanned["per_clip_prompts"][:4],
+            committed_v1["clip_prompts"][:4],
+        )
+        self.assertNotIn(
+            "prompt_contract_seal",
+            v1_replanned["_h3_longform"]["shot_plan"],
         )
 
         # Pre-v1 plans have no semantic contract to replay. Their sealed
@@ -1831,7 +2139,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
             )
 
     def test_semantic_execution_slices_dispatch_exact_children(self):
-        from services.h3_shot_planner import plan_h3_native_shots
+        from services.h3_shot_planner import (
+            plan_h3_native_shots,
+            seal_h3_shot_plan,
+        )
 
         class RecoveryError(RuntimeError):
             pass
@@ -1851,16 +2162,20 @@ class QueueLaunchWiringTests(unittest.TestCase):
             ("_h3_execution_shots_for_dispatch",),
             {
                 "copy": __import__("copy"),
+                "hashlib": hashlib,
                 "QueueRecoveryRuntimeError": RecoveryError,
             },
         )
         dispatch = namespace["_h3_execution_shots_for_dispatch"]
+        local_prompts = list(plan["clip_prompts"])
         shots = dispatch(
-            {"shot_plan": plan}, [prompt, prompt], 2,
+            {"shot_plan": plan}, local_prompts, 2,
         )
         self.assertEqual(shots[0]["execution_cursor_frame"], 0)
         self.assertEqual(shots[1]["execution_cursor_frame"], 144)
-        self.assertEqual(shots[0]["prompt"].encode(), shots[1]["prompt"].encode())
+        self.assertNotEqual(
+            shots[0]["prompt"].encode(), shots[1]["prompt"].encode(),
+        )
         self.assertEqual(
             shots[1]["execution_slice"]["end_frame_exclusive"]
             - shots[1]["execution_slice"]["start_frame"],
@@ -1869,9 +2184,81 @@ class QueueLaunchWiringTests(unittest.TestCase):
         broken = __import__("copy").deepcopy(plan)
         broken["shots"].pop()
         with self.assertRaises(RecoveryError):
-            dispatch({"shot_plan": broken}, [prompt, prompt], 2)
+            dispatch({"shot_plan": broken}, local_prompts, 2)
 
-    def test_recovered_v1_h3_worker_preserves_replan_contract_to_parser(self):
+        corrupt_owner = copy.deepcopy(plan)
+        corrupt_event = corrupt_owner["source_contracts"][0][
+            "event_ownership"
+        ][0]
+        corrupt_event.update({
+            "owner_segment_index": 1,
+            "owner_physical_segment_index": 1,
+            "owner_physical_segment_id": "h3-authored-shot-1:segment-2",
+        })
+        corrupt_owner["semantic_shots"] = copy.deepcopy(
+            corrupt_owner["source_contracts"]
+        )
+        corrupt_owner["event_ownership"] = [
+            copy.deepcopy(item)
+            for contract in corrupt_owner["source_contracts"]
+            for item in contract["event_ownership"]
+        ]
+        seal_h3_shot_plan(corrupt_owner)
+        with self.assertRaisesRegex(RecoveryError, "event ownership"):
+            dispatch({"shot_plan": corrupt_owner}, local_prompts, 2)
+
+        v1_plan = _committed_v1_h3_plan(plan)
+        v1_prompts = list(v1_plan["clip_prompts"])
+        v1_shots = dispatch({"shot_plan": v1_plan}, v1_prompts, 2)
+        self.assertEqual(len(v1_shots), 2)
+        self.assertEqual(v1_shots[1]["execution_cursor_frame"], 144)
+
+        unversioned = copy.deepcopy(v1_plan)
+        unversioned.pop("semantic_physical_contract_version", None)
+        self.assertIsNone(
+            dispatch({"shot_plan": unversioned}, v1_prompts, 2)
+        )
+        future = copy.deepcopy(plan)
+        future["semantic_physical_contract_version"] = 99
+        with self.assertRaisesRegex(RecoveryError, "unsupported"):
+            dispatch({"shot_plan": future}, local_prompts, 2)
+
+    def test_h3_recovery_settings_persist_actual_contract_version(self):
+        class RecoveryError(RuntimeError):
+            pass
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("_h3_segment_recovery_settings",),
+            {"copy": copy, "QueueRecoveryRuntimeError": RecoveryError},
+        )
+        settings = namespace["_h3_segment_recovery_settings"]({
+            "generated_frames": 158,
+            "published_frames": 144,
+            "trim_tail_frames": 14,
+            "native_boundary_conditioning": False,
+            "semantic_physical_contract_version": 2,
+            "semantic_shot_index": 0,
+            "physical_segment_index": 0,
+            "physical_segment_count": 2,
+            "predecessor_segment_index": None,
+            "execution_cursor_frame": 0,
+            "execution_slice": {
+                "start_frame": 0,
+                "end_frame_exclusive": 144,
+            },
+        })
+        self.assertEqual(settings["semantic_execution"]["version"], 2)
+        with self.assertRaisesRegex(RecoveryError, "unsupported"):
+            namespace["_h3_segment_recovery_settings"]({
+                "generated_frames": 158,
+                "published_frames": 144,
+                "trim_tail_frames": 14,
+                "native_boundary_conditioning": False,
+                "semantic_physical_contract_version": 3,
+            })
+
+    def test_recovered_v2_h3_worker_preserves_replan_contract_to_parser(self):
         """Exercise restored task materialization through the pre-model boundary."""
         from services.h3_shot_planner import plan_h3_native_shots
 
@@ -1928,8 +2315,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
             "model_type": "minimax_h3",
             "resolution": "1344x768",
             "multi_prompts_gen_type": 3,
-            "prompt": prompt,
-            "per_clip_prompts": [prompt] * 6,
+            "prompt": "\n---MAESTRO-CLIP---\n".join(
+                shot_plan["clip_prompts"]
+            ),
+            "per_clip_prompts": list(shot_plan["clip_prompts"]),
             "per_clip_frames": clip_frames,
             "num_inference_steps": 20,
             "override_profile": -1,
@@ -1939,6 +2328,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         }
         plan = seal_h3_offload_plan(params, effective_profile=5)
         restarted_plan = json.loads(json.dumps(plan))
+        restarted_params = json.loads(json.dumps(params))
         self.assertEqual(
             assert_h3_offload_plan_parity(
                 plan, restarted_plan, params=params,
@@ -1981,7 +2371,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         job = {
             "id": "synthetic-restored-h3",
             "status": "queued",
-            "params": copy.deepcopy(params),
+            "params": restarted_params,
             "h3_offload_plan": restarted_plan,
             "out_dir": recovery_root.name,
             "recovery_cursor": {
@@ -2078,6 +2468,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
         for index, task in enumerate(captured):
             task_params = task["params"]
             self.assertEqual(task_params["override_profile"], 5)
+            self.assertEqual(
+                task_params["multi_clip_info"][
+                    "semantic_physical_contract_version"
+                ],
+                2,
+            )
             self.assertEqual(
                 task_params["_h3_execution_slice"],
                 shot_plan["shots"][index]["execution_slice"],
@@ -3248,6 +3644,164 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(malformed["recovery_state"], "blocked")
         self.assertEqual(
             malformed["_recovery_reason_code"], "input_missing_or_changed",
+        )
+
+    def test_durable_h3_resource_retry_survives_prepare_crash_points(self):
+        next_attempt_calls = []
+        namespace = _isolated_functions(
+            self.launch,
+            ("_queue_recovery_materialize_job",),
+            {
+                "hmac": hmac,
+                "math": __import__("math"),
+                "time": time,
+                "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
+                "_MAX_AUTOMATIC_RESOURCE_RETRIES": 2,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_queue_recovery_worker": lambda _job: object(),
+                "load_request_manifest": lambda *_args, **_kwargs: {
+                    "params": {"_h3_longform": {"clip_count": 5}},
+                    "inputs": [],
+                },
+                "validate_manifest_inputs": lambda *_args: None,
+                "_queue_recovery_manifest_validator": (
+                    lambda *_args, **_kwargs: True
+                ),
+                "_require_h3_offload_plan_parity": (
+                    lambda *_args, **_kwargs: None
+                ),
+                "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                "_h3_incomplete_recovery_prefix": lambda _job: 4,
+                "_h3_dependency_closed_recovery_prefix": lambda _job: 4,
+                "next_recovery_attempt": lambda _job: (
+                    next_attempt_calls.append(True) or (99, False)
+                ),
+            },
+        )
+        materialize = namespace["_queue_recovery_materialize_job"]
+        base = {
+            "id": "job-h3-resource-retry",
+            "status": "queued",
+            "queue_held": True,
+            "recovery_state": "retrying",
+            "workspace": "project-a",
+            "owner_principal": "owner:v1:" + "a" * 64,
+            "project_instance": "project:v1:" + "b" * 64,
+            "request_manifest": {
+                "path": ".maestro-recovery/job-h3-resource-retry.request.json",
+            },
+            "recovery_attempt": 3,
+            "resource_retry_attempt": 1,
+            "resource_retry_limit": 2,
+            "resource_retry_phase": "generation",
+            "resource_retry_reason": "generation_oom",
+        }
+        projects = {"project-a": ("/project", base["project_instance"])}
+
+        pending, auto_resume = materialize({
+            **base,
+            "_recovery_reason_code": "h3_resource_retry_pending_replan",
+        }, projects)
+        self.assertTrue(auto_resume)
+        self.assertTrue(pending["queue_held"])
+        self.assertEqual(pending["recovery_state"], "retrying")
+        self.assertEqual(pending["resource_retry_attempt"], 1)
+
+        replanned, auto_resume = materialize({
+            **base,
+            "_recovery_reason_code": "h3_generation_oom_replanned",
+        }, projects)
+        self.assertTrue(auto_resume)
+        self.assertFalse(replanned["queue_held"])
+        self.assertEqual(replanned["recovery_state"], "retrying")
+        self.assertEqual(replanned["resource_retry_attempt"], 1)
+        self.assertEqual(next_attempt_calls, [])
+
+        calls = []
+        preparation = _isolated_functions(
+            self.launch,
+            ("_prepare_pending_h3_resource_retry",),
+            {
+                "_prepare_h3_peak_recovery": lambda _job: (
+                    _ for _ in ()
+                ).throw(OSError("storage unavailable")),
+                "_queue_recovery_checkpoint": lambda job, **updates: (
+                    calls.append(("checkpoint", dict(updates)))
+                    or job.update(updates) is None
+                ),
+                "_release_model_for_resource_retry": lambda _job: (
+                    calls.append(("release", {}))
+                ),
+                "update_queue_job": lambda *_args, **_kwargs: True,
+            },
+        )
+        original_failure = {"code": "cuda_oom", "is_oom": True}
+        failed = {
+            "id": "job-h3-prepare-failed",
+            "failure_details": dict(original_failure),
+        }
+        self.assertFalse(
+            preparation["_prepare_pending_h3_resource_retry"](failed)
+        )
+        self.assertEqual(failed["failure_details"], original_failure)
+        self.assertTrue(failed["queue_held"])
+        self.assertEqual(
+            failed["_recovery_reason_code"],
+            "h3_resource_retry_prepare_failed",
+        )
+        self.assertEqual([call[0] for call in calls], ["checkpoint", "release"])
+
+        unhold_calls = []
+        unhold_failure = _isolated_functions(
+            self.launch,
+            ("_prepare_pending_h3_resource_retry",),
+            {
+                "_prepare_h3_peak_recovery": lambda _job: True,
+                "_queue_recovery_checkpoint": lambda *_args, **_kwargs: (
+                    _ for _ in ()
+                ).throw(OSError("journal unavailable")),
+                "_release_model_for_resource_retry": lambda _job: (
+                    unhold_calls.append("release")
+                ),
+                "update_queue_job": lambda *_args, **_kwargs: (
+                    unhold_calls.append("queue") or True
+                ),
+                "is_cancel_requested": lambda _job: False,
+            },
+        )
+        held_replanned = {
+            "id": "job-h3-replanned-held",
+            "status": "queued",
+            "queue_held": True,
+            "_recovery_reason_code": "h3_generation_oom_replanned",
+        }
+        self.assertFalse(
+            unhold_failure["_prepare_pending_h3_resource_retry"](
+                held_replanned
+            )
+        )
+        self.assertTrue(held_replanned["queue_held"])
+        self.assertEqual(unhold_calls, ["release"])
+
+        boundary = _isolated_functions(
+            self.launch,
+            ("_h3_resource_retry_boundary",),
+            {
+                "_queue_recovery_delivery_pending": lambda _job: None,
+                "_h3_dependency_closed_recovery_prefix": lambda _job: None,
+                "_queue_recovery_units": lambda _job: [
+                    {"kind": "h3_segment", "variant": 0, "index": 0},
+                    {"kind": "h3_segment", "variant": 0, "index": 1},
+                    {"kind": "h3_concat", "variant": 0, "index": 0},
+                ],
+            },
+        )
+        self.assertEqual(
+            boundary["_h3_resource_retry_boundary"]({
+                "requested_outputs": 1,
+                "params": {"_h3_longform": {"clip_count": 2}},
+            }),
+            "finalization",
         )
 
     def test_remote_recovery_resume_requires_exact_owner_and_revalidation(self):

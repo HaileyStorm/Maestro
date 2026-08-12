@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import ts from 'typescript'
+import { compile } from 'tailwindcss'
 import { resolveSidebarNavigation } from '../src/lib/sidebarNavigation.ts'
 
 import {
@@ -1801,6 +1802,134 @@ test('project reference display errors scrub arbitrary exception details', () =>
     projectReferenceSafeErrorMessage(fixed, 'fallback'),
     'Project reference storage is unavailable (HTTP 503)',
   )
+})
+
+test('Reference authoring controls expose 44px mobile targets and compact at 768px', async () => {
+  const source = await readFile(componentUrl, 'utf8')
+  const authoringStart = source.indexOf('Create reference candidates')
+  const authoringEnd = source.indexOf('<div className="overflow-visible p-4">', authoringStart)
+  assert.ok(authoringStart >= 0 && authoringEnd > authoringStart)
+  const sourceFile = ts.createSourceFile(
+    'ProjectReferenceLibrary.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX,
+  )
+  const interactiveTags = new Set(['button', 'input', 'select', 'textarea', 'summary', 'a'])
+  const missingTargets = []
+  const tagName = node => node.tagName?.getText(sourceFile)
+  const inspectControl = node => {
+    if ((ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node))
+      && node.pos >= authoringStart && node.end <= authoringEnd
+      && interactiveTags.has(tagName(node))) {
+      const openingTag = node.getText(sourceFile)
+      let targetOwner = openingTag
+      const type = node.attributes.properties.find(property => (
+        property.name?.getText(sourceFile) === 'type'
+      ))?.initializer?.getText(sourceFile) ?? ''
+      if (tagName(node) === 'input' && /checkbox|radio/.test(type)) {
+        let parent = node.parent
+        while (parent && parent.pos >= authoringStart) {
+          if (ts.isJsxElement(parent) && tagName(parent.openingElement) === 'label') {
+            targetOwner = parent.openingElement.getText(sourceFile)
+            break
+          }
+          parent = parent.parent
+        }
+      }
+      if (!targetOwner.includes('min-h-11') || !targetOwner.includes('md:min-h-0')) {
+        missingTargets.push(`${tagName(node)} at line ${sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1}`)
+      }
+      if (tagName(node) === 'button'
+        && (!openingTag.includes('min-w-11') || !openingTag.includes('md:min-w-0'))) {
+        missingTargets.push(`button width at line ${sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1}`)
+      }
+    }
+    ts.forEachChild(node, inspectControl)
+  }
+  inspectControl(sourceFile)
+  assert.deepEqual(missingTargets, [], `all Reference authoring controls need mobile targets: ${missingTargets.join(', ')}`)
+
+  const directControlMarkers = [
+    'aria-label="Reference name"',
+    'aria-label="Reference description"',
+    'aria-label="Reference visual style"',
+    'aria-label="Custom reference visual style"',
+    'aria-label="Custom sheets per reference pack"',
+    'id="project-reference-character-gender"',
+    'id="project-reference-character-age"',
+    'id="project-reference-content-capability"',
+    'id="project-reference-initial-blur"',
+    'id="project-reference-intelligence-policy"',
+    'aria-label={`${item.label} detail source`}',
+    'aria-label={`${item.label} detail operation`}',
+    'aria-label={`Add custom ${definition.label.toLowerCase()} callout`}',
+    'aria-label="Reference generation model"',
+    'aria-label="Reference editor model"',
+    'aria-label="Additional LoRA scope"',
+    'aria-label="Additional LoRA multiplier"',
+    'aria-label="Additional compatible LoRA"',
+    'aria-label={`${lora.id} multiplier`}',
+    'aria-label={`${lora.id} scope`}',
+    'aria-label="Reference candidate packs"',
+    'aria-label="Reference sheet collage columns"',
+    'aria-label="Reference sheet palette swatches"',
+    'aria-label="Reference planning model"',
+    'aria-label="Reference visual review model"',
+    'aria-label="Maximum panel repair attempts"',
+  ]
+  for (const marker of directControlMarkers) {
+    const markerIndex = source.indexOf(marker)
+    assert.notEqual(markerIndex, -1, `found ${marker}`)
+    const nearby = source.slice(markerIndex, markerIndex + 1_200)
+    assert.match(nearby, /className="[^"]*min-h-11[^"]*md:min-h-0/, `${marker} has a mobile-only 44px minimum`)
+  }
+
+  for (const template of [
+    /ASSET_TYPES\.map[\s\S]*?className=\{`flex min-h-11[\s\S]*?md:min-h-0/,
+    /INTENT_OPTIONS\.map[\s\S]*?className=\{`min-h-11[\s\S]*?md:min-h-0/,
+    /DEPTH_OPTIONS\.map[\s\S]*?className=\{`min-h-11[\s\S]*?md:min-h-0/,
+    /visiblePresets\.map[\s\S]*?className=\{`min-h-11[\s\S]*?md:min-h-0/,
+    /definition\.options\.map[\s\S]*?className=\{`min-h-11[\s\S]*?md:min-h-0/,
+    /SHEET_MODES\.map[\s\S]*?className=\{`block min-h-11[\s\S]*?md:min-h-0/,
+    /MOODY_MODEL_TYPES\.map[\s\S]*?className=\{`min-h-11[\s\S]*?md:min-h-0/,
+  ]) assert.match(source, template)
+
+  for (const copy of [
+    'Explicit convenience',
+    'Explicit output',
+    'Keep anatomy anchor private and blurred',
+    'Review exact terms',
+    'Open source page',
+    'Open exact manual download',
+    'Verify local checkpoint',
+    'Refresh reviewer status',
+    'Automatic · unavailable',
+    '>Off</button>',
+    'Queue reference packs',
+  ]) {
+    const copyIndex = source.indexOf(copy)
+    assert.notEqual(copyIndex, -1, `found ${copy}`)
+    const controlStart = Math.max(
+      source.lastIndexOf('<button', copyIndex),
+      source.lastIndexOf('<label', copyIndex),
+      source.lastIndexOf('<a ', copyIndex),
+    )
+    const nearby = source.slice(controlStart, copyIndex + 400)
+    assert.match(nearby, /min-h-11/)
+    assert.match(nearby, /md:min-h-0/)
+  }
+
+  assert.match(source, /<summary className="flex min-h-11[^\"]*md:min-h-0">Advanced<\/summary>/)
+  assert.match(source, /grid grid-cols-1 gap-1 md:grid-cols-2/)
+  assert.match(source, /mt-1\.5 flex flex-col gap-1 md:flex-row/)
+  assert.match(source, /mt-1\.5 grid grid-cols-1 gap-1 md:grid-cols-\[1fr_auto\]/)
+  assert.match(source, /grid grid-cols-1 gap-1 md:grid-cols-\[minmax\(0,1fr\)_auto_auto\]/)
+  assert.match(source, /aria-label="Reference candidate packs"/)
+
+  const compiler = await compile('@theme { --spacing: 0.25rem; --breakpoint-md: 48rem; } @tailwind utilities;')
+  const css = compiler.build(['min-h-11', 'min-w-11', 'md:min-h-0', 'md:min-w-0'])
+  assert.match(css, /min-height: calc\(var\(--spacing\) \* 11\)/)
+  assert.match(css, /min-width: calc\(var\(--spacing\) \* 11\)/)
+  assert.match(css, /@media \(width >= 48rem\)/)
+  assert.match(css, /min-height: calc\(var\(--spacing\) \* 0\)/)
 })
 
 test('component source guards lifecycle, accessibility, mobile flow, and sheet-only apply', async () => {

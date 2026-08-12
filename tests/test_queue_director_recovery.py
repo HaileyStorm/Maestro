@@ -788,6 +788,84 @@ class DirectorRecoveryTests(unittest.TestCase):
         )
         self.assertNotIn(None, director._pipeline_child_jobs)
 
+    def test_resource_requeue_keeps_one_child_and_refreshes_wait_window(self):
+        unit = {"kind": "clip", "variant": 0, "index": 0}
+        submitted = []
+        completion_threads = []
+
+        def submit(job, _parent, _unit, _attempt):
+            submitted.append(job["id"])
+            job["status"] = "running"
+            director._jobs[job["id"]] = job
+
+            def retry_then_complete():
+                # Commit the retry after the wait deadline exists, then finish
+                # after the original window but inside the refreshed one.
+                time.sleep(0.05)
+                job["status"] = "queued"
+                job["resource_retry_attempt"] = 1
+                time.sleep(0.38)
+                job["status"] = "completed"
+
+            worker = threading.Thread(target=retry_then_complete)
+            worker.start()
+            completion_threads.append(worker)
+            return job
+
+        director._recovery_submit_child = submit
+        director._recovery_verify_child = lambda _job, _out: {
+            "outputs": ["clip.mp4"],
+            "clip_output_files": {"0": "clip.mp4"},
+            "artifacts": [{"basename": "clip.mp4"}],
+        }
+        outputs = director._submit_and_wait({
+            "_director_request_id": "c" * 32,
+            "_director_recovery_parent_id": "c" * 32,
+            "_director_recovery_unit": unit,
+        }, timeout_s=0.30, out_dir=str(self.root))
+        for worker in completion_threads:
+            worker.join(timeout=1)
+
+        self.assertEqual(outputs, ["clip.mp4"])
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(set(submitted)), 1)
+
+    def test_terminal_child_preserves_structured_resource_failure(self):
+        unit = {"kind": "clip", "variant": 0, "index": 0}
+        details = {
+            "stage": "model_load",
+            "code": "insufficient_host_memory",
+            "detail": (
+                "The generation model could not be loaded with the available "
+                "host memory."
+            ),
+            "exception_type": "HostMemoryAdmissionError",
+            "is_oom": False,
+        }
+
+        def submit(job, _parent, _unit, _attempt):
+            job.update({
+                "status": "failed",
+                "error": details["detail"],
+                "failure_details": details,
+            })
+            director._jobs[job["id"]] = job
+            return job
+
+        director._recovery_submit_child = submit
+        with self.assertRaises(director.DirectorChildGenerationError) as raised:
+            director._submit_and_wait({
+                "_director_request_id": "d" * 32,
+                "_director_recovery_parent_id": "d" * 32,
+                "_director_recovery_unit": unit,
+            }, timeout_s=0.05, out_dir=str(self.root))
+        self.assertEqual(
+            director._director_failure_details(
+                raised.exception, code="director_pipeline_failed",
+            )["code"],
+            "insufficient_host_memory",
+        )
+
     def test_invalid_child_retry_preserves_owner_and_access_policy(self):
         unit = {"kind": "prepipeline_music", "variant": 0, "index": 0}
         submitted = []

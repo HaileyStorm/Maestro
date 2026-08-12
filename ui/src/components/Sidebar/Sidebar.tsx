@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { Settings, X, Globe, BookMarked } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { useIsMobile } from '../../lib/useIsMobile'
@@ -37,6 +38,7 @@ import { ToolsPanel } from './ToolsPanel'
 import { HardwareStatusBar } from './HardwareStatusBar'
 import { GenerationPrivacyControls } from './GenerationPrivacyControls'
 import { ProjectReferenceLibrary } from './ProjectReferenceLibrary'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 
 export function Sidebar() {
   const toggleSettings = useStore(s => s.toggleSettings)
@@ -54,6 +56,11 @@ export function Sidebar() {
   const isMobile = useIsMobile()
   const mobileSidebarRef = useRef<HTMLElement>(null)
   const mobileCloseRef = useRef<HTMLButtonElement>(null)
+  const mobileRestoreFocusRef = useRef<HTMLElement | null>(null)
+
+  const closeMobileSidebar = useCallback(() => {
+    closeModalIfTop(document, mobileSidebarRef.current, () => setSidebarOpen(false))
+  }, [setSidebarOpen])
 
   const isVideo = generationMode === 'video'
   const isImage = generationMode === 'image'
@@ -87,38 +94,20 @@ export function Sidebar() {
   )
 
   useEffect(() => {
-    if (!isMobile || !sidebarOpen) return
-    const previousFocus = document.activeElement instanceof HTMLElement
+    if (!isMobile || !sidebarOpen || !mobileSidebarRef.current || !mobileCloseRef.current) return
+    mobileRestoreFocusRef.current = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null
-    mobileCloseRef.current?.focus()
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        setSidebarOpen(false)
-        return
-      }
-      if (event.key !== 'Tab' || !mobileSidebarRef.current) return
-      const focusable = Array.from(mobileSidebarRef.current.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ))
-      if (focusable.length === 0) return
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => {
-      document.removeEventListener('keydown', handleKeyDown)
-      previousFocus?.focus()
-    }
-  }, [isMobile, setSidebarOpen, sidebarOpen])
+    return installModalFocus({
+      document,
+      dialog: mobileSidebarRef.current,
+      initialFocus: mobileCloseRef.current,
+      restoreFocus: mobileRestoreFocusRef.current,
+      appRoot: document.getElementById('root'),
+      onClose: closeMobileSidebar,
+      priority: 60,
+    })
+  }, [closeMobileSidebar, isMobile, sidebarOpen])
 
   const openRecipes = () => {
     setSidebarOpen(false)
@@ -140,13 +129,13 @@ export function Sidebar() {
   )
 
   const modeToggle = (size: 'sm' | 'md') => (
-    <div role="group" aria-label="Creative workspace" className={`flex bg-bg-tertiary rounded-lg p-0.5 border border-border ${size === 'sm' ? 'w-full' : ''}`}>
+    <div role="group" aria-label="Creative workspace" className={`grid grid-cols-3 bg-bg-tertiary rounded-lg p-0.5 border border-border ${size === 'sm' ? 'w-full' : ''}`}>
       <button
         type="button"
         onClick={() => setSidebarMode('studio')}
         aria-label="Open Generate"
         aria-pressed={sidebarMode === 'studio'}
-        className={`${size === 'sm' ? 'flex-1 px-1.5 py-1 text-[10px]' : 'px-2.5 py-1 text-[11px]'} rounded-md transition-all ${
+        className={`mobile-control-target min-w-0 px-1.5 py-1 text-[10px] md:px-2.5 md:text-[11px] rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
           sidebarMode === 'studio' ? 'bg-toggle-active shadow-accent-glow text-white' : 'text-text-secondary hover:text-text-primary'
         }`}
       >
@@ -157,7 +146,7 @@ export function Sidebar() {
         onClick={() => setSidebarMode('director')}
         aria-label="Open Director"
         aria-pressed={isDirector}
-        className={`${size === 'sm' ? 'flex-1 px-1.5 py-1 text-[10px]' : 'px-2.5 py-1 text-[11px]'} rounded-md transition-all ${
+        className={`mobile-control-target min-w-0 px-1.5 py-1 text-[10px] md:px-2.5 md:text-[11px] rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
           // bg-toggle-active is flat accent-blue in the default theme
           // (preserves the original blue pill) and a red→orange sunset
           // gradient in Golden Hour. shadow-accent-glow is empty in
@@ -173,7 +162,7 @@ export function Sidebar() {
         disabled={!activeWorkspace || browsingUploads || referenceLocked}
         aria-label={referenceLocked ? 'Unlock project to open Reference' : 'Open Reference'}
         aria-pressed={isReference}
-        className={`${size === 'sm' ? 'flex-1 px-1.5 py-1 text-[10px]' : 'px-2.5 py-1 text-[11px]'} rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-40 ${
+        className={`mobile-control-target min-w-0 px-1.5 py-1 text-[10px] md:px-2.5 md:text-[11px] rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-40 ${
           isReference ? 'bg-toggle-active shadow-accent-glow text-white' : 'text-text-secondary hover:text-text-primary'
         }`}
       >
@@ -319,7 +308,7 @@ export function Sidebar() {
           <button
             type="button"
             onClick={openRecipes}
-            className="p-2 rounded-lg bg-bg-tertiary border border-border hover:border-border-light text-text-secondary hover:text-accent-blue transition-colors shrink-0"
+            className="mobile-control-target flex shrink-0 items-center justify-center rounded-lg border border-border bg-bg-tertiary p-2 text-text-secondary transition-colors hover:border-border-light hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             title="Recipes — one-click presets"
             aria-label="Browse recipes"
           >
@@ -348,7 +337,7 @@ export function Sidebar() {
 
   // Mobile: overlay drawer
   if (isMobile) {
-    return (
+    return createPortal(
       <>
         {sidebarOpen && (
           <button
@@ -356,7 +345,7 @@ export function Sidebar() {
             aria-label="Close creative workspace menu"
             tabIndex={-1}
             className="fixed inset-0 bg-black/40 z-40"
-            onClick={() => setSidebarOpen(false)}
+            onClick={closeMobileSidebar}
           />
         )}
         <aside
@@ -367,7 +356,7 @@ export function Sidebar() {
           aria-label="Generate, Director, and Reference menu"
           aria-hidden={!sidebarOpen}
           inert={!sidebarOpen}
-          className={`fixed top-0 left-0 h-[100dvh] w-[380px] max-w-[85vw] bg-bg-secondary border-r border-border z-[60] flex flex-col overflow-hidden transform transition-transform duration-300 ease-in-out pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] ${
+          className={`fixed top-0 left-0 h-[100vh] supports-[height:100dvh]:h-[100dvh] w-[380px] max-w-[85vw] bg-bg-secondary border-r border-border z-[60] flex flex-col overflow-hidden transform transition-transform duration-300 ease-in-out pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}>
           {/* Header */}
@@ -376,11 +365,11 @@ export function Sidebar() {
             <button
               ref={mobileCloseRef}
               type="button"
-              onClick={() => setSidebarOpen(false)}
-              className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+              onClick={closeMobileSidebar}
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
               aria-label="Close creative workspace menu"
             >
-              <X size={16} />
+              <X aria-hidden="true" size={16} />
             </button>
             <div className="col-span-2 min-w-0">{modeToggle('sm')}</div>
           </div>
@@ -393,7 +382,8 @@ export function Sidebar() {
             {machineControls && <HardwareStatusBar />}
           </div>
         </aside>
-      </>
+      </>,
+      document.body,
     )
   }
 

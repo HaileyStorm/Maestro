@@ -2775,7 +2775,11 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
             _ROOT, "ui", "src", "components", "H3GenerationPlanDialog.tsx",
         ))
         self.assertIn("const serverOptions", dialog)
-        self.assertIn("void approve({", dialog)
+        self.assertRegex(
+            dialog,
+            r"void Promise\.resolve\(approve\(\{[\s\S]*?\}\)\)\.finally"
+            r"\(\(\) => \{ operationRef\.current = false \}\)",
+        )
         self.assertNotIn("selectModel(model)", dialog)
         self.assertNotIn("_copyH3ProfileParamsIntoSubmission(", store)
         self.assertIn("await api.approveGenerationPlan(jobId, {", store)

@@ -11,7 +11,7 @@ import { boundedBackoffDelay, DOWNLOAD_REFRESH_EVENT, POLL_INTERVAL_MS, useVisib
  * Polls /api/v1/downloads/active every 2s during a transfer and every
  * 30s while idle. When downloads are active, shows a compact
  * banner with the current file's progress + a "stalled / retrying"
- * badge if the byte counter hasn't advanced in >15s.
+ * badge if the byte counter hasn't advanced in >30s.
  *
  * Polling is not gated on "is a job running" because
  * model downloads can fire from several paths in Maestro: job
@@ -98,21 +98,42 @@ export function DownloadStatusBanner() {
     const curPct = cur.total_bytes ? cur.downloaded_bytes / cur.total_bytes : 0
     return curPct > bestPct ? cur : best
   }, downloads[0])
+  const liveSummary = incomplete
+    ? 'A model download was interrupted. Re-run the request to finish it.'
+    : stalled
+      ? 'A model download is slow. Maestro is waiting to retry automatically.'
+      : `Model download in progress. ${downloads.length} ${downloads.length === 1 ? 'file' : 'files'}.`
 
   return (
-    <div className="fixed bottom-4 right-4 z-40 max-w-md w-[calc(100vw-2rem)] sm:w-auto">
+    <div
+      className="pointer-events-none fixed inset-0 z-40 flex max-h-[100vh] items-end justify-end supports-[height:100dvh]:max-h-[100dvh]"
+      style={{
+        paddingTop: 'max(1rem, env(safe-area-inset-top, 0px))',
+        paddingRight: 'max(1rem, env(safe-area-inset-right, 0px))',
+        paddingBottom: 'max(1rem, env(safe-area-inset-bottom, 0px))',
+        paddingLeft: 'max(1rem, env(safe-area-inset-left, 0px))',
+      }}
+    >
       {/* Outer container is always solid bg-bg-secondary so text
           stays readable over images/videos in the main feed.
           Border color switches to amber on stall to draw the eye
           without sacrificing contrast. */}
-      <div className={`bg-bg-secondary rounded-lg border shadow-2xl overflow-hidden ${
+      <div className={`pointer-events-auto max-h-full w-full max-w-md overflow-y-auto overscroll-contain rounded-lg border bg-bg-secondary shadow-2xl ${
         incomplete ? 'border-red-500/60' : stalled ? 'border-amber-500/60' : 'border-border'
       }`}>
+        <div
+          className="sr-only"
+          role={incomplete ? 'alert' : 'status'}
+          aria-live={incomplete ? 'assertive' : 'polite'}
+          aria-atomic="true"
+        >
+          {liveSummary}
+        </div>
         {/* Interrupted download — red strip. The file is probably truncated;
             re-running the download/generation fetches the rest. */}
         {incomplete && (
-          <div className="px-4 py-2 bg-red-500/15 border-b border-red-500/30 flex items-center gap-2">
-            <AlertTriangle size={14} className="text-red-400 shrink-0" />
+          <div className="flex flex-wrap items-center gap-2 border-b border-red-500/30 bg-red-500/15 px-4 py-2">
+            <AlertTriangle size={14} aria-hidden="true" className="shrink-0 text-red-400" />
             <div className="text-xs font-medium text-text-primary">
               A download was interrupted — re-run to finish it
             </div>
@@ -121,8 +142,8 @@ export function DownloadStatusBanner() {
         {/* Optional amber accent strip on stall — semi-transparent
             tint over the solid backdrop, same pattern as OomRecoveryBanner. */}
         {stalled && !incomplete && (
-          <div className="px-4 py-2 bg-amber-500/15 border-b border-amber-500/30 flex items-center gap-2">
-            <AlertTriangle size={14} className="text-indicator-warning shrink-0" />
+          <div className="flex flex-wrap items-center gap-2 border-b border-amber-500/30 bg-amber-500/15 px-4 py-2">
+            <AlertTriangle size={14} aria-hidden="true" className="shrink-0 text-indicator-warning" />
             <div className="text-xs font-medium text-text-primary">
               Download is slow — waiting for retry
             </div>
@@ -132,12 +153,12 @@ export function DownloadStatusBanner() {
         <div className="px-4 py-3">
           <div className="flex items-start gap-2.5">
             {!stalled && (
-              <Download size={16} className="text-accent-blue shrink-0 mt-0.5 animate-pulse" />
+              <Download size={16} aria-hidden="true" className="mt-0.5 shrink-0 animate-pulse text-accent-blue motion-reduce:animate-none" />
             )}
             <div className="flex-1 min-w-0">
               {!stalled && (
-                <div className="flex items-center justify-between gap-2">
-                  <div className="text-xs font-medium text-text-primary truncate">
+                <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+                  <div className="text-xs font-medium text-text-primary">
                     Downloading model files
                   </div>
                   {downloads.length > 1 && (
@@ -152,7 +173,7 @@ export function DownloadStatusBanner() {
                   {downloads.length} files
                 </div>
               )}
-              <div className="text-[10px] text-text-muted truncate" title={featured.filename}>
+              <div className="break-all text-[10px] text-text-muted sm:truncate" title={featured.filename}>
                 {featured.filename}
               </div>
               <DownloadProgressBar download={featured} stalled={!!stalled} />
@@ -191,11 +212,22 @@ function DownloadProgressBar({
 
   return (
     <div className="mt-1.5">
-      <div className="h-1 rounded-full bg-bg-tertiary overflow-hidden">
+      <div
+        className="h-1 overflow-hidden rounded-full bg-bg-tertiary"
+        role="progressbar"
+        aria-label={`Download progress for ${download.filename}`}
+        aria-valuemin={pct !== null ? 0 : undefined}
+        aria-valuemax={pct !== null ? 100 : undefined}
+        aria-valuenow={pct ?? undefined}
+        aria-valuetext={pct !== null
+          ? `${pct} percent, ${_formatBytes(download.downloaded_bytes)} of ${_formatBytes(download.total_bytes!)}`
+          : `${_formatBytes(download.downloaded_bytes)} downloaded`}
+      >
         <div
-          className={`h-full transition-all duration-500 ${
+          className={`h-full transition-all duration-500 motion-reduce:transition-none ${
             stalled ? 'bg-indicator-warning' : 'bg-accent-blue'
           }`}
+          aria-hidden="true"
           style={{ width: pct !== null ? `${pct}%` : '15%' }}
         />
       </div>

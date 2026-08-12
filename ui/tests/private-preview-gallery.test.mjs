@@ -16,6 +16,7 @@ import {
   subscribePrivatePreviewChanges,
   subscribePrivatePreviewReveal,
 } from '../src/lib/privatePreview.ts'
+import { closeModalIfTop, installModalFocus } from '../src/lib/modalFocus.ts'
 import { requestThumbnail } from '../src/lib/thumbnailCache.ts'
 
 class SessionStorageFake {
@@ -70,6 +71,42 @@ class ThrowingSessionStorage {
   removeItem() { throw new Error('storage disabled') }
 }
 
+class ModalTestDocument extends EventTarget {
+  activeElement = null
+  body
+  defaultView = { getComputedStyle: () => ({ display: 'block', visibility: 'visible' }) }
+
+  constructor() {
+    super()
+    this.appRoot = new ModalTestElement(this, 'app root')
+    this.body = new ModalTestElement(this, 'body')
+    this.body.style = { overflow: 'auto' }
+  }
+
+  getElementById(id) { return id === 'root' ? this.appRoot : null }
+}
+
+class ModalTestElement {
+  attributes = new Map()
+  descendants = new Set()
+  focusable = []
+  isConnected = true
+
+  constructor(document, name) {
+    this.document = document
+    this.name = name
+  }
+
+  focus() { this.document.activeElement = this }
+  hasAttribute(name) { return this.attributes.has(name) }
+  getAttribute(name) { return this.attributes.get(name) ?? null }
+  setAttribute(name, value = '') { this.attributes.set(name, String(value)) }
+  removeAttribute(name) { this.attributes.delete(name) }
+  contains(element) { return element === this || this.descendants.has(element) }
+  querySelectorAll() { return this.focusable }
+  closest() { return null }
+}
+
 function fakeThumbnailDocument(videos) {
   return {
     createElement(tag) {
@@ -103,13 +140,25 @@ async function loadThumbnailGalleryHarness() {
   const modules = new Map([
     ['react', `
       export function useState(initial) {
-        return [typeof initial === 'function' ? initial() : initial, () => {}]
+        const value = globalThis.__galleryStateValues?.length
+          ? globalThis.__galleryStateValues.shift()
+          : (typeof initial === 'function' ? initial() : initial)
+        return [value, update => {
+          const next = typeof update === 'function' ? update(value) : update
+          ;(globalThis.__galleryStateUpdates ||= []).push(next)
+        }]
       }
       export function useEffect(effect) {
         const cleanup = effect()
         if (typeof cleanup === 'function') globalThis.__galleryEffectCleanups.push(cleanup)
       }
-      export function useRef(initial) { return { current: initial } }
+      export function useRef(initial) {
+        return {
+          current: globalThis.__galleryRefValues?.length
+            ? globalThis.__galleryRefValues.shift()
+            : initial,
+        }
+      }
       export function useMemo(factory) { return factory() }
       export function useCallback(callback) { return callback }
     `],
@@ -118,8 +167,15 @@ async function loadThumbnailGalleryHarness() {
       export function jsx(type, props, key) { return { type, props: props || {}, key } }
       export const jsxs = jsx
     `],
+    ['react-dom', `
+      export function createPortal(children, target) {
+        ;(globalThis.__galleryPortalTargets ||= []).push(target)
+        return globalThis.__galleryMountPortal?.(children, target) ?? children
+      }
+    `],
     ['lucide-react', `
       const icon = props => ({ type: 'svg', props: props || {} })
+      export const Eye = icon
       export const EyeOff = icon
       export const Film = icon
       export const Music = icon
@@ -137,10 +193,18 @@ async function loadThumbnailGalleryHarness() {
         return new Promise(() => {})
       }
     `],
-    ['../../lib/useIsMobile', 'export function useIsMobile() { return false }'],
+    ['../../lib/useIsMobile', 'export function useIsMobile() { return Boolean(globalThis.__galleryIsMobile) }'],
+    ['../../lib/modalFocus', `
+      export function installModalFocus(options) {
+        return globalThis.__galleryInstallModalFocus(options)
+      }
+      export function closeModalIfTop(document, dialog, onClose) {
+        return globalThis.__galleryCloseModalIfTop(document, dialog, onClose)
+      }
+    `],
     ['../../lib/privatePreview', `
       export function privatePreviewIdentity(workspace, name, revision = '') {
-        return workspace + '\\u0000' + name + '\\u0000' + revision
+        return workspace + '\u0000' + name + '\u0000' + revision
       }
       export function privatePreviewWasRevealed(identity) {
         return globalThis.__galleryRevealed.has(identity)
@@ -177,6 +241,89 @@ async function loadThumbnailGalleryHarness() {
     compiledModule.exports,
   )
   return compiledModule.exports.ThumbnailGallery
+}
+
+async function loadMediaFeedItemHarness() {
+  const iconNames = [
+    'Play', 'Pencil', 'RefreshCw', 'Copy', 'Trash2', 'Check', 'Combine',
+    'Loader2', 'Heart', 'ArrowLeftToLine', 'Download', 'FolderInput',
+    'Scissors', 'FastForward', 'BookMarked', 'EyeOff', 'Share2', 'Link2Off',
+  ]
+  const modules = new Map([
+    ['react', `
+      export function useState(initial) {
+        return [typeof initial === 'function' ? initial() : initial, () => {}]
+      }
+      export function useEffect() {}
+      export function useRef(initial) { return { current: initial } }
+      export function useCallback(callback) { return callback }
+    `],
+    ['react/jsx-runtime', `
+      export const Fragment = Symbol('Fragment')
+      export function jsx(type, props, key) { return { type, props: props || {}, key } }
+      export const jsxs = jsx
+    `],
+    ['lucide-react', `
+      const icon = props => ({ type: 'svg', props: props || {} })
+      ${iconNames.map(name => `export const ${name} = icon`).join('\n')}
+    `],
+    ['../Recipes/SaveRecipeDialog', 'export function SaveRecipeDialog() { return null }'],
+    ['../../stores/useStore', `
+      export function useStore(selector) { return selector(globalThis.__mediaFeedStore) }
+      useStore.getState = () => globalThis.__mediaFeedStore
+      useStore.setState = () => {}
+    `],
+    ['../../api/client', `
+      export const createOutputShare = async () => ({})
+      export const deleteOutputComponents = async () => ({ failed: [] })
+      export const getUploadUrl = value => '/uploads/' + value
+      export const fetchOutputMetadata = async () => null
+      export const getFileUrl = name => '/files/' + name
+      export const moveOutput = async () => {}
+      export const revokeOutputShare = async () => {}
+      export const uploadImage = async () => ({ path: '' })
+    `],
+    ['../../lib/modelDisplay', 'export function modelDisplayName() { return "" }'],
+    ['../../lib/privatePreview', `
+      export function privatePreviewIdentity(workspace, name, revision = '') {
+        return workspace + '\\u0000' + name + '\\u0000' + revision
+      }
+      export function privatePreviewWasRevealed(identity) {
+        return globalThis.__mediaFeedRevealed.has(identity)
+      }
+      export function revealPrivatePreview(identity) { globalThis.__mediaFeedRevealed.add(identity) }
+      export function hidePrivatePreview(identity) { globalThis.__mediaFeedRevealed.delete(identity) }
+      export function subscribePrivatePreviewReveal() { return () => {} }
+    `],
+  ])
+  const result = await build({
+    entryPoints: [mediaFeedItemUrl.pathname],
+    bundle: true,
+    format: 'cjs',
+    jsx: 'automatic',
+    platform: 'node',
+    write: false,
+    plugins: [{
+      name: 'media-feed-item-test-mocks',
+      setup(builder) {
+        builder.onResolve({ filter: /.*/ }, args => (
+          modules.has(args.path) ? { path: args.path, namespace: 'media-feed-test' } : undefined
+        ))
+        builder.onLoad({ filter: /.*/, namespace: 'media-feed-test' }, args => ({
+          contents: modules.get(args.path),
+          loader: 'js',
+        }))
+      },
+    }],
+  })
+  const compiledModule = { exports: {} }
+  const require = createRequire(import.meta.url)
+  new Function('require', 'module', 'exports', result.outputFiles[0].text)(
+    require,
+    compiledModule,
+    compiledModule.exports,
+  )
+  return compiledModule.exports.MediaFeedItem
 }
 
 async function loadTabFilterHarness() {
@@ -468,10 +615,12 @@ test('project bulk toggle covers none, some, all, pagination, and per-item overr
   const alphabet = privatePreviewIdentity('alphabet', 'keep.mp4', 'r1')
   const beta = privatePreviewIdentity('beta', 'keep.mp4', 'r1')
   assert.equal(privatePreviewWorkspaceHasRevealed('alpha'), false)
+  assert.equal(privatePreviewWorkspaceHasRevealed('alpha', 'all'), false)
   assert.equal(privatePreviewWasRevealed(alphaOne), false)
 
   revealPrivatePreview(alphaOne)
   assert.equal(privatePreviewWorkspaceHasRevealed('alpha'), true)
+  assert.equal(privatePreviewWorkspaceHasRevealed('alpha', 'all'), false)
   assert.equal(privatePreviewWasRevealed(alphaOne), true)
   assert.equal(privatePreviewWasRevealed(alphaTwo), false)
   revealPrivatePreview(alphabet)
@@ -492,6 +641,7 @@ test('project bulk toggle covers none, some, all, pagination, and per-item overr
 
   assert.equal(privatePreviewWasRevealed(alphaOne), true)
   assert.equal(privatePreviewWasRevealed(alphaTwo), true)
+  assert.equal(privatePreviewWorkspaceHasRevealed('alpha', 'all'), true)
   const newlyPaginated = privatePreviewIdentity('alpha', 'new-page.mp4', 'r9')
   assert.equal(privatePreviewWasRevealed(newlyPaginated), true)
   assert.equal(privatePreviewWasRevealed(alphabet), true)
@@ -505,18 +655,22 @@ test('project bulk toggle covers none, some, all, pagination, and per-item overr
   assert.equal(privatePreviewWasRevealed(alphaOne), false)
   assert.equal(privatePreviewWasRevealed(alphaTwo), true)
   assert.equal(privatePreviewWasRevealed(newlyPaginated), true)
+  assert.equal(privatePreviewWorkspaceHasRevealed('alpha'), true)
+  assert.equal(privatePreviewWorkspaceHasRevealed('alpha', 'all'), false)
   assert.deepEqual(itemChanges, [['one', false]])
 
   changes.length = 0
   itemChanges.length = 0
   revealPrivatePreview(alphaOne)
   assert.equal(privatePreviewWasRevealed(alphaOne), true)
+  assert.equal(privatePreviewWorkspaceHasRevealed('alpha', 'all'), true)
   assert.deepEqual(itemChanges, [['one', true]])
 
   changes.length = 0
   itemChanges.length = 0
   hidePrivatePreviewsForWorkspace('alpha')
   assert.equal(privatePreviewWorkspaceHasRevealed('alpha'), false)
+  assert.equal(privatePreviewWorkspaceHasRevealed('alpha', 'all'), false)
   assert.equal(privatePreviewWasRevealed(alphaOne), false)
   assert.equal(privatePreviewWasRevealed(alphaTwo), false)
   assert.equal(privatePreviewWasRevealed(newlyPaginated), false)
@@ -544,16 +698,112 @@ test('storage failure keeps session-only bulk and per-item controls coherent', t
   const first = privatePreviewIdentity(workspace, 'first.mp4', 'r1')
   const later = privatePreviewIdentity(workspace, 'later.mp4', 'r2')
   setPrivatePreviewsForWorkspaceRevealed(workspace, true)
+  assert.equal(privatePreviewWorkspaceHasRevealed(workspace, 'all'), true)
   assert.equal(privatePreviewWasRevealed(first), true)
   assert.equal(privatePreviewWasRevealed(later), true)
   hidePrivatePreview(first)
+  assert.equal(privatePreviewWorkspaceHasRevealed(workspace, 'all'), false)
   assert.equal(privatePreviewWasRevealed(first), false)
   assert.equal(privatePreviewWasRevealed(later), true)
   revealPrivatePreview(first)
   assert.equal(privatePreviewWasRevealed(first), true)
+  assert.equal(privatePreviewWorkspaceHasRevealed(workspace, 'all'), true)
   hidePrivatePreviewsForWorkspace(workspace)
   assert.equal(privatePreviewWasRevealed(first), false)
   assert.equal(privatePreviewWasRevealed(later), false)
+})
+
+test('bulk activation reads live state across rapid repeats and workspace changes', t => {
+  const originalWindow = globalThis.window
+  const originalSessionStorage = globalThis.sessionStorage
+  globalThis.window = new EventTarget()
+  globalThis.sessionStorage = new SessionStorageFake()
+  t.after(() => {
+    globalThis.window = originalWindow
+    globalThis.sessionStorage = originalSessionStorage
+  })
+
+  const activate = workspace => setPrivatePreviewsForWorkspaceRevealed(
+    workspace,
+    !privatePreviewWorkspaceHasRevealed(workspace, 'all'),
+  )
+  const alphaItem = privatePreviewIdentity('rapid-alpha', 'one.mp4', 'r1')
+  const betaItem = privatePreviewIdentity('rapid-beta', 'one.mp4', 'r1')
+
+  revealPrivatePreview(alphaItem)
+  activate('rapid-alpha')
+  assert.equal(privatePreviewWorkspaceHasRevealed('rapid-alpha', 'all'), true)
+  assert.equal(privatePreviewWasRevealed(alphaItem), true)
+  activate('rapid-alpha')
+  assert.equal(privatePreviewWorkspaceHasRevealed('rapid-alpha'), false)
+  assert.equal(privatePreviewWasRevealed(alphaItem), false)
+
+  activate('rapid-beta')
+  assert.equal(privatePreviewWorkspaceHasRevealed('rapid-beta', 'all'), true)
+  assert.equal(privatePreviewWasRevealed(betaItem), true)
+  assert.equal(privatePreviewWorkspaceHasRevealed('rapid-alpha'), false)
+})
+
+test('private audio and retry images acquire no media URL before reveal', async t => {
+  const noop = () => {}
+  globalThis.__mediaFeedRevealed = new Set()
+  globalThis.__mediaFeedStore = {
+    setSelectedOutput: noop,
+    loadSettingsFromOutput: noop,
+    rerollGeneration: noop,
+    deleteSelectedOutput: noop,
+    rejoinClipGroup: noop,
+    toggleFavorite: noop,
+    setStartImage: noop,
+    addImageRef: noop,
+    setContinueVideo: noop,
+    setParam: noop,
+    openRetakeDialog: noop,
+    generationMode: 'video',
+    workspaces: [],
+    accessContext: null,
+    browsingUploads: false,
+    models: [],
+    gallerySelectionMode: false,
+    selectedOutputKeys: [],
+    toggleOutputSelection: noop,
+    saveRecipeFromOutput: noop,
+  }
+  t.after(() => {
+    delete globalThis.__mediaFeedRevealed
+    delete globalThis.__mediaFeedStore
+  })
+
+  const MediaFeedItem = await loadMediaFeedItemHarness()
+  const render = file => materialize(MediaFeedItem({
+    file: {
+      favorite: false,
+      linked_component_count: 0,
+      artifact_class: 'final',
+      revision: 'r1',
+      workspace: 'private-media',
+      private: true,
+      ...file,
+    },
+    index: 0,
+    isActive: true,
+    onVisible: noop,
+    measurementEpoch: 0,
+    onMeasured: noop,
+  }))
+  const mediaSources = tree => findElements(tree, element => (
+    element.type === 'img' || element.type === 'audio' || element.type === 'video'
+  )).map(element => element.props?.src).filter(Boolean)
+
+  const image = { name: 'private.png', type: 'image', url: '/private.png' }
+  const audio = { name: 'private.wav', type: 'audio', url: '/private.wav' }
+  assert.deepEqual(mediaSources(render(image)), [])
+  assert.deepEqual(mediaSources(render(audio)), [])
+
+  globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', image.name, 'r1'))
+  globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', audio.name, 'r1'))
+  assert.deepEqual(mediaSources(render(image)), ['/private.png'])
+  assert.deepEqual(mediaSources(render(audio)), ['/private.wav'])
 })
 
 test('private image and video thumbnails acquire sources only while revealed', async t => {
@@ -637,6 +887,204 @@ test('private image and video thumbnails acquire sources only while revealed', a
   assert.equal(globalThis.__galleryThumbnailRequests[1].signal.aborted, false)
   cleanupGalleryEffects()
   assert.equal(globalThis.__galleryThumbnailRequests[1].signal.aborted, true)
+})
+
+test('mobile thumbnail overlay joins the modal stack with top-only dismissal and focus restoration', async t => {
+  globalThis.__galleryEffectCleanups = []
+  globalThis.__galleryThumbnailRequests = []
+  globalThis.__galleryRevealed = new Set()
+  globalThis.__galleryIsMobile = true
+  globalThis.__galleryStateValues = []
+  globalThis.__galleryStateUpdates = []
+  globalThis.__galleryRefValues = []
+  globalThis.__galleryPortalTargets = []
+  globalThis.__galleryMountPortal = (children, target) => {
+    const mount = element => {
+      if (Array.isArray(element)) {
+        for (const child of element) mount(child)
+        return
+      }
+      if (element === null || element === undefined || typeof element !== 'object') return
+      if (element.props?.ref?.current) target.descendants.add(element.props.ref.current)
+      mount(element.props?.children)
+    }
+    mount(children)
+    return children
+  }
+  globalThis.__galleryInstallModalFocus = installModalFocus
+  globalThis.__galleryCloseModalIfTop = closeModalIfTop
+  globalThis.__galleryStoreState = {
+    filteredOutputs: () => [{
+      name: 'private-image.png',
+      url: '/private-image.png',
+      type: 'image',
+      revision: 'r1',
+      workspace: 'mobile-private',
+      private: true,
+    }],
+    outputs: [],
+    outputsTotal: 1,
+    outputsLoading: false,
+  }
+  let toggles = 0
+  const selected = []
+  const originalDocument = globalThis.document
+  t.after(() => {
+    cleanupGalleryEffects()
+    delete globalThis.__galleryEffectCleanups
+    delete globalThis.__galleryThumbnailRequests
+    delete globalThis.__galleryRevealed
+    delete globalThis.__galleryIsMobile
+    delete globalThis.__galleryStoreState
+    delete globalThis.__galleryStateValues
+    delete globalThis.__galleryStateUpdates
+    delete globalThis.__galleryRefValues
+    delete globalThis.__galleryPortalTargets
+    delete globalThis.__galleryMountPortal
+    delete globalThis.__galleryInstallModalFocus
+    delete globalThis.__galleryCloseModalIfTop
+    globalThis.document = originalDocument
+  })
+
+  const modalDocument = new ModalTestDocument()
+  globalThis.document = modalDocument
+  const outerOpener = new ModalTestElement(modalDocument, 'outer opener')
+  const parentDialog = new ModalTestElement(modalDocument, 'parent dialog')
+  const parentClose = new ModalTestElement(modalDocument, 'parent close')
+  const openerNode = new ModalTestElement(modalDocument, 'thumbnail opener')
+  const closeNode = new ModalTestElement(modalDocument, 'thumbnail close')
+  const dialogNode = new ModalTestElement(modalDocument, 'thumbnail dialog')
+  parentDialog.focusable = [parentClose, openerNode]
+  parentDialog.descendants = new Set([parentClose, openerNode])
+  dialogNode.focusable = [closeNode]
+  dialogNode.descendants = new Set([closeNode])
+  outerOpener.focus()
+  let parentCloseRequests = 0
+  const cleanupParent = installModalFocus({
+    document: modalDocument,
+    dialog: parentDialog,
+    initialFocus: parentClose,
+    restoreFocus: outerOpener,
+    appRoot: modalDocument.appRoot,
+    onClose: () => { parentCloseRequests += 1 },
+    priority: 60,
+  })
+
+  const ThumbnailGallery = await loadThumbnailGalleryHarness()
+  globalThis.__galleryStateValues = [false, false]
+  globalThis.__galleryRefValues = [openerNode, closeNode, dialogNode]
+  let tree = materialize(ThumbnailGallery({
+    activeIndex: 0,
+    onThumbnailClick(index) { selected.push(index) },
+    privatePreviewControl: {
+      workspace: 'mobile-private',
+      state: 'some',
+      onToggle() { toggles += 1 },
+    },
+  }))
+  const opener = findElements(tree, element => element.props?.['aria-controls'] === 'mobile-thumbnail-panel')[0]
+  assert.ok(opener)
+  assert.equal(opener.props.type, 'button')
+  assert.match(opener.props.className, /min-h-11 min-w-11/)
+  opener.props.onClick()
+  assert.deepEqual(globalThis.__galleryStateUpdates, [true])
+
+  cleanupGalleryEffects()
+  globalThis.__galleryStateValues = [false, true]
+  globalThis.__galleryStateUpdates = []
+  globalThis.__galleryRefValues = [openerNode, closeNode, dialogNode]
+  tree = materialize(ThumbnailGallery({
+    activeIndex: 0,
+    onThumbnailClick(index) { selected.push(index) },
+    privatePreviewControl: {
+      workspace: 'mobile-private',
+      state: 'some',
+      onToggle() { toggles += 1 },
+    },
+  }))
+  assert.equal(globalThis.__galleryPortalTargets.at(-1), modalDocument.body)
+  assert.equal(modalDocument.body.contains(dialogNode), true)
+  assert.equal(modalDocument.appRoot.contains(dialogNode), false)
+  assert.equal(modalDocument.activeElement, closeNode)
+  assert.equal(modalDocument.appRoot.hasAttribute('inert'), true)
+  assert.equal(parentDialog.hasAttribute('inert'), true)
+  assert.equal(dialogNode.hasAttribute('inert'), false)
+  assert.equal(modalDocument.body.style.overflow, 'hidden')
+
+  const action = findElements(tree, element => (
+    element.type === 'button'
+    && element.props?.['aria-label'] === 'Reveal all remaining private previews for project mobile-private'
+  ))[0]
+  assert.ok(action)
+  assert.equal(action.props.type, 'button')
+  assert.equal(action.props['aria-pressed'], 'mixed')
+  assert.match(action.props.className, /min-h-11/)
+  action.props.onClick()
+  assert.equal(toggles, 1)
+
+  const closer = findElements(tree, element => element.props?.['aria-label'] === 'Hide thumbnails')[0]
+  assert.ok(closer)
+  assert.equal(closer.props.type, 'button')
+  assert.match(closer.props.className, /min-h-11 min-w-11/)
+
+  const backdrop = findElements(tree, element => (
+    element.type === 'button' && element.props?.['aria-label'] === 'Close thumbnail history'
+  ))[0]
+  assert.ok(backdrop)
+
+  const upperDialog = new ModalTestElement(modalDocument, 'upper dialog')
+  const upperClose = new ModalTestElement(modalDocument, 'upper close')
+  upperDialog.focusable = [upperClose]
+  upperDialog.descendants = new Set([upperClose])
+  let upperCloseRequests = 0
+  const cleanupUpper = installModalFocus({
+    document: modalDocument,
+    dialog: upperDialog,
+    initialFocus: upperClose,
+    restoreFocus: closeNode,
+    appRoot: modalDocument.appRoot,
+    onClose: () => { upperCloseRequests += 1 },
+    priority: 100,
+  })
+  assert.equal(dialogNode.hasAttribute('inert'), true)
+  globalThis.__galleryStateUpdates = []
+  backdrop.props.onClick()
+  closer.props.onClick()
+  assert.deepEqual(globalThis.__galleryStateUpdates, [], 'covered history cannot dismiss')
+
+  const thumbnail = findElements(tree, element => Number.isInteger(element.props?.['data-thumb-index']))[0]
+  assert.ok(thumbnail)
+  thumbnail.props.onClick()
+  assert.deepEqual(selected, [], 'covered history cannot select')
+  assert.equal(globalThis.__galleryRevealed.size, 0, 'covered history cannot reveal')
+  assert.deepEqual(globalThis.__galleryStateUpdates, [], 'covered selection cannot mutate state')
+
+  const escape = new Event('keydown', { cancelable: true })
+  Object.defineProperty(escape, 'key', { value: 'Escape' })
+  modalDocument.dispatchEvent(escape)
+  assert.equal(upperCloseRequests, 1)
+  assert.equal(parentCloseRequests, 0)
+  cleanupUpper()
+  assert.equal(modalDocument.activeElement, closeNode)
+  assert.equal(dialogNode.hasAttribute('inert'), false)
+
+  globalThis.__galleryStateUpdates = []
+  thumbnail.props.onClick()
+  assert.deepEqual(selected, [0])
+  assert.deepEqual(globalThis.__galleryStateUpdates, [false, 1])
+  cleanupGalleryEffects()
+  assert.equal(modalDocument.activeElement, openerNode)
+  assert.equal(parentDialog.hasAttribute('inert'), false)
+  assert.equal(modalDocument.body.style.overflow, 'hidden')
+
+  const parentEscape = new Event('keydown', { cancelable: true })
+  Object.defineProperty(parentEscape, 'key', { value: 'Escape' })
+  modalDocument.dispatchEvent(parentEscape)
+  assert.equal(parentCloseRequests, 1)
+  cleanupParent()
+  assert.equal(modalDocument.activeElement, outerOpener)
+  assert.equal(modalDocument.appRoot.hasAttribute('inert'), false)
+  assert.equal(modalDocument.body.style.overflow, 'auto')
 })
 
 test('private and initial-blur reference images acquire a source only while revealed', async t => {
@@ -742,10 +1190,13 @@ test('gallery privacy, revocation, and virtualization contracts are wired withou
     readFile(privatePreviewUrl, 'utf8'),
   ])
 
-  assert.match(main, /privatePreviewWorkspaceHasRevealed\(activeWorkspace\)/)
+  assert.match(main, /privatePreviewWorkspaceHasRevealed\(activeWorkspace, 'all'\)/)
+  assert.match(main, /privatePreviewWorkspaceHasRevealed\(activeWorkspace\) \? 'some' : 'none'/)
   assert.match(main, /setPrivatePreviewsForWorkspaceRevealed\(/)
-  assert.match(main, /\? 'Blur all' : 'Reveal all'/)
-  assert.match(main, /aria-pressed=\{anyProjectPrivatePreviewRevealed\}/)
+  assert.match(main, /\? 'Blur all'[\s\S]*'Reveal all remaining'[\s\S]*'Reveal all'/)
+  assert.match(main, /aria-pressed=\{privatePreviewActionPressed\}/)
+  assert.match(main, /min-h-11[^"]*md:min-h-0/)
+  assert.doesNotMatch(main, /min-h-11[^"]*sm:min-h-0/)
   assert.match(main, /Browser-session preview only; project access unchanged\./)
   assert.match(main, /activeWorkspace && !browsingUploads/)
   assert.match(main, /Map<string, \{ height: number; epoch: number \}>/)
@@ -781,7 +1232,15 @@ test('gallery privacy, revocation, and virtualization contracts are wired withou
   )
   assert.ok(thumbnailClick.indexOf('setSelectedOutput(index)') < thumbnailClick.indexOf('feedEl.scrollTo'))
 
-  assert.match(item, /src=\{privateBlurred \? undefined : file\.url\}/)
+  const withheldFeedMedia = item.slice(
+    item.indexOf('{privateBlurred ? ('),
+    item.indexOf(") : file.type === 'video'"),
+  )
+  assert.notEqual(withheldFeedMedia, '')
+  assert.doesNotMatch(withheldFeedMedia, /file\.url|<audio|<video|RetryImage/)
+  assert.match(item, /<video[\s\S]*src=\{file\.url\}/)
+  assert.match(item, /<audio[^>]*src=\{file\.url\}/)
+  assert.match(item, /<RetryImage[^>]*url=\{file\.url\}/)
   assert.match(item, /if \(previous && previous !== video\) releaseVideoSource\(previous\)/)
   assert.match(item, /ref=\{setVideoElement\}/)
   assert.match(item, /video\.pause\(\)[\s\S]*video\.removeAttribute\('src'\)[\s\S]*video\.load\(\)/)
@@ -807,6 +1266,32 @@ test('gallery privacy, revocation, and virtualization contracts are wired withou
   assert.doesNotMatch(thumbnails, /autoPlay|video\.play\(/)
   assert.match(thumbnails, /key=\{privateIdentity\}/)
   assert.match(thumbnails, /Reveal blurred preview and select/)
+  assert.match(thumbnails, /aria-controls="mobile-thumbnail-panel"/)
+  assert.match(thumbnails, /createPortal\([\s\S]*document\.body/)
+  assert.match(thumbnails, /inert=\{!mobileOpen\}/)
+  assert.match(thumbnails, /installModalFocus\(\{/)
+  assert.match(thumbnails, /closeModalIfTop\(document, mobileDialogRef\.current/)
+  assert.match(thumbnails, /appRoot: document\.getElementById\('root'\)/)
+  assert.match(thumbnails, /priority: 70/)
+  assert.match(thumbnails, /role="dialog"/)
+  assert.match(thumbnails, /aria-modal=\{mobileOpen \? true : undefined\}/)
+  assert.doesNotMatch(thumbnails, /addEventListener\('keydown'|requestAnimationFrame\(\(\) => mobileOpenerRef/)
+  const thumbnailActivation = thumbnails.slice(
+    thumbnails.indexOf('onClick={() => {', thumbnails.indexOf('data-thumb-index={idx}')),
+    thumbnails.indexOf('className={`absolute', thumbnails.indexOf('data-thumb-index={idx}')),
+  )
+  assert.ok(thumbnailActivation.indexOf('if (onMobileClick && !onMobileClick()) return') >= 0)
+  assert.ok(
+    thumbnailActivation.indexOf('if (onMobileClick && !onMobileClick()) return')
+      < thumbnailActivation.indexOf('revealPrivatePreview(privateIdentity)'),
+  )
+  assert.ok(
+    thumbnailActivation.indexOf('if (onMobileClick && !onMobileClick()) return')
+      < thumbnailActivation.indexOf('onThumbnailClick(idx)'),
+  )
+  assert.match(thumbnails, /min-h-11 min-w-11/)
+  assert.match(thumbnails, /Reveal all remaining/)
+  assert.match(thumbnails, /Browser-session preview only; project access unchanged\./)
   assert.doesNotMatch(thumbnails, /Re-blur/)
   const projectAssetPreview = references.slice(
     references.indexOf('function ProjectAssetPreview'),

@@ -468,7 +468,6 @@ class TestDirectorModelCatalogContract(unittest.TestCase):
         self.assertIsNone(remote["image_roles"]["creator"]["resolved_model"])
         self.assertIsNone(remote["image_roles"]["editor"]["resolved_model"])
         self.assertEqual(remote["image_roles"]["creator"]["candidates"], [])
-
     def test_automatic_creator_requires_complete_readiness_in_preference_order(self):
         candidates = [
             {
@@ -552,6 +551,578 @@ class TestDirectorModelCatalogContract(unittest.TestCase):
                     scope="generation",
                 )
             self.assertEqual(raised.exception.status_code, 400)
+
+
+class TestDirectorPreflightContract(unittest.TestCase):
+    TRIO = {
+        "video_model": "minimax_h3_pinkcherry_fl2va",
+        "image_creator_model": "krea2_moody_mix_v7_fp8",
+        "continuity_editor_model": "qwen_image_edit_2511",
+    }
+    FAILURE_CODES = frozenset({
+        "director_model_unavailable",
+        "director_model_not_ready",
+        "director_model_terms_required",
+        "director_role_lora_unavailable",
+        "director_reference_unavailable",
+    })
+    FAILURE_COMPONENTS = frozenset({
+        "video_model", "image_creator_model", "continuity_editor_model",
+        "image_creator_lora", "continuity_editor_lora",
+        "character_reference", "location_reference", "starting_image",
+    })
+
+    def _body(self, **updates):
+        body = {
+            "explicit_output": True,
+            "pipeline_type": "short_film_story",
+            **self.TRIO,
+            "image_creator_loras": [{"id": "moody.safetensors", "multiplier": 1}],
+            "continuity_editor_loras": [{
+                "id": "uncensored.safetensors", "multiplier": 0.8,
+            }],
+            "director_resolution_preset": "720p",
+            "director_aspect_ratio": "16:9",
+            "reference_presence": {
+                "starting_image": True,
+                "character": False,
+                "location": True,
+            },
+        }
+        body.update(updates)
+        return body
+
+    def test_content_free_preflight_adapts_roles_and_has_no_runtime_side_effects(self):
+        admitted = []
+
+        def resolve(request, body, *, component_errors=False):
+            admitted.append((request, copy.deepcopy(body), component_errors))
+            body["_director_image_role_loras"] = {
+                "creator": [{"id": "moody.safetensors"}],
+                "editor": [{"id": "uncensored.safetensors"}],
+            }
+            return "roles"
+
+        namespace = _launch_functions_namespace(
+            ["_director_preflight_admission_body", "director_preflight"],
+            _resolve_director_image_role_request=resolve,
+            _director_component_error_response=lambda error: None,
+            _director_validate_resolution_request=lambda *_args, **_kwargs: {
+                "preset": "720p",
+                "aspect_ratio": "16:9",
+                "video_resolution": "1280x704",
+                "image_resolution": "1280x720",
+            },
+        )
+        request = _Request(self._body())
+        response = asyncio.run(namespace["director_preflight"](request))
+        self.assertEqual(response, {
+            "status": "ready",
+            "resolved": {
+                "pipeline_type": "short_film_story",
+                **self.TRIO,
+                "director_resolution_preset": "720p",
+                "director_aspect_ratio": "16:9",
+                "video_resolution": "1280x704",
+                "image_resolution": "1280x720",
+            },
+            "components": [
+                {"component": "video_model", "status": "ready"},
+                {"component": "image_creator_model", "status": "ready"},
+                {"component": "continuity_editor_model", "status": "ready"},
+                {"component": "image_creator_lora", "status": "ready"},
+                {"component": "continuity_editor_lora", "status": "ready"},
+                {"component": "starting_image", "status": "ready"},
+                {"component": "character_reference", "status": "not_required"},
+                {"component": "location_reference", "status": "ready"},
+            ],
+        })
+        self.assertEqual(len(admitted), 1)
+        admitted_body = admitted[0][1]
+        self.assertTrue(admitted[0][2])
+        self.assertEqual(
+            admitted_body["image_editor_model"],
+            self.TRIO["continuity_editor_model"],
+        )
+        self.assertNotIn("continuity_editor_model", admitted_body)
+        self.assertEqual(
+            admitted_body["image_editor_loras"],
+            self._body()["continuity_editor_loras"],
+        )
+
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        function = next(
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "director_preflight"
+        )
+        implementation = ast.get_source_segment(source, function)
+        for forbidden in (
+            "_init_pipeline", "_authorize_director_media_inputs",
+            "start_pipeline", "_begin_workspace_operation",
+            "_resolve_authorized_request_media", "download_model", "load_models",
+        ):
+            self.assertNotIn(forbidden, implementation)
+
+    def test_model_options_emits_the_authoritative_resolution_contract(self):
+        model_def = {
+            "architecture": "h3",
+            "resolution_presets": {
+                "720p": {
+                    "label": "Native",
+                    "values": {"16:9": "1344x768"},
+                },
+            },
+            "resolution_preset_order": ["720p"],
+            "supports_auto_aspect": False,
+            "resolutions": [("Native", "1344x768")],
+        }
+        registry = type("Registry", (), {
+            "get_model_def": lambda _self, _model: model_def,
+            "get_default_settings": lambda _self, _model: {},
+        })()
+        namespace = _launch_functions_namespace(
+            ["get_model_options"],
+            wgp=registry,
+            _require_remote_visible_models=lambda *_args: None,
+            _model_resolution_contract=lambda definition: {
+                "resolution_presets": definition["resolution_presets"],
+                "resolution_preset_order": definition["resolution_preset_order"],
+                "supports_auto_aspect": definition["supports_auto_aspect"],
+            },
+        )
+        result = namespace["get_model_options"]("h3", _Request())
+        self.assertEqual(result["resolution_preset_order"], ["720p"])
+        self.assertEqual(
+            result["resolution_presets"]["720p"]["values"]["16:9"],
+            "1344x768",
+        )
+        self.assertFalse(result["supports_auto_aspect"])
+        self.assertEqual(
+            result["resolutions"],
+            [{"label": "Native", "value": "1344x768"}],
+        )
+
+    def test_preflight_and_start_share_exact_resolution_validation(self):
+        video = {
+            "resolution_presets": {
+                "720p": {"label": "720p", "values": {
+                    "16:9": "1280x704", "auto": "auto_720p",
+                }},
+                "768p": {"label": "768p", "values": {
+                    "16:9": "1344x768",
+                }},
+            },
+            "resolution_preset_order": ["720p"],
+            "supports_auto_aspect": True,
+            "resolutions": [("Native", "1344x768")],
+        }
+        image = {}
+        registry = type("Registry", (), {
+            "get_model_def": lambda _self, model: {
+                "video": video,
+                "image": image,
+                "editor": image,
+                "different-editor": {
+                    "resolution_presets": {
+                        "720p": {"label": "720p", "values": {
+                            "16:9": "1024x576",
+                        }},
+                    },
+                    "resolution_preset_order": ["720p"],
+                    "supports_auto_aspect": False,
+                },
+            }.get(model),
+        })()
+        default_presets = {
+            "720p": {"label": "720p", "values": {"16:9": "1280x720"}},
+        }
+        namespace = _launch_functions_namespace(
+            [
+                "_model_resolution_contract",
+                "_director_model_resolution",
+                "_director_validate_resolution_request",
+            ],
+            wgp=registry,
+            _DEFAULT_RESOLUTION_PRESETS=default_presets,
+            _DEFAULT_RESOLUTION_PRESET_ORDER=["720p"],
+            _RESOLUTION_ASPECT_VALUES=frozenset({"auto", "16:9"}),
+        )
+        validate = namespace["_director_validate_resolution_request"]
+        selection = {
+            "video_model": "video",
+            "image_creator_model": "image",
+            "image_editor_model": "editor",
+            "director_resolution_preset": "720p",
+            "director_aspect_ratio": "16:9",
+        }
+        resolved = validate(
+            selection,
+            require_selection=True,
+            require_resolved_values=False,
+        )
+        self.assertEqual(resolved["video_resolution"], "1280x704")
+        self.assertEqual(resolved["image_resolution"], "1280x720")
+        exact_start = {
+            **selection,
+            "video_params": {"resolution": "1280x704"},
+            "image_params": {"resolution": "1280x720"},
+        }
+        self.assertEqual(
+            validate(
+                exact_start,
+                require_selection=False,
+                require_resolved_values=True,
+            )["video_resolution"],
+            "1280x704",
+        )
+        for invalid in (
+            {**exact_start, "video_params": {"resolution": "1280x720"}},
+            {**exact_start, "director_resolution_preset": "1080p"},
+            {**exact_start, "director_aspect_ratio": "9:16"},
+            {**exact_start, "image_editor_model": "different-editor"},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(_HTTPException) as raised:
+                    validate(
+                        invalid,
+                        require_selection=False,
+                        require_resolved_values=True,
+                    )
+                self.assertEqual(raised.exception.status_code, 400)
+
+        # Hidden 768p is not a new selectable tier, but a recovered concrete
+        # native value remains legal without inventing a preset/aspect pair.
+        legacy = validate(
+            {
+                "video_model": "video",
+                "video_params": {"resolution": "1344x768"},
+            },
+            require_selection=False,
+            require_resolved_values=True,
+        )
+        self.assertTrue(legacy["legacy"])
+        self.assertIsNone(legacy["preset"])
+
+    def test_all_visible_moody_qwen_pinkcherry_resolve_independently(self):
+        visible = set(self.TRIO.values())
+        events = []
+
+        def require_visible(request, models):
+            events.append(("visible", request.state.maestro_remote, tuple(models)))
+            if request.state.maestro_remote and any(
+                model not in visible for model in models
+            ):
+                raise _HTTPException(status_code=404, detail="Model not found")
+
+        def ready(model, *, image_role="", video_role=False, component=""):
+            events.append(("ready", model, image_role, component, video_role))
+
+        def loras(value, *, model_type, scope):
+            events.append(("loras", model_type, scope, copy.deepcopy(value)))
+            return list(value or ())
+
+        namespace = _launch_functions_namespace(
+            [
+                "_director_component_error",
+                "_director_require_visible_model",
+                "_resolve_director_image_role_request",
+            ],
+            _DIRECTOR_FAILURE_CODES=self.FAILURE_CODES,
+            _DIRECTOR_FAILURE_COMPONENTS=self.FAILURE_COMPONENTS,
+            _require_remote_visible_models=require_visible,
+            _migrate_director_final_video_postprocess=lambda body: None,
+            _director_image_role_wire_mode=lambda body: "roles",
+            _director_explicit_creator_resolution=lambda unrestricted: {},
+            _DIRECTOR_DEFAULT_EDITOR_MODEL="unused",
+            _director_model_ready_or_raise=ready,
+            _director_role_lora_request=loras,
+            _director_validate_workflow_or_raise=lambda body: events.append((
+                "workflow", body["pipeline_type"], body["video_model"],
+            )),
+        )
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                events.clear()
+                request = _Request()
+                request.state.maestro_remote = remote
+                body = {
+                    "explicit_output": True,
+                    "pipeline_type": "short_film_story",
+                    "video_model": self.TRIO["video_model"],
+                    "image_creator_model": self.TRIO["image_creator_model"],
+                    "image_editor_model": self.TRIO["continuity_editor_model"],
+                    "image_creator_loras": [{"id": "moody.safetensors"}],
+                    "image_editor_loras": [{"id": "uncensored.safetensors"}],
+                }
+                self.assertEqual(
+                    namespace["_resolve_director_image_role_request"](
+                        request, body, component_errors=True,
+                    ),
+                    "roles",
+                )
+                self.assertEqual(
+                    [event[1] for event in events if event[0] == "ready"],
+                    [
+                        self.TRIO["image_creator_model"],
+                        self.TRIO["continuity_editor_model"],
+                        self.TRIO["video_model"],
+                    ],
+                )
+                self.assertEqual(
+                    [event[2] for event in events if event[0] == "loras"],
+                    ["generation", "editing"],
+                )
+                self.assertEqual(
+                    set(body["_director_image_role_loras"]),
+                    {"creator", "editor"},
+                )
+                self.assertIn((
+                    "workflow",
+                    "short_film_story",
+                    self.TRIO["video_model"],
+                ), events)
+
+    def test_preflight_rejects_shape_drift_and_projects_closed_errors_at_top_level(self):
+        namespace = _launch_functions_namespace(
+            [
+                "_director_component_error_response",
+                "_director_preflight_admission_body",
+                "director_preflight",
+            ],
+            _DIRECTOR_FAILURE_CODES=self.FAILURE_CODES,
+            _DIRECTOR_FAILURE_COMPONENTS=self.FAILURE_COMPONENTS,
+            _resolve_director_image_role_request=lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(_HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "director_model_unavailable",
+                        "component": "video_model",
+                        "message": "Selected Director model is unavailable in this session.",
+                    },
+                ))
+            ),
+        )
+        response = asyncio.run(namespace["director_preflight"](
+            _Request(self._body()),
+        ))
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.content, {
+            "code": "director_model_unavailable",
+            "component": "video_model",
+            "message": "Selected Director model is unavailable in this session.",
+        })
+        for invalid in (
+            {**self._body(), "workspace": "private-project"},
+            {**self._body(), "explicit_output": 1},
+            {**self._body(), "pipeline_type": "unknown_workflow"},
+            {**self._body(), "video_model": "   "},
+            {**self._body(), "continuity_editor_model": " qwen_image_edit_2511"},
+            {**self._body(), "reference_presence": {"starting_image": True}},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(_HTTPException) as raised:
+                    namespace["_director_preflight_admission_body"](invalid)
+                self.assertEqual(raised.exception.status_code, 400)
+
+    def test_exact_workflow_compatibility_uses_service_validator_and_closed_error(self):
+        namespace = _launch_functions_namespace(
+            ["_director_component_error", "_director_validate_workflow_or_raise"],
+            _DIRECTOR_FAILURE_CODES=self.FAILURE_CODES,
+            _DIRECTOR_FAILURE_COMPONENTS=self.FAILURE_COMPONENTS,
+        )
+        body = {
+            "pipeline_type": "short_film_story",
+            "video_model": self.TRIO["video_model"],
+            "seamless": False,
+        }
+        with patch.object(pipeline, "_validate_director_models") as validate:
+            namespace["_director_validate_workflow_or_raise"](body)
+        validate.assert_called_once_with(body, stages=("video",))
+
+        with patch.object(
+            pipeline,
+            "_validate_director_models",
+            side_effect=pipeline.DirectorModelCompatibilityError(
+                "private model/workflow reason",
+            ),
+        ):
+            with self.assertRaises(_HTTPException) as raised:
+                namespace["_director_validate_workflow_or_raise"](body)
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(raised.exception.detail, {
+            "code": "director_model_unavailable",
+            "component": "video_model",
+            "message": "Selected Director model is unavailable for this workflow.",
+        })
+        self.assertNotIn(
+            "private model/workflow reason",
+            json.dumps(raised.exception.detail),
+        )
+
+        h3_body = {
+            "pipeline_type": "short_film_story",
+            "video_model": "pinkcherry",
+            "seamless": False,
+        }
+        with patch.object(
+            pipeline, "_wgp", _Registry({"pinkcherry": _h3_video()}),
+        ):
+            namespace["_director_validate_workflow_or_raise"](h3_body)
+            for incompatible in (
+                {**h3_body, "pipeline_type": "music_video"},
+                {**h3_body, "seamless": True},
+                {**h3_body, "voice_reference": "present"},
+            ):
+                with self.subTest(incompatible=incompatible):
+                    with self.assertRaises(_HTTPException) as raised:
+                        namespace["_director_validate_workflow_or_raise"](
+                            incompatible,
+                        )
+                    self.assertEqual(raised.exception.status_code, 404)
+                    self.assertEqual(
+                        raised.exception.detail["component"], "video_model",
+                    )
+
+    def test_model_admission_maps_unavailable_terms_and_readiness(self):
+        state = {
+            "model_def": None,
+            "terms": None,
+            "downloaded": True,
+            "manifest_valid": True,
+        }
+        registry = type("Registry", (), {
+            "get_model_def": lambda _self, _model: state["model_def"],
+            "models_def": {},
+        })()
+
+        def require_terms(_models):
+            if state["terms"] is not None:
+                raise _HTTPException(status_code=409, detail=state["terms"])
+
+        namespace = _launch_functions_namespace(
+            ["_director_component_error", "_director_model_ready_or_raise"],
+            _DIRECTOR_FAILURE_CODES=self.FAILURE_CODES,
+            _DIRECTOR_FAILURE_COMPONENTS=self.FAILURE_COMPONENTS,
+            wgp=registry,
+            _require_model_recipe_terms=require_terms,
+            _check_model_downloaded=lambda _model: state["downloaded"],
+        )
+        cases = (
+            (None, None, True, True, 404, "director_model_unavailable"),
+            ({}, None, True, False, 404, "director_model_unavailable"),
+            ({}, "terms", True, True, 409, "director_model_terms_required"),
+            ({}, None, False, True, 409, "director_model_not_ready"),
+        )
+        for model_def, terms, downloaded, manifest_valid, status, code in cases:
+            with self.subTest(code=code):
+                state.update({
+                    "model_def": model_def,
+                    "terms": terms,
+                    "downloaded": downloaded,
+                    "manifest_valid": manifest_valid,
+                })
+                with patch(
+                    "services.model_terms.model_terms_manifest_valid",
+                    side_effect=lambda *_args: state["manifest_valid"],
+                ):
+                    with self.assertRaises(_HTTPException) as raised:
+                        namespace["_director_model_ready_or_raise"](
+                            self.TRIO["video_model"], component="video_model",
+                        )
+                self.assertEqual(raised.exception.status_code, status)
+                self.assertEqual(raised.exception.detail["code"], code)
+                self.assertEqual(
+                    raised.exception.detail["component"], "video_model",
+                )
+
+        state.update({
+            "model_def": {},
+            "terms": None,
+            "downloaded": True,
+            "manifest_valid": True,
+        })
+        registry.models_def = {"plain-video": {}}
+        self.assertIsNone(namespace["_director_model_ready_or_raise"](
+            "plain-video", component="video_model",
+        ))
+
+    def test_preflight_rejects_a_ready_model_with_no_director_video_role(self):
+        model = {
+            "name": "Still-only",
+            "image_outputs": True,
+        }
+        registry = type("Registry", (), {
+            "models_def": {"still": model},
+            "get_model_def": lambda _self, _model: model,
+            "get_model_family": lambda _self, _model, for_ui=True: "test",
+            "get_base_model_type": lambda _self, _model: "still",
+        })()
+        namespace = _launch_functions_namespace(
+            ["_director_component_error", "_director_model_ready_or_raise"],
+            _DIRECTOR_FAILURE_CODES=self.FAILURE_CODES,
+            _DIRECTOR_FAILURE_COMPONENTS=self.FAILURE_COMPONENTS,
+            wgp=registry,
+            _require_model_recipe_terms=lambda _models: None,
+            _check_model_downloaded=lambda _model: True,
+        )
+        with patch(
+            "services.model_terms.model_terms_manifest_valid",
+            return_value=True,
+        ):
+            with self.assertRaises(_HTTPException) as raised:
+                namespace["_director_model_ready_or_raise"](
+                    "still", video_role=True, component="video_model",
+                )
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(raised.exception.detail["code"], "director_model_unavailable")
+        self.assertEqual(raised.exception.detail["component"], "video_model")
+
+    def test_role_lora_failures_remain_bound_to_the_selected_role(self):
+        failing_scope = ["generation"]
+
+        def resolve_loras(_value, *, model_type, scope):
+            if scope == failing_scope[0]:
+                raise _HTTPException(
+                    status_code=409,
+                    detail=f"unavailable for {model_type}",
+                )
+            return []
+
+        namespace = _launch_functions_namespace(
+            ["_director_component_error", "_resolve_director_image_role_request"],
+            _DIRECTOR_FAILURE_CODES=self.FAILURE_CODES,
+            _DIRECTOR_FAILURE_COMPONENTS=self.FAILURE_COMPONENTS,
+            _migrate_director_final_video_postprocess=lambda body: None,
+            _director_image_role_wire_mode=lambda body: "roles",
+            _director_explicit_creator_resolution=lambda unrestricted: {},
+            _DIRECTOR_DEFAULT_EDITOR_MODEL="unused",
+            _director_require_visible_model=lambda *_args: None,
+            _director_model_ready_or_raise=lambda *_args, **_kwargs: None,
+            _director_role_lora_request=resolve_loras,
+        )
+        for scope, component in (
+            ("generation", "image_creator_lora"),
+            ("editing", "continuity_editor_lora"),
+        ):
+            with self.subTest(component=component):
+                failing_scope[0] = scope
+                with self.assertRaises(_HTTPException) as raised:
+                    namespace["_resolve_director_image_role_request"](
+                        _Request(),
+                        {
+                            "video_model": self.TRIO["video_model"],
+                            "image_creator_model": self.TRIO["image_creator_model"],
+                            "image_editor_model": self.TRIO["continuity_editor_model"],
+                        },
+                        component_errors=True,
+                    )
+                self.assertEqual(raised.exception.status_code, 409)
+                self.assertEqual(raised.exception.detail, {
+                    "code": "director_role_lora_unavailable",
+                    "component": component,
+                    "message": "Selected Director role LoRA is unavailable.",
+                })
 
 
 class TestDirectorSavedActionPublicContract(unittest.TestCase):

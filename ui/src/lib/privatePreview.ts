@@ -51,22 +51,45 @@ export function privatePreviewWasRevealed(identity: string): boolean {
   )
 }
 
-export function privatePreviewWorkspaceHasRevealed(workspace: string): boolean {
-  if (storedFlag(
+export function privatePreviewWorkspaceHasRevealed(
+  workspace: string,
+  match: 'any' | 'all' = 'any',
+): boolean {
+  const projectDefaultRevealed = storedFlag(
     privateProjectRevealStorageKey(workspace),
     memoryProjectDefaults.get(workspace),
-  )) return true
-  if ([...memoryRevealed].some(([identity, revealed]) => (
-    revealed && identityWorkspace(identity) === workspace
+  )
+  if (match === 'all') {
+    return projectDefaultRevealed && !workspaceHasStoredOverride(
+      workspace,
+      PRIVATE_HIDDEN_SESSION_PREFIX,
+      memoryHidden,
+    )
+  }
+  if (projectDefaultRevealed) return true
+  return workspaceHasStoredOverride(
+    workspace,
+    PRIVATE_REVEAL_SESSION_PREFIX,
+    memoryRevealed,
+  )
+}
+
+function workspaceHasStoredOverride(
+  workspace: string,
+  prefix: string,
+  memory: Map<string, boolean>,
+): boolean {
+  if ([...memory].some(([identity, enabled]) => (
+    enabled && identityWorkspace(identity) === workspace
   ))) return true
   try {
     for (let index = 0; index < sessionStorage.length; index++) {
       const key = sessionStorage.key(index)
-      if (!key?.startsWith(PRIVATE_REVEAL_SESSION_PREFIX)) continue
-      const identity = decodeStoredIdentity(key, PRIVATE_REVEAL_SESSION_PREFIX)
+      if (!key?.startsWith(prefix)) continue
+      const identity = decodeStoredIdentity(key, prefix)
       if (
         identity !== null
-        && memoryRevealed.get(identity) !== false
+        && memory.get(identity) !== false
         && identityWorkspace(identity) === workspace
       ) return true
     }

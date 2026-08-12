@@ -115,8 +115,8 @@ export function DurationSlider() {
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-1.5">
-        <label className="text-[11px] text-text-muted uppercase tracking-wider">Duration</label>
+      <div className="mb-1.5 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+        <label htmlFor="studio-duration-seconds" className="text-[11px] text-text-muted uppercase tracking-wider">Duration</label>
         <span className="text-xs text-text-secondary">
           {duration >= 60 ? `${Math.floor(duration / 60)}m${duration % 60 ? ` ${duration % 60}s` : ''}` : `${duration}s`}
           {(usesSegments || showSlidingWindow) && (
@@ -129,6 +129,7 @@ export function DurationSlider() {
         </span>
       </div>
       <input
+        id="studio-duration-seconds"
         type="range"
         min={durationMin}
         max={durationMax}
@@ -155,13 +156,14 @@ export function DurationSlider() {
       )}
       {supportsWindowPlanning && !isMultiClip && (
         <div className="mt-3 rounded-lg border border-border bg-bg-tertiary/60 p-2.5">
-          <div className="flex items-center justify-between mb-1.5">
-            <div className="flex items-center gap-1.5">
-              <label className="text-[11px] text-text-muted uppercase tracking-wider">{usesSegments ? 'Maximum segment length' : 'Window size'}</label>
+          <div className="mb-1.5 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <label htmlFor="studio-window-seconds" className="text-[11px] text-text-muted uppercase tracking-wider">{usesSegments ? 'Maximum segment length' : 'Window size'}</label>
               <button
                 type="button"
                 onClick={() => setLocked(!locked)}
-                className={`flex items-center gap-1 rounded px-1 py-0.5 text-[9px] ${locked ? 'text-accent-blue' : 'text-text-muted hover:text-text-secondary'}`}
+                aria-pressed={locked}
+                className={`mobile-control-target flex items-center justify-center gap-1 rounded px-2 py-0.5 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${locked ? 'text-accent-blue' : 'text-text-muted hover:text-text-secondary'}`}
                 title={usesSegments
                   ? locked
                     ? 'Manual H3 segment ceiling — click for Automatic planning'
@@ -177,6 +179,7 @@ export function DurationSlider() {
             </span>
           </div>
           <input
+            id="studio-window-seconds"
             type="range"
             min={windowMin}
             max={windowMax}
@@ -195,7 +198,7 @@ export function DurationSlider() {
               : 'Effective aligned value for this model. Larger windows use more VRAM; smaller windows create more joins.'}
           </p>
           {usesSegments && (
-            <label className="mt-2 flex items-start gap-2 rounded-md border border-border/70 bg-bg-primary/40 p-2 text-[10px] text-text-secondary">
+            <label className="mobile-control-target mt-2 flex cursor-pointer items-start gap-2 rounded-md border border-border/70 bg-bg-primary/40 p-2 text-[10px] text-text-secondary">
               <input
                 type="checkbox"
                 className="mt-0.5"
@@ -210,14 +213,20 @@ export function DurationSlider() {
           )}
           {usesSegments && (
             <div className="mt-2">
-              <button type="button" onClick={() => setEvaluationOpen(value => !value)} className="text-[9px] text-accent-blue hover:underline">
+              <button
+                type="button"
+                aria-expanded={evaluationOpen}
+                aria-controls="h3-evaluated-profiles"
+                onClick={() => setEvaluationOpen(value => !value)}
+                className="mobile-control-target inline-flex items-center rounded text-left text-[9px] text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+              >
                 {evaluationOpen ? 'Hide' : 'Show'} evaluated H3 engine / encoder profiles
               </button>
               {evaluationOpen && (
-                <div className="mt-1.5 space-y-1 rounded-md border border-border/70 bg-bg-primary/40 p-2">
+                <div id="h3-evaluated-profiles" className="mt-1.5 space-y-1 rounded-md border border-border/70 bg-bg-primary/40 p-2">
                   {evaluationError && <p className="text-[9px] text-red-300">{evaluationError}</p>}
                   {evaluationCatalog && Object.values(evaluationCatalog.profiles).map(profile => (
-                    <div key={profile.id} className="flex items-start justify-between gap-2 text-[9px]">
+                    <div key={profile.id} className="flex flex-wrap items-start justify-between gap-2 text-[9px]">
                       <span className="text-text-secondary">{profile.label}</span>
                       <span className={`shrink-0 rounded px-1 ${profile.experimental ? 'bg-amber-500/15 text-amber-300' : 'bg-accent-green/15 text-accent-green'}`}>
                         {profile.experimental ? 'experimental · opt-in' : 'official · default'}
@@ -291,10 +300,11 @@ export function WindowSettings() {
         <div>
           <p className="mb-2 text-[9px] text-text-muted">Window size and Automatic/Manual mode are in the main Studio duration panel.</p>
           <div className="flex items-center justify-between mb-1.5">
-            <label className="text-[11px] text-text-muted uppercase tracking-wider">Window Overlap</label>
+            <label htmlFor="advanced-window-overlap" className="text-[11px] text-text-muted uppercase tracking-wider">Window Overlap</label>
             <span className="text-xs text-text-secondary">{overlap}f ({overlapSeconds}s)</span>
           </div>
           <input
+            id="advanced-window-overlap"
             type="range"
             min={safeOverlapMin}
             max={safeOverlapMax}

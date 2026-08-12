@@ -1,8 +1,8 @@
 import { useState, useCallback, useRef, useMemo, useEffect } from 'react'
 import { Upload, Loader2, Music, RotateCcw, Check, X, ChevronRight, ChevronDown, ImageIcon, Play, Film, Mic, Sparkles, Send, Users, FileText, Clock, Download, HardDrive, Settings } from 'lucide-react'
-import { useStore, getFamiliesForMode, getModelsForFamily, isDirectorPipelineActive, resolveResolution } from '../../stores/useStore'
+import { useStore, getFamiliesForMode, getModelsForFamily, isDirectorPipelineActive, resolveDeclaredResolution } from '../../stores/useStore'
 import { downloadModel, estimateH3Performance, fetchDefaults, fetchModelOptions, getDirectorHostActionAccessState, getFileUrl, verifyManualCheckpoint, waitForModelDownloadTerminal } from '../../api/client'
-import type { DirectorImageRoleCandidate, DirectorReadinessReason } from '../../api/client'
+import type { DirectorFailureComponent, DirectorImageRoleCandidate, DirectorReadinessReason } from '../../api/client'
 import { DirectorImageRoleLoraSelector, DirectorLoraSelector } from '../SettingsDrawer/DirectorLoraSelector'
 import { DirectorSongSetup } from './DirectorSongSetup'
 import { InfoTooltip } from './InfoTooltip'
@@ -55,6 +55,42 @@ function AudioScaleSlider() {
 
 const STEP_ORDER = ['upload', 'analyze', 'structure', 'style', 'plan', 'review', 'generate_images', 'plan_video', 'review_video'] as const
 type DirectorStep = typeof STEP_ORDER[number]
+
+const DIRECTOR_COMPONENT_LABELS: Record<DirectorFailureComponent, string> = {
+  video_model: 'Video model',
+  image_creator_model: 'Image creator',
+  continuity_editor_model: 'Continuity editor',
+  image_creator_lora: 'Creator LoRA',
+  continuity_editor_lora: 'Editor LoRA',
+  character_reference: 'Character reference',
+  location_reference: 'Location reference',
+  starting_image: 'Starting image',
+}
+
+const DIRECTOR_MODEL_COMPONENTS = new Set<DirectorFailureComponent>([
+  'video_model',
+  'image_creator_model',
+  'continuity_editor_model',
+  'image_creator_lora',
+  'continuity_editor_lora',
+])
+
+function clearDirectorComponentError(component: DirectorFailureComponent) {
+  const state = useStore.getState()
+  if (state.directorComponentError?.component !== component) return
+  useStore.setState({ directorComponentError: null, directorError: null })
+}
+
+function DirectorComponentAlert({ component }: { component: DirectorFailureComponent }) {
+  const failure = useStore(s => s.directorComponentError?.component === component
+    ? s.directorComponentError : null)
+  if (!failure) return null
+  return (
+    <div role="alert" className="mt-1.5 rounded border border-red-500/40 bg-red-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-red-300">
+      {failure.message}
+    </div>
+  )
+}
 
 function formatTime(s: number): string {
   const m = Math.floor(s / 60)
@@ -275,6 +311,7 @@ export function DirectorChat() {
   // mode) or already generating from a previous click (manual mode).
   const isGenerating = useStore(s => s.isGenerating)
   const error = useStore(s => s.directorError)
+  const componentError = useStore(s => s.directorComponentError)
   const analysis = useStore(s => s.directorAnalysis)
   const plannedClips = useStore(s => s.directorPlannedClips)
   const energyBias = useStore(s => s.directorEnergyBias)
@@ -304,8 +341,8 @@ export function DirectorChat() {
   const setAutoMode = useStore(s => s.setDirectorAutoMode)
   const seamless = useStore(s => s.directorSeamless)
   const setSeamless = useStore(s => s.setDirectorSeamless)
-  const selectedVideoModel = useStore(s => s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')
-  const selectedVideoDefinition = useStore(s => s.models.find(model => model.model_type === (s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')))
+  const selectedVideoModel = useStore(s => s.selectedModelPerMode.video || '')
+  const selectedVideoDefinition = useStore(s => s.models.find(model => model.model_type === s.selectedModelPerMode.video))
   const shotImageGuidance = useStore(s => s.directorShotImageGuidance)
   const directorHasVisualReferences = useStore(s => Boolean(
     s.directorReferenceImage
@@ -362,6 +399,7 @@ export function DirectorChat() {
   }, [selectedVideoModel, selectedVideoSupportsSeamless, seamless, setSeamless])
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const directorRootRef = useRef<HTMLDivElement>(null)
   const [dragOver, setDragOver] = useState(false)
   const [localBias, setLocalBias] = useState<number | null>(null)
   const [showAnalysisDetails, setShowAnalysisDetails] = useState(false)
@@ -437,6 +475,22 @@ export function DirectorChat() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [step, loading, loadingMessage, error, clipPlans.length, clipImages.length, skill])
 
+  useEffect(() => {
+    if (!componentError) return
+    const frame = window.requestAnimationFrame(() => {
+      const target = directorRootRef.current?.querySelector<HTMLElement>(
+        `[data-director-component="${componentError.component}"]`,
+      )
+      if (!target) return
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      const focusable = target.matches('button:not(:disabled), select:not(:disabled), input:not([type="hidden"]):not(:disabled):not(.hidden):not(.sr-only):not([hidden])')
+        ? target
+        : target.querySelector<HTMLElement>('select:not(:disabled), button:not(:disabled), input:not([type="hidden"]):not(:disabled):not(.hidden):not(.sr-only):not([hidden])')
+      ;(focusable || target).focus({ preventScroll: true })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [componentError])
+
   const handleChatSubmit = () => {
     // Music Video "Generate a track": the chat is the song description, and
     // Send runs write-song → render track → analyze → plan → images → video.
@@ -484,7 +538,7 @@ export function DirectorChat() {
     : 'Reviewing...'
 
   return (
-    <div className="flex-1 flex flex-col min-h-0">
+    <div ref={directorRootRef} className="flex-1 flex flex-col min-h-0">
       {/* Message list */}
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
         {/* Header with Start Over */}
@@ -510,8 +564,11 @@ export function DirectorChat() {
           </div>
           <div className="flex items-center gap-2">
             <button
+              type="button"
               onClick={() => useStore.getState().setDashboardOpen(true)}
-              className="text-[10px] text-accent-blue hover:text-accent-blue/80 flex items-center gap-0.5 transition-colors"
+              aria-haspopup="dialog"
+              aria-label="Open Director pipeline dashboard"
+              className="mobile-control-target flex touch-manipulation items-center justify-center gap-0.5 px-2 text-[10px] text-accent-blue transition-colors hover:text-accent-blue/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:px-0"
               title="Open pipeline dashboard"
             >
               Dashboard
@@ -745,9 +802,19 @@ export function DirectorChat() {
 
         {/* Error */}
         {error && (
-          <div className="text-[11px] text-red-400 bg-red-500/10 rounded px-2 py-1.5 border border-red-500/20">
-            {error}
+          <div role="alert" className="text-[11px] text-red-400 bg-red-500/10 rounded px-2 py-1.5 border border-red-500/20">
+            {componentError
+              ? `Director needs attention: ${DIRECTOR_COMPONENT_LABELS[componentError.component]}. Fix the highlighted control below.`
+              : error}
           </div>
+        )}
+        {componentError && !isShortFilm && DIRECTOR_MODEL_COMPONENTS.has(componentError.component) && (
+          <SystemBubble>
+            <div aria-label="Director model recovery" className="space-y-1.5">
+              <p className="text-[10px] text-text-secondary">Review the exact failing role, then submit again.</p>
+              <DirectorLoraAccordion />
+            </div>
+          </SystemBubble>
         )}
 
         {/* Exact-pipeline, process-memory-only LLM telemetry. This is the one
@@ -1129,14 +1196,37 @@ function DirectorAspectRatioSelector() {
     { value: '3:4' as const, label: '3:4', desc: 'Tall' },
   ]
   return (
-    <div>
-      <label className="text-[10px] text-text-muted uppercase tracking-wider mb-1.5 block">Aspect Ratio</label>
-      <div className="flex gap-1.5">
+    <fieldset className="min-w-0">
+      <legend className="mb-1.5 block text-[10px] uppercase tracking-wider text-text-muted">Aspect Ratio</legend>
+      <div role="radiogroup" aria-label="Director aspect ratio" className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-5">
         {presets.map(p => (
           <button
+            type="button"
             key={p.value}
             onClick={() => setRatio(p.value)}
-            className={`flex-1 py-1.5 rounded-lg border text-xs transition-all ${
+            onKeyDown={(event) => {
+              const currentIndex = presets.findIndex(candidate => candidate.value === p.value)
+              const nextIndex = event.key === 'Home'
+                ? 0
+                : event.key === 'End'
+                  ? presets.length - 1
+                  : event.key === 'ArrowRight' || event.key === 'ArrowDown'
+                    ? (currentIndex + 1) % presets.length
+                    : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+                      ? (currentIndex - 1 + presets.length) % presets.length
+                      : null
+              if (nextIndex === null) return
+              event.preventDefault()
+              setRatio(presets[nextIndex].value)
+              event.currentTarget.parentElement
+                ?.querySelectorAll<HTMLButtonElement>('button[role="radio"]')[nextIndex]
+                ?.focus()
+            }}
+            role="radio"
+            aria-checked={ratio === p.value}
+            aria-label={`${p.label}, ${p.desc}`}
+            tabIndex={ratio === p.value ? 0 : -1}
+            className={`mobile-control-target min-w-0 touch-manipulation break-words rounded-lg border px-1 py-1.5 text-xs transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
               ratio === p.value
                 ? 'border-accent-blue bg-accent-blue/10 text-text-primary'
                 : 'border-border text-text-muted hover:border-border-light hover:text-text-secondary'
@@ -1147,7 +1237,7 @@ function DirectorAspectRatioSelector() {
           </button>
         ))}
       </div>
-    </div>
+    </fieldset>
   )
 }
 
@@ -1155,47 +1245,89 @@ function DirectorResolutionSelector() {
   const resolution = useStore(s => s.directorResolution)
   const setResolution = useStore(s => s.setDirectorResolution)
   const ratio = useStore(s => s.directorAspectRatio)
-  const videoModel = useStore(s => s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')
-  const [options, setOptions] = useState<ModelOptions | null>(null)
+  const videoModel = useStore(s => s.selectedModelPerMode.video || '')
+  const optionsModelType = useStore(s => s.directorResolutionModelType)
+  const options = useStore(s => s.directorResolutionOptions)
+  const optionsLoading = useStore(s => s.directorResolutionOptionsLoading)
+  const optionsError = useStore(s => s.directorResolutionOptionsError)
+  const loadOptions = useStore(s => s.loadDirectorResolutionOptions)
 
   useEffect(() => {
-    let current = true
-    fetchModelOptions(videoModel)
-      .then(next => { if (current) setOptions(next) })
-      .catch(() => { if (current) setOptions(null) })
-    return () => { current = false }
-  }, [videoModel])
+    void loadOptions(videoModel)
+  }, [loadOptions, videoModel])
 
-  const activeOptions = options?.model_type === videoModel ? options : null
-  const presets = activeOptions?.resolution_preset_order?.length
-    ? activeOptions.resolution_preset_order.filter(value => value !== 'auto')
-    : (['480p', '540p', '720p', '1080p'] as const)
+  const activeOptions = optionsModelType === videoModel && options?.model_type === videoModel
+    ? options
+    : null
+  const availablePresets = activeOptions?.resolution_preset_order || []
+  const selectedPresetAvailable = availablePresets.includes(resolution)
+  const presets = selectedPresetAvailable
+    ? availablePresets
+    : [resolution, ...availablePresets]
   const selectedPreset = activeOptions?.resolution_presets?.[resolution]
-  const resolvedResolution = resolveResolution(activeOptions, resolution, ratio)
+  const resolvedResolution = resolveDeclaredResolution(activeOptions, resolution, ratio)
 
   return (
-    <div>
-      <label className="text-[10px] text-text-muted uppercase tracking-wider mb-1.5 block">Resolution</label>
-      <div className="flex gap-1.5">
-        {presets.map(p => (
+    <fieldset className="min-w-0">
+      <legend className="mb-1.5 block text-[10px] uppercase tracking-wider text-text-muted">Resolution</legend>
+      <div role="radiogroup" aria-label="Director resolution" className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-4">
+        {presets.map((p, index) => {
+          const available = availablePresets.includes(p)
+          const label = activeOptions?.resolution_presets?.[p]?.label || p
+          return (
           <button
+            type="button"
             key={p}
-            onClick={() => setResolution(p)}
-            className={`flex-1 py-2 rounded-lg border text-xs font-medium transition-all ${
+            data-resolution-preset={p}
+            onClick={() => { if (available) setResolution(p) }}
+            onKeyDown={(event) => {
+              const currentIndex = availablePresets.findIndex(candidate => candidate === p)
+              const nextIndex = event.key === 'Home'
+                ? 0
+                : event.key === 'End'
+                  ? availablePresets.length - 1
+                  : event.key === 'ArrowRight' || event.key === 'ArrowDown'
+                    ? (currentIndex + 1) % availablePresets.length
+                    : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+                      ? (currentIndex - 1 + availablePresets.length) % availablePresets.length
+                      : null
+              if (nextIndex === null) return
+              event.preventDefault()
+              const nextPreset = availablePresets[nextIndex]
+              setResolution(nextPreset)
+              event.currentTarget.parentElement
+                ?.querySelector<HTMLButtonElement>(`button[data-resolution-preset="${nextPreset}"]`)
+                ?.focus()
+            }}
+            role="radio"
+            aria-checked={resolution === p}
+            aria-label={available ? label : `${label}, unavailable for selected model`}
+            aria-disabled={!available}
+            disabled={!available}
+            tabIndex={available && (resolution === p || (!selectedPresetAvailable && index === 1)) ? 0 : -1}
+            className={`mobile-control-target min-w-0 touch-manipulation break-words rounded-lg border px-1 py-2 text-xs font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
               resolution === p
                 ? 'border-accent-blue bg-accent-blue/10 text-text-primary'
                 : 'border-border text-text-muted hover:border-border-light hover:text-text-secondary'
-            }`}
+            } ${available ? '' : 'cursor-not-allowed opacity-60'}`}
           >
-            {activeOptions?.resolution_presets?.[p]?.label || p}
+            {label}{available ? '' : ' (Unavailable)'}
           </button>
-        ))}
+          )
+        })}
       </div>
       <p className={`mt-1 text-[9px] ${selectedPreset?.experimental ? 'text-amber-300' : 'text-text-muted'}`}>
-        {resolvedResolution.replace('x', ' × ')}
-        {selectedPreset?.hint ? ` · ${selectedPreset.experimental ? 'Experimental · ' : ''}${selectedPreset.hint}` : ''}
+        {optionsLoading && optionsModelType === videoModel
+          ? 'Loading exact model resolutions…'
+          : optionsError && optionsModelType === videoModel
+            ? 'Exact resolution options are unavailable. Retry by reselecting the video model.'
+            : !selectedPresetAvailable
+              ? 'This carried selection is unavailable for the selected model. Choose an available resolution.'
+              : !resolvedResolution
+                ? 'This aspect ratio is unavailable at the selected resolution.'
+                : `${resolvedResolution.replace('x', ' × ')}${selectedPreset?.hint ? ` · ${selectedPreset.experimental ? 'Experimental · ' : ''}${selectedPreset.hint}` : ''}`}
       </p>
-    </div>
+    </fieldset>
   )
 }
 
@@ -1332,16 +1464,21 @@ function ReferenceImageUpload({
   const setParam = useStore(s => s.setParam)
   const [dragOver, setDragOver] = useState(false)
 
+  const updateReferenceImage = useCallback((file: File | null) => {
+    clearDirectorComponentError('starting_image')
+    setReferenceImage(file)
+  }, [setReferenceImage])
+
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setDragOver(false)
     const file = e.dataTransfer.files[0]
-    if (file && file.type.startsWith('image/')) setReferenceImage(file)
-  }, [setReferenceImage])
+    if (file && file.type.startsWith('image/')) updateReferenceImage(file)
+  }, [updateReferenceImage])
 
   if (compact) {
     return (
-      <div className="space-y-2">
+      <div data-director-component="starting_image" tabIndex={-1} className="space-y-2 outline-none">
         {referenceImage && refImagePreview ? (
           <div className="flex items-center gap-2">
             <label className="cursor-pointer">
@@ -1355,14 +1492,14 @@ function ReferenceImageUpload({
                 type="file"
                 accept={IMAGE_ACCEPT}
                 className="hidden"
-                onChange={e => { const f = e.target.files?.[0]; if (f) setReferenceImage(f) }}
+                onChange={e => { const f = e.target.files?.[0]; if (f) updateReferenceImage(f) }}
               />
             </label>
             <div className="flex-1 min-w-0">
               <span className="text-[10px] text-text-muted">Reference photo</span>
             </div>
             <button
-              onClick={() => setReferenceImage(null)}
+              onClick={() => updateReferenceImage(null)}
               className="p-1 rounded hover:bg-bg-hover transition-colors"
               title="Remove"
             >
@@ -1377,7 +1514,7 @@ function ReferenceImageUpload({
               type="file"
               accept={IMAGE_ACCEPT}
               className="hidden"
-              onChange={e => { const f = e.target.files?.[0]; if (f) setReferenceImage(f) }}
+              onChange={e => { const f = e.target.files?.[0]; if (f) updateReferenceImage(f) }}
             />
           </label>
         )}
@@ -1393,12 +1530,13 @@ function ReferenceImageUpload({
             <p className="text-[9px] text-text-muted">Lower values can increase motion</p>
           </div>
         )}
+        <DirectorComponentAlert component="starting_image" />
       </div>
     )
   }
 
   return (
-    <div className="space-y-2">
+    <div data-director-component="starting_image" tabIndex={-1} className="space-y-2 outline-none">
       {referenceImage && refImagePreview ? (
         <div className="relative">
           <label className="cursor-pointer block">
@@ -1412,11 +1550,11 @@ function ReferenceImageUpload({
               type="file"
               accept={IMAGE_ACCEPT}
               className="hidden"
-              onChange={e => { const f = e.target.files?.[0]; if (f) setReferenceImage(f) }}
+              onChange={e => { const f = e.target.files?.[0]; if (f) updateReferenceImage(f) }}
             />
           </label>
           <button
-            onClick={() => setReferenceImage(null)}
+            onClick={() => updateReferenceImage(null)}
             className="absolute top-1.5 right-1.5 bg-bg-primary/80 rounded-full p-1 hover:bg-bg-hover transition-colors"
             title="Remove"
           >
@@ -1444,7 +1582,7 @@ function ReferenceImageUpload({
             type="file"
             accept={IMAGE_ACCEPT}
             className="hidden"
-            onChange={e => { const f = e.target.files?.[0]; if (f) setReferenceImage(f) }}
+            onChange={e => { const f = e.target.files?.[0]; if (f) updateReferenceImage(f) }}
           />
         </label>
       )}
@@ -1460,6 +1598,7 @@ function ReferenceImageUpload({
           <p className="text-[9px] text-text-muted">Lower values can increase motion</p>
         </div>
       )}
+      <DirectorComponentAlert component="starting_image" />
     </div>
   )
 }
@@ -1528,7 +1667,7 @@ function AdditionalRefsSection() {
   const identityScale = useStore(s => s.directorIdentityGuidanceScale)
   const setIdentityScale = useStore(s => s.setDirectorIdentityGuidanceScale)
   const selectedVideoDefinition = useStore(s => s.models.find(
-    model => model.model_type === (s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1'),
+    model => model.model_type === s.selectedModelPerMode.video,
   ))
   const voiceReferenceEnabled = useStore(s => s.servicesConfig?.voice_reference_enabled ?? false)
   const voiceReferenceMode = selectedVideoDefinition?.director?.voice_reference_mode ?? 'none'
@@ -1538,8 +1677,11 @@ function AdditionalRefsSection() {
 
   const handleFiles = useCallback((files: FileList | null, type: 'char' | 'loc') => {
     if (!files) return
+    const accepted = Array.from(files).filter(file => file.type.startsWith('image/'))
+    if (accepted.length === 0) return
+    clearDirectorComponentError(type === 'char' ? 'character_reference' : 'location_reference')
     const add = type === 'char' ? addCharRef : addLocRef
-    Array.from(files).forEach(f => { if (f.type.startsWith('image/')) add(f) })
+    accepted.forEach(add)
   }, [addCharRef, addLocRef])
 
   const totalRefs = charRefs.length + locRefs.length + (showVoiceReference && voiceRef ? 1 : 0)
@@ -1575,7 +1717,7 @@ function AdditionalRefsSection() {
             </label>
           </div>
           {/* Character References */}
-          <div>
+          <div data-director-component="character_reference" tabIndex={-1} className="outline-none">
             <div className="flex items-center justify-between mb-1">
               <span className="text-[10px] text-text-secondary">Character refs</span>
               <label className="cursor-pointer text-[9px] text-accent-blue hover:underline">
@@ -1588,7 +1730,10 @@ function AdditionalRefsSection() {
               <div className="space-y-1">
                 {charRefs.map((f, i) => (
                   <DraggableRefRow key={`c${i}-${f.name}`} file={f} label={charLabels[i] || ''} index={i}
-                    onRemove={removeCharRef} onLabelChange={setCharLabel} onReorder={reorderCharRefs}
+                    onRemove={index => {
+                      clearDirectorComponentError('character_reference')
+                      removeCharRef(index)
+                    }} onLabelChange={setCharLabel} onReorder={reorderCharRefs}
                     placeholder="e.g. Thor - blonde, hammer" />
                 ))}
               </div>
@@ -1596,9 +1741,10 @@ function AdditionalRefsSection() {
             {charRefs.length === 0 && (
               <p className="text-[9px] text-text-muted italic">Individual character close-ups improve identity</p>
             )}
+            <DirectorComponentAlert component="character_reference" />
           </div>
           {/* Location References */}
-          <div>
+          <div data-director-component="location_reference" tabIndex={-1} className="outline-none">
             <div className="flex items-center justify-between mb-1">
               <span className="text-[10px] text-text-secondary">Location refs</span>
               <label className="cursor-pointer text-[9px] text-accent-blue hover:underline">
@@ -1611,7 +1757,10 @@ function AdditionalRefsSection() {
               <div className="space-y-1">
                 {locRefs.map((f, i) => (
                   <DraggableRefRow key={`l${i}-${f.name}`} file={f} label={locLabels[i] || ''} index={i}
-                    onRemove={removeLocRef} onLabelChange={setLocLabel} onReorder={reorderLocRefs}
+                    onRemove={index => {
+                      clearDirectorComponentError('location_reference')
+                      removeLocRef(index)
+                    }} onLabelChange={setLocLabel} onReorder={reorderLocRefs}
                     placeholder="e.g. backstage, leather couches" />
                 ))}
               </div>
@@ -1619,6 +1768,7 @@ function AdditionalRefsSection() {
             {locRefs.length === 0 && (
               <p className="text-[9px] text-text-muted italic">Scene/environment reference images</p>
             )}
+            <DirectorComponentAlert component="location_reference" />
           </div>
           {/* Voice references require both model support and the explicit
               Services toggle. */}
@@ -1932,9 +2082,9 @@ function StructureView({
  */
 function DirectorAdvancedAccordion() {
   const [open, setOpen] = useState(false)
-  const videoModel = useStore(s => s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')
+  const videoModel = useStore(s => s.selectedModelPerMode.video || '')
   const videoModelDefinition = useStore(s => s.models.find(
-    model => model.model_type === (s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1'),
+    model => model.model_type === s.selectedModelPerMode.video,
   ))
   const shotImageGuidance = useStore(s => s.directorShotImageGuidance)
   const setShotImageGuidance = useStore(s => s.setDirectorShotImageGuidance)
@@ -2295,6 +2445,7 @@ function DirectorModelPicker({ value, onChange }: {
   const seamless = useStore(s => s.directorSeamless)
   const h3SelectedProfile = useStore(s => s.h3SelectedProfile)
   const h3Profiles = useStore(s => s.h3PerformanceProfiles)
+  const componentError = useStore(s => s.directorComponentError)
   const pinkCompatibility = useStore(
     s => s.h3ModelProfileCompatibility.minimax_h3_pinkcherry_fl2va,
   )
@@ -2324,16 +2475,7 @@ function DirectorModelPicker({ value, onChange }: {
 
   const compatibleModels = useMemo(() => groups.flatMap(group => group.models), [groups])
   const known = compatibleModels.some(model => model.model_type === value)
-  const preferredId = 'ltx2_22B_distilled_1_1'
-  const fallbackModel = compatibleModels.find(model => model.model_type === preferredId) || compatibleModels[0]
-  const selectedValue = known ? value : (fallbackModel?.model_type || '')
-  const currentModel = compatibleModels.find(model => model.model_type === selectedValue)
-
-  useEffect(() => {
-    if (!known && fallbackModel && fallbackModel.model_type !== value) {
-      void Promise.resolve(onChange(fallbackModel.model_type))
-    }
-  }, [known, fallbackModel, onChange, value])
+  const currentModel = compatibleModels.find(model => model.model_type === value)
   const requestedProfileLabel = h3Profiles.find(
     profile => profile.id === pinkCompatibility?.requestedProfileId,
   )?.label || pinkCompatibility?.requestedProfileId
@@ -2349,34 +2491,42 @@ function DirectorModelPicker({ value, onChange }: {
       : 'Only models that can follow the uploaded soundtrack or dialogue timeline are shown.'
 
   return (
-    <div className="flex items-center gap-1.5">
-      <span className="text-[10px] text-text-muted uppercase tracking-wider w-11 shrink-0">
-        Video
-      </span>
-      <select
-        value={selectedValue}
-        onChange={e => { void Promise.resolve(onChange(e.target.value)) }}
-        disabled={compatibleModels.length === 0}
-        title={pickerTitle}
-        className="flex-1 min-w-0 bg-bg-tertiary border border-border rounded-lg px-2 py-1 text-[11px] text-text-primary focus:outline-none focus:border-accent-blue"
-      >
-        {compatibleModels.length === 0 && <option value="">No compatible models enabled</option>}
-        {groups.map(({ family, models: famModels }) => (
-          <optgroup key={family.id} label={family.label}>
-            {famModels.map(m => (
-              <option key={m.model_type} value={m.model_type}>
-                {m.name}{m.model_type === 'minimax_h3_pinkcherry_fl2va' && pinkReconciliationLabel ? ` · ${pinkReconciliationLabel}` : ''}
-              </option>
-            ))}
-          </optgroup>
-        ))}
-      </select>
-      {(currentModel?.selector_help || currentModel?.description) && (
-        <InfoTooltip
-          text={currentModel.selector_help || currentModel.description || ''}
-          label={`About ${currentModel.name}`}
-        />
-      )}
+    <div
+      data-director-component="video_model"
+      tabIndex={-1}
+      className={`rounded outline-none ${componentError?.component === 'video_model' ? 'ring-1 ring-red-500/60' : ''}`}
+    >
+      <div className="flex items-center gap-1.5">
+        <span className="text-[10px] text-text-muted uppercase tracking-wider w-11 shrink-0">
+          Video
+        </span>
+        <select
+          value={value}
+          onChange={e => { void Promise.resolve(onChange(e.target.value)) }}
+          disabled={compatibleModels.length === 0}
+          title={pickerTitle}
+          className="flex-1 min-w-0 bg-bg-tertiary border border-border rounded-lg px-2 py-1 text-[11px] text-text-primary focus:outline-none focus:border-accent-blue"
+        >
+          {!known && value && <option value={value}>Selected exact model · unavailable in this session</option>}
+          {!value && <option value="">{compatibleModels.length === 0 ? 'No compatible models enabled' : 'Choose an exact video model'}</option>}
+          {groups.map(({ family, models: famModels }) => (
+            <optgroup key={family.id} label={family.label}>
+              {famModels.map(m => (
+                <option key={m.model_type} value={m.model_type}>
+                  {m.name}{m.model_type === 'minimax_h3_pinkcherry_fl2va' && pinkReconciliationLabel ? ` · ${pinkReconciliationLabel}` : ''}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+        {(currentModel?.selector_help || currentModel?.description) && (
+          <InfoTooltip
+            text={currentModel.selector_help || currentModel.description || ''}
+            label={`About ${currentModel.name}`}
+          />
+        )}
+      </div>
+      <DirectorComponentAlert component="video_model" />
     </div>
   )
 }
@@ -2540,6 +2690,7 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
   const selections = useStore(s => s.directorImageRoleLoras[role])
   const setSelections = useStore(s => s.setDirectorImageRoleLoras)
   const explicitOutput = useStore(s => s.explicitOutput)
+  const componentError = useStore(s => s.directorComponentError)
   const [lorasOpen, setLorasOpen] = useState(false)
   const capability = capabilities?.image_roles[role]
   const effectiveModel = override || capability?.resolved_model || ''
@@ -2550,9 +2701,17 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
   const description = role === 'creator'
     ? 'Creates reference-free anchors, keyframes, and shot stills.'
     : 'Edits from references and handles continuity, reframing, and repair.'
+  const modelComponent: DirectorFailureComponent = role === 'creator'
+    ? 'image_creator_model' : 'continuity_editor_model'
+  const loraComponent: DirectorFailureComponent = role === 'creator'
+    ? 'image_creator_lora' : 'continuity_editor_lora'
+  const lorasExpanded = lorasOpen || componentError?.component === loraComponent
 
   return (
-    <fieldset className="rounded-lg border border-border bg-bg-tertiary/20 p-2">
+    <fieldset
+      data-director-component={modelComponent}
+      className={`rounded-lg border bg-bg-tertiary/20 p-2 ${componentError?.component === modelComponent ? 'border-red-500/60' : 'border-border'}`}
+    >
       <legend className="px-1 text-[10px] font-medium text-text-secondary">{label}</legend>
       <p className="mb-1.5 text-[9px] text-text-muted">{description}</p>
       <select aria-label={`Director ${label}`} value={override} onChange={event => setRoleModel(role, event.target.value)} disabled={!capability} className="w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] text-text-primary disabled:opacity-50">
@@ -2560,6 +2719,7 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
         {override && !candidate && <option value={override}>{modelName(override)} · unavailable in this session</option>}
         {compatibleCandidates.map(item => <option key={item.model_type} value={item.model_type}>{modelName(item.model_type)}{item.ready ? '' : ' · setup required'}</option>)}
       </select>
+      <DirectorComponentAlert component={modelComponent} />
       <p className="mt-1 text-[8px] text-text-muted">
         {!effectiveModel
           ? 'The server default is hidden or unavailable in this session. Select an authorized model or use Maestro locally.'
@@ -2585,21 +2745,24 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
           ))}
         </div>
       )}
-      {effectiveModel && candidate?.ready && (
-        <div className="mt-2 overflow-hidden rounded border border-border">
-          <button type="button" aria-expanded={lorasOpen} onClick={() => setLorasOpen(!lorasOpen)} className="flex w-full items-center justify-between px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover">
-            <span>{role === 'creator' ? 'Creator LoRAs' : 'Editor LoRAs'}{selections.length > 0 ? ` (${selections.length})` : ''}</span>
-            {lorasOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-          </button>
-          {lorasOpen && <div className="border-t border-border p-2"><DirectorImageRoleLoraSelector role={role} modelType={effectiveModel} selections={selections} onChange={next => setSelections(role, next)} /></div>}
-        </div>
-      )}
+      <div data-director-component={loraComponent} tabIndex={-1} className="outline-none">
+        <DirectorComponentAlert component={loraComponent} />
+        {effectiveModel && candidate?.ready && (
+          <div className={`mt-2 overflow-hidden rounded border ${componentError?.component === loraComponent ? 'border-red-500/60' : 'border-border'}`}>
+            <button type="button" aria-expanded={lorasExpanded} onClick={() => setLorasOpen(!lorasExpanded)} className="flex w-full items-center justify-between px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover">
+              <span>{role === 'creator' ? 'Creator LoRAs' : 'Editor LoRAs'}{selections.length > 0 ? ` (${selections.length})` : ''}</span>
+              {lorasExpanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+            </button>
+            {lorasExpanded && <div className="border-t border-border p-2"><DirectorImageRoleLoraSelector role={role} modelType={effectiveModel} selections={selections} onChange={next => setSelections(role, next)} /></div>}
+          </div>
+        )}
+      </div>
     </fieldset>
   )
 }
 
 function DirectorLoraAccordion() {
-  const videoModel = useStore(s => s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')
+  const videoModel = useStore(s => s.selectedModelPerMode.video || '')
   const selectDirectorVideoModel = useStore(s => s.selectDirectorVideoModel)
   const capabilities = useStore(s => (
     s.directorCapabilitiesExplicitOutput === s.explicitOutput ? s.directorCapabilities : null
@@ -2684,7 +2847,7 @@ function StyleForm({
   const customVisualStyle = useStore(s => s.directorCustomVisualStyle)
   const setVisualStyle = useStore(s => s.setDirectorVisualStyle)
   const setCustomVisualStyle = useStore(s => s.setDirectorCustomVisualStyle)
-  const effectiveVideoModel = useStore(s => s.selectedModelPerMode.video || 'ltx2_22B_distilled_1_1')
+  const effectiveVideoModel = useStore(s => s.selectedModelPerMode.video || '')
 
   if (!isActive) {
     return (

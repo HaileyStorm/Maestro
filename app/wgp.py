@@ -1,5 +1,6 @@
 import os, sys
 import hashlib
+import copy
 os.environ["GRADIO_LANG"] = "en"
 # # os.environ.pop("TORCH_LOGS", None)  # make sure no env var is suppressing/overriding
 # os.environ["TORCH_LOGS"]= "recompiles"
@@ -96,6 +97,13 @@ from services.model_terms import (
     PORNMASTER_V4_PONPOKE_RECIPE,
     require_model_terms,
 )
+from services.model_residency import (
+    ModelResidencyError,
+    ModelResidencyEvidenceStore,
+    ResidencySingleflight,
+    build_residency_key,
+    choose_profile_action,
+)
 
 # import torch._dynamo as dynamo
 # dynamo.config.recompile_limit = 2000   # default is 256
@@ -139,6 +147,19 @@ reload_needed = True
 _loaded_model_configuration = None
 _loaded_residency_base_key = None
 _loaded_residency_affinity_key = None
+_model_residency_store = None
+_model_residency_singleflight = ResidencySingleflight()
+_model_residency_offload_setup_lock = threading.Lock()
+_loaded_model_residency_evidence_template = None
+_loaded_model_residency_evidence_context_id = None
+_model_residency_evidence_contexts = {}
+_model_residency_evidence_context_sequence = 0
+_model_residency_evidence_context_lock = threading.RLock()
+_MODEL_RESIDENCY_EVIDENCE_CONTEXT_VERSION = 1
+_MODEL_RESIDENCY_EVIDENCE_CONTEXT_MAX = 16
+_MODEL_RESIDENCY_POLICY_REVISION = 1
+_MODEL_RESIDENCY_PROFILE_COST_SECONDS = 90.0
+_MODEL_RESIDENCY_RECOVERY_COST_SECONDS = 180.0
 # Remembers the VAE-upsampling kwarg last passed to load_models. Used as the
 # fallback comparison target for models whose vae object doesn't expose an
 # upsampling_set attribute (LTX-2, etc.) — without this the VAE check at
@@ -288,6 +309,33 @@ class HostMemoryAdmissionError(RuntimeError):
 
     stage = "model_load"
     code = "insufficient_host_memory"
+
+    def __init__(
+        self,
+        message,
+        *,
+        available_bytes=None,
+        required_bytes=None,
+        total_bytes=None,
+    ):
+        super().__init__(message)
+
+        def bounded(value):
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                return min(max(0, int(value)), (1 << 63) - 1)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        self.available_bytes = bounded(available_bytes)
+        self.required_bytes = bounded(required_bytes)
+        self.total_bytes = bounded(total_bytes)
+        self.retryable = not (
+            self.required_bytes is not None
+            and self.total_bytes is not None
+            and self.required_bytes > self.total_bytes
+        )
 
 
 def _host_memory_snapshot():
@@ -463,7 +511,7 @@ def _require_h3_host_memory(
     cancel_callback=None,
 ):
     """Admit an H3 cold load after bounded post-eviction RAM reclamation."""
-    available, _ = _host_memory_snapshot()
+    available, total = _host_memory_snapshot()
     if available is None:
         return None
     checkpoint_bytes = _h3_checkpoint_bytes(paths)
@@ -502,7 +550,7 @@ def _require_h3_host_memory(
         remaining = max(0.0, deadline - time.monotonic())
         time.sleep(min(poll_seconds, remaining))
         check_cancelled()
-        available, _ = _host_memory_snapshot()
+        available, total = _host_memory_snapshot()
         if available is None:
             return None
         poll_seconds = min(
@@ -515,7 +563,10 @@ def _require_h3_host_memory(
             "MiniMax H3 was not loaded because host memory is too low "
             f"({available / _GIB:.1f} GiB available; "
             f"{required / _GIB:.1f} GiB required). "
-            "Close other memory-heavy local work, then retry."
+            "Close other memory-heavy local work, then retry.",
+            available_bytes=available,
+            required_bytes=required,
+            total_bytes=total,
         )
     return {
         "available_bytes": available,
@@ -530,10 +581,20 @@ def _invalidate_loaded_model_state():
     """Invalidate WGP and scheduler identity before fallible load/release work."""
     global reload_needed, _loaded_model_configuration
     global _loaded_residency_base_key, _loaded_residency_affinity_key
+    global _loaded_model_residency_evidence_template
+    global _loaded_model_residency_evidence_context_id
     reload_needed = True
     _loaded_model_configuration = None
     _loaded_residency_base_key = None
     _loaded_residency_affinity_key = None
+    evidence_lock = globals().get("_model_residency_evidence_context_lock")
+    if evidence_lock is None:
+        _loaded_model_residency_evidence_template = None
+        _loaded_model_residency_evidence_context_id = None
+    else:
+        with evidence_lock:
+            _loaded_model_residency_evidence_template = None
+            _loaded_model_residency_evidence_context_id = None
     invalidate_residency_state()
 
 
@@ -5027,6 +5088,13 @@ def compute_profile(override_profile, output_type="video"):
     return override_profile if override_profile != -1 else get_default_profile(output_type)
 
 
+def _effective_preload_setting():
+    preload = int(args.preload)
+    if preload == 0:
+        preload = server_config.get("preload_in_VRAM", 0)
+    return preload
+
+
 def _model_load_environment_signature(model_type, profile):
     """Resolve model/enhancer settings that are fixed at load/profile time."""
     model_def = get_model_def(model_type) or {}
@@ -5120,6 +5188,617 @@ def _release_for_model_reprofile(
     return True
 
 
+def _residency_digest_token(*components):
+    """Return a bounded token without retaining paths or user-facing names."""
+    digest = hashlib.sha256()
+    digest.update(b"maestro-model-residency-v1\0")
+    for component in components:
+        digest.update(str(component).encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+    return "sha256-" + digest.hexdigest()
+
+
+def _residency_artifact_revision(paths):
+    """Fingerprint artifact metadata without reading or persisting file paths."""
+    observations = []
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            continue
+        try:
+            stat_result = os.stat(path, follow_symlinks=False)
+            observations.append((
+                _residency_digest_token(os.path.basename(path)),
+                int(stat_result.st_size),
+                int(stat_result.st_mtime_ns),
+            ))
+        except OSError:
+            observations.append((_residency_digest_token(path), 0, 0))
+    return _residency_digest_token(*sorted(observations))
+
+
+def _bounded_nonnegative_int(value, *, maximum=1_000_000):
+    if isinstance(value, bool):
+        return 0
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(max(0, result), maximum)
+
+
+def _count_residency_items(value):
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple, set)):
+        return sum(_count_residency_items(item) for item in value)
+    return int(value != "")
+
+
+def _generation_residency_context(
+    *,
+    output_type,
+    resolution,
+    frame_count,
+    steps,
+    references,
+    loras,
+    stage_count,
+    cache_mode,
+    attention_backend,
+):
+    """Normalize only content-free workload dimensions for residency evidence."""
+    width = height = 0
+    if isinstance(resolution, str):
+        match = re.fullmatch(r"\s*(\d{1,6})x(\d{1,6})\s*", resolution)
+        if match is not None:
+            width = _bounded_nonnegative_int(match.group(1))
+            height = _bounded_nonnegative_int(match.group(2))
+    return {
+        "kind": str(output_type or "video"),
+        "width": width,
+        "height": height,
+        "frame_count": _bounded_nonnegative_int(frame_count),
+        "steps": _bounded_nonnegative_int(steps),
+        "reference_count": _count_residency_items(references),
+        "lora_count": _count_residency_items(loras),
+        "lora_signature": _residency_digest_token(loras),
+        "stage_count": max(1, _bounded_nonnegative_int(stage_count)),
+        "cache_mode": str(cache_mode or "none"),
+        "attention_backend": str(attention_backend or "auto"),
+    }
+
+
+def _residency_hardware_snapshot():
+    available_host, total_host = _host_memory_snapshot()
+    available_vram = total_vram = 0
+    accelerator = "cpu"
+    driver_version = getattr(torch.version, "cuda", None) or "none"
+    try:
+        if torch.cuda.is_available():
+            available_vram, total_vram = torch.cuda.mem_get_info()
+            properties = torch.cuda.get_device_properties(0)
+            accelerator = _residency_digest_token(
+                getattr(properties, "name", "cuda"),
+                getattr(properties, "major", 0),
+                getattr(properties, "minor", 0),
+            )
+            driver_getter = getattr(torch._C, "_cuda_getDriverVersion", None)
+            if callable(driver_getter):
+                driver_version = str(driver_getter())
+    except Exception:
+        available_vram = total_vram = 0
+        accelerator = "cuda-unknown"
+    gib = float(_GIB)
+    return {
+        "accelerator": accelerator,
+        "total_vram_gib": max(0.0, float(total_vram or 0) / gib),
+        "total_host_ram_gib": max(0.0, float(total_host or 0) / gib),
+        "free_vram_band_gib": max(
+            0, int(float(available_vram or 0) / gib / 2.0) * 2,
+        ),
+        "free_host_ram_band_gib": max(
+            0, int(float(available_host or 0) / gib / 8.0) * 8,
+        ),
+        "driver_version": _residency_digest_token(driver_version),
+    }
+
+
+def _resolve_model_residency_attention(model_type, requested_attention):
+    resolved = requested_attention
+    if not resolved or resolved == "auto":
+        resolved = get_overridden_attention(model_type)
+    if resolved is None:
+        resolved = attention_mode
+    if resolved == "auto":
+        try:
+            resolved = get_auto_attention()
+        except Exception:
+            resolved = "auto"
+    return resolved
+
+
+def _build_model_residency_key_from_template(template, residency_context):
+    """Build a fresh exact key from a path-free loaded-model template."""
+    context = dict(residency_context or {})
+    context.setdefault("kind", template["default_kind"])
+    for name in (
+        "width", "height", "frame_count", "steps", "reference_count",
+        "lora_count", "stage_count",
+    ):
+        context[name] = _bounded_nonnegative_int(context.get(name))
+    context["stage_count"] = max(1, context["stage_count"])
+    hardware = _residency_hardware_snapshot()
+    requested_budget = max(
+        0.0,
+        hardware["total_vram_gib"]
+        * template["settings"]["vram_safety_coefficient"],
+    )
+    resolved_attention = context.get("attention_backend")
+    if not resolved_attention or resolved_attention == "auto":
+        resolved_attention = template["default_attention"]
+    return build_residency_key(
+        model=template["model"],
+        runtime={
+            "runtime_id": "wan2gp",
+            "runtime_version": template["runtime"]["runtime_version"],
+            "build_id": _residency_digest_token(
+                *template["runtime"]["build_parts"],
+                context.get("lora_signature") or "none",
+            ),
+            "driver_version": hardware["driver_version"],
+        },
+        hardware={
+            "accelerator": hardware["accelerator"],
+            "total_vram_gib": hardware["total_vram_gib"],
+            "total_host_ram_gib": hardware["total_host_ram_gib"],
+        },
+        workload={
+            "kind": _residency_digest_token(context["kind"]),
+            "width": context["width"],
+            "height": context["height"],
+            "frame_count": context["frame_count"],
+            "steps": context["steps"],
+            "reference_count": context["reference_count"],
+            "lora_count": context["lora_count"],
+            "stage_count": context["stage_count"],
+        },
+        settings={
+            "offload_profile": template["settings"]["offload_profile"],
+            "resident_budget_gib": requested_budget,
+            "attention_backend": _residency_digest_token(resolved_attention),
+            "cache_mode": _residency_digest_token(
+                context.get("cache_mode") or "none",
+            ),
+            "weight_quantization": template["settings"]["weight_quantization"],
+        },
+        condition={
+            "free_vram_band_gib": hardware["free_vram_band_gib"],
+            "free_host_ram_band_gib": hardware["free_host_ram_band_gib"],
+            # Attached prompt-enhancer residency is already part of the
+            # runtime build identity. Keep the categorical cold-load region
+            # stable across clean A/B/A reloads and process restarts.
+            "residency_epoch_band": 0,
+        },
+        policy_revision=_MODEL_RESIDENCY_POLICY_REVISION,
+    )
+
+
+def _build_model_residency_key(
+    *,
+    model_type,
+    base_model_type,
+    artifact_paths,
+    profile,
+    vram_safety_coefficient,
+    transformer_dtype,
+    load_environment,
+    residency_context,
+    return_template=False,
+):
+    try:
+        requested_coefficient = float(vram_safety_coefficient)
+    except (TypeError, ValueError):
+        requested_coefficient = 0.8
+    weight_quantization = _residency_digest_token(
+        transformer_quantization, transformer_dtype,
+    )
+    template = {
+        "default_kind": str(base_model_type or "model"),
+        "default_attention": _resolve_model_residency_attention(
+            model_type, "auto",
+        ),
+        "model": {
+            "artifact_id": _residency_digest_token(model_type),
+            "artifact_revision": _residency_artifact_revision(artifact_paths),
+            "family": _residency_digest_token(base_model_type),
+            "quantization": weight_quantization,
+        },
+        "runtime": {
+            "runtime_version": _residency_digest_token(WanGP_version),
+            "build_parts": (
+                WanGP_version, mmgp_version, torch.__version__,
+                getattr(torch.version, "cuda", None),
+                copy.deepcopy(load_environment),
+            ),
+        },
+        "settings": {
+            "offload_profile": float(profile),
+            "vram_safety_coefficient": requested_coefficient,
+            "weight_quantization": weight_quantization,
+        },
+    }
+    key = _build_model_residency_key_from_template(
+        template, residency_context,
+    )
+    if return_template:
+        return key, template
+    return key
+
+
+def _get_model_residency_store():
+    global _model_residency_store
+    if _model_residency_store is None:
+        root = config_dir if config_dir else os.path.join(wgp_root, "storage")
+        _model_residency_store = ModelResidencyEvidenceStore(
+            os.path.join(root, "model_residency_evidence.json"),
+        )
+    return _model_residency_store
+
+
+def _register_model_residency_evidence_context(key, *, template=None):
+    """Issue one bounded opaque handle for a WGP-built exact key."""
+    global _model_residency_evidence_context_sequence
+    global _loaded_model_residency_evidence_context_id
+    global _loaded_model_residency_evidence_template
+    try:
+        identity = key["identity"]
+        settings = identity["settings"]
+        condition = identity["condition"]
+        with _model_residency_evidence_context_lock:
+            _model_residency_evidence_context_sequence += 1
+            context_id = _residency_digest_token(
+                key["exact_key"], _model_residency_evidence_context_sequence,
+            )
+            public_context = {
+                "schema_version": _MODEL_RESIDENCY_EVIDENCE_CONTEXT_VERSION,
+                "context_id": context_id,
+                "exact_key": key["exact_key"],
+                "offload_profile": settings["offload_profile"],
+                "resident_budget_gib": settings["resident_budget_gib"],
+                "condition": copy.deepcopy(condition),
+            }
+            _model_residency_evidence_contexts[context_id] = {
+                "context": copy.deepcopy(public_context),
+                "key": copy.deepcopy(key),
+            }
+            while (
+                len(_model_residency_evidence_contexts)
+                > _MODEL_RESIDENCY_EVIDENCE_CONTEXT_MAX
+            ):
+                oldest = next(iter(_model_residency_evidence_contexts))
+                del _model_residency_evidence_contexts[oldest]
+            _loaded_model_residency_evidence_context_id = context_id
+            if template is not None:
+                _loaded_model_residency_evidence_template = copy.deepcopy(template)
+            return copy.deepcopy(public_context)
+    except Exception:
+        return None
+
+
+def get_current_model_residency_evidence_context():
+    """Return a content-free deep copy for the current exact WGP load."""
+    try:
+        with _model_residency_evidence_context_lock:
+            if wan_model is None or offloadobj is None or reload_needed:
+                return None
+            entry = _model_residency_evidence_contexts.get(
+                _loaded_model_residency_evidence_context_id,
+            )
+            if entry is None:
+                return None
+            return copy.deepcopy(entry["context"])
+    except Exception:
+        return None
+
+
+def _clear_current_model_residency_evidence_context():
+    """Stop implicit attribution while a new workload key is unresolved."""
+    global _loaded_model_residency_evidence_context_id
+    try:
+        with _model_residency_evidence_context_lock:
+            _loaded_model_residency_evidence_context_id = None
+    except Exception:
+        pass
+
+
+def derive_current_model_residency_evidence_context(residency_context):
+    """Issue the exact current workload key for a resident WGP model."""
+    global _loaded_model_residency_evidence_context_id
+    try:
+        with _model_residency_evidence_context_lock:
+            if (
+                wan_model is None
+                or offloadobj is None
+                or reload_needed
+                or _loaded_model_residency_evidence_template is None
+            ):
+                _loaded_model_residency_evidence_context_id = None
+                return None
+            template = copy.deepcopy(
+                _loaded_model_residency_evidence_template,
+            )
+            try:
+                key = _build_model_residency_key_from_template(
+                    template, residency_context,
+                )
+                issued = _register_model_residency_evidence_context(
+                    key, template=template,
+                )
+            except Exception:
+                issued = None
+            if issued is None:
+                # Never leave a prior workload advertised when this job's
+                # finalized exact context could not be built or registered.
+                _loaded_model_residency_evidence_context_id = None
+            return issued
+    except Exception:
+        return None
+
+
+def record_model_residency_runtime_outcome(
+    outcome,
+    *,
+    phase,
+    required_margin_gib=0.0,
+    evidence_context=None,
+):
+    """Persist a stage-scoped runtime result for a WGP-issued exact key.
+
+    OOM evidence retains the validated phase. A success strengthens the exact
+    key's phase-independent success evidence, matching the core store schema.
+    Any stale context, invalid input, or evidence-store failure is advisory and
+    therefore returns ``False`` without changing generation behavior.
+    """
+    if outcome not in {"success", "oom"}:
+        return False
+    if phase not in {"model_load", "generation", "finalization"}:
+        return False
+    if evidence_context is None:
+        evidence_context = get_current_model_residency_evidence_context()
+    if not isinstance(evidence_context, dict):
+        return False
+    try:
+        with _model_residency_evidence_context_lock:
+            context_id = evidence_context.get("context_id")
+            entry = _model_residency_evidence_contexts.get(context_id)
+            if (
+                entry is None
+                or evidence_context != entry["context"]
+                or evidence_context.get("exact_key")
+                != entry["key"].get("exact_key")
+            ):
+                return False
+            key = copy.deepcopy(entry["key"])
+        store = _get_model_residency_store()
+        if outcome == "success":
+            store.record_success(key)
+        else:
+            margin = float(required_margin_gib)
+            if not math.isfinite(margin) or not 0.0 <= margin <= 1024.0:
+                return False
+            store.record_oom(
+                key, phase=phase, required_margin_gib=margin,
+            )
+        return True
+    except Exception:
+        return False
+
+
+def _mmgp_profile_defaults(profile_no):
+    """Resolve the pinned MMGP 3.7.12 profile into direct ``all`` kwargs."""
+    try:
+        profile_value = int(profile_no)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if float(profile_no) != float(profile_value) or profile_value not in range(1, 6):
+        return None
+    defaults = {
+        "pinnedMemory": {
+            1: True, 2: True, 3: "transformer", 4: "transformer", 5: False,
+        }[profile_value],
+        "extraModelsToQuantize": None,
+        "budgets": {
+            1: None,
+            2: {"transformer": 1200, "*": 3000},
+            3: None,
+            4: {"transformer": 1200, "*": 3000},
+            5: {"transformer": 400, "*": 3000},
+        }[profile_value],
+        "asyncTransfers": True,
+        "quantizeTransformer": True,
+    }
+    return defaults
+
+
+def _select_model_residency_plan(
+    key,
+    *,
+    store,
+    force_reprofile=False,
+):
+    if force_reprofile:
+        return {
+            "action": "profile", "reason": "explicit_reprofile",
+            "recommendation": None,
+        }
+    if store is None:
+        return {
+            "action": "profile", "reason": "evidence_unavailable",
+            "recommendation": None,
+        }
+    try:
+        recommendation = store.recommend(key)
+        decision = choose_profile_action(
+            recommendation,
+            profiling_cost_seconds=_MODEL_RESIDENCY_PROFILE_COST_SECONDS,
+            recovery_cost_seconds=_MODEL_RESIDENCY_RECOVERY_COST_SECONDS,
+        )
+    except Exception:
+        return {
+            "action": "profile", "reason": "evidence_unavailable",
+            "recommendation": None,
+        }
+    if decision.get("decision") != "use_estimate":
+        return {
+            "action": "profile",
+            "reason": str(decision.get("reason") or "cost_policy"),
+            "recommendation": recommendation,
+        }
+    if recommendation.get("status") != "supported":
+        return {
+            "action": "profile", "reason": "unsupported_region",
+            "recommendation": recommendation,
+        }
+    return {
+        "action": "reuse",
+        "reason": str(
+            recommendation.get("provenance", {}).get("kind") or "supported"
+        ),
+        "recommendation": recommendation,
+    }
+
+
+def _residency_status(plan):
+    if plan["action"] == "profile":
+        reason = {
+            "explicit_reprofile": "explicit reprofile",
+            "evidence_unavailable": "residency evidence unavailable",
+            "unsupported_region": "unsupported residency region",
+            "profiling_cost_below_expected_recovery": "cost policy",
+        }.get(plan.get("reason"), "residency confidence policy")
+        return f"Profiling model offload · {reason}"
+    recommendation = plan.get("recommendation") or {}
+    provenance = recommendation.get("provenance") or {}
+    kind = str(provenance.get("kind") or "supported")
+    source = str(provenance.get("source") or "evidence")
+    if kind == "exact":
+        source_label = "prior-run" if source == "prior_run" else "shipped"
+        return f"Applying cached model offload plan · exact {source_label} evidence"
+    return f"Applying conservative model offload plan · compatible {kind}"
+
+
+def _record_model_residency_oom(store, key, error, *, margin_gib=1.0):
+    if store is None:
+        return
+    try:
+        from services.oom_detect import is_oom
+        if (
+            getattr(error, "code", None) != "insufficient_host_memory"
+            and not is_oom(error)
+        ):
+            return
+        store.record_oom(
+            key,
+            phase="model_load",
+            required_margin_gib=max(0.0, float(margin_gib)),
+        )
+    except Exception:
+        # Advisory evidence must never replace the authoritative load error.
+        pass
+
+
+def _model_residency_graph_flight_key(exact_key, pipe):
+    """Bind in-process offload setup coalescing to one pipeline graph."""
+    prefix = str(exact_key).rsplit(":", 1)[0]
+    graph_digest = hashlib.sha256(
+        f"{exact_key}\0{id(pipe)}".encode("ascii", errors="strict"),
+    ).hexdigest()
+    return f"{prefix}:{graph_digest}"
+
+
+def _run_model_offload_with_residency(
+    pipe,
+    *,
+    profile_no,
+    offload_kwargs,
+    key,
+    store,
+    status_callback,
+    force_reprofile=False,
+):
+    def operation():
+        # MMGP setup mutates process-global state. Serialize graph leaders, but
+        # re-read evidence inside the lock so a waiting graph can use a prior
+        # leader's successful profile without receiving its pipe-bound object.
+        with _model_residency_offload_setup_lock:
+            plan = _select_model_residency_plan(
+                key, store=store, force_reprofile=force_reprofile,
+            )
+            defaults = _mmgp_profile_defaults(profile_no)
+            if defaults is None and plan["action"] == "reuse":
+                plan = {
+                    "action": "profile", "reason": "unsupported_profile",
+                    "recommendation": plan.get("recommendation"),
+                }
+            recommendation = plan.get("recommendation") or {}
+            if (
+                plan["action"] == "reuse"
+                and float(recommendation.get("resident_budget_gib") or 0) <= 0
+            ):
+                plan = {
+                    "action": "profile", "reason": "insufficient_margin",
+                    "recommendation": recommendation,
+                }
+            if callable(status_callback):
+                status_callback(_residency_status(plan))
+            try:
+                if plan["action"] == "profile":
+                    result = offload.profile(
+                        pipe, profile_no=profile_no, **offload_kwargs,
+                    )
+                else:
+                    direct_kwargs = dict(defaults)
+                    direct_kwargs.update(offload_kwargs)
+                    requested_budget = float(
+                        key["identity"]["settings"]["resident_budget_gib"]
+                    )
+                    recommended_budget = recommendation.get(
+                        "resident_budget_gib"
+                    )
+                    if (
+                        recommended_budget is not None
+                        and requested_budget > 0
+                        and float(recommended_budget) < requested_budget
+                    ):
+                        current = float(
+                            direct_kwargs["vram_safety_coefficient"]
+                        )
+                        conservative = (
+                            current * float(recommended_budget)
+                            / requested_budget
+                        )
+                        direct_kwargs["vram_safety_coefficient"] = min(
+                            current, conservative,
+                        )
+                    result = offload.all(pipe, **direct_kwargs)
+            except Exception as error:
+                _record_model_residency_oom(store, key, error)
+                raise
+            try:
+                if store is not None:
+                    store.record_success(key)
+            except Exception:
+                # The current load is real and successful; a failed evidence
+                # write only prevents durable reuse on a future load.
+                pass
+            return result
+
+    return _model_residency_singleflight.run(
+        _model_residency_graph_flight_key(key["exact_key"], pipe),
+        operation,
+    )
+
+
 def get_requested_residency_identity(
     model_type,
     override_profile=-1,
@@ -5187,9 +5866,7 @@ def get_output_type_for_model(model_type, image_mode=0):
     return "video"
 
 def init_pipe(pipe, kwargs, profile):
-    preload =int(args.preload)
-    if preload == 0:
-        preload = server_config.get("preload_in_VRAM", 0)
+    preload = _effective_preload_setting()
 
     kwargs["extraModelsToQuantize"]=  None
     source_budgets = kwargs.get("budgets", None)
@@ -5277,6 +5954,8 @@ def load_models(
     output_type="video",
     load_status_callback=None,
     load_cancel_callback=None,
+    residency_context=None,
+    force_residency_reprofile=False,
     **model_kwargs,
 ):
     global transformer_type, loaded_profile, reload_needed
@@ -5294,8 +5973,8 @@ def load_models(
         model_def,
         models_def,
     )
-    # A replacement load is not resident until MMGP profiling completes. If
-    # any download/load/profile step raises, the invalid state remains durable.
+    # A replacement load is not resident until MMGP offload setup completes.
+    # If any download/load/setup step raises, the invalid state remains durable.
     _invalidate_loaded_model_state()
     base_model_type = get_base_model_type(model_type)
     save_quantized = args.save_quantized and model_def != None
@@ -5409,20 +6088,10 @@ def load_models(
 
     profile = compute_profile(override_profile, output_type)
     load_environment = _model_load_environment_signature(model_type, profile)
-    lm_decoder_engine_obtained = load_environment["lm_decoder_engine"]
-    requested_lm_decoder_engine = resolve_lm_decoder_engine(
-        lm_decoder_engine, model_def.get("lm_engines", []),
-    )
-    if (
-        requested_lm_decoder_engine in ("cg", "vllm")
-        and lm_decoder_engine_obtained == "legacy"
-    ):
-        print(f"Unable to use LM Engine '{requested_lm_decoder_engine}' as it requires a Memory Profile such as 1,3 or 3+ that loads entirely the Main Models in VRAM. Switching to Legacy LM Engine...")
-        lm_decoder_engine_obtained = "legacy"
     is_h3_load = str(base_model_type or "").startswith("minimax_h3")
+    h3_checkpoint_paths = []
     if is_h3_load:
-        h3_checkpoint_paths = list(local_model_file_list)
-        h3_checkpoint_paths.append(text_encoder_filename)
+        h3_checkpoint_paths = [*local_model_file_list, text_encoder_filename]
         assets_root = model_def.get("minimax_h3_assets_root", "minimax_h3")
         for relative_path in (
             os.path.join("vae", "minimax_h3_video_vae_fp16.safetensors"),
@@ -5434,6 +6103,52 @@ def load_models(
                     error_if_none=False,
                 )
             )
+    residency_load_environment = {
+        **load_environment,
+        "transformer_dtype": str(transformer_dtype),
+        "transformer_quantization": str(transformer_quantization),
+        "text_encoder_quantization": str(text_encoder_quantization),
+        "vae_precision": str(server_config.get("vae_precision", "16")),
+        "mixed_precision": str(server_config.get("mixed_precision", "0")),
+        "vae_config": str(vae_config),
+        "vae_upsampling": str(model_kwargs.get("VAE_upsampling") or "none"),
+        "save_quantized": bool(save_quantized),
+        "auto_quantize": bool(quantizeTransformer),
+        "preload": str(_effective_preload_setting()),
+        "reserved_memory_percent": str(perc_reserved_mem_max),
+    }
+    residency_key, residency_template = _build_model_residency_key(
+        model_type=model_type,
+        base_model_type=base_model_type,
+        artifact_paths=(
+            h3_checkpoint_paths
+            if is_h3_load else [*local_model_file_list, text_encoder_filename]
+        ),
+        profile=profile,
+        vram_safety_coefficient=vram_safety_coefficient,
+        transformer_dtype=transformer_dtype,
+        load_environment=residency_load_environment,
+        residency_context=residency_context,
+        return_template=True,
+    )
+    try:
+        residency_store = _get_model_residency_store()
+    except Exception:
+        # Evidence is an optimization. An unsafe/unavailable store must make
+        # this load take the ordinary profiling path, never fail generation or
+        # assume that an unverified plan is reusable.
+        residency_store = None
+    lm_decoder_engine_obtained = load_environment["lm_decoder_engine"]
+    requested_lm_decoder_engine = resolve_lm_decoder_engine(
+        lm_decoder_engine, model_def.get("lm_engines", []),
+    )
+    if (
+        requested_lm_decoder_engine in ("cg", "vllm")
+        and lm_decoder_engine_obtained == "legacy"
+    ):
+        print(f"Unable to use LM Engine '{requested_lm_decoder_engine}' as it requires a Memory Profile such as 1,3 or 3+ that loads entirely the Main Models in VRAM. Switching to Legacy LM Engine...")
+        lm_decoder_engine_obtained = "legacy"
+    if is_h3_load:
         if callable(load_status_callback):
             try:
                 load_status_callback(
@@ -5443,12 +6158,23 @@ def load_models(
                 )
             except Exception:
                 pass
-        _require_h3_host_memory(
-            h3_checkpoint_paths,
-            profile,
-            status_callback=load_status_callback,
-            cancel_callback=load_cancel_callback,
-        )
+        try:
+            _require_h3_host_memory(
+                h3_checkpoint_paths,
+                profile,
+                status_callback=load_status_callback,
+                cancel_callback=load_cancel_callback,
+            )
+        except HostMemoryAdmissionError as error:
+            available = error.available_bytes or 0
+            required = error.required_bytes or _h3_required_host_memory_bytes(
+                _h3_checkpoint_bytes(h3_checkpoint_paths),
+            )
+            margin = max(1.0, float(required - (available or 0)) / _GIB)
+            _record_model_residency_oom(
+                residency_store, residency_key, error, margin_gib=margin,
+            )
+            raise
 
     status_reporter = _ModelLoadStatusReporter(
         load_status_callback,
@@ -5464,7 +6190,7 @@ def load_models(
     kwargs = None
     loras_transformer = None
     offloadobj = None
-    profile_started = False
+    offload_setup_started = False
     model_load_succeeded = False
     try:
         previous_default_device = torch.get_default_device()
@@ -5513,15 +6239,31 @@ def load_models(
         if compile_modules == False:
             print("Pytorch compilation is not supported for this Model")
         # kwargs["pinnedMemory"] = "text_encoder"
-        status_reporter.transition("Profiling model offload")
-        profile_started = True
-        offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, **kwargs)
+        offload_setup_started = True
+        offload_kwargs = dict(kwargs)
+        offload_kwargs.update({
+            "compile": compile_modules,
+            "quantizeTransformer": False,
+            "loras": loras_transformer,
+            "perc_reserved_mem_max": perc_reserved_mem_max,
+            "vram_safety_coefficient": vram_safety_coefficient,
+            "convertWeightsFloatTo": transformer_dtype,
+        })
+        offloadobj = _run_model_offload_with_residency(
+            pipe,
+            profile_no=mmgp_profile,
+            offload_kwargs=offload_kwargs,
+            key=residency_key,
+            store=residency_store,
+            status_callback=status_reporter.transition,
+            force_reprofile=force_residency_reprofile,
+        )
         status_reporter.check_cancelled()
         status_reporter.transition("Model runtime ready")
         model_load_succeeded = True
     except Exception:
         partial_offloader = offloadobj
-        if partial_offloader is None and profile_started:
+        if partial_offloader is None and offload_setup_started:
             partial_offloader = getattr(offload, "last_offload_obj", None)
         cleanup_error = None
         try:
@@ -5546,7 +6288,7 @@ def load_models(
         partial_offloader = None
         # The handler returns a separate component dictionary in addition to
         # the wrapper. It aliases the same tensors and must be dropped before
-        # the host allocator flush, especially after profile-time failures.
+        # the host allocator flush, especially after offload-setup failures.
         pipe = None
         kwargs = None
         loras_transformer = None
@@ -5596,6 +6338,9 @@ def load_models(
         )
     )
     reload_needed = False
+    _register_model_residency_evidence_context(
+        residency_key, template=residency_template,
+    )
     note_residency_state(
         _loaded_residency_base_key,
         _loaded_residency_affinity_key,
@@ -9227,6 +9972,26 @@ def generate_video(
     # after a coefficient/profile/VAE change would retain the stale budget, so
     # the helper above goes through the existing safe release path exactly once.
     enhancer_mode = server_config.get("enhancer_mode", 1)
+    requested_residency_evidence_context = _generation_residency_context(
+        output_type=output_type,
+        resolution=resolution,
+        frame_count=video_length,
+        steps=num_inference_steps,
+        references=[
+            image_start, image_end, image_refs, image_guide,
+            video_source, video_end, video_guide, video_guide2,
+            video_guide3, custom_guide, voice_reference,
+            audio_source, audio_guide, audio_guide2, audio_guide3,
+            audio_guide4, audio_guide5, audio_guide6,
+        ],
+        loras=activated_loras,
+        stage_count=(
+            multi_clip_info.get("total", 1)
+            if isinstance(multi_clip_info, dict) else 1
+        ),
+        cache_mode=skip_steps_cache_type,
+        attention_backend=override_attention,
+    )
     if model_type != transformer_type or reload_needed or profile != loaded_profile:
         if not configuration_reprofiled:
             release_model()
@@ -9265,11 +10030,13 @@ def generate_video(
             output_type=output_type,
             load_status_callback=lambda stage: send_cmd("status", stage),
             load_cancel_callback=lambda: bool(gen.get("abort", False)),
+            residency_context=requested_residency_evidence_context,
             **model_kwargs,
         )
         send_cmd("status", "Model loaded")
         send_cmd("refresh_models", get_unique_id())
         reload_needed=  False
+    _clear_current_model_residency_evidence_context()
     # Remember the VAE setting we just asked for so the next generation's
     # comparison has a real value to check against (instead of falling back
     # to None and spuriously "detecting a change" every gen on LTX-2).
@@ -10128,6 +10895,29 @@ def generate_video(
             )
 
     first_window_video_length = current_video_length
+    finalized_residency_evidence_context = _generation_residency_context(
+        output_type=output_type,
+        resolution=f"{width}x{height}",
+        frame_count=first_window_video_length,
+        steps=num_inference_steps,
+        references=[
+            image_start, image_end, image_refs, image_guide,
+            video_source, video_end, video_guide, video_guide2,
+            video_guide3, custom_guide, voice_reference,
+            audio_source, audio_guide, audio_guide2, audio_guide3,
+            audio_guide4, audio_guide5, audio_guide6,
+        ],
+        loras=loras_selected,
+        stage_count=(
+            multi_clip_info.get("total", 1)
+            if isinstance(multi_clip_info, dict) else 1
+        ),
+        cache_mode=skip_steps_cache_type,
+        attention_backend=attn,
+    )
+    derive_current_model_residency_evidence_context(
+        finalized_residency_evidence_context,
+    )
     original_prompts = prompts.copy()
     gen["sliding_window"] = sliding_window 
     while not abort: 

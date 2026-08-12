@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   ArrowRight,
   Clapperboard,
@@ -18,6 +19,7 @@ import {
 import { useStore } from '../stores/useStore'
 import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from '../lib/branding'
 import { CHANGELOG_MANIFEST, CURRENT_RELEASE } from '../lib/changelog'
+import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
 
 const SEEN_KEY = 'maestro_welcome_seen_v1'
 
@@ -51,37 +53,19 @@ export function WelcomeModal() {
   }, [dismiss, setSidebarMode])
 
   useEffect(() => {
-    if (!open) return
-    const previousFocus = document.activeElement instanceof HTMLElement
+    if (!open || !dialogRef.current || !startButtonRef.current) return
+    const restoreFocus = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null
-    startButtonRef.current?.focus()
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        dismiss()
-        return
-      }
-      if (event.key !== 'Tab' || !dialogRef.current) return
-      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ))
-      if (focusable.length === 0) return
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => {
-      document.removeEventListener('keydown', handleKeyDown)
-      previousFocus?.focus()
-    }
+    return installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: startButtonRef.current,
+      restoreFocus,
+      appRoot: document.getElementById('root'),
+      onClose: dismiss,
+      priority: 120,
+    })
   }, [dismiss, open])
 
   if (!open) return null
@@ -95,23 +79,30 @@ export function WelcomeModal() {
       ? 'Your local studio keeps working independently of its Cloudflare share address.'
       : `Open ${PRODUCT_NAME} from Pinokio for the most direct, dependable local connection.`
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-[120] flex items-center justify-center overflow-hidden bg-black/70 p-3 sm:p-6"
+      className="fixed inset-0 z-[120] flex h-[100vh] items-center justify-center overflow-hidden supports-[height:100dvh]:h-[100dvh]"
       style={{
         paddingTop: 'max(0.75rem, env(safe-area-inset-top))',
+        paddingRight: 'max(0.75rem, env(safe-area-inset-right))',
         paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(0.75rem, env(safe-area-inset-left))',
       }}
-      onClick={dismiss}
     >
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label={`Close welcome to ${PRODUCT_NAME}`}
+        className="absolute inset-0 appearance-none border-0 bg-black/70 p-0"
+        onClick={() => closeModalIfTop(document, dialogRef.current, dismiss)}
+      />
       <div
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
-        className="flex w-full max-w-3xl max-h-[calc(100dvh-1.5rem)] min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-bg-secondary shadow-2xl sm:max-h-[92vh]"
-        onClick={e => e.stopPropagation()}
+        className="relative flex min-h-0 max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-border bg-bg-secondary shadow-2xl"
       >
         <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain [-webkit-overflow-scrolling:touch]">
         <div className="relative overflow-hidden border-b border-border px-5 pb-5 pt-6 sm:px-7 sm:pb-6 sm:pt-7">
@@ -136,8 +127,13 @@ export function WelcomeModal() {
                 Move from a single idea to finished images, video, audio, and connected stories—without losing sight of the work between.
               </p>
             </div>
-            <button type="button" onClick={dismiss} className="shrink-0 rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label={`Close welcome to ${PRODUCT_NAME}`}>
-              <X size={17} />
+            <button
+              type="button"
+              onClick={() => closeModalIfTop(document, dialogRef.current, dismiss)}
+              className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-lg text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 md:p-1.5"
+              aria-label={`Close welcome to ${PRODUCT_NAME}`}
+            >
+              <X size={17} aria-hidden="true" />
             </button>
           </div>
           <div className="relative mt-4 rounded-xl border border-accent-blue/25 bg-accent-blue/10 px-3 py-2.5 sm:flex sm:items-center sm:gap-3">
@@ -211,7 +207,7 @@ export function WelcomeModal() {
         </div>
         </div>
 
-        <div className="sticky bottom-0 shrink-0 border-t border-border bg-bg-secondary px-5 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:flex sm:items-center sm:justify-between sm:gap-5 sm:px-7">
+        <div className="sticky bottom-0 max-h-[55%] overflow-y-auto overscroll-contain shrink-0 border-t border-border bg-bg-secondary px-5 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] [-webkit-overflow-scrolling:touch] sm:flex sm:max-h-none sm:items-center sm:justify-between sm:gap-5 sm:overflow-visible sm:px-7">
           <div className="space-y-1.5 text-[10px] leading-relaxed text-text-muted sm:max-w-lg sm:text-[11px]">
             <div className="flex items-start gap-2">
               <ShieldCheck size={14} className="mt-0.5 shrink-0 text-accent-green" />
@@ -226,13 +222,14 @@ export function WelcomeModal() {
             ref={startButtonRef}
             type="button"
             onClick={enterStudio}
-            className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-gradient-cta-from to-gradient-cta-to px-5 py-2.5 text-xs font-semibold text-white transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue sm:mt-0 sm:w-auto"
+            className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-gradient-cta-from to-gradient-cta-to px-5 py-2.5 text-xs font-semibold text-white transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue sm:mt-0 sm:w-auto"
           >
             Enter the studio <ArrowRight size={14} />
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 

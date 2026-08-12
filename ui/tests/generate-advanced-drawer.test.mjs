@@ -246,7 +246,7 @@ test('closed advanced drawer is mounted but inert and has zero viewport intersec
   assert.match(drawer.props.className, /md:-translate-x-\[100vw\]/)
   assert.match(drawer.props.className, /pointer-events-none/)
 
-  for (const viewportWidth of [767, 768, 1080, 1920, 3840]) {
+  for (const viewportWidth of [320, 360, 390, 430, 767, 768, 1080, 1920, 3840]) {
     const geometry = desktopGeometry(viewportWidth, false)
     const intersection = Math.max(
       0,
@@ -272,12 +272,18 @@ test('open geometry stays anchored and modal focus traps both tab directions', a
   assert.equal(drawer.props.inert, false)
   assert.equal(drawer.props['aria-modal'], true)
   assert.match(drawer.props.className, /translate-x-0/)
+  assert.match(drawer.props.className, /z-\[80\]/)
+  assert.match(drawer.props.className, /h-\[100vh\] supports-\[height:100dvh\]:h-\[100dvh\]/)
+  assert.match(drawer.props.className, /safe-area-inset-left/)
+  assert.match(drawer.props.className, /safe-area-inset-right/)
   assert.ok(backdrop)
   assert.equal(backdrop.props.type, 'button')
   assert.equal(backdrop.props.tabIndex, -1)
+  assert.match(backdrop.props.className, /z-\[70\]/)
   assert.ok(closeButton)
   assert.equal(closeButton.props.type, 'button')
-  assert.equal(backdrop.props.onClick, closeButton.props.onClick)
+  assert.equal(typeof backdrop.props.onClick, 'function')
+  assert.equal(typeof closeButton.props.onClick, 'function')
   assert.equal(runtime.document.activeElement, runtime.close, 'opening transfers focus to the drawer close control')
   assert.equal(runtime.appRoot.hasAttribute('inert'), true, 'the portalled modal makes the background inert')
   assert.equal(runtime.document.body.style.overflow, 'hidden')
@@ -296,6 +302,13 @@ test('open geometry stays anchored and modal focus traps both tab directions', a
     assert.ok(geometry.left >= 460 && geometry.left <= 560)
     assert.ok(geometry.width > 0 && geometry.width <= 380)
     assert.ok(geometry.left + geometry.width <= viewportWidth)
+  }
+
+  for (const [viewportWidth, viewportHeight] of [[320, 568], [360, 800], [390, 844], [430, 932], [767, 430]]) {
+    const geometry = desktopGeometry(viewportWidth, true)
+    assert.equal(geometry.left, 0)
+    assert.equal(geometry.width, viewportWidth)
+    assert.ok(viewportHeight > 0, `${viewportWidth}x${viewportHeight} dynamic viewport remains usable`)
   }
 
   globalThis.__advancedDrawerCleanups.forEach(cleanup => cleanup())

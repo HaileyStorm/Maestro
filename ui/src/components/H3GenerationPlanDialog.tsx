@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { AlertTriangle, Check, X } from 'lucide-react'
 import { useStore } from '../stores/useStore'
 import type { H3SegmentBoundary, H3SegmentPlan, H3SegmentPlanItem } from '../types'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
+import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
 
 function compactTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return 'calculating…'
@@ -86,11 +88,26 @@ export function H3GenerationPlanDialog() {
   const [boundaries, setBoundaries] = useState<BoundaryType[]>([])
   const [editorJobId, setEditorJobId] = useState<string | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
+  const [dialogRef] = useState<{ current: HTMLDivElement | null }>(() => ({ current: null }))
+  const [closeRef] = useState<{ current: HTMLButtonElement | null }>(() => ({ current: null }))
+  const [restoreFocusRef] = useState<{ current: HTMLElement | null }>(() => ({ current: null }))
+  const [operationRef] = useState<{ current: boolean }>(() => ({ current: false }))
+  const [modalIdentityRef] = useState<{ current: string | null }>(() => ({ current: null }))
+  const [reviewLoadingRef] = useState<{ current: boolean }>(() => ({ current: false }))
   const ref2vaTermsAccepted = hostTerms?.minimax_h3_ref2va.accepted === true
+
+  const requestClose = useMemo(() => () => {
+    if (reviewLoadingRef.current || operationRef.current) return
+    close()
+  }, [close, operationRef, reviewLoadingRef])
 
   useEffect(() => {
     if (activeWorkspace && !hostTerms && !hostTermsLoading) void loadHostTerms()
   }, [activeWorkspace, hostTerms, hostTermsLoading, loadHostTerms])
+
+  useEffect(() => {
+    reviewLoadingRef.current = reviewLoading
+  }, [reviewLoading, reviewLoadingRef])
 
   useEffect(() => {
     if (!plan || !planJobId) {
@@ -113,6 +130,31 @@ export function H3GenerationPlanDialog() {
     const timer = window.setInterval(() => setNowMs(Date.now()), 250)
     return () => window.clearInterval(timer)
   }, [])
+
+  const planOpen = Boolean(plan && planJobId && planWorkspace)
+  useEffect(() => {
+    if (!planOpen || !planJobId || !planWorkspace || !dialogRef.current || !closeRef.current) return
+    const modalIdentity = `${planWorkspace}\u0000${planJobId}`
+    if (modalIdentityRef.current !== modalIdentity) {
+      restoreFocusRef.current = (
+        typeof HTMLElement !== 'undefined' && document.activeElement instanceof HTMLElement
+      ) ? document.activeElement : null
+      modalIdentityRef.current = modalIdentity
+    }
+    const uninstall = installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: closeRef.current,
+      restoreFocus: restoreFocusRef.current,
+      appRoot: document.getElementById('root'),
+      onClose: requestClose,
+      priority: 180,
+    })
+    return () => {
+      uninstall()
+      if (modalIdentityRef.current === modalIdentity) modalIdentityRef.current = null
+    }
+  }, [closeRef, dialogRef, modalIdentityRef, planJobId, planOpen, planWorkspace, requestClose, restoreFocusRef])
 
   useEffect(() => {
     if (planWorkspace && activeWorkspace !== planWorkspace) close()
@@ -167,26 +209,50 @@ export function H3GenerationPlanDialog() {
     return ''
   }
 
+  const runIfTop = (action: () => void) => {
+    if (typeof document === 'undefined') {
+      action()
+      return true
+    }
+    return closeModalIfTop(document, dialogRef.current, action)
+  }
+
   const submit = () => {
-    if (!plan || !editsReady || reviewSecondsRemaining === 0) return
-    const blockedIndex = models.findIndex((model, index) => getModelBlockedReason(index, model))
-    if (blockedIndex >= 0) {
-      window.alert(getModelBlockedReason(blockedIndex, models[blockedIndex]) || 'This checkpoint is unavailable for the selected segment.')
-      return
-    }
-    if (models.includes('minimax_h3_ref2va') && !ref2vaTermsAccepted) {
-      window.alert('Accept the MiniMax H3 Ref2VA model terms before submitting this plan.')
-      return
-    }
-    void approve({
-      segmentOverrides: models.map((model, index) => ({
-        model_type: model,
-        drop_semantic_refs: model !== 'minimax_h3_ref2va',
-        reason: model === plan.segments[index]?.model_type
-          ? plan.segments[index].model_reason
-          : 'user plan override',
-      })),
-      boundaryOverrides: boundaries.map(type => ({ type })),
+    runIfTop(() => {
+      if (
+        !plan || !editsReady
+        || reviewSecondsRemaining === 0
+        || reviewLoadingRef.current
+        || operationRef.current
+      ) return
+      const blockedIndex = models.findIndex((model, index) => getModelBlockedReason(index, model))
+      if (blockedIndex >= 0) {
+        window.alert(getModelBlockedReason(blockedIndex, models[blockedIndex]) || 'This checkpoint is unavailable for the selected segment.')
+        return
+      }
+      if (models.includes('minimax_h3_ref2va') && !ref2vaTermsAccepted) {
+        window.alert('Accept the MiniMax H3 Ref2VA model terms before submitting this plan.')
+        return
+      }
+      operationRef.current = true
+      void Promise.resolve(approve({
+        segmentOverrides: models.map((model, index) => ({
+          model_type: model,
+          drop_semantic_refs: model !== 'minimax_h3_ref2va',
+          reason: model === plan.segments[index]?.model_type
+            ? plan.segments[index].model_reason
+            : 'user plan override',
+        })),
+        boundaryOverrides: boundaries.map(type => ({ type })),
+      })).finally(() => { operationRef.current = false })
+    })
+  }
+
+  const cancelGeneration = () => {
+    runIfTop(() => {
+      if (reviewLoadingRef.current || operationRef.current) return
+      operationRef.current = true
+      void Promise.resolve(cancel()).finally(() => { operationRef.current = false })
     })
   }
 
@@ -224,22 +290,36 @@ export function H3GenerationPlanDialog() {
     setBoundaries(values => values.map((value, i) => i === index ? type : value))
   }
 
-  return (
+  const dialog = (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto overscroll-contain bg-black/70 p-3 [-webkit-overflow-scrolling:touch]"
+      className="fixed inset-0 z-[180] flex h-[100vh] items-center justify-center overflow-hidden supports-[height:100dvh]:h-[100dvh]"
       style={{
         paddingTop: 'max(0.75rem, env(safe-area-inset-top))',
+        paddingRight: 'max(0.75rem, env(safe-area-inset-right))',
         paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(0.75rem, env(safe-area-inset-left))',
       }}
-      role="dialog"
-      aria-modal="true"
-      aria-label="Review long video plan"
     >
-      <div className="flex max-h-[calc(100dvh-1.5rem)] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-2xl sm:max-h-[92vh]">
-        <div className="flex items-start justify-between border-b border-border px-4 py-3">
-          <div>
-            <h2 className="text-sm font-semibold text-text-primary">Review long-video plan</h2>
-            <p className="mt-0.5 text-[11px] text-text-muted">
+      <button
+        type="button"
+        tabIndex={-1}
+        disabled={reviewLoading}
+        aria-label="Close long-video plan review"
+        className="absolute inset-0 appearance-none border-0 bg-black/70 p-0"
+        onClick={() => closeModalIfTop(document, dialogRef.current, requestClose)}
+      />
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="h3-plan-dialog-title"
+        aria-describedby="h3-plan-dialog-description"
+        className="relative flex min-h-0 max-h-[calc(100vh-1.5rem)] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-2xl supports-[height:100dvh]:max-h-[calc(100dvh-1.5rem)] motion-reduce:[&_*]:transition-none motion-reduce:[&_*]:animate-none sm:max-h-[92vh]"
+      >
+        <div className="flex shrink-0 items-start justify-between gap-3 border-b border-border px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <h2 id="h3-plan-dialog-title" className="text-sm font-semibold text-text-primary">Review long-video plan</h2>
+            <p id="h3-plan-dialog-description" className="mt-0.5 text-[11px] text-text-muted">
               Planned segments {plan.clip_count} · {(planPublishedFrames / planFps).toFixed(2)}s published
               {plan.planned_frames !== planPublishedFrames && ` · ${(plan.planned_frames / planFps).toFixed(2)}s generated`}
               {' '}· {switchCount} checkpoint switch{switchCount === 1 ? '' : 'es'}
@@ -251,10 +331,19 @@ export function H3GenerationPlanDialog() {
               </p>
             )}
           </div>
-          <button onClick={close} className="rounded p-1 text-text-muted hover:bg-bg-hover hover:text-text-primary" aria-label="Close plan review"><X size={16} /></button>
+          <button
+            ref={closeRef}
+            type="button"
+            disabled={reviewLoading}
+            onClick={() => closeModalIfTop(document, dialogRef.current, requestClose)}
+            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-wait disabled:opacity-50"
+            aria-label="Close long-video plan review"
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
         </div>
 
-        <div className="min-h-0 overflow-y-auto overscroll-contain p-4 [-webkit-overflow-scrolling:touch]">
+        <div className="min-h-0 overflow-y-auto overscroll-contain flex-1 p-4 [-webkit-overflow-scrolling:touch]">
           <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-[10px] text-text-secondary">
             <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-400" />
             <span>FL2VA continues motion from frame anchors. Ref2VA uses semantic references and recent context. A final end frame locks the last segment to FL2VA. Semantic references remain attached to the plan but are not consumed by FL2VA segments.</span>
@@ -269,9 +358,9 @@ export function H3GenerationPlanDialog() {
                 {!ref2vaTermsAccepted && hostTerms && (
                   <button
                     type="button"
-                    disabled={hostTermsLoading}
+                    disabled={hostTermsLoading || reviewLoading}
                     onClick={() => { void acceptHostTerm('minimax_h3_ref2va') }}
-                    className="w-full shrink-0 rounded border border-violet-400/50 px-2 py-1 text-violet-200 hover:bg-violet-500/10 disabled:opacity-50 sm:w-auto sm:px-1.5 sm:py-0.5"
+                    className="min-h-11 w-full shrink-0 rounded border border-violet-400/50 px-3 py-2 text-violet-200 transition-colors hover:bg-violet-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300 disabled:opacity-50 sm:w-auto"
                   >
                     Accept for this host
                   </button>
@@ -305,13 +394,13 @@ export function H3GenerationPlanDialog() {
                       {generatedFrames !== publishedFrames && ` · ${generatedSeconds.toFixed(2)}s generated · ${generatedFrames}f`}
                     </span>
                     {index > 0 && (
-                      <select disabled={!editsReady} value={boundaries[index - 1]} onChange={event => changeBoundary(index - 1, event.target.value as BoundaryType)} className="ml-auto rounded border border-border bg-bg-primary px-2 py-1 text-[10px] text-text-secondary disabled:opacity-50">
+                      <select disabled={!editsReady || reviewLoading} value={boundaries[index - 1]} onChange={event => changeBoundary(index - 1, event.target.value as BoundaryType)} aria-label={`Boundary before segment ${segment.index}`} className="ml-auto min-h-11 max-w-full rounded border border-border bg-bg-primary px-2 py-1 text-[10px] text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                         {Object.entries(BOUNDARY_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                       </select>
                     )}
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <select disabled={!editsReady} value={models[index]} onChange={event => changeModel(index, event.target.value as H3Model)} className="rounded border border-border bg-bg-primary px-2 py-1 text-[11px] text-text-primary disabled:opacity-50">
+                    <select disabled={!editsReady || reviewLoading} value={models[index]} onChange={event => changeModel(index, event.target.value as H3Model)} aria-label={`Checkpoint for segment ${segment.index}`} className="min-h-11 max-w-full rounded border border-border bg-bg-primary px-2 py-1 text-[11px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                       {checkpointOptions.map(option => (
                         <option
                           key={option.model_type}
@@ -351,10 +440,10 @@ export function H3GenerationPlanDialog() {
           </div>
         </div>
 
-        <div className="shrink-0 flex flex-wrap items-center gap-2 border-t border-border px-4 py-3">
+        <div className="flex max-h-[45vh] shrink-0 flex-wrap items-center gap-2 overflow-y-auto overscroll-contain border-t border-border px-4 py-3 [-webkit-overflow-scrolling:touch]">
           <div className="mr-auto min-w-0 text-[10px] text-text-muted">
             <p className="truncate">Job {planJobId} · Project {planWorkspace}</p>
-            <p className="mt-1 text-amber-200">
+            <p role="status" aria-live="polite" className="mt-1 text-amber-200">
               {reviewSecondsRemaining == null
                 ? !ref2vaTermsAccepted && (planReviewTermsRequired || needsRef2VA)
                   ? 'Approval required to accept Ref2VA terms'
@@ -363,12 +452,13 @@ export function H3GenerationPlanDialog() {
                   ? `Server auto-accepts this frozen plan in ${Math.ceil(reviewSecondsRemaining)}s`
                   : 'Server is auto-accepting this frozen plan…'}
             </p>
-            {reviewError && <p className="mt-1 text-red-300">{reviewError}</p>}
+            {reviewError && <p role="alert" className="mt-1 text-red-300">{reviewError}</p>}
           </div>
-          <button disabled={reviewLoading} onClick={() => void cancel()} className="rounded border border-red-400/40 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/10 disabled:opacity-50">Cancel generation</button>
-          <button disabled={reviewLoading || reviewSecondsRemaining === 0 || invalidSelections.length > 0} onClick={submit} className="flex items-center gap-1.5 rounded bg-accent-blue px-3 py-1.5 text-xs font-medium text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"><Check size={13} />{reviewLoading ? 'Applying…' : 'Approve & resume'}</button>
+          <button type="button" disabled={reviewLoading} onClick={cancelGeneration} className="min-h-11 w-full rounded border border-red-400/40 px-3 py-2 text-xs text-red-300 transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 disabled:cursor-wait disabled:opacity-50 sm:w-auto">Cancel generation</button>
+          <button type="button" disabled={reviewLoading || reviewSecondsRemaining === 0 || invalidSelections.length > 0} onClick={submit} className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded bg-accent-blue px-3 py-2 text-xs font-medium text-white transition-[filter] hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"><Check size={13} aria-hidden="true" />{reviewLoading ? 'Applying…' : 'Approve & resume'}</button>
         </div>
       </div>
     </div>
   )
+  return typeof document === 'undefined' ? dialog : createPortal(dialog, document.body)
 }

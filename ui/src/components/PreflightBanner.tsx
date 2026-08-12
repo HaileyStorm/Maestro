@@ -31,32 +31,50 @@ export function PreflightBanner() {
   const hasError = checks.some(c => c.level === 'error')
 
   return (
-    <div className={`fixed top-0 inset-x-0 z-50 px-4 py-2 flex items-start gap-2.5 border-b backdrop-blur-sm ${
-      hasError
-        ? 'bg-red-500/20 border-red-500/40'
-        : 'bg-amber-500/20 border-amber-500/40'
-    }`}>
-      <AlertTriangle
-        size={15}
-        className={`shrink-0 mt-0.5 ${hasError ? 'text-chip-red' : 'text-indicator-warning'}`}
-      />
-      <div className="flex-1 min-w-0 space-y-0.5">
-        {checks.map(c => (
-          <div key={c.id} className="text-[11px] leading-snug text-text-primary">
-            {c.message}
-          </div>
-        ))}
-      </div>
-      <button
-        onClick={() => {
-          sessionStorage.setItem('maestro_preflight_dismissed', '1')
-          setDismissed(true)
-        }}
-        className="shrink-0 p-0.5 rounded text-text-muted hover:text-text-primary transition-colors"
-        aria-label="Dismiss"
+    <div
+      className="pointer-events-none fixed inset-0 z-50 flex max-h-[100vh] items-start supports-[height:100dvh]:max-h-[100dvh]"
+      style={{
+        paddingTop: 'env(safe-area-inset-top, 0px)',
+        paddingRight: 'env(safe-area-inset-right, 0px)',
+        paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+        paddingLeft: 'env(safe-area-inset-left, 0px)',
+      }}
+    >
+      <div
+        role={hasError ? 'alert' : 'status'}
+        aria-live={hasError ? 'assertive' : 'polite'}
+        aria-atomic="true"
+        aria-label={hasError ? 'Environment preflight errors' : 'Environment preflight warnings'}
+        className={`pointer-events-auto flex max-h-full w-full items-start gap-2.5 overflow-y-auto overscroll-contain border-b px-4 py-2 backdrop-blur-sm ${
+          hasError
+            ? 'bg-red-500/20 border-red-500/40'
+            : 'bg-amber-500/20 border-amber-500/40'
+        }`}
       >
-        <X size={13} />
-      </button>
+        <AlertTriangle
+          size={15}
+          aria-hidden="true"
+          className={`mt-3.5 shrink-0 ${hasError ? 'text-chip-red' : 'text-indicator-warning'}`}
+        />
+        <div className="min-w-0 flex-1 space-y-0.5 py-3">
+          {checks.map(c => (
+            <div key={c.id} className="break-words text-[11px] leading-snug text-text-primary">
+              {c.message}
+            </div>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            sessionStorage.setItem('maestro_preflight_dismissed', '1')
+            setDismissed(true)
+          }}
+          className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded text-text-muted transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary motion-reduce:transition-none"
+          aria-label="Dismiss environment preflight notice"
+        >
+          <X size={16} aria-hidden="true" />
+        </button>
+      </div>
     </div>
   )
 }

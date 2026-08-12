@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useId, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { X, HardDrive, Loader2, Trash2, RefreshCw, Copy, Boxes, FolderOpen, Film } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import {
@@ -7,6 +8,7 @@ import {
   type StorageUsage, type StorageDuplicate,
 } from '../../api/client'
 import { formatBytes } from '../../lib/format'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 
 /** Full-screen storage manager: usage analytics backfilled from every
  *  generation sidecar, plus a linked-install duplicate finder. Every row
@@ -25,6 +27,29 @@ export function StorageDashboard() {
   const [confirmKey, setConfirmKey] = useState<string | null>(null)
   const [busyKey, setBusyKey] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const titleId = useId()
+
+  const closeDashboard = useCallback(() => {
+    setOpen(false)
+  }, [setOpen])
+
+  useEffect(() => {
+    if (!open || !dialogRef.current || !closeButtonRef.current) return
+    const restoreFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    return installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: closeButtonRef.current,
+      restoreFocus,
+      appRoot: document.getElementById('root'),
+      onClose: closeDashboard,
+      priority: 70,
+    })
+  }, [closeDashboard, open])
 
   const loadUsage = useCallback(async () => {
     setUsageLoading(true)
@@ -80,11 +105,13 @@ export function StorageDashboard() {
   const totalLoras = usage ? usage.loras.reduce((a, l) => a + l.size_bytes, 0) : 0
   const totalMedia = usage ? usage.workspaces.reduce((a, w) => a + w.size_bytes, 0) : 0
 
-  const rowBtn = (key: string, label: string, onRun: () => Promise<void>) => (
+  const rowBtn = (key: string, label: string, accessibleSubject: string, onRun: () => Promise<void>) => (
     <button
+      type="button"
       onClick={() => confirmAndRun(key, onRun)}
       disabled={busyKey === key}
-      className={`flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded border transition-colors shrink-0 ${
+      aria-label={`${confirmKey === key ? 'Confirm ' : ''}${label} ${accessibleSubject}`}
+      className={`flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded border px-2 py-1 text-[10px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
         confirmKey === key
           ? 'bg-red-500/20 border-red-500/50 text-red-400'
           : 'border-border text-text-muted hover:text-red-400 hover:border-red-500/40'
@@ -95,27 +122,56 @@ export function StorageDashboard() {
     </button>
   )
 
-  return (
-    <div className="fixed inset-0 z-[60] flex flex-col bg-bg-primary">
-      <div className="px-4 py-3 border-b border-border flex items-center gap-3 shrink-0">
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[60] flex h-[100vh] items-stretch justify-stretch overflow-hidden supports-[height:100dvh]:h-[100dvh]"
+      style={{
+        paddingTop: 'max(0.5rem, env(safe-area-inset-top))',
+        paddingRight: 'max(0.5rem, env(safe-area-inset-right))',
+        paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(0.5rem, env(safe-area-inset-left))',
+      }}
+    >
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label="Close storage manager"
+        className="absolute inset-0 z-[60] appearance-none border-0 bg-black/60 p-0"
+        onClick={() => closeModalIfTop(document, dialogRef.current, closeDashboard)}
+      />
+      <div
+        id="storage-manager-dialog"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="relative z-[70] flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-bg-primary shadow-2xl"
+      >
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-2 sm:gap-3 sm:px-4 sm:py-3">
         <HardDrive size={16} className="text-accent-blue" />
-        <h1 className="text-sm font-semibold text-text-primary">Storage Manager</h1>
+        <h1 id={titleId} className="text-sm font-semibold text-text-primary">Storage Manager</h1>
         {usage && (
-          <span className="text-[10px] text-text-muted">
+          <span className="min-w-0 truncate text-[10px] text-text-muted">
             usage from {usage.scanned_sidecars} generations
           </span>
         )}
         {usageLoading && <Loader2 size={13} className="animate-spin text-accent-blue" />}
-        <button onClick={() => setOpen(false)} className="ml-auto p-1.5 rounded-lg hover:bg-bg-hover transition-colors">
-          <X size={16} className="text-text-muted" />
+        <button
+          ref={closeButtonRef}
+          type="button"
+          onClick={() => closeModalIfTop(document, dialogRef.current, closeDashboard)}
+          className="ml-auto flex min-h-11 min-w-11 items-center justify-center rounded-lg transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+          aria-label="Close storage manager"
+        >
+          <X size={16} className="text-text-muted" aria-hidden="true" />
         </button>
       </div>
 
       {error && (
-        <div className="mx-4 mt-3 px-3 py-2 text-[11px] text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg">{error}</div>
+        <div role="alert" className="mx-4 mt-3 px-3 py-2 text-[11px] text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg">{error}</div>
       )}
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-6">
+      <div className="min-h-0 flex-1 space-y-6 overflow-y-auto overscroll-contain p-3 [-webkit-overflow-scrolling:touch] sm:p-4">
         {/* Summary tiles */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
           {[
@@ -133,25 +189,26 @@ export function StorageDashboard() {
 
         {/* Duplicates */}
         <section>
-          <div className="flex items-center gap-2 mb-2">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
             <h2 className="text-xs font-medium text-text-primary uppercase tracking-wider">Duplicates in linked folders</h2>
             <button
+              type="button"
               onClick={scanDupes}
               disabled={dupesLoading}
-              className="flex items-center gap-1 px-2 py-1 text-[10px] rounded border border-border text-text-secondary hover:text-text-primary transition-colors disabled:opacity-50"
+              className="flex min-h-11 min-w-11 items-center justify-center gap-1 rounded border border-border px-2 py-1 text-[10px] text-text-secondary transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
             >
               {dupesLoading ? <Loader2 size={10} className="animate-spin" /> : <RefreshCw size={10} />}
               Scan
             </button>
-            <span className="text-[10px] text-text-muted">
+            <span className="w-full text-[10px] text-text-muted lg:w-auto lg:flex-1">
               same file in Maestro AND a linked install — deleting Maestro's copy is free, the linked one keeps working
             </span>
-            <label className="ml-auto flex items-center gap-1.5 text-[10px] text-text-secondary cursor-pointer shrink-0" title="The inverse direction: keep Maestro's copy and remove the duplicate FROM the linked install. Removals go to the Windows Recycle Bin so they can be undone. Off by default because it modifies other installs.">
+            <label className="flex min-h-11 w-full cursor-pointer items-center gap-2 text-[10px] text-text-secondary md:ml-auto md:w-auto md:shrink-0" title="The inverse direction: keep Maestro's copy and remove the duplicate FROM the linked install. Removals go to the Windows Recycle Bin so they can be undone. Off by default because it modifies other installs.">
               <input
                 type="checkbox"
                 checked={allowLinkedRemoval}
                 onChange={e => updateServicesConfig({ storage_allow_linked_removal: e.target.checked })}
-                className="w-3 h-3 rounded border-border bg-bg-tertiary accent-accent-blue"
+                className="h-4 w-4 rounded border-border bg-bg-tertiary accent-accent-blue"
               />
               Allow removing from linked installs
             </label>
@@ -162,12 +219,12 @@ export function StorageDashboard() {
           {dupes && dupes.duplicates.length > 0 && (
             <div className="rounded-lg border border-border overflow-hidden">
               {dupes.duplicates.map(d => (
-                <div key={d.primary_path} className="flex items-center gap-2 px-3 py-1.5 text-xs border-b border-border last:border-b-0 hover:bg-bg-hover">
+                <div key={d.primary_path} className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-1.5 text-xs last:border-b-0 hover:bg-bg-hover md:flex-nowrap">
                   <span className="text-[9px] px-1 py-0.5 rounded bg-bg-tertiary text-text-muted uppercase shrink-0">{d.kind}</span>
                   <span className="truncate text-text-primary flex-1 min-w-0" title={d.primary_path}>{d.rel_path}</span>
                   <span className="text-text-muted shrink-0" title={`Also in ${d.linked_path}`}>in {d.linked_install}</span>
                   <span className="text-text-secondary tabular-nums shrink-0">{formatBytes(d.size_bytes)}</span>
-                  {rowBtn(`dup:${d.primary_path}`, 'Reclaim', async () => {
+                  {rowBtn(`dup:${d.primary_path}`, 'Reclaim', d.rel_path, async () => {
                     await reclaimDuplicate(d.primary_path)
                     setDupes(prev => prev ? {
                       ...prev,
@@ -175,7 +232,7 @@ export function StorageDashboard() {
                       total_reclaimable_bytes: prev.total_reclaimable_bytes - d.size_bytes,
                     } : prev)
                   })}
-                  {allowLinkedRemoval && rowBtn(`dupl:${d.linked_path}`, 'Remove linked', async () => {
+                  {allowLinkedRemoval && rowBtn(`dupl:${d.linked_path}`, 'Remove linked', d.rel_path, async () => {
                     await removeLinkedDuplicate(d.linked_path)
                     // Pair broken the other way: Maestro's copy stays, the
                     // linked one is in that install's Recycle Bin.
@@ -202,7 +259,7 @@ export function StorageDashboard() {
           {usage && (
             <div className="rounded-lg border border-border overflow-hidden">
               {usage.models.filter(m => m.size_bytes > 0).map(m => (
-                <div key={m.model_type} className="flex items-center gap-2 px-3 py-1.5 text-xs border-b border-border last:border-b-0 hover:bg-bg-hover">
+                <div key={m.model_type} className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-1.5 text-xs last:border-b-0 hover:bg-bg-hover md:flex-nowrap">
                   <span className="truncate text-text-primary flex-1 min-w-0">{m.name}</span>
                   <span className={`shrink-0 ${m.use_count === 0 ? 'text-indicator-warning' : 'text-text-muted'}`}>
                     {m.use_count === 0 ? 'never used' : `${m.use_count} uses, last ${fmtWhen(m.last_used)}`}
@@ -210,7 +267,7 @@ export function StorageDashboard() {
                   <span className="text-text-secondary tabular-nums shrink-0" title={m.primary_bytes < m.size_bytes ? `${formatBytes(m.primary_bytes)} deletable here; the rest lives in linked installs or belongs to a base model` : undefined}>
                     {formatBytes(m.size_bytes)}
                   </span>
-                  {m.primary_bytes > 0 ? rowBtn(`model:${m.model_type}`, 'Delete', async () => {
+                  {m.primary_bytes > 0 ? rowBtn(`model:${m.model_type}`, 'Delete', m.name, async () => {
                     await deleteModel(m.model_type)
                     loadUsage()
                   }) : m.alias_of ? (
@@ -240,7 +297,7 @@ export function StorageDashboard() {
           {usage && (
             <div className="rounded-lg border border-border overflow-hidden">
               {usage.loras.map(l => (
-                <div key={`${l.directory}/${l.filename}`} className="flex items-center gap-2 px-3 py-1.5 text-xs border-b border-border last:border-b-0 hover:bg-bg-hover">
+                <div key={`${l.directory}/${l.filename}`} className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-1.5 text-xs last:border-b-0 hover:bg-bg-hover md:flex-nowrap">
                   <span className="truncate text-text-primary flex-1 min-w-0">{l.filename}</span>
                   {l.linked && (
                     <span
@@ -254,7 +311,7 @@ export function StorageDashboard() {
                     {l.use_count === 0 ? 'never used' : `${l.use_count} uses, last ${fmtWhen(l.last_used)}`}
                   </span>
                   <span className="text-text-secondary tabular-nums shrink-0">{formatBytes(l.size_bytes)}</span>
-                  {!l.linked && rowBtn(`lora:${l.directory}/${l.filename}`, 'Delete', async () => {
+                  {!l.linked && rowBtn(`lora:${l.directory}/${l.filename}`, 'Delete', l.filename, async () => {
                     await deleteLoraFile(l.directory, l.filename)
                     setUsage(prev => prev ? { ...prev, loras: prev.loras.filter(x => !(x.directory === l.directory && x.filename === l.filename)) } : prev)
                   })}
@@ -270,12 +327,12 @@ export function StorageDashboard() {
           {usage && (
             <div className="rounded-lg border border-border overflow-hidden">
               {usage.workspaces.map(w => (
-                <div key={w.name} className="flex items-center gap-2 px-3 py-1.5 text-xs border-b border-border last:border-b-0 hover:bg-bg-hover">
+                <div key={w.name} className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-1.5 text-xs last:border-b-0 hover:bg-bg-hover md:flex-nowrap">
                   <FolderOpen size={11} className="text-text-muted shrink-0" />
                   <span className="truncate text-text-primary flex-1 min-w-0">{w.name}</span>
                   <span className="text-text-muted shrink-0">{w.file_count} files</span>
                   <span className="text-text-secondary tabular-nums shrink-0">{formatBytes(w.size_bytes)}</span>
-                  {w.name !== 'default' && rowBtn(`ws:${w.name}`, 'Delete', async () => {
+                  {w.name !== 'default' && rowBtn(`ws:${w.name}`, 'Delete', `${w.name} workspace`, async () => {
                     await apiDeleteWorkspace(w.name)
                     loadWorkspaces()
                     loadUsage()
@@ -286,6 +343,8 @@ export function StorageDashboard() {
           )}
         </section>
       </div>
-    </div>
+      </div>
+    </div>,
+    document.body,
   )
 }

@@ -28,7 +28,7 @@ export function AspectRatioGrid() {
           <button
             key={r.value}
             onClick={() => setAspectRatio(r.value)}
-            className={`flex-1 flex flex-col items-center gap-0.5 py-2 rounded-lg border text-[10px] transition-all ${
+            className={`mobile-control-target min-w-0 flex-1 flex flex-col items-center gap-0.5 py-2 rounded-lg border text-[10px] transition-all ${
               aspectRatio === r.value
                 ? 'border-accent-blue bg-bg-active text-text-primary'
                 : 'border-border text-text-muted hover:border-border-light hover:text-text-secondary'

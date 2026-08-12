@@ -140,6 +140,19 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertIn("POLL_INTERVAL_MS.queueIdleVisible", MAIN)
         self.assertIn("if (!document.hidden) void refreshQueue()", MAIN)
         self.assertIn("QUEUE_REFRESH_EVENT", MAIN)
+        self.assertIn("queueRefreshIsStale(sequence, queuePollSequence.current", MAIN)
+        self.assertIn("role=\"status\"", MAIN)
+        self.assertIn("aria-live=\"polite\"", MAIN)
+        self.assertIn("Showing the last successful update", MAIN)
+        self.assertIn("retrying automatically", MAIN)
+        self.assertIn("machineControls && queue &&", MAIN)
+        self.assertIn("const queueDisplayJobs = queueTabDisplayJobs(queueTabSnapshot, jobs)", MAIN)
+        self.assertIn("Queue contents are unavailable until a scheduler refresh succeeds.", MAIN)
+        self.assertLess(
+            MAIN.index("reconcileQueueState(next)"),
+            MAIN.index("jobs: useStore.getState().jobs"),
+        )
+        self.assertNotIn("setQueueTabState(null)", MAIN)
         self.assertIn("downloads.length > 0", DOWNLOADS)
         self.assertIn("POLL_INTERVAL_MS.downloadsActiveVisible", DOWNLOADS)
         self.assertIn("POLL_INTERVAL_MS.downloadsIdleVisible", DOWNLOADS)

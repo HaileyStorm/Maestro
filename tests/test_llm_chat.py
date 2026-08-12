@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -33,6 +34,17 @@ from services import (  # noqa: E402
     llm_response_assist,
     llm_service,
 )
+
+
+def _jsx_div_element(source: str, marker: str) -> tuple[int, str, str]:
+    start = source.index(marker)
+    opening = source[start:source.index(">", start) + 1]
+    depth = 0
+    for match in re.finditer(r"<(/?)div(?:\s|>)", source[start:]):
+        depth += -1 if match.group(1) else 1
+        if depth == 0:
+            return start, opening, source[start:start + match.end()]
+    raise AssertionError(f"Unclosed JSX div for {marker!r}")
 
 
 class _ChatResponse:
@@ -140,11 +152,17 @@ class ChatPolicyTests(unittest.TestCase):
 
     def test_chat_composer_owns_per_message_guide_controls_and_snapshot(self):
         source = LLM_CHAT_UI_PATH.read_text(encoding="utf-8")
-        composer = source.index('className="border-t border-border')
-        guide_control = source.index("Add a prompting guide to this message")
-        send_button = source.index('onClick={() => void send()}', guide_control)
+        composer_start, opening, composer = _jsx_div_element(
+            source,
+            "<div data-chat-composer",
+        )
+        guide_control = composer.index("Add a prompting guide to this message")
+        send_button = composer.index('onClick={() => void send()}', guide_control)
 
-        self.assertGreater(guide_control, composer)
+        self.assertLess(source.index("data-chat-transcript"), composer_start)
+        self.assertIn("max-h-[46%]", opening)
+        self.assertIn("overflow-y-auto overscroll-contain", opening)
+        self.assertIn("lg:max-h-none lg:overflow-visible", opening)
         self.assertGreater(send_button, guide_control)
         self.assertIn("target_model_prefixes", source)
         self.assertIn("prefix.length > best.prefixLength", source)
@@ -189,9 +207,8 @@ class ChatPolicyTests(unittest.TestCase):
         self.assertIn("Anthropic external provider", source)
         self.assertIn("configured external provider", source)
         self.assertIn("local provider on this machine", source)
-        disclosure = source.index('id="chat-data-disclosure"')
-        composer = source.index('className="border-t border-border')
-        self.assertGreater(disclosure, composer)
+        _, _, composer = _jsx_div_element(source, "<div data-chat-composer")
+        self.assertIn('id="chat-data-disclosure"', composer)
 
     def test_prompt_polish_prefers_ref2va_specific_video_guide(self):
         source = PROMPT_POLISH_PATH.read_text(encoding="utf-8")

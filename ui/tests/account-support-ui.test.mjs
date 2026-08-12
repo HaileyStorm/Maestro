@@ -54,6 +54,16 @@ async function withFetchMock(handler, action) {
   }
 }
 
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((done, fail) => {
+    resolve = done
+    reject = fail
+  })
+  return { promise, reject, resolve }
+}
+
 test('account wrappers keep credentials in same-origin no-store bodies and bind one nonce per mutation', async () => {
   const calls = []
   await withFetchMock(async (url, init = {}) => {
@@ -275,6 +285,169 @@ test('a successful sign-in hydrates current sessions and owner users without reo
   assert.equal(useStore.getState().accountUsers[0].username, 'Owner')
 })
 
+test('account loaders ignore reverse-order and post-logout responses from a stale identity', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.localStorage = new StorageFake()
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+
+  const accountA = {
+    id: 'account-a', username: 'Account A', role: 'owner', disabled: false,
+    created_at: 1, has_email: false, passkey_credentials: 0,
+    passkey_authentication_available: false,
+  }
+  const accountB = { ...accountA, id: 'account-b', username: 'Account B' }
+  const context = account => ({
+    enabled: true, authenticated: Boolean(account), account,
+    capabilities: account ? ['account.self', 'accounts.admin', 'services.admin'] : [],
+    reauthenticated: Boolean(account), passkey_authentication_available: false,
+    bootstrap_available: false,
+  })
+  const contextRequests = []
+  const sessionRequests = []
+  const userRequests = []
+  const accessRequests = []
+  let logoutContext = false
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.endsWith('/access-context')) {
+      const request = deferred()
+      accessRequests.push(request)
+      return request.promise
+    }
+    if (url.endsWith('/account/context')) {
+      if (logoutContext) return jsonResponse(context(null))
+      const request = deferred()
+      contextRequests.push(request)
+      return request.promise
+    }
+    if (url.endsWith('/account/sessions')) {
+      const request = deferred()
+      sessionRequests.push(request)
+      return request.promise
+    }
+    if (url.endsWith('/account/users')) {
+      const request = deferred()
+      userRequests.push(request)
+      return request.promise
+    }
+    if (url.endsWith('/account/nonce')) {
+      return jsonResponse({ nonce: 'logout-nonce', purpose: 'revoke_session', expires_in: 300 })
+    }
+    if (url.endsWith('/account/logout') && init.method === 'POST') {
+      logoutContext = true
+      return jsonResponse({ status: 'logged_out' })
+    }
+    throw new Error(`Unexpected account request: ${url} ${init.method || 'GET'}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+  })
+
+  const bundled = await build({
+    stdin: {
+      contents: "export { useStore } from './src/stores/useStore.ts'",
+      resolveDir: uiRoot,
+      loader: 'js',
+    },
+    bundle: true,
+    format: 'esm',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+  })
+  const { useStore } = await import(`${asDataModule(bundled.outputFiles[0].text)}#account-fencing`)
+
+  useStore.setState({ accessContext: null, accountContext: null })
+  const initialAccess = useStore.getState().loadAccessContext()
+  await useStore.getState().loadAccountContext()
+  accessRequests[0].resolve(jsonResponse({
+    remote: false,
+    project_password_required: false,
+    project_names_visible: true,
+    machine_controls: true,
+    custom_model_sources: true,
+    catalog_model_downloads: true,
+    classic_ui: false,
+    cloudflare_enabled: false,
+    share_url: '',
+    share_flow: '',
+    accounts: context(accountA),
+  }))
+  await initialAccess
+  assert.equal(useStore.getState().accountContext.account.id, accountA.id)
+
+  const staleAccess = useStore.getState().loadAccessContext()
+  const newerAccountContext = useStore.getState().loadAccountContext()
+  contextRequests[0].resolve(jsonResponse(context(accountB)))
+  await newerAccountContext
+  accessRequests[1].resolve(jsonResponse({
+    remote: false,
+    project_password_required: false,
+    project_names_visible: true,
+    machine_controls: true,
+    custom_model_sources: true,
+    catalog_model_downloads: true,
+    classic_ui: false,
+    cloudflare_enabled: false,
+    share_url: '',
+    share_flow: '',
+    accounts: context(accountA),
+  }))
+  await staleAccess
+  assert.equal(useStore.getState().accountContext.account.id, accountB.id)
+  assert.equal(useStore.getState().accessContext.accounts.account.id, accountB.id)
+  contextRequests.length = 0
+
+  useStore.setState({
+    accessContext: { accounts: context(accountA) },
+    accountContext: context(accountA),
+  })
+
+  const firstContext = useStore.getState().loadAccountContext()
+  const secondContext = useStore.getState().loadAccountContext()
+  contextRequests[1].resolve(jsonResponse(context(accountB)))
+  await secondContext
+  contextRequests[0].resolve(jsonResponse(context(accountA)))
+  await firstContext
+  assert.equal(useStore.getState().accountContext.account.id, accountB.id)
+
+  useStore.setState({ accountContext: context(accountA) })
+  const firstSessions = useStore.getState().loadAccountSessions()
+  const secondSessions = useStore.getState().loadAccountSessions()
+  sessionRequests[1].resolve(jsonResponse({ sessions: [{ id: 'new-session' }] }))
+  await secondSessions
+  sessionRequests[0].resolve(jsonResponse({ sessions: [{ id: 'old-session' }] }))
+  await firstSessions
+  assert.equal(useStore.getState().accountSessions[0].id, 'new-session')
+
+  const staleSessions = useStore.getState().loadAccountSessions()
+  const staleUsers = useStore.getState().loadAccountUsers()
+  await useStore.getState().logoutAccount()
+  sessionRequests[2].resolve(jsonResponse({ sessions: [{ id: 'stale-session' }] }))
+  userRequests[0].resolve(jsonResponse({ accounts: [accountA] }))
+  await Promise.all([staleSessions, staleUsers])
+  assert.equal(useStore.getState().accountContext.account, null)
+  assert.deepEqual(useStore.getState().accountSessions, [])
+  assert.deepEqual(useStore.getState().accountUsers, [])
+  assert.equal(useStore.getState().accountDetailsLoading, false)
+})
+
 test('account context is explicitly no-store and structured server errors stay bounded', async () => {
   const calls = []
   await withFetchMock(async (url, init = {}) => {
@@ -457,7 +630,7 @@ async function loadAccountButton() {
             export const Check='Check', ExternalLink='ExternalLink', HeartHandshake='HeartHandshake', KeyRound='KeyRound', Loader2='Loader2', LogIn='LogIn', LogOut='LogOut', RefreshCw='RefreshCw', ShieldCheck='ShieldCheck', UserCog='UserCog', UserPlus='UserPlus', UserRound='UserRound', X='X'
           ` }
           if (args.path === 'api') return { contents: 'export class AccountApiError extends Error {}' }
-          if (args.path === 'focus') return { contents: 'export const installModalFocus = () => () => {}' }
+          if (args.path === 'focus') return { contents: 'export const closeModalIfTop = () => true; export const installModalFocus = () => () => {}' }
           if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__accountStore)' }
           return null
         })
@@ -767,6 +940,13 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(source, /aria-labelledby=\{accountTabId\}/)
   assert.match(source, /if \(tab === 'support'\)[^]*lifecycleRef\.current\.closed\(\)[^]*clearSensitive\(\)/)
   assert.match(source, /<SupportPanel \/>/)
+  const headerCloseButton = source.match(/<button\s+ref=\{closeRef\}[^]*?<\/button>/)?.[0]
+  assert.ok(headerCloseButton, 'the visible Support drawer close button must remain present')
+  assert.match(headerCloseButton, /className="[^"]*\bh-11\b[^"]*\bw-11\b[^"]*\bp-0\b[^"]*\bmd:h-auto\b[^"]*\bmd:w-auto\b[^"]*\bmd:p-1\.5\b[^"]*"/)
+  const scrollRegion = source.match(/<div\s+role="region"[^]*?className="[^"]*\boverflow-y-auto\b[^"]*"\s*>/)?.[0]
+  assert.ok(scrollRegion, 'the drawer scroll container must remain an explicit accessible region')
+  assert.match(scrollRegion, /aria-label=\{accountsEnabled \? 'Support and account content' : 'Support content'\}/)
+  assert.match(scrollRegion, /tabIndex=\{0\}/)
   assert.match(supportSource, /rel="noopener noreferrer"/)
   assert.match(supportSource, /This is an acknowledgement[^]*not moderation, classification, or permission/)
   assert.match(supportSource, /already spent hundreds on Codex/)

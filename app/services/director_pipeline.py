@@ -127,7 +127,13 @@ def _explicit_guidance_from_snapshot(params: dict) -> bool:
 def _director_failure_details(exc: BaseException, *, code: str) -> dict:
     """Build a path/content-free failure record for persisted public state."""
     try:
-        from services.oom_detect import build_failure_details
+        from services.oom_detect import (
+            build_failure_details,
+            normalize_failure_details,
+        )
+        embedded = getattr(exc, "failure_details", None)
+        if isinstance(embedded, dict):
+            return normalize_failure_details(embedded)
         return build_failure_details(exc, stage="generation", code=code)
     except Exception:
         return {
@@ -145,6 +151,23 @@ class PipelineBusyError(RuntimeError):
 
 class DirectorModelCompatibilityError(ValueError):
     """Raised before Director submits work to an incompatible model."""
+
+
+class DirectorChildGenerationError(RuntimeError):
+    """Safe child failure retaining its structured resource diagnosis."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_details: dict | None = None,
+        oom_info: dict | None = None,
+    ):
+        super().__init__(message)
+        self.failure_details = (
+            dict(failure_details) if isinstance(failure_details, dict) else None
+        )
+        self.oom_info = dict(oom_info) if isinstance(oom_info, dict) else None
 
 
 def _director_model_assessment(model_type: str) -> tuple[dict, dict] | None:
@@ -3156,6 +3179,7 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
     # Wait for completion, mirroring job progress to pipeline status
     deadline = time.time() + timeout_s
     _abort_signalled = False
+    _resource_retry_seen = 0
 
     def _release_managed_child() -> None:
         if not recovery_managed or not _dir_pid:
@@ -3167,10 +3191,22 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
                 if not child_jobs:
                     _pipeline_child_jobs.pop(_dir_pid, None)
 
-    while time.time() < deadline:
+    while True:
         j = _jobs.get(job_id)
         if not j:
             raise RuntimeError("Job disappeared")
+        try:
+            resource_retry_attempt = max(
+                0, int(j.get("resource_retry_attempt", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            resource_retry_attempt = 0
+        if resource_retry_attempt > _resource_retry_seen:
+            _resource_retry_seen = resource_retry_attempt
+            # The child remains the same durable unit/job. Grant its bounded
+            # resource re-admission a fresh wait window without creating a
+            # second Director child or resetting parent progress.
+            deadline = max(deadline, time.time() + timeout_s)
         if j["status"] == "completed":
             outputs = _director_job_outputs(j)
             if recovery_managed:
@@ -3264,7 +3300,44 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
             err = j.get("error") or "Generation failed"
             print(f"[Pipeline] Job {job_id} failed: {err}")
             _release_managed_child()
-            raise RuntimeError(err)
+            raise DirectorChildGenerationError(
+                err,
+                failure_details=j.get("failure_details"),
+                oom_info=j.get("oom_info"),
+            )
+        # Reaching the old deadline is not sufficient to cancel: the retry
+        # counter above is re-read in this same iteration first, so a durable
+        # requeue committed at the edge receives its complete fresh window.
+        if time.time() >= deadline:
+            cancel_result = request_cancel(
+                job,
+                job_id=job_id,
+                active_states=_active_gen_states or {},
+                expected_resource_retry_attempt=_resource_retry_seen,
+            )
+            if not cancel_result.changed:
+                refreshed = _jobs.get(job_id)
+                if refreshed is not None:
+                    try:
+                        refreshed_retry_attempt = max(
+                            0,
+                            int(
+                                refreshed.get(
+                                    "resource_retry_attempt", 0,
+                                ) or 0
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        refreshed_retry_attempt = _resource_retry_seen
+                    if refreshed_retry_attempt > _resource_retry_seen:
+                        _resource_retry_seen = refreshed_retry_attempt
+                        deadline = time.time() + timeout_s
+                        continue
+                    if refreshed.get("status") in {
+                        "completed", "failed", "cancelled",
+                    }:
+                        continue
+            break
         # Backstop for stop_pipeline's abort: if the pipeline was cancelled
         # while this job runs (e.g. the job was submitted in the window
         # after the stop endpoint scanned _jobs), signal abort from here.
@@ -3298,11 +3371,6 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
                     )
         time.sleep(min(1.0, max(0.01, deadline - time.time())))
 
-    request_cancel(
-        job,
-        job_id=job_id,
-        active_states=_active_gen_states or {},
-    )
     if thread is not None:
         thread.join(timeout=_GENERATION_SETTLE_GRACE_S)
     if thread is not None and thread.is_alive():
@@ -4721,15 +4789,21 @@ def _run_pipeline(pid: str, resume: bool = False):
         # Tag with OOM info if applicable so the UI can surface the
         # OOM recovery banner. detect_oom returns None for non-OOM
         # failures, in which case oom_info stays absent.
-        _oom_info = None
+        _oom_info = (
+            dict(e.oom_info)
+            if isinstance(
+                getattr(e, "oom_info", None), dict,
+            ) else None
+        )
         try:
             from services.oom_detect import detect_oom
-            _coef = float(
-                getattr(_wgp, "server_config", {}).get(
-                    "vram_safety_coefficient", 0.80,
+            if _oom_info is None:
+                _coef = float(
+                    getattr(_wgp, "server_config", {}).get(
+                        "vram_safety_coefficient", 0.80,
+                    )
                 )
-            )
-            _oom_info = detect_oom(e, _coef)
+                _oom_info = detect_oom(e, _coef)
         except Exception:
             pass  # Never fail a failure handler
         _failure_details = _director_failure_details(
@@ -6390,6 +6464,628 @@ def _normalize_director_h3_keyframe_refs(gen_params: dict) -> list:
     return director_keyframe_refs
 
 
+def _canonicalize_director_h3_v2_shot_plan(
+    shot_plan: dict,
+    *,
+    prompts: list[str],
+    published: list[int],
+    fps: float,
+    compile_workflow,
+) -> list[str]:
+    """Validate and canonicalize sealed segment-local H3 prompt contracts."""
+    from services.h3_shot_planner import (
+        _compile_semantic_prompt,
+        _compile_segment_local_prompts,
+        _authored_opening_contains,
+        _authored_opening_payload,
+        _canonical_context_ir_parts,
+        _extract_final_blocking,
+        _semantic_dialogue_identity,
+        _strip_dialogue_occurrence_tokens,
+        _tag_dialogue_occurrences,
+        _validate_dialogue_spans,
+        validate_h3_shot_plan_seal,
+    )
+
+    contracts = shot_plan.get("source_contracts")
+    semantic_shots = shot_plan.get("semantic_shots")
+    shots = shot_plan.get("shots")
+    boundaries = shot_plan.get("clip_boundaries")
+    clip_frames = shot_plan.get("clip_frames")
+    clip_published = shot_plan.get("clip_published_frames")
+    clip_trims = shot_plan.get("clip_trim_tail_frames")
+    if not isinstance(contracts, list) or not contracts:
+        raise ValueError("Saved Director H3 semantic shots are incomplete")
+    if not isinstance(semantic_shots, list) or semantic_shots != contracts:
+        raise ValueError("Saved Director H3 semantic shot copies disagree")
+    if not isinstance(shots, list) or len(shots) != len(prompts):
+        raise ValueError("Saved Director H3 shot records are incomplete")
+    if not all(isinstance(shot, dict) for shot in shots):
+        raise ValueError("Saved Director H3 shot record is invalid")
+    if not isinstance(boundaries, list) or len(boundaries) != len(prompts) - 1:
+        raise ValueError("Saved Director H3 continuity metadata is incomplete")
+    if not all(isinstance(value, list) for value in (
+        clip_frames, clip_published, clip_trims,
+    )) or not (
+        len(clip_frames) == len(clip_published) == len(clip_trims) == len(prompts)
+        and [int(value) for value in clip_published] == [
+            int(value) for value in published
+        ]
+    ):
+        raise ValueError("Saved Director H3 physical geometry is incomplete")
+
+    canonical = [""] * len(prompts)
+    covered: set[int] = set()
+    mapping: dict[int, tuple[dict, int, dict, str, str]] = {}
+    authored_ids: set[str] = set()
+    nested_events: list[dict] = []
+    expected_dialogue_ordinals: list[tuple[int, int]] = []
+    for expected_source_index, contract in enumerate(contracts):
+        if not isinstance(contract, dict):
+            raise ValueError("Saved Director H3 semantic shot is invalid")
+        positions = contract.get("segment_indices")
+        semantic_prompt = contract.get("semantic_prompt")
+        authored_prompt = contract.get("authored_prompt")
+        source_index = contract.get("source_index")
+        semantic_index = contract.get("semantic_shot_index")
+        authored_shot_id = contract.get("authored_shot_id")
+        if any(field in contract for field in (
+            "semantic_dialogue_provenance",
+            "semantic_dialogue_provenance_sha256",
+        )):
+            raise ValueError(
+                "Saved Director H3 obsolete dialogue provenance is unsupported"
+            )
+        if (
+            not isinstance(positions, list)
+            or not positions
+            or not isinstance(semantic_prompt, str)
+            or not semantic_prompt.strip()
+            or not isinstance(authored_prompt, str)
+            or isinstance(source_index, bool)
+            or not isinstance(source_index, int)
+            or source_index != expected_source_index
+            or isinstance(semantic_index, bool)
+            or not isinstance(semantic_index, int)
+            or semantic_index != expected_source_index
+            or not isinstance(authored_shot_id, str)
+            or not authored_shot_id.strip()
+            or authored_shot_id in authored_ids
+            or contract.get("prompt_rewrite_for_physical_split") is not True
+            or contract.get("physical_prompt_compiler_version") != 2
+        ):
+            raise ValueError("Saved Director H3 semantic shot is incomplete")
+        _validate_dialogue_spans(semantic_prompt)
+        visual_context = contract.get("visual_context")
+        opening_blocking = contract.get("opening_blocking")
+        final_blocking = contract.get("final_blocking")
+        structured_dialogue_blocks = contract.get(
+            "structured_dialogue_blocks"
+        )
+        if (
+            not isinstance(visual_context, str)
+            or not isinstance(opening_blocking, str)
+            or not isinstance(final_blocking, str)
+            or not isinstance(structured_dialogue_blocks, list)
+            or not all(
+                isinstance(block, str) for block in structured_dialogue_blocks
+            )
+        ):
+            raise ValueError(
+                "Saved Director H3 semantic compiler inputs are incomplete"
+            )
+        rebuilt_semantic_prompt, _rebuilt_dialogue = _compile_semantic_prompt(
+            authored_prompt,
+            visual_context=visual_context,
+            opening_blocking=opening_blocking,
+            final_blocking=final_blocking,
+            structured_dialogue_blocks=structured_dialogue_blocks,
+        )
+        if rebuilt_semantic_prompt != semantic_prompt:
+            raise ValueError(
+                "Saved Director H3 semantic prompt provenance disagrees"
+            )
+        if visual_context:
+            without_visual, _ = _compile_semantic_prompt(
+                authored_prompt,
+                visual_context="",
+                opening_blocking=opening_blocking,
+                final_blocking=final_blocking,
+                structured_dialogue_blocks=structured_dialogue_blocks,
+            )
+            if without_visual == semantic_prompt:
+                raise ValueError(
+                    "Saved Director H3 semantic compiler inputs are not canonical"
+                )
+        source_is_canonical = (
+            _canonical_context_ir_parts(authored_prompt) is not None
+        )
+        if final_blocking and not source_is_canonical:
+            without_final, _ = _compile_semantic_prompt(
+                authored_prompt,
+                visual_context=visual_context,
+                opening_blocking=opening_blocking,
+                final_blocking="",
+                structured_dialogue_blocks=structured_dialogue_blocks,
+            )
+            if without_final == semantic_prompt:
+                raise ValueError(
+                    "Saved Director H3 semantic compiler inputs are not canonical"
+                )
+        if opening_blocking:
+            without_opening, _ = _compile_semantic_prompt(
+                authored_prompt,
+                visual_context=visual_context,
+                opening_blocking="",
+                final_blocking=final_blocking,
+                structured_dialogue_blocks=structured_dialogue_blocks,
+            )
+            if without_opening == semantic_prompt:
+                authored_opening = _authored_opening_payload(authored_prompt)
+                if (
+                    not _authored_opening_contains(
+                        authored_prompt, opening_blocking,
+                    )
+                    or opening_blocking != authored_opening
+                ):
+                    raise ValueError(
+                        "Saved Director H3 semantic compiler inputs are not canonical"
+                    )
+        for block_index in range(len(structured_dialogue_blocks)):
+            candidate_blocks = [
+                block
+                for index, block in enumerate(structured_dialogue_blocks)
+                if index != block_index
+            ]
+            without_block, _ = _compile_semantic_prompt(
+                authored_prompt,
+                visual_context=visual_context,
+                opening_blocking=opening_blocking,
+                final_blocking=final_blocking,
+                structured_dialogue_blocks=candidate_blocks,
+            )
+            if without_block == semantic_prompt:
+                raise ValueError(
+                    "Saved Director H3 semantic compiler inputs are not canonical"
+                )
+        prompt_changed = contract.get("prompt_changed_before_split")
+        authored_final_blocking = contract.get("authored_final_blocking")
+        if (
+            type(prompt_changed) is not bool
+            or prompt_changed != (semantic_prompt != authored_prompt)
+            or not isinstance(authored_final_blocking, str)
+            or authored_final_blocking
+                != _extract_final_blocking(authored_prompt)[1]
+        ):
+            raise ValueError(
+                "Saved Director H3 authored prompt provenance disagrees"
+            )
+        authored_ids.add(authored_shot_id)
+        normalized_positions: list[int] = []
+        for value in positions:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("Saved Director H3 segment mapping is invalid")
+            if value < 0 or value >= len(prompts) or value in covered:
+                raise ValueError("Saved Director H3 segment mapping is incomplete")
+            normalized_positions.append(value)
+            covered.add(value)
+        if normalized_positions != list(range(
+            normalized_positions[0], normalized_positions[-1] + 1,
+        )):
+            raise ValueError("Saved Director H3 semantic segments are not contiguous")
+
+        reference_labels = list(dict.fromkeys(re.findall(
+            r"<(?:Subject|Picture|Video|Audio)\s+[1-9]\d*>",
+            semantic_prompt,
+            flags=re.IGNORECASE,
+        )))
+        if contract.get("reference_labels") != reference_labels:
+            raise ValueError("Saved Director H3 semantic reference mapping disagrees")
+        slices = contract.get("execution_slices")
+        digests = contract.get("executable_prompt_sha256")
+        if (
+            not isinstance(slices, list)
+            or len(slices) != len(normalized_positions)
+            or not isinstance(digests, list)
+            or len(digests) != len(normalized_positions)
+        ):
+            raise ValueError("Saved Director H3 execution slices are incomplete")
+        local_cursor = 0
+        for local_index, position in enumerate(normalized_positions):
+            end_cursor = local_cursor + int(published[position])
+            expected_slice = {
+                "segment_index": position,
+                "physical_segment_index": local_index,
+                "start_frame": local_cursor,
+                "end_frame_exclusive": end_cursor,
+                "start_seconds": local_cursor / fps,
+                "end_seconds": end_cursor / fps,
+            }
+            if slices[local_index] != expected_slice:
+                raise ValueError("Saved Director H3 execution slice geometry disagrees")
+            original_prompt = str(prompts[position])
+            if digests[local_index] != hashlib.sha256(
+                original_prompt.encode("utf-8")
+            ).hexdigest():
+                raise ValueError("Saved Director H3 physical prompt bytes disagree")
+            physical_id = f"{authored_shot_id}:segment-{local_index + 1}"
+            mapping[position] = (
+                contract, local_index, expected_slice, physical_id,
+                original_prompt,
+            )
+            mode = (
+                "ref2va"
+                if _director_h3_prompt_schema(original_prompt) == "ref2va"
+                else "t2va"
+            )
+            canonical[position] = compile_workflow(
+                _director_h3_canonical_prompt(
+                    original_prompt,
+                    duration_seconds=int(published[position]) / fps,
+                    mode=mode,
+                )
+            )
+            local_cursor = end_cursor
+        contract_events = contract.get("event_ownership")
+        if not isinstance(contract_events, list):
+            raise ValueError("Saved Director H3 event ownership is incomplete")
+        nested_manifest = contract.get("dialogue_manifest")
+        if not isinstance(nested_manifest, list) or not all(
+            isinstance(item, dict) for item in nested_manifest
+        ):
+            raise ValueError("Saved Director H3 semantic dialogue is incomplete")
+        if any(
+            isinstance(item.get("semantic_occurrence_index"), bool)
+            or not isinstance(item.get("semantic_occurrence_index"), int)
+            for item in nested_manifest
+        ):
+            raise ValueError("Saved Director H3 semantic dialogue identity disagrees")
+        semantic_manifest = sorted(
+            nested_manifest,
+            key=lambda item: item.get("semantic_occurrence_index", -1),
+        )
+        if [
+            item.get("semantic_occurrence_index") for item in semantic_manifest
+        ] != list(range(len(semantic_manifest))):
+            raise ValueError("Saved Director H3 semantic dialogue identity disagrees")
+        semantic_blocks = [
+            match.group(0) for match in re.finditer(
+                r"<d>.*?</d>", semantic_prompt,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        ]
+        if len(semantic_manifest) != len(semantic_blocks):
+            raise ValueError("Saved Director H3 semantic dialogue identity disagrees")
+        for ordinal, (item, block) in enumerate(zip(
+            semantic_manifest, semantic_blocks,
+        )):
+            expected_identity = _semantic_dialogue_identity(
+                block,
+                source_index=source_index,
+                semantic_occurrence_index=ordinal,
+            )
+            if (
+                isinstance(item.get("source_index"), bool)
+                or not isinstance(item.get("source_index"), int)
+                or any(
+                    item.get(field) != value
+                    for field, value in expected_identity.items()
+                )
+            ):
+                raise ValueError(
+                    "Saved Director H3 semantic dialogue provenance disagrees"
+                )
+        localized_semantic_prompt, dialogue_tokens = _tag_dialogue_occurrences(
+            semantic_prompt, semantic_manifest,
+        )
+        _expected_prompts, expected_events = _compile_segment_local_prompts(
+            localized_semantic_prompt,
+            segment_positions=normalized_positions,
+            published_frames=published,
+            source_index=source_index,
+            fps=fps,
+            final_blocking=(
+                str(contract.get("final_blocking") or "")
+                if source_is_canonical else ""
+            ),
+            opening_blocking=(
+                str(contract.get("opening_blocking") or "")
+                if source_is_canonical else ""
+            ),
+            dialogue_occurrence_tokens=dialogue_tokens,
+        )
+        localized_ordinals: set[int] = set()
+        for local_index, expected_prompt in enumerate(_expected_prompts):
+            position = normalized_positions[local_index]
+            for match in re.finditer(
+                r"<d>.*?</d>", expected_prompt,
+                flags=re.IGNORECASE | re.DOTALL,
+            ):
+                ordinal_matches = [
+                    ordinal for ordinal, token in enumerate(dialogue_tokens)
+                    if token in match.group(0)
+                ]
+                if len(ordinal_matches) != 1:
+                    raise ValueError(
+                        "Saved Director H3 dialogue occurrence identity disagrees"
+                    )
+                ordinal = ordinal_matches[0]
+                if ordinal in localized_ordinals:
+                    raise ValueError(
+                        "Saved Director H3 dialogue occurrence identity disagrees"
+                    )
+                localized_ordinals.add(ordinal)
+                expected_dialogue_ordinals.append((position, ordinal))
+        if localized_ordinals != set(range(len(semantic_manifest))):
+            raise ValueError("Saved Director H3 dialogue occurrence identity disagrees")
+        _expected_prompts = [
+            _strip_dialogue_occurrence_tokens(prompt, dialogue_tokens)
+            for prompt in _expected_prompts
+        ]
+        for expected_event in expected_events:
+            expected_event["executable_payload"] = (
+                _strip_dialogue_occurrence_tokens(
+                    str(expected_event.get("executable_payload") or ""),
+                    dialogue_tokens,
+                )
+            )
+        for local_index, position in enumerate(normalized_positions):
+            expected_prompt = _expected_prompts[local_index]
+            expected_mode = (
+                "ref2va"
+                if _director_h3_prompt_schema(expected_prompt) == "ref2va"
+                else "t2va"
+            )
+            expected_canonical = compile_workflow(
+                _director_h3_canonical_prompt(
+                    expected_prompt,
+                    duration_seconds=int(published[position]) / fps,
+                    mode=expected_mode,
+                )
+            )
+            if canonical[position] != expected_canonical:
+                raise ValueError(
+                    "Saved Director H3 physical prompt semantics disagree"
+                )
+        if len(contract_events) != len(expected_events):
+            raise ValueError("Saved Director H3 event ownership coverage disagrees")
+        source_published_offset = sum(
+            int(value) for value in published[:normalized_positions[0]]
+        )
+        for event_index, (event, expected_event) in enumerate(zip(
+            contract_events, expected_events,
+        )):
+            if not isinstance(event, dict):
+                raise ValueError("Saved Director H3 event ownership is invalid")
+            expected_event = dict(expected_event)
+            expected_event["continuation_slices"] = [
+                {
+                    **dict(continuation),
+                    "physical_segment_id": (
+                        f"{authored_shot_id}:segment-"
+                        f"{int(continuation['physical_segment_index']) + 1}"
+                    ),
+                    "published_start_frame": (
+                        source_published_offset
+                        + int(continuation["source_start_frame"])
+                    ),
+                    "published_end_frame_exclusive": (
+                        source_published_offset
+                        + int(continuation["source_end_frame_exclusive"])
+                    ),
+                }
+                for continuation in expected_event.get("continuation_slices") or []
+            ]
+            expected_event.update({
+                "event_id": f"{authored_shot_id}:event-{event_index + 1}",
+                "authored_shot_id": authored_shot_id,
+                "semantic_shot_index": source_index,
+                "owner_physical_segment_id": (
+                    f"{authored_shot_id}:segment-"
+                    f"{int(expected_event['owner_physical_segment_index']) + 1}"
+                ),
+                "published_start_frame": (
+                    source_published_offset
+                    + int(expected_event["source_start_frame"])
+                    if expected_event.get("source_start_frame") is not None
+                    else None
+                ),
+                "published_end_frame_exclusive": (
+                    source_published_offset
+                    + int(expected_event["source_end_frame_exclusive"])
+                    if expected_event.get("source_end_frame_exclusive") is not None
+                    else None
+                ),
+            })
+            if any(
+                event.get(field) != value
+                for field, value in expected_event.items()
+            ):
+                raise ValueError("Saved Director H3 event ownership disagrees")
+            owner = event.get("owner_segment_index")
+            local_owner = event.get("owner_physical_segment_index")
+            if (
+                isinstance(owner, bool)
+                or not isinstance(owner, int)
+                or owner not in normalized_positions
+                or isinstance(local_owner, bool)
+                or not isinstance(local_owner, int)
+                or local_owner < 0
+                or local_owner >= len(normalized_positions)
+                or normalized_positions[local_owner] != owner
+                or event.get("owner_physical_segment_id")
+                    != f"{authored_shot_id}:segment-{local_owner + 1}"
+                or event.get("authored_shot_id") != authored_shot_id
+                or event.get("semantic_shot_index") != expected_source_index
+            ):
+                raise ValueError("Saved Director H3 event ownership disagrees")
+            owner_slice = slices[local_owner]
+            executable_payload = event.get("executable_payload")
+            if (
+                not isinstance(executable_payload, str)
+                or not executable_payload.strip()
+                or executable_payload not in prompts[owner]
+            ):
+                raise ValueError(
+                    "Saved Director H3 event payload and owner prompt disagree"
+                )
+            source_start = event.get("source_start_frame")
+            source_end = event.get("source_end_frame_exclusive")
+            if source_start is None or source_end is None:
+                if any(event.get(field) is not None for field in (
+                    "local_start_frame", "local_end_frame_exclusive",
+                    "published_start_frame", "published_end_frame_exclusive",
+                )):
+                    raise ValueError("Saved Director H3 event frame ownership disagrees")
+            elif (
+                isinstance(source_start, bool)
+                or not isinstance(source_start, int)
+                or isinstance(source_end, bool)
+                or not isinstance(source_end, int)
+                or not (
+                    int(owner_slice["start_frame"])
+                    <= source_start
+                    < int(owner_slice["end_frame_exclusive"])
+                )
+                or source_end <= source_start
+                or event.get("local_start_frame")
+                    != source_start - int(owner_slice["start_frame"])
+                or event.get("local_end_frame_exclusive")
+                    != min(source_end, int(owner_slice["end_frame_exclusive"]))
+                    - int(owner_slice["start_frame"])
+                or event.get("published_start_frame")
+                    != sum(int(value) for value in published[:normalized_positions[0]])
+                    + source_start
+                or event.get("published_end_frame_exclusive")
+                    != sum(int(value) for value in published[:normalized_positions[0]])
+                    + source_end
+            ):
+                raise ValueError("Saved Director H3 event frame ownership disagrees")
+        nested_events.extend(contract_events)
+
+    if covered != set(range(len(prompts))) or any(not item for item in canonical):
+        raise ValueError("Saved Director H3 segment mapping is incomplete")
+    if shot_plan.get("event_ownership") != nested_events:
+        raise ValueError("Saved Director H3 event ownership copies disagree")
+
+    manifest = shot_plan.get("dialogue_manifest")
+    if not isinstance(manifest, list):
+        raise ValueError("Saved Director H3 dialogue manifest is incomplete")
+    expected_dialogue = [
+        (position, match.group(0))
+        for position, prompt in enumerate(prompts)
+        for match in re.finditer(
+            r"<d>.*?</d>", prompt, flags=re.IGNORECASE | re.DOTALL,
+        )
+    ]
+    if (
+        len(manifest) != len(expected_dialogue)
+        or len(manifest) != len(expected_dialogue_ordinals)
+    ):
+        raise ValueError("Saved Director H3 dialogue manifest coverage disagrees")
+    for item, (position, block), (ordinal_position, ordinal) in zip(
+        manifest, expected_dialogue, expected_dialogue_ordinals,
+    ):
+        contract = mapping[position][0]
+        expected_identity = _semantic_dialogue_identity(
+            block,
+            source_index=contract["source_index"],
+            semantic_occurrence_index=ordinal,
+        )
+        if (
+            not isinstance(item, dict)
+            or ordinal_position != position
+            or isinstance(item.get("semantic_occurrence_index"), bool)
+            or not isinstance(item.get("semantic_occurrence_index"), int)
+            or isinstance(item.get("source_index"), bool)
+            or not isinstance(item.get("source_index"), int)
+            or any(
+                item.get(field) != value
+                for field, value in expected_identity.items()
+            )
+            or not isinstance(item.get("authored_shot_id"), str)
+            or item.get("authored_shot_id") != contract["authored_shot_id"]
+            or isinstance(item.get("semantic_shot_index"), bool)
+            or not isinstance(item.get("semantic_shot_index"), int)
+            or item.get("semantic_shot_index") != contract["semantic_shot_index"]
+            or isinstance(item.get("segment_index"), bool)
+            or not isinstance(item.get("segment_index"), int)
+            or item.get("segment_index") != position
+        ):
+            raise ValueError("Saved Director H3 dialogue association disagrees")
+    for contract in contracts:
+        nested_manifest = contract.get("dialogue_manifest")
+        expected_nested = [
+            dict(item) for item in manifest
+            if item["source_index"] == contract["source_index"]
+        ]
+        if nested_manifest != expected_nested:
+            raise ValueError("Saved Director H3 semantic dialogue association disagrees")
+
+    generated_cursor = 0
+    published_cursor = 0
+    for index, shot in enumerate(shots):
+        contract, local_index, expected_slice, physical_id, original_prompt = mapping[index]
+        expected_boundary = boundaries[index - 1] if index else None
+        expected_values = {
+            "index": index,
+            "source_index": contract["source_index"],
+            "authored_shot_id": contract["authored_shot_id"],
+            "semantic_shot_index": contract["semantic_shot_index"],
+            "physical_segment_id": physical_id,
+            "physical_segment_index": local_index,
+            "physical_segment_count": len(contract["segment_indices"]),
+            "predecessor_segment_index": index - 1 if index else None,
+            "predecessor_physical_segment_id": mapping[index - 1][3] if index else None,
+            "predecessor_authored_shot_id": (
+                mapping[index - 1][0]["authored_shot_id"] if index else None
+            ),
+            "execution_cursor_frame": expected_slice["start_frame"],
+            "execution_slice": expected_slice,
+            "frames": int(clip_frames[index]),
+            "start_frame": generated_cursor,
+            "end_frame": generated_cursor + int(clip_frames[index]) - 1,
+            "published_frames": int(clip_published[index]),
+            "published_start_frame": published_cursor,
+            "published_end_frame": published_cursor + int(clip_published[index]) - 1,
+            "published_end_frame_exclusive": (
+                published_cursor + int(clip_published[index])
+            ),
+            "trim_tail_frames": int(clip_trims[index]),
+            "continuity_mode": (
+                str(expected_boundary.get("continuity_mode") or "")
+                if isinstance(expected_boundary, dict) else "independent"
+            ),
+            "boundary_before": expected_boundary,
+            "prompt": original_prompt,
+            "dialogue_manifest_indices": [
+                manifest_index
+                for manifest_index, item in enumerate(manifest)
+                if item["segment_index"] == index
+            ],
+        }
+        if any(shot.get(key) != value for key, value in expected_values.items()):
+            raise ValueError("Saved Director H3 physical segment metadata disagrees")
+        generated_cursor += int(clip_frames[index])
+        published_cursor += int(clip_published[index])
+
+    try:
+        validate_h3_shot_plan_seal(shot_plan)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+
+    for contract in contracts:
+        contract["executable_prompt_sha256"] = [
+            hashlib.sha256(canonical[position].encode("utf-8")).hexdigest()
+            for position in contract["segment_indices"]
+        ]
+    for index, prompt in enumerate(canonical):
+        shots[index]["prompt"] = prompt
+    shot_plan["clip_prompts"] = canonical
+    shot_plan["semantic_shots"] = contracts
+    return canonical
+
+
 def _canonicalize_director_h3_shot_plan(
     shot_plan: dict,
     *,
@@ -6436,12 +7132,26 @@ def _canonicalize_director_h3_shot_plan(
     if raw_contract_version is not None and (
         isinstance(raw_contract_version, bool)
         or not isinstance(raw_contract_version, int)
-        or raw_contract_version not in {0, 1}
+        or raw_contract_version not in {0, 1, 2}
     ):
         raise ValueError(
             "Saved Director H3 semantic/physical contract version is unsupported"
         )
     semantic_contract = int(raw_contract_version or 0)
+    if semantic_contract == 2:
+        canonical = _canonicalize_director_h3_v2_shot_plan(
+            shot_plan,
+            prompts=prompts,
+            published=published,
+            fps=fps,
+            compile_workflow=compile_workflow,
+        )
+        if workflow is not None:
+            shot_plan["h3_style_workflow"] = dict(workflow)
+        from services.h3_shot_planner import seal_h3_shot_plan
+
+        seal_h3_shot_plan(shot_plan)
+        return canonical
     if semantic_contract == 1:
         contracts = shot_plan.get("source_contracts")
         if not isinstance(contracts, list) or not contracts:
@@ -6690,6 +7400,70 @@ def _canonicalize_director_h3_shot_plan(
     return canonical
 
 
+_DIRECTOR_H3_RUNTIME_CONTRACT_FIELDS = (
+    "model_type",
+    "requested_frames",
+    "planned_frames",
+    "published_frames",
+    "final_trim_frames",
+    "clip_count",
+    "clip_frames",
+    "clip_published_frames",
+    "clip_trim_tail_frames",
+    "segment_frames_maximum",
+    "manual_segment_ceiling",
+    "continuation",
+    "clip_boundaries",
+    "segment_policy",
+    "segment_models",
+    "segment_source_indices",
+    "director_keyframe_conditioning",
+    "adaptive_conditioning",
+    "native_boundary_conditioning",
+    "preserve_generated_audio",
+    "global_prompt",
+    "original_image_start",
+    "original_image_end",
+)
+
+
+def _bind_director_h3_runtime_contract(plan: dict) -> None:
+    """Seal every outer field that can change a v2 replay invocation."""
+
+    import copy
+
+    shot_plan = plan.get("shot_plan")
+    if (
+        not isinstance(shot_plan, dict)
+        or shot_plan.get("semantic_physical_contract_version") != 2
+    ):
+        return
+    shot_plan["director_runtime_contract"] = {
+        field: copy.deepcopy(plan.get(field))
+        for field in _DIRECTOR_H3_RUNTIME_CONTRACT_FIELDS
+    }
+    from services.h3_shot_planner import seal_h3_shot_plan
+
+    seal_h3_shot_plan(shot_plan)
+
+
+def _validate_director_h3_runtime_contract(plan: dict, shot_plan: dict) -> None:
+    """Reject v2 replay when an outer runtime control escaped the shot seal."""
+
+    if shot_plan.get("semantic_physical_contract_version") != 2:
+        return
+    from services.h3_shot_planner import validate_h3_shot_plan_seal
+
+    validate_h3_shot_plan_seal(shot_plan)
+    saved = shot_plan.get("director_runtime_contract")
+    expected = {
+        field: plan.get(field)
+        for field in _DIRECTOR_H3_RUNTIME_CONTRACT_FIELDS
+    }
+    if not isinstance(saved, dict) or saved != expected:
+        raise ValueError("Saved Director H3 runtime contract disagrees")
+
+
 def _rehydrate_director_h3_longform(
     gen_params: dict,
     plan: dict,
@@ -6785,6 +7559,11 @@ def _rehydrate_director_h3_longform(
     shot_plan["clip_published_frames"] = list(published)
     shot_plan["clip_trim_tail_frames"] = list(trims)
     shot_plan["published_frames"] = requested_total
+    if shot_plan.get("semantic_physical_contract_version") == 2 and (
+        not isinstance(plan.get("global_prompt"), str)
+        or plan.get("global_prompt") != shot_plan.get("global_prompt")
+    ):
+        raise ValueError("Saved Director H3 global prompt provenance disagrees")
     prompts = _canonicalize_director_h3_shot_plan(
         shot_plan,
         published_frames=published,
@@ -6792,7 +7571,7 @@ def _rehydrate_director_h3_longform(
     )
     if len(prompts) != len(frames):
         raise ValueError("Saved Director H3 shot plan is incomplete")
-    if shot_plan.get("semantic_physical_contract_version") == 1:
+    if shot_plan.get("semantic_physical_contract_version") in {1, 2}:
         saved_models = plan.get("segment_models")
         if not isinstance(saved_models, list) or len(saved_models) != len(prompts):
             raise ValueError("Saved Director H3 segment models are incomplete")
@@ -6806,13 +7585,17 @@ def _rehydrate_director_h3_longform(
                     f"Saved Director H3 segment {index + 1} prompt schema and "
                     "checkpoint disagree"
                 )
+    _validate_director_h3_runtime_contract(plan, shot_plan)
     # Legacy committed plans may duplicate a pre-Context-IR source in either
     # global prompt field. Preserve already-canonical multi-scene provenance;
     # migrate only fields whose parsed events include bare range records.
     from services.director.h3_dialogue import _H3_CANONICAL_RECORD_RE
     from shared.utils.prompt_parser import parse_global_timeline_prompt
 
-    for container in (shot_plan, plan):
+    for container in (
+        () if shot_plan.get("semantic_physical_contract_version") == 2
+        else (shot_plan, plan)
+    ):
         global_prompt = str(container.get("global_prompt") or "").strip()
         if not global_prompt:
             continue
@@ -7408,6 +8191,7 @@ def _prepare_director_h3_longform(
             "original_image_end": last_anchor,
         },
     })
+    _bind_director_h3_runtime_contract(gen_params["_h3_longform"])
     if h3_style_workflow is not None:
         gen_params["h3_style_workflow"] = dict(h3_style_workflow)
     gen_params["image_prompt_type"] = (

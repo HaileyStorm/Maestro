@@ -51,21 +51,134 @@ def _hf_url(repo_id: str, revision: str, *parts: str) -> str:
 
 
 _RESOLUTIONS = [
+    ("1920x1088 (16:9 experimental)", "1920x1088"),
+    ("1088x1920 (9:16 experimental)", "1088x1920"),
+    ("1440x1088 (4:3 experimental)", "1440x1088"),
+    ("1088x1440 (3:4 experimental)", "1088x1440"),
+    ("1088x1088 (1:1 experimental)", "1088x1088"),
     ("1344x768 (16:9 native)", "1344x768"),
     ("768x1344 (9:16 native)", "768x1344"),
     ("1024x768 (4:3 native)", "1024x768"),
     ("768x1024 (3:4 native)", "768x1024"),
     ("768x768 (1:1 native)", "768x768"),
+    ("1280x704 (16:9 720p)", "1280x704"),
+    ("704x1280 (9:16 720p)", "704x1280"),
+    ("928x704 (4:3 720p)", "928x704"),
+    ("704x928 (3:4 720p)", "704x928"),
+    ("704x704 (1:1 720p)", "704x704"),
     ("1152x640 (16:9)", "1152x640"),
     ("640x1152 (9:16)", "640x1152"),
     ("960x544 (16:9)", "960x544"),
     ("544x960 (9:16)", "544x960"),
+    ("736x544 (4:3)", "736x544"),
+    ("544x736 (3:4)", "544x736"),
+    ("736x736 (1:1)", "736x736"),
     ("864x480 (16:9 low VRAM)", "864x480"),
     ("480x864 (9:16 low VRAM)", "480x864"),
+    ("640x480 (4:3 low VRAM)", "640x480"),
+    ("480x640 (3:4 low VRAM)", "480x640"),
     ("640x640 (1:1 low VRAM)", "640x640"),
     ("608x352 (16:9 minimum)", "608x352"),
     ("352x608 (9:16 minimum)", "352x608"),
 ]
+
+_RESOLUTION_PRESETS = {
+    "480p": {
+        "label": "480p",
+        "values": {
+            "auto": "auto_480p",
+            "16:9": "864x480",
+            "9:16": "480x864",
+            "1:1": "640x640",
+            "4:3": "640x480",
+            "3:4": "480x640",
+        },
+    },
+    "540p": {
+        "label": "540p",
+        "values": {
+            "auto": "auto_540p",
+            "16:9": "960x544",
+            "9:16": "544x960",
+            "1:1": "736x736",
+            "4:3": "736x544",
+            "3:4": "544x736",
+        },
+    },
+    "720p": {
+        "label": "720p",
+        "hint": "Uses a model-aligned 1280x704 canvas for faster H3 generation.",
+        "values": {
+            "auto": "auto_720p",
+            "16:9": "1280x704",
+            "9:16": "704x1280",
+            "1:1": "704x704",
+            "4:3": "928x704",
+            "3:4": "704x928",
+        },
+    },
+    # Hidden compatibility tier for saved settings and output recovery.
+    "768p": {
+        "label": "768p High",
+        "hint": "H3's released 1344x768 native canvas family.",
+        "values": {
+            "auto": "auto_768p",
+            "16:9": "1344x768",
+            "9:16": "768x1344",
+            "1:1": "768x768",
+            "4:3": "1024x768",
+            "3:4": "768x1024",
+        },
+    },
+    "1080p": {
+        "label": "1080p",
+        "experimental": True,
+        "hint": "Experimental high-resolution H3 generation; shorter windows may be required.",
+        "values": {
+            "auto": "auto_1080p",
+            "16:9": "1920x1088",
+            "9:16": "1088x1920",
+            "1:1": "1088x1088",
+            "4:3": "1440x1088",
+            "3:4": "1088x1440",
+        },
+    },
+}
+_RESOLUTION_PRESET_ORDER = ["480p", "540p", "720p", "1080p"]
+_AUTO_RESOLUTION_BUDGETS = {
+    "auto": 1280 * 704,
+    "auto_480p": 864 * 480,
+    "auto_540p": 960 * 544,
+    "auto_720p": 1280 * 704,
+    "auto_768p": 1344 * 768,
+    "auto_1080p": 1920 * 1088,
+}
+_AUTO_RESOLUTION_FALLBACKS = {
+    "auto": "1280x704",
+    "auto_480p": "864x480",
+    "auto_540p": "960x544",
+    "auto_720p": "1280x704",
+    "auto_768p": "1344x768",
+    "auto_1080p": "1920x1088",
+}
+_LEGACY_RESOLUTION_ALIASES = {
+    "848x480": "864x480", "480x848": "480x864", "672x672": "640x640",
+    "832x608": "736x544", "608x832": "544x736",
+    "1280x720": "1280x704", "720x1280": "704x1280",
+    "1024x1024": "768x768", "1104x832": "1024x768",
+    "832x1104": "768x1024",
+}
+
+
+def _normalize_resolution(value) -> str:
+    resolution = str(value or "864x480").strip().lower()
+    if resolution in _AUTO_RESOLUTION_BUDGETS:
+        return resolution
+    if resolution in _LEGACY_RESOLUTION_ALIASES:
+        return _LEGACY_RESOLUTION_ALIASES[resolution]
+    if resolution in {item for _, item in _RESOLUTIONS}:
+        return resolution
+    return "864x480"
 
 
 class family_handler:
@@ -128,6 +241,11 @@ class family_handler:
             "visible_phases": 0,
             "compile": False,
             "resolutions": _RESOLUTIONS,
+            "resolution_presets": _RESOLUTION_PRESETS,
+            "resolution_preset_order": _RESOLUTION_PRESET_ORDER,
+            "supports_auto_aspect": True,
+            "auto_resolution_budgets": _AUTO_RESOLUTION_BUDGETS,
+            "auto_resolution_fallbacks": _AUTO_RESOLUTION_FALLBACKS,
             "profiles_dir": ["minimax_h3"],
             "minimax_h3_assets_root": _ASSETS_ROOT,
             "minimax_h3_reference_mode": reference_mode,
@@ -580,9 +698,9 @@ class family_handler:
             requested_frames = minimum_frames
         aligned_frames = align_num_frames(max(1, requested_frames))
         ui_defaults["video_length"] = min(345, max(minimum_frames, aligned_frames))
-        resolution = str(ui_defaults.get("resolution", "864x480"))
-        if resolution not in {value for _, value in _RESOLUTIONS}:
-            ui_defaults["resolution"] = "864x480"
+        ui_defaults["resolution"] = _normalize_resolution(
+            ui_defaults.get("resolution", "864x480")
+        )
         ui_defaults["guidance_scale"] = 1.0
         custom_settings = ui_defaults.get("custom_settings")
         if not isinstance(custom_settings, dict):

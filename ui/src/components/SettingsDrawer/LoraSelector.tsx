@@ -79,8 +79,10 @@ export function LoraSortToggle({ sort, onChange }: { sort: LoraPickerSort; onCha
   const newest = sort === 'newest'
   return (
     <button
+      type="button"
       onClick={() => onChange(newest ? 'name' : 'newest')}
-      className={`text-[10px] flex items-center gap-0.5 transition-colors ${
+      aria-label={newest ? 'Sort LoRAs by name' : 'Sort LoRAs by newest release'}
+      className={`flex min-h-11 min-w-11 items-center justify-center gap-0.5 rounded text-[10px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 md:justify-start md:rounded-none ${
         newest ? 'text-accent-blue hover:text-accent-blue-hover' : 'text-text-muted hover:text-accent-blue'
       }`}
       title={newest
@@ -169,6 +171,11 @@ export function LoraSelector() {
   // refresh button so the user sees at a glance whether anything's
   // outdated without expanding the list.
   const updatableCount = Object.values(updateStatuses).filter(s => s === 'available').length
+  const checkUpdatesLabel = checking
+    ? 'Checking CivitAI updates'
+    : updatableCount > 0
+      ? `Check CivitAI updates, ${updatableCount} update${updatableCount === 1 ? '' : 's'} available`
+      : 'Check CivitAI updates'
 
   // Render-only formatter — "5m ago" / "2h ago" / "3d ago" / "" for null.
   const formatRelative = (iso: string | null): string => {
@@ -184,14 +191,16 @@ export function LoraSelector() {
   }
 
   const loraHeader = (
-    <div className="flex items-center justify-between mb-1.5">
+    <div className="mb-1.5 flex flex-wrap items-center justify-between gap-1">
       <label className="text-[11px] text-text-muted uppercase tracking-wider">LoRAs</label>
-      <div className="flex items-center gap-2">
+      <div className="ml-auto flex flex-wrap items-center justify-end gap-1 md:gap-2">
         <LoraSortToggle sort={sortMode} onChange={setSortSticky} />
         <button
+          type="button"
           onClick={handleCheckUpdates}
           disabled={checking || !modelType}
-          className="text-[10px] text-text-muted hover:text-accent-blue flex items-center gap-0.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          aria-label={checkUpdatesLabel}
+          className="flex min-h-11 min-w-11 items-center justify-center gap-0.5 rounded px-1 text-[10px] text-text-muted transition-colors hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-50 md:min-h-0 md:min-w-0 md:justify-start md:rounded-none md:px-0"
           title={lastCheckedAt
             ? `Check CivitAI for newer LoRA versions (last checked ${formatRelative(lastCheckedAt)})`
             : 'Check CivitAI for newer LoRA versions'}
@@ -210,8 +219,10 @@ export function LoraSelector() {
           )}
         </button>
         <button
+          type="button"
           onClick={() => openBrowser(true, modelType)}
-          className="text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5 transition-colors"
+          aria-label="Browse CivitAI"
+          className="flex min-h-11 min-w-11 items-center justify-center gap-0.5 rounded px-1 text-[10px] text-accent-blue transition-colors hover:text-accent-blue-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 md:justify-start md:rounded-none md:px-0"
           title="Browse CivitAI"
         >
           <Globe size={10} />

@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef, Component, type ReactNode } from 'react'
+import { useState, useEffect, useRef, useCallback, useId, Component, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { X, Play, ImageIcon, Check, AlertTriangle, Clock, Brain, Sparkles, Loader2, Camera, Film, Combine, Pencil, Trash2 } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { getFileUrl } from '../../api/client'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import type { PipelineClipState, SavedPipelineState } from '../../types'
 
 /** Safely coerce any value to a displayable string */
@@ -441,6 +443,10 @@ function DirectorDashboardInner() {
   const [repairCancellingPid, setRepairCancellingPid] = useState<string | null>(null)
   const [regenErrors, setRegenErrors] = useState<Record<string, string>>({})
   const autoLoadAttemptedPid = useRef<string | null>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const titleId = useId()
+  const closeDashboard = useCallback(() => setOpen(false), [setOpen])
   const selectedPid = selectedPipeline?.pipeline_id || null
   const repairStarting = repairStartingPid === selectedPid
   const repairCancelling = repairCancellingPid === selectedPid
@@ -513,6 +519,22 @@ function DirectorDashboardInner() {
   const canResumeRecovery = selectedPipeline?.recovery_actions?.includes('resume') === true
   const showRepairAction = hasMissing || repairActive || repairRetryable || pipelineTerminal
 
+  useEffect(() => {
+    if (!dialogRef.current || !closeButtonRef.current) return
+    const restoreFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    return installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: closeButtonRef.current,
+      restoreFocus,
+      appRoot: document.getElementById('root'),
+      onClose: closeDashboard,
+      priority: 90,
+    })
+  }, [closeDashboard])
+
   const generateMissing = async () => {
     if (!selectedPipeline) return
     const pid = selectedPipeline.pipeline_id
@@ -527,14 +549,38 @@ function DirectorDashboardInner() {
     }
   }
 
-  return (
-    <div className="fixed inset-0 z-[60] flex flex-col bg-bg-primary">
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[90] flex h-[100vh] items-stretch justify-stretch overflow-hidden supports-[height:100dvh]:h-[100dvh]"
+      style={{
+        paddingTop: 'max(0.5rem, env(safe-area-inset-top))',
+        paddingRight: 'max(0.5rem, env(safe-area-inset-right))',
+        paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(0.5rem, env(safe-area-inset-left))',
+      }}
+    >
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label="Close Director dashboard"
+        className="absolute inset-0 appearance-none border-0 bg-black/60 p-0"
+        onClick={() => closeModalIfTop(document, dialogRef.current, closeDashboard)}
+      />
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="relative flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-bg-primary shadow-2xl motion-reduce:[&_*]:transition-none motion-reduce:[&_*]:animate-none [&_a]:min-h-11 [&_a]:min-w-11 [&_button]:min-h-11 [&_button]:min-w-11 [&_input:not([type=checkbox])]:min-h-11 [&_select]:min-h-11 [&_textarea]:min-h-11"
+      >
       {/* Header */}
-      <div className="px-4 py-3 border-b border-border flex flex-wrap items-center gap-2 shrink-0">
-        <h1 className="text-sm font-semibold text-text-primary shrink-0">Dashboard</h1>
+      <div className="max-h-[55%] shrink-0 overflow-y-auto overscroll-contain border-b border-border px-3 py-2 [-webkit-overflow-scrolling:touch] sm:px-4 sm:py-3">
+        <div className="flex flex-wrap items-center gap-2">
+        <h1 id={titleId} className="text-sm font-semibold text-text-primary shrink-0">Director Dashboard</h1>
 
         {/* Pipeline selector */}
         <select
+          aria-label="Select Director pipeline"
           value={selectedPipeline?.pipeline_id || ''}
           onChange={e => { if (e.target.value) loadPipeline(e.target.value) }}
           className="flex-1 min-w-0 max-w-md bg-bg-tertiary border border-border rounded-lg px-3 py-1.5 text-xs text-text-primary focus:outline-none focus:border-accent-blue truncate"
@@ -717,14 +763,20 @@ function DirectorDashboardInner() {
           </div>
         )}
 
-        <button onClick={() => setOpen(false)}
-          className="fixed top-3 right-4 z-[61] p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors shadow-md border border-border">
-          <X size={16} className="text-text-muted" />
+        <button
+          ref={closeButtonRef}
+          type="button"
+          onClick={() => closeModalIfTop(document, dialogRef.current, closeDashboard)}
+          className="ml-auto flex shrink-0 items-center justify-center rounded-lg border border-border bg-bg-secondary p-1.5 shadow-md transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+          aria-label="Close Director dashboard"
+        >
+          <X size={16} className="text-text-muted" aria-hidden="true" />
         </button>
+        </div>
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-3 [-webkit-overflow-scrolling:touch] sm:p-4">
         {loading && (
           <div className="flex items-center justify-center py-12 text-text-muted">
             <Loader2 size={20} className="animate-spin mr-2" />
@@ -791,6 +843,8 @@ function DirectorDashboardInner() {
           </>
         )}
       </div>
+      </div>
     </div>
+    , document.body
   )
 }

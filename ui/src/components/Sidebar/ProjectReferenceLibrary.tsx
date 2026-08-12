@@ -193,7 +193,7 @@ function LoraParameterFields({
                   ))
                   onChange(parameter.id, option?.value)
                 }}
-                className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary"
+                className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary md:min-h-0"
               >
                 <option value="">Choose…</option>
                 {parameter.options?.map(option => (
@@ -210,7 +210,7 @@ function LoraParameterFields({
                   parameter.id,
                   event.target.value === '' ? undefined : event.target.value === 'true',
                 )}
-                className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary"
+                className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary md:min-h-0"
               >
                 <option value="">Choose…</option>
                 <option value="true">Yes</option>
@@ -224,7 +224,7 @@ function LoraParameterFields({
                 type="text"
                 value={typeof value === 'string' ? value : ''}
                 onChange={event => onChange(parameter.id, event.target.value)}
-                className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary"
+                className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary md:min-h-0"
               />
             ) : (
               <input
@@ -242,7 +242,7 @@ function LoraParameterFields({
                     ? undefined
                     : event.target.valueAsNumber,
                 )}
-                className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary"
+                className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary md:min-h-0"
               />
             )}
             {parameter.description && <span id={helpId} className="mt-0.5 block text-[8px] text-text-muted">{parameter.description}</span>}
@@ -2759,7 +2759,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
             {actionError && (
               <div role="alert" className="mx-4 mt-3 flex shrink-0 items-start justify-between gap-3 rounded-lg border border-red-500/60 bg-red-500/15 px-3 py-2 text-[11px] leading-relaxed text-red-200 shadow-lg">
                 <p>{actionError}</p>
-                <button type="button" aria-label="Dismiss project reference error" onClick={() => setActionError('')} className="shrink-0 rounded p-0.5 text-red-200 hover:bg-red-500/20 hover:text-white"><X size={14} /></button>
+                <button type="button" aria-label="Dismiss project reference error" onClick={() => setActionError('')} className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded p-0.5 text-red-200 hover:bg-red-500/20 hover:text-white md:min-h-0 md:min-w-0"><X size={14} /></button>
               </div>
             )}
 
@@ -2770,21 +2770,21 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   {ASSET_TYPES.map(option => {
                     const Icon = option.icon
                     return (
-                      <button type="button" key={option.value} aria-pressed={assetType === option.value} onClick={() => changeAssetType(option.value)} className={`flex items-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] ${assetType === option.value ? 'border-accent-blue bg-accent-blue/15 text-accent-blue' : 'border-border text-text-secondary'}`}>
+                      <button type="button" key={option.value} aria-pressed={assetType === option.value} onClick={() => changeAssetType(option.value)} className={`flex min-h-11 min-w-11 items-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] md:min-h-0 md:min-w-0 ${assetType === option.value ? 'border-accent-blue bg-accent-blue/15 text-accent-blue' : 'border-border text-text-secondary'}`}>
                         <Icon size={11} /> {option.label}
                       </button>
                     )
                   })}
                 </div>
                 <label htmlFor="project-reference-name" className="mt-3 block text-[10px] text-text-secondary">Name
-                  <input id="project-reference-name" aria-label="Reference name" value={name} onChange={event => setName(event.target.value)} placeholder="Name" className="mt-1 w-full rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary" />
+                  <input id="project-reference-name" aria-label="Reference name" value={name} onChange={event => setName(event.target.value)} placeholder="Name" className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary md:min-h-0" />
                 </label>
                 <label htmlFor="project-reference-description" className="mt-2 block text-[10px] text-text-secondary">Description
-                  <textarea id="project-reference-description" aria-label="Reference description" value={description} onChange={event => setDescription(event.target.value)} placeholder="Detailed description / card (optional)" rows={5} className="mt-1 w-full resize-y rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary" />
+                  <textarea id="project-reference-description" aria-label="Reference description" value={description} onChange={event => setDescription(event.target.value)} placeholder="Detailed description / card (optional)" rows={5} className="mt-1 min-h-11 w-full resize-y rounded-md border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary md:min-h-0" />
                 </label>
                 <fieldset className="mt-3 rounded-md border border-border bg-bg-tertiary/40 p-2">
                   <legend className="px-1 text-[10px] font-medium text-text-secondary">Visual style</legend>
-                  <select aria-label="Reference visual style" value={visualStyle} onChange={event => setVisualStyle(event.target.value)} className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-[10px] text-text-primary">
+                  <select aria-label="Reference visual style" value={visualStyle} onChange={event => setVisualStyle(event.target.value)} className="min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-[10px] text-text-primary md:min-h-0">
                     <option value="">Realistic (default)</option>
                     <option value="cinematic">Cinematic</option>
                     <option value="stylized 3D animation">Stylized 3D animation</option>
@@ -2792,7 +2792,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     <option value="anime">Anime</option>
                     <option value="custom">Custom…</option>
                   </select>
-                  {visualStyle === 'custom' && <input aria-label="Custom reference visual style" value={customVisualStyle} onChange={event => setCustomVisualStyle(event.target.value)} placeholder="e.g. 1970s editorial watercolor" className="mt-1.5 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-[10px] text-text-primary" />}
+                  {visualStyle === 'custom' && <input aria-label="Custom reference visual style" value={customVisualStyle} onChange={event => setCustomVisualStyle(event.target.value)} placeholder="e.g. 1970s editorial watercolor" className="mt-1.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-[10px] text-text-primary md:min-h-0" />}
                   <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Realistic is the fallback only. Choose a preset to make it explicit, or use Custom when your own freeform style should be authoritative.</p>
                 </fieldset>
                 <fieldset aria-label="Reference creation method" className="mt-3 rounded-md border border-accent-blue/30 bg-accent-blue/5 p-2">
@@ -2804,7 +2804,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                       aria-pressed={candidateKind === 'image_pack'}
                       aria-controls="project-reference-image-pack-method"
                       onClick={() => changeCreationMethod('image_pack')}
-                      className={`rounded border p-2 text-left ${candidateKind === 'image_pack' ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-secondary'}`}
+                      className={`min-h-11 min-w-11 rounded border p-2 text-left md:min-h-0 md:min-w-0 ${candidateKind === 'image_pack' ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-secondary'}`}
                     >
                       <span className="block text-[10px] font-medium text-accent-blue">Image Reference Pack</span>
                       <span className="mt-0.5 block text-[8px] text-text-muted">Author the selected semantic type using the controls below.</span>
@@ -2814,7 +2814,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                       aria-pressed={candidateKind === 'blender_motion'}
                       aria-controls="project-reference-blender-motion-method"
                       onClick={() => changeCreationMethod('blender_motion')}
-                      className={`rounded border p-2 text-left ${candidateKind === 'blender_motion' ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-secondary'}`}
+                      className={`min-h-11 min-w-11 rounded border p-2 text-left md:min-h-0 md:min-w-0 ${candidateKind === 'blender_motion' ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-secondary'}`}
                     >
                       <span className="block text-[10px] font-medium text-accent-blue">Blender Motion Video</span>
                       <span className="mt-0.5 block text-[8px] text-text-muted">Create a structured motion and camera reference.</span>
@@ -2848,7 +2848,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Intent</legend>
                   <div className="grid grid-cols-3 gap-1">
                     {INTENT_OPTIONS.map(option => (
-                      <button key={option.value} type="button" aria-pressed={intent === option.value} title={option.description} onClick={() => changeIntent(option.value)} className={`rounded border px-1.5 py-1.5 text-[9px] ${intent === option.value ? 'border-accent-blue bg-accent-blue/10 text-accent-blue' : 'border-border text-text-secondary'}`}>
+                      <button key={option.value} type="button" aria-pressed={intent === option.value} title={option.description} onClick={() => changeIntent(option.value)} className={`min-h-11 min-w-11 rounded border px-1.5 py-1.5 text-[9px] md:min-h-0 md:min-w-0 ${intent === option.value ? 'border-accent-blue bg-accent-blue/10 text-accent-blue' : 'border-border text-text-secondary'}`}>
                         {option.label}
                       </button>
                     ))}
@@ -2859,7 +2859,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Reference depth</legend>
                   <div className="grid grid-cols-2 gap-1">
                     {DEPTH_OPTIONS.map(option => (
-                      <button key={option.value} type="button" aria-pressed={depth === option.value} onClick={() => changeDepth(option.value)} className={`rounded border px-2 py-1.5 text-left ${depth === option.value ? 'border-accent-blue bg-accent-blue/10' : 'border-border'}`}>
+                      <button key={option.value} type="button" aria-pressed={depth === option.value} onClick={() => changeDepth(option.value)} className={`min-h-11 min-w-11 rounded border px-2 py-1.5 text-left md:min-h-0 md:min-w-0 ${depth === option.value ? 'border-accent-blue bg-accent-blue/10' : 'border-border'}`}>
                         <span className="block text-[9px] font-medium text-text-primary">{option.label}</span>
                         <span className="block text-[8px] text-text-muted">{option.description}</span>
                       </button>
@@ -2867,7 +2867,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   </div>
                   {depth === 'custom' && (
                     <label htmlFor="project-reference-sheet-count" className="mt-2 flex items-center justify-between text-[10px] text-text-secondary">Sheets per pack
-                      <input id="project-reference-sheet-count" aria-label="Custom sheets per reference pack" type="number" min={1} max={5} value={customSheetCount} onChange={event => changeCustomSheetCount(Number(event.target.value))} className="w-16 rounded border border-border bg-bg-tertiary px-2 py-1 text-right" />
+                      <input id="project-reference-sheet-count" aria-label="Custom sheets per reference pack" type="number" min={1} max={5} value={customSheetCount} onChange={event => changeCustomSheetCount(Number(event.target.value))} className="min-h-11 w-16 rounded border border-border bg-bg-tertiary px-2 py-1 text-right md:min-h-0" />
                     </label>
                   )}
                 </fieldset>
@@ -2875,7 +2875,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Preset</legend>
                   <div className="flex flex-wrap gap-1">
                     {visiblePresets.map(option => (
-                      <button key={option.value} type="button" aria-pressed={preset === option.value} onClick={() => changePreset(option.value)} className={`rounded-full border px-2 py-1 text-[9px] ${preset === option.value ? 'border-accent-blue bg-accent-blue/10 text-accent-blue' : 'border-border text-text-secondary'}`}>
+                      <button key={option.value} type="button" aria-pressed={preset === option.value} onClick={() => changePreset(option.value)} className={`min-h-11 min-w-11 rounded-full border px-3 py-1 text-[9px] md:min-h-0 md:min-w-0 md:px-2 ${preset === option.value ? 'border-accent-blue bg-accent-blue/10 text-accent-blue' : 'border-border text-text-secondary'}`}>
                         {option.label}
                       </button>
                     ))}
@@ -2885,9 +2885,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Sheet construction mode</legend>
                   <div className="space-y-1.5">
                     {SHEET_MODES.map(option => (
-                      <label key={option.value} className={`block cursor-pointer rounded-md border p-2 ${sheetMode === option.value ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-tertiary/40'}`}>
+                      <label key={option.value} className={`block min-h-11 cursor-pointer rounded-md border p-2 md:min-h-0 ${sheetMode === option.value ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-tertiary/40'}`}>
                         <span className="flex items-center gap-1.5 text-[10px] font-medium text-text-primary">
-                          <input type="radio" name="reference-sheet-mode" value={option.value} checked={sheetMode === option.value} onChange={() => setSheetMode(option.value)} />
+                          <input type="radio" name="reference-sheet-mode" value={option.value} checked={sheetMode === option.value} onChange={() => setSheetMode(option.value)} className="h-5 w-5 shrink-0 md:h-auto md:w-auto" />
                           {option.label}
                         </span>
                         <span className="mt-0.5 block pl-5 text-[9px] leading-relaxed text-text-muted">{option.description}</span>
@@ -2904,7 +2904,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                           id="project-reference-character-gender"
                           value={characterGender}
                           onChange={event => setCharacterGender(event.target.value as ProjectReferenceCharacterGender)}
-                          className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary"
+                          className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary md:min-h-0"
                         >
                           <option value="unspecified">Unspecified</option>
                           <option value="woman">Woman</option>
@@ -2924,7 +2924,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                           value={characterAge}
                           placeholder="Optional"
                           onChange={event => setCharacterAge(event.target.value)}
-                          className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary"
+                          className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary md:min-h-0"
                         />
                       </label>
                     </div>
@@ -2937,10 +2937,11 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                           ['vulva', 'Vulva'],
                           ['penis', 'Penis'],
                         ] as Array<[ProjectReferenceCharacterAnatomy, string]>).map(([value, label]) => (
-                          <label key={value} className="flex items-start gap-1.5 rounded border border-border/60 px-1.5 py-1 text-[8px] text-text-secondary">
+                          <label key={value} className="flex min-h-11 items-center gap-2 rounded border border-border/60 px-2 py-1 text-[8px] text-text-secondary md:min-h-0 md:items-start md:gap-1.5 md:px-1.5">
                             <input
                               type="checkbox"
                               checked={characterExplicitAnatomy.includes(value)}
+                              className="h-5 w-5 shrink-0 md:h-auto md:w-auto"
                               onChange={event => setCharacterExplicitAnatomy(current => event.target.checked
                                 ? [...current.filter(item => item !== value), value]
                                 : current.filter(item => item !== value))}
@@ -2950,8 +2951,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                         ))}
                       </div>
                     </fieldset>
-                    <label className="mt-2 flex items-start gap-2 text-[9px] text-text-secondary">
-                      <input type="checkbox" checked={explicitConvenience} onChange={event => applyExplicitConvenience(event.target.checked)} />
+                    <label className="mt-2 flex min-h-11 items-start gap-2 py-1 text-[9px] text-text-secondary md:min-h-0 md:py-0">
+                      <input type="checkbox" checked={explicitConvenience} onChange={event => applyExplicitConvenience(event.target.checked)} className="h-5 w-5 shrink-0 md:h-auto md:w-auto" />
                       <span><span className="font-medium">Explicit convenience</span><span className="mt-0.5 block text-[8px] text-text-muted">Uses the Anatomy / Nude anchor and asks the server to create managed detail callouts for the anatomy selected above. It turns on Explicit output authorization; turning convenience off does not change that separate choice. Breasts creates separate front and profile callouts; vulva and penis remain independent choices. Draft keeps the profile but does not create callout sheets.</span></span>
                     </label>
                     <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Explicit convenience is for adult characters. An authored age below 18 blocks queueing; leaving age blank does not assert adulthood. Gender never selects anatomy or establishes age.</p>
@@ -2960,8 +2961,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 )}
                 <fieldset className="mt-3 rounded-md border border-border bg-bg-tertiary/40 p-2">
                   <legend className="px-1 text-[10px] font-medium text-text-secondary">Output handling</legend>
-                  <label className="flex items-center gap-2 text-[9px] text-text-secondary">
-                    <input type="checkbox" checked={referenceExplicitOutput} onChange={event => {
+                  <label className="flex min-h-11 items-center gap-2 text-[9px] text-text-secondary md:min-h-0">
+                    <input type="checkbox" checked={referenceExplicitOutput} className="h-5 w-5 shrink-0 md:h-auto md:w-auto" onChange={event => {
                       const enabled = event.target.checked
                       setReferenceExplicitOutput(enabled)
                       if (!enabled) setExplicitConvenience(false)
@@ -2972,19 +2973,19 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <p className="mt-1 text-[8px] text-text-muted">The visual fidelity reviewer checks identity, anatomy, layout, style adherence, and retry quality. It does not classify or censor content or decide whether a request is allowed.</p>
                   <div className="mt-2 grid grid-cols-1 gap-1.5">
                     <label htmlFor="project-reference-content-capability" className="text-[9px] text-text-muted">Content capability
-                      <select id="project-reference-content-capability" value={contentCapability} onChange={event => setContentCapability(event.target.value as 'standard' | 'unrestricted_local')} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary">
+                      <select id="project-reference-content-capability" value={contentCapability} onChange={event => setContentCapability(event.target.value as 'standard' | 'unrestricted_local')} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary md:min-h-0">
                         {contentCapabilities.includes('standard') && <option value="standard">Standard</option>}
                         {contentCapabilities.includes('unrestricted_local') && <option value="unrestricted_local">Unrestricted local</option>}
                       </select>
                     </label>
                     <label htmlFor="project-reference-initial-blur" className="text-[9px] text-text-muted">Initial output
-                      <select id="project-reference-initial-blur" value={initialBlur ? 'blur' : 'reveal'} onChange={event => setInitialBlur(event.target.value === 'blur')} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary">
+                      <select id="project-reference-initial-blur" value={initialBlur ? 'blur' : 'reveal'} onChange={event => setInitialBlur(event.target.value === 'blur')} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary md:min-h-0">
                         <option value="blur">Blur</option>
                         <option value="reveal">Reveal</option>
                       </select>
                     </label>
                     <label htmlFor="project-reference-intelligence-policy" className="text-[9px] text-text-muted">Intelligence
-                      <select id="project-reference-intelligence-policy" value={intelligencePolicy} onChange={event => { setIntelligenceCustomized(true); setIntelligencePolicy(event.target.value as 'standard_auto' | 'uncensored_auto') }} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary">
+                      <select id="project-reference-intelligence-policy" value={intelligencePolicy} onChange={event => { setIntelligenceCustomized(true); setIntelligencePolicy(event.target.value as 'standard_auto' | 'uncensored_auto') }} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary md:min-h-0">
                         {intelligencePolicies.includes('standard_auto') && <option value="standard_auto">Standard Auto</option>}
                         {intelligencePolicies.includes('uncensored_auto') && <option value="uncensored_auto">Uncensored-capable Auto</option>}
                       </select>
@@ -3011,7 +3012,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             const item = sectionOptionItem(authoritativeTypeCapabilities, definition, option)
                             const selected = item ? section.values.some(value => value.id === item.id) : false
                             return (
-                              <button key={option} type="button" aria-pressed={selected} onClick={() => toggleSectionValue(definition.id, option)} className={`rounded-full border px-2 py-1 text-[9px] ${selected ? 'border-accent-blue bg-accent-blue/10 text-accent-blue' : 'border-border text-text-muted'}`}>
+                              <button key={option} type="button" aria-pressed={selected} onClick={() => toggleSectionValue(definition.id, option)} className={`min-h-11 min-w-11 rounded-full border px-3 py-1 text-[9px] md:min-h-0 md:min-w-0 md:px-2 ${selected ? 'border-accent-blue bg-accent-blue/10 text-accent-blue' : 'border-border text-text-muted'}`}>
                                 {option}
                               </button>
                             )
@@ -3020,9 +3021,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                         {definition.id !== 'details' && section.values.some(item => item.custom) && (
                           <div className="mt-1.5 space-y-1" aria-label={`Custom ${definition.label.toLowerCase()} values`}>
                             {section.values.filter(item => item.custom).map(item => (
-                              <div key={item.id} className="flex items-center gap-1">
-                                <input aria-label={`Edit custom ${definition.label.toLowerCase()}: ${item.label || item.id}`} maxLength={500} value={item.label} onChange={event => updateCustomSectionValue(definition.id, item.id, event.target.value)} className="min-w-0 flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-primary" />
-                                <button type="button" aria-label={`Remove custom ${definition.label.toLowerCase()} ${item.label}`} onClick={() => removeSectionValue(definition.id, item.id)} className="rounded border border-border px-2 py-1 text-[8px] text-text-muted">Remove</button>
+                              <div key={item.id} className="flex flex-col gap-1 md:flex-row md:items-center">
+                                <input aria-label={`Edit custom ${definition.label.toLowerCase()}: ${item.label || item.id}`} maxLength={500} value={item.label} onChange={event => updateCustomSectionValue(definition.id, item.id, event.target.value)} className="min-h-11 min-w-0 flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-primary md:min-h-0" />
+                                <button type="button" aria-label={`Remove custom ${definition.label.toLowerCase()} ${item.label}`} onClick={() => removeSectionValue(definition.id, item.id)} className="min-h-11 min-w-11 rounded border border-border px-3 py-1 text-[8px] text-text-muted md:min-h-0 md:min-w-0 md:px-2">Remove</button>
                               </div>
                             ))}
                           </div>
@@ -3034,20 +3035,20 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                               const setting = detailSettings[item.id] ?? { operation: 'auto' as const, sourceRole: validDetailSourceRoles[0] ?? '' }
                               return (
                               <div key={item.id} className="rounded border border-border/60 px-1.5 py-1 text-[8px] text-text-muted">
-                                <div className="flex items-center gap-1">
+                                <div className="flex flex-col gap-1 md:flex-row md:items-center">
                                   {item.custom
-                                    ? <input aria-label={`Edit custom detail: ${item.label || item.id}`} maxLength={500} value={item.label} onChange={event => updateCustomSectionValue('details', item.id, event.target.value)} className="min-w-0 flex-1 rounded border border-border bg-bg-primary px-1.5 py-1 text-[8px] text-text-primary" />
+                                    ? <input aria-label={`Edit custom detail: ${item.label || item.id}`} maxLength={500} value={item.label} onChange={event => updateCustomSectionValue('details', item.id, event.target.value)} className="min-h-11 min-w-0 flex-1 rounded border border-border bg-bg-primary px-1.5 py-1 text-[8px] text-text-primary md:min-h-0" />
                                     : <span className="min-w-0 flex-1">{item.label}</span>}
-                                  {item.custom && <button type="button" aria-label={`Remove custom detail ${item.label}`} onClick={() => removeSectionValue('details', item.id)} className="rounded border border-border px-1.5 py-1 text-[8px] text-text-muted">Remove</button>}
+                                  {item.custom && <button type="button" aria-label={`Remove custom detail ${item.label}`} onClick={() => removeSectionValue('details', item.id)} className="min-h-11 min-w-11 rounded border border-border px-3 py-1 text-[8px] text-text-muted md:min-h-0 md:min-w-0 md:px-1.5">Remove</button>}
                                 </div>
-                                <div className="mt-1 grid grid-cols-2 gap-1">
+                                <div className="mt-1 grid grid-cols-1 gap-1 md:grid-cols-2">
                                   <label className="text-[8px] text-text-muted">Source sheet
-                                    <select aria-label={`${item.label} detail source`} disabled={sheetMode === 'draft'} value={callout?.source_role ?? setting.sourceRole} onChange={event => setDetailSettings(current => ({ ...current, [item.id]: { ...setting, sourceRole: event.target.value } }))} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary disabled:opacity-50">
+                                    <select aria-label={`${item.label} detail source`} disabled={sheetMode === 'draft'} value={callout?.source_role ?? setting.sourceRole} onChange={event => setDetailSettings(current => ({ ...current, [item.id]: { ...setting, sourceRole: event.target.value } }))} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary disabled:opacity-50 md:min-h-0">
                                       {validDetailSourceRoles.map(role => <option key={role} value={role}>{friendlyRole(role)}</option>)}
                                     </select>
                                   </label>
                                   <label className="text-[8px] text-text-muted">Operation
-                                    <select aria-label={`${item.label} detail operation`} disabled={sheetMode === 'draft'} value={callout?.operation ?? setting.operation} onChange={event => setDetailSettings(current => ({ ...current, [item.id]: { ...setting, operation: event.target.value as ProjectReferenceDetailOperation } }))} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary disabled:opacity-50">
+                                    <select aria-label={`${item.label} detail operation`} disabled={sheetMode === 'draft'} value={callout?.operation ?? setting.operation} onChange={event => setDetailSettings(current => ({ ...current, [item.id]: { ...setting, operation: event.target.value as ProjectReferenceDetailOperation } }))} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary disabled:opacity-50 md:min-h-0">
                                       {(authoritativePreset?.detail_operations ?? referenceCapabilities?.detail_operations ?? []).map(operation => <option key={operation} value={operation} disabled={operation === 'reconstruct' && intent === 'exact_spec'}>{detailOperationLabel(operation)}</option>)}
                                     </select>
                                   </label>
@@ -3059,10 +3060,10 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             {sheetMode === 'draft' && <p className="text-[8px] text-amber-300">Draft does not create editor-dependent detail outputs. These selections will be used when you choose Production or Hybrid.</p>}
                           </div>
                         )}
-                        <div className="mt-1.5 flex gap-1">
-                          <input aria-label={`Add custom ${definition.label.toLowerCase()} callout`} disabled={definition.id === 'details' && (authoritativeTypeCapabilities?.supports_custom_details !== true || section.values.length >= 8)} maxLength={500} value={customSectionInputs[definition.id] ?? ''} onChange={event => setCustomSectionInputs(current => ({ ...current, [definition.id]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); addCustomSectionValue(definition.id) } }} placeholder="Add callout" className="min-w-0 flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-primary disabled:opacity-50" />
-                          <button type="button" disabled={definition.id === 'details' && (authoritativeTypeCapabilities?.supports_custom_details !== true || section.values.length >= 8)} onClick={() => addCustomSectionValue(definition.id)} className="rounded border border-border px-2 py-1 text-[9px] text-text-secondary disabled:opacity-50">Add</button>
-                          {section.pinned && <button type="button" onClick={() => resetSection(definition)} className="rounded border border-border px-2 py-1 text-[9px] text-text-muted">Reset</button>}
+                        <div className="mt-1.5 flex flex-col gap-1 md:flex-row">
+                          <input aria-label={`Add custom ${definition.label.toLowerCase()} callout`} disabled={definition.id === 'details' && (authoritativeTypeCapabilities?.supports_custom_details !== true || section.values.length >= 8)} maxLength={500} value={customSectionInputs[definition.id] ?? ''} onChange={event => setCustomSectionInputs(current => ({ ...current, [definition.id]: event.target.value }))} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); addCustomSectionValue(definition.id) } }} placeholder="Add callout" className="min-h-11 min-w-0 flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-primary disabled:opacity-50 md:min-h-0" />
+                          <button type="button" disabled={definition.id === 'details' && (authoritativeTypeCapabilities?.supports_custom_details !== true || section.values.length >= 8)} onClick={() => addCustomSectionValue(definition.id)} className="min-h-11 min-w-11 rounded border border-border px-3 py-1 text-[9px] text-text-secondary disabled:opacity-50 md:min-h-0 md:min-w-0 md:px-2">Add</button>
+                          {section.pinned && <button type="button" onClick={() => resetSection(definition)} className="min-h-11 min-w-11 rounded border border-border px-3 py-1 text-[9px] text-text-muted md:min-h-0 md:min-w-0 md:px-2">Reset</button>}
                         </div>
                       </fieldset>
                     )
@@ -3076,8 +3077,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   </div>
                   <p className="mt-1 text-[9px] text-text-secondary">Canonical anchor: {anchorBasis === 'anatomy' ? 'Anatomy / Nude' : anchorBasis === 'primary_outfit' ? 'Primary outfit' : 'Least-occluded view'}</p>
                   {anchorBasis === 'anatomy' && (
-                    <label className="mt-1 flex items-center gap-2 text-[9px] text-text-secondary">
-                      <input type="checkbox" checked={anatomyPrivate} onChange={event => setAnatomyPrivate(event.target.checked)} />
+                    <label className="mt-1 flex min-h-11 items-center gap-2 text-[9px] text-text-secondary md:min-h-0">
+                      <input type="checkbox" checked={anatomyPrivate} onChange={event => setAnatomyPrivate(event.target.checked)} className="h-5 w-5 shrink-0 md:h-auto md:w-auto" />
                       Keep anatomy anchor private and blurred
                     </label>
                   )}
@@ -3097,7 +3098,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <p className="mt-1 text-[8px] text-text-muted">Depth changes update untouched sections only. Customized sections stay pinned.</p>
                 </section>
                 <label htmlFor="project-reference-generation-model" className="mt-3 block text-[10px] text-text-secondary">Generation model
-                  <select id="project-reference-generation-model" aria-label="Reference generation model" value={referenceModelType} onChange={event => { setReferenceModelCustomized(true); setReferenceModelType(event.target.value) }} disabled={referenceModels.length === 0} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50">
+                  <select id="project-reference-generation-model" aria-label="Reference generation model" value={referenceModelType} onChange={event => { setReferenceModelCustomized(true); setReferenceModelType(event.target.value) }} disabled={referenceModels.length === 0} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50 md:min-h-0">
                     {!referenceModelType && <option value="">{sheetMode === 'draft' ? 'Fast Draft model unavailable' : 'FLUX.2-dev unavailable'}</option>}
                     {referenceModels.length === 0 && <option value="">No image-output models available</option>}
                     {referenceModels.map(model => <option key={model.model_type} value={model.model_type}>{model.name}{getProjectReferenceModelAvailabilityCopy(model)}</option>)}
@@ -3105,7 +3106,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 </label>
                 {sheetMode !== 'draft' && (
                   <label htmlFor="project-reference-editor-model" className="mt-2 block text-[10px] text-text-secondary">Editor model
-                    <select id="project-reference-editor-model" aria-label="Reference editor model" value={editorModelType} onChange={event => { setEditorModelCustomized(true); setEditorModelType(event.target.value) }} disabled={editorModels.length === 0} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50">
+                    <select id="project-reference-editor-model" aria-label="Reference editor model" value={editorModelType} onChange={event => { setEditorModelCustomized(true); setEditorModelType(event.target.value) }} disabled={editorModels.length === 0} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary disabled:opacity-50 md:min-h-0">
                       {!editorModelType && <option value="">Qwen-Image-Edit-2511 unavailable</option>}
                       {editorModels.length === 0 && <option value="">No reference-image editors available</option>}
                       {editorModels.map(model => <option key={model.model_type} value={model.model_type}>{model.name}{getProjectReferenceModelAvailabilityCopy(model)}</option>)}
@@ -3143,7 +3144,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             setReferenceModelCustomized(true)
                             setReferenceModelType(modelType)
                           }}
-                          className={`rounded border px-2 py-1.5 text-left text-[9px] ${referenceModelType === modelType ? 'border-accent-blue bg-accent-blue/15 text-accent-blue' : 'border-border text-text-secondary'} disabled:cursor-not-allowed disabled:opacity-50`}
+                          className={`min-h-11 min-w-11 rounded border px-2 py-1.5 text-left text-[9px] md:min-h-0 md:min-w-0 ${referenceModelType === modelType ? 'border-accent-blue bg-accent-blue/15 text-accent-blue' : 'border-border text-text-secondary'} disabled:cursor-not-allowed disabled:opacity-50`}
                         >
                           <span className="block font-medium">{MOODY_MODEL_NAMES[modelType]}</span>
                           <span className="mt-0.5 block text-[8px] text-text-muted">{status}</span>
@@ -3156,7 +3157,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <div role="status" className="mt-2 rounded border border-border bg-bg-tertiary/60 px-2 py-1.5 text-[9px] text-text-secondary">
                     <p>Moody Krea 2 recipes are available but are not enabled for this host: {disabledMoodyModels.map(modelType => MOODY_MODEL_NAMES[modelType]).join(', ')}.</p>
                     {machineControls ? (
-                      <button type="button" onClick={() => openModelVisibility('image')} className="mt-1 rounded border border-accent-blue/40 px-1.5 py-0.5 text-accent-blue hover:bg-accent-blue/10">
+                      <button type="button" onClick={() => openModelVisibility('image')} className="mt-1 min-h-11 min-w-11 rounded border border-accent-blue/40 px-3 py-0.5 text-accent-blue hover:bg-accent-blue/10 md:min-h-0 md:min-w-0 md:px-1.5">
                         Open Settings → System → Enabled Models
                       </button>
                     ) : (
@@ -3176,9 +3177,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   return (
                     <div key={requirement.term} role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
                       <p>{requirement.notice}</p>
-                      <div className="mt-1 flex items-center gap-2">
-                        <a href={requirement.license_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">{notice.linkLabel || 'Review exact terms'}</a>
-                        <button type="button" disabled={hostTermsLoading || !hostTerms} onClick={() => { void acceptHostTerm(requirement.term) }} className="rounded border border-amber-400/40 px-1.5 py-0.5 font-medium text-amber-100 disabled:opacity-40">Accept for this host</button>
+                      <div className="mt-1 flex flex-col gap-1 md:flex-row md:items-center md:gap-2">
+                        <a href={requirement.license_url} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center text-accent-blue hover:underline md:min-h-0">{notice.linkLabel || 'Review exact terms'}</a>
+                        <button type="button" disabled={hostTermsLoading || !hostTerms} onClick={() => { void acceptHostTerm(requirement.term) }} className="min-h-11 min-w-11 rounded border border-amber-400/40 px-3 py-0.5 font-medium text-amber-100 disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">Accept for this host</button>
                       </div>
                     </div>
                   )
@@ -3199,9 +3200,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                       <p className="mt-1 text-red-300">The exact public manual-install manifest is unavailable; installation cannot be verified safely.</p>
                     )}
                     {model.manual_installation && (
-                      <div className="mt-1 flex flex-wrap gap-2">
-                        <a href={model.manual_installation.source_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Open source page</a>
-                        <a href={model.manual_installation.download_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Open exact manual download</a>
+                      <div className="mt-1 flex flex-col gap-1 md:flex-row md:flex-wrap md:gap-2">
+                        <a href={model.manual_installation.source_url} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center text-accent-blue hover:underline md:min-h-0">Open source page</a>
+                        <a href={model.manual_installation.download_url} target="_blank" rel="noreferrer" className="inline-flex min-h-11 items-center text-accent-blue hover:underline md:min-h-0">Open exact manual download</a>
                       </div>
                     )}
                     {model.manual_checkpoint_verification_required && machineControls ? (
@@ -3226,7 +3227,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                               if (projectEpoch.current === epoch) setVerifyingManualModel('')
                             })
                         }}
-                        className="mt-1 inline-flex items-center gap-1 rounded border border-amber-400/40 px-1.5 py-0.5 font-medium text-amber-100 disabled:opacity-40"
+                        className="mt-1 inline-flex min-h-11 min-w-11 items-center gap-1 rounded border border-amber-400/40 px-3 py-0.5 font-medium text-amber-100 disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5"
                       >
                         {verifyingManualModel === model.model_type && <Loader2 size={9} className="animate-spin" />}
                         {verifyingManualModel === model.model_type ? 'Verifying local checkpoint…' : 'Verify local checkpoint'}
@@ -3241,18 +3242,18 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 <fieldset className="mt-3 rounded-md border border-border p-2">
                   <legend className="px-1 text-[10px] font-medium text-text-secondary">Additional LoRAs</legend>
                   <p className="text-[8px] text-text-muted">Choices are filtered by the selected creation/editor models. Auto compatible applies only to compatible stages; explicit stage scopes must be compatible.</p>
-                  <div className="mt-1.5 grid grid-cols-[1fr_auto] gap-1">
-                    <select aria-label="Additional LoRA scope" value={pendingLoraScope} onChange={event => { setPendingLoraScope(event.target.value as ProjectReferenceLoraScope); setPendingLoraId('') }} className="rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[9px] text-text-secondary">
+                  <div className="mt-1.5 grid grid-cols-1 gap-1 md:grid-cols-[1fr_auto]">
+                    <select aria-label="Additional LoRA scope" value={pendingLoraScope} onChange={event => { setPendingLoraScope(event.target.value as ProjectReferenceLoraScope); setPendingLoraId('') }} className="min-h-11 rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[9px] text-text-secondary md:min-h-0">
                       {loraScopes.includes('auto') && <option value="auto">Auto compatible</option>}
                       {loraScopes.includes('generation') && <option value="generation">Create / anchor</option>}
                       {loraScopes.includes('editing') && sheetMode !== 'draft' && <option value="editing">Edit / derivative</option>}
                     </select>
-                    <input aria-label="Additional LoRA multiplier" type="number" min={-10} max={10} step="0.05" value={pendingLoraMultiplier} onChange={event => setPendingLoraMultiplier(Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 1)} className="w-20 rounded border border-border bg-bg-tertiary px-1.5 py-1 text-right text-[9px] text-text-secondary" />
-                    <select aria-label="Additional compatible LoRA" value={pendingLoraId} onChange={event => setPendingLoraId(event.target.value)} disabled={availablePendingLoras.length === 0} className="rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[9px] text-text-secondary disabled:opacity-50">
+                    <input aria-label="Additional LoRA multiplier" type="number" min={-10} max={10} step="0.05" value={pendingLoraMultiplier} onChange={event => setPendingLoraMultiplier(Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 1)} className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-1.5 py-1 text-right text-[9px] text-text-secondary md:min-h-0 md:w-20" />
+                    <select aria-label="Additional compatible LoRA" value={pendingLoraId} onChange={event => setPendingLoraId(event.target.value)} disabled={availablePendingLoras.length === 0} className="min-h-11 rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[9px] text-text-secondary disabled:opacity-50 md:min-h-0">
                       <option value="">{availablePendingLoras.length > 0 ? 'Select a compatible LoRA' : 'No compatible LoRAs'}</option>
                       {availablePendingLoras.map(id => <option key={id} value={id}>{id}</option>)}
                     </select>
-                    <button type="button" onClick={addAdditionalLora} disabled={!pendingLoraId || pendingLoraMultiplier < -10 || pendingLoraMultiplier > 10 || pendingLoraSchemaConflict || additionalLoras.length >= 64} className="rounded border border-border px-2 py-1 text-[9px] text-text-secondary disabled:opacity-40">Add</button>
+                    <button type="button" onClick={addAdditionalLora} disabled={!pendingLoraId || pendingLoraMultiplier < -10 || pendingLoraMultiplier > 10 || pendingLoraSchemaConflict || additionalLoras.length >= 64} className="min-h-11 min-w-11 rounded border border-border px-3 py-1 text-[9px] text-text-secondary disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-2">Add</button>
                   </div>
                   {pendingLoraSchemaConflict && <p role="status" className="mt-1 text-[8px] text-red-300">This LoRA publishes different generation and editing input schemas. Choose Create / anchor or Edit / derivative before adding it.</p>}
                   {additionalLoras.length > 0 && (
@@ -3269,12 +3270,12 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                         )
                         return (
                         <div key={lora.id} className="rounded border border-border/70 bg-bg-tertiary/40 p-1.5">
-                          <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-1">
+                          <div className="grid grid-cols-1 gap-1 md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-center">
                             <span className="truncate text-[8px] text-text-secondary" title={lora.id}>{lora.id}</span>
-                            <input aria-label={`${lora.id} multiplier`} type="number" min={-10} max={10} step="0.05" value={lora.multiplier} onChange={event => updateAdditionalLora(lora.id, { multiplier: Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 1 })} className="w-16 rounded border border-border bg-bg-primary px-1 py-0.5 text-right text-[8px] text-text-secondary" />
-                            <button type="button" aria-label={`Remove ${lora.id}`} onClick={() => setAdditionalLoras(current => current.filter(candidate => candidate.id !== lora.id))} className="rounded p-0.5 text-text-muted hover:text-red-300"><X size={10} /></button>
+                            <input aria-label={`${lora.id} multiplier`} type="number" min={-10} max={10} step="0.05" value={lora.multiplier} onChange={event => updateAdditionalLora(lora.id, { multiplier: Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 1 })} className="min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-right text-[8px] text-text-secondary md:min-h-0 md:w-16" />
+                            <button type="button" aria-label={`Remove ${lora.id}`} onClick={() => setAdditionalLoras(current => current.filter(candidate => candidate.id !== lora.id))} className="flex min-h-11 min-w-11 items-center justify-center rounded p-0.5 text-text-muted hover:text-red-300 md:min-h-0 md:min-w-0"><X size={10} /></button>
                           </div>
-                          <select aria-label={`${lora.id} scope`} value={lora.scope} onChange={event => updateAdditionalLora(lora.id, { scope: event.target.value as ProjectReferenceLoraScope })} className="mt-1 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary">
+                          <select aria-label={`${lora.id} scope`} value={lora.scope} onChange={event => updateAdditionalLora(lora.id, { scope: event.target.value as ProjectReferenceLoraScope })} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-[8px] text-text-secondary md:min-h-0">
                             {loraScopes.includes('auto') && <option value="auto">Auto compatible</option>}
                             {loraScopes.includes('generation') && <option value="generation" disabled={!generationLoras.includes(lora.id)}>Create / anchor</option>}
                             {loraScopes.includes('editing') && <option value="editing" disabled={sheetMode === 'draft' || !editingLoras.includes(lora.id)}>Edit / derivative</option>}
@@ -3304,18 +3305,18 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 </fieldset>
                 <label className="mt-3 flex items-center justify-between text-[10px] text-text-secondary">
                   Candidate packs
-                  <input type="number" min={1} max={8} value={candidateCount} onChange={event => setCandidateCount(Math.max(1, Math.min(8, Number(event.target.value) || 1)))} className="w-16 rounded border border-border bg-bg-tertiary px-2 py-1 text-right" />
+                  <input aria-label="Reference candidate packs" type="number" min={1} max={8} value={candidateCount} onChange={event => setCandidateCount(Math.max(1, Math.min(8, Number(event.target.value) || 1)))} className="min-h-11 w-16 rounded border border-border bg-bg-tertiary px-2 py-1 text-right md:min-h-0" />
                 </label>
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <label className="text-[9px] text-text-muted">Collage columns
-                    <input aria-label="Reference sheet collage columns" type="number" min={1} max={4} value={columns} onChange={event => setColumns(Math.max(1, Math.min(4, Number(event.target.value) || 1)))} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-text-secondary" />
+                    <input aria-label="Reference sheet collage columns" type="number" min={1} max={4} value={columns} onChange={event => setColumns(Math.max(1, Math.min(4, Number(event.target.value) || 1)))} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-text-secondary md:min-h-0" />
                   </label>
                   <label className="text-[9px] text-text-muted">Palette swatches
-                    <input aria-label="Reference sheet palette swatches" type="number" min={3} max={12} value={paletteSwatches} onChange={event => setPaletteSwatches(Math.max(3, Math.min(12, Number(event.target.value) || 3)))} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-text-secondary" />
+                    <input aria-label="Reference sheet palette swatches" type="number" min={3} max={12} value={paletteSwatches} onChange={event => setPaletteSwatches(Math.max(3, Math.min(12, Number(event.target.value) || 3)))} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-text-secondary md:min-h-0" />
                   </label>
                 </div>
                 <label htmlFor="project-reference-planning-model" className="mt-2 block text-[10px] text-text-secondary">Planning model
-                  <select id="project-reference-planning-model" aria-label="Reference planning model" value={planningModel} onChange={event => setPlanningModel(event.target.value)} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary">
+                  <select id="project-reference-planning-model" aria-label="Reference planning model" value={planningModel} onChange={event => setPlanningModel(event.target.value)} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary md:min-h-0">
                     <option value="auto">Auto (local only)</option>
                     <option value="deterministic">Deterministic only</option>
                     {planningModels.map(model => <option key={model.id} value={model.id}>{model.label} · {model.provider ?? 'local'} · loaded</option>)}
@@ -3323,7 +3324,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 </label>
                 {selectedPlanningModel && (selectedPlanningModel.provider ?? 'local') !== 'local' && <p className="mt-1 text-[9px] text-amber-300">Selected remote planning sends the reference text to {selectedPlanningModel.provider}; that provider’s terms and privacy policy apply.</p>}
                 <label htmlFor="project-reference-review-model" className="mt-2 block text-[10px] text-text-secondary">Visual review model
-                  <select id="project-reference-review-model" aria-label="Reference visual review model" value={reviewModel} onChange={event => setReviewModel(event.target.value)} className="mt-1 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary">
+                  <select id="project-reference-review-model" aria-label="Reference visual review model" value={reviewModel} onChange={event => setReviewModel(event.target.value)} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary md:min-h-0">
                     <option value="auto_local">{intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract ? `Auto local · ${uncensoredReviewContract.resolved_model}` : 'Auto local'}</option>
                     <option value="off" disabled={mandatoryReview}>{mandatoryReview ? 'Off · unavailable for unrestricted / explicit output' : 'Off'}</option>
                     {selectableReviewModels.map(model => <option key={model.id} value={model.id}>{model.label} · {model.provider ?? 'local'} · {intelligencePolicy !== 'uncensored_auto' || uncensoredReviewContract?.setup_state === 'ready_resident' ? 'vision ready' : uncensoredReviewContract?.setup_state === 'ready_unloaded' ? 'installed; auto-loads for review' : 'setup required'}</option>)}
@@ -3339,11 +3340,11 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     <p role="status" className={uncensoredReviewContract.queue_ready ? 'mt-0.5 text-accent-green' : 'mt-0.5 text-red-300'}>{reviewerSetupCopy}</p>
                     <div className="mt-1 flex flex-wrap gap-1">
                       {reviewerSetupAction && machineControls && (
-                        <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(true) }} className="rounded border border-accent-blue/40 px-1.5 py-0.5 text-accent-blue disabled:opacity-40">
+                        <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(true) }} className="min-h-11 min-w-11 rounded border border-accent-blue/40 px-3 py-0.5 text-accent-blue disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">
                           {reviewerAction === 'loading' ? 'Preparing required reviewer…' : reviewerSetupAction.label}
                         </button>
                       )}
-                      <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="rounded border border-border px-1.5 py-0.5 text-text-secondary disabled:opacity-40">
+                      <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="min-h-11 min-w-11 rounded border border-border px-3 py-0.5 text-text-secondary disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">
                         {reviewerAction === 'refreshing' ? 'Refreshing reviewer status…' : 'Refresh reviewer status'}
                       </button>
                     </div>
@@ -3354,18 +3355,18 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 {intelligencePolicy === 'uncensored_auto' && !uncensoredReviewContract && (
                   <div className="mt-1 text-[9px]">
                     <p role="status" className="text-red-300">{reviewerSetupCopy}</p>
-                    <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="mt-1 rounded border border-border px-1.5 py-0.5 text-text-secondary disabled:opacity-40">{reviewerAction === 'refreshing' ? 'Refreshing reviewer status…' : 'Refresh reviewer status'}</button>
+                    <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="mt-1 min-h-11 min-w-11 rounded border border-border px-3 py-0.5 text-text-secondary disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">{reviewerAction === 'refreshing' ? 'Refreshing reviewer status…' : 'Refresh reviewer status'}</button>
                     {reviewerActionError && <p role="status" className="mt-1 text-red-300">{reviewerActionError}</p>}
                   </div>
                 )}
                 {intelligencePolicy === 'standard_auto' && selectedReviewModel && (selectedReviewModel.provider ?? 'local') !== 'local' && <p className="mt-1 text-[9px] text-amber-300">Selected remote visual review sends generated reference images to {selectedReviewModel.provider}; that provider’s terms and privacy policy apply.</p>}
                 <details className="mt-2 rounded border border-border px-2 py-1.5">
-                  <summary className="cursor-pointer text-[10px] text-text-secondary">Advanced</summary>
+                  <summary className="flex min-h-11 cursor-pointer items-center text-[10px] text-text-secondary md:min-h-0">Advanced</summary>
                   <fieldset className="mt-2">
                     <legend className="text-[9px] text-text-muted">Structural layout assist</legend>
                     <div className="mt-1 grid grid-cols-2 gap-1">
-                      <button type="button" disabled aria-pressed={false} title="No vetted managed layout assist is installed" className="rounded border border-border px-2 py-1 text-[9px] text-text-muted opacity-50">Automatic · unavailable</button>
-                      <button type="button" aria-pressed className="rounded border border-accent-blue bg-accent-blue/10 px-2 py-1 text-[9px] text-accent-blue">Off</button>
+                      <button type="button" disabled aria-pressed={false} title="No vetted managed layout assist is installed" className="min-h-11 min-w-11 rounded border border-border px-2 py-1 text-[9px] text-text-muted opacity-50 md:min-h-0 md:min-w-0">Automatic · unavailable</button>
+                      <button type="button" aria-pressed className="min-h-11 min-w-11 rounded border border-accent-blue bg-accent-blue/10 px-2 py-1 text-[9px] text-accent-blue md:min-h-0 md:min-w-0">Off</button>
                     </div>
                     <p className="mt-1 text-[8px] text-text-muted">Only vetted structural/layout assists can appear here. Subject and content LoRAs are never enabled automatically.</p>
                   </fieldset>
@@ -3375,7 +3376,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 ) : mandatoryReview || reviewModel !== 'off' ? (
                   <label htmlFor="project-reference-max-repairs" className="mt-2 flex items-center justify-between gap-2 text-[10px] text-text-secondary">
                     Maximum panel repairs
-                    <input id="project-reference-max-repairs" aria-label="Maximum panel repair attempts" type="number" min={1} max={5} value={maxRepairAttempts} onChange={event => setMaxRepairAttempts(Math.max(1, Math.min(5, Number(event.target.value) || 1)))} className="w-16 rounded border border-border bg-bg-tertiary px-2 py-1 text-right" />
+                    <input id="project-reference-max-repairs" aria-label="Maximum panel repair attempts" type="number" min={1} max={5} value={maxRepairAttempts} onChange={event => setMaxRepairAttempts(Math.max(1, Math.min(5, Number(event.target.value) || 1)))} className="min-h-11 w-16 rounded border border-border bg-bg-tertiary px-2 py-1 text-right md:min-h-0" />
                   </label>
                 ) : (
                   <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Review is off, so panel repair is disabled and 0 repair attempts are sent.</p>
@@ -3396,7 +3397,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   aria-disabled={queueBlockers.length > 0}
                   aria-describedby={visibleQueueBlockers.length > 0 ? 'project-reference-queue-blockers' : undefined}
                   title={visibleQueueBlockers.length > 0 ? `Queue blocked: ${visibleQueueBlockers.map(blocker => blocker.message).join(' ')}` : 'Queue reference packs'}
-                  className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent-blue px-3 py-2 text-xs font-medium text-white disabled:opacity-40"
+                  className="mt-3 flex min-h-11 min-w-11 w-full items-center justify-center gap-1.5 rounded-lg bg-accent-blue px-3 py-2 text-xs font-medium text-white disabled:opacity-40 md:min-h-0 md:min-w-0"
                 >
                   {submitting ? <Loader2 size={13} className="animate-spin" /> : <ImagePlus size={13} />} Queue reference packs
                 </button>

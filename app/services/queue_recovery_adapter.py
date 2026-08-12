@@ -63,6 +63,8 @@ _JOB_FIELDS = frozenset({
     "plan_review_terms_required",
     "resource_intent", "resource_execution", "preemption_mode",
     "resource_state", "execution_attempt", "parent_job_id",
+    "resource_retry_attempt", "resource_retry_limit",
+    "resource_retry_phase", "resource_retry_reason",
     "logical_job_kind",
     "failure_details", "oom_info", "failed_child_job_id", "failed_child_status",
     "failed_child_reason",
@@ -98,6 +100,13 @@ _LOGICAL_JOB_KINDS = frozenset({
     "reference_pack_parent", "reference_pack_child",
 })
 _MAX_EXECUTION_ATTEMPT = 1_000_000
+_MAX_RESOURCE_RETRY_ATTEMPT = 8
+_RESOURCE_RETRY_PHASES = frozenset({
+    "model_load", "generation", "finalization",
+})
+_RESOURCE_RETRY_REASONS = frozenset({
+    "host_memory_pressure", "generation_oom", "finalization_oom",
+})
 
 
 class QueueRecoveryAdapterError(RuntimeError):
@@ -631,6 +640,26 @@ def serialize_job(
                     "job.execution_attempt is invalid."
                 )
             result[key] = value
+        elif key in {"resource_retry_attempt", "resource_retry_limit"}:
+            minimum = 0 if key == "resource_retry_attempt" else 1
+            if (
+                type(value) is not int
+                or not minimum <= value <= _MAX_RESOURCE_RETRY_ATTEMPT
+            ):
+                raise QueueRecoveryAdapterError(f"job.{key} is invalid.")
+            result[key] = value
+        elif key == "resource_retry_phase":
+            if value not in _RESOURCE_RETRY_PHASES:
+                raise QueueRecoveryAdapterError(
+                    "job.resource_retry_phase is invalid."
+                )
+            result[key] = value
+        elif key == "resource_retry_reason":
+            if value not in _RESOURCE_RETRY_REASONS:
+                raise QueueRecoveryAdapterError(
+                    "job.resource_retry_reason is invalid."
+                )
+            result[key] = value
         elif key == "parent_job_id":
             if not _valid_job_id(value):
                 raise QueueRecoveryAdapterError(
@@ -688,6 +717,29 @@ def serialize_job(
         "failed_child_job_id", "failed_child_status", "failed_child_reason",
     }
     present_child_fields = child_fields.intersection(result)
+    resource_retry_fields = {
+        "resource_retry_attempt", "resource_retry_limit",
+        "resource_retry_phase", "resource_retry_reason",
+    }
+    present_resource_retry_fields = resource_retry_fields.intersection(result)
+    if present_resource_retry_fields and (
+        present_resource_retry_fields != resource_retry_fields
+        or result["resource_retry_attempt"] < 1
+        or result["resource_retry_attempt"] > result["resource_retry_limit"]
+    ):
+        raise QueueRecoveryAdapterError(
+            "job resource retry state is incomplete."
+        )
+    if present_resource_retry_fields == resource_retry_fields:
+        expected_reason = {
+            "model_load": "host_memory_pressure",
+            "generation": "generation_oom",
+            "finalization": "finalization_oom",
+        }[result["resource_retry_phase"]]
+        if result["resource_retry_reason"] != expected_reason:
+            raise QueueRecoveryAdapterError(
+                "job resource retry phase and reason disagree."
+            )
     logical_kind = result.get("logical_job_kind")
     if (
         logical_kind == "reference_pack_parent"
@@ -708,10 +760,23 @@ def serialize_job(
         raise QueueRecoveryAdapterError(
             "job failed-child relation is incomplete."
         )
+    has_gpu_resource_retry = (
+        present_resource_retry_fields == resource_retry_fields
+        and result["resource_retry_reason"] in {
+            "generation_oom", "finalization_oom",
+        }
+    )
+    has_raw_oom = "oom_info" in job and job.get("oom_info") is not None
     if (
-        present_child_fields == child_fields
-        and "oom_info" in job
-        and job.get("oom_info") is not None
+        has_raw_oom
+        and present_resource_retry_fields == resource_retry_fields
+        and not has_gpu_resource_retry
+    ):
+        raise QueueRecoveryAdapterError(
+            "job.oom_info is invalid for this resource retry."
+        )
+    if has_raw_oom and (
+        present_child_fields == child_fields or has_gpu_resource_retry
     ):
         raw_oom = job["oom_info"]
         details = result.get("failure_details")

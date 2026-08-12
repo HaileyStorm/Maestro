@@ -36,6 +36,161 @@ def _serialize(job):
 
 
 class LogicalReferenceRecoveryTests(unittest.TestCase):
+    def test_resource_retry_state_is_complete_bounded_and_round_trips(self):
+        retry = _serialize({
+            "id": "resource-retry", "status": "queued",
+            "resource_retry_attempt": 1,
+            "resource_retry_limit": 2,
+            "resource_retry_phase": "model_load",
+            "resource_retry_reason": "host_memory_pressure",
+        })
+        self.assertEqual(retry["resource_retry_attempt"], 1)
+        self.assertEqual(retry["resource_retry_limit"], 2)
+        self.assertEqual(retry["resource_retry_phase"], "model_load")
+        self.assertEqual(
+            retry["resource_retry_reason"], "host_memory_pressure",
+        )
+
+        invalid = (
+            {
+                "resource_retry_attempt": 1,
+                "resource_retry_limit": 2,
+                "resource_retry_phase": "model_load",
+            },
+            {
+                "resource_retry_attempt": 3,
+                "resource_retry_limit": 2,
+                "resource_retry_phase": "model_load",
+                "resource_retry_reason": "host_memory_pressure",
+            },
+            {
+                "resource_retry_attempt": 1,
+                "resource_retry_limit": 9,
+                "resource_retry_phase": "model_load",
+                "resource_retry_reason": "host_memory_pressure",
+            },
+            {
+                "resource_retry_attempt": 1,
+                "resource_retry_limit": 2,
+                "resource_retry_phase": "unknown",
+                "resource_retry_reason": "host_memory_pressure",
+            },
+            {
+                "resource_retry_attempt": 1,
+                "resource_retry_limit": 2,
+                "resource_retry_phase": "generation",
+                "resource_retry_reason": "finalization_oom",
+            },
+        )
+        for index, fields in enumerate(invalid):
+            with self.subTest(index=index), self.assertRaises(
+                QueueRecoveryAdapterError,
+            ):
+                _serialize({
+                    "id": f"bad-resource-{index}",
+                    "status": "queued",
+                    **fields,
+                })
+
+    def test_gpu_resource_retry_reconstructs_only_safe_oom_info(self):
+        private = "/private/models/secret.safetensors traceback"
+        retry = _serialize({
+            "id": "gpu-resource-retry",
+            "status": "queued",
+            "resource_retry_attempt": 1,
+            "resource_retry_limit": 2,
+            "resource_retry_phase": "generation",
+            "resource_retry_reason": "generation_oom",
+            "failure_details": {
+                "code": "cuda_oom",
+                "stage": "denoise",
+                "detail": private,
+                "exception_type": "OutOfMemoryError",
+                "is_oom": True,
+                "allocator": {
+                    "device_type": "cuda",
+                    "free_bytes": 10,
+                    "private_path": private,
+                },
+            },
+            "oom_info": {
+                "is_oom": True,
+                "stage": "denoise",
+                "current_coefficient": 0.8,
+                "suggested_coefficient": 0.1,
+                "message": private,
+                "allocator": {
+                    "device_type": "cuda",
+                    "free_bytes": 10,
+                    "private_path": private,
+                },
+                "traceback": private,
+            },
+        })
+        self.assertEqual(retry["oom_info"], {
+            "is_oom": True,
+            "stage": "denoise",
+            "current_coefficient": 0.8,
+            "suggested_coefficient": 0.7,
+            "message": "The operation ran out of GPU memory.",
+            "allocator": {"device_type": "cuda", "free_bytes": 10},
+        })
+        self.assertNotIn(private, repr(retry))
+
+        invalid_jobs = (
+            {
+                "failure_details": {
+                    "code": "cuda_oom", "stage": "denoise",
+                    "exception_type": "RuntimeError", "is_oom": True,
+                },
+                "oom_info": "raw traceback",
+            },
+            {
+                "failure_details": {
+                    "code": "cuda_oom", "stage": "denoise",
+                    "exception_type": "RuntimeError", "is_oom": True,
+                },
+                "oom_info": {
+                    "is_oom": True, "current_coefficient": float("inf"),
+                },
+            },
+            {
+                "failure_details": {
+                    "code": "generation_failed", "stage": "generation",
+                    "exception_type": "RuntimeError", "is_oom": False,
+                },
+                "oom_info": {"is_oom": True, "current_coefficient": 0.8},
+            },
+        )
+        for index, updates in enumerate(invalid_jobs):
+            with self.subTest(index=index), self.assertRaises(
+                QueueRecoveryAdapterError,
+            ):
+                _serialize({
+                    "id": f"bad-gpu-retry-{index}",
+                    "status": "queued",
+                    "resource_retry_attempt": 1,
+                    "resource_retry_limit": 2,
+                    "resource_retry_phase": "generation",
+                    "resource_retry_reason": "generation_oom",
+                    **updates,
+                })
+
+        with self.assertRaises(QueueRecoveryAdapterError):
+            _serialize({
+                "id": "bad-host-retry-oom",
+                "status": "queued",
+                "resource_retry_attempt": 1,
+                "resource_retry_limit": 2,
+                "resource_retry_phase": "model_load",
+                "resource_retry_reason": "host_memory_pressure",
+                "failure_details": {
+                    "code": "cuda_oom", "stage": "generation",
+                    "exception_type": "RuntimeError", "is_oom": True,
+                },
+                "oom_info": {"is_oom": True, "current_coefficient": 0.8},
+            })
+
     def test_marker_is_strict_and_requires_the_corresponding_relation(self):
         parent = _serialize({
             "id": "reference-parent", "status": "queued",

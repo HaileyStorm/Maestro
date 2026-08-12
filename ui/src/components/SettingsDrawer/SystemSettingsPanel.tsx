@@ -1187,8 +1187,11 @@ export function SystemSettingsPanel() {
 
       {/* Storage Manager — usage analytics + duplicate reclaim */}
       <button
+        type="button"
         onClick={() => useStore.getState().setStorageDashboardOpen(true)}
-        className="flex items-center gap-2 w-full px-3 py-2 rounded-lg border border-border text-xs text-text-secondary hover:text-text-primary hover:border-border-light transition-colors"
+        className="flex min-h-11 w-full items-center gap-2 rounded-lg border border-border px-3 py-2 text-xs text-text-secondary transition-colors hover:border-border-light hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+        aria-haspopup="dialog"
+        aria-controls="storage-manager-dialog"
       >
         <HardDrive size={13} className="text-accent-blue" />
         <span className="flex-1 text-left">Storage Manager</span>

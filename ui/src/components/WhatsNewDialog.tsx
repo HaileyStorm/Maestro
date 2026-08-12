@@ -1,30 +1,85 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import { Check, ChevronRight, History, Megaphone, X } from 'lucide-react'
 import { PRODUCT_NAME } from '../lib/branding'
 import { CHANGELOG_MANIFEST, CURRENT_RELEASE, type PublicReleaseNote } from '../lib/changelog'
-import { installModalFocus } from '../lib/modalFocus'
+import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
+import { PerformanceHistoryChart } from './PerformanceHistoryChart'
+
+const whatsNewListeners = new Set<() => void>()
+let whatsNewOpen = false
+let whatsNewRestoreFocus: HTMLElement | null = null
+
+function subscribeWhatsNew(listener: () => void) {
+  whatsNewListeners.add(listener)
+  return () => whatsNewListeners.delete(listener)
+}
+
+function setWhatsNewOpen(open: boolean) {
+  if (whatsNewOpen === open) return
+  whatsNewOpen = open
+  for (const listener of whatsNewListeners) listener()
+}
+
+function getWhatsNewOpen() {
+  return whatsNewOpen
+}
+
+function resolveWhatsNewTrigger(
+  document: Document,
+  fallback: HTMLElement | null,
+): HTMLElement | null {
+  const mobile = document.defaultView?.matchMedia?.('(max-width: 767px)').matches === true
+  const expected = document.querySelector<HTMLElement>(
+    `[data-responsive-dialog-trigger="whats-new:${mobile ? 'mobile' : 'desktop'}"]`,
+  )
+  if (expected && expected.isConnected !== false) return expected
+  if (fallback && fallback.isConnected !== false) return fallback
+  const replacement = document.querySelector<HTMLElement>('[data-responsive-dialog-trigger^="whats-new:"]')
+  return replacement && replacement.isConnected !== false ? replacement : null
+}
 
 export function WhatsNewButton({ compact = false }: { compact?: boolean }) {
-  const [open, setOpen] = useState(false)
+  const open = useSyncExternalStore(subscribeWhatsNew, getWhatsNewOpen, getWhatsNewOpen)
   const triggerRef = useRef<HTMLButtonElement>(null)
-  const closeDialog = useCallback(() => setOpen(false), [])
+
+  return (
+    <button
+      ref={triggerRef}
+      type="button"
+      onClick={() => {
+        whatsNewRestoreFocus = triggerRef.current
+        setWhatsNewOpen(true)
+      }}
+      data-responsive-dialog-trigger={`whats-new:${compact ? 'mobile' : 'desktop'}`}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      aria-label={`What's new in ${PRODUCT_NAME} v${CHANGELOG_MANIFEST.currentVersion}`}
+      className={`flex shrink-0 items-center justify-center gap-1 rounded-md border border-border/80 text-[9px] font-medium text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
+        compact ? 'h-11 w-11 p-0' : 'px-1.5 py-1'
+      }`}
+    >
+      <Megaphone size={compact ? 13 : 11} aria-hidden="true" />
+      {!compact && <span>What's new</span>}
+    </button>
+  )
+}
+
+export function WhatsNewDialogHost() {
+  const open = useSyncExternalStore(subscribeWhatsNew, getWhatsNewOpen, getWhatsNewOpen)
+  const focusReturnRef = useRef<HTMLSpanElement>(null)
+  const closeDialog = useCallback(() => setWhatsNewOpen(false), [])
 
   return (
     <>
-      <button
-        ref={triggerRef}
-        type="button"
-        onClick={() => setOpen(true)}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-label={`What's new in ${PRODUCT_NAME} v${CHANGELOG_MANIFEST.currentVersion}`}
-        className="flex shrink-0 items-center gap-1 rounded-md border border-border/80 px-1.5 py-1 text-[9px] font-medium text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-      >
-        <Megaphone size={compact ? 13 : 11} aria-hidden="true" />
-        {!compact && <span>What's new</span>}
-      </button>
-      {open && <WhatsNewDialog onClose={closeDialog} restoreFocusRef={triggerRef} />}
+      <span
+        ref={focusReturnRef}
+        tabIndex={-1}
+        className="fixed h-px w-px overflow-hidden opacity-0 pointer-events-none"
+        data-responsive-dialog-focus-return="whats-new"
+        onFocus={() => resolveWhatsNewTrigger(document, whatsNewRestoreFocus)?.focus()}
+      />
+      {open && <WhatsNewDialog onClose={closeDialog} restoreFocusRef={focusReturnRef} />}
     </>
   )
 }
@@ -34,12 +89,15 @@ function WhatsNewDialog({
   restoreFocusRef,
 }: {
   onClose: () => void
-  restoreFocusRef: React.RefObject<HTMLButtonElement | null>
+  restoreFocusRef: React.RefObject<HTMLElement | null>
 }) {
   const titleId = useId()
   const descriptionId = useId()
   const dialogRef = useRef<HTMLDivElement>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
+  const requestClose = useCallback(() => {
+    closeModalIfTop(document, dialogRef.current, onClose)
+  }, [onClose])
 
   useEffect(() => {
     if (!dialogRef.current || !closeRef.current) return
@@ -66,7 +124,7 @@ function WhatsNewDialog({
         paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))',
       }}
     >
-      <div aria-hidden="true" className="absolute inset-0 bg-black/75" onClick={onClose} />
+      <div aria-hidden="true" className="absolute inset-0 bg-black/75" onClick={requestClose} />
       <div
         ref={dialogRef}
         role="dialog"
@@ -88,8 +146,8 @@ function WhatsNewDialog({
           <button
             ref={closeRef}
             type="button"
-            onClick={onClose}
-            className="rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            onClick={requestClose}
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg p-0 text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:h-auto md:w-auto md:p-1.5"
             aria-label="Close what's new"
           >
             <X size={17} />
@@ -130,8 +188,10 @@ function WhatsNewDialog({
             </ul>
           </section>
 
+          <PerformanceHistoryChart />
+
           <details className="group mt-5 rounded-xl border border-border bg-bg-tertiary/35">
-            <summary className="flex cursor-pointer list-none items-center gap-2 px-3.5 py-3 text-xs font-semibold text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue [&::-webkit-details-marker]:hidden">
+            <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 px-3.5 py-3 text-xs font-semibold text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue md:min-h-0 [&::-webkit-details-marker]:hidden">
               <History size={14} aria-hidden="true" className="text-accent-blue" />
               All release history
               <ChevronRight size={14} aria-hidden="true" className="ml-auto transition-transform group-open:rotate-90" />
@@ -149,8 +209,8 @@ function WhatsNewDialog({
         <footer className="shrink-0 border-t border-border bg-bg-secondary px-5 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-6">
           <button
             type="button"
-            onClick={onClose}
-            className="w-full rounded-lg bg-accent-blue px-4 py-2 text-xs font-semibold text-white hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary"
+            onClick={requestClose}
+            className="min-h-11 w-full rounded-lg bg-bg-active px-4 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary md:min-h-0"
           >
             Done
           </button>

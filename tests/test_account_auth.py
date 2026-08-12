@@ -131,29 +131,62 @@ class AccountAuthStoreTests(unittest.TestCase):
             )
         self.assertEqual(duplicate.exception.code, "bootstrap_complete")
 
-    def test_windows_acl_verification_is_sid_based_and_stat_bound(self):
-        info = types.SimpleNamespace(
-            st_dev=1, st_ino=2, st_size=3, st_mtime_ns=4, st_ctime_ns=5,
-        )
-        completed = types.SimpleNamespace(returncode=0)
+    def test_windows_acl_cache_is_bound_to_security_descriptor_state(self):
+        private = account_auth.hashlib.sha256(b"private").digest()
+        repaired = account_auth.hashlib.sha256(b"repaired").digest()
+        completed = [
+            types.SimpleNamespace(
+                returncode=0,
+                stdout=account_auth.base64.b64encode(b"private"),
+            ),
+            types.SimpleNamespace(
+                returncode=0,
+                stdout=account_auth.base64.b64encode(b"repaired"),
+            ),
+        ]
         account_auth._windows_acl_cache.clear()
         with patch.object(account_auth.os, "name", "nt"), patch.object(
-            account_auth.os, "lstat", return_value=info,
+            account_auth.os, "lstat", return_value=object(),
         ), patch.object(
-            account_auth.subprocess, "run", return_value=completed,
+            account_auth,
+            "_windows_security_descriptor_fingerprint",
+            side_effect=[b"original", b"drifted-after-verification", repaired],
+        ) as descriptor_fingerprint, patch.object(
+            account_auth.subprocess, "run", side_effect=completed,
         ) as powershell:
             account_auth._tighten_windows_acl("C:/Maestro/accounts.json", directory=False)
-            account_auth._tighten_windows_acl("C:/Maestro/accounts.json", directory=False)
-            self.assertEqual(powershell.call_count, 1)
-            command = powershell.call_args.args[0][-1]
-            self.assertIn("GetOwner([Security.Principal.SecurityIdentifier])", command)
-            changed = types.SimpleNamespace(
-                st_dev=1, st_ino=2, st_size=4, st_mtime_ns=4, st_ctime_ns=6,
-            )
-            account_auth.os.lstat.return_value = changed
+            self.assertEqual(account_auth._windows_acl_cache[
+                (os.path.abspath("C:/Maestro/accounts.json"), False)
+            ], private)
             account_auth._tighten_windows_acl("C:/Maestro/accounts.json", directory=False)
             self.assertEqual(powershell.call_count, 2)
+            self.assertEqual(descriptor_fingerprint.call_count, 2)
+            self.assertEqual(account_auth._windows_acl_cache[
+                (os.path.abspath("C:/Maestro/accounts.json"), False)
+            ], repaired)
+            account_auth._tighten_windows_acl("C:/Maestro/accounts.json", directory=False)
+            self.assertEqual(powershell.call_count, 2)
+            self.assertEqual(descriptor_fingerprint.call_count, 3)
+            command = powershell.call_args.args[0][-1]
+            self.assertIn("GetOwner([Security.Principal.SecurityIdentifier])", command)
+            self.assertIn("GetAccessRules", command)
+            self.assertIn("AreAccessRulesProtected", command)
+            self.assertIn("GetSecurityDescriptorBinaryForm", command)
+            self.assertIn("$actual.InheritanceFlags -ne $inheritance", command)
+            self.assertIn("$actual.PropagationFlags -ne", command)
         account_auth._windows_acl_cache.clear()
+
+    def test_windows_security_descriptor_query_failure_is_stable(self):
+        account_auth._windows_acl_cache.clear()
+        with patch.object(account_auth.os, "name", "nt"), patch.object(
+            account_auth.os, "lstat", return_value=types.SimpleNamespace(),
+        ), patch.object(
+            account_auth,
+            "_windows_security_descriptor_fingerprint",
+            side_effect=AccountStoreCorruptError(),
+        ), self.assertRaises(AccountStoreCorruptError) as unavailable:
+            account_auth._tighten_windows_acl("C:/Maestro/accounts.json", directory=False)
+        self.assertEqual(unavailable.exception.code, "account_store_unavailable")
 
     def test_nonce_is_bound_single_use_expiring_and_restart_durable(self):
         nonce = self._nonce("login")
@@ -636,6 +669,59 @@ class AccountAuthStoreTests(unittest.TestCase):
         refreshed = self.store.list_sessions(current)[0]
         self.assertGreater(refreshed["last_seen_at"], original_seen)
 
+    def test_session_inventory_persists_expired_sibling_clock_high_water(self):
+        first = self._bootstrap()["account_session_id"]
+        self.clock.advance(1000)
+        browser = "8" * 32
+        current = self.store.login(
+            username="Owner",
+            password=PASSWORD,
+            device_label="Current",
+            nonce_session_id=browser,
+            nonce=self.store.issue_nonce(browser, "login")["nonce"],
+            remote=True,
+        )["account_session_id"]
+        self.clock.advance(2700)
+
+        self.assertEqual(
+            [item["device_label"] for item in self.store.list_sessions(current)],
+            ["Current"],
+        )
+        self.assertGreaterEqual(
+            self.store._load()["clock_high_water"], self.clock.value,
+        )
+
+        self.clock.advance(-1700)
+        restarted = self._new_store()
+        self.assertIsNone(restarted.resolve_session(first))
+        self.assertEqual(
+            [item["device_label"] for item in restarted.list_sessions(current)],
+            ["Current"],
+        )
+
+    def test_container_email_and_device_labels_return_stable_errors(self):
+        for field, value, code in (
+            ("email", [], "invalid_email"),
+            ("email", {}, "invalid_email"),
+            ("device_label", [], "invalid_device_label"),
+            ("device_label", {}, "invalid_device_label"),
+        ):
+            with self.subTest(field=field, container=type(value).__name__):
+                arguments = {
+                    "username": "Owner",
+                    "password": PASSWORD,
+                    "email": "",
+                    "device_label": "Browser",
+                    "nonce_session_id": self.browser_session,
+                    "nonce": self._nonce("bootstrap"),
+                    "remote": False,
+                }
+                arguments[field] = value
+                with self.assertRaises(AccountAuthError) as invalid:
+                    self.store.bootstrap_owner(**arguments)
+                self.assertEqual(invalid.exception.code, code)
+                self.assertFalse(self.store.has_accounts())
+
     def test_malformed_and_tampered_stores_fail_closed(self):
         self.path.write_text("{}", encoding="utf-8")
         with self.assertRaises(AccountStoreCorruptError):
@@ -870,6 +956,14 @@ class AccountAuthStoreTests(unittest.TestCase):
                 self.store.issue_nonce("d" * 32, "login")
         self.assertEqual(flush.exception.code, "account_store_unavailable")
         self.assertTrue(self._new_store().has_accounts())
+
+    def test_private_directory_creation_failure_is_stable_store_error(self):
+        with patch(
+            "services.account_auth.os.makedirs",
+            side_effect=PermissionError("directory denied"),
+        ), self.assertRaises(AccountStoreCorruptError) as unavailable:
+            self.store.has_accounts()
+        self.assertEqual(unavailable.exception.code, "account_store_unavailable")
 
     def test_attempt_pruning_preserves_current_identity_and_newest_records(self):
         self._bootstrap()

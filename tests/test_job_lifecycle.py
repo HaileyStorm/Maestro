@@ -54,6 +54,7 @@ from services.job_lifecycle import (  # noqa: E402
     snapshot_job,
     stamp_job_residency,
     try_requeue,
+    try_resource_retry,
     try_start,
     unregister_abort_state,
     update_queue_job,
@@ -709,6 +710,79 @@ class TestJobLifecycle(unittest.TestCase):
         self.assertFalse(update_job(job, message="Late worker message"))
         self.assertEqual(job["status"], "cancelled")
         self.assertEqual(job["message"], "Cancelled")
+
+    def test_resource_retry_is_same_job_bounded_and_durable(self):
+        job = {**_job(), "resource_intent": "generation"}
+        self.assertTrue(try_start(job))
+        self.assertEqual(try_resource_retry(
+            job,
+            phase="model_load",
+            reason="host_memory_pressure",
+            limit=2,
+            error=None,
+        ), 1)
+        self.assertEqual(job["id"], "job-1")
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["resource_state"], "queued")
+        self.assertEqual(job["resource_retry_attempt"], 1)
+        self.assertEqual(job["resource_retry_limit"], 2)
+
+        self.assertTrue(try_start(job))
+        self.assertEqual(try_resource_retry(
+            job,
+            phase="generation",
+            reason="generation_oom",
+            limit=2,
+        ), 2)
+        self.assertTrue(try_start(job))
+        self.assertIsNone(try_resource_retry(
+            job,
+            phase="generation",
+            reason="generation_oom",
+            limit=2,
+        ))
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["resource_retry_attempt"], 2)
+
+    def test_cancel_reentrant_from_resource_retry_durability_hook_wins(self):
+        job = {**_job(), "status": "running"}
+        injected = False
+
+        def durability_hook(proposal):
+            nonlocal injected
+            if proposal.name == "resource_retry" and not injected:
+                injected = True
+                request_cancel(job)
+
+        configure_durability_hook(durability_hook)
+        try:
+            self.assertIsNone(try_resource_retry(
+                job,
+                phase="model_load",
+                reason="host_memory_pressure",
+                limit=2,
+            ))
+        finally:
+            configure_durability_hook(None)
+        self.assertEqual(job["status"], "cancelled")
+        self.assertTrue(job["cancel_requested"])
+
+    def test_timeout_cancel_is_fenced_by_resource_retry_attempt(self):
+        job = {
+            **_job(),
+            "status": "queued",
+            "resource_retry_attempt": 1,
+        }
+        stale = request_cancel(
+            job, expected_resource_retry_attempt=0,
+        )
+        self.assertFalse(stale.changed)
+        self.assertEqual(job["status"], "queued")
+        current = request_cancel(
+            job, expected_resource_retry_attempt=1,
+        )
+        self.assertTrue(current.changed)
+        self.assertEqual(job["status"], "cancelled")
 
     def test_queued_job_ignores_a_stale_active_state(self):
         job = _job()

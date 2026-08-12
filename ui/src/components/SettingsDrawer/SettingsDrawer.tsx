@@ -1,5 +1,8 @@
+import { useCallback, useEffect, useId, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import { SystemSettingsPanel } from './SystemSettingsPanel'
 import { ServicesSettingsPanel } from './ServicesSettingsPanel'
 
@@ -29,34 +32,72 @@ export function SettingsDrawer() {
   const setSettingsOpen = useStore(s => s.setSettingsOpen)
   const settingsTab = useStore(s => s.settingsTab)
   const setSettingsTab = useStore(s => s.setSettingsTab)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const titleId = useId()
+
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false)
+  }, [setSettingsOpen])
+
+  useEffect(() => {
+    if (!settingsOpen || !dialogRef.current || !closeButtonRef.current) return
+    const restoreFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    return installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: closeButtonRef.current,
+      restoreFocus,
+      appRoot: document.getElementById('root'),
+      onClose: closeSettings,
+      priority: 50,
+    })
+  }, [closeSettings, settingsOpen])
 
   const tabs = [
     { id: 'performance' as const, label: 'Performance' },
     { id: 'integrations' as const, label: 'Integrations' },
   ]
 
-  return (
+  return createPortal(
     <>
       {/* Backdrop */}
       {settingsOpen && (
-        <div
-          className="fixed inset-0 bg-black/40 z-40"
-          onClick={() => setSettingsOpen(false)}
+        <button
+          type="button"
+          tabIndex={-1}
+          aria-label="Close settings"
+          className="fixed inset-0 z-40 appearance-none border-0 bg-black/40 p-0"
+          onClick={() => closeModalIfTop(document, dialogRef.current, closeSettings)}
         />
       )}
 
       {/* Drawer */}
-      <div className={`fixed top-0 left-0 flex h-[100dvh] w-full flex-col border-r border-border bg-bg-secondary pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)] z-50 transform transition-transform duration-300 ease-in-out md:w-[clamp(460px,24vw,560px)] ${
+      <div
+        id="machine-settings-drawer"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-hidden={!settingsOpen}
+        inert={!settingsOpen}
+        className={`fixed left-0 top-0 z-50 flex h-[100vh] w-full flex-col overflow-hidden border-r border-border bg-bg-secondary pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] shadow-2xl transform transition-transform duration-300 ease-in-out supports-[height:100dvh]:h-[100dvh] motion-reduce:transition-none md:w-[clamp(460px,24vw,560px)] ${
         settingsOpen ? 'translate-x-0' : '-translate-x-full'
-      }`}>
+      }`}
+      >
         {/* Header */}
-        <div className="shrink-0 px-5 py-3 border-b border-border flex items-center justify-between">
-          <h2 className="font-semibold text-sm">Settings</h2>
+        <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-2 sm:px-5 sm:py-3">
+          <h2 id={titleId} className="font-semibold text-sm">Settings</h2>
           <button
-            onClick={() => setSettingsOpen(false)}
-            className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+            ref={closeButtonRef}
+            type="button"
+            onClick={() => closeModalIfTop(document, dialogRef.current, closeSettings)}
+            className="flex min-h-11 min-w-11 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            aria-label="Close settings"
           >
-            <X size={16} />
+            <X size={16} aria-hidden="true" />
           </button>
         </div>
 
@@ -66,12 +107,14 @@ export function SettingsDrawer() {
             {tabs.map(tab => (
               <button
                 key={tab.id}
+                type="button"
                 onClick={() => setSettingsTab(tab.id)}
-                className={`flex-1 text-xs py-1.5 rounded-md transition-all ${
+                className={`min-h-11 flex-1 rounded-md py-1.5 text-xs transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
                   settingsTab === tab.id
                     ? 'bg-bg-active text-text-primary'
                     : 'text-text-secondary hover:text-text-primary'
                 }`}
+                aria-pressed={settingsTab === tab.id}
               >
                 {tab.label}
               </button>
@@ -90,6 +133,7 @@ export function SettingsDrawer() {
           )}
         </div>
       </div>
-    </>
+    </>,
+    document.body,
   )
 }

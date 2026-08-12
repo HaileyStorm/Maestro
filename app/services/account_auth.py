@@ -2,9 +2,10 @@
 
 Accounts are an optional authority layered on top of Maestro's anonymous
 browser session.  The store never persists bearer session IDs, nonces,
-passwords, or recovery codes: those values are represented by keyed digests
-under Maestro's owner-only session secret.  Email is optional profile data and
-is never a login credential by itself.
+passwords, or recovery codes.  Session IDs, nonces, and recovery codes are
+represented by keyed digests under Maestro's owner-only session secret;
+passwords use salted scrypt verifiers inside the keyed sealed store.  Email is
+optional profile data and is never a login credential by itself.
 
 Passkey credential records are schema-reserved for a future WebAuthn
 implementation.  This module deliberately exposes no passkey ceremony and
@@ -126,11 +127,41 @@ class AccountStoreCapacityError(AccountAuthError):
 
 
 _windows_acl_cache_lock = threading.Lock()
-_windows_acl_cache: dict[tuple[str, bool], tuple[int, int, int, int, int]] = {}
+_windows_acl_cache: dict[tuple[str, bool], bytes] = {}
 
 
 def _portable_owner_matches(info: os.stat_result) -> bool:
     return not hasattr(os, "getuid") or info.st_uid == os.getuid()
+
+
+def _windows_security_descriptor_fingerprint(path: str) -> bytes:
+    """Return a cheap owner, group, and DACL fingerprint via native Win32."""
+    if os.name != "nt":
+        return b""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        get_file_security = advapi32.GetFileSecurityW
+        get_file_security.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        get_file_security.restype = wintypes.BOOL
+        requested = 0x00000001 | 0x00000002 | 0x00000004
+        required = wintypes.DWORD()
+        get_file_security(path, requested, None, 0, ctypes.byref(required))
+        if required.value <= 0 or ctypes.get_last_error() != 122:
+            raise OSError(ctypes.get_last_error(), "security descriptor query failed")
+        descriptor = ctypes.create_string_buffer(required.value)
+        if not get_file_security(
+            path, requested, descriptor, required.value, ctypes.byref(required),
+        ):
+            raise OSError(ctypes.get_last_error(), "security descriptor read failed")
+        return hashlib.sha256(descriptor.raw[:required.value]).digest()
+    except (AttributeError, OSError, ValueError) as error:
+        raise AccountStoreCorruptError() from error
 
 
 def _tighten_windows_acl(path: str, *, directory: bool) -> None:
@@ -139,17 +170,15 @@ def _tighten_windows_acl(path: str, *, directory: bool) -> None:
         return
     absolute = os.path.abspath(path)
     try:
-        before = os.lstat(absolute)
+        os.lstat(absolute)
     except OSError as error:
         raise AccountStoreCorruptError() from error
-    signature = (
-        int(getattr(before, "st_dev", 0)), int(getattr(before, "st_ino", 0)),
-        int(before.st_size), int(getattr(before, "st_mtime_ns", 0)),
-        int(getattr(before, "st_ctime_ns", 0)),
-    )
+    fingerprint = _windows_security_descriptor_fingerprint(absolute)
     cache_key = (absolute, bool(directory))
     with _windows_acl_cache_lock:
-        if _windows_acl_cache.get(cache_key) == signature:
+        if hmac.compare_digest(
+            _windows_acl_cache.get(cache_key, b""), fingerprint,
+        ):
             return
     inheritance = "ContainerInherit,ObjectInherit" if directory else "None"
     script = r"""
@@ -187,6 +216,11 @@ $actual = $rules[0]
 if ($actual.IdentityReference.Value -ne $identity.Value) { exit 44 }
 if ($actual.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { exit 45 }
 if (($actual.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl) { exit 46 }
+if ($actual.InheritanceFlags -ne $inheritance) { exit 47 }
+if ($actual.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) { exit 48 }
+[Console]::Out.Write([Convert]::ToBase64String(
+    $verified.GetSecurityDescriptorBinaryForm()
+))
 """
     try:
         environment = os.environ.copy()
@@ -202,21 +236,25 @@ if (($actual.FileSystemRights -band [Security.AccessControl.FileSystemRights]::F
             ],
             env=environment,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=20,
             check=False,
         )
         if completed.returncode != 0:
             raise AccountStoreCorruptError()
-        after = os.lstat(absolute)
-        verified_signature = (
-            int(getattr(after, "st_dev", 0)), int(getattr(after, "st_ino", 0)),
-            int(after.st_size), int(getattr(after, "st_mtime_ns", 0)),
-            int(getattr(after, "st_ctime_ns", 0)),
-        )
+        encoded_descriptor = completed.stdout
+        if not isinstance(encoded_descriptor, bytes) or len(encoded_descriptor) > 128 * 1024:
+            raise AccountStoreCorruptError()
+        try:
+            verified_descriptor = base64.b64decode(encoded_descriptor, validate=True)
+        except (TypeError, ValueError) as error:
+            raise AccountStoreCorruptError() from error
+        if not verified_descriptor:
+            raise AccountStoreCorruptError()
+        verified_fingerprint = hashlib.sha256(verified_descriptor).digest()
         with _windows_acl_cache_lock:
-            _windows_acl_cache[cache_key] = verified_signature
+            _windows_acl_cache[cache_key] = verified_fingerprint
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise AccountStoreCorruptError() from error
 
@@ -262,8 +300,8 @@ def _fsync_directory(path: str) -> None:
 
 
 def _ensure_private_directory(path: str) -> None:
-    os.makedirs(path, mode=0o700, exist_ok=True)
     try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
         info = os.lstat(path)
         if (
             not stat.S_ISDIR(info.st_mode)
@@ -449,10 +487,12 @@ def _normalize_username(value: Any) -> tuple[str, str]:
 
 
 def _normalize_email(value: Any) -> str:
-    if value in {None, ""}:
+    if value is None:
         return ""
     if not isinstance(value, str):
         raise AccountAuthError("Email must be text.", code="invalid_email")
+    if value == "":
+        return ""
     email = unicodedata.normalize("NFKC", value).strip().casefold()
     if (
         not 3 <= len(email) <= 254
@@ -466,10 +506,12 @@ def _normalize_email(value: Any) -> str:
 
 
 def _normalize_device_label(value: Any) -> str:
-    if value in {None, ""}:
+    if value is None:
         return "Browser"
     if not isinstance(value, str):
         raise AccountAuthError("Device label must be text.", code="invalid_device_label")
+    if value == "":
+        return "Browser"
     label = " ".join(value.split())
     if not 1 <= len(label) <= 80 or any(ord(character) < 32 for character in label):
         raise AccountAuthError(
@@ -1831,9 +1873,16 @@ class AccountAuthStore:
         now = float(self._clock())
         with self._lock:
             payload = self._load()
+            previous_high_water = float(payload["clock_high_water"])
             now = self._monotonic_event_time(payload, now)
             account, current = self._require_session_for_event_locked(
                 payload, session_id, now,
+            )
+            sibling_expiry_crossed = any(
+                item["account_id"] == account["id"]
+                and item["revoked_at"] is None
+                and previous_high_water < float(item["expires_at"]) <= now
+                for item in payload["sessions"]
             )
             sessions = []
             for item in payload["sessions"]:
@@ -1852,6 +1901,8 @@ class AccountAuthStore:
                     "expires_at": float(item["expires_at"]),
                     "current": item["handle"] == current["handle"],
                 })
+            if sibling_expiry_crossed:
+                self._save(payload)
             return sorted(sessions, key=lambda item: item["created_at"], reverse=True)
 
     def revoke_session(

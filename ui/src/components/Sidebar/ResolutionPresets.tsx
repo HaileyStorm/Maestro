@@ -25,7 +25,7 @@ export function ResolutionPresets() {
     return (
       <div>
         <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Resolution</label>
-        <select disabled className="w-full rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-muted">
+        <select disabled aria-label="Resolution" className="mobile-control-target w-full rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-muted">
           <option>Loading H3-native canvases…</option>
         </select>
       </div>
@@ -51,9 +51,10 @@ export function ResolutionPresets() {
       <div>
         <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Resolution</label>
         <select
+          aria-label="Resolution"
           value={resolution}
           onChange={event => setH3NativeResolution(event.target.value)}
-          className="w-full rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary"
+          className="mobile-control-target w-full rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
         >
           {!selectedIsNative && (
             <option value={resolution} disabled>{resolution} · choose an H3-native canvas</option>
@@ -88,16 +89,18 @@ export function ResolutionPresets() {
   return (
     <div>
       <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Resolution</label>
-      <div className="flex bg-bg-tertiary rounded-lg p-0.5 border border-border">
+      <div role="group" aria-label="Resolution presets" className="flex max-w-full overflow-x-auto rounded-lg border border-border bg-bg-tertiary p-0.5">
         {presets.map(p => (
           <button
+            type="button"
             key={p}
             onClick={() => setResolutionPreset(p)}
-            className={`flex-1 text-xs py-1.5 rounded-md transition-all capitalize ${
+            aria-pressed={resolutionPreset === p}
+            className={`mobile-control-target min-w-11 flex-1 rounded-md px-1.5 py-1.5 text-xs capitalize transition-all md:min-w-0 ${
               resolutionPreset === p
                 ? 'bg-bg-active text-text-primary'
                 : 'text-text-secondary hover:text-text-primary'
-            }`}
+            } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue`}
           >
             {p === 'auto' ? 'Auto' : modelOptions?.resolution_presets?.[p]?.label || p}
           </button>

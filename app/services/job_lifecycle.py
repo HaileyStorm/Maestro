@@ -2048,47 +2048,121 @@ def try_start(
             job["_generation_slot_owned"] = True
 
 
-def try_requeue(job: MutableMapping[str, Any], **updates: Any) -> bool:
-    """Return a multi-phase job to queued unless cancellation won first."""
-    if "status" in updates:
-        raise ValueError("status must be changed through a lifecycle transition")
-    with _queue_condition, _lifecycle_lock:
-        if is_cancel_requested(job):
-            candidate = _copy_job_for_transition(job)
-            candidate["status"] = "cancelled"
-            candidate["message"] = "Cancelled"
-            if candidate.get("resource_intent") in _RESOURCE_INTENTS:
-                candidate["resource_state"] = "released"
-                candidate["preemption_mode"] = PREEMPTION_MODE_NONE
-            _persist_prospective_unlocked(
-                "requeue_cancelled",
-                jobs=(candidate,),
-                global_state=_global_state_unlocked(
-                    replacements={id(job): candidate},
-                ),
-            )
-            _publish_job_unlocked(job, candidate)
-            _queue_waiters.pop(id(job), None)
-            _queue_condition.notify_all()
-            return False
-        if job.get("status") != "running":
-            return False
+def _try_requeue_unlocked(
+    job: MutableMapping[str, Any],
+    updates: Mapping[str, Any],
+    *,
+    transition: str = "requeue",
+) -> bool:
+    """Publish one already-validated requeue while lifecycle locks are held."""
+    if is_cancel_requested(job):
         candidate = _copy_job_for_transition(job)
-        candidate.update(updates)
-        candidate["status"] = "queued"
+        candidate["status"] = "cancelled"
+        candidate["message"] = "Cancelled"
         if candidate.get("resource_intent") in _RESOURCE_INTENTS:
-            candidate["resource_state"] = "queued"
-        _append_job_event_unlocked(candidate, status="queued", **updates)
+            candidate["resource_state"] = "released"
+            candidate["preemption_mode"] = PREEMPTION_MODE_NONE
         _persist_prospective_unlocked(
-            "requeue",
+            "requeue_cancelled",
             jobs=(candidate,),
             global_state=_global_state_unlocked(
                 replacements={id(job): candidate},
             ),
         )
         _publish_job_unlocked(job, candidate)
+        _queue_waiters.pop(id(job), None)
         _queue_condition.notify_all()
-        return True
+        return False
+    if job.get("status") != "running":
+        return False
+    candidate = _copy_job_for_transition(job)
+    candidate.update(updates)
+    candidate["status"] = "queued"
+    if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+        candidate["resource_state"] = "queued"
+    _append_job_event_unlocked(candidate, status="queued", **dict(updates))
+    _persist_prospective_unlocked(
+        transition,
+        jobs=(candidate,),
+        global_state=_global_state_unlocked(
+            replacements={id(job): candidate},
+        ),
+    )
+    # A durability hook may synchronously publish cancellation or finality
+    # while this RLock is re-entered. Never replace that later winner with the
+    # older queued candidate prepared above.
+    if is_cancel_requested(job) or str(job.get("status") or "") in TERMINAL_STATUSES:
+        return False
+    _publish_job_unlocked(job, candidate)
+    _queue_condition.notify_all()
+    return True
+
+
+def try_requeue(job: MutableMapping[str, Any], **updates: Any) -> bool:
+    """Return a multi-phase job to queued unless cancellation won first."""
+    if "status" in updates:
+        raise ValueError("status must be changed through a lifecycle transition")
+    with _queue_condition, _lifecycle_lock:
+        return _try_requeue_unlocked(job, updates)
+
+
+def try_resource_retry(
+    job: MutableMapping[str, Any],
+    *,
+    phase: str,
+    reason: str,
+    limit: int,
+    **updates: Any,
+) -> int | None:
+    """Atomically requeue one transient resource failure on the same job.
+
+    The returned attempt is durably committed before another worker may run.
+    Cancellation, terminality, a stale/non-running caller, or exhaustion wins
+    without granting another resource attempt.
+    """
+    if "status" in updates or any(
+        key in updates for key in {
+            "resource_retry_attempt", "resource_retry_limit",
+            "resource_retry_phase", "resource_retry_reason",
+        }
+    ):
+        raise ValueError("resource retry fields are transition-owned")
+    if phase not in {"model_load", "generation", "finalization"}:
+        raise ValueError("Invalid resource retry phase")
+    if reason not in {
+        "host_memory_pressure", "generation_oom", "finalization_oom",
+    }:
+        raise ValueError("Invalid resource retry reason")
+    if type(limit) is not int or not 1 <= limit <= 8:
+        raise ValueError("Invalid resource retry limit")
+    with _queue_condition, _lifecycle_lock:
+        if is_cancel_requested(job):
+            _try_requeue_unlocked(job, {})
+            return None
+        if job.get("status") != "running":
+            return None
+        try:
+            previous = max(0, int(job.get("resource_retry_attempt", 0) or 0))
+        except (TypeError, ValueError):
+            return None
+        if previous >= limit:
+            return None
+        attempt = previous + 1
+        retry_updates = dict(updates)
+        retry_updates.update({
+            "resource_retry_attempt": attempt,
+            "resource_retry_limit": limit,
+            "resource_retry_phase": phase,
+            "resource_retry_reason": reason,
+        })
+        retry_updates.setdefault(
+            "message", f"Retrying after resource pressure ({attempt}/{limit})",
+        )
+        if not _try_requeue_unlocked(
+            job, retry_updates, transition="resource_retry",
+        ):
+            return None
+        return attempt
 
 
 def update_job(
@@ -2175,12 +2249,30 @@ def request_cancel(
     *,
     job_id: str | None = None,
     active_states: MutableMapping[str, MutableMapping[str, Any]] | None = None,
+    expected_resource_retry_attempt: int | None = None,
 ) -> CancelResult:
     """Atomically cancel lifecycle state and remove scheduler membership."""
+    if (
+        expected_resource_retry_attempt is not None
+        and (
+            type(expected_resource_retry_attempt) is not int
+            or expected_resource_retry_attempt < 0
+        )
+    ):
+        raise ValueError("Invalid expected resource retry attempt")
     with _queue_condition, _lifecycle_lock:
         status = job.get("status")
         if status in TERMINAL_STATUSES:
             return CancelResult(False, False, False)
+        if expected_resource_retry_attempt is not None:
+            try:
+                current_resource_retry_attempt = max(
+                    0, int(job.get("resource_retry_attempt", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                return CancelResult(False, False, False)
+            if current_resource_retry_attempt != expected_resource_retry_attempt:
+                return CancelResult(False, False, False)
 
         was_running = status == "running"
         candidate = _copy_job_for_transition(job)

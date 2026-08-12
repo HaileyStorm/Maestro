@@ -5,6 +5,17 @@ import { ChoiceControl } from '../shared/ChoiceControl'
 import { FileUploadZone } from '../shared/FileUploadZone'
 import * as api from '../../api/client'
 
+const uploadErrorMessage = (label: string, error: unknown): string => {
+  const category = error instanceof Error ? error.message.toLowerCase() : ''
+  if (/too large|size limit|500\s*mb/.test(category)) {
+    return `${label} exceeds the upload limit. Choose a smaller file and try again.`
+  }
+  if (/format|extension|decode|audio track|convert/.test(category)) {
+    return `${label} is not a supported readable file. Choose another file and try again.`
+  }
+  return `${label} could not be uploaded. Check the connection, then try again.`
+}
+
 export function AudioModeSection() {
   const modelOptions = useStore(s => s.modelOptions)
   const params = useStore(s => s.params)
@@ -12,7 +23,8 @@ export function AudioModeSection() {
   const audioGuideFilename = useStore(s => s.audioGuideFilename)
   const setAudioGuideFilename = useStore(s => s.setAudioGuideFilename)
   const [videoGuideFilename, setVideoGuideFilename] = useState<string | null>(null)
-  const [uploading, setUploading] = useState(false)
+  const [uploadTarget, setUploadTarget] = useState<string | null>(null)
+  const [uploadError, setUploadError] = useState<{ target: string; message: string } | null>(null)
 
   // Dynamic multi-voice state
   const ttsVoiceCount = useStore(s => s.ttsVoiceCount)
@@ -68,7 +80,8 @@ export function AudioModeSection() {
   }
 
   const handleLegacyUpload = async (file: File, paramKey: 'audio_guide' | 'audio_guide2' | 'video_guide', setFilename: (n: string | null) => void) => {
-    setUploading(true)
+    setUploadTarget(paramKey)
+    setUploadError(null)
     try {
       // Route audio_guide uploads through /api/v1/upload-audio, which
       // accepts both audio AND video files (extracting the audio track
@@ -92,24 +105,27 @@ export function AudioModeSection() {
         if (dur && dur > 0) setDurationSeconds(Math.round(dur * 10) / 10)
       }
     } catch (e) {
-      console.error('Upload failed:', e)
+      const label = paramKey === 'video_guide' ? 'Control video' : 'Audio file'
+      setUploadError({ target: paramKey, message: uploadErrorMessage(label, e) })
     } finally {
-      setUploading(false)
+      setUploadTarget(null)
     }
   }
 
   const handleVoiceUpload = async (file: File, index: number) => {
-    setUploading(true)
+    const target = `voice-${index}`
+    setUploadTarget(target)
+    setUploadError(null)
     try {
-      const result = await api.uploadImage(file)
+      const result = await api.uploadAudio(file)
       setTtsVoiceFile(index, file.name, result.path)
       // Also set legacy params for backward compat
       const key = index === 0 ? 'audio_guide' : `audio_guide${index + 1}`
       setParam(key as keyof import('../../types').GenerateParams, result.path)
     } catch (e) {
-      console.error('Upload failed:', e)
+      setUploadError({ target, message: uploadErrorMessage(`Voice ${index + 1}`, e) })
     } finally {
-      setUploading(false)
+      setUploadTarget(null)
     }
   }
 
@@ -128,25 +144,28 @@ export function AudioModeSection() {
           removed that to let Scenema/Index TTS2 show their explicit text/single-ref/
           two-ref choices). */}
       {!hideAudioModeChoice && (
-        <ChoiceControl
-          config={config}
-          value={audioBaseMode}
-          onChange={val => {
-            const flags = audioValue.replace(/[^NV]/g, '')
-            setParam('audio_prompt_type', val + flags)
-            if (!val.includes('A')) {
-              setParam('audio_guide', undefined)
-              setAudioGuideFilename(null)
-            }
-            if (val !== 'K') {
-              setParam('video_guide', undefined)
-              setVideoGuideFilename(null)
-            }
-            const isAudioDriven = val.includes('A') && !isAudioOnly
-            setParam('modality_scale' as keyof import('../../types').GenerateParams, isAudioDriven ? 1.0 : 1.0)
-          }}
-          label="Audio Mode"
-        />
+        <fieldset disabled={uploadTarget !== null} aria-busy={uploadTarget !== null}
+          className="m-0 min-w-0 border-0 p-0 disabled:opacity-60">
+          <ChoiceControl
+            config={config}
+            value={audioBaseMode}
+            onChange={val => {
+              const flags = audioValue.replace(/[^NV]/g, '')
+              setParam('audio_prompt_type', val + flags)
+              if (!val.includes('A')) {
+                setParam('audio_guide', undefined)
+                setAudioGuideFilename(null)
+              }
+              if (val !== 'K') {
+                setParam('video_guide', undefined)
+                setVideoGuideFilename(null)
+              }
+              const isAudioDriven = val.includes('A') && !isAudioOnly
+              setParam('modality_scale' as keyof import('../../types').GenerateParams, isAudioDriven ? 1.0 : 1.0)
+            }}
+            label="Audio Mode"
+          />
+        </fieldset>
       )}
 
       {/* TTS Voice Cloning — dynamic 1-6 voices */}
@@ -155,8 +174,10 @@ export function AudioModeSection() {
           {/* Add Voice button — always at top */}
           {ttsVoiceCount < maxVoiceCount && (
             <button
+              type="button"
               onClick={addTtsVoice}
-              className="w-full py-1.5 rounded-lg text-[10px] font-medium border border-dashed border-border text-text-muted hover:text-text-primary hover:border-border-light transition-colors flex items-center justify-center gap-1.5"
+              disabled={uploadTarget !== null}
+              className="w-full py-1.5 rounded-lg text-[10px] font-medium border border-dashed border-border text-text-muted hover:text-text-primary hover:border-border-light transition-colors flex items-center justify-center gap-1.5 disabled:cursor-wait disabled:opacity-50"
             >
               <Plus size={12} />
               {ttsVoiceCount === 0 ? 'Add Voice Clone' : `Add Voice (${ttsVoiceCount}/${maxVoiceCount})`}
@@ -175,8 +196,10 @@ export function AudioModeSection() {
               {ttsVoices.slice(0, ttsVoiceCount).map((voice, i) => (
                 <div key={i} className="bg-bg-tertiary/50 border border-border rounded-lg p-2 relative">
                   <button
+                    type="button"
                     onClick={() => removeTtsVoice(i)}
-                    className="absolute -top-1.5 -right-1.5 p-0.5 rounded-full bg-bg-secondary border border-border text-text-muted hover:text-red-400 hover:border-red-400/50 transition-colors z-10"
+                    disabled={uploadTarget !== null}
+                    className="absolute -top-1.5 -right-1.5 p-0.5 rounded-full bg-bg-secondary border border-border text-text-muted hover:text-red-400 hover:border-red-400/50 transition-colors z-10 disabled:cursor-wait disabled:opacity-50"
                   >
                     <X size={10} />
                   </button>
@@ -184,16 +207,23 @@ export function AudioModeSection() {
                     Voice {i + 1}
                   </label>
                   <FileUploadZone
-                    label={uploading ? '...' : 'Drop audio'}
+                    label={uploadTarget === `voice-${i}` ? 'Uploading…' : 'Drop audio'}
                     accept=".wav,.mp3,.flac,.ogg,.m4a"
                     filename={voice.filename}
                     onFile={f => handleVoiceUpload(f, i)}
-                    onClear={() => clearVoice(i)}
+                    onClear={() => {
+                      setUploadError(current => current?.target === `voice-${i}` ? null : current)
+                      clearVoice(i)
+                    }}
+                    busy={uploadTarget === `voice-${i}`}
+                    disabled={uploadTarget !== null}
+                    error={uploadError?.target === `voice-${i}` ? uploadError.message : null}
                   />
                   <input
                     type="text"
                     placeholder="Speaker name"
                     value={voice.name}
+                    disabled={uploadTarget !== null}
                     onChange={e => setTtsVoiceName(i, e.target.value)}
                     className="w-full mt-1 bg-bg-tertiary border border-border rounded px-1.5 py-0.5 text-[9px] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue"
                   />
@@ -259,14 +289,18 @@ export function AudioModeSection() {
             Audio File
           </label>
           <FileUploadZone
-            label={uploading ? 'Uploading...' : 'Drop audio or video (audio will be extracted)'}
+            label={uploadTarget === 'audio_guide' ? 'Uploading…' : 'Drop audio or video (audio will be extracted)'}
             accept=".wav,.mp3,.flac,.ogg,.m4a,.mp4,.mov,.mkv,.webm,.avi,.m4v"
             filename={audioGuideFilename}
             onFile={file => handleLegacyUpload(file, 'audio_guide', setAudioGuideFilename)}
             onClear={() => {
+              setUploadError(current => current?.target === 'audio_guide' ? null : current)
               setParam('audio_guide', undefined)
               setAudioGuideFilename(null)
             }}
+            busy={uploadTarget === 'audio_guide'}
+            disabled={uploadTarget !== null}
+            error={uploadError?.target === 'audio_guide' ? uploadError.message : null}
           />
         </div>
       )}
@@ -301,14 +335,18 @@ export function AudioModeSection() {
             Control Video
           </label>
           <FileUploadZone
-            label={uploading ? 'Uploading...' : 'Drop video file (.mp4)'}
+            label={uploadTarget === 'video_guide' ? 'Uploading…' : 'Drop video file (.mp4)'}
             accept=".mp4,.webm,.mkv"
             filename={videoGuideFilename}
             onFile={file => handleLegacyUpload(file, 'video_guide', setVideoGuideFilename)}
             onClear={() => {
+              setUploadError(current => current?.target === 'video_guide' ? null : current)
               setParam('video_guide', undefined)
               setVideoGuideFilename(null)
             }}
+            busy={uploadTarget === 'video_guide'}
+            disabled={uploadTarget !== null}
+            error={uploadError?.target === 'video_guide' ? uploadError.message : null}
           />
         </div>
       )}

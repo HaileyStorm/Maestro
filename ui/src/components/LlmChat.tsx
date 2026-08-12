@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Bot, Check, Copy, Flag, ImagePlus, Loader2, Pencil, RotateCcw, Send, Trash2, UserRound, X } from 'lucide-react'
 import * as api from '../api/client'
+import { observeChatVisualViewport } from '../lib/chatVisualViewport'
 import { copyTextToClipboard, isAssistantCopyScopeCurrent } from '../lib/clipboard'
 import { useStore } from '../stores/useStore'
 import type { LlmChatMessage, LlmModelOption, LlmPromptGuideOption } from '../types'
@@ -427,6 +428,8 @@ export function LlmChat() {
   const [savingRefusalLiteral, setSavingRefusalLiteral] = useState(false)
   const [assistantCopyNotice, setAssistantCopyNotice] = useState<AssistantCopyNotice | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [chatViewportHeight, setChatViewportHeight] = useState<number | null>(null)
+  const chatShellRef = useRef<HTMLElement>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -698,8 +701,17 @@ export function LlmChat() {
   }, [activeWorkspace, adoptProjectInstance, sending])
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    endRef.current?.scrollTo({
+      top: endRef.current?.scrollHeight ?? 0,
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+    })
   }, [messages, sending])
+
+  useEffect(() => {
+    const shell = chatShellRef.current
+    if (!shell) return
+    return observeChatVisualViewport(shell, setChatViewportHeight)
+  }, [])
 
   useEffect(() => {
     clearAssistantCopyNotice()
@@ -1340,10 +1352,15 @@ export function LlmChat() {
   }
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col bg-bg-primary">
-      <div className="border-b border-border bg-bg-secondary px-3 py-3 md:px-6">
-        <div className="mx-auto flex max-w-5xl flex-wrap items-end gap-3">
-          <label className="min-w-0 basis-full flex-1 text-[10px] font-medium text-text-muted md:basis-[420px]">
+    <section
+      ref={chatShellRef}
+      data-chat-shell
+      style={chatViewportHeight === null ? undefined : { maxHeight: `${chatViewportHeight}px` }}
+      className="flex min-h-0 flex-1 flex-col overflow-hidden bg-bg-primary"
+    >
+      <div className="max-h-[24%] shrink-0 overflow-y-auto overscroll-contain border-b border-border bg-bg-secondary px-3 py-2 md:px-6 md:py-3 lg:max-h-none lg:overflow-visible">
+        <div className="mx-auto flex max-w-5xl flex-wrap items-end gap-2 md:gap-3">
+          <label className="min-w-[10rem] flex-1 text-[10px] font-medium text-text-muted md:basis-[420px]">
             LLM
             <select
               aria-label="Language model for Chat"
@@ -1367,7 +1384,7 @@ export function LlmChat() {
                 }
               }}
               disabled={loadingCatalog || interactionLocked}
-              className="mt-1 w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-xs text-text-primary"
+              className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-xs text-text-primary md:min-h-0"
             >
               {models.length === 0 && <option value="">{loadingCatalog ? 'Loading models…' : 'No models available'}</option>}
               {models.map(model => (
@@ -1389,16 +1406,16 @@ export function LlmChat() {
                 }}
                 disabled={interactionLocked}
                 placeholder="org/model or https://huggingface.co/org/model"
-                className="mt-1 w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-xs text-text-primary placeholder:text-text-muted"
+                className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-xs text-text-primary placeholder:text-text-muted md:min-h-0"
               />
             </label>
           )}
 
-          <button type="button" onClick={clearConversation} disabled={!messages.length || interactionLocked} className="flex items-center gap-1 rounded-md border border-border px-3 py-2 text-xs text-text-secondary disabled:opacity-40">
+          <button type="button" onClick={clearConversation} disabled={!messages.length || interactionLocked} className="flex min-h-11 items-center gap-1 rounded-md border border-border px-3 py-2 text-xs text-text-secondary disabled:opacity-40 md:min-h-0">
             <Trash2 size={13} /> Clear
           </button>
         </div>
-        <div id="llm-model-details" className="mx-auto mt-2 max-w-5xl text-[10px] text-text-muted">
+        <div id="llm-model-details" className="mx-auto mt-2 max-w-5xl truncate text-[10px] text-text-muted md:whitespace-normal">
           {selectedModel
             ? `${selectedModel.label} · ${modelMeta(selectedModel) || selectedModel.id}`
             : effectiveModelId
@@ -1407,13 +1424,20 @@ export function LlmChat() {
           {downloadProgress(selectedModel) ? ` · ${downloadProgress(selectedModel)} downloaded` : ''}
         </div>
         {selectedModel?.speed?.reason && (
-          <div className="mx-auto mt-1 max-w-5xl text-[10px] text-text-muted">
+          <div className="mx-auto mt-1 max-w-5xl truncate text-[10px] text-text-muted md:whitespace-normal">
             Speed basis: {selectedModel.speed.reason}
           </div>
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-5 md:px-6">
+      <div
+        ref={endRef}
+        data-chat-transcript
+        role="region"
+        aria-label="Chat transcript"
+        tabIndex={0}
+        className="min-h-[30%] flex-1 overflow-y-auto overscroll-contain px-3 py-2 md:px-6 md:py-5 lg:min-h-0"
+      >
         <div className="mx-auto flex max-w-4xl flex-col gap-3">
           {messages.length === 0 && (
             <div className="rounded-xl border border-dashed border-border bg-bg-secondary/60 p-8 text-center text-sm text-text-muted">
@@ -1526,14 +1550,14 @@ export function LlmChat() {
                           type="button"
                           onClick={cancelRefusalCapture}
                           disabled={savingRefusalLiteral}
-                          className="min-h-9 rounded-md border border-border px-3 text-xs text-text-secondary disabled:opacity-40"
+                          className="min-h-11 rounded-md border border-border px-3 text-xs text-text-secondary disabled:opacity-40 md:min-h-9"
                         >
                           Cancel
                         </button>
                         <button
                           type="submit"
                           disabled={savingRefusalLiteral || !!api.validateLlmRefusalLiteral(refusalCapture.literal)}
-                          className="flex min-h-9 items-center gap-1.5 rounded-md bg-accent-blue px-3 text-xs font-medium text-white disabled:opacity-40"
+                          className="flex min-h-11 items-center gap-1.5 rounded-md bg-accent-blue px-3 text-xs font-medium text-white disabled:opacity-40 md:min-h-9"
                         >
                           {savingRefusalLiteral && <Loader2 size={13} className="animate-spin" />}
                           Confirm exact wording
@@ -1569,7 +1593,7 @@ export function LlmChat() {
                           : 'Edit this turn and replace its descendants'}
                       onClick={() => editUserTurn(index)}
                       disabled={branchControlsLocked || editUnavailable}
-                      className="flex h-9 w-9 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40"
+                      className="flex h-11 w-11 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40 md:h-9 md:w-9"
                     >
                       <Pencil size={13} />
                     </button>
@@ -1584,7 +1608,7 @@ export function LlmChat() {
                             ? 'Copy failed'
                             : 'Copy response'}
                         onClick={() => void copyAssistantTurn(index)}
-                        className="flex h-9 w-9 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary"
+                        className="flex h-11 w-11 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary md:h-9 md:w-9"
                       >
                         {copyNoticeForTurn?.outcome === 'copied'
                           ? <Check size={13} className="text-accent-green" />
@@ -1605,7 +1629,7 @@ export function LlmChat() {
                           : 'Retry this response and replace its descendants'}
                         onClick={() => void retryAssistantTurn(index)}
                         disabled={branchControlsLocked || retryUnavailable}
-                        className="flex h-9 w-9 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40"
+                        className="flex h-11 w-11 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40 md:h-9 md:w-9"
                       >
                         <RotateCcw size={13} />
                       </button>
@@ -1626,7 +1650,7 @@ export function LlmChat() {
                           }}
                           onClick={event => beginRefusalCapture(index, event.detail > 0)}
                           disabled={savingRefusalLiteral}
-                          className="flex h-9 w-9 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40"
+                          className="flex h-11 w-11 items-center justify-center rounded border border-border text-text-muted hover:text-text-primary disabled:opacity-40 md:h-9 md:w-9"
                         >
                           <Flag size={13} />
                         </button>
@@ -1694,7 +1718,7 @@ export function LlmChat() {
                 type="button"
                 aria-label="Cancel waiting for this LLM request"
                 onClick={() => requestRef.current?.controller.abort()}
-                className="ml-auto rounded border border-border px-2 py-1 text-[10px] text-text-secondary"
+                className="ml-auto min-h-11 rounded border border-border px-3 py-1 text-[10px] text-text-secondary md:min-h-0 md:px-2"
               >
                 Cancel wait
               </button>
@@ -1707,7 +1731,7 @@ export function LlmChat() {
                 <button
                   type="button"
                   onClick={() => setResumeNonce(value => value + 1)}
-                  className="ml-auto rounded border border-red-400/40 px-2 py-1 text-[10px] text-red-200"
+                  className="ml-auto min-h-11 rounded border border-red-400/40 px-3 py-1 text-[10px] text-red-200 md:min-h-0 md:px-2"
                 >
                   Resume wait
                 </button>
@@ -1723,11 +1747,10 @@ export function LlmChat() {
               {activeLiveStatus.live_tps != null ? ` · Last live rate ${activeLiveStatus.live_tps.toFixed(1)} TPS` : ''}
             </div>
           )}
-          <div ref={endRef} />
         </div>
       </div>
 
-      <div className="border-t border-border bg-bg-secondary px-3 py-3 md:px-6">
+      <div data-chat-composer className="max-h-[46%] shrink-0 overflow-y-auto overscroll-contain border-t border-border bg-bg-secondary px-3 py-2 md:px-6 md:py-3 lg:max-h-none lg:overflow-visible">
         <div className="mx-auto max-w-4xl">
           {editingTurn && (
             <div className="mb-2 flex items-center gap-2 rounded-md border border-accent-blue/30 bg-accent-blue/5 px-3 py-2 text-xs text-text-secondary">
@@ -1747,7 +1770,7 @@ export function LlmChat() {
                   window.requestAnimationFrame(() => textareaRef.current?.focus())
                 }}
                 disabled={interactionLocked}
-                className="ml-auto rounded border border-border px-2 py-1 text-[10px] disabled:opacity-40"
+                className="ml-auto min-h-11 rounded border border-border px-3 py-1 text-[10px] disabled:opacity-40 md:min-h-0 md:px-2"
               >
                 Cancel edit
               </button>
@@ -1764,7 +1787,7 @@ export function LlmChat() {
                     aria-label={`Remove ${file.name}`}
                     onClick={() => setSelectedImages(current => current.filter((_, itemIndex) => itemIndex !== index))}
                     disabled={interactionLocked}
-                    className="shrink-0 text-text-muted hover:text-text-primary disabled:opacity-40"
+                    className="flex h-11 w-11 shrink-0 items-center justify-center text-text-muted hover:text-text-primary disabled:opacity-40 md:h-auto md:w-auto"
                   >
                     <X size={12} />
                   </button>
@@ -1790,12 +1813,14 @@ export function LlmChat() {
             disabled={interactionLocked || !activeWorkspace || !projectInstance || !effectiveModelId}
             rows={3}
             placeholder={unavailableReason || 'Message the model… (Shift+Enter for a new line)'}
-            className="min-h-[74px] w-full resize-y rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted"
+            className="min-h-[74px] max-h-[min(24vh,9rem)] w-full resize-none overflow-y-auto rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted md:resize-y"
           />
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <input
               ref={fileInputRef}
               type="file"
+              tabIndex={-1}
+              aria-hidden="true"
               accept="image/*,.avif,.bmp,.gif,.jpg,.jpeg,.png,.webp"
               multiple
               onChange={event => selectImages(event.target.files)}
@@ -1808,11 +1833,11 @@ export function LlmChat() {
               title={!modelAcceptsImages ? 'Vision is unavailable for this LLM' : 'Attach up to four images'}
               onClick={() => fileInputRef.current?.click()}
               disabled={interactionLocked || !effectiveModelId || !modelAcceptsImages || selectedImages.length >= MAX_IMAGE_ATTACHMENTS}
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border text-text-secondary disabled:opacity-40"
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-border text-text-secondary disabled:opacity-40 md:h-10 md:w-10"
             >
               <ImagePlus size={16} />
             </button>
-            <label className="flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-[10px] font-medium text-text-secondary">
+            <label className="flex min-h-11 items-center gap-2 rounded-lg border border-border px-3 text-[10px] font-medium text-text-secondary md:min-h-10">
               <input
                 type="checkbox"
                 checked={useGuide}
@@ -1831,7 +1856,7 @@ export function LlmChat() {
                   setGuideId(event.target.value)
                 }}
                 disabled={!useGuide || !videoGuides.length || interactionLocked}
-                className="mt-0.5 w-full rounded-md border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-primary disabled:opacity-50"
+                className="mt-0.5 min-h-11 w-full rounded-md border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-primary disabled:opacity-50 md:min-h-0"
               >
                 {!guideId && (
                   <option value="">
@@ -1850,7 +1875,7 @@ export function LlmChat() {
                   ? 'Following Studio / Director video model'
                   : 'No Studio / Director video model selected'}
             </span>
-            <button type="button" onClick={() => void send()} disabled={!draft.trim() || interactionLocked || !!unavailableReason} className="ml-auto flex h-10 items-center gap-2 rounded-lg bg-accent-blue px-4 text-xs font-medium text-white disabled:opacity-40">
+            <button type="button" onClick={() => void send()} disabled={!draft.trim() || interactionLocked || !!unavailableReason} className="ml-auto flex h-11 items-center gap-2 rounded-lg bg-accent-blue px-4 text-xs font-medium text-white disabled:opacity-40 md:h-10">
               {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />} {editingTurn ? 'Send edit' : 'Send'}
             </button>
           </div>

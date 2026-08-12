@@ -62,10 +62,26 @@ class ProductBrandingTests(unittest.TestCase):
         )
 
     def test_welcome_remains_scrollable_with_reachable_primary_action(self):
-        self.assertIn("max-h-[calc(100dvh-1.5rem)]", WELCOME)
+        self.assertIn("h-[100vh]", WELCOME)
+        self.assertIn("supports-[height:100dvh]:h-[100dvh]", WELCOME)
+        self.assertIn("max-h-full", WELCOME)
+        for property_name, edge in (
+            ("paddingTop", "top"),
+            ("paddingRight", "right"),
+            ("paddingBottom", "bottom"),
+            ("paddingLeft", "left"),
+        ):
+            self.assertIn(
+                f"{property_name}: 'max(0.75rem, env(safe-area-inset-{edge}))'",
+                WELCOME,
+            )
         self.assertIn("flex-1 min-h-0 overflow-y-auto", WELCOME)
-        self.assertIn("sticky bottom-0 shrink-0", WELCOME)
+        self.assertIn(
+            "sticky bottom-0 max-h-[55%] overflow-y-auto overscroll-contain shrink-0 border-t border-border",
+            WELCOME,
+        )
         self.assertIn("pb-[max(1rem,env(safe-area-inset-bottom))]", WELCOME)
+        self.assertIn("flex min-h-11 w-full items-center justify-center", WELCOME)
         self.assertIn("Enter the studio", WELCOME)
 
     def test_whats_new_is_static_accessible_and_provenance_aware(self):

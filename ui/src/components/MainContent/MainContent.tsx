@@ -1,4 +1,4 @@
-import { useRef, useCallback, useState, useEffect, useId, useLayoutEffect, useMemo, type JSX } from 'react'
+import { useRef, useCallback, useState, useEffect, useId, useLayoutEffect, useMemo, type JSX, type ReactNode } from 'react'
 import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Upload, Trash2, ListChecks, Eye, EyeOff, FolderInput, Lock, LockOpen, KeyRound, Pause, ArrowUp, ArrowDown } from 'lucide-react'
 import { TabFilter } from './TabFilter'
 import { ThumbnailGallery } from './ThumbnailGallery'
@@ -23,6 +23,165 @@ const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
 const RESOURCE_WAIT_TITLE = 'This job is durably queued and will start when the generation lane is available.'
 const CPU_RESTART_WARNING = 'CPU text is slower and may be discarded and restarted with acceleration only when that is predicted to deliver sooner.'
+
+const MAIN_VIEWS = ['gallery', 'queue', 'chat'] as const
+type MainView = typeof MAIN_VIEWS[number]
+
+function nextMainViewFromKey(current: MainView, key: string): MainView | null {
+  if (key === 'Home') return MAIN_VIEWS[0]
+  if (key === 'End') return MAIN_VIEWS[MAIN_VIEWS.length - 1]
+  if (key !== 'ArrowLeft' && key !== 'ArrowRight') return null
+  const offset = key === 'ArrowRight' ? 1 : -1
+  const currentIndex = MAIN_VIEWS.indexOf(current)
+  return MAIN_VIEWS[(currentIndex + offset + MAIN_VIEWS.length) % MAIN_VIEWS.length]
+}
+
+function MainViewTabs({
+  activeView,
+  onSelect,
+  queueTitle,
+  queueStateColor,
+  activeQueueCount,
+  queueStateLabel,
+  queueDetails,
+}: {
+  activeView: MainView
+  onSelect: (view: MainView) => void
+  queueTitle: string
+  queueStateColor: string
+  activeQueueCount: number
+  queueStateLabel: string
+  queueDetails?: JSX.Element
+}) {
+  const selectFromKeyboard = (event: React.KeyboardEvent<HTMLButtonElement>, current: MainView) => {
+    const next = nextMainViewFromKey(current, event.key)
+    if (!next) return
+    event.preventDefault()
+    onSelect(next)
+    window.requestAnimationFrame(() => {
+      document.getElementById(`main-${next}-tab`)?.focus()
+    })
+  }
+
+  return (
+    <div
+      role="tablist"
+      aria-label="Main views"
+      aria-orientation="horizontal"
+      className="flex max-w-full shrink-0 overflow-x-auto rounded-md border border-border bg-bg-tertiary p-0.5 text-[10px]"
+    >
+      <button
+        type="button"
+        id="main-gallery-tab"
+        role="tab"
+        aria-selected={activeView === 'gallery'}
+        aria-controls="main-gallery-panel"
+        tabIndex={activeView === 'gallery' ? 0 : -1}
+        className={`min-h-11 min-w-11 shrink-0 rounded px-2 py-1 md:min-h-0 md:min-w-0 ${activeView === 'gallery' ? 'bg-bg-active text-text-primary' : 'text-text-muted'}`}
+        onClick={() => onSelect('gallery')}
+        onKeyDown={event => selectFromKeyboard(event, 'gallery')}
+      >
+        Gallery
+      </button>
+      <button
+        type="button"
+        id="main-queue-tab"
+        role="tab"
+        aria-selected={activeView === 'queue'}
+        aria-controls="main-queue-panel"
+        tabIndex={activeView === 'queue' ? 0 : -1}
+        title={queueTitle}
+        className={`flex min-h-11 min-w-11 shrink-0 items-center gap-1.5 rounded px-2 py-1 md:min-h-0 md:min-w-0 ${activeView === 'queue' ? 'bg-bg-active text-text-primary' : 'text-text-muted'}`}
+        onClick={() => onSelect('queue')}
+        onKeyDown={event => selectFromKeyboard(event, 'queue')}
+      >
+        <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${queueStateColor}`} />
+        <span>Queue</span>
+        {activeQueueCount > 0 && <span className="rounded-full bg-bg-primary/70 px-1 text-[9px]">{activeQueueCount}</span>}
+        <span className="hidden text-[9px] lg:inline">{queueStateLabel}</span>
+        {queueDetails}
+      </button>
+      <button
+        type="button"
+        id="main-chat-tab"
+        role="tab"
+        aria-selected={activeView === 'chat'}
+        aria-controls="main-chat-panel"
+        tabIndex={activeView === 'chat' ? 0 : -1}
+        className={`min-h-11 min-w-11 shrink-0 rounded px-2 py-1 md:min-h-0 md:min-w-0 ${activeView === 'chat' ? 'bg-bg-active text-text-primary' : 'text-text-muted'}`}
+        onClick={() => onSelect('chat')}
+        onKeyDown={event => selectFromKeyboard(event, 'chat')}
+      >
+        Chat
+      </button>
+    </div>
+  )
+}
+
+function MainViewPanels({ activeView, children }: { activeView: MainView; children: ReactNode }) {
+  return (
+    <>
+      {MAIN_VIEWS.filter(view => view !== activeView).map(view => (
+        <div
+          key={view}
+          id={`main-${view}-panel`}
+          role="tabpanel"
+          aria-labelledby={`main-${view}-tab`}
+          hidden
+          className="hidden"
+        />
+      ))}
+      <div
+        id={`main-${activeView}-panel`}
+        role="tabpanel"
+        aria-labelledby={`main-${activeView}-tab`}
+        tabIndex={0}
+        className="flex min-h-0 flex-1 flex-col overflow-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
+      >
+        {children}
+      </div>
+    </>
+  )
+}
+
+type QueueTabSnapshot = {
+  state: api.QueueState | null
+  jobs: GenerationJob[]
+  error: string | null
+  lastSuccessAt: number | null
+}
+
+type QueueTabRefreshOutcome =
+  | { kind: 'success'; state: api.QueueState; jobs: GenerationJob[]; receivedAt: number }
+  | { kind: 'failure'; error: string }
+
+function queueRefreshIsStale(
+  sequence: number,
+  currentSequence: number,
+  aborted: boolean,
+): boolean {
+  return sequence !== currentSequence || aborted
+}
+
+function reduceQueueTabSnapshot(
+  current: QueueTabSnapshot,
+  outcome: QueueTabRefreshOutcome,
+): QueueTabSnapshot {
+  if (outcome.kind === 'failure') return { ...current, error: outcome.error }
+  return {
+    state: outcome.state,
+    jobs: outcome.jobs,
+    error: null,
+    lastSuccessAt: outcome.receivedAt,
+  }
+}
+
+function queueTabDisplayJobs(
+  snapshot: QueueTabSnapshot,
+  liveJobs: GenerationJob[],
+): GenerationJob[] {
+  return snapshot.error ? snapshot.jobs : liveJobs
+}
 
 type ResourcePresentation = {
   label: string
@@ -678,7 +837,7 @@ function WorkspaceSelector() {
                         ? 'text-red-400 bg-red-500/15'
                         : deleting === ws.name
                           ? 'text-text-muted cursor-wait'
-                          : 'text-text-muted opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-red-400'
+                          : 'text-text-muted opacity-100 hover:text-red-400 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100'
                     }`}
                     title={confirmDelete === ws.name
                       ? `Click again to permanently delete "${ws.name}" and its ${ws.file_count ?? 0} files`
@@ -818,7 +977,7 @@ function WorkspaceSelector() {
                   Unlock
                 </button>
               </div>
-              <label className="flex cursor-pointer items-start gap-1.5 rounded px-1 py-0.5 text-[9px] leading-relaxed text-text-muted hover:bg-bg-hover">
+              <label className="flex min-h-11 cursor-pointer items-start gap-1.5 rounded px-1 py-0.5 text-[9px] leading-relaxed text-text-muted hover:bg-bg-hover md:min-h-0">
                 <input
                   type="checkbox"
                   checked={unlockRemember === 'device'}
@@ -1344,8 +1503,9 @@ function JobPlaceholder({
         </div>
         {!isFailed && (
           <button
+            type="button"
             onClick={onStop}
-            className="flex items-center gap-1 text-xs text-red-400 hover:text-red-300 transition-colors shrink-0 ml-2"
+            className="ml-2 flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 text-xs text-red-400 transition-colors hover:text-red-300 md:min-h-0 md:min-w-0"
           >
             <Square size={11} />
             Stop
@@ -1398,6 +1558,7 @@ function QueuePanel({
   onDismiss,
   queue,
   queueError,
+  queueLastSuccessAt,
   refreshQueue,
 }: {
   jobs: GenerationJob[]
@@ -1405,6 +1566,7 @@ function QueuePanel({
   onDismiss: (jobId: string) => void
   queue: api.QueueState | null
   queueError: string | null
+  queueLastSuccessAt: number | null
   refreshQueue: () => Promise<void>
 }) {
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
@@ -1517,19 +1679,25 @@ function QueuePanel({
   }
 
   return (
-    <div className="flex-1 overflow-y-auto p-3 md:p-4">
+    <div className="flex-1 overflow-y-auto p-3 [&_button]:min-h-11 [&_button]:min-w-11 [&_input:not([type=checkbox])]:min-h-11 [&_summary]:min-h-11 md:p-4 md:[&_button]:min-h-0 md:[&_button]:min-w-0 md:[&_input:not([type=checkbox])]:min-h-0 md:[&_summary]:min-h-0">
       <div className="mx-auto max-w-4xl space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-bg-tertiary px-3 py-2">
           <div>
             <p className="text-xs font-medium text-text-primary">Generation queue</p>
             <p className="text-[10px] text-text-muted">
-              {queue?.paused ? 'Paused — queued jobs will not start.' : queue?.pause_after_current ? 'Will pause after the current output.' : 'Running in priority order.'}
+              {queueError && !queue
+                ? 'Queue status unavailable.'
+                : queue?.paused
+                  ? 'Paused — queued jobs will not start.'
+                  : queue?.pause_after_current
+                    ? 'Will pause after the current output.'
+                    : 'Running in priority order.'}
             </p>
             {queue && (
               <p className="mt-0.5 text-[10px] text-text-secondary">{queueSummaryLabel(projection.summary)}</p>
             )}
             <details className="group mt-1.5 max-w-2xl text-[10px] text-text-muted">
-              <summary className="cursor-pointer text-text-secondary hover:text-text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent-blue">
+              <summary className="flex min-h-11 cursor-pointer items-center text-text-secondary hover:text-text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent-blue md:min-h-0">
                 How queue priority works
               </summary>
               <div className="mt-1.5 space-y-1 rounded-md border border-border bg-bg-primary/40 px-2.5 py-2 leading-relaxed">
@@ -1540,7 +1708,7 @@ function QueuePanel({
               </div>
             </details>
           </div>
-          {machineControls && <div className="flex items-center gap-2">
+          {machineControls && queue && <div className="flex items-center gap-2">
             {queue?.paused ? (
               <button className="rounded-md bg-accent-green/15 px-2.5 py-1 text-[10px] text-accent-green" onClick={() => void act(api.resumeQueue)}>
                 Resume queue
@@ -1552,9 +1720,25 @@ function QueuePanel({
             )}
           </div>}
         </div>
-        {(error || queueError || planReviewError) && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error || queueError || planReviewError}</div>}
+        {queueError && (
+          <div
+            className={`rounded-md border px-3 py-2 text-xs ${queue ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-red-500/30 bg-red-500/10 text-red-300'}`}
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {queue
+              ? `Queue refresh failed. Showing the last successful update${queueLastSuccessAt == null ? '' : ` from ${new Date(queueLastSuccessAt).toLocaleTimeString()}`}; retrying automatically. ${queueError}`
+              : `Queue unavailable; retrying automatically. ${queueError}`}
+          </div>
+        )}
+        {(error || planReviewError) && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error || planReviewError}</div>}
         <PipelinePlaceholder />
-        {visibleJobs.length === 0 ? (
+        {queueError && !queue ? (
+          <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-text-muted">
+            Queue contents are unavailable until a scheduler refresh succeeds.
+          </div>
+        ) : visibleJobs.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-text-muted">
             No queued, running, or failed generations.
           </div>
@@ -1721,7 +1905,7 @@ function GalleryBulkToolbar() {
   }
 
   return (
-    <div className="border-b border-border bg-bg-tertiary/70 px-2 py-2 md:px-6">
+    <div className="border-b border-border bg-bg-tertiary/70 px-2 py-2 [&_button]:min-h-11 [&_button]:min-w-11 [&_select]:min-h-11 md:px-6 md:[&_button]:min-h-0 md:[&_button]:min-w-0 md:[&_select]:min-h-0">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs font-medium text-text-primary">{selected.length} selected</span>
         <button onClick={selectAll} disabled={!outputs.length || busy} className="rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary hover:text-text-primary disabled:opacity-40">
@@ -1898,9 +2082,15 @@ export function MainContent() {
   const loadAccessContext = useStore(s => s.loadAccessContext)
   const reconcileQueueState = useStore(s => s.reconcileQueueState)
   const [shareCopied, setShareCopied] = useState(false)
-  const [mainView, setMainView] = useState<'gallery' | 'queue' | 'chat'>('gallery')
-  const [queueTabState, setQueueTabState] = useState<api.QueueState | null>(null)
-  const [queueTabError, setQueueTabError] = useState<string | null>(null)
+  const [mainView, setMainView] = useState<MainView>('gallery')
+  const [queueTabSnapshot, setQueueTabSnapshot] = useState<QueueTabSnapshot>({
+    state: null,
+    jobs: [],
+    error: null,
+    lastSuccessAt: null,
+  })
+  const queueTabState = queueTabSnapshot.state
+  const queueTabError = queueTabSnapshot.error
   const [accessPollAttempt, setAccessPollAttempt] = useState(0)
   const [privatePreviewVersion, setPrivatePreviewVersion] = useState(0)
   const queuePollSequence = useRef(0)
@@ -1911,10 +2101,27 @@ export function MainContent() {
     setPrivatePreviewVersion(version => version + 1)
   }), [])
 
-  const anyProjectPrivatePreviewRevealed = useMemo(() => {
+  const privatePreviewRevealState = useMemo<'none' | 'some' | 'all'>(() => {
     void privatePreviewVersion
-    return Boolean(activeWorkspace) && privatePreviewWorkspaceHasRevealed(activeWorkspace)
+    if (!activeWorkspace) return 'none'
+    if (privatePreviewWorkspaceHasRevealed(activeWorkspace, 'all')) return 'all'
+    return privatePreviewWorkspaceHasRevealed(activeWorkspace) ? 'some' : 'none'
   }, [activeWorkspace, privatePreviewVersion])
+  const privatePreviewActionLabel = privatePreviewRevealState === 'all'
+    ? 'Blur all'
+    : privatePreviewRevealState === 'some' ? 'Reveal all remaining' : 'Reveal all'
+  const privatePreviewActionPressed = privatePreviewRevealState === 'some'
+    ? 'mixed' as const
+    : privatePreviewRevealState === 'all'
+  const togglePrivatePreviews = useCallback(() => {
+    if (!activeWorkspace) return
+    // Read current session state at activation time so repeated clicks/taps do
+    // not depend on a React render completing between events.
+    setPrivatePreviewsForWorkspaceRevealed(
+      activeWorkspace,
+      !privatePreviewWorkspaceHasRevealed(activeWorkspace, 'all'),
+    )
+  }, [activeWorkspace])
 
   useEffect(() => {
     const openGallery = () => setMainView('gallery')
@@ -1946,16 +2153,20 @@ export function MainContent() {
     pollSignal?.addEventListener('abort', relayAbort, { once: true })
     try {
       const next = await api.fetchQueueState(controller.signal)
-      if (sequence !== queuePollSequence.current || controller.signal.aborted) return
+      if (queueRefreshIsStale(sequence, queuePollSequence.current, controller.signal.aborted)) return
       reconcileQueueState(next)
-      setQueueTabState(next)
-      setQueueTabError(null)
+      setQueueTabSnapshot(current => reduceQueueTabSnapshot(current, {
+        kind: 'success',
+        state: next,
+        jobs: useStore.getState().jobs,
+        receivedAt: Date.now(),
+      }))
     } catch (reason) {
-      if (sequence !== queuePollSequence.current || controller.signal.aborted) return
-      setQueueTabState(null)
-      setQueueTabError(
-        reason instanceof Error ? reason.message : 'Queue update failed',
-      )
+      if (queueRefreshIsStale(sequence, queuePollSequence.current, controller.signal.aborted)) return
+      setQueueTabSnapshot(current => reduceQueueTabSnapshot(current, {
+        kind: 'failure',
+        error: reason instanceof Error ? reason.message : 'Queue update failed',
+      }))
       throw reason
     } finally {
       pollSignal?.removeEventListener('abort', relayAbort)
@@ -1971,9 +2182,10 @@ export function MainContent() {
     return () => window.removeEventListener(QUEUE_REFRESH_EVENT, refresh)
   }, [refreshQueue])
 
+  const queueDisplayJobs = queueTabDisplayJobs(queueTabSnapshot, jobs)
   const logicalQueue = useMemo(
-    () => projectLogicalQueue(jobs, queueTabState?.jobs),
-    [jobs, queueTabState?.jobs],
+    () => projectLogicalQueue(queueDisplayJobs, queueTabState?.jobs),
+    [queueDisplayJobs, queueTabState?.jobs],
   )
   const activeQueueJobs = logicalQueue.visibleJobs.filter(isActiveLogicalQueueJob)
   const queueActivity = logicalQueue.activeCount > 0
@@ -2398,29 +2610,23 @@ export function MainContent() {
   return (
     <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden">
       {/* Top bar */}
-      <div className="relative z-40 flex flex-wrap items-start justify-between gap-2 border-b border-border px-2 py-2 md:px-6 md:py-3">
+      <div className="relative z-40 flex flex-wrap items-start justify-between gap-2 border-b border-border px-2 py-2 [&_button]:min-h-11 [&_button]:min-w-11 [&_input:not([type=checkbox])]:min-h-11 [&_label]:min-h-11 [&_select]:min-h-11 md:px-6 md:py-3 md:[&_button]:min-h-0 md:[&_button]:min-w-0 md:[&_input:not([type=checkbox])]:min-h-0 md:[&_label]:min-h-0 md:[&_select]:min-h-0">
         {mainView === 'gallery' ? <TabFilter /> : <div className="text-xs font-medium text-text-primary">{mainView === 'queue' ? 'Queue' : 'LLM Chat'}</div>}
         <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 sm:gap-2">
-          <div className="flex rounded-md border border-border bg-bg-tertiary p-0.5 text-[10px]">
-            <button className={`rounded px-2 py-1 ${mainView === 'gallery' ? 'bg-bg-active text-text-primary' : 'text-text-muted'}`} onClick={() => setMainView('gallery')}>Gallery</button>
-            <button
-              title={`${queueTooltip}${ownedJobEtaTooltip}`}
-              className={`flex items-center gap-1.5 rounded px-2 py-1 ${mainView === 'queue' ? 'bg-bg-active text-text-primary' : 'text-text-muted'}`}
-              onClick={() => setMainView('queue')}
-            >
-              <span className={`h-1.5 w-1.5 rounded-full ${queueStateColor}`} />
-              <span>Queue</span>
-              {logicalQueue.activeCount > 0 && <span className="rounded-full bg-bg-primary/70 px-1 text-[9px]">{logicalQueue.activeCount}</span>}
-              <span className="hidden lg:inline text-[9px]">{queueStateLabel}</span>
-              {currentJob && (
-                <span className="hidden xl:inline text-[9px]">
-                  · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {compactEta(currentEtaSeconds)}
-                  {currentSubtaskEtaSeconds != null ? ` · task ${compactEta(currentSubtaskEtaSeconds)}` : ''}
-                </span>
-              )}
-            </button>
-            <button className={`rounded px-2 py-1 ${mainView === 'chat' ? 'bg-bg-active text-text-primary' : 'text-text-muted'}`} onClick={() => setMainView('chat')}>Chat</button>
-          </div>
+          <MainViewTabs
+            activeView={mainView}
+            onSelect={setMainView}
+            queueTitle={`${queueTooltip}${ownedJobEtaTooltip}`}
+            queueStateColor={queueStateColor}
+            activeQueueCount={logicalQueue.activeCount}
+            queueStateLabel={queueStateLabel}
+            queueDetails={currentJob ? (
+              <span className="hidden text-[9px] xl:inline">
+                · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {compactEta(currentEtaSeconds)}
+                {currentSubtaskEtaSeconds != null ? ` · task ${compactEta(currentSubtaskEtaSeconds)}` : ''}
+              </span>
+            ) : undefined}
+          />
           <div className="text-[10px] md:text-xs text-text-muted hidden md:block">
             {outputsTotal > outputs.length
               ? `${outputs.length} / ${outputsTotal} items`
@@ -2448,18 +2654,15 @@ export function MainContent() {
             </span>
             <button
               type="button"
-              aria-pressed={anyProjectPrivatePreviewRevealed}
+              aria-pressed={privatePreviewActionPressed}
               aria-describedby="private-preview-session-note"
-              aria-label={`${anyProjectPrivatePreviewRevealed ? 'Blur' : 'Reveal'} all private previews for project ${activeWorkspace}`}
-              onClick={() => setPrivatePreviewsForWorkspaceRevealed(
-                activeWorkspace,
-                !anyProjectPrivatePreviewRevealed,
-              )}
-              title={`${anyProjectPrivatePreviewRevealed ? 'Blur' : 'Reveal'} all private previews for this project in this browser session; project access is unchanged`}
-              className="flex items-center gap-1 rounded-md border border-violet-500/40 px-2 py-1 text-[10px] text-violet-200 transition-colors hover:bg-violet-500/10"
+              aria-label={`${privatePreviewActionLabel} private previews for project ${activeWorkspace}`}
+              onClick={togglePrivatePreviews}
+              title={`${privatePreviewActionLabel} private previews for this project in this browser session; project access is unchanged`}
+              className="flex min-h-11 items-center gap-1 rounded-md border border-violet-500/40 px-3 text-[10px] text-violet-200 transition-colors hover:bg-violet-500/10 md:min-h-0 md:px-2 md:py-1"
             >
-              {anyProjectPrivatePreviewRevealed ? <EyeOff size={12} /> : <Eye size={12} />}
-              {anyProjectPrivatePreviewRevealed ? 'Blur all' : 'Reveal all'}
+              {privatePreviewRevealState === 'all' ? <EyeOff size={12} /> : <Eye size={12} />}
+              {privatePreviewActionLabel}
             </button>
           </>}
           {mainView === 'gallery' && <button
@@ -2472,22 +2675,23 @@ export function MainContent() {
           <WorkspaceSelector />
         </div>
       </div>
-      {mainView === 'gallery' && gallerySelectionMode && <GalleryBulkToolbar />}
-
       {/* Content area: feed + thumbnails */}
-      {mainView === 'chat' ? (
-        <LlmChat />
-      ) : mainView === 'queue' ? (
-        <QueuePanel
-          jobs={jobs}
-          onStop={stopGeneration}
-          onDismiss={dismissJob}
-          queue={queueTabState}
-          queueError={queueTabError}
-          refreshQueue={refreshQueue}
-        />
-      ) : (
-      <div className="flex-1 flex flex-row gap-0 overflow-hidden relative">
+      <MainViewPanels activeView={mainView}>
+        {mainView === 'gallery' && gallerySelectionMode && <GalleryBulkToolbar />}
+        {mainView === 'chat' ? (
+          <LlmChat />
+        ) : mainView === 'queue' ? (
+          <QueuePanel
+            jobs={queueDisplayJobs}
+            onStop={stopGeneration}
+            onDismiss={dismissJob}
+            queue={queueTabState}
+            queueError={queueTabError}
+            queueLastSuccessAt={queueTabSnapshot.lastSuccessAt}
+            refreshQueue={refreshQueue}
+          />
+        ) : (
+        <div className="flex-1 flex flex-row gap-0 overflow-hidden relative">
         {/* Scrollable media feed */}
         <div
           ref={feedRef}
@@ -2563,9 +2767,15 @@ export function MainContent() {
         <ThumbnailGallery
           activeIndex={activeIndex}
           onThumbnailClick={handleThumbnailClick}
+          privatePreviewControl={activeWorkspace && !browsingUploads ? {
+            workspace: activeWorkspace,
+            state: privatePreviewRevealState,
+            onToggle: togglePrivatePreviews,
+          } : undefined}
         />
-      </div>
-      )}
+        </div>
+        )}
+      </MainViewPanels>
     </main>
   )
 }

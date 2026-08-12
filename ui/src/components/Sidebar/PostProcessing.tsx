@@ -80,25 +80,30 @@ export function PostProcessing() {
   return (
     <div>
       <button
+        type="button"
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-1.5 text-[11px] text-text-muted uppercase tracking-wider w-full hover:text-text-primary transition-colors"
+        aria-expanded={open}
+        aria-controls="post-processing-settings"
+        className="mobile-control-target flex items-center gap-1.5 text-[11px] text-text-muted uppercase tracking-wider w-full hover:text-text-primary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
       >
-        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        {open ? <ChevronDown aria-hidden="true" size={12} /> : <ChevronRight aria-hidden="true" size={12} />}
         <span className="flex-1 text-left">Post Processing</span>
-        {hasAny && <span className="w-1.5 h-1.5 rounded-full bg-accent-blue" />}
+        {hasAny && <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-accent-blue" />}
       </button>
 
       {open && (
-        <div className="mt-3 space-y-4">
+        <div id="post-processing-settings" className="mt-3 space-y-4">
           {/* Spatial Upsampling */}
           <div>
-            <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
+            <span id="post-processing-upscaling-label" className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
               Spatial Upsampling
-            </label>
+            </span>
             <select
+              id="post-processing-upscaling"
+              aria-labelledby="post-processing-upscaling-label"
               value={spatialUpsampling}
               onChange={e => setSpatialUpsampling(e.target.value)}
-              className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
+              className="mobile-control-target w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue"
             >
               {upsamplingOptions.map(opt => (
                 <option key={opt.value} value={opt.value}>{opt.label}</option>
@@ -114,6 +119,7 @@ export function PostProcessing() {
             </div>
             <input
               type="range"
+              aria-label="Film Grain Intensity"
               min={0}
               max={1}
               step={0.01}
@@ -131,6 +137,7 @@ export function PostProcessing() {
               </div>
               <input
                 type="range"
+                aria-label="Film Grain Saturation"
                 min={0}
                 max={1}
                 step={0.01}
@@ -151,14 +158,20 @@ export function PostProcessing() {
                   <Mic size={11} /> Voice Clone (SeedVC)
                 </label>
                 <button
+                  type="button"
                   onClick={() => setVoiceCloneEnabled(!voiceCloneEnabled)}
-                  className={`relative w-9 h-5 rounded-full transition-colors ${
-                    voiceCloneEnabled ? 'bg-accent-blue' : 'bg-bg-tertiary border border-border'
-                  }`}
+                  role="switch"
+                  aria-checked={voiceCloneEnabled}
+                  aria-label="Voice Clone"
+                  className="mobile-control-target flex items-center justify-center rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                 >
-                  <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white border border-border transition-transform ${
-                    voiceCloneEnabled ? 'translate-x-4' : ''
-                  }`} />
+                  <span aria-hidden="true" className={`relative block w-9 h-5 rounded-full transition-colors ${
+                    voiceCloneEnabled ? 'bg-accent-blue' : 'bg-bg-tertiary border border-border'
+                  }`}>
+                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white border border-border transition-transform ${
+                      voiceCloneEnabled ? 'translate-x-4' : ''
+                    }`} />
+                  </span>
                 </button>
               </div>
               {voiceCloneEnabled && (
@@ -166,8 +179,10 @@ export function PostProcessing() {
                   {/* Mode selector */}
                   <div className="flex gap-1.5 text-xs">
                     <button
+                      type="button"
                       onClick={() => setVoiceCloneMode('single')}
-                      className={`flex-1 py-1.5 rounded-md border transition-colors ${
+                      aria-pressed={voiceCloneMode === 'single'}
+                      className={`mobile-control-target flex-1 py-1.5 rounded-md border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
                         voiceCloneMode === 'single'
                           ? 'bg-accent-blue/10 border-accent-blue text-text-primary'
                           : 'bg-bg-tertiary border-border text-text-secondary hover:text-text-primary'
@@ -176,8 +191,10 @@ export function PostProcessing() {
                       Single Voice
                     </button>
                     <button
+                      type="button"
                       onClick={() => setVoiceCloneMode('two')}
-                      className={`flex-1 py-1.5 rounded-md border transition-colors ${
+                      aria-pressed={voiceCloneMode === 'two'}
+                      className={`mobile-control-target flex-1 py-1.5 rounded-md border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
                         voiceCloneMode === 'two'
                           ? 'bg-accent-blue/10 border-accent-blue text-text-primary'
                           : 'bg-bg-tertiary border-border text-text-secondary hover:text-text-primary'
@@ -200,15 +217,17 @@ export function PostProcessing() {
                       <div key={idx}>
                         <label className="text-[10px] text-text-muted uppercase tracking-wider mb-1 block">{label}</label>
                         {!ref || !ref.path ? (
-                          <div
-                            onClick={() => vcFileRefs[idx].current?.click()}
-                            className={`border-2 border-dashed border-border rounded-lg p-2 text-center cursor-pointer hover:border-accent-blue transition-colors ${
-                              vcUploading === idx ? 'opacity-50 pointer-events-none' : ''
-                            }`}
-                          >
-                            <p className="text-[11px] text-text-secondary">
-                              {vcUploading === idx ? 'Uploading...' : `Upload ${label.toLowerCase()} sample`}
-                            </p>
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => vcFileRefs[idx].current?.click()}
+                              disabled={vcUploading === idx}
+                              className="mobile-control-target w-full cursor-pointer rounded-lg border-2 border-dashed border-border p-2 text-center transition-colors hover:border-accent-blue focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-wait disabled:opacity-50"
+                            >
+                              <span className="block text-[11px] text-text-secondary">
+                                {vcUploading === idx ? 'Uploading...' : `Upload ${label.toLowerCase()} sample`}
+                              </span>
+                            </button>
                             <input
                               ref={vcFileRefs[idx]}
                               type="file"
@@ -216,16 +235,18 @@ export function PostProcessing() {
                               className="hidden"
                               onChange={e => { const f = e.target.files?.[0]; if (f) handleVcUpload(idx, f) }}
                             />
-                          </div>
+                          </>
                         ) : (
                           <div className="flex items-center gap-2 bg-bg-tertiary border border-border rounded-lg px-2 py-1.5">
                             <Mic size={12} className="text-accent-blue shrink-0" />
                             <span className="flex-1 min-w-0 truncate text-[11px] text-text-primary">{ref.filename}</span>
                             <button
+                              type="button"
                               onClick={() => setVoiceCloneRef(idx, null)}
-                              className="p-0.5 text-text-muted hover:text-red-400 transition-colors"
+                              aria-label={`Remove ${label} reference`}
+                              className="mobile-control-target flex shrink-0 items-center justify-center rounded p-0.5 text-text-muted hover:text-red-400 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                             >
-                              <X size={12} />
+                              <X aria-hidden="true" size={12} />
                             </button>
                           </div>
                         )}

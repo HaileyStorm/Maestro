@@ -29,8 +29,10 @@ server authority.
 H3 long-form prompting: Studio and Director retain one coherent global prompt.
 Authored timestamps remain exact; untimed prompts are mapped deterministically
 onto legal native shots, with unequal shot lengths when action/dialogue density
-warrants them. This native-shot plan is an execution artifact, not a set of
-per-window prompts written by an LLM, and it is persisted for reproducibility.
+warrants them. After physical geometry is exact, Maestro compiles and seals
+segment-local execution prompts without another LLM call. Timed actions spanning
+physical boundaries receive explicit continuation slices, while dialogue and final
+blocking retain one owner. The coherent global prompt remains immutable provenance.
 
 Director H3 execution: Director uses the same server-authored profiles and
 deterministic native-shot planner as Studio. It rejects unsafe runtime shrinkage

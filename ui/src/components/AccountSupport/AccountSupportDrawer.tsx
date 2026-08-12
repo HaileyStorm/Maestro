@@ -15,11 +15,22 @@ import {
   X,
 } from 'lucide-react'
 import { AccountApiError } from '../../api/client'
-import { installModalFocus } from '../../lib/modalFocus'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import { useStore } from '../../stores/useStore'
 import { createAccountDrawerLifecycle } from './accountDrawerLifecycle'
 import { SupportPanel } from './SupportPanel'
 import { nextAccountSupportTab, type AccountSupportTab } from './supportPresentation'
+
+function resolveAccountSupportTrigger(document: Document, fallback: HTMLElement | null): HTMLElement | null {
+  const mobile = document.defaultView?.matchMedia?.('(max-width: 767px)').matches === true
+  const expected = document.querySelector<HTMLElement>(
+    `[data-responsive-dialog-trigger="account-support:${mobile ? 'mobile' : 'desktop'}"]`,
+  )
+  if (expected && expected.isConnected !== false) return expected
+  if (fallback && fallback.isConnected !== false) return fallback
+  const replacement = document.querySelector<HTMLElement>('[data-responsive-dialog-trigger^="account-support:"]')
+  return replacement && replacement.isConnected !== false ? replacement : null
+}
 
 function accountErrorMessage(error: unknown): string {
   if (error instanceof AccountApiError && error.retryAfter > 0) {
@@ -116,12 +127,13 @@ export function AccountSupportButton({ compact = false }: { compact?: boolean })
     <button
       type="button"
       onClick={() => setOpen(true)}
+      data-responsive-dialog-trigger={`account-support:${compact ? 'mobile' : 'desktop'}`}
       aria-haspopup="dialog"
       aria-controls="account-support-drawer"
       aria-expanded={open}
       aria-label={accountLabel ? `Open Support and account for ${accountLabel}` : 'Open Support'}
       className={`flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-border bg-bg-secondary text-text-secondary shadow-lg transition-colors hover:border-border-light hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
-        compact ? 'h-9 w-9 p-2' : 'px-3 py-2 text-[11px] font-semibold'
+        compact ? 'h-11 w-11 p-0' : 'px-3 py-2 text-[11px] font-semibold'
       }`}
     >
       <HeartHandshake size={compact ? 18 : 14} aria-hidden="true" />
@@ -140,6 +152,7 @@ export function AccountSupportDrawer() {
   const supportTabRef = useRef<HTMLButtonElement>(null)
   const accountTabRef = useRef<HTMLButtonElement>(null)
   const restoreFocusRef = useRef<HTMLElement | null>(null)
+  const focusReturnRef = useRef<HTMLSpanElement>(null)
   const lifecycleRef = useRef(createAccountDrawerLifecycle())
   const open = useStore(state => state.accountDrawerOpen)
   const setOpen = useStore(state => state.setAccountDrawerOpen)
@@ -198,6 +211,10 @@ export function AccountSupportDrawer() {
     setActiveTab('support')
     setOpen(false)
   }, [clearSensitive, setOpen])
+
+  const requestCloseDrawer = useCallback(() => {
+    closeModalIfTop(document, dialogRef.current, closeDrawer)
+  }, [closeDrawer])
 
   const selectTab = useCallback((tab: AccountSupportTab) => {
     if (tab === activeTab) return
@@ -296,7 +313,7 @@ export function AccountSupportDrawer() {
       document,
       dialog: dialogRef.current,
       initialFocus: closeRef.current,
-      restoreFocus: restoreFocusRef.current,
+      restoreFocus: focusReturnRef.current,
       appRoot: document.getElementById('root'),
       onClose: closeDrawer,
     })
@@ -306,7 +323,17 @@ export function AccountSupportDrawer() {
     }
   }, [closeDrawer, open])
 
-  if (!open) return null
+  const focusReturnTarget = (
+    <span
+      ref={focusReturnRef}
+      tabIndex={-1}
+      className="fixed h-px w-px overflow-hidden opacity-0 pointer-events-none"
+      data-responsive-dialog-focus-return="account-support"
+      onFocus={() => resolveAccountSupportTrigger(document, restoreFocusRef.current)?.focus()}
+    />
+  )
+
+  if (!open) return focusReturnTarget
   const accountsEnabled = context?.enabled === true
   const authenticated = accountsEnabled && context.authenticated && context.account !== null
   const selfService = authenticated && context.capabilities.includes('account.self')
@@ -314,7 +341,9 @@ export function AccountSupportDrawer() {
     && context.capabilities.includes('accounts.admin')
     && context.capabilities.includes('services.admin')
 
-  return createPortal(
+  return <>
+    {focusReturnTarget}
+    {createPortal(
     <div
       className="fixed inset-0 z-[170] flex items-stretch justify-end"
       style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}
@@ -324,7 +353,7 @@ export function AccountSupportDrawer() {
         tabIndex={-1}
         aria-label="Close Support panel"
         className="absolute inset-0 appearance-none border-0 bg-black/70 p-0"
-        onClick={closeDrawer}
+        onClick={requestCloseDrawer}
       />
       <div
         id="account-support-drawer"
@@ -350,9 +379,9 @@ export function AccountSupportDrawer() {
           <button
             ref={closeRef}
             type="button"
-            onClick={closeDrawer}
+            onClick={requestCloseDrawer}
             aria-label="Close Support panel"
-            className="rounded-lg p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg p-0 text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:h-auto md:w-auto md:p-1.5"
           >
             <X size={17} aria-hidden="true" />
           </button>
@@ -391,7 +420,12 @@ export function AccountSupportDrawer() {
           </div>
         )}
 
-        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 [-webkit-overflow-scrolling:touch] sm:px-5">
+        <div
+          role="region"
+          aria-label={accountsEnabled ? 'Support and account content' : 'Support content'}
+          tabIndex={0}
+          className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 [-webkit-overflow-scrolling:touch] sm:px-5"
+        >
           {activeTab === 'support' || !accountsEnabled ? (
             <div
               id="support-panel"
@@ -793,5 +827,6 @@ export function AccountSupportDrawer() {
       </div>
     </div>,
     document.body,
-  )
+    )}
+  </>
 }

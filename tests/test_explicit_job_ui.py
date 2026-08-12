@@ -306,9 +306,23 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("max-h-[calc(100dvh-1.5rem)]", H3_PLAN_DIALOG)
         self.assertIn("safe-area-inset-bottom", H3_PLAN_DIALOG)
         self.assertIn("min-h-0 overflow-y-auto overscroll-contain", H3_PLAN_DIALOG)
-        self.assertIn("max-h-[calc(100dvh-1.5rem)]", WELCOME)
-        self.assertIn("sticky bottom-0", WELCOME)
-        self.assertIn("safe-area-inset-bottom", WELCOME)
+        self.assertIn("h-[100vh]", WELCOME)
+        self.assertIn("supports-[height:100dvh]:h-[100dvh]", WELCOME)
+        self.assertIn("max-h-full", WELCOME)
+        self.assertIn(
+            "sticky bottom-0 max-h-[55%] overflow-y-auto overscroll-contain shrink-0 border-t border-border",
+            WELCOME,
+        )
+        for property_name, edge in (
+            ("paddingTop", "top"),
+            ("paddingRight", "right"),
+            ("paddingBottom", "bottom"),
+            ("paddingLeft", "left"),
+        ):
+            self.assertIn(
+                f"{property_name}: 'max(0.75rem, env(safe-area-inset-{edge}))'",
+                WELCOME,
+            )
 
     def test_profiles_and_output_restore_preserve_only_user_policy(self):
         profile_block = STORE[
@@ -451,7 +465,16 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("sessionStorage.setItem(privateRevealStorageKey(identity), '1')", PRIVATE_PREVIEW)
         self.assertIn("sessionStorage.removeItem(privateRevealStorageKey(identity))", PRIVATE_PREVIEW)
         self.assertIn("subscribePrivatePreviewReveal(privateRevealKey, syncReveal)", MEDIA_ITEM)
-        self.assertIn("src={privateBlurred ? undefined : file.url}", MEDIA_ITEM)
+        withheld_media = MEDIA_ITEM[
+            MEDIA_ITEM.index("{privateBlurred ? ("):
+            MEDIA_ITEM.index(") : file.type === 'video'")
+        ]
+        self.assertNotIn("file.url", withheld_media)
+        self.assertNotIn("<audio", withheld_media)
+        self.assertNotIn("<video", withheld_media)
+        self.assertNotIn("RetryImage", withheld_media)
+        self.assertIn("src={file.url}", MEDIA_ITEM)
+        self.assertIn("url={file.url}", MEDIA_ITEM)
         self.assertIn("video.removeAttribute('src')", MEDIA_ITEM)
         self.assertIn("video.load()", MEDIA_ITEM)
         self.assertNotIn("video.play()", MEDIA_ITEM)
@@ -509,11 +532,38 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertNotIn("group-hover/private:blur-none", REFERENCE_LIBRARY)
         self.assertIn("Blur previews", MAIN_CONTENT)
         self.assertIn("Show previews", MAIN_CONTENT)
-        self.assertIn("'Blur all' : 'Reveal all'", MAIN_CONTENT)
-        self.assertIn("aria-pressed={anyProjectPrivatePreviewRevealed}", MAIN_CONTENT)
+        self.assertIn("privatePreviewWorkspaceHasRevealed(activeWorkspace, 'all')", MAIN_CONTENT)
+        self.assertIn("privatePreviewWorkspaceHasRevealed(activeWorkspace) ? 'some' : 'none'", MAIN_CONTENT)
+        self.assertIn("'Reveal all remaining'", MAIN_CONTENT)
+        self.assertIn("aria-pressed={privatePreviewActionPressed}", MAIN_CONTENT)
+        self.assertIn("min-h-11", MAIN_CONTENT)
+        self.assertIn("md:min-h-0", MAIN_CONTENT)
+        self.assertNotIn("sm:min-h-0", MAIN_CONTENT)
         self.assertIn("Browser-session preview only; project access unchanged.", MAIN_CONTENT)
         self.assertIn("setPrivatePreviewsForWorkspaceRevealed(", MAIN_CONTENT)
         self.assertIn("activeWorkspace && !browsingUploads", MAIN_CONTENT)
+        self.assertIn('aria-controls="mobile-thumbnail-panel"', THUMBNAILS)
+        self.assertIn("createPortal(", THUMBNAILS)
+        self.assertIn("document.body", THUMBNAILS)
+        self.assertIn("inert={!mobileOpen}", THUMBNAILS)
+        self.assertIn("installModalFocus({", THUMBNAILS)
+        self.assertIn("closeModalIfTop(document, mobileDialogRef.current", THUMBNAILS)
+        self.assertIn("appRoot: document.getElementById('root')", THUMBNAILS)
+        self.assertIn("priority: 70", THUMBNAILS)
+        self.assertIn('role="dialog"', THUMBNAILS)
+        self.assertIn("aria-modal={mobileOpen ? true : undefined}", THUMBNAILS)
+        self.assertNotIn("addEventListener('keydown'", THUMBNAILS)
+        self.assertNotIn("requestAnimationFrame(() => mobileOpenerRef", THUMBNAILS)
+        thumbnail_activation = THUMBNAILS[
+            THUMBNAILS.index("onClick={() => {", THUMBNAILS.index("data-thumb-index={idx}")):
+            THUMBNAILS.index("className={`absolute", THUMBNAILS.index("data-thumb-index={idx}"))
+        ]
+        guard = thumbnail_activation.index("if (onMobileClick && !onMobileClick()) return")
+        self.assertLess(guard, thumbnail_activation.index("revealPrivatePreview(privateIdentity)"))
+        self.assertLess(guard, thumbnail_activation.index("onThumbnailClick(idx)"))
+        self.assertIn("min-h-11 min-w-11", THUMBNAILS)
+        self.assertIn("Reveal all remaining", THUMBNAILS)
+        self.assertIn("privatePreviewControl.onToggle", THUMBNAILS)
         self.assertNotIn("> Public", MAIN_CONTENT)
 
     def test_gallery_virtualization_and_card_stacking_follow_output_identity(self):

@@ -1,8 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useId } from 'react'
+import { createPortal } from 'react-dom'
 import { X, Search, Loader2, BookOpen, HardDrive, Tag, Link2, ArrowUpCircle, RefreshCw, KeyRound, ExternalLink, Boxes, Trash2 } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { fetchCivitAIModelFilters, startLoraScan, fetchLoraScanStatus, fetchInstalledLoras, importHuggingFaceLora, checkLoraUpdates, deleteLoraFile } from '../../api/client'
 import { formatBytes } from '../../lib/format'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import type { CivitAIModelFilter, InstalledLora } from '../../api/client'
 import { ModelCard } from './ModelCard'
 import { ModelDetail } from './ModelDetail'
@@ -77,6 +79,26 @@ export function LoraBrowser() {
   // True while a manual /check-updates call is in flight. Used to
   // gate double-clicks and swap the icon for a spinner.
   const [checkingUpdates, setCheckingUpdates] = useState(false)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const titleId = useId()
+  const closeBrowser = useCallback(() => setOpen(false), [setOpen])
+
+  useEffect(() => {
+    if (!open || !dialogRef.current || !closeButtonRef.current) return
+    const restoreFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    return installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: closeButtonRef.current,
+      restoreFocus,
+      appRoot: document.getElementById('root'),
+      onClose: closeBrowser,
+      priority: 95,
+    })
+  }, [closeBrowser, open])
 
   // Force a CivitAI version check then refetch the installed-LoRAs
   // list so each card's update_status reflects the new manifest.
@@ -222,11 +244,35 @@ export function LoraBrowser() {
 
   if (!open) return null
 
-  return (
-    <div className="fixed inset-0 z-[60] flex flex-col bg-bg-primary">
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[95] flex h-[100vh] items-stretch justify-stretch overflow-hidden supports-[height:100dvh]:h-[100dvh]"
+      style={{
+        paddingTop: 'max(0.5rem, env(safe-area-inset-top))',
+        paddingRight: 'max(0.5rem, env(safe-area-inset-right))',
+        paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(0.5rem, env(safe-area-inset-left))',
+      }}
+    >
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label="Close model browser"
+        className="absolute inset-0 appearance-none border-0 bg-black/60 p-0"
+        onClick={() => closeModalIfTop(document, dialogRef.current, closeBrowser)}
+      />
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="relative flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-bg-primary shadow-2xl motion-reduce:[&_*]:transition-none motion-reduce:[&_*]:animate-none [&_a]:min-h-11 [&_a]:min-w-11 [&_button]:min-h-11 [&_button]:min-w-11 [&_input:not([type=checkbox])]:min-h-11 [&_select]:min-h-11 [&_textarea]:min-h-11"
+      >
+      <div className="max-h-[55%] shrink-0 overflow-y-auto overscroll-contain border-b border-border [-webkit-overflow-scrolling:touch]">
       {/* Top bar */}
-      <div className="px-4 py-3 border-b border-border flex items-center gap-3 shrink-0">
-        <h1 className="text-sm font-semibold text-text-primary shrink-0">Model Browser</h1>
+      <div className="border-b border-border px-3 py-2 sm:px-4 sm:py-3">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+        <h1 id={titleId} className="text-sm font-semibold text-text-primary shrink-0">Model Browser</h1>
 
         {/* LoRA (adapter) vs Checkpoint (full model) mode */}
         <div className="flex items-center rounded-lg border border-border overflow-hidden shrink-0 text-xs">
@@ -378,7 +424,6 @@ export function LoraBrowser() {
                 onChange={e => setQuery(e.target.value)}
                 placeholder="Search CivitAI..."
                 className="w-full bg-bg-tertiary border border-border rounded-lg pl-8 pr-3 py-1.5 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue"
-                autoFocus
               />
             </div>
           </div>
@@ -386,11 +431,15 @@ export function LoraBrowser() {
 
         <div className="ml-auto shrink-0">
           <button
-            onClick={() => setOpen(false)}
-            className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+            ref={closeButtonRef}
+            type="button"
+            onClick={() => closeModalIfTop(document, dialogRef.current, closeBrowser)}
+            className="flex items-center justify-center rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            aria-label="Close model browser"
           >
-            <X size={18} />
+            <X size={18} aria-hidden="true" />
           </button>
+        </div>
         </div>
       </div>
 
@@ -479,7 +528,7 @@ export function LoraBrowser() {
               corresponding toggle in the Settings LoraSelector. */}
           {showInstalled && (
             <label
-              className="flex items-center gap-1.5 text-xs cursor-pointer shrink-0 select-none"
+              className="flex min-h-11 items-center gap-1.5 text-xs cursor-pointer shrink-0 select-none"
               title={updatableCount > 0
                 ? `${updatableCount} LoRA${updatableCount === 1 ? ' has' : 's have'} updates available — check to filter`
                 : 'No updates available — click Check to refresh from CivitAI'}
@@ -591,9 +640,10 @@ export function LoraBrowser() {
           {loading && <Loader2 size={14} className="animate-spin text-accent-blue ml-auto shrink-0" />}
         </div>
       )}
+      </div>
 
       {/* Main content */}
-      <div className="flex-1 overflow-hidden">
+      <div className="min-h-11 flex-1 overflow-hidden">
         {selectedModel ? (
           <ModelDetail model={selectedModel} onBack={clearSelection} kind={browseKind} />
         ) : (browseKind === 'checkpoint' && showCkptInstalled) ? (
@@ -827,6 +877,8 @@ export function LoraBrowser() {
 
       {/* Download progress bar */}
       <DownloadBar />
+      </div>
     </div>
+    , document.body
   )
 }

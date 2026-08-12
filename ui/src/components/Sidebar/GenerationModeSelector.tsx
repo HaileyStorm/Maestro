@@ -15,21 +15,23 @@ export function GenerationModeSelector() {
   const setGenerationMode = useStore(s => s.setGenerationMode)
 
   return (
-    <div className="flex bg-bg-tertiary rounded-lg p-0.5 border border-border">
+    <div role="group" aria-label="Generation mode" className="grid grid-cols-3 gap-0.5 rounded-lg border border-border bg-bg-tertiary p-0.5 md:grid-cols-5 md:gap-0">
       {modes.map(m => {
         const Icon = m.icon
         const active = generationMode === m.value
         return (
           <button
             key={m.value}
+            type="button"
             onClick={() => setGenerationMode(m.value)}
-            className={`flex-1 flex items-center justify-center gap-1.5 text-xs py-2 rounded-md transition-all ${
+            aria-pressed={active}
+            className={`mobile-control-target flex min-w-0 items-center justify-center gap-1.5 rounded-md py-2 text-xs transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
               active
                 ? 'bg-bg-active text-text-primary'
                 : 'text-text-secondary hover:text-text-primary'
             }`}
           >
-            <Icon size={14} />
+            <Icon aria-hidden="true" className="shrink-0" size={14} />
             <span>{m.label}</span>
           </button>
         )

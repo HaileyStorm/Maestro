@@ -297,6 +297,63 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
         self.assertNotIn("oom_info", snapshot)
         self.assertNotIn("private-rich-h3-contract", repr(snapshot))
 
+    def test_same_job_resource_retry_oom_round_trips_safe_banner(self):
+        private_error = "/private/cuda/retry allocator traceback"
+        job = self._job(
+            "same-job-oom-retry",
+            status="queued",
+            resource_retry_attempt=1,
+            resource_retry_limit=2,
+            resource_retry_phase="finalization",
+            resource_retry_reason="finalization_oom",
+            failure_details={
+                "code": "cuda_oom",
+                "stage": "delivery",
+                "detail": private_error,
+                "exception_type": "OutOfMemoryError",
+                "is_oom": True,
+                "allocator": {
+                    "device_type": "cuda",
+                    "free_bytes": 20,
+                    "private_path": private_error,
+                },
+            },
+            oom_info={
+                "is_oom": True,
+                "stage": "delivery",
+                "current_coefficient": 0.8,
+                "suggested_coefficient": 0.1,
+                "message": private_error,
+                "allocator": {
+                    "device_type": "cuda",
+                    "free_bytes": 20,
+                    "private_path": private_error,
+                },
+                "traceback": private_error,
+            },
+        )
+        self._register(job)
+
+        restored = QueueRecoveryCoordinator(self.journal).restore().jobs[
+            job["id"]
+        ]
+        self.assertEqual(restored["resource_retry_attempt"], 1)
+        self.assertEqual(restored["resource_retry_phase"], "finalization")
+        self.assertEqual(restored["failure_details"]["stage"], "delivery")
+        self.assertEqual(restored["oom_info"], {
+            "is_oom": True,
+            "stage": "delivery",
+            "current_coefficient": 0.8,
+            "suggested_coefficient": 0.7,
+            "message": "The operation ran out of GPU memory.",
+            "allocator": {"device_type": "cuda", "free_bytes": 20},
+        })
+        self.assertNotIn(private_error, repr(restored))
+        self.assertNotIn(
+            private_error,
+            (self.root / "queue.jsonl").read_text(encoding="utf-8"),
+        )
+
     def test_reference_failure_durable_fields_fail_closed(self):
         valid = {
             "failed_child_job_id": "reference-child",

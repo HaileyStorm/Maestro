@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { X, BookMarked, Trash2, Upload, Play, Loader2, AlertTriangle, Download, ExternalLink, Layers } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import type { RecipeCard, RecipeLora } from '../../api/client'
 import * as api from '../../api/client'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 
 /**
  * RecipesOverlay — the one-click preset library. Bundled starters + the
@@ -39,42 +41,21 @@ export function RecipesOverlay() {
   }, [setOpen])
 
   useEffect(() => {
-    if (!open) return
-    const previousFocus = document.activeElement instanceof HTMLElement
+    if (!open || !dialogRef.current || !closeButtonRef.current) return
+    const restoreFocus = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null
     setMissing(null)
     setError(null)
-    closeButtonRef.current?.focus()
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        closeOverlay()
-        return
-      }
-      if (event.key !== 'Tab' || !dialogRef.current) return
-      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ))
-      if (focusable.length === 0) return
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (!dialogRef.current.contains(document.activeElement)) {
-        event.preventDefault()
-        ;(event.shiftKey ? last : first).focus()
-      } else if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => {
-      document.removeEventListener('keydown', handleKeyDown)
-      previousFocus?.focus()
-    }
+    return installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: closeButtonRef.current,
+      restoreFocus,
+      appRoot: document.getElementById('root'),
+      onClose: closeOverlay,
+      priority: 100,
+    })
   }, [closeOverlay, open])
 
   if (!open) return null
@@ -148,16 +129,33 @@ export function RecipesOverlay() {
     }
   }
 
-  return (
+  return createPortal(
     <div
-      ref={dialogRef}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby={titleId}
-      className="fixed inset-0 z-[100] flex h-[100dvh] flex-col overflow-hidden bg-bg-primary pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]"
+      className="fixed inset-0 z-[100] flex h-[100vh] items-center justify-center overflow-hidden supports-[height:100dvh]:h-[100dvh]"
+      style={{
+        paddingTop: 'max(0.5rem, env(safe-area-inset-top))',
+        paddingRight: 'max(0.5rem, env(safe-area-inset-right))',
+        paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(0.5rem, env(safe-area-inset-left))',
+      }}
     >
+      <button
+        type="button"
+        tabIndex={-1}
+        disabled={applying !== null}
+        aria-label="Close recipes"
+        className="absolute inset-0 appearance-none border-0 bg-black/60 p-0"
+        onClick={() => closeModalIfTop(document, dialogRef.current, closeOverlay)}
+      />
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="relative flex h-full min-h-0 w-full max-w-7xl flex-col overflow-hidden rounded-xl border border-border bg-bg-primary shadow-2xl"
+      >
       {/* Header */}
-      <div className="px-3 py-3 sm:px-4 border-b border-border flex items-center gap-2 shrink-0">
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-2 sm:px-4">
         <BookMarked size={16} className="text-accent-blue shrink-0" />
         <h1 id={titleId} className="text-sm font-semibold text-text-primary">Recipes</h1>
         <span className="hidden text-[11px] text-text-muted sm:inline">one-click presets — pick a look, tweak the prompt, generate</span>
@@ -166,7 +164,7 @@ export function RecipesOverlay() {
           type="button"
           onClick={handleImport}
           disabled={applying !== null}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] bg-bg-tertiary border border-border rounded-lg text-text-secondary hover:text-text-primary hover:border-border-light transition-colors"
+          className="flex min-h-11 items-center gap-1.5 rounded-lg border border-border bg-bg-tertiary px-2.5 py-1.5 text-[11px] text-text-secondary transition-colors hover:border-border-light hover:text-text-primary md:min-h-0"
           aria-label="Import a recipe file"
         >
           <Upload size={12} /> Import
@@ -174,8 +172,8 @@ export function RecipesOverlay() {
         <button
           ref={closeButtonRef}
           type="button"
-          onClick={closeOverlay}
-          className="p-1.5 rounded-lg bg-bg-secondary hover:bg-bg-hover transition-colors border border-border"
+          onClick={() => closeModalIfTop(document, dialogRef.current, closeOverlay)}
+          className="flex min-h-11 min-w-11 items-center justify-center rounded-lg border border-border bg-bg-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 md:p-1.5"
           aria-label={applying ? 'Recipe action in progress; close is temporarily unavailable' : 'Close recipes'}
           aria-disabled={applying !== null}
         >
@@ -208,7 +206,7 @@ export function RecipesOverlay() {
               {machineControls && !civitaiKeySet && missing.loras.some(l => l.source_url) && (
                 <div className="mt-1.5 text-[10px] text-text-secondary leading-snug">
                   Auto-download needs a free CivitAI API key.{' '}
-                  <button type="button" onClick={openCivitaiKeySettings} className="underline hover:text-text-primary">Add one in Settings</button>
+                  <button type="button" onClick={openCivitaiKeySettings} className="inline-flex min-h-11 items-center underline hover:text-text-primary md:min-h-0">Add one in Settings</button>
                   {' '}— then click Download. Or use each “Open source” link to grab it manually.
                 </div>
               )}
@@ -219,7 +217,7 @@ export function RecipesOverlay() {
               </div>
             </div>
             <button type="button" onClick={() => { setMissing(null); closeOverlay() }}
-              className="text-[10px] text-text-secondary hover:text-text-primary shrink-0">Dismiss</button>
+              className="flex min-h-11 min-w-11 shrink-0 items-center justify-center text-[10px] text-text-secondary hover:text-text-primary md:min-h-0 md:min-w-0">Dismiss</button>
           </div>
         </div>
       )}
@@ -240,7 +238,7 @@ export function RecipesOverlay() {
             <button
               type="button"
               onClick={() => void loadRecipes()}
-              className="rounded-lg border border-border bg-bg-secondary px-3 py-1.5 text-xs text-text-primary hover:bg-bg-hover"
+              className="min-h-11 rounded-lg border border-border bg-bg-secondary px-3 py-1.5 text-xs text-text-primary hover:bg-bg-hover md:min-h-0"
             >
               Try again
             </button>
@@ -271,7 +269,9 @@ export function RecipesOverlay() {
         )}
       </div>
       </div>
+      </div>
     </div>
+    , document.body
   )
 }
 
@@ -353,7 +353,7 @@ function MissingLoraRow({ lora, modelType, civitaiKeySet, canInstall }: {
   // file directly, no key needed to view it).
   const sourceLink = lora.source_url ? (
     <a href={lora.source_url} target="_blank" rel="noreferrer"
-      className="flex items-center gap-0.5 text-accent-blue hover:text-accent-blue-hover shrink-0">
+      className="flex min-h-11 shrink-0 items-center gap-0.5 text-accent-blue hover:text-accent-blue-hover md:min-h-0">
       <ExternalLink size={10} /> Open source
     </a>
   ) : (
@@ -370,7 +370,7 @@ function MissingLoraRow({ lora, modelType, civitaiKeySet, canInstall }: {
       {!canInstall && <span className="text-text-secondary shrink-0">host installation required</span>}
       {canInstall && lora.source_url && civitaiKeySet && state === 'idle' && (
         <button type="button" onClick={handleDownload}
-          className="flex items-center gap-0.5 text-accent-blue hover:text-accent-blue-hover shrink-0">
+          className="flex min-h-11 shrink-0 items-center gap-0.5 text-accent-blue hover:text-accent-blue-hover md:min-h-0">
           <Download size={10} /> Download
         </button>
       )}

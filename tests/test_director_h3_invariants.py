@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -159,14 +161,16 @@ non_diegetic_music: N/A"""
         self.assertEqual(plan["shot_plan"]["h3_style_workflow"], workflow)
         self.assertEqual(body["h3_style_workflow"], workflow)
         marker = f"H3 workflow guidance [{workflow['id']}]:"
-        for prompt in body["per_clip_prompts"]:
+        for prompt, frames in zip(
+            body["per_clip_prompts"], plan["clip_published_frames"],
+        ):
             visual = prompt.split(
                 "integrated_multimodal_description:", 1,
             )[1].split("overall_soundscape:", 1)[0]
             self.assertIn(marker, visual)
             self.assertEqual(
                 validate_h3_context_ir_records(
-                    prompt, mode="t2va", duration_seconds=20,
+                    prompt, mode="t2va", duration_seconds=frames / 24,
                 ),
                 [],
             )
@@ -220,14 +224,23 @@ non_diegetic_music: N/A"""
         )
         self.assertIsNotNone(plan)
         marker = f"H3 workflow guidance [{workflow['id']}]:"
-        for prompt in body["per_clip_prompts"]:
+        for prompt, frames in zip(
+            body["per_clip_prompts"], plan["clip_published_frames"],
+        ):
             visual = prompt.split("detailed_description:", 1)[1].split(
                 "overall_soundscape:", 1,
             )[0]
             self.assertIn(marker, visual)
+            self.assertNotIn(
+                "Preserve the authored reference scene.", prompt,
+            )
+            self.assertRegex(
+                prompt,
+                r"summary: (?:Execute only the segment-local|Continue only the established)",
+            )
             self.assertEqual(
                 validate_h3_context_ir_records(
-                    prompt, mode="ref2va", duration_seconds=20,
+                    prompt, mode="ref2va", duration_seconds=frames / 24,
                 ),
                 [],
             )
@@ -272,10 +285,31 @@ non_diegetic_music: N/A"""
                 self.assertIn("[15.000s-", plan["global_prompt"])
                 semantic = plan["shot_plan"]["semantic_shots"]
                 self.assertEqual(len(semantic), 1)
-                self.assertEqual(
-                    body["per_clip_prompts"],
-                    [semantic[0]["semantic_prompt"]] * plan["clip_count"],
-                )
+                self.assertEqual(len(set(body["per_clip_prompts"])), plan["clip_count"])
+                self.assertTrue(semantic[0]["prompt_rewrite_for_physical_split"])
+                for prompt, frames in zip(
+                    body["per_clip_prompts"], plan["clip_published_frames"],
+                ):
+                    self.assertEqual(
+                        validate_h3_context_ir_records(
+                            prompt,
+                            mode="t2va",
+                            duration_seconds=frames / 24,
+                        ),
+                        [],
+                    )
+                for event_text in ("crosses the station", "train arrives"):
+                    event = next(
+                        item for item in semantic[0]["event_ownership"]
+                        if event_text in item["executable_payload"]
+                    )
+                    self.assertEqual(
+                        sum(
+                            event_text in item
+                            for item in body["per_clip_prompts"]
+                        ),
+                        1 + len(event["continuation_slices"]),
+                    )
                 self.assertEqual(
                     validate_h3_context_ir_records(
                         semantic[0]["semantic_prompt"],
@@ -425,9 +459,15 @@ non_diegetic_music: N/A"""
                 )
                 self.assertEqual(cut_boundary["at_seconds"], 15.0)
                 self.assertEqual(cut_boundary["source"], "explicit_cut")
-                self.assertIn(
-                    "[Shot 1] [0.000s-",
-                    body["per_clip_prompts"][cut_index + 1],
+                self.assertEqual(
+                    validate_h3_context_ir_records(
+                        body["per_clip_prompts"][cut_index + 1],
+                        mode="t2va",
+                        duration_seconds=(
+                            plan["clip_published_frames"][cut_index + 1] / 24
+                        ),
+                    ),
+                    [],
                 )
                 self.assertIn(
                     "cut to a close-up as the train arrives",
@@ -674,6 +714,102 @@ non_diegetic_music: N/A"""
                 fps=24,
             )
 
+    def test_committed_v2_rejects_global_provenance_and_event_owner_drift(self):
+        clips, planned = self._scene(20.0)
+        params = {
+            "h3_ref2va_terms_accepted": True,
+            "director_max_shot_frames": 243,
+        }
+        pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        original = params["_h3_longform"]["shot_plan"]
+
+        changed_global = copy.deepcopy(original)
+        changed_global["global_prompt"] += " changed"
+        with self.assertRaisesRegex(ValueError, "seal disagrees"):
+            pipeline._canonicalize_director_h3_shot_plan(changed_global)
+
+        changed_owner = copy.deepcopy(original)
+        event = changed_owner["source_contracts"][0]["event_ownership"][-1]
+        event["owner_segment_index"] = 0
+        changed_owner["semantic_shots"] = copy.deepcopy(
+            changed_owner["source_contracts"]
+        )
+        changed_owner["event_ownership"] = [
+            copy.deepcopy(item)
+            for contract in changed_owner["source_contracts"]
+            for item in contract["event_ownership"]
+        ]
+        with self.assertRaisesRegex(ValueError, "event ownership disagrees"):
+            pipeline._canonicalize_director_h3_shot_plan(changed_owner)
+
+    def test_committed_v1_plan_replays_without_migration(self):
+        clips, planned = self._scene(20.0)
+        params = {"h3_ref2va_terms_accepted": True}
+        pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        saved = copy.deepcopy(params["_h3_longform"])
+        shot_plan = saved["shot_plan"]
+        shot_plan["semantic_physical_contract_version"] = 1
+        shot_plan.pop("prompt_contract_seal", None)
+        shot_plan.pop("event_ownership", None)
+        v1_prompts = [""] * len(shot_plan["clip_prompts"])
+        for contract in shot_plan["source_contracts"]:
+            contract["prompt_rewrite_for_physical_split"] = False
+            contract.pop("physical_prompt_compiler_version", None)
+            contract.pop("event_ownership", None)
+            contract.pop("executable_prompt_sha256", None)
+            for position in contract["segment_indices"]:
+                v1_prompts[position] = contract["semantic_prompt"]
+        shot_plan["clip_prompts"] = v1_prompts
+        for index, shot in enumerate(shot_plan["shots"]):
+            shot["prompt"] = v1_prompts[index]
+        for item in shot_plan["dialogue_manifest"]:
+            contract = shot_plan["source_contracts"][item["source_index"]]
+            item["segment_index"] = contract["segment_indices"][0]
+        for contract in shot_plan["source_contracts"]:
+            contract["dialogue_manifest"] = [
+                copy.deepcopy(item)
+                for item in shot_plan["dialogue_manifest"]
+                if item["source_index"] == contract["source_index"]
+            ]
+        for index, shot in enumerate(shot_plan["shots"]):
+            shot["dialogue_manifest_indices"] = [
+                manifest_index
+                for manifest_index, item in enumerate(shot_plan["dialogue_manifest"])
+                if item["segment_index"] == index
+            ]
+        shot_plan["semantic_shots"] = copy.deepcopy(
+            shot_plan["source_contracts"]
+        )
+
+        restored = pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params={
+                "h3_ref2va_terms_accepted": True,
+                "_h3_longform": saved,
+            },
+            clip_plans=[],
+            planned_clips=[],
+            fps=24,
+        )
+        self.assertEqual(
+            restored["shot_plan"]["semantic_physical_contract_version"], 1,
+        )
+        self.assertEqual(
+            restored["shot_plan"]["clip_prompts"], v1_prompts,
+        )
+
     def test_committed_semantic_contract_rejects_corrupt_replay_metadata(self):
         clips, planned = self._scene(20.0)
         params = {
@@ -910,6 +1046,9 @@ non_diegetic_music: N/A"""
             body, params=params, clip_plans=clips, planned_clips=planned, fps=24,
         )
         saved = copy.deepcopy(params["_h3_longform"])
+        saved["shot_plan"].pop("semantic_physical_contract_version", None)
+        saved["shot_plan"].pop("prompt_contract_seal", None)
+        saved["shot_plan"].pop("semantic_shots", None)
         legacy_global = "[0-10s] Legacy scene A.\n\n[0-10s] Legacy scene B."
         saved["global_prompt"] = legacy_global
         saved["shot_plan"]["global_prompt"] = legacy_global
@@ -1436,15 +1575,23 @@ non_diegetic_music: N/A"""
             self.assertEqual(plan["clip_published_frames"], [144, 336])
             self.assertEqual(plan["clip_trim_tail_frames"], [14, 9])
             self.assertEqual(plan["clip_boundaries"][0]["at_seconds"], 6.0)
-            self.assertEqual(
+            self.assertNotEqual(
                 plan["shot_plan"]["clip_prompts"][0],
                 plan["shot_plan"]["clip_prompts"][1],
             )
-            self.assertTrue(all(
-                item.count(dialogue) == 1
-                and "guest faces camera" in item
-                for item in plan["shot_plan"]["clip_prompts"]
-            ))
+            self.assertEqual(
+                sum(
+                    item.count(dialogue)
+                    for item in plan["shot_plan"]["clip_prompts"]
+                ),
+                1,
+            )
+            self.assertNotIn(
+                "guest faces camera", plan["shot_plan"]["clip_prompts"][0],
+            )
+            self.assertIn(
+                "guest faces camera", plan["shot_plan"]["clip_prompts"][1],
+            )
         for semantic in director["shot_plan"]["semantic_shots"]:
             frames = sum(
                 director["clip_published_frames"][index]
@@ -1591,6 +1738,1195 @@ non_diegetic_music: N/A"""
             provider="local",
             remote_url="",
             api_key="",
+        )
+
+    def test_v2_replay_rejects_mutable_outer_runtime_controls(self):
+        clips, planned = self._scene(20.0)
+        params = {"h3_ref2va_terms_accepted": True}
+        pipeline._prepare_director_h3_longform(
+            self._base_generation_params(),
+            params=params,
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        original = params["_h3_longform"]
+        for field, value in (
+            ("segment_frames_maximum", 1),
+            ("continuation", "semantic_references"),
+        ):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(original)
+                changed[field] = value
+                with self.assertRaisesRegex(ValueError, "runtime contract disagrees"):
+                    pipeline._prepare_director_h3_longform(
+                        self._base_generation_params(),
+                        params={
+                            "h3_ref2va_terms_accepted": True,
+                            "_h3_longform": changed,
+                        },
+                        clip_plans=[],
+                        planned_clips=[],
+                        fps=24,
+                    )
+
+    def test_v2_resealed_event_owner_must_match_executable_payload(self):
+        from services.h3_shot_planner import plan_h3_native_shots, seal_h3_shot_plan
+
+        shot_plan = plan_h3_native_shots(
+            global_prompt="An adult host enters. The host waits by the desk.",
+            clip_frame_counts=[124, 124],
+            fps=24,
+        )
+        event = shot_plan["source_contracts"][0]["event_ownership"][0]
+        event.update({
+            "owner_segment_index": 1,
+            "owner_physical_segment_index": 1,
+            "owner_physical_segment_id": "h3-authored-shot-1:segment-2",
+        })
+        shot_plan["semantic_shots"] = copy.deepcopy(
+            shot_plan["source_contracts"]
+        )
+        shot_plan["event_ownership"] = [
+            copy.deepcopy(item)
+            for contract in shot_plan["source_contracts"]
+            for item in contract["event_ownership"]
+        ]
+        seal_h3_shot_plan(shot_plan)
+
+        with self.assertRaisesRegex(ValueError, "event ownership disagrees"):
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan)
+
+    def test_v2_continuation_slices_round_trip_and_reject_resealed_drift(self):
+        import hashlib
+        from services.h3_shot_planner import plan_h3_native_shots, seal_h3_shot_plan
+
+        dialogue = "<d>[English] Continue forward.</d>"
+        action = "<Subject 1> carries the sealed case through the long hall."
+        prompt = (
+            "subject_definitions: <Subject 1> is an adult courier.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-20s] shot_name: Hall crossing | "
+            f"audiovisual_description: {action} | "
+            "dialogue_and_vocalizations: <Subject 1> says: "
+            f"{dialogue}\n"
+            "overall_soundscape: Quiet footsteps.\n"
+            "non_diegetic_music: N/A"
+        )
+        shot_plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            clip_frame_counts=[144, 144, 192],
+            fps=24,
+        )
+        expected = list(shot_plan["clip_prompts"])
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan), expected,
+        )
+        self.assertEqual(sum(dialogue in item for item in expected), 1)
+        self.assertEqual(sum(action in item for item in expected), 3)
+
+        changed = copy.deepcopy(shot_plan)
+        continuation = changed["source_contracts"][0]["event_ownership"][0][
+            "continuation_slices"
+        ][0]
+        continuation["source_end_frame_exclusive"] -= 1
+        changed["semantic_shots"] = copy.deepcopy(changed["source_contracts"])
+        changed["event_ownership"] = [
+            copy.deepcopy(item)
+            for contract in changed["source_contracts"]
+            for item in contract["event_ownership"]
+        ]
+        seal_h3_shot_plan(changed)
+        with self.assertRaisesRegex(ValueError, "event ownership disagrees"):
+            pipeline._canonicalize_director_h3_shot_plan(changed)
+
+        for injected in (
+            "An extra action occurs. ",
+            "<d>[English] Extra words.</d> ",
+        ):
+            with self.subTest(injected=injected):
+                changed = copy.deepcopy(shot_plan)
+                changed_prompt = changed["clip_prompts"][1].replace(
+                    " | dialogue_and_vocalizations:",
+                    f" {injected}| dialogue_and_vocalizations:",
+                    1,
+                )
+                changed["clip_prompts"][1] = changed_prompt
+                changed["shots"][1]["prompt"] = changed_prompt
+                changed["source_contracts"][0]["executable_prompt_sha256"][1] = (
+                    hashlib.sha256(changed_prompt.encode("utf-8")).hexdigest()
+                )
+                changed["semantic_shots"] = copy.deepcopy(
+                    changed["source_contracts"]
+                )
+                seal_h3_shot_plan(changed)
+                with self.assertRaisesRegex(
+                    ValueError, "physical prompt semantics disagree",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(changed)
+
+    def test_v2_untimed_and_final_blocking_events_replay(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        for prompt in (
+            "An adult host enters. The host waits beside the desk.",
+            "An adult host enters.\nFINAL BLOCKING: The host faces camera.",
+            "[0-4s] An adult host enters. FINAL BLOCKING: The host faces camera.",
+        ):
+            with self.subTest(prompt=prompt):
+                shot_plan = plan_h3_native_shots(
+                    global_prompt=prompt,
+                    clip_frame_counts=[124, 124],
+                    fps=24,
+                )
+                self.assertTrue(all(
+                    item["continuation_slices"] == []
+                    for item in shot_plan["event_ownership"]
+                ))
+                self.assertEqual(
+                    pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+                    shot_plan["clip_prompts"],
+                )
+
+    def test_v2_partial_timed_action_fills_local_gaps_and_replays(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        action = "An adult courier carries a sealed case."
+        shot_plan = plan_h3_native_shots(
+            global_prompt=f"[5-18s] {action}",
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        self.assertIn("[0-5s] Continue the established", shot_plan["clip_prompts"][0])
+        self.assertIn("[8-10s] Continue the established", shot_plan["clip_prompts"][1])
+        self.assertEqual(sum(action in item for item in shot_plan["clip_prompts"]), 2)
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
+        )
+
+    def test_v2_point_actions_use_one_frame_half_open_geometry_and_replay(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        for timestamp, expected_range in ((0, (0, 1)), (5, (120, 121))):
+            with self.subTest(timestamp=timestamp):
+                shot_plan = plan_h3_native_shots(
+                    global_prompt=(
+                        f"At {timestamp} seconds, an adult host waves."
+                    ),
+                    clip_frame_counts=[240],
+                    fps=24,
+                )
+                event = shot_plan["event_ownership"][0]
+                self.assertEqual(event["kind"], "point")
+                self.assertEqual(
+                    (
+                        event["source_start_frame"],
+                        event["source_end_frame_exclusive"],
+                    ),
+                    expected_range,
+                )
+                self.assertIn(
+                    "[0-0.042s]" if timestamp == 0 else "[5-5.042s]",
+                    shot_plan["clip_prompts"][0],
+                )
+                self.assertEqual(
+                    pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+                    shot_plan["clip_prompts"],
+                )
+
+        boundary_plan = plan_h3_native_shots(
+            global_prompt=(
+                "[0-5s] An adult host crosses the room.\n"
+                "At 5 seconds, the host waves."
+            ),
+            clip_frame_counts=[120, 120],
+            fps=24,
+        )
+        point = next(
+            item for item in boundary_plan["event_ownership"]
+            if item["kind"] == "point"
+        )
+        self.assertEqual(point["owner_segment_index"], 1)
+        self.assertEqual(point["owner_physical_segment_index"], 1)
+        self.assertEqual(point["local_start_frame"], 0)
+        self.assertEqual(point["local_end_frame_exclusive"], 1)
+        self.assertIn("[0-0.042s]", boundary_plan["clip_prompts"][1])
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(boundary_plan),
+            boundary_plan["clip_prompts"],
+        )
+
+    def test_v2_ambiguous_inline_opening_dialogue_fails_before_sealing(self):
+        from services.h3_shot_planner import H3ShotPlanError, plan_h3_native_shots
+
+        for suffix in (
+            "The host says Hello.",
+            "while remaining seated. The host walks.",
+            "“The host says Hello.”",
+        ):
+            with self.subTest(suffix=suffix):
+                with self.assertRaisesRegex(
+                    H3ShotPlanError, "requires terminal punctuation",
+                ):
+                    plan_h3_native_shots(
+                        global_prompt=(
+                            "[0-4s] OPENING BLOCKING: The host says "
+                            f"<d>[English] Ready</d> {suffix}"
+                        ),
+                        clip_frame_counts=[48, 48],
+                        fps=24,
+                    )
+
+    def test_v2_exact_structured_opening_dialogue_without_punctuation_replays(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        opening_dialogue = "<d>[English] Ready</d>"
+        prompt = (
+            "subject_definitions: <Subject 1> is an adult host.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-20s] shot_name: Studio | "
+            "audiovisual_description: <Subject 1> studies a ledger. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        shot_plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            structured_shots=[{
+                "spatial_setup": f"The host says {opening_dialogue}",
+            }],
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        self.assertEqual(
+            sum(
+                item.count(opening_dialogue)
+                for item in shot_plan["clip_prompts"]
+            ),
+            1,
+        )
+        self.assertNotIn("Opening blocking", shot_plan["clip_prompts"][1])
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
+        )
+
+    def test_v2_line_closed_opening_preserves_later_dialogue_association(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        opening_dialogue = "<d>[English] Ready</d>"
+        later_dialogue = "<d>[English] Hello</d>"
+        shot_plan = plan_h3_native_shots(
+            global_prompt=(
+                "[0-4s] OPENING BLOCKING: The host says "
+                f"{opening_dialogue}\n"
+                f"The host says {later_dialogue} and walks."
+            ),
+            clip_frame_counts=[48, 48],
+            fps=24,
+        )
+        self.assertEqual(
+            [
+                item["exact_block"]
+                for item in shot_plan["dialogue_manifest"]
+            ],
+            [later_dialogue, opening_dialogue],
+        )
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
+        )
+
+    def test_v2_replay_rejects_balanced_noncanonical_dialogue_tags(self):
+        from services.h3_shot_planner import plan_h3_native_shots, seal_h3_shot_plan
+
+        for dialogue in (
+            "<d>Ready</d>",
+            "<d>[English] </d>",
+            "<d>[English] \t\n </d>",
+            "<d>[ ] hello</d>",
+        ):
+            with self.subTest(dialogue=dialogue):
+                shot_plan = plan_h3_native_shots(
+                    global_prompt="[0-4s] An adult host says TOKEN_READY.",
+                    clip_frame_counts=[48, 48],
+                    fps=24,
+                )
+                shot_plan["source_contracts"][0]["semantic_prompt"] = (
+                    f"[0-4s] An adult host says {dialogue}."
+                )
+                shot_plan["semantic_shots"] = copy.deepcopy(
+                    shot_plan["source_contracts"]
+                )
+                seal_h3_shot_plan(shot_plan)
+                with self.assertRaisesRegex(
+                    ValueError, r"canonical <d>\[language\]",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(shot_plan)
+
+    def test_v2_replay_rejects_resealed_semantic_prompt_field_tamper(self):
+        from services.h3_shot_planner import plan_h3_native_shots, seal_h3_shot_plan
+
+        clips, _planned = self._ref_scene(20.0)
+        prompt = clips[0]["video_prompt"]
+        shot_plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        shot_plan["source_contracts"][0]["semantic_prompt"] = (
+            shot_plan["source_contracts"][0]["semantic_prompt"].replace(
+                "summary: Preserve the authored reference scene.",
+                "summary: TAMPERED summary.",
+            )
+        )
+        shot_plan["semantic_shots"] = copy.deepcopy(
+            shot_plan["source_contracts"]
+        )
+        seal_h3_shot_plan(shot_plan)
+        with self.assertRaisesRegex(
+            ValueError, "semantic prompt provenance disagrees",
+        ):
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan)
+
+        pristine = plan_h3_native_shots(
+            global_prompt=prompt,
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        for field, value in (
+            ("prompt_changed_before_split", "yes"),
+            (
+                "prompt_changed_before_split",
+                not pristine["source_contracts"][0][
+                    "prompt_changed_before_split"
+                ],
+            ),
+            ("authored_final_blocking", "The host sits."),
+        ):
+            with self.subTest(field=field, value=value):
+                tampered = copy.deepcopy(pristine)
+                tampered["source_contracts"][0][field] = value
+                tampered["semantic_shots"] = copy.deepcopy(
+                    tampered["source_contracts"]
+                )
+                seal_h3_shot_plan(tampered)
+                with self.assertRaisesRegex(
+                    ValueError, "authored prompt provenance disagrees",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+    def test_v2_replay_rejects_masked_semantic_compiler_inputs(self):
+        from services.h3_shot_planner import plan_h3_native_shots, seal_h3_shot_plan
+
+        dialogue = "<d>[English] Ready.</d>"
+        cases = (
+            (
+                "[0-4s] An adult host waits.",
+                "visual_context",
+                "An adult host",
+            ),
+            (
+                "[0-4s] OPENING BLOCKING: Ready. The host walks.",
+                "opening_blocking",
+                "attacker opening",
+            ),
+            (
+                f"[0-4s] The host says {dialogue}",
+                "structured_dialogue_blocks",
+                [dialogue],
+            ),
+        )
+        for prompt, field, value in cases:
+            with self.subTest(field=field):
+                shot_plan = plan_h3_native_shots(
+                    global_prompt=prompt,
+                    clip_frame_counts=[48, 48],
+                    fps=24,
+                )
+                shot_plan["source_contracts"][0][field] = value
+                shot_plan["semantic_shots"] = copy.deepcopy(
+                    shot_plan["source_contracts"]
+                )
+                seal_h3_shot_plan(shot_plan)
+                with self.assertRaisesRegex(
+                    ValueError, "semantic compiler inputs are not canonical",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(shot_plan)
+
+    def test_v2_replay_rejects_opening_claimed_from_later_action(self):
+        from services.h3_shot_planner import plan_h3_native_shots, seal_h3_shot_plan
+
+        prompt_without_opening = (
+            "subject_definitions: <Subject 1> is an adult archivist.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-20s] shot_name: Archive | "
+            "audiovisual_description: <Subject 1> stands and studies the ledger. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        valid = plan_h3_native_shots(
+            global_prompt=prompt_without_opening,
+            structured_shots=[{"spatial_setup": "stands"}],
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(valid),
+            valid["clip_prompts"],
+        )
+
+        prompt = (
+            "subject_definitions: <Subject 1> is an adult archivist.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-20s] shot_name: Archive | "
+            "audiovisual_description: OPENING BLOCKING: The cabinet remains "
+            "closed. <Subject 1> studies the ledger. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        for invalid_opening in (
+            "<Subject 1> studies the ledger",
+            "The cabinet",
+            "cabinet remains",
+        ):
+            with self.subTest(invalid_opening=invalid_opening):
+                shot_plan = plan_h3_native_shots(
+                    global_prompt=prompt,
+                    clip_frame_counts=[240, 240],
+                    fps=24,
+                )
+                shot_plan["source_contracts"][0]["opening_blocking"] = (
+                    invalid_opening
+                )
+                shot_plan["semantic_shots"] = copy.deepcopy(
+                    shot_plan["source_contracts"]
+                )
+                seal_h3_shot_plan(shot_plan)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "(?:semantic compiler inputs are not canonical|"
+                    "structured opening blocking conflicts)",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(shot_plan)
+
+        final_prompt = (
+            "subject_definitions: <Subject 1> is an adult archivist.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-20s] shot_name: Archive | "
+            "audiovisual_description: OPENING BLOCKING: The host waits "
+            "FINAL BLOCKING: attacker opening. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        shot_plan = plan_h3_native_shots(
+            global_prompt=final_prompt,
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        shot_plan["source_contracts"][0]["opening_blocking"] = (
+            "attacker opening"
+        )
+        shot_plan["semantic_shots"] = copy.deepcopy(
+            shot_plan["source_contracts"]
+        )
+        seal_h3_shot_plan(shot_plan)
+        with self.assertRaisesRegex(
+            ValueError,
+            "(?:semantic compiler inputs are not canonical|"
+            "structured opening blocking conflicts)",
+        ):
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan)
+
+    def test_v2_opening_punctuation_replays_and_multiple_fields_reject(self):
+        from services.h3_shot_planner import plan_h3_native_shots, seal_h3_shot_plan
+
+        def prompt(opening: str) -> str:
+            return (
+                "subject_definitions: <Subject 1> is an adult host.\n\n"
+                "integrated_multimodal_description:\n"
+                "[Shot 1] [0s-20s] shot_name: Studio | "
+                f"audiovisual_description: OPENING BLOCKING: {opening} "
+                "<Subject 1> then walks. | dialogue_and_vocalizations: none\n"
+                "overall_soundscape: Quiet room tone.\n"
+                "non_diegetic_music: N/A"
+            )
+
+        for authored, structured in (
+            ("The host kneels.", "The host kneels?"),
+            ("The host kneels?", "The host kneels."),
+            ("The host kneels!", "The host kneels"),
+        ):
+            with self.subTest(authored=authored):
+                shot_plan = plan_h3_native_shots(
+                    global_prompt=prompt(authored),
+                    structured_shots=[{"spatial_setup": structured}],
+                    clip_frame_counts=[240, 240],
+                    fps=24,
+                )
+                self.assertEqual(
+                    pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+                    shot_plan["clip_prompts"],
+                )
+
+        shot_plan = plan_h3_native_shots(
+            global_prompt=prompt("First pose."),
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        multiple = prompt(
+            "First pose. OPENING BLOCKING: Second pose."
+        )
+        shot_plan["source_contracts"][0]["authored_prompt"] = multiple
+        shot_plan["source_contracts"][0]["semantic_prompt"] = multiple
+        shot_plan["source_contracts"][0]["prompt_changed_before_split"] = False
+        shot_plan["semantic_shots"] = copy.deepcopy(
+            shot_plan["source_contracts"]
+        )
+        seal_h3_shot_plan(shot_plan)
+        with self.assertRaisesRegex(
+            ValueError, "multiple OPENING BLOCKING fields",
+        ):
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan)
+
+    def test_v2_canonical_structured_opening_punctuation_replays(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        prompt = (
+            "subject_definitions: <Subject 1> is an adult host.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-4s] shot_name: Studio | "
+            "audiovisual_description: <Subject 1> walks forward. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        for opening in ("stand.", "stand!", "stand?"):
+            with self.subTest(opening=opening):
+                shot_plan = plan_h3_native_shots(
+                    global_prompt=prompt,
+                    structured_shots=[{"spatial_setup": opening}],
+                    clip_frame_counts=[96],
+                    fps=24,
+                )
+                self.assertIn(
+                    f"Opening blocking: {opening} <Subject 1> walks forward.",
+                    shot_plan["clip_prompts"][0],
+                )
+                self.assertEqual(
+                    pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+                    shot_plan["clip_prompts"],
+                )
+
+    def test_v2_each_canonical_record_replays_its_local_opening_once(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        prompt = (
+            "subject_definitions: <Subject 1> is an adult host.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-2s] shot_name: Studio wide | "
+            "audiovisual_description: <Subject 1> looks around. | "
+            "dialogue_and_vocalizations: none\n"
+            "[Shot 2] [2s-6s] shot_name: Studio close | "
+            "audiovisual_description: OPENING BLOCKING: stands beside the desk. "
+            "<Subject 1> walks forward. | dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        shot_plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            structured_shots=[{"spatial_setup": "stands"}],
+            clip_frame_counts=[48, 48, 48],
+            fps=24,
+        )
+        self.assertEqual(
+            [
+                item.casefold().count("opening blocking:")
+                for item in shot_plan["clip_prompts"]
+            ],
+            [1, 1, 0],
+        )
+        self.assertNotIn(
+            "stands beside the desk",
+            shot_plan["clip_prompts"][2].casefold(),
+        )
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
+        )
+
+    def test_v2_dialogue_terminated_opening_outer_punctuation_replays(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        dialogue = "<d>[English] Ready!</d>"
+        generic = plan_h3_native_shots(
+            global_prompt=(
+                "[0-4s] OPENING BLOCKING: The host kneels and says "
+                f"{dialogue}. The host walks."
+            ),
+            clip_frame_counts=[48, 48],
+            fps=24,
+        )
+        self.assertNotIn(": . The host walks", generic["clip_prompts"][1])
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(generic),
+            generic["clip_prompts"],
+        )
+
+        canonical_prompt = (
+            "subject_definitions: <Subject 1> is an adult host.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-2s] shot_name: Studio wide | "
+            "audiovisual_description: <Subject 1> looks around. | "
+            "dialogue_and_vocalizations: none\n"
+            "[Shot 2] [2s-6s] shot_name: Studio close | "
+            "audiovisual_description: OPENING BLOCKING: The host kneels and says "
+            f"{dialogue}. <Subject 1> walks forward. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        canonical = plan_h3_native_shots(
+            global_prompt=canonical_prompt,
+            structured_shots=[{"spatial_setup": "stands"}],
+            clip_frame_counts=[48, 48, 48],
+            fps=24,
+        )
+        self.assertNotIn(": . <Subject 1>", canonical["clip_prompts"][2])
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(canonical),
+            canonical["clip_prompts"],
+        )
+
+    def test_v2_multisentence_opening_recovery_preserves_authored_provenance(self):
+        from services.h3_shot_planner import (
+            H3_COMPILER_INPUT_REPLAY_VERSION,
+            plan_h3_native_shots,
+            seal_h3_shot_plan,
+        )
+
+        opening = (
+            "The cabinet stays locked. The warning lamp flickers twice!"
+        )
+        prompt = (
+            "subject_definitions: <Subject 1> is an adult archivist.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-20s] shot_name: Archive | "
+            "audiovisual_description: <Subject 1> studies the ledger. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        initial = plan_h3_native_shots(
+            global_prompt=prompt,
+            structured_shots=[{"spatial_setup": opening}],
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        contract = initial["source_contracts"][0]
+        compiler_inputs = {
+            "version": H3_COMPILER_INPUT_REPLAY_VERSION,
+            "authored_shot_id": contract["authored_shot_id"],
+            "visual_context": contract["visual_context"],
+            "opening_blocking": contract["opening_blocking"],
+            "final_blocking": contract["final_blocking"],
+            "structured_dialogue_blocks": contract[
+                "structured_dialogue_blocks"
+            ],
+        }
+        replay = plan_h3_native_shots(
+            global_prompt=contract["authored_prompt"],
+            source_prompts=[contract["authored_prompt"]],
+            source_compiler_inputs=[compiler_inputs],
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        self.assertEqual(
+            replay["source_contracts"][0]["semantic_prompt"],
+            contract["semantic_prompt"],
+        )
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(replay),
+            replay["clip_prompts"],
+        )
+
+        for changed in (
+            opening.lower(),
+            opening.replace(" ", "  ", 1),
+            opening + " <Subject 1> studies",
+        ):
+            with self.subTest(changed=changed):
+                tampered = copy.deepcopy(initial)
+                tampered["source_contracts"][0]["opening_blocking"] = changed
+                tampered["semantic_shots"] = copy.deepcopy(
+                    tampered["source_contracts"]
+                )
+                seal_h3_shot_plan(tampered)
+                with self.assertRaisesRegex(
+                    ValueError, "semantic prompt provenance disagrees",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+    def test_v2_exact_compiler_inputs_round_trip_visual_and_dialogue(self):
+        from services.h3_shot_planner import (
+            H3_COMPILER_INPUT_REPLAY_VERSION,
+            plan_h3_native_shots,
+            seal_h3_shot_plan,
+        )
+
+        source = "[0-4s] An adult mechanic holds position beside the workbench."
+        initial = plan_h3_native_shots(
+            global_prompt=source,
+            structured_shots=[{
+                "shot_id": "shot-replay",
+                "environment": "a neutral amber workshop",
+                "visual_style": "restrained documentary realism",
+                "lighting": "soft practical lamps",
+                "subjects_on_screen": [{
+                    "speaker_name": "Ada",
+                    "visual_description": "an adult mechanic",
+                    "wardrobe": "plain green coveralls",
+                }],
+                "spatial_setup": "Ada remains at the left workbench",
+                "closing_blocking": "Ada closes the steel toolbox",
+                "dialogue_beats": [{
+                    "spoken_text": "Keep these words exactly.",
+                }],
+            }],
+            clip_frame_counts=[48, 48],
+            fps=24,
+        )
+        contract = initial["source_contracts"][0]
+        compiler_inputs = {
+            "version": H3_COMPILER_INPUT_REPLAY_VERSION,
+            "authored_shot_id": contract["authored_shot_id"],
+            "visual_context": contract["visual_context"],
+            "opening_blocking": contract["opening_blocking"],
+            "final_blocking": contract["final_blocking"],
+            "structured_dialogue_blocks": list(
+                contract["structured_dialogue_blocks"]
+            ),
+        }
+        replay = plan_h3_native_shots(
+            global_prompt=contract["authored_prompt"],
+            source_prompts=[contract["authored_prompt"]],
+            source_compiler_inputs=[compiler_inputs],
+            clip_frame_counts=[48, 48],
+            fps=24,
+        )
+
+        self.assertEqual(replay["clip_prompts"], initial["clip_prompts"])
+        self.assertEqual(replay["event_ownership"], initial["event_ownership"])
+        self.assertEqual(replay["dialogue_manifest"], initial["dialogue_manifest"])
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(replay),
+            replay["clip_prompts"],
+        )
+
+        for field, value in (
+            ("visual_context", contract["visual_context"] + " attacker"),
+            (
+                "structured_dialogue_blocks",
+                contract["structured_dialogue_blocks"]
+                + ["<d>[English] Changed.</d>"],
+            ),
+        ):
+            with self.subTest(field=field):
+                tampered = copy.deepcopy(replay)
+                tampered["source_contracts"][0][field] = value
+                tampered["semantic_shots"] = copy.deepcopy(
+                    tampered["source_contracts"]
+                )
+                seal_h3_shot_plan(tampered)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "(?:semantic prompt provenance disagrees|"
+                    "semantic compiler inputs are not canonical)",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+    def test_v2_structured_opening_reserved_markers_reject(self):
+        from services.h3_shot_planner import (
+            plan_h3_native_shots,
+            seal_h3_shot_plan,
+        )
+
+        canonical = (
+            "subject_definitions: <Subject 1> is an adult host.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-4s] shot_name: Studio | "
+            "audiovisual_description: <Subject 1> walks forward. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        for source in (canonical, "[0-4s] An adult host walks forward."):
+            shot_plan = plan_h3_native_shots(
+                global_prompt=source,
+                structured_shots=[{"spatial_setup": "stands"}],
+                clip_frame_counts=[96],
+                fps=24,
+            )
+            for opening in (
+                "stands. FINAL BLOCKING: sits",
+                "OPENING BLOCKING: sits",
+            ):
+                with self.subTest(canonical=source == canonical, opening=opening):
+                    tampered = copy.deepcopy(shot_plan)
+                    tampered["source_contracts"][0]["opening_blocking"] = opening
+                    tampered["semantic_shots"] = copy.deepcopy(
+                        tampered["source_contracts"]
+                    )
+                    seal_h3_shot_plan(tampered)
+                    with self.assertRaisesRegex(
+                        ValueError, "reserved structural marker",
+                    ):
+                        pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+    def test_v2_generic_distinct_final_sources_replay_exactly(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        shot_plan = plan_h3_native_shots(
+            global_prompt=(
+                "An adult host walks. FINAL BLOCKING: Authored ending."
+            ),
+            structured_shots=[{
+                "closing_blocking": "Structured ending.",
+            }],
+            clip_frame_counts=[48, 48],
+            fps=24,
+        )
+        final = next(
+            item for item in shot_plan["event_ownership"]
+            if item["kind"] == "final_blocking"
+        )
+        self.assertEqual(
+            final["executable_payload"],
+            "Structured ending. Authored ending.",
+        )
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
+        )
+
+    def test_v2_generic_duplicate_final_punctuation_replays_once(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        for authored, structured in (
+            ("Host sits!", "host sits"),
+            ("Host sits?", "HOST SITS."),
+        ):
+            with self.subTest(authored=authored, structured=structured):
+                shot_plan = plan_h3_native_shots(
+                    global_prompt=(
+                        "An adult host walks. "
+                        f"FINAL BLOCKING: {authored}"
+                    ),
+                    structured_shots=[{
+                        "closing_blocking": structured,
+                    }],
+                    clip_frame_counts=[48, 48],
+                    fps=24,
+                )
+                final = next(
+                    item for item in shot_plan["event_ownership"]
+                    if item["kind"] == "final_blocking"
+                )
+                self.assertEqual(final["executable_payload"], authored)
+                self.assertEqual(
+                    pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+                    shot_plan["clip_prompts"],
+                )
+
+    def test_v2_repeated_dialogue_keeps_occurrence_provenance_after_reordering(self):
+        from services.h3_shot_planner import plan_h3_native_shots, seal_h3_shot_plan
+
+        dialogue = "<d>[English] Ready</d>"
+        shot_plan = plan_h3_native_shots(
+            global_prompt=(
+                "[0-4s] OPENING BLOCKING: The host says "
+                f"{dialogue}\n"
+                f"The guest repeats {dialogue}."
+            ),
+            structured_shots=[{
+                "dialogue_beats": [{
+                    "exact_block": dialogue,
+                    "speaker_id": "host-structured",
+                }],
+            }],
+            clip_frame_counts=[48, 48],
+            fps=24,
+        )
+        self.assertEqual(
+            [item["exact_block"] for item in shot_plan["dialogue_manifest"]],
+            [dialogue, dialogue],
+        )
+        self.assertEqual(
+            [item["source"] for item in shot_plan["dialogue_manifest"]],
+            ["semantic_prompt", "semantic_prompt"],
+        )
+        self.assertEqual(
+            [item["speaker_id"] for item in shot_plan["dialogue_manifest"]],
+            ["", ""],
+        )
+        self.assertEqual(
+            [
+                item["semantic_occurrence_index"]
+                for item in shot_plan["dialogue_manifest"]
+            ],
+            [1, 0],
+        )
+        self.assertNotIn(
+            "semantic_dialogue_provenance", shot_plan["source_contracts"][0],
+        )
+        changed = copy.deepcopy(shot_plan)
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
+        )
+
+        pristine = copy.deepcopy(changed)
+        changed["dialogue_manifest"][:2] = reversed(
+            changed["dialogue_manifest"][:2]
+        )
+        changed["source_contracts"][0]["dialogue_manifest"][:2] = reversed(
+            changed["source_contracts"][0]["dialogue_manifest"][:2]
+        )
+        changed["semantic_shots"] = copy.deepcopy(changed["source_contracts"])
+        seal_h3_shot_plan(changed)
+        with self.assertRaisesRegex(ValueError, "dialogue"):
+            pipeline._canonicalize_director_h3_shot_plan(changed)
+
+        for field, value in (
+            ("speaker_id", "attacker-voice"),
+            ("source", "attacker_source"),
+            ("spoken_text", "[English] Changed"),
+        ):
+            with self.subTest(field=field):
+                tampered = copy.deepcopy(pristine)
+                for manifest in (
+                    tampered["dialogue_manifest"],
+                    tampered["source_contracts"][0]["dialogue_manifest"],
+                ):
+                    item = next(
+                        entry for entry in manifest
+                        if entry["semantic_occurrence_index"] == 0
+                    )
+                    item[field] = value
+                tampered["semantic_shots"] = copy.deepcopy(
+                    tampered["source_contracts"]
+                )
+                seal_h3_shot_plan(tampered)
+                with self.assertRaisesRegex(
+                    ValueError, "dialogue (?:provenance|association)",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+        coherently_tampered = copy.deepcopy(pristine)
+        for manifest in (
+            coherently_tampered["dialogue_manifest"],
+            coherently_tampered["source_contracts"][0]["dialogue_manifest"],
+        ):
+            item = next(
+                entry for entry in manifest
+                if entry["semantic_occurrence_index"] == 0
+            )
+            item.update({
+                "speaker_id": "attacker-voice",
+                "source": "attacker_source",
+                "spoken_text": "[English] Changed",
+            })
+        contract = coherently_tampered["source_contracts"][0]
+        former_projection = [
+            {
+                field: item[field]
+                for field in (
+                    "semantic_occurrence_index", "exact_block", "spoken_text",
+                    "speaker_id", "source", "source_index",
+                )
+            }
+            for item in sorted(
+                contract["dialogue_manifest"],
+                key=lambda item: item["semantic_occurrence_index"],
+            )
+        ]
+        contract["semantic_dialogue_provenance"] = former_projection
+        contract["semantic_dialogue_provenance_sha256"] = hashlib.sha256(
+            json.dumps(
+                former_projection,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        coherently_tampered["semantic_shots"] = copy.deepcopy(
+            coherently_tampered["source_contracts"]
+        )
+        seal_h3_shot_plan(coherently_tampered)
+        with self.assertRaisesRegex(ValueError, "dialogue provenance"):
+            pipeline._canonicalize_director_h3_shot_plan(coherently_tampered)
+
+        for obsolete in (
+            {"semantic_dialogue_provenance": {"not": "a list"}},
+            {"semantic_dialogue_provenance_sha256": "bogus"},
+        ):
+            with self.subTest(obsolete=next(iter(obsolete))):
+                tampered = copy.deepcopy(pristine)
+                tampered["source_contracts"][0].update(obsolete)
+                tampered["semantic_shots"] = copy.deepcopy(
+                    tampered["source_contracts"]
+                )
+                seal_h3_shot_plan(tampered)
+                with self.assertRaisesRegex(
+                    ValueError, "obsolete dialogue provenance",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+        for field, value in (
+            ("speaker_id", 123),
+            ("source", []),
+            ("spoken_text", None),
+        ):
+            with self.subTest(field=field, invalid_type=True):
+                tampered = copy.deepcopy(pristine)
+                for manifest in (
+                    tampered["dialogue_manifest"],
+                    tampered["source_contracts"][0]["dialogue_manifest"],
+                ):
+                    item = next(
+                        entry for entry in manifest
+                        if entry["semantic_occurrence_index"] == 0
+                    )
+                    item[field] = value
+                tampered["semantic_shots"] = copy.deepcopy(
+                    tampered["source_contracts"]
+                )
+                seal_h3_shot_plan(tampered)
+                with self.assertRaisesRegex(ValueError, "dialogue"):
+                    pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+        for field in ("source_index", "semantic_shot_index", "segment_index"):
+            with self.subTest(field=field, boolean=True):
+                tampered = copy.deepcopy(pristine)
+                for manifest in (
+                    tampered["dialogue_manifest"],
+                    tampered["source_contracts"][0]["dialogue_manifest"],
+                ):
+                    item = next(
+                        entry for entry in manifest
+                        if entry["semantic_occurrence_index"] == 0
+                    )
+                    item[field] = False
+                tampered["semantic_shots"] = copy.deepcopy(
+                    tampered["source_contracts"]
+                )
+                seal_h3_shot_plan(tampered)
+                with self.assertRaisesRegex(ValueError, "dialogue"):
+                    pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+        for ordinals in ((False, True), (0.0, 1.0)):
+            with self.subTest(ordinals=ordinals):
+                tampered = copy.deepcopy(pristine)
+                for manifest in (
+                    tampered["dialogue_manifest"],
+                    tampered["source_contracts"][0]["dialogue_manifest"],
+                ):
+                    for item in manifest:
+                        semantic_index = item["semantic_occurrence_index"]
+                        item["semantic_occurrence_index"] = ordinals[
+                            semantic_index
+                        ]
+                tampered["semantic_shots"] = copy.deepcopy(
+                    tampered["source_contracts"]
+                )
+                seal_h3_shot_plan(tampered)
+                with self.assertRaisesRegex(
+                    ValueError, "dialogue identity",
+                ):
+                    pipeline._canonicalize_director_h3_shot_plan(tampered)
+
+    def test_v2_dialogue_ordinals_do_not_consume_final_blocking_limit(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        dialogue = "<d>[English] Ready.</d>"
+        blocking = f"{dialogue} " + ("state " * 192).strip()
+        self.assertLess(len(blocking), 1200)
+        shot_plan = plan_h3_native_shots(
+            global_prompt=(
+                "[0-4s] The host walks. "
+                f"FINAL BLOCKING: {blocking}"
+            ),
+            clip_frame_counts=[48, 48],
+            fps=24,
+        )
+        final = next(
+            item for item in shot_plan["event_ownership"]
+            if item["kind"] == "final_blocking"
+        )
+        self.assertEqual(final["executable_payload"], blocking)
+        self.assertFalse(final["executable_payload"].endswith("..."))
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
+        )
+
+    def test_structured_canonical_blocking_remains_valid_context_ir(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        prompt = (
+            "subject_definitions: <Subject 1> is an adult archivist.\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0s-20s] shot_name: Archive | "
+            "audiovisual_description: OPENING BLOCKING: the closed cabinet "
+            "remains at frame left. <Subject 1> studies a ledger. "
+            "Final blocking: the archivist closes the ledger. | "
+            "dialogue_and_vocalizations: none\n"
+            "overall_soundscape: Quiet room tone.\n"
+            "non_diegetic_music: N/A"
+        )
+        shot_plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            source_prompts=[prompt],
+            source_indices=[0, 0],
+            structured_shots=[{
+                "spatial_setup": "the closed cabinet remains at frame left",
+                "closing_blocking": "the archivist closes the ledger",
+            }],
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        for prompt_bytes, frames in zip(
+            shot_plan["clip_prompts"], shot_plan["clip_published_frames"],
+        ):
+            self.assertEqual(
+                validate_h3_context_ir_records(
+                    prompt_bytes,
+                    mode="t2va",
+                    duration_seconds=frames / 24,
+                ),
+                [],
+            )
+        self.assertEqual(
+            sum(
+                "closed cabinet remains" in item
+                for item in shot_plan["clip_prompts"]
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                "archivist closes the ledger" in item
+                for item in shot_plan["clip_prompts"]
+            ),
+            1,
+        )
+        self.assertEqual(
+            pipeline._canonicalize_director_h3_shot_plan(shot_plan),
+            shot_plan["clip_prompts"],
         )
 
 

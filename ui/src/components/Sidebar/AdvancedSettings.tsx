@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { X, Save, Trash2, FolderOpen, SlidersHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
-import { installModalFocus } from '../../lib/modalFocus'
+import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import { PostProcessing } from './PostProcessing'
 import { ControlVideoSection } from './ControlVideoSection'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
@@ -81,30 +81,35 @@ function PresetManager() {
   return (
     <div>
       <div className="flex items-center justify-between mb-1.5">
-        <label className="text-[11px] text-text-muted uppercase tracking-wider">Presets</label>
+        <span className="text-[11px] text-text-muted uppercase tracking-wider">Presets</span>
         <button
+          type="button"
           onClick={() => setShowSave(!showSave)}
-          className="text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5"
+          aria-expanded={showSave}
+          aria-controls="advanced-preset-save-form"
+          className="mobile-control-target text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5"
         >
-          <Save size={10} /> Save Current
+          <Save aria-hidden="true" size={10} /> Save Current
         </button>
       </div>
 
       {showSave && (
-        <div className="flex gap-1.5 mb-2">
+        <div id="advanced-preset-save-form" className="flex gap-1.5 mb-2">
           <input
             type="text"
+            aria-label="Preset name"
             value={saveName}
             onChange={e => setSaveName(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && handleSave()}
             placeholder="Preset name..."
-            className="flex-1 bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
+            className="mobile-control-target min-w-0 flex-1 bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue"
             autoFocus
           />
           <button
+            type="button"
             onClick={handleSave}
             disabled={!saveName.trim()}
-            className="px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover disabled:opacity-50"
+            className="mobile-control-target px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
           >
             Save
           </button>
@@ -116,22 +121,25 @@ function PresetManager() {
           {modePresets.map(p => (
             <div key={p.id} className="flex items-center gap-1.5 group">
               <button
+                type="button"
                 onClick={() => loadPresetFn(p)}
-                className="flex-1 text-left px-2 py-1.5 rounded text-xs text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors truncate flex items-center gap-1.5"
+                className="mobile-control-target flex-1 text-left px-2 py-1.5 rounded text-xs text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors truncate flex items-center gap-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                 title={`${p.name}\n${p.activated_loras.length} LoRA(s) - ${p.model_type}`}
               >
                 <FolderOpen size={10} className="shrink-0 text-text-muted" />
                 <span className="truncate">{p.name}</span>
               </button>
               <button
+                type="button"
                 onClick={() => handleDelete(p.id)}
-                className={`p-1 rounded transition-colors shrink-0 ${
+                aria-label={`${confirmDelete === p.id ? 'Confirm delete' : 'Delete'} preset ${p.name}`}
+                className={`mobile-control-target flex shrink-0 items-center justify-center rounded p-1 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
                   confirmDelete === p.id
                     ? 'text-red-400 bg-red-500/20'
-                    : 'text-text-muted opacity-0 group-hover:opacity-100 hover:text-red-400'
+                    : 'text-text-muted opacity-100 md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 focus-visible:opacity-100 hover:text-red-400'
                 }`}
               >
-                <Trash2 size={10} />
+                <Trash2 aria-hidden="true" size={10} />
               </button>
             </div>
           ))}
@@ -299,10 +307,7 @@ export function AdvancedSettings() {
   }, [open, isH3])
 
   // The drawer is portalled outside #root so the shared modal controller can
-  // inert the rest of the app without also disabling the open drawer. Native
-  // form controls are already browser tab stops; explicitly annotating them
-  // lets the shared selector include the drawer's inputs, selects, and textareas
-  // when it determines the first and last stops for focus wrapping.
+  // inert the rest of the app without also disabling the open drawer.
   useEffect(() => {
     if (!open || !panelRef.current || !closeRef.current) return
     const nativeControls = Array.from(panelRef.current.querySelectorAll<HTMLElement>(
@@ -317,6 +322,7 @@ export function AdvancedSettings() {
       restoreFocus: triggerRef.current,
       appRoot: document.getElementById('root'),
       onClose: closeDrawer,
+      priority: 80,
     })
     return () => {
       for (const control of annotatedControls) control.removeAttribute('tabindex')
@@ -334,7 +340,7 @@ export function AdvancedSettings() {
         aria-expanded={open}
         aria-label={open ? 'Close Advanced Settings' : 'Open Advanced Settings'}
         onClick={() => setOpen(current => !current)}
-        className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-colors border ${
+        className={`mobile-control-target flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-colors border focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
           open ? 'border-accent-blue text-accent-blue' : 'border-border text-text-secondary hover:text-text-primary hover:border-border-light'
         }`}
       >
@@ -358,8 +364,8 @@ export function AdvancedSettings() {
               type="button"
               tabIndex={-1}
               aria-label="Close Advanced Settings"
-              className="fixed inset-0 z-50 appearance-none border-0 bg-black/30 p-0"
-              onClick={closeDrawer}
+              className="fixed inset-0 z-[70] appearance-none border-0 bg-black/30 p-0"
+              onClick={() => closeModalIfTop(document, panelRef.current, closeDrawer)}
             />
           )}
           <div
@@ -370,11 +376,10 @@ export function AdvancedSettings() {
             aria-labelledby="advanced-settings-title"
             aria-hidden={!open}
             inert={!open}
-            className={`fixed top-0 h-full bg-bg-secondary border-r border-border z-50 flex flex-col shadow-2xl overflow-hidden transition-transform duration-200
+            className={`fixed top-0 h-[100vh] supports-[height:100dvh]:h-[100dvh] bg-bg-secondary border-r border-border z-[80] flex flex-col shadow-2xl overflow-hidden transition-transform duration-200 pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]
               left-0 w-full md:left-[clamp(460px,24vw,560px)] md:w-[min(380px,calc(100vw-clamp(460px,24vw,560px)))] md:max-w-[90vw] ${
               open ? 'translate-x-0' : '-translate-x-full md:-translate-x-[100vw] pointer-events-none'
             }`}
-            style={{ maxHeight: '100vh' }}
           >
             {/* Header */}
             <div className="px-4 py-3 border-b border-border flex items-center justify-between shrink-0">
@@ -384,9 +389,9 @@ export function AdvancedSettings() {
                 type="button"
                 aria-label="Close Advanced Settings"
                 onClick={closeDrawer}
-                className="p-1 rounded-lg hover:bg-bg-hover text-text-secondary"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:h-auto md:w-auto md:p-1"
               >
-                <X size={16} />
+                <X aria-hidden="true" size={16} />
               </button>
             </div>
 
@@ -410,8 +415,10 @@ export function AdvancedSettings() {
                   </div>
 
                   <div>
-                    <label className="mb-1 block text-[10px] text-text-muted">Attention engine</label>
+                    <span id="h3-attention-engine-label" className="mb-1 block text-[10px] text-text-muted">Attention engine</span>
                     <select
+                      id="h3-attention-engine"
+                      aria-labelledby="h3-attention-engine-label"
                       value={h3Engine}
                       onChange={event => setH3Custom(
                         'h3_attention_engine',
@@ -419,7 +426,7 @@ export function AdvancedSettings() {
                           ? 'sdpa'
                           : event.target.value === 'sage2' ? 'sage2' : 'sol_attn',
                       )}
-                      className="w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs text-text-primary"
+                      className="mobile-control-target w-full rounded border border-border bg-bg-primary px-2 py-1.5 text-xs text-text-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                     >
                       <option value="sdpa">Dense SDPA · exact override</option>
                       <option value="sol_attn" disabled={h3Acceleration?.sol_attn.available === false}>
@@ -517,7 +524,7 @@ export function AdvancedSettings() {
                           setParam('num_inference_steps', 4)
                           setH3Custom('h3_sol_dense_steps', 0)
                         }}
-                        className="rounded border border-accent-blue/50 px-2 py-1 text-[9px] text-accent-blue hover:bg-accent-blue/10"
+                        className="mobile-control-target rounded border border-accent-blue/50 px-2 py-1 text-[9px] text-accent-blue hover:bg-accent-blue/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                       >
                         Apply quick task
                       </button>
@@ -692,16 +699,18 @@ export function AdvancedSettings() {
               {/* Seed */}
               <div>
                   <div className="flex items-center justify-between mb-1.5">
-                    <label className="text-[11px] text-text-muted uppercase tracking-wider">Seed</label>
-                    <button onClick={() => setParam('seed', -1)} className="text-[10px] text-accent-blue hover:text-accent-blue-hover">
+                    <span id="advanced-seed-label" className="text-[11px] text-text-muted uppercase tracking-wider">Seed</span>
+                    <button type="button" onClick={() => setParam('seed', -1)} className="mobile-control-target text-[10px] text-accent-blue hover:text-accent-blue-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
                       Random
                     </button>
                   </div>
                   <input
                     type="number"
+                    id="advanced-seed"
+                    aria-labelledby="advanced-seed-label"
                     value={params.seed}
                     onChange={e => setParam('seed', Number(e.target.value))}
-                    className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
+                    className="mobile-control-target w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue"
                     placeholder="-1 for random"
                   />
               </div>
@@ -902,23 +911,26 @@ export function AdvancedSettings() {
               {showInferenceSteps && (
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
-                    <label className="text-[11px] text-text-muted uppercase tracking-wider">
+                    <span id="advanced-inference-steps-label" className="text-[11px] text-text-muted uppercase tracking-wider">
                       {modelOptions?.lock_inference_steps && !isScailEdit
                         ? 'Stage 1 / Primary Steps (Fixed)'
                         : 'Inference Steps'}
-                    </label>
+                    </span>
                     <input
                       type="number"
+                      id="advanced-inference-steps"
+                      aria-labelledby="advanced-inference-steps-label"
                       min={minimumInferenceSteps}
                       max={50}
                       value={params.num_inference_steps}
                       onChange={e => setParam('num_inference_steps', Math.max(minimumInferenceSteps, Math.min(50, Number(e.target.value) || minimumInferenceSteps)))}
                       disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}
-                      className="w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue disabled:cursor-not-allowed disabled:opacity-60"
+                      className="mobile-control-target w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-60"
                     />
                   </div>
                   <input
                     type="range" min={minimumInferenceSteps} max={50} step={1}
+                    aria-labelledby="advanced-inference-steps-label"
                     value={params.num_inference_steps}
                     onChange={e => setParam('num_inference_steps', Number(e.target.value))}
                     disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}
@@ -943,17 +955,20 @@ export function AdvancedSettings() {
               {showGuidanceScale && (
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
-                    <label className="text-[11px] text-text-muted uppercase tracking-wider">Guidance Scale</label>
+                    <span id="advanced-guidance-scale-label" className="text-[11px] text-text-muted uppercase tracking-wider">Guidance Scale</span>
                     <input
                       type="number"
+                      id="advanced-guidance-scale"
+                      aria-labelledby="advanced-guidance-scale-label"
                       value={params.guidance_scale}
                       onChange={e => setParam('guidance_scale', Number(e.target.value))}
                       step={0.1}
-                      className="w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue"
+                      className="mobile-control-target w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue"
                     />
                   </div>
                   <input
                     type="range" min={0} max={20} step={0.1}
+                    aria-labelledby="advanced-guidance-scale-label"
                     value={params.guidance_scale}
                     onChange={e => setParam('guidance_scale', Number(e.target.value))}
                     className="w-full"
@@ -1070,7 +1085,7 @@ export function AdvancedSettings() {
               {/* MMAudio — video models only */}
               {isVideo && (
                 <div className="space-y-2">
-                  <label className="flex items-center gap-2 cursor-pointer group">
+                  <label className="mobile-control-target flex items-center gap-2 cursor-pointer group">
                     <input
                       type="checkbox"
                       checked={params.MMAudio_setting === 1}
@@ -1129,6 +1144,7 @@ export function AdvancedSettings() {
                 </div>
                 <input
                   type="range" min={1} max={10} step={1}
+                  aria-label="Output Count"
                   value={params.repeat_generation || 1}
                   onChange={e => setParam('repeat_generation', Number(e.target.value))}
                   className="w-full"

@@ -34,9 +34,11 @@ Direct access to every model and every knob:
 
 MiniMax H3 Studio accepts one coherent global prompt. Authored timestamps stay exact;
 otherwise Maestro's deterministic planner maps the prompt onto legal native shots and can
-choose unequal lengths from action and dialogue density. The plan is an execution artifact,
-not a set of per-window prompts written by an LLM. Prompt Enhance remains optional and
-preserves user-supplied timestamp tokens.
+choose unequal lengths from action and dialogue density. After exact physical geometry is
+known, Maestro deterministically compiles sealed segment-local prompts without another LLM
+call. Timed actions that cross a segment boundary receive explicit continuation slices, while
+dialogue and final blocking retain one owner. Prompt Enhance remains optional and preserves
+user-supplied timestamp tokens.
 
 H3 uses server-authored performance profiles: **Draft** is managed four-step Turbo at
 608x352, **Fast** is managed eight-step Turbo at 864x480, **Quality** and **High** are
@@ -149,7 +151,7 @@ Maestro Continuum has its own product release version, separate from the bundled
 **H3 resolutions and long-video planning**
 - Generate and Director keep one coherent global H3 prompt instead of asking an LLM to write a separate prompt for every continuation window.
 - Authored timestamps are authoritative; untimed prompts use a deterministic native-shot planner that can choose unequal shot lengths from action/dialogue density.
-- The resulting native-shot plan is persisted as reproducible execution metadata while the user's global prompt remains the prompt authority.
+- The resulting native-shot plan persists the user's global prompt as immutable provenance and seals deterministic segment-local execution prompts. Boundary-spanning timed actions use explicit continuation slices; dialogue and final blocking remain single-owner.
 
 **Director H3 workflow improvements**
 - Director now uses the same server-authored H3 profiles and deterministic native-shot planner as Studio.

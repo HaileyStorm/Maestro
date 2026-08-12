@@ -542,12 +542,12 @@ class LaunchSecurityContractTests(unittest.TestCase):
         exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
         return namespace
 
-    def test_director_pipeline_start_route_registers_without_runtime_imports(self):
-        node = next(
+    def test_director_pipeline_routes_register_without_runtime_imports(self):
+        nodes = [
             item for item in self.tree.body
             if isinstance(item, ast.AsyncFunctionDef)
-            and item.name == "director_pipeline_start"
-        )
+            and item.name in {"director_preflight", "director_pipeline_start"}
+        ]
 
         class RouteRecorder:
             def __init__(self):
@@ -560,7 +560,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 return register
 
         recorder = RouteRecorder()
-        module = ast.Module(body=[node], type_ignores=[])
+        module = ast.Module(body=nodes, type_ignores=[])
         ast.fix_missing_locations(module)
         namespace = {"api": recorder, "Request": object}
         exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
@@ -569,6 +569,11 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertEqual(
             recorder.routes["/api/v1/director/pipeline/start"].__name__,
             "director_pipeline_start",
+        )
+        self.assertIn("/api/v1/director/preflight", recorder.routes)
+        self.assertEqual(
+            recorder.routes["/api/v1/director/preflight"].__name__,
+            "director_preflight",
         )
 
     def test_ui_bootstraps_one_session_before_mounting_pollers(self):
@@ -584,15 +589,20 @@ class LaunchSecurityContractTests(unittest.TestCase):
 
     def test_director_client_surfaces_route_project_and_media_failures(self):
         client = CLIENT_PATH.read_text(encoding="utf-8")
+        helper_start = client.index("async function throwDirectorRequestFailure")
+        helper_end = client.index("export interface DirectorPreflightRequest", helper_start)
+        helper = client[helper_start:helper_end]
         start = client.index("export async function startPipeline")
         end = client.index("export async function fetchPipelineStatus", start)
         implementation = client[start:end]
 
-        self.assertIn("Director is not available in the running Maestro backend", implementation)
-        self.assertIn("Director access was denied", implementation)
-        self.assertIn("Unlock the selected Director project first", implementation)
-        self.assertIn("Director could not access a selected reference", implementation)
-        self.assertIn("payload.detail", implementation)
+        self.assertIn("Director is not available in the running Maestro backend", helper)
+        self.assertIn("Director access was denied", helper)
+        self.assertIn("Unlock the selected Director project first", helper)
+        self.assertIn("Director could not access a selected reference", helper)
+        self.assertIn("directorStructuredFailure(payload)", helper)
+        self.assertIn("payload.detail", helper)
+        self.assertIn("throwDirectorRequestFailure(res", implementation)
 
     def test_generation_destinations_require_unlocked_project(self):
         ordinary = self._function_source("generate")
@@ -601,6 +611,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
 
         self.assertIn("job_out_dir = _require_project_access(request, workspace)", ordinary)
         self.assertIn("out_dir = _require_project_access(request, workspace)", music)
+        self.assertIn('body["_director_component_errors"] = True', director)
         self.assertIn("_authorize_director_media_inputs(request, body)", director)
         self.assertIn('body["workspace"] = workspace', director)
 
@@ -1295,8 +1306,10 @@ class LaunchSecurityContractTests(unittest.TestCase):
             ROOT / "ui/src/components/MainContent/MainContent.tsx"
         ).read_text(encoding="utf-8")
         self.assertIn("accessContext?.machine_controls === true", queue)
-        self.assertIn("{machineControls && <div", queue)
+        self.assertIn("{machineControls && queue && <div", queue)
         self.assertIn("{machineControls && <>", queue)
+        self.assertIn("info.held ? api.resumeQueueJob", queue)
+        self.assertIn("job.recoveryActions?.includes(action)", queue)
         self.assertIn("job.logEvents", queue)
         self.assertIn("setLogEvents(job.logEvents)", queue)
 
@@ -1369,6 +1382,151 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn('body.get("image_model")', director_auth)
         for implementation in (asset_generate, music_generate, estimate):
             self.assertIn("_require_remote_visible_models", implementation)
+
+    def test_director_remote_model_errors_identify_role_without_catalog_leaks(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        configured = {
+            "configured": True,
+            "enabled_models": [],
+        }
+        failure_codes = frozenset({
+            "director_model_unavailable", "director_model_not_ready",
+            "director_model_terms_required", "director_role_lora_unavailable",
+            "director_reference_unavailable",
+        })
+        failure_components = frozenset({
+            "video_model", "image_creator_model", "continuity_editor_model",
+            "image_creator_lora", "continuity_editor_lora",
+            "character_reference", "location_reference", "starting_image",
+        })
+        namespace = self._function_namespace(
+            (
+                "_remote_visible_model_ids",
+                "_require_remote_visible_models",
+                "_director_component_error",
+                "_director_require_visible_model",
+            ),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "_model_visibility_response": lambda: configured,
+                "_DIRECTOR_FAILURE_CODES": failure_codes,
+                "_DIRECTOR_FAILURE_COMPONENTS": failure_components,
+            },
+        )
+        remote = types.SimpleNamespace(
+            state=types.SimpleNamespace(maestro_remote=True),
+        )
+        local = types.SimpleNamespace(
+            state=types.SimpleNamespace(maestro_remote=False),
+        )
+        selected = (
+            ("minimax_h3_pinkcherry_fl2va", "video_model"),
+            ("krea2_moody_mix_v7_fp8", "image_creator_model"),
+            ("qwen_image_edit_2511", "continuity_editor_model"),
+        )
+        require = namespace["_director_require_visible_model"]
+        configured["enabled_models"] = [model for model, _component in selected]
+        for model, component in selected:
+            require(remote, model, component)
+
+        for omitted_model, omitted_component in selected:
+            with self.subTest(omitted_component=omitted_component):
+                configured["enabled_models"] = [
+                    model for model, _component in selected
+                    if model != omitted_model
+                ]
+                with self.assertRaises(FakeHTTPException) as raised:
+                    require(remote, omitted_model, omitted_component)
+                self.assertEqual(raised.exception.status_code, 404)
+                self.assertEqual(raised.exception.detail, {
+                    "code": "director_model_unavailable",
+                    "component": omitted_component,
+                    "message": "Selected Director model is unavailable in this session.",
+                })
+                require(local, omitted_model, omitted_component)
+
+        configured["enabled_models"] = []
+        public_errors = []
+        for model in (selected[0][0], "unknown-private-model-id"):
+            with self.assertRaises(FakeHTTPException) as raised:
+                require(remote, model, "video_model")
+            public_errors.append(raised.exception.detail)
+        self.assertEqual(public_errors[0], public_errors[1])
+
+    def test_director_reference_404_remains_distinct_from_model_404(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        failure_codes = frozenset({
+            "director_model_unavailable", "director_model_not_ready",
+            "director_model_terms_required", "director_role_lora_unavailable",
+            "director_reference_unavailable",
+        })
+        failure_components = frozenset({
+            "video_model", "image_creator_model", "continuity_editor_model",
+            "image_creator_lora", "continuity_editor_lora",
+            "character_reference", "location_reference", "starting_image",
+        })
+        namespace = self._function_namespace(
+            ("_director_component_error", "_authorize_director_media_inputs"),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "_DIRECTOR_FAILURE_CODES": failure_codes,
+                "_DIRECTOR_FAILURE_COMPONENTS": failure_components,
+                "_get_active_workspace": lambda: "project",
+                "_require_project_access": lambda request, workspace: None,
+                "_director_image_role_wire_mode": lambda body: "roles",
+                "_director_require_visible_model": lambda *args: None,
+                "_require_remote_visible_models": lambda *args: None,
+                "_resolve_authorized_request_media": lambda *args: None,
+            },
+        )
+        for field, value, component in (
+            ("reference_image_path", "opaque-selection", "starting_image"),
+            ("character_ref_paths", ["opaque-character"], "character_reference"),
+            ("location_ref_paths", ["opaque-location"], "location_reference"),
+        ):
+            with self.subTest(component=component):
+                body = {
+                    "video_model": "minimax_h3_pinkcherry_fl2va",
+                    "image_creator_model": "krea2_moody_mix_v7_fp8",
+                    "image_editor_model": "qwen_image_edit_2511",
+                    field: value,
+                }
+                with self.assertRaises(FakeHTTPException) as raised:
+                    namespace["_authorize_director_media_inputs"](
+                        types.SimpleNamespace(state=types.SimpleNamespace()),
+                        body,
+                        component_errors=True,
+                    )
+                self.assertEqual(raised.exception.status_code, 404)
+                self.assertEqual(raised.exception.detail, {
+                    "code": "director_reference_unavailable",
+                    "component": component,
+                    "message": "Selected Director reference is unavailable.",
+                })
+
+        start = self._function_source("director_pipeline_start")
+        resolver = self._function_source("_resolve_director_image_role_request")
+        self.assertIn('body["_director_component_errors"] = True', start)
+        self.assertIn('body.pop("_director_component_errors", None)', start)
+        self.assertIn("_director_component_error_response(error)", start)
+        self.assertIn("if component_errors:", resolver)
+        self.assertIn("_director_validate_workflow_or_raise(body)", resolver)
+        self.assertLess(
+            start.index("_resolve_director_image_role_request(request, body)"),
+            start.index("except HTTPException as error"),
+        )
 
     def test_remote_origin_job_registry_rejects_hidden_child_checkpoints(self):
         class FakeHTTPException(Exception):

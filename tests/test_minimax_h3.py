@@ -351,6 +351,31 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertTrue(model_def["returns_audio"])
         self.assertTrue(model_def["no_negative_prompt"])
         self.assertFalse(model_def["sliding_window"])
+        self.assertEqual(
+            model_def["resolution_preset_order"],
+            ["480p", "540p", "720p", "1080p"],
+        )
+        self.assertEqual(
+            model_def["resolution_presets"]["720p"]["values"]["16:9"],
+            "1280x704",
+        )
+        self.assertEqual(
+            model_def["resolution_presets"]["768p"]["values"]["16:9"],
+            "1344x768",
+        )
+        self.assertNotIn("768p", model_def["resolution_preset_order"])
+        self.assertTrue(model_def["supports_auto_aspect"])
+        self.assertEqual(
+            model_def["auto_resolution_fallbacks"]["auto_1080p"],
+            "1920x1088",
+        )
+        native_values = {value for _label, value in model_def["resolutions"]}
+        for definition in model_def["resolution_presets"].values():
+            self.assertTrue(
+                set(definition["values"].values())
+                - set(model_def["auto_resolution_budgets"])
+                <= native_values,
+            )
         self.assertIn("qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", model_def["text_encoder_URLs"][0])
 
     def test_ref2va_defaults_native_segment_max_without_lengthening_video(self):

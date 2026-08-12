@@ -109,7 +109,7 @@ test("mobile what's-new trigger remains reachable while the sidebar drawer is cl
   assert.ok(sidebarMount > mobileHeaderStart)
 
   const mobileHeader = appSource.slice(mobileHeaderStart, sidebarMount)
-  const remoteMenuGateEnd = mobileHeader.indexOf('</button> : <span className="w-9" aria-hidden="true" />}')
+  const remoteMenuGateEnd = mobileHeader.indexOf('</button> : <span className="h-11 w-11 shrink-0" aria-hidden="true" />}')
   const trigger = mobileHeader.indexOf('<WhatsNewButton compact />')
   const machineSettingsGate = mobileHeader.indexOf('{machineControls ? (')
 
@@ -131,4 +131,42 @@ test('current notes and collapsed archive remain reachable on mobile', () => {
   assert.match(welcomeSource, /aria-label=\{`Continuum \$\{CURRENT_RELEASE\.version\} release highlights`\}/)
   assert.doesNotMatch(dialogSource, /Continuum 0\.2 release highlights/)
   assert.doesNotMatch(welcomeSource, /Continuum 0\.2 release highlights/)
+})
+
+test("what's-new visible controls keep mobile touch targets and compact desktop sizing", () => {
+  const closeButton = dialogSource.match(/<button\s+ref=\{closeRef\}[^]*?<\/button>/)?.[0]
+  assert.ok(closeButton, "the visible what's-new close button must remain present")
+  assert.match(closeButton, /className="[^"]*\bh-11\b[^"]*\bw-11\b[^"]*\bp-0\b[^"]*\bmd:h-auto\b[^"]*\bmd:w-auto\b[^"]*\bmd:p-1\.5\b[^"]*"/)
+
+  const releaseHistorySummary = dialogSource.match(/<summary[^]*?<\/summary>/)?.[0]
+  assert.ok(releaseHistorySummary, 'the release-history disclosure must remain present')
+  assert.match(releaseHistorySummary, /className="[^"]*\bmin-h-11\b[^"]*\bmd:min-h-0\b[^"]*"/)
+  assert.match(releaseHistorySummary, /All release history/)
+
+  const footer = dialogSource.match(/<footer[^]*?<\/footer>/)?.[0]
+  const doneButton = footer?.match(/<button[^]*?>\s*Done\s*<\/button>/)?.[0]
+  assert.ok(doneButton, "the visible what's-new Done button must remain present")
+  assert.match(doneButton, /className="[^"]*\bmin-h-11\b[^"]*\bmd:min-h-0\b[^"]*"/)
+  assert.match(doneButton, /className="[^"]*\bbg-bg-active\b[^"]*\btext-text-primary\b[^"]*\bhover:bg-bg-hover\b[^"]*"/)
+  assert.doesNotMatch(doneButton, /\bbg-accent-blue\b|\btext-white\b/)
+})
+
+test('welcome onboarding uses the shared priority stack and bounded mobile geometry', () => {
+  assert.match(appSource, /\{!remoteProjectRequired && <WelcomeModal \/>\}/)
+  assert.match(welcomeSource, /maestro_welcome_seen_v1/)
+  assert.match(welcomeSource, /createPortal\(/)
+  assert.match(welcomeSource, /document\.body/)
+  assert.match(welcomeSource, /installModalFocus\(\{/)
+  assert.match(welcomeSource, /priority: 120/)
+  assert.match(welcomeSource, /restoreFocus,/)
+  assert.match(welcomeSource, /closeModalIfTop\(document, dialogRef\.current, dismiss\)/)
+  assert.doesNotMatch(welcomeSource, /document\.addEventListener\('keydown'/)
+  assert.match(welcomeSource, /h-\[100vh\][^"\n]*supports-\[height:100dvh\]:h-\[100dvh\]/)
+  assert.match(welcomeSource, /max-h-full/)
+  assert.match(welcomeSource, /max-h-\[55%\][^"\n]*overflow-y-auto/)
+  for (const edge of ['top', 'right', 'bottom', 'left']) {
+    assert.match(welcomeSource, new RegExp(`safe-area-inset-${edge}`))
+  }
+  assert.match(welcomeSource, /min-h-11 min-w-11/)
+  assert.match(welcomeSource, /flex-1 min-h-0 overflow-y-auto/)
 })

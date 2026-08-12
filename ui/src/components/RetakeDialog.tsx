@@ -1,11 +1,26 @@
-import { useState, useEffect } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
 import { useStore } from '../stores/useStore'
 import { VideoTimelineSelector } from './shared/VideoTimelineSelector'
 import * as api from '../api/client'
 import { modelDisplayName } from '../lib/modelDisplay'
+import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
 
 export function RetakeDialog() {
+  const titleId = useId()
+  const descriptionId = useId()
+  const promptId = useId()
+  const negativePromptId = useId()
+  const seedId = useId()
+  const stepsId = useId()
+  const guidanceId = useId()
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const closeRef = useRef<HTMLButtonElement>(null)
+  const restoreFocusRef = useRef<HTMLButtonElement | null>(null)
+  const submittingRef = useRef(false)
+  const requestEpochRef = useRef(0)
+  const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const retakeOpen = useStore(s => s.retakeDialogOpen)
   const retakeFile = useStore(s => s.retakeSourceFile)
   const closeRetake = useStore(s => s.closeRetakeDialog)
@@ -33,6 +48,22 @@ export function RetakeDialog() {
   const activatedLoras = useStore(s => s.params.activated_loras) as string[] || []
   const lorasMultipliers = useStore(s => s.params.loras_multipliers) as string || ''
 
+  const closeDialog = useCallback(() => {
+    requestEpochRef.current += 1
+    submittingRef.current = false
+    if (successTimerRef.current !== null) {
+      clearTimeout(successTimerRef.current)
+      successTimerRef.current = null
+    }
+    setSubmitting(false)
+    setError(null)
+    setSuccess(null)
+    closeRetake()
+  }, [closeRetake])
+  const requestClose = useCallback(() => {
+    if (!submittingRef.current) closeDialog()
+  }, [closeDialog])
+
   // Get video duration on open
   useEffect(() => {
     if (!retakeFile) return
@@ -46,11 +77,46 @@ export function RetakeDialog() {
     }
   }, [retakeFile])
 
+  useEffect(() => {
+    if (!retakeOpen || !retakeFile || !dialogRef.current || !closeRef.current) return
+    restoreFocusRef.current = document.activeElement instanceof HTMLButtonElement
+      ? document.activeElement
+      : null
+    return installModalFocus({
+      document,
+      dialog: dialogRef.current,
+      initialFocus: closeRef.current,
+      restoreFocus: restoreFocusRef.current,
+      appRoot: document.getElementById('root'),
+      onClose: requestClose,
+      priority: 100,
+    })
+  }, [requestClose, retakeFile, retakeOpen])
+
+  useEffect(() => () => {
+    requestEpochRef.current += 1
+    submittingRef.current = false
+    if (successTimerRef.current !== null) clearTimeout(successTimerRef.current)
+    successTimerRef.current = null
+  }, [])
+
+  useEffect(() => {
+    if (retakeOpen) return
+    requestEpochRef.current += 1
+    submittingRef.current = false
+    if (successTimerRef.current !== null) clearTimeout(successTimerRef.current)
+    successTimerRef.current = null
+    setSubmitting(false)
+  }, [retakeOpen])
+
   if (!retakeOpen || !retakeFile) return null
 
   const videoUrl = api.getFileUrl(retakeFile)
 
   const handleSubmit = async () => {
+    if (!prompt || submittingRef.current) return
+    const requestEpoch = requestEpochRef.current
+    submittingRef.current = true
     setSubmitting(true)
     setError(null)
     setSuccess(null)
@@ -71,34 +137,69 @@ export function RetakeDialog() {
         loras_multipliers: lorasMultipliers,
         workspace: activeWorkspace,
       })
+      if (requestEpochRef.current !== requestEpoch) return
       setSuccess(`Retake queued: ${result.retake_frames}`)
       loadOutputs()
-      setTimeout(() => closeRetake(), 1500)
+      successTimerRef.current = setTimeout(() => {
+        successTimerRef.current = null
+        if (requestEpochRef.current === requestEpoch) closeDialog()
+      }, 1500)
     } catch (e) {
-      setError((e as Error).message)
+      if (requestEpochRef.current === requestEpoch) setError((e as Error).message)
     } finally {
-      setSubmitting(false)
+      if (requestEpochRef.current === requestEpoch) {
+        submittingRef.current = false
+        setSubmitting(false)
+      }
     }
   }
 
-  return (
-    <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={closeRetake}>
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center"
+      style={{
+        paddingTop: 'max(0.75rem, env(safe-area-inset-top))',
+        paddingRight: 'max(0.75rem, env(safe-area-inset-right))',
+        paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(0.75rem, env(safe-area-inset-left))',
+      }}
+    >
+      <button
+        type="button"
+        tabIndex={-1}
+        disabled={submitting}
+        aria-label="Close Retake dialog"
+        className="absolute inset-0 appearance-none border-0 bg-black/60 p-0"
+        onClick={() => closeModalIfTop(document, dialogRef.current, requestClose)}
+      />
       <div
-        className="bg-bg-secondary border border-border rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        className="relative flex min-h-0 max-h-[calc(100vh-1.5rem)] w-full max-w-lg flex-col overflow-hidden rounded-xl border border-border bg-bg-secondary shadow-2xl supports-[height:100dvh]:max-h-[calc(100dvh-1.5rem)] sm:max-h-[92vh]"
         onClick={e => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-          <div>
-            <h2 className="text-sm font-semibold text-text-primary">Retake</h2>
-            <p className="text-[10px] text-text-muted">Select the part you want to fix, then describe the change</p>
+        <div className="flex shrink-0 items-start justify-between gap-3 border-b border-border px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <h2 id={titleId} className="text-sm font-semibold text-text-primary">Retake</h2>
+            <p id={descriptionId} className="text-[10px] text-text-muted">Select the part you want to fix, then describe the change</p>
           </div>
-          <button onClick={closeRetake} className="p-1 rounded hover:bg-bg-hover text-text-muted hover:text-text-primary transition-colors">
-            <X size={16} />
+          <button
+            ref={closeRef}
+            type="button"
+            disabled={submitting}
+            onClick={() => closeModalIfTop(document, dialogRef.current, requestClose)}
+            aria-label="Close Retake dialog"
+            className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-lg text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0 md:p-1.5"
+          >
+            <X size={16} aria-hidden="true" />
           </button>
         </div>
 
-        <div className="p-4 space-y-4">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4 [-webkit-overflow-scrolling:touch]">
           {/* Timeline selector */}
           <VideoTimelineSelector
             videoUrl={videoUrl}
@@ -111,19 +212,19 @@ export function RetakeDialog() {
 
           {/* Prompt */}
           <div>
-            <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
+            <label htmlFor={promptId} className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
               What should happen in this section?
             </label>
-            <textarea value={prompt}
+            <textarea id={promptId} value={prompt}
               onChange={e => setPrompt(e.target.value)}
               placeholder="Describe the new content for the selected time range..."
               rows={2}
-              className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue"
+              className="min-h-11 w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-blue focus:outline-none"
               style={{ resize: 'vertical', minHeight: 48 }} />
           </div>
 
           {/* Regenerate Audio */}
-          <label className="flex items-center gap-2 cursor-pointer">
+          <label className="flex min-h-11 cursor-pointer items-center gap-2 md:min-h-0">
             <input type="checkbox" checked={regenerateAudio}
               onChange={e => setRegenerateAudio(e.target.checked)}
               className="w-3.5 h-3.5 rounded border-border accent-accent-blue" />
@@ -135,34 +236,36 @@ export function RetakeDialog() {
 
           {/* Advanced toggle */}
           <button onClick={() => setShowAdvanced(!showAdvanced)}
-            className="text-[10px] text-text-muted hover:text-text-primary transition-colors">
+            type="button"
+            aria-expanded={showAdvanced}
+            className="min-h-11 text-[10px] text-text-muted transition-colors hover:text-text-primary md:min-h-0">
             {showAdvanced ? '▾' : '▸'} Advanced
           </button>
           {showAdvanced && (
             <div className="space-y-2 pl-2 border-l border-border/50">
               <div>
-                <label className="text-[10px] text-text-muted uppercase tracking-wider mb-1 block">Negative Prompt</label>
-                <input type="text" value={negPrompt}
+                <label htmlFor={negativePromptId} className="text-[10px] text-text-muted uppercase tracking-wider mb-1 block">Negative Prompt</label>
+                <input id={negativePromptId} type="text" value={negPrompt}
                   onChange={e => setNegPrompt(e.target.value)}
                   placeholder="What to avoid..."
-                  className="w-full bg-bg-tertiary border border-border rounded px-2.5 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue" />
+                  className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-2.5 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:border-accent-blue focus:outline-none md:min-h-0" />
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <div>
-                  <label className="text-[9px] text-text-muted block mb-0.5">Seed</label>
-                  <input type="number" value={seed} onChange={e => setSeed(parseInt(e.target.value) || -1)}
-                    className="w-full bg-bg-tertiary border border-border rounded px-1.5 py-1 text-[10px] text-text-primary focus:outline-none focus:border-accent-blue" />
+                  <label htmlFor={seedId} className="text-[9px] text-text-muted block mb-0.5">Seed</label>
+                  <input id={seedId} type="number" value={seed} onChange={e => setSeed(parseInt(e.target.value) || -1)}
+                    className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0" />
                 </div>
                 <div>
-                  <label className="text-[9px] text-text-muted block mb-0.5">Steps</label>
-                  <input type="number" min={1} max={50} value={steps} onChange={e => setSteps(parseInt(e.target.value) || 8)}
-                    className="w-full bg-bg-tertiary border border-border rounded px-1.5 py-1 text-[10px] text-text-primary focus:outline-none focus:border-accent-blue" />
+                  <label htmlFor={stepsId} className="text-[9px] text-text-muted block mb-0.5">Steps</label>
+                  <input id={stepsId} type="number" min={1} max={50} value={steps} onChange={e => setSteps(parseInt(e.target.value) || 8)}
+                    className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0" />
                 </div>
                 <div>
-                  <label className="text-[9px] text-text-muted block mb-0.5">Guidance</label>
-                  <input type="number" min={0} max={20} step={0.1} value={guidance}
+                  <label htmlFor={guidanceId} className="text-[9px] text-text-muted block mb-0.5">Guidance</label>
+                  <input id={guidanceId} type="number" min={0} max={20} step={0.1} value={guidance}
                     onChange={e => setGuidance(parseFloat(e.target.value) || 1.0)}
-                    className="w-full bg-bg-tertiary border border-border rounded px-1.5 py-1 text-[10px] text-text-primary focus:outline-none focus:border-accent-blue" />
+                    className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0" />
                 </div>
               </div>
             </div>
@@ -175,16 +278,18 @@ export function RetakeDialog() {
           </p>
 
           {/* Error/Success */}
-          {error && <div className="text-[10px] text-red-400 bg-red-500/10 border border-red-500/20 rounded px-2 py-1.5">{error}</div>}
-          {success && <div className="text-[10px] text-indicator-success bg-green-500/10 border border-green-500/20 rounded px-2 py-1.5">{success}</div>}
+          {error && <div role="alert" className="text-[10px] text-red-400 bg-red-500/10 border border-red-500/20 rounded px-2 py-1.5">{error}</div>}
+          {success && <div role="status" className="text-[10px] text-indicator-success bg-green-500/10 border border-green-500/20 rounded px-2 py-1.5">{success}</div>}
 
           {/* Submit */}
           <button onClick={handleSubmit} disabled={submitting || !prompt}
-            className="w-full py-2.5 rounded-lg text-sm font-medium bg-accent-blue text-white hover:bg-accent-blue/80 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+            type="button"
+            className="min-h-11 w-full rounded-lg bg-accent-blue py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-blue/80 disabled:cursor-not-allowed disabled:opacity-40">
             {submitting ? 'Submitting...' : 'Retake'}
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }

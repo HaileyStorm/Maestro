@@ -29,9 +29,9 @@ export function GenerationPrivacyControls() {
 
   return (
     <div className="px-4 py-2 border-b border-border bg-bg-tertiary/50">
-      <div className="grid grid-cols-2 gap-2">
+      <div role="group" aria-label="Generation output privacy" className="grid grid-cols-2 gap-2">
         <label
-          className={`flex cursor-pointer items-center justify-center gap-1.5 rounded-lg border px-2 py-1.5 text-[11px] transition-colors ${
+          className={`mobile-control-target flex min-w-0 cursor-pointer flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5 rounded-lg border px-2 py-1.5 text-center text-[11px] leading-tight transition-colors focus-within:outline-none focus-within:ring-2 focus-within:ring-accent-blue ${
             explicitOutput
               ? 'border-red-500/50 bg-red-500/15 text-red-300'
               : 'border-border bg-bg-secondary text-text-secondary hover:text-text-primary'
@@ -44,10 +44,11 @@ export function GenerationPrivacyControls() {
             onChange={event => setExplicitOutput(event.target.checked)}
             className="sr-only"
           />
-          <Flame size={12} /> Explicit {explicitOutput ? 'On' : 'Off'}
+          <Flame aria-hidden="true" className="shrink-0" size={12} />
+          <span>Explicit {explicitOutput ? 'On' : 'Off'}</span>
         </label>
         <label
-          className={`flex cursor-pointer items-center justify-center gap-1.5 rounded-lg border px-2 py-1.5 text-[11px] transition-colors ${
+          className={`mobile-control-target flex min-w-0 cursor-pointer flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5 rounded-lg border px-2 py-1.5 text-center text-[11px] leading-tight transition-colors focus-within:outline-none focus-within:ring-2 focus-within:ring-accent-blue ${
             privateOutput
               ? 'border-violet-500/50 bg-violet-500/15 text-violet-200'
               : 'border-border bg-bg-secondary text-text-secondary hover:text-text-primary'
@@ -60,7 +61,8 @@ export function GenerationPrivacyControls() {
             onChange={event => setPrivateOutput(event.target.checked)}
             className="sr-only"
           />
-          <EyeOff size={12} /> Private {privateOutput ? 'On' : 'Off'}
+          <EyeOff aria-hidden="true" className="shrink-0" size={12} />
+          <span>Private {privateOutput ? 'On' : 'Off'}</span>
         </label>
       </div>
       {explicitOutput && privateOutput && (
