@@ -516,6 +516,28 @@ const responsibleUse = {
   },
 }
 
+const recordedAllowance = {
+  state: 'recorded_not_enforced',
+  enforcement_enabled: false,
+  unit: 'compute_seconds',
+  as_of: '2026-08-11T09:00:00Z',
+  effective_allowance: 460,
+  sources: [
+    {
+      source: 'free', granted_allowance: 10, effective_allowance: 10,
+      expires_at: null, status: 'active', refund_state: 'not_applicable',
+    },
+    {
+      source: 'one_time_support', granted_allowance: 300, effective_allowance: 100,
+      expires_at: '2026-08-11T10:00:00Z', status: 'active', refund_state: 'partial',
+    },
+    {
+      source: 'recurring_support', granted_allowance: 350, effective_allowance: 350,
+      expires_at: '2026-08-11T09:30:00Z', status: 'active', refund_state: 'none',
+    },
+  ],
+}
+
 test('Support wrappers use exact no-store envelopes and discard private contribution fields', async () => {
   const calls = []
   await withFetchMock(async (url, init = {}) => {
@@ -528,6 +550,20 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
           event_count: 2, one_time_tier: 'backer', recurring_tier: null,
           active_recurring_count: 0, currency_totals_minor: { USD: 2500 },
           subject_key: 'private-subject', audit: [{ amount_minor: 2500 }],
+          recorded_allowance: {
+            ...recordedAllowance,
+            account_id: 'private-allowance-account',
+            amount_minor: 2500,
+            currency_totals_minor: { USD: 2500 },
+            audit: [{ provider: 'private-allowance-provider' }],
+            sources: recordedAllowance.sources.map((source, index) => ({
+              ...source,
+              source_event_id: `private-source-event-${index}`,
+              provider: 'private-source-provider',
+              amount_minor: 2500,
+              account_id: 'private-source-account',
+            })),
+          },
         },
         benefits: {
           state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
@@ -542,7 +578,14 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     }
     if (String(url).includes('/support/admin/accounts/')) return jsonResponse({
       account_support: {
-        recorded: { event_count: 1, active_recurring_count: 1, amount_minor: 9999 },
+        recorded: {
+          event_count: 1, active_recurring_count: 1, amount_minor: 9999,
+          recorded_allowance: {
+            ...recordedAllowance,
+            effective_allowance: 350,
+            sources: [recordedAllowance.sources[2]],
+          },
+        },
         benefits: {
           state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
           effective_benefits: [], recorded_eligibility: ['periodic_credit_eligibility'],
@@ -564,8 +607,14 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     assert.equal(notice.notice.version, 1)
     assert.equal(accepted.status.accepted, true)
     assert.equal(admin.account.event_count, 1)
+    assert.deepEqual(self.account.recorded_allowance, recordedAllowance)
+    assert.deepEqual(admin.account.recorded_allowance, {
+      ...recordedAllowance,
+      effective_allowance: 350,
+      sources: [recordedAllowance.sources[2]],
+    })
     const safe = JSON.stringify({ self, admin })
-    assert.doesNotMatch(safe, /currency_totals_minor|amount_minor|subject_key|private@example|provider_secret/)
+    assert.doesNotMatch(safe, /currency_totals_minor|amount_minor|subject_key|source_event_id|account_id|"audit"|private@example|provider_secret|private-allowance|private-source/)
   })
 
   assert.deepEqual(calls.map(call => [call.init.method || 'GET', call.url]), [
@@ -585,6 +634,63 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     content_sha256: 'd'.repeat(64),
   })
   assert.equal(calls[0].init.body, undefined)
+})
+
+test('Support account mapping preserves legacy responses without a recorded allowance', async () => {
+  await withFetchMock(async () => jsonResponse({
+    ...publicSupport,
+    account_support: {
+      recorded: { event_count: 1, active_recurring_count: 0 },
+      benefits: {
+        state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
+        effective_benefits: [], recorded_eligibility: [],
+      },
+    },
+    responsible_use: responsibleUse,
+  }), async () => {
+    const self = await fetchSupportSelf()
+    assert.equal(Object.hasOwn(self.account, 'recorded_allowance'), false)
+  })
+})
+
+test('Support allowance mapping matches the backend unit boundary and rejects incomplete breakdowns', async () => {
+  const unitAtBackendLimit = `a${'b'.repeat(63)}`
+  const allowances = [
+    { ...recordedAllowance, unit: unitAtBackendLimit },
+    { ...recordedAllowance, effective_allowance: 999 },
+    {
+      ...recordedAllowance,
+      sources: [
+        ...recordedAllowance.sources,
+        {
+          source: 'future_private_source', granted_allowance: 0, effective_allowance: 0,
+          expires_at: null, status: 'active', refund_state: 'none',
+        },
+      ],
+    },
+  ]
+  await withFetchMock(async () => jsonResponse({
+    ...publicSupport,
+    account_support: {
+      recorded: {
+        event_count: 1,
+        active_recurring_count: 0,
+        recorded_allowance: allowances.shift(),
+      },
+      benefits: {
+        state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
+        effective_benefits: [], recorded_eligibility: [],
+      },
+    },
+    responsible_use: responsibleUse,
+  }), async () => {
+    const boundary = await fetchSupportSelf()
+    assert.equal(boundary.account.recorded_allowance.unit, unitAtBackendLimit)
+    const mismatched = await fetchSupportSelf()
+    assert.equal(Object.hasOwn(mismatched.account, 'recorded_allowance'), false)
+    const incomplete = await fetchSupportSelf()
+    assert.equal(Object.hasOwn(incomplete.account, 'recorded_allowance'), false)
+  })
 })
 
 function asDataModule(source) {
@@ -639,6 +745,150 @@ async function loadAccountButton() {
   })
   return import(asDataModule(result.outputFiles[0].text))
 }
+
+async function loadSupportPanel() {
+  const result = await build({
+    entryPoints: [supportPanelUrl.pathname],
+    bundle: true,
+    format: 'esm',
+    jsx: 'automatic',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+    plugins: [{
+      name: 'support-panel-runtime',
+      setup(bundle) {
+        bundle.onResolve({ filter: /^react$/ }, () => ({ path: 'react', namespace: 'support-panel' }))
+        bundle.onResolve({ filter: /^react\/jsx-runtime$/ }, () => ({ path: 'jsx-runtime', namespace: 'support-panel' }))
+        bundle.onResolve({ filter: /^lucide-react$/ }, () => ({ path: 'lucide', namespace: 'support-panel' }))
+        bundle.onResolve({ filter: /api\/client$/ }, () => ({ path: 'api', namespace: 'support-panel' }))
+        bundle.onResolve({ filter: /stores\/useStore$/ }, () => ({ path: 'store', namespace: 'support-panel' }))
+        bundle.onLoad({ filter: /.*/, namespace: 'support-panel' }, args => {
+          if (args.path === 'react') return { contents: `
+            export const useEffect = () => {}
+            export const useMemo = value => value()
+            export const useRef = value => ({ current: value })
+            export const useState = value => [value, () => {}]
+          ` }
+          if (args.path === 'jsx-runtime') return { contents: `
+            export const Fragment = Symbol.for('fragment')
+            export const jsx = (type, props, key) => ({ type, key, props: props || {} })
+            export const jsxs = jsx
+          ` }
+          if (args.path === 'lucide') return { contents: `
+            export const Check='Check', ExternalLink='ExternalLink', HeartHandshake='HeartHandshake', Loader2='Loader2', ShieldCheck='ShieldCheck'
+          ` }
+          if (args.path === 'api') return { contents: 'export class AccountApiError extends Error {}' }
+          if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__supportStore)' }
+          return null
+        })
+      },
+    }],
+  })
+  return import(`${asDataModule(result.outputFiles[0].text)}#support-panel`)
+}
+
+function expandElement(value) {
+  if (Array.isArray(value)) return value.map(expandElement)
+  if (value === null || value === undefined || typeof value !== 'object') return value
+  if (typeof value.type === 'function') return expandElement(value.type(value.props || {}))
+  return {
+    ...value,
+    props: {
+      ...(value.props || {}),
+      children: expandElement(value.props?.children),
+    },
+  }
+}
+
+function elementText(value) {
+  if (Array.isArray(value)) return value.map(elementText).join('')
+  if (value === null || value === undefined || typeof value === 'boolean') return ''
+  if (typeof value !== 'object') return String(value)
+  return elementText(value.props?.children)
+}
+
+function findElements(value, predicate, found = []) {
+  if (Array.isArray(value)) {
+    for (const child of value) findElements(child, predicate, found)
+  } else if (value && typeof value === 'object') {
+    if (predicate(value)) found.push(value)
+    findElements(value.props?.children, predicate, found)
+  }
+  return found
+}
+
+test('Support panel renders a semantic mobile-safe recorded allowance without overstating enforcement', async () => {
+  const { SupportPanel } = await loadSupportPanel()
+  const account = {
+    event_count: 2, one_time_tier: 'backer', recurring_tier: 'member', active_recurring_count: 1,
+    recorded_allowance: recordedAllowance,
+    benefits: {
+      state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
+      effective_benefits: [], recorded_eligibility: [],
+    },
+  }
+  globalThis.__supportStore = {
+    accountContext: {
+      enabled: true, authenticated: true, account: { id: 'current-account' },
+      capabilities: ['account.self'], reauthenticated: false,
+    },
+    accountUsers: [], supportCatalog: publicSupport, supportCatalogLoading: false,
+    supportCatalogUnavailable: false,
+    supportSelf: { public: publicSupport, account, responsible_use: responsibleUse },
+    responsibleUse: null, supportAdmin: null, supportAdminAccountId: null,
+    supportDetailsLoading: false,
+    loadSupportCatalog: async () => null, loadSupportSelf: async () => null,
+    loadResponsibleUse: async () => null, acceptResponsibleUse: async () => null,
+    loadSupportAdmin: async () => null, clearSupportAdmin: () => {},
+  }
+
+  const tree = expandElement(SupportPanel())
+  const text = elementText(tree)
+  assert.match(text, /Current recorded allowance/)
+  assert.match(text, /460 compute seconds/)
+  assert.match(text, /Recorded only as of/)
+  assert.match(text, /not enforced and does not currently change generation, queueing, or retries/)
+  assert.match(text, /Free allowance/)
+  assert.match(text, /One-time support/)
+  assert.match(text, /Recurring support/)
+  assert.match(text, /Partial refund recorded/)
+  assert.doesNotMatch(text, /spendable|remaining|private-source|source-event|provider/i)
+
+  const allowanceSection = findElements(tree, node => node.props?.['aria-label'] === 'Recorded compute allowance')
+  assert.equal(allowanceSection.length, 1)
+  assert.match(allowanceSection[0].props.className, /\bmin-w-0\b/)
+  const sourceList = findElements(tree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Recorded allowance sources')
+  assert.equal(sourceList.length, 1)
+  assert.match(sourceList[0].props.className, /\bgrid-cols-1\b/)
+  assert.match(sourceList[0].props.className, /\bmin-w-0\b/)
+  assert.equal(findElements(sourceList[0], node => node.type === 'li').length, 3)
+
+  globalThis.__supportStore.supportSelf = {
+    public: publicSupport,
+    account: {
+      ...account,
+      recorded_allowance: {
+        ...recordedAllowance,
+        sources: Array.from({ length: 25 }, () => recordedAllowance.sources[0]),
+      },
+    },
+    responsible_use: responsibleUse,
+  }
+  const boundedTree = expandElement(SupportPanel())
+  const boundedList = findElements(boundedTree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Recorded allowance sources')[0]
+  assert.equal(findElements(boundedList, node => node.type === 'li').length, 20)
+  assert.match(elementText(boundedTree), /5 additional recorded sources are not shown in this compact view/)
+
+  globalThis.__supportStore.supportSelf = {
+    public: publicSupport,
+    account: { ...account, recorded_allowance: undefined },
+    responsible_use: responsibleUse,
+  }
+  const legacyText = elementText(expandElement(SupportPanel()))
+  assert.doesNotMatch(legacyText, /Current recorded allowance|Recorded allowance sources/)
+})
 
 test('Support trigger stays discoverable with accounts off and describes optional account state truthfully', async () => {
   const { AccountSupportButton } = await loadAccountButton()
@@ -737,9 +987,22 @@ test('Support store loads public catalog with accounts off and gates self and ad
   const pendingSelf = []
   const pendingAcceptance = []
   const pendingAdmins = []
+  const allowancePayload = effectiveAllowance => ({
+    ...recordedAllowance,
+    effective_allowance: effectiveAllowance,
+    sources: [{
+      ...recordedAllowance.sources[0],
+      granted_allowance: effectiveAllowance,
+      effective_allowance: effectiveAllowance,
+    }],
+  })
   const adminPayload = eventCount => ({
     account_support: {
-      recorded: { event_count: eventCount, active_recurring_count: 0 },
+      recorded: {
+        event_count: eventCount,
+        active_recurring_count: 0,
+        recorded_allowance: allowancePayload(eventCount * 100),
+      },
       benefits: {
         state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
         effective_benefits: [], recorded_eligibility: [],
@@ -751,7 +1014,11 @@ test('Support store loads public catalog with accounts off and gates self and ad
   const selfPayload = (eventCount, responsible = responsibleUse) => ({
     ...publicSupport,
     account_support: {
-      recorded: { event_count: eventCount, active_recurring_count: 0 },
+      recorded: {
+        event_count: eventCount,
+        active_recurring_count: 0,
+        recorded_allowance: allowancePayload(eventCount * 100),
+      },
       benefits: {
         state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
         effective_benefits: [], recorded_eligibility: [],
@@ -833,6 +1100,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
   }))
   await useStore.getState().loadSupportAdmin(account.id)
   assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account')
+  assert.equal(useStore.getState().supportAdmin.account.recorded_allowance.effective_allowance, 100)
   await assert.rejects(useStore.getState().loadSupportAdmin('not-returned'), /server-returned account/)
   assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account')
 
@@ -862,6 +1130,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
   await firstSelection
   assert.equal(useStore.getState().supportAdminAccountId, secondAccount.id)
   assert.equal(useStore.getState().supportAdmin.account.event_count, 2)
+  assert.equal(useStore.getState().supportAdmin.account.recorded_allowance.effective_allowance, 200)
 
   nextAccountContext = {
     enabled: true, authenticated: true, account: secondAccount,
@@ -889,6 +1158,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
   pendingSelf[0].resolve(jsonResponse(selfPayload(1)))
   await firstSelf
   assert.equal(useStore.getState().supportSelf.account.event_count, 2)
+  assert.equal(useStore.getState().supportSelf.account.recorded_allowance.effective_allowance, 200)
 
   deferAcceptance = true
   useStore.setState({
@@ -952,7 +1222,7 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(supportSource, /already spent hundreds on Codex/)
   assert.match(supportSource, /When support is sufficient, I will host Maestro \/ Continuum with more compute/)
   assert.match(supportSource, /not enforced yet/)
-  assert.doesNotMatch(supportSource, /localStorage|sessionStorage|console\.|currency_totals_minor|amount_minor|subject_key|source_event_key|@|\$600|SLA|tax|end-to-end|passkey/i)
+  assert.doesNotMatch(supportSource, /localStorage|sessionStorage|console\.|currency_totals_minor|amount_minor|subject_key|source_event_(?:id|key)|account_id|@|\$600|SLA|tax|end-to-end|passkey/i)
   assert.match(appSource, /context\.accounts\?\.enabled === true/)
   assert.match(appSource, /AccountSupportDrawer/)
 })

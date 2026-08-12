@@ -5,6 +5,7 @@ import { useStore } from '../stores/useStore'
 import type { H3SegmentBoundary, H3SegmentPlan, H3SegmentPlanItem } from '../types'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
 import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
+import { H3DurationPlanBar } from './H3DurationPlanBar'
 
 function compactTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return 'calculating…'
@@ -16,6 +17,8 @@ function compactTime(seconds: number): string {
 
 type H3Model = H3SegmentPlanItem['model_type']
 type BoundaryType = H3SegmentBoundary['type']
+type DurationSnapMode = 'manual' | 'nearest' | 'down'
+type DurationRedistribution = 'none' | 'next' | 'future'
 type H3CheckpointOption = {
   model_type: H3Model
   name: string
@@ -94,6 +97,9 @@ export function H3GenerationPlanDialog() {
   const [operationRef] = useState<{ current: boolean }>(() => ({ current: false }))
   const [modalIdentityRef] = useState<{ current: string | null }>(() => ({ current: null }))
   const [reviewLoadingRef] = useState<{ current: boolean }>(() => ({ current: false }))
+  const [durationSnapMode, setDurationSnapMode] = useState<DurationSnapMode>('manual')
+  const [durationFrames, setDurationFrames] = useState<number[]>([])
+  const [durationRedistribution, setDurationRedistribution] = useState<DurationRedistribution>('none')
   const ref2vaTermsAccepted = hostTerms?.minimax_h3_ref2va.accepted === true
 
   const requestClose = useMemo(() => () => {
@@ -115,6 +121,9 @@ export function H3GenerationPlanDialog() {
         setModels([])
         setBoundaries([])
         setEditorJobId(null)
+        setDurationSnapMode('manual')
+        setDurationFrames([])
+        setDurationRedistribution('none')
       }, 0)
       return () => window.clearTimeout(reset)
     }
@@ -122,6 +131,9 @@ export function H3GenerationPlanDialog() {
       setModels(plan.segments.map(segment => segment.model_type))
       setBoundaries(plan.segments.slice(1).map(segment => segment.boundary_from_previous?.type || 'continuous'))
       setEditorJobId(planJobId)
+      setDurationSnapMode('manual')
+      setDurationFrames(plan.duration_plan?.segments.map(segment => segment.published_frames) ?? [])
+      setDurationRedistribution(plan.duration_plan?.redistribution_mode ?? 'none')
     }, 0)
     return () => window.clearTimeout(timer)
   }, [plan, planJobId])
@@ -174,6 +186,27 @@ export function H3GenerationPlanDialog() {
     && models.length === plan.segments.length
     && boundaries.length === Math.max(0, plan.segments.length - 1),
   )
+  const durationPlan = plan?.duration_plan
+  const selectedSnapCandidate = durationSnapMode === 'manual'
+    ? null
+    : durationPlan?.snap_candidates[durationSnapMode]
+  const selectedSnapAvailable = durationSnapMode === 'manual' || Boolean(
+    selectedSnapCandidate
+    && selectedSnapCandidate.applied
+    && selectedSnapCandidate.confidence === 'high'
+    && selectedSnapCandidate.candidate_published_frames != null,
+  )
+  const durationEditsReady = !durationPlan || (
+    durationFrames.length === durationPlan.segments.length
+    && durationFrames.every((value, index) => {
+      const segment = durationPlan.segments[index]
+      return Number.isSafeInteger(value)
+        && value >= segment.min_published_frames
+        && value <= segment.max_published_frames
+        && (value - segment.grid_offset) % segment.grid_step === 0
+        && (!(segment.authored_locked || segment.completed_locked) || value === segment.published_frames)
+    })
+  )
   const reviewSecondsRemaining = planReviewDeadline == null
     ? null
     : Math.max(0, planReviewDeadline - nowMs / 1000)
@@ -221,6 +254,8 @@ export function H3GenerationPlanDialog() {
     runIfTop(() => {
       if (
         !plan || !editsReady
+        || (durationSnapMode === 'manual' && !durationEditsReady)
+        || !selectedSnapAvailable
         || reviewSecondsRemaining === 0
         || reviewLoadingRef.current
         || operationRef.current
@@ -244,6 +279,18 @@ export function H3GenerationPlanDialog() {
             : 'user plan override',
         })),
         boundaryOverrides: boundaries.map(type => ({ type })),
+        ...(durationPlan ? {
+          planRevision: durationPlan.revision,
+          durationSnapMode,
+          segmentDurationEdits: durationSnapMode === 'manual'
+            ? durationFrames.flatMap((publishedFrames, index) => (
+                publishedFrames === durationPlan.segments[index].published_frames
+                  ? []
+                  : [{ segmentIndex: durationPlan.segments[index].index, publishedFrames }]
+              ))
+            : [],
+          durationRedistribution: durationSnapMode === 'manual' ? durationRedistribution : 'none',
+        } : {}),
       })).finally(() => { operationRef.current = false })
     })
   }
@@ -277,6 +324,9 @@ export function H3GenerationPlanDialog() {
   const invalidSelections = editsReady
     ? models.map((model, index) => getModelBlockedReason(index, model)).filter(Boolean)
     : ['Loading plan editor']
+  const durationBlocked = (
+    durationSnapMode === 'manual' && !durationEditsReady
+  ) || !selectedSnapAvailable
   const missingModels = Array.from(new Set(models))
     .map(model => optionByModel.get(model))
     .filter((option): option is H3CheckpointOption => Boolean(
@@ -377,6 +427,115 @@ export function H3GenerationPlanDialog() {
             </div>
           )}
 
+          {durationPlan && (
+            <section aria-labelledby="h3-duration-controls-title" className="mb-3 space-y-3 rounded-lg border border-border bg-bg-primary/30 p-3">
+              <div>
+                <h3 id="h3-duration-controls-title" className="text-xs font-semibold text-text-primary">Published duration</h3>
+                <p className="mt-0.5 text-[10px] leading-relaxed text-text-muted">
+                  Keep the manual plan or choose a server-authored segment-efficient boundary. All frame geometry is verified again by the server at approval.
+                </p>
+              </div>
+              <fieldset disabled={reviewLoading} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-3">
+                <legend className="sr-only">Duration mode</legend>
+                {(['manual', 'nearest', 'down'] as const).map(mode => {
+                  const candidate = mode === 'manual' ? null : durationPlan.snap_candidates[mode]
+                  const available = mode === 'manual' || Boolean(
+                    candidate?.applied
+                    && candidate.confidence === 'high'
+                    && candidate.candidate_published_frames != null,
+                  )
+                  const detail = mode === 'manual'
+                    ? `${durationPlan.current_published_frames} published frames`
+                    : available
+                      ? `${candidate?.candidate_published_frames} frames · ${candidate?.segment_count} segments`
+                      : candidate?.reason || 'Unavailable for this plan'
+                  return (
+                    <label key={mode} className={`flex min-h-11 min-w-0 items-start gap-2 rounded border px-3 py-2 ${available ? 'border-border bg-bg-secondary' : 'border-border/60 bg-bg-tertiary/30 opacity-60'}`}>
+                      <input
+                        type="radio"
+                        name="h3-duration-mode"
+                        value={mode}
+                        checked={durationSnapMode === mode}
+                        disabled={!available || reviewLoading}
+                        onChange={() => setDurationSnapMode(mode)}
+                        className="mt-0.5"
+                      />
+                      <span className="min-w-0">
+                        <span className="block text-[10px] font-semibold capitalize text-text-primary">{mode}</span>
+                        <span className="block break-words text-[9px] leading-relaxed text-text-muted">{detail}</span>
+                      </span>
+                    </label>
+                  )
+                })}
+              </fieldset>
+
+              <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
+                {durationPlan.segments.map((segment, index) => {
+                  const locked = segment.authored_locked || segment.completed_locked
+                  return (
+                    <label key={segment.index} className="min-w-0 rounded border border-border/70 p-2 text-[10px] text-text-secondary">
+                      <span className="flex min-w-0 items-center justify-between gap-2">
+                        <span className="font-semibold text-text-primary">Segment {segment.index} published frames</span>
+                        {locked && <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[9px] text-amber-200">Locked</span>}
+                      </span>
+                      <input
+                        type="number"
+                        inputMode="numeric"
+                        min={segment.min_published_frames}
+                        max={segment.max_published_frames}
+                        step={segment.grid_step}
+                        value={durationFrames[index] ?? segment.published_frames}
+                        disabled={reviewLoading || durationSnapMode !== 'manual' || locked}
+                        aria-label={`Published frames for segment ${segment.index}`}
+                        onChange={event => {
+                          const value = event.currentTarget.valueAsNumber
+                          setDurationFrames(values => values.map((current, itemIndex) => itemIndex === index ? value : current))
+                        }}
+                        className="mt-1 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-sm text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-60"
+                      />
+                      <span className="mt-1 block break-words text-[9px] text-text-muted">
+                        Server range {segment.min_published_frames}–{segment.max_published_frames}f
+                        {locked && ` · ${segment.lock_reason || 'server locked'}`}
+                      </span>
+                    </label>
+                  )
+                })}
+              </div>
+
+              <label className="block min-w-0 text-[10px] text-text-secondary">
+                Preserve the original target after manual edits
+                <select
+                  value={durationRedistribution}
+                  disabled={reviewLoading || durationSnapMode !== 'manual'}
+                  onChange={event => setDurationRedistribution(event.currentTarget.value as DurationRedistribution)}
+                  aria-label="Duration redistribution"
+                  className="mt-1 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[11px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-60"
+                >
+                  <option value="none">None · allow a visible mismatch</option>
+                  <option value="next">Adjust the next unlocked segment</option>
+                  <option value="future">Distribute across future unlocked segments</option>
+                </select>
+              </label>
+
+              <H3DurationPlanBar
+                targetPublishedFrames={durationPlan.target_published_frames}
+                currentPublishedFrames={durationPlan.current_published_frames}
+                currentGeneratedFrames={durationPlan.current_generated_frames}
+                currentMinusTargetFrames={-durationPlan.residual_published_frames}
+                outcome={durationPlan.outcome}
+                reason={durationPlan.reason}
+              />
+              <p role="status" className="break-words text-[9px] leading-relaxed text-text-muted">
+                This bar shows the current frozen server plan. Manual edits or a selected snap are verified and applied by the server when you approve; the browser does not estimate revised frame totals.
+              </p>
+              {durationSnapMode === 'manual' && !durationEditsReady && (
+                <p role="alert" className="break-words text-[9px] leading-relaxed text-red-300">
+                  Each edited segment must stay on its server-authored frame grid and within its unlocked range.
+                </p>
+              )}
+            </section>
+          )}
+
           <div className="space-y-2">
             {plan.segments.map((segment, index) => {
               const selectedOption = optionByModel.get(models[index])
@@ -455,7 +614,7 @@ export function H3GenerationPlanDialog() {
             {reviewError && <p role="alert" className="mt-1 text-red-300">{reviewError}</p>}
           </div>
           <button type="button" disabled={reviewLoading} onClick={cancelGeneration} className="min-h-11 w-full rounded border border-red-400/40 px-3 py-2 text-xs text-red-300 transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 disabled:cursor-wait disabled:opacity-50 sm:w-auto">Cancel generation</button>
-          <button type="button" disabled={reviewLoading || reviewSecondsRemaining === 0 || invalidSelections.length > 0} onClick={submit} className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded bg-accent-blue px-3 py-2 text-xs font-medium text-white transition-[filter] hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"><Check size={13} aria-hidden="true" />{reviewLoading ? 'Applying…' : 'Approve & resume'}</button>
+          <button type="button" disabled={reviewLoading || reviewSecondsRemaining === 0 || invalidSelections.length > 0 || durationBlocked} onClick={submit} className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded bg-accent-blue px-3 py-2 text-xs font-medium text-white transition-[filter] hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"><Check size={13} aria-hidden="true" />{reviewLoading ? 'Applying…' : 'Approve & resume'}</button>
         </div>
       </div>
     </div>

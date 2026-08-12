@@ -5599,8 +5599,16 @@ export const useStore = create<AppState>((set, get) => ({
   },
   approveH3Plan: async (decision) => {
     const sequence = ++_h3PlanReviewSequence
-    const { pendingH3PlanJobId: jobId, pendingH3PlanWorkspace: workspace } = get()
+    const {
+      pendingH3PlanJobId: jobId,
+      pendingH3PlanWorkspace: workspace,
+      pendingH3Plan: plan,
+    } = get()
     if (!jobId || !workspace || get().activeWorkspace !== workspace) return
+    if (plan?.duration_plan && decision.planRevision !== plan.duration_plan.revision) {
+      set({ h3PlanReviewError: 'The duration plan changed. Reopen the review and try again.' })
+      return
+    }
     set({ h3PlanReviewLoading: true, h3PlanReviewError: null })
     try {
       const result = await api.approveGenerationPlan(jobId, {
@@ -5608,6 +5616,15 @@ export const useStore = create<AppState>((set, get) => ({
         segment_overrides: decision.segmentOverrides,
         boundary_overrides: decision.boundaryOverrides,
         h3_ref2va_terms_accepted: h3Ref2VATermsAccepted(),
+        ...(decision.planRevision ? {
+          plan_revision: decision.planRevision,
+          duration_snap_mode: decision.durationSnapMode ?? 'manual',
+          segment_duration_edits: (decision.segmentDurationEdits ?? []).map(edit => ({
+            segment_index: edit.segmentIndex,
+            published_frames: edit.publishedFrames,
+          })),
+          duration_redistribution: decision.durationRedistribution ?? 'none',
+        } : {}),
       })
       if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
       set(s => ({

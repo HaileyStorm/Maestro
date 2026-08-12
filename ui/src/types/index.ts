@@ -778,12 +778,35 @@ export interface ResponsibleUseProjection {
   status: ResponsibleUseStatus
 }
 
+export type SupportAllowanceSourceKind = 'free' | 'one_time_support' | 'recurring_support'
+export type SupportAllowanceStatus = 'active' | 'inactive' | 'refunded' | 'expired' | 'capped' | 'canceled'
+export type SupportAllowanceRefundState = 'not_applicable' | 'none' | 'partial' | 'full' | 'excess'
+
+export interface SupportRecordedAllowanceSource {
+  source: SupportAllowanceSourceKind
+  granted_allowance: number
+  effective_allowance: number
+  expires_at: string | null
+  status: SupportAllowanceStatus
+  refund_state: SupportAllowanceRefundState
+}
+
+export interface SupportRecordedAllowance {
+  state: 'recorded_not_enforced'
+  enforcement_enabled: false
+  unit: string
+  as_of: string
+  effective_allowance: number
+  sources: SupportRecordedAllowanceSource[]
+}
+
 /** Deliberately excludes raw contribution totals, subjects, and audit events. */
 export interface SupportAccountSummary {
   event_count: number
   one_time_tier: string | null
   recurring_tier: string | null
   active_recurring_count: number
+  recorded_allowance?: SupportRecordedAllowance
   benefits: {
     state: string
     scheduler_enforcement_enabled: boolean
@@ -902,6 +925,44 @@ export interface H3SegmentPlanItem {
   prompt_preview?: string
 }
 
+export interface H3DurationSnapCandidate {
+  requested_published_frames: number
+  candidate_published_frames: number | null
+  segment_count: number | null
+  generated_frames: number[]
+  segment_published_frames: number[]
+  confidence: 'high' | 'low' | 'unavailable'
+  applied: boolean
+  reason: string
+}
+
+export interface H3DurationPlanSegment {
+  index: number
+  published_frames: number
+  min_published_frames: number
+  max_published_frames: number
+  grid_step: number
+  grid_offset: number
+  authored_locked: boolean
+  completed_locked: boolean
+  lock_reason: string | null
+}
+
+export interface H3DurationPlan {
+  revision: string
+  target_published_frames: number
+  current_published_frames: number
+  current_generated_frames: number
+  fps: number
+  snap_candidates: Record<'nearest' | 'down', H3DurationSnapCandidate>
+  segments: H3DurationPlanSegment[]
+  redistribution_mode: 'none' | 'next' | 'future'
+  outcome: 'exact' | 'acceptable' | 'insufficient_capacity'
+  reason: string
+  /** Server-authored target minus current frames. */
+  residual_published_frames: number
+}
+
 export interface H3SegmentPlan {
   kind: 'h3_segments'
   clip_count: number
@@ -912,6 +973,7 @@ export interface H3SegmentPlan {
   adaptive_conditioning: boolean
   checkpoint_switches: number
   segments: H3SegmentPlanItem[]
+  duration_plan?: H3DurationPlan
 }
 
 export interface H3GenerationRequirements {
@@ -928,6 +990,10 @@ export interface H3GenerationRequirements {
 export interface H3PlanDecision {
   segmentOverrides: NonNullable<GenerateParams['h3_segment_overrides']>
   boundaryOverrides: NonNullable<GenerateParams['h3_boundary_overrides']>
+  planRevision?: string
+  durationSnapMode?: 'manual' | 'nearest' | 'down'
+  segmentDurationEdits?: Array<{ segmentIndex: number; publishedFrames: number }>
+  durationRedistribution?: 'none' | 'next' | 'future'
 }
 
 export interface OutputFile {

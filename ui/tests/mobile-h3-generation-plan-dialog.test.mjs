@@ -57,6 +57,7 @@ function dispatchKey(document, key) {
 }
 
 function treeChildren(node) {
+  if (Array.isArray(node)) return node
   if (!node || typeof node !== 'object') return []
   const children = node.props?.children
   return Array.isArray(children) ? children : children == null ? [] : [children]
@@ -101,6 +102,7 @@ async function loadDialog() {
         if (typeof cleanup === 'function') globalThis.__h3Cleanups.push(cleanup)
       }
       export function useMemo(callback) { return callback() }
+      export function useId() { return 'h3-duration-test-id' }
     `],
     ['react-dom', `
       export function createPortal(children, target) { return { ...children, portalTarget: target } }
@@ -222,6 +224,50 @@ function plan() {
         boundary_from_previous: { type: 'continuous' },
       },
     ],
+  }
+}
+
+function planWithDuration() {
+  const current = plan()
+  return {
+    ...current,
+    duration_plan: {
+      revision: 'h3dp1_test-revision',
+      target_published_frames: 48,
+      current_published_frames: 48,
+      current_generated_frames: 64,
+      fps: 24,
+      snap_candidates: {
+        nearest: {
+          requested_published_frames: 48,
+          candidate_published_frames: 47,
+          segment_count: 2,
+          generated_frames: [32, 32],
+          segment_published_frames: [23, 24],
+          confidence: 'high',
+          applied: true,
+          reason: 'Nearest proven server boundary.',
+        },
+        down: {
+          requested_published_frames: 48,
+          candidate_published_frames: null,
+          segment_count: null,
+          generated_frames: [],
+          segment_published_frames: [],
+          confidence: 'unavailable',
+          applied: false,
+          reason: 'No lower boundary is available.',
+        },
+      },
+      segments: [
+        { index: 1, published_frames: 24, min_published_frames: 20, max_published_frames: 32, grid_step: 1, grid_offset: 0, authored_locked: false, completed_locked: false, lock_reason: null },
+        { index: 2, published_frames: 24, min_published_frames: 24, max_published_frames: 24, grid_step: 1, grid_offset: 0, authored_locked: true, completed_locked: false, lock_reason: 'authored' },
+      ],
+      redistribution_mode: 'none',
+      outcome: 'exact',
+      reason: 'The server-authored plan exactly matches the target.',
+      residual_published_frames: 0,
+    },
   }
 }
 
@@ -481,6 +527,89 @@ test('loading and expired review states cannot dismiss or resubmit stale plan wo
   assert.equal(cancels, 0)
   assert.match(nodeText(tree), /Server is auto-accepting this frozen plan/)
   assert.equal(findNodes(tree, node => node.props?.role === 'alert').length, 1)
+})
+
+test('duration controls preserve server authority, locks, revision, and exact approval intent', async t => {
+  const Dialog = await loadDialog()
+  const document = new FakeDocument()
+  const dialog = new FakeElement(document, 'rendered H3 dialog')
+  const closeButton = new FakeElement(document, 'rendered H3 close')
+  document.appRoot = new FakeElement(document, 'app root')
+  document.activeElement = new FakeElement(document, 'opener')
+  const approvals = []
+  const currentPlan = planWithDuration()
+  const store = {
+    pendingH3Plan: currentPlan,
+    pendingH3PlanEstimate: null,
+    pendingH3PlanJobId: 'review-job',
+    pendingH3PlanWorkspace: 'project one',
+    jobs: [{ id: 'review-job', status: 'waiting_for_plan_approval', planReviewDeadline: 2_000 }],
+    h3PlanReviewLoading: false,
+    h3PlanReviewError: null,
+    models: [],
+    activeWorkspace: 'project one',
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+    hostTermsLoading: false,
+    hostTermsError: null,
+    loadHostTerms() {},
+    acceptHostTerm() {},
+    closeH3PlanReview() {},
+    approveH3Plan(payload) { approvals.push(payload) },
+    cancelH3Plan() {},
+  }
+  resetHarness(document, store, { dialog, close: closeButton })
+  globalThis.__h3HookState[10] = 'manual'
+  globalThis.__h3HookState[11] = [24, 24]
+  globalThis.__h3HookState[12] = 'none'
+  t.after(() => {
+    delete globalThis.document
+    delete globalThis.window
+    delete globalThis.HTMLElement
+  })
+
+  let tree = render(Dialog)
+  const bar = findNodes(tree, node => node.type?.name === 'H3DurationPlanBar')[0]
+  assert.ok(bar)
+  assert.deepEqual(bar.props, {
+    targetPublishedFrames: 48,
+    currentPublishedFrames: 48,
+    currentGeneratedFrames: 64,
+    currentMinusTargetFrames: -0,
+    outcome: 'exact',
+    reason: 'The server-authored plan exactly matches the target.',
+  })
+  const frameInputs = findNodes(tree, node => String(node.props?.['aria-label'] || '').startsWith('Published frames for segment'))
+  assert.equal(frameInputs.length, 2)
+  assert.equal(frameInputs[0].props.disabled, false)
+  assert.equal(frameInputs[1].props.disabled, true)
+  assert.match(nodeText(tree), /No lower boundary is available/)
+  assert.match(nodeText(tree), /bar shows the current frozen server plan/i)
+
+  frameInputs[0].props.onChange({ currentTarget: { valueAsNumber: 23 } })
+  const redistribution = findNodes(tree, node => node.props?.['aria-label'] === 'Duration redistribution')[0]
+  redistribution.props.onChange({ currentTarget: { value: 'future' } })
+  tree = render(Dialog)
+  const approveButton = findNodes(tree, node => node.type === 'button' && nodeText(node).includes('Approve & resume'))[0]
+  assert.equal(approveButton.props.disabled, false)
+  approveButton.props.onClick()
+  assert.equal(approvals.length, 1)
+  assert.deepEqual(approvals[0].planRevision, 'h3dp1_test-revision')
+  assert.equal(approvals[0].durationSnapMode, 'manual')
+  assert.deepEqual(approvals[0].segmentDurationEdits, [{ segmentIndex: 1, publishedFrames: 23 }])
+  assert.equal(approvals[0].durationRedistribution, 'future')
+  await Promise.resolve()
+
+  globalThis.__h3HookState[10] = 'nearest'
+  globalThis.__h3HookState[11] = [99, 24]
+  tree = render(Dialog)
+  const nearestApprove = findNodes(tree, node => node.type === 'button' && nodeText(node).includes('Approve & resume'))[0]
+  assert.equal(nearestApprove.props.disabled, false, 'server snap is independent of stale disabled manual fields')
+  assert.equal(findNodes(tree, node => node.props?.role === 'alert').length, 0)
+  nearestApprove.props.onClick()
+  assert.equal(approvals.length, 2)
+  assert.equal(approvals[1].durationSnapMode, 'nearest')
+  assert.deepEqual(approvals[1].segmentDurationEdits, [])
+  assert.equal(approvals[1].durationRedistribution, 'none')
 })
 
 test('H3 plan mobile shell compiles four-edge safe areas, dynamic viewport, scrolling, touch, zoom, and reduced-motion rules', async () => {

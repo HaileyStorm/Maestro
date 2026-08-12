@@ -1181,6 +1181,10 @@ class DirectorRecoveryTests(unittest.TestCase):
         namespace = {
             "Request": object,
             "HTTPException": HTTPError,
+            "re": __import__("re"),
+            "_CREDIT_ACCOUNT_PARAM": "_maestro_credit_account_id",
+            "_CREDIT_REALM_PARAM": "_maestro_credit_execution_realm",
+            "_credit_prepare_director_pipeline": lambda _body: False,
             "_init_pipeline": lambda: None,
             "_reject_client_director_image_role_internals": lambda _body: None,
             "_authorize_director_media_inputs": (

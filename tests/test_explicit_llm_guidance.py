@@ -771,6 +771,7 @@ class DirectorSnapshotTests(unittest.TestCase):
         namespace = _launch_functions(
             "_public_pipeline_state",
             copy=copy,
+            _CREDIT_INTERNAL_PARAMS=(),
             _redact_local_paths=lambda value: value,
             _sanitize_director_public_failures=lambda value: value,
             _strip_director_image_role_internals=lambda value: value,

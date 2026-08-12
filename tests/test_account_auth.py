@@ -1728,6 +1728,9 @@ class AccountCapabilityTests(unittest.TestCase):
             "_REMOTE_OWNER_REAUTH_ALLOWED_EXACT": frozenset(),
             "_request_session_id": contextvars.ContextVar("route_session"),
             "_request_remote": contextvars.ContextVar("route_remote"),
+            "_request_account_id": contextvars.ContextVar(
+                "route_account", default="",
+            ),
             "_attach_account_request_state": attach,
             "_require_account_store": lambda _request: store,
             "_require_account_principal": require_principal,

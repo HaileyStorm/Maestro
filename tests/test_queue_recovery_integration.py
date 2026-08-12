@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -75,11 +77,139 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             global_state=global_state,
         )
 
+    @staticmethod
+    def _credit_queue(
+        *,
+        decision="hosted_priority_credit",
+        queue_band=1,
+        requested=True,
+        reservation_state="reserved",
+        revalidation_state=None,
+        transition_id="transition_recovery_0001",
+    ):
+        result = {
+            "schema_version": 1,
+            "realm": "hosted",
+            "enforcement_enabled": True,
+            "metering_applied": True,
+            "decision": decision,
+            "requested_units_positive": requested,
+            "queue_band": queue_band,
+            "reservation_state": reservation_state,
+            "reservation_revision": (
+                None if reservation_state is None else "e" * 64
+            ),
+            "revalidation_state": revalidation_state,
+            "allowance_revision": "a" * 64,
+            "allowance_observed_at": "2026-08-11T10:00:00Z",
+            "transition_id": transition_id,
+            "transition_history": [],
+        }
+        fingerprint = hashlib.sha256(json.dumps(
+            {
+                key: result[key]
+                for key in (
+                    "schema_version",
+                    "realm",
+                    "enforcement_enabled",
+                    "metering_applied",
+                    "decision",
+                    "requested_units_positive",
+                    "queue_band",
+                    "reservation_state",
+                    "reservation_revision",
+                    "revalidation_state",
+                    "allowance_revision",
+                    "allowance_observed_at",
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")).hexdigest()
+        result["transition_history"] = [[transition_id, fingerprint]]
+        return result
+
     def test_server_job_incarnation_timestamp_round_trips_exactly(self):
         job = self._job("discovered-job", created_at=4_321.25)
         self._register(job)
         restored = self.coordinator.restore().jobs[job["id"]]
         self.assertEqual(restored["created_at"], 4_321.25)
+
+    def test_credit_queue_envelope_and_three_band_order_survive_restart(self):
+        active = self._job(
+            "active-credit",
+            created_at=30.0,
+            source_remote=True,
+            credit_queue=self._credit_queue(),
+        )
+        standard = self._job(
+            "standard-credit",
+            created_at=20.0,
+            source_remote=True,
+        )
+        depleted = self._job(
+            "depleted-credit",
+            created_at=10.0,
+            source_remote=True,
+            credit_queue=self._credit_queue(
+                decision="hosted_baseline",
+                queue_band=-1,
+                reservation_state=None,
+                transition_id="transition_recovery_0002",
+            ),
+        )
+        for job in (depleted, standard, active):
+            self._register(job)
+
+        recovered = QueueRecoveryCoordinator(self.journal).restore()
+        self.assertEqual(
+            recovered.jobs[active["id"]]["credit_queue"],
+            active["credit_queue"],
+        )
+        self.assertEqual(recovered.global_state["queue_order"], [
+            active["id"],
+            standard["id"],
+            depleted["id"],
+        ])
+        self.assertFalse(recovered.jobs[depleted["id"]]["queue_held"])
+
+    def test_credit_queue_recovery_rejects_unknown_or_inconsistent_metadata(self):
+        variants = []
+        unknown = self._credit_queue()
+        unknown["account_id"] = "must-not-persist"
+        variants.append(unknown)
+        boosted_exclusion = self._credit_queue(
+            decision="capability_excluded",
+            queue_band=1,
+            reservation_state=None,
+        )
+        variants.append(boosted_exclusion)
+        wrong_realm = self._credit_queue()
+        wrong_realm["realm"] = "lan"
+        variants.append(wrong_realm)
+        raw_allowance_identity = self._credit_queue()
+        raw_allowance_identity["allowance_revision"] = "event_credit_0001"
+        variants.append(raw_allowance_identity)
+        wrong_reservation_revision = self._credit_queue()
+        wrong_reservation_revision["reservation_revision"] = None
+        variants.append(wrong_reservation_revision)
+        unhashable_decision = self._credit_queue()
+        unhashable_decision["decision"] = []
+        variants.append(unhashable_decision)
+        unhashable_reservation = self._credit_queue()
+        unhashable_reservation["reservation_state"] = []
+        variants.append(unhashable_reservation)
+
+        for index, credit_queue in enumerate(variants):
+            with self.subTest(index=index), self.assertRaises(
+                QueueRecoveryAdapterError,
+            ):
+                serialize_job(
+                    self._job(f"tampered-credit-{index}", credit_queue=credit_queue),
+                    owner_digest=self.owner,
+                    project_digest=self.project,
+                    request_manifest={"kind": "synthetic"},
+                )
 
     def test_resource_intent_is_closed_and_legacy_active_jobs_restore_conservatively(self):
         job = self._job(
@@ -565,6 +695,114 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
         self.assertEqual(
             snapshot["current_segment_boundary"],
             {"type": "cut", "source": "explicit_cut", "at_seconds": 5.0},
+        )
+
+    def test_waiting_h3_duration_plan_round_trips_across_restart(self):
+        candidate = {
+            "requested_published_frames": 346,
+            "candidate_published_frames": 345,
+            "segment_count": 1,
+            "generated_frames": [345],
+            "segment_published_frames": [345],
+            "confidence": "high",
+            "applied": True,
+            "reason": "Authoritative boundary.",
+        }
+        duration_plan = {
+            "revision": "h3dp1_" + "a" * 64,
+            "target_published_frames": 346,
+            "current_published_frames": 346,
+            "current_generated_frames": 350,
+            "fps": 24,
+            "snap_candidates": {
+                "nearest": copy.deepcopy(candidate),
+                "down": copy.deepcopy(candidate),
+            },
+            "segments": [
+                {
+                    "index": 1,
+                    "published_frames": 175,
+                    "min_published_frames": 124,
+                    "max_published_frames": 345,
+                    "grid_step": 1,
+                    "grid_offset": 0,
+                    "authored_locked": True,
+                    "completed_locked": False,
+                    "lock_reason": "authored",
+                },
+                {
+                    "index": 2,
+                    "published_frames": 171,
+                    "min_published_frames": 124,
+                    "max_published_frames": 345,
+                    "grid_step": 1,
+                    "grid_offset": 0,
+                    "authored_locked": False,
+                    "completed_locked": True,
+                    "lock_reason": "completed",
+                },
+            ],
+            "redistribution_mode": "future",
+            "outcome": "exact",
+            "reason": "Server-owned duration plan.",
+            "residual_published_frames": 0,
+        }
+        public_plan = {
+            "kind": "h3_segments",
+            "clip_count": 2,
+            "fps": 24,
+            "published_frames": 346,
+            "segments": [
+                {
+                    "index": 1,
+                    "generated_frames": 175,
+                    "published_frames": 175,
+                    "generated_duration_seconds": 175 / 24,
+                    "published_duration_seconds": 175 / 24,
+                    "duration_min_published_frames": 124,
+                    "duration_max_published_frames": 345,
+                    "duration_grid_step": 1,
+                    "duration_grid_offset": 0,
+                    "authored_locked": True,
+                    "completed_locked": False,
+                    "lock_reason": "authored",
+                },
+                {
+                    "index": 2,
+                    "generated_frames": 175,
+                    "published_frames": 171,
+                    "generated_duration_seconds": 175 / 24,
+                    "published_duration_seconds": 171 / 24,
+                    "duration_min_published_frames": 124,
+                    "duration_max_published_frames": 345,
+                    "duration_grid_step": 1,
+                    "duration_grid_offset": 0,
+                    "authored_locked": False,
+                    "completed_locked": True,
+                    "lock_reason": "completed",
+                },
+            ],
+            "duration_plan": duration_plan,
+        }
+        job = self._job(
+            "waiting-duration",
+            status="waiting_for_plan_approval",
+            h3_segment_plan=public_plan,
+            plan_review_required=True,
+            plan_review_deadline=200.0,
+        )
+        self._register(job)
+        restored = QueueRecoveryCoordinator(self.journal).restore().jobs[job["id"]]
+        self.assertEqual(restored["status"], "waiting_for_plan_approval")
+        self.assertEqual(restored["h3_segment_plan"]["duration_plan"], duration_plan)
+        self.assertEqual(
+            restored["h3_segment_plan"]["segments"][0][
+                "duration_min_published_frames"
+            ],
+            124,
+        )
+        self.assertTrue(
+            restored["h3_segment_plan"]["segments"][1]["completed_locked"]
         )
 
     def test_h3_recovery_geometry_rejects_nonfinite_or_boolean_numbers(self):

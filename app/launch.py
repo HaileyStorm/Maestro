@@ -196,6 +196,16 @@ from services.entitlements import (
     ContributionLedger,
     EntitlementError,
     LedgerIntegrityError,
+    SUPPORT_PRIORITY_IDENTITY_CONTRACTS,
+    opaque_key,
+    support_priority_capability_marker,
+)
+from services.credit_runtime import (
+    CreditRuntimeError,
+    CreditRuntimePolicy,
+    quote_reservation,
+    reserve_quote,
+    transition_reservation,
 )
 from services.responsible_use import (
     ResponsibleUseError,
@@ -253,6 +263,9 @@ _remote_active_projects: dict[str, str] = {}
 _remote_active_projects_lock = threading.RLock()
 _request_session_id = contextvars.ContextVar("maestro_request_session", default=None)
 _request_remote = contextvars.ContextVar("maestro_request_remote", default=False)
+_request_account_id = contextvars.ContextVar(
+    "maestro_request_account", default=None,
+)
 _STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -1108,11 +1121,16 @@ async def _maestro_session_middleware(request: Request, call_next):
             return _stamp_recovery_no_store_response(request, remote_denial)
     token = _request_session_id.set(session_id)
     remote_token = _request_remote.set(bool(request.state.maestro_remote))
+    principal = getattr(request.state, "maestro_account_principal", None)
+    account_token = _request_account_id.set(
+        str(principal.get("id") or "") if isinstance(principal, dict) else None
+    )
     try:
         response = await _call_next_with_recovery_no_store(
             request, call_next,
         )
     finally:
+        _request_account_id.reset(account_token)
         _request_remote.reset(remote_token)
         _request_session_id.reset(token)
     if created:
@@ -1162,12 +1180,15 @@ def _safe_join(base: str, *parts: str) -> str | None:
 
 # --- Generation job tracking ---
 from services.job_lifecycle import (
+    _credit_queue_metadata_from_quote,
+    apply_credit_queue_decision,
     authorized_logical_queue_projection,
     arm_prepared_job_plan_review,
     approve_prepared_job,
     block_generation_recovery,
     block_resource_admission_failure,
     complete_preparation,
+    consume_credit_queue_reservation,
     DurableTransition,
     GENERATED_MEDIA_EXTENSIONS,
     clear_job_residency,
@@ -1225,6 +1246,16 @@ from services.h3_offload_plan import (
     public_h3_offload_plan,
     seal_h3_offload_plan,
     validate_h3_offload_plan,
+)
+from services.h3_duration_plan import (
+    GeneratedFrameCount,
+    H3DurationOraclePlan,
+    H3DurationPlanError,
+    H3SegmentFrameRange,
+    PublishedFrameCount,
+    PublishedFrameGrid,
+    redistribute_segment_duration,
+    snap_published_duration,
 )
 from services.queue_recovery_adapter import (
     QueueRecoveryAdapterError,
@@ -1419,6 +1450,377 @@ def _stamp_job_origin(job: dict) -> dict:
     """Capture local-vs-Cloudflare origin before a worker thread is spawned."""
     job.setdefault("source_remote", bool(_request_remote.get()))
     return job
+
+
+_CREDIT_ACCOUNT_PARAM = "_maestro_credit_account_id"
+_CREDIT_REALM_PARAM = "_maestro_credit_execution_realm"
+_CREDIT_INTERNAL_PARAMS = frozenset({
+    _CREDIT_ACCOUNT_PARAM,
+    _CREDIT_REALM_PARAM,
+})
+_CREDIT_EXEMPT_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice"})
+# Runtime credit enforcement is intentionally unavailable until Maestro has
+# one durable account/source debit ledger and a validated nonzero policy.  An
+# environment flag alone must never contradict the recorded_not_enforced API.
+_CREDIT_RUNTIME_ACCOUNTING_DURABLE = False
+_CREDIT_RUNTIME_VALIDATED_POLICY_UNITS = 0
+_credit_admission_evaluations: dict[str, tuple] = {}
+
+
+def _credit_runtime_policy() -> CreditRuntimePolicy:
+    """Remain advisory until durable accounting and policy both exist."""
+    policy_ready = bool(
+        _CREDIT_RUNTIME_ACCOUNTING_DURABLE is True
+        and type(_CREDIT_RUNTIME_VALIDATED_POLICY_UNITS) is int
+        and _CREDIT_RUNTIME_VALIDATED_POLICY_UNITS > 0
+    )
+    return CreditRuntimePolicy(enforcement_enabled=bool(
+        policy_ready
+        and _accounts_enabled()
+        and _env_flag_enabled("MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED")
+    ))
+
+
+def _credit_server_execution_realm() -> str:
+    """Resolve compute locality from host configuration, never request origin."""
+    realm = str(
+        os.environ.get("MAESTRO_COMPUTE_EXECUTION_REALM") or "local"
+    ).strip().lower()
+    return realm if realm in {"local", "lan", "hosted"} else "local"
+
+
+def _credit_account_id(job: dict, *, persisted: bool = True) -> str:
+    """Resolve only a server-carried account lineage for allowance lookup."""
+    candidates = [job.get("_credit_account_id")]
+    parent_id = str(job.get("parent_job_id") or "")
+    if parent_id:
+        parent = _jobs.get(parent_id)
+        if isinstance(parent, dict):
+            candidates.append(parent.get("_credit_account_id"))
+            parent_params = parent.get("params")
+            if isinstance(parent_params, dict):
+                candidates.append(parent_params.get(_CREDIT_ACCOUNT_PARAM))
+    if persisted:
+        params = job.get("params")
+        if isinstance(params, dict):
+            candidates.append(params.get(_CREDIT_ACCOUNT_PARAM))
+    candidates.append(_request_account_id.get())
+    for candidate in candidates:
+        value = str(candidate or "")
+        if re.fullmatch(r"[0-9a-f]{32}", value):
+            return value
+    return ""
+
+
+def _credit_recorded_allowance(job: dict) -> dict:
+    """Read one current privacy-safe projection; no contribution data escapes."""
+    account_id = _credit_account_id(job)
+    if account_id and _accounts_enabled():
+        subject = opaque_key(
+            "maestro_account_support",
+            account_id,
+            _support_domain_key("account-identity"),
+        )
+        return ContributionLedger(
+            integrity_key=_support_domain_key("ledger"),
+        ).privacy_safe_user_projection(subject)["recorded_allowance"]
+    return {
+        "state": "recorded_not_enforced",
+        "enforcement_enabled": False,
+        "unit": "compute_seconds",
+        "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "effective_allowance": 0,
+        "sources": [{
+            "source": "free",
+            "source_event_id": None,
+            "granted_allowance": 0,
+            "effective_allowance": 0,
+            "expires_at": None,
+            "status": "inactive",
+            "refund_state": "not_applicable",
+        }],
+    }
+
+
+def _credit_allowance_revision(recorded_allowance: dict) -> str:
+    """Hash content-free allowance state without account/provider identities."""
+    raw_sources = recorded_allowance.get("sources")
+    sources = raw_sources if isinstance(raw_sources, list) else []
+    canonical_sources = sorted(
+        (
+            str(source.get("source") or ""),
+            source.get("granted_allowance"),
+            source.get("effective_allowance"),
+            source.get("expires_at"),
+            source.get("status"),
+            source.get("refund_state"),
+        )
+        for source in sources
+        if isinstance(source, dict)
+    )
+    payload = {
+        "unit": recorded_allowance.get("unit"),
+        "as_of": recorded_allowance.get("as_of"),
+        "effective_allowance": recorded_allowance.get("effective_allowance"),
+        "sources": canonical_sources,
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _credit_requested_units(job: dict) -> int:
+    """Seal a conservative compute-seconds quote from server-planned geometry."""
+    estimate = job.get("h3_estimate")
+    if isinstance(estimate, dict):
+        try:
+            seconds = float(estimate.get("seconds") or 0)
+            load = float(estimate.get("model_load_seconds") or 0)
+            if math.isfinite(seconds) and math.isfinite(load) and seconds > 0:
+                return max(1, math.ceil(max(0.0, seconds - load)))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    for key in ("_duration_seconds", "duration_seconds"):
+        try:
+            seconds = float(params.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(seconds) and seconds > 0:
+            return max(1, math.ceil(seconds))
+    try:
+        frames = int(params.get("video_length") or 0)
+    except (TypeError, ValueError):
+        frames = 0
+    return max(1, math.ceil(frames / 24)) if frames > 0 else 1
+
+
+def _credit_capability_priority(job: dict) -> dict:
+    """Reduce exact registered model relations to one support-priority marker."""
+    from services.model_terms import required_model_terms
+
+    model_ids = sorted(set(_job_model_term_ids(job)))
+    excluded = []
+    for model_id in model_ids:
+        terms = set(required_model_terms(model_id, wgp.models_def))
+        for capability_id, contract in SUPPORT_PRIORITY_IDENTITY_CONTRACTS.items():
+            if model_id == capability_id or contract.creator_term in terms:
+                excluded.append(capability_id)
+    if excluded:
+        return support_priority_capability_marker(min(set(excluded)))
+    encoded = json.dumps(model_ids, separators=(",", ":")).encode("utf-8")
+    return support_priority_capability_marker(
+        "generation." + hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def _credit_evaluation(job: dict):
+    # Current host configuration is authoritative on every recovery. A
+    # persisted hosted stamp must be neutralized when work resumes locally.
+    realm = _credit_server_execution_realm()
+    recorded_allowance = _credit_recorded_allowance(job)
+    quote = quote_reservation(
+        realm=realm,
+        requested_units=_credit_requested_units(job),
+        recorded_allowance=recorded_allowance,
+        capability_priority=_credit_capability_priority(job),
+        policy=_credit_runtime_policy(),
+    )
+    return quote, _credit_allowance_revision(recorded_allowance)
+
+
+def _credit_quote(job: dict):
+    """Compatibility projection for tests and diagnostics."""
+    return _credit_evaluation(job)[0]
+
+
+def _credit_transition_id(
+    job: dict,
+    stage: str,
+    quote,
+    state: str,
+    allowance_revision: str,
+) -> str:
+    payload = {
+        "job": str(job.get("id") or ""),
+        "stage": stage,
+        "realm": quote.realm,
+        "decision": quote.decision,
+        "metering": quote.metering_applied,
+        "requested": quote.requested_units,
+        "reserved": quote.reserved_units,
+        "state": state,
+        "allowance_revision": allowance_revision,
+        "models": sorted(set(_job_model_term_ids(job))),
+    }
+    digest = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return f"credit:v1:{stage}:{digest[:40]}"
+
+
+def _credit_reservation(job: dict, quote, *, consumed: bool):
+    if not quote.reservation_required:
+        return None
+    reservation_id = "credit-reservation:" + hashlib.sha256(
+        (str(job.get("id") or "") + ":" + quote.unit).encode("utf-8")
+    ).hexdigest()[:40]
+    state = reserve_quote(quote, reservation_id=reservation_id)
+    return transition_reservation(state, "consume") if consumed else state
+
+
+def _credit_job_exempt(job: dict) -> bool:
+    """Keep standalone GPU tools outside the unavailable billing surface."""
+    return str(job.get("kind") or "") in _CREDIT_EXEMPT_JOB_KINDS
+
+
+def _credit_prepare_submission(job: dict) -> bool:
+    """Atomically add the first hosted envelope before journal registration."""
+    if _credit_job_exempt(job):
+        return False
+    params = job.get("params") if isinstance(job.get("params"), dict) else None
+    if params is None:
+        return False
+    # Fresh clients cannot nominate account or execution authority. Only the
+    # server-side top-level lineage and host realm are copied into the private
+    # request manifest when hosted enforcement is explicitly active.
+    params.pop(_CREDIT_ACCOUNT_PARAM, None)
+    params.pop(_CREDIT_REALM_PARAM, None)
+    policy = _credit_runtime_policy()
+    realm = _credit_server_execution_realm()
+    if not policy.enforcement_enabled or realm != "hosted":
+        return False
+    account_id = _credit_account_id(job, persisted=False)
+    if account_id:
+        params[_CREDIT_ACCOUNT_PARAM] = account_id
+    params[_CREDIT_REALM_PARAM] = realm
+    quote, allowance_revision = _credit_evaluation(job)
+    reservation = _credit_reservation(job, quote, consumed=False)
+    transition_id = _credit_transition_id(
+        job, "submit", quote,
+        "reserved" if reservation is not None else "none",
+        allowance_revision,
+    )
+    job["credit_queue"] = _credit_queue_metadata_from_quote(
+        quote,
+        transition_id=transition_id,
+        allowance_revision=allowance_revision,
+        reservation=reservation,
+        revalidation=None,
+    )
+    return True
+
+
+def _credit_prepare_admission(job: dict) -> bool:
+    """Re-evaluate and notify queue ordering before waiting for the slot."""
+    job_id = str(job.get("id") or "")
+    _credit_admission_evaluations.pop(job_id, None)
+    if _credit_job_exempt(job):
+        return False
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    if "credit_queue" not in job and not (
+        _credit_runtime_policy().enforcement_enabled
+        and str(params.get(_CREDIT_REALM_PARAM) or "") == "hosted"
+    ):
+        return False
+    quote, allowance_revision = _credit_evaluation(job)
+    was_consumed = (
+        isinstance(job.get("credit_queue"), dict)
+        and job["credit_queue"].get("reservation_state") == "consumed"
+    )
+    reservation = _credit_reservation(job, quote, consumed=was_consumed)
+    transition_id = _credit_transition_id(
+        job, "admission", quote,
+        (
+            "consumed" if reservation is not None and was_consumed
+            else "reserved" if reservation is not None else "none"
+        ),
+        allowance_revision,
+    )
+    changed = apply_credit_queue_decision(
+        job,
+        quote,
+        transition_id=transition_id,
+        allowance_revision=allowance_revision,
+        reservation=reservation,
+    )
+    _credit_admission_evaluations[job_id] = (
+        quote, allowance_revision, reservation,
+    )
+    return changed
+
+
+def _credit_prepare_dispatch(job: dict) -> bool:
+    """Consume only after running admission grants model-work authority."""
+    job_id = str(job.get("id") or "")
+    evaluation = _credit_admission_evaluations.pop(job_id, None)
+    if _credit_job_exempt(job):
+        return False
+    current = job.get("credit_queue")
+    if not isinstance(current, dict) or current.get("reservation_state") != (
+        "reserved"
+    ):
+        return False
+    if not isinstance(evaluation, tuple) or len(evaluation) != 3:
+        raise CreditRuntimeError(
+            "credit admission evaluation is unavailable after admission"
+        )
+    quote, allowance_revision, reserved = evaluation
+    if reserved is None:
+        raise CreditRuntimeError(
+            "credit admission reservation is unavailable after admission"
+        )
+    reservation = transition_reservation(reserved, "consume")
+    transition_id = _credit_transition_id(
+        job, "dispatch", quote, "consumed", allowance_revision,
+    )
+    consumed = consume_credit_queue_reservation(
+        job,
+        quote,
+        transition_id=transition_id,
+        allowance_revision=allowance_revision,
+        reservation=reservation,
+    )
+    if not consumed and not is_cancel_requested(job):
+        raise CreditRuntimeError(
+            "credit reservation could not be consumed after admission"
+        )
+    return consumed
+
+
+def _credit_block_runtime_error(job: dict) -> None:
+    """Durably remove an invalid credit waiter and wake queue followers."""
+    _credit_admission_evaluations.pop(str(job.get("id") or ""), None)
+    if str(job.get("status") or "") == "queued":
+        block_resource_admission_failure(job)
+        return
+    if str(job.get("status") or "") == "running":
+        finish_job(
+            job,
+            "failed",
+            error="Queue admission validation failed",
+            message="Queue admission validation failed",
+            recovery_state="terminal",
+            reruns_denoise=False,
+        )
+
+
+def _credit_prepare_director_pipeline(params: dict) -> bool:
+    """Carry private lineage only for the same explicit hosted policy."""
+    params.pop(_CREDIT_ACCOUNT_PARAM, None)
+    params.pop(_CREDIT_REALM_PARAM, None)
+    if (
+        not _credit_runtime_policy().enforcement_enabled
+        or _credit_server_execution_realm() != "hosted"
+    ):
+        return False
+    params[_CREDIT_REALM_PARAM] = "hosted"
+    account_id = str(_request_account_id.get() or "")
+    if re.fullmatch(r"[0-9a-f]{32}", account_id):
+        params[_CREDIT_ACCOUNT_PARAM] = account_id
+    return True
+
+
 _gen_lock = threading.Lock()
 _active_gen_states: dict = {}  # job_id -> wgp gen state dict (for abort signaling)
 _cpu_text_lane = CPUTextLane()
@@ -2045,6 +2447,7 @@ def _queue_recovery_register_and_publish(
     ):
         _seal_h3_offload_plan_for_job(job.get("params"), job=job)
     prepared = _jobs.prepare(_stamp_job_origin(job))
+    _credit_prepare_submission(prepared)
     prepared_params = prepared.get("params")
     if isinstance(prepared_params, dict):
         # These are worker-authored native staging controls. HTTP payloads and
@@ -2794,6 +3197,25 @@ def _director_recovery_submit_child(
     attempt: int,
 ) -> dict:
     """Attach to one deterministic child, or durably register it once."""
+    try:
+        from services import director_pipeline as _director_service
+
+        pipeline = _director_service._pipelines.get(pid) or {}
+        pipeline_params = (
+            pipeline.get("params")
+            if isinstance(pipeline.get("params"), dict) else {}
+        )
+        account_id = str(pipeline_params.get(_CREDIT_ACCOUNT_PARAM) or "")
+        realm = str(pipeline_params.get(_CREDIT_REALM_PARAM) or "")
+        if (
+            _credit_runtime_policy().enforcement_enabled
+            and _credit_server_execution_realm() == "hosted"
+            and realm == "hosted"
+            and re.fullmatch(r"[0-9a-f]{32}", account_id)
+        ):
+            job["_credit_account_id"] = account_id
+    except (AttributeError, TypeError):
+        pass
     job_id = str(job.get("id") or "")
     existing = _jobs.get(job_id)
     if existing is not None:
@@ -6384,6 +6806,8 @@ def _replan_h3_final_segment_for_peak(
         raise QueueRecoveryRuntimeError(
             "H3 recovery changed the job publication contract."
         )
+    longform["_duration_completed_locks"] = list(range(completed_prefix))
+    _stamp_h3_duration_contract(result, longform)
     result["_h3_longform"] = longform
     return result
 
@@ -11115,6 +11539,214 @@ def _require_h3_native_boundary_experimental(body: dict) -> None:
         )
 
 
+def _h3_duration_segment_limits(body: dict, plan: dict) -> list[dict]:
+    """Return server-owned editable publication bounds for one H3 plan."""
+    frames = list(plan.get("clip_frames") or [])
+    published = list(plan.get("clip_published_frames") or frames)
+    models = list(plan.get("segment_models") or [])
+    policy = plan.get("segment_policy")
+    authored_timeline = (
+        isinstance(policy, dict)
+        and policy.get("id") == "authored_timeline_exact_v1"
+    )
+    limits = []
+    for index, generated in enumerate(frames):
+        model = models[index] if index < len(models) else {}
+        model_type = str(
+            model.get("model_type") if isinstance(model, dict) else ""
+        ) or str(body.get("model_type") or "")
+        model_def = wgp.get_model_def(model_type) or {}
+        model_minimum = max(1, int(model_def.get("frames_minimum") or 1))
+        current_published = int(
+            published[index] if index < len(published) else generated
+        )
+        # A locked anchored/timestamp segment may already publish a shorter
+        # exact tail than the checkpoint's generated-frame minimum. Keep that
+        # existing server-authored value representable without making shorter
+        # unlocked segments newly editable.
+        minimum = min(model_minimum, current_published)
+        maximum = max(
+            minimum,
+            min(
+                int(model_def.get("frames_maximum") or generated),
+                int(plan.get("segment_frames_maximum") or generated),
+            ),
+        )
+        edge_locked = bool(
+            (index == 0 and plan.get("original_image_start"))
+            or (index == len(frames) - 1 and plan.get("original_image_end"))
+        )
+        limits.append({
+            "index": index,
+            "minimum": minimum,
+            "maximum": maximum,
+            # Published tails are exact integer frames even though generated
+            # frames use the checkpoint's coarser temporal lattice.
+            "step": 1,
+            "offset": 0,
+            "authored_locked": bool(authored_timeline or edge_locked),
+        })
+    return limits
+
+
+def _h3_duration_plan_revision(plan: dict) -> str:
+    """Fingerprint only server-authored geometry and its sealed prompt plan."""
+    shot_plan = plan.get("shot_plan")
+    shot_seal = (
+        shot_plan.get("prompt_contract_seal")
+        if isinstance(shot_plan, dict) else None
+    )
+    payload = {
+        "version": 1,
+        "target": int(
+            plan.get("_duration_target_published_frames")
+            or plan.get("published_frames")
+            or plan.get("requested_frames")
+            or 0
+        ),
+        "generated": [int(value) for value in plan.get("clip_frames") or []],
+        "published": [
+            int(value) for value in plan.get("clip_published_frames") or []
+        ],
+        "limits": list(plan.get("_duration_segment_limits") or []),
+        "completed_locks": [
+            int(value) for value in plan.get("_duration_completed_locks") or []
+            if type(value) is int and value >= 0
+        ],
+        "redistribution": str(
+            plan.get("_duration_redistribution_mode") or "none"
+        ),
+        "snap_candidates": dict(
+            plan.get("_duration_snap_candidates") or {}
+        ),
+        "shot_seal": shot_seal,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    return "h3dp1_" + hashlib.sha256(encoded).hexdigest()
+
+
+def _public_h3_duration_snap_result(result) -> dict:
+    return {
+        "requested_published_frames": int(result.requested_published_frames),
+        "candidate_published_frames": (
+            int(result.candidate_published_frames)
+            if result.candidate_published_frames is not None else None
+        ),
+        "segment_count": result.segment_count,
+        "generated_frames": [int(value) for value in result.generated_frames],
+        "segment_published_frames": [
+            int(value) for value in result.segment_published_frames
+        ],
+        "confidence": result.confidence,
+        "applied": bool(result.applied),
+        "reason": str(result.reason),
+    }
+
+
+def _h3_duration_oracle(body: dict):
+    """Adapt the authoritative generation planner to the pure snap contract."""
+    model_type = str(body.get("model_type") or "")
+    model_def = wgp.get_model_def(model_type) or {}
+    current_plan = body.get("_h3_longform")
+    authoritative_prompt = str(
+        current_plan.get("global_prompt")
+        if isinstance(current_plan, dict) else body.get("prompt") or ""
+    )
+    cache: dict[int, H3DurationOraclePlan | None] = {}
+
+    def oracle(total: PublishedFrameCount) -> H3DurationOraclePlan | None:
+        requested = int(total)
+        if requested in cache:
+            return cache[requested]
+        candidate = copy.deepcopy(body)
+        for key in (
+            "_h3_longform", "per_clip_prompts", "per_clip_frames",
+            "h3_segment_overrides", "h3_boundary_overrides",
+        ):
+            candidate.pop(key, None)
+        candidate["multi_prompts_gen_type"] = 0
+        candidate["prompt"] = authoritative_prompt
+        candidate["video_length"] = requested
+        candidate["_h3_duration_contract_disabled"] = True
+        plan = _prepare_h3_long_studio_request(candidate)
+        if plan is None:
+            minimum = max(1, int(model_def.get("frames_minimum") or 1))
+            maximum = int(model_def.get("frames_maximum") or 0)
+            generated = max(
+                minimum,
+                int(wgp.align_model_frame_count(requested, model_def)),
+            )
+            if maximum <= 0 or generated > maximum or generated < requested:
+                cache[requested] = None
+                return None
+            generated_frames = [generated]
+            published_frames = [requested]
+        else:
+            generated_frames = [
+                int(value) for value in plan.get("clip_frames") or []
+            ]
+            published_frames = [
+                int(value) for value in plan.get("clip_published_frames") or []
+            ]
+        if not generated_frames or sum(published_frames) != requested:
+            cache[requested] = None
+            return None
+        cache[requested] = H3DurationOraclePlan(
+            requested_published_frames=PublishedFrameCount(requested),
+            generated_frames=tuple(
+                GeneratedFrameCount(value) for value in generated_frames
+            ),
+            published_frames=tuple(
+                PublishedFrameCount(value) for value in published_frames
+            ),
+            confidence="high",
+            reason="Authoritative H3 generation planner result.",
+        )
+        return cache[requested]
+
+    return oracle
+
+
+def _stamp_h3_duration_contract(body: dict, plan: dict) -> None:
+    """Attach a versioned, content-free duration contract to a private plan."""
+    target = int(
+        plan.get("_duration_target_published_frames")
+        or plan.get("published_frames")
+        or plan.get("requested_frames")
+        or 0
+    )
+    current = sum(int(value) for value in plan.get("clip_published_frames") or [])
+    plan["_duration_target_published_frames"] = target
+    plan["_duration_segment_limits"] = _h3_duration_segment_limits(body, plan)
+    plan.setdefault("_duration_redistribution_mode", "none")
+    plan.setdefault("_duration_residual_published_frames", target - current)
+    plan.setdefault(
+        "_duration_outcome", "exact" if current == target else "acceptable",
+    )
+    plan.setdefault(
+        "_duration_reason",
+        "The authoritative H3 plan preserves the requested published duration."
+        if current == target else
+        "The server-authored published duration differs from the original target.",
+    )
+    fps = float(plan.get("fps") or 24)
+    maximum = min(1_000_000, max(target + 1, int(round(300 * fps))))
+    grid = PublishedFrameGrid(
+        minimum=PublishedFrameCount(1),
+        maximum=PublishedFrameCount(maximum),
+    )
+    oracle = _h3_duration_oracle(body)
+    plan["_duration_snap_candidates"] = {
+        mode: _public_h3_duration_snap_result(snap_published_duration(
+            target, mode=mode, grid=grid, oracle=oracle,
+        ))
+        for mode in ("nearest", "down")
+    }
+    plan["_duration_revision"] = _h3_duration_plan_revision(plan)
+
+
 def _prepare_h3_long_studio_request(body: dict) -> dict | None:
     """Convert a >native-window H3 Studio request into native clip tasks.
 
@@ -11334,6 +11966,12 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
         "original_image_start": first_anchor,
         "original_image_end": last_anchor,
     }
+    duration_contract_disabled = (
+        body.pop("_h3_duration_contract_disabled", False) is True
+    )
+    duration_stamper = globals().get("_stamp_h3_duration_contract")
+    if not duration_contract_disabled and callable(duration_stamper):
+        duration_stamper(body, body["_h3_longform"])
     return body["_h3_longform"]
 
 
@@ -11398,6 +12036,11 @@ def _public_h3_long_plan(
         fps = 24.0
     models = list(plan.get("segment_models") or [])
     boundaries = list(plan.get("clip_boundaries") or [])
+    duration_limits = list(plan.get("_duration_segment_limits") or [])
+    completed_locks = {
+        int(value) for value in plan.get("_duration_completed_locks") or []
+        if type(value) is int and value >= 0
+    }
     segments = []
     for index in range(int(plan.get("clip_count") or 0)):
         model = models[index] if index < len(models) and isinstance(models[index], dict) else {}
@@ -11407,6 +12050,19 @@ def _public_h3_long_plan(
             published_frames[index]
             if index < len(published_frames) else frame_count
         )
+        duration_limit = (
+            duration_limits[index]
+            if index < len(duration_limits)
+            and isinstance(duration_limits[index], dict)
+            else {}
+        )
+        authored_locked = duration_limit.get("authored_locked") is True
+        completed_locked = index in completed_locks
+        lock_reasons = []
+        if authored_locked:
+            lock_reasons.append("authored")
+        if completed_locked:
+            lock_reasons.append("completed")
         segments.append({
             "index": index + 1,
             # Compatibility aliases retain their historical generated meaning.
@@ -11427,6 +12083,17 @@ def _public_h3_long_plan(
             ),
             "switch_from_previous": bool(model.get("switch_from_previous")),
             "boundary_from_previous": _public_h3_boundary(boundary),
+            "duration_min_published_frames": int(
+                duration_limit.get("minimum") or 1
+            ),
+            "duration_max_published_frames": int(
+                duration_limit.get("maximum") or max(1, frame_count)
+            ),
+            "duration_grid_step": int(duration_limit.get("step") or 1),
+            "duration_grid_offset": int(duration_limit.get("offset") or 0),
+            "authored_locked": authored_locked,
+            "completed_locked": completed_locked,
+            "lock_reason": ", ".join(lock_reasons) if lock_reasons else None,
         })
     effective_models = []
     for segment in segments:
@@ -11449,6 +12116,62 @@ def _public_h3_long_plan(
         "effective_model_count": len(effective_models),
         "effective_models": effective_models,
         "segments": segments,
+    }
+    target_published = int(
+        plan.get("_duration_target_published_frames")
+        or plan.get("published_frames")
+        or plan.get("requested_frames")
+        or 0
+    )
+    current_published = sum(
+        int(segment["published_frames"]) for segment in segments
+    )
+    revision_builder = globals().get("_h3_duration_plan_revision")
+    revision = str(plan.get("_duration_revision") or "")
+    if not revision and callable(revision_builder):
+        revision = str(revision_builder(plan))
+    public["duration_plan"] = {
+        "revision": revision,
+        "target_published_frames": target_published,
+        "current_published_frames": current_published,
+        "current_generated_frames": sum(
+            int(segment["generated_frames"]) for segment in segments
+        ),
+        "fps": fps,
+        "snap_candidates": dict(
+            plan.get("_duration_snap_candidates") or {}
+        ),
+        "segments": [{
+            "index": int(segment["index"]),
+            "published_frames": int(segment["published_frames"]),
+            "min_published_frames": int(
+                segment["duration_min_published_frames"]
+            ),
+            "max_published_frames": int(
+                segment["duration_max_published_frames"]
+            ),
+            "grid_step": int(segment["duration_grid_step"]),
+            "grid_offset": int(segment["duration_grid_offset"]),
+            "authored_locked": bool(segment["authored_locked"]),
+            "completed_locked": bool(segment["completed_locked"]),
+            "lock_reason": segment["lock_reason"],
+        } for segment in segments],
+        "redistribution_mode": str(
+            plan.get("_duration_redistribution_mode") or "none"
+        ),
+        "outcome": str(
+            plan.get("_duration_outcome")
+            or ("exact" if current_published == target_published else "acceptable")
+        ),
+        "reason": str(
+            plan.get("_duration_reason")
+            or "The server authored this H3 duration plan."
+        ),
+        "residual_published_frames": int(
+            plan.get("_duration_residual_published_frames")
+            if type(plan.get("_duration_residual_published_frames")) is int
+            else target_published - current_published
+        ),
     }
     if isinstance(requirements, dict):
         options = requirements.get("checkpoint_options")
@@ -29249,6 +29972,8 @@ def _public_pipeline_state(state: dict) -> dict:
         snapshot = dict(snapshot)
         snapshot.pop("_maestro_session_id", None)
         snapshot.pop("_maestro_access_policy", None)
+        for internal_key in _CREDIT_INTERNAL_PARAMS:
+            snapshot.pop(internal_key, None)
         _strip_director_image_role_internals(snapshot)
         snapshot.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
         public["_params_snapshot"] = snapshot
@@ -29879,6 +30604,7 @@ async def director_pipeline_start(request: Request):
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     from services.director_pipeline import start_pipeline
     body = await request.json()
+    _credit_prepare_director_pipeline(body)
     # This private recovery bit is server-owned. start_pipeline recomputes it
     # from the authoritative consent/provider policy and literal request flag.
     body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
@@ -47040,6 +47766,7 @@ async def tools_upscale(request: Request):
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {
         "id": job_id, "status": "queued", "progress": 0, "step": 0, "total_steps": 0,
+        "kind": "tool_upscale",
         "source_remote": bool(_request_remote.get()),
         "phase": "", "message": "Queued (upscale)", "created_at": time.time(),
         "params": {
@@ -47103,6 +47830,7 @@ async def tools_revoice(request: Request):
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {
         "id": job_id, "status": "queued", "progress": 0, "step": 0, "total_steps": 0,
+        "kind": "tool_revoice",
         "source_remote": bool(_request_remote.get()),
         "phase": "", "message": "Queued (revoice)", "created_at": time.time(),
         "params": {
@@ -47246,6 +47974,14 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
     start_time = time.time()
     abort_state = None
 
+    try:
+        _credit_prepare_admission(job)
+    except (CreditRuntimeError, EntitlementError, ValueError):
+        # A malformed server stamp is never repaired from client/job content.
+        # Park it durably and wake followers instead of stranding queue head.
+        _credit_block_runtime_error(job)
+        return False
+
     # Director/internal callers can enter this worker without using the main
     # HTTP submission endpoint. Stamp them before registration so they receive
     # the same residency-aware ordering, while preserving all existing tiers.
@@ -47255,6 +47991,7 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
         _gen_lock, job, block_on_persistence_failure=True,
     ) as acquired:
         if not acquired:
+            _credit_admission_evaluations.pop(job_id, None)
             return False
         try:
             if not try_start(
@@ -47263,11 +48000,13 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 block_on_persistence_failure=True,
                 message="Preparing...",
             ):
+                _credit_admission_evaluations.pop(job_id, None)
                 return False
 
             try:
                 sealed_h3_offload_plan = _require_h3_offload_plan_parity(job)
             except QueueRecoveryRuntimeError:
+                _credit_admission_evaluations.pop(job_id, None)
                 finish_job(
                     job,
                     "failed",
@@ -47284,6 +48023,7 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                 try:
                     _require_job_runtime_model_admission(job)
                 except HTTPException as error:
+                    _credit_admission_evaluations.pop(job_id, None)
                     role_mode = _director_image_role_wire_mode(
                         job.get("params") or {},
                     ) == "roles"
@@ -47298,6 +48038,12 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
                         ),
                     )
                     return False
+
+            try:
+                _credit_prepare_dispatch(job)
+            except (CreditRuntimeError, EntitlementError, ValueError):
+                _credit_block_runtime_error(job)
+                return False
 
             # Per-job VRAM coefficient adjustment — accounts for active
             # LoRAs and pipeline stage count beyond what the auto-tuned
@@ -47348,6 +48094,8 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
             # Build task manifest from user params
             raw_params = job["params"].copy()
             raw_params.pop("_h3_offload_plan", None)
+            for internal_key in _CREDIT_INTERNAL_PARAMS:
+                raw_params.pop(internal_key, None)
             validation_reference_bytes = job.get(
                 "_h3_turbo_validation_reference_bytes"
             )
@@ -53029,6 +53777,417 @@ def _require_owned_job_project(
     return job
 
 
+def _h3_duration_segment_oracle(body: dict, plan: dict):
+    """Verify edited publication frames through H3's native shot planner."""
+    models = list(plan.get("segment_models") or [])
+
+    def oracle(
+        published: tuple[PublishedFrameCount, ...],
+    ) -> H3DurationOraclePlan | None:
+        generated = []
+        for index, value in enumerate(published):
+            model = models[index] if index < len(models) else {}
+            model_type = str(
+                model.get("model_type") if isinstance(model, dict) else ""
+            ) or str(body.get("model_type") or "")
+            model_def = wgp.get_model_def(model_type) or {}
+            frame_count = int(wgp.align_model_frame_count(int(value), model_def))
+            maximum = int(model_def.get("frames_maximum") or 0)
+            if maximum <= 0 or frame_count > maximum or frame_count < int(value):
+                return None
+            generated.append(frame_count)
+        try:
+            shot_plan = _replay_h3_duration_shot_plan(
+                plan,
+                generated=generated,
+                published=[int(value) for value in published],
+            )
+        except (TypeError, ValueError):
+            return None
+        if list(shot_plan.get("clip_published_frames") or []) != [
+            int(value) for value in published
+        ]:
+            return None
+        return H3DurationOraclePlan(
+            requested_published_frames=PublishedFrameCount(sum(published)),
+            generated_frames=tuple(
+                GeneratedFrameCount(value) for value in generated
+            ),
+            published_frames=published,
+            confidence="high",
+            reason="Authoritative H3 native shot planner result.",
+        )
+
+    return oracle
+
+
+def _replay_h3_duration_shot_plan(
+    plan: dict,
+    *,
+    generated: list[int],
+    published: list[int],
+) -> dict:
+    """Recompile geometry only from the sealed semantic-source contract."""
+    from services.h3_shot_planner import (
+        plan_h3_native_shots,
+        seal_h3_shot_plan,
+        validate_h3_shot_plan_seal,
+    )
+
+    shot_plan = plan.get("shot_plan")
+    if not isinstance(shot_plan, dict):
+        raise TypeError("sealed H3 prompt contract is unavailable")
+    validate_h3_shot_plan_seal(shot_plan)
+    if shot_plan.get("semantic_physical_contract_version") != 2:
+        raise ValueError("sealed H3 prompt contract cannot be replayed exactly")
+    if (
+        str(shot_plan.get("global_prompt") or "")
+        != str(plan.get("global_prompt") or "")
+    ):
+        raise ValueError("sealed H3 prompt source changed")
+    contracts = list(shot_plan.get("source_contracts") or [])
+    shots = list(shot_plan.get("shots") or [])
+    if not contracts or not shots or len(generated) != len(published):
+        raise ValueError("sealed H3 prompt mapping is incomplete")
+    try:
+        source_indices = [int(item.get("source_index")) for item in shots]
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("sealed H3 prompt mapping is invalid") from None
+    if len(generated) != len(source_indices):
+        unique_sources = sorted(set(source_indices))
+        if len(unique_sources) != 1:
+            raise ValueError(
+                "duration geometry cannot preserve every sealed H3 source"
+            )
+        source_indices = [unique_sources[0]] * len(generated)
+    if sorted(set(source_indices)) != list(range(len(contracts))):
+        raise ValueError("duration geometry cannot preserve every sealed H3 source")
+
+    source_prompts = []
+    compiler_inputs = []
+    for expected_index, contract in enumerate(contracts):
+        if (
+            not isinstance(contract, dict)
+            or contract.get("source_index") != expected_index
+            or not isinstance(contract.get("authored_prompt"), str)
+            or not contract.get("authored_prompt")
+        ):
+            raise ValueError("sealed H3 prompt source is incomplete")
+        source_prompts.append(contract["authored_prompt"])
+        compiler_inputs.append({
+            "version": 1,
+            "authored_shot_id": contract.get("authored_shot_id"),
+            "visual_context": contract.get("visual_context"),
+            "opening_blocking": contract.get("opening_blocking"),
+            "final_blocking": contract.get("final_blocking"),
+            "structured_dialogue_blocks": copy.deepcopy(
+                contract.get("structured_dialogue_blocks")
+            ),
+        })
+    boundaries = list(plan.get("clip_boundaries") or [])
+    if len(boundaries) < len(generated) - 1:
+        raise ValueError("sealed H3 boundary mapping is incomplete")
+    replayed = plan_h3_native_shots(
+        global_prompt=str(plan.get("global_prompt") or ""),
+        clip_frame_counts=generated,
+        fps=float(plan.get("fps") or 24),
+        clip_boundaries=boundaries[:max(0, len(generated) - 1)],
+        clip_requested_frames=published,
+        segment_frames_maximum=int(
+            plan.get("segment_frames_maximum") or max(generated)
+        ),
+        segment_policy={
+            "version": 1,
+            "id": "approved_duration_edit_v1",
+            "reason": "server-verified duration approval",
+            "clip_requested_frames": published,
+        },
+        source_prompts=source_prompts,
+        source_indices=source_indices,
+        source_compiler_inputs=compiler_inputs,
+    )
+    if "h3_style_workflow" in shot_plan:
+        replayed["h3_style_workflow"] = copy.deepcopy(
+            shot_plan.get("h3_style_workflow")
+        )
+        seal_h3_shot_plan(replayed)
+    validate_h3_shot_plan_seal(replayed)
+    return replayed
+
+
+def _apply_h3_duration_approval(
+    prepared_params: dict,
+    plan: dict,
+    *,
+    plan_revision: str | None,
+    duration_snap_mode: str | None,
+    segment_duration_edits: list,
+    duration_redistribution: str | None,
+) -> dict:
+    """Apply one revision-fenced duration edit before approval publication."""
+    duration_controls = bool(
+        duration_snap_mode is not None
+        or segment_duration_edits
+        or duration_redistribution is not None
+    )
+    expected_revision = str(
+        plan.get("_duration_revision") or _h3_duration_plan_revision(plan)
+    )
+    if plan_revision is not None:
+        if not isinstance(plan_revision, str) or not hmac.compare_digest(
+            plan_revision, expected_revision,
+        ):
+            raise ValueError("duration plan revision is stale")
+    elif duration_controls:
+        raise ValueError("duration plan revision is required")
+    if not duration_controls:
+        return plan
+    snap_mode = duration_snap_mode or "manual"
+    if snap_mode not in {"manual", "nearest", "down"}:
+        raise ValueError("duration snap mode is invalid")
+    if snap_mode != "manual" and (
+        segment_duration_edits or duration_redistribution is not None
+    ):
+        raise ValueError(
+            "duration snap cannot be combined with segment edits or redistribution"
+        )
+    redistribution = duration_redistribution or "none"
+    if redistribution not in {"none", "next", "future"}:
+        raise ValueError("duration redistribution mode is invalid")
+
+    target = int(
+        plan.get("_duration_target_published_frames")
+        or plan.get("published_frames")
+        or plan.get("requested_frames")
+        or 0
+    )
+    if snap_mode != "manual":
+        candidate = dict(
+            (plan.get("_duration_snap_candidates") or {}).get(snap_mode) or {}
+        )
+        candidate_frames = candidate.get("candidate_published_frames")
+        if (
+            candidate.get("confidence") != "high"
+            or type(candidate_frames) is not int
+            or candidate_frames <= 0
+        ):
+            raise ValueError("duration snap candidate is unavailable")
+        generated = candidate.get("generated_frames")
+        candidate_published = candidate.get("segment_published_frames")
+        if (
+            not isinstance(generated, list)
+            or not isinstance(candidate_published, list)
+            or not generated
+            or len(generated) != len(candidate_published)
+            or any(type(value) is not int or value <= 0 for value in generated)
+            or any(
+                type(value) is not int or value <= 0
+                for value in candidate_published
+            )
+            or sum(candidate_published) != candidate_frames
+        ):
+            raise ValueError("duration snap candidate geometry is unavailable")
+        shot_plan = _replay_h3_duration_shot_plan(
+            plan,
+            generated=list(generated),
+            published=list(candidate_published),
+        )
+        segment_models = _plan_h3_adaptive_models(
+            prepared_params,
+            clip_count=len(generated),
+            clip_boundaries=list(shot_plan.get("clip_boundaries") or []),
+            first_anchor=plan.get("original_image_start"),
+            last_anchor=plan.get("original_image_end"),
+        )
+        director_runtime = isinstance(
+            (plan.get("shot_plan") or {}).get("director_runtime_contract"),
+            dict,
+        )
+        plan.update({
+            "requested_frames": candidate_frames,
+            "planned_frames": sum(generated),
+            "published_frames": candidate_frames,
+            "final_trim_frames": sum(generated) - candidate_frames,
+            "clip_count": len(generated),
+            "clip_frames": list(generated),
+            "clip_published_frames": list(candidate_published),
+            "clip_trim_tail_frames": [
+                made - visible
+                for made, visible in zip(generated, candidate_published)
+            ],
+            "clip_prompt_previews": [
+                str(value)[:240] for value in shot_plan.get("clip_prompts") or []
+            ],
+            "clip_boundaries": list(shot_plan.get("clip_boundaries") or []),
+            "shot_plan": shot_plan,
+            "segment_source_indices": [
+                int(item.get("source_index"))
+                for item in shot_plan.get("shots") or []
+            ],
+            "segment_policy": dict(shot_plan.get("segment_policy") or {}),
+            "segment_models": segment_models,
+        })
+        if director_runtime:
+            from services.director_pipeline import (
+                _bind_director_h3_runtime_contract,
+            )
+
+            _bind_director_h3_runtime_contract(plan)
+        prepared_params["prompt"] = _MULTI_CLIP_SEPARATOR.join(
+            list(shot_plan.get("clip_prompts") or [])
+        )
+        prepared_params["per_clip_prompts"] = list(
+            shot_plan.get("clip_prompts") or []
+        )
+        prepared_params["per_clip_frames"] = list(generated)
+        prepared_params["video_length"] = candidate_frames
+        prepared_params["multi_prompts_gen_type"] = 3
+        plan["_duration_segment_limits"] = _h3_duration_segment_limits(
+            prepared_params, plan,
+        )
+        plan["_duration_completed_locks"] = [
+            value for value in plan.get("_duration_completed_locks") or []
+            if type(value) is int and 0 <= value < len(generated)
+        ]
+
+    raw_limits = list(plan.get("_duration_segment_limits") or [])
+    frames = list(plan.get("clip_frames") or [])
+    published = list(plan.get("clip_published_frames") or [])
+    if not raw_limits or len(raw_limits) != len(frames) or len(published) != len(frames):
+        raise ValueError("duration plan bounds are unavailable")
+    segments = []
+    for index, (generated, current, limit) in enumerate(
+        zip(frames, published, raw_limits)
+    ):
+        if not isinstance(limit, dict):
+            raise TypeError("duration plan bounds are invalid")
+        segments.append(H3SegmentFrameRange(
+            index=index,
+            generated_frames=GeneratedFrameCount(int(generated)),
+            published_frames=PublishedFrameCount(int(current)),
+            published_grid=PublishedFrameGrid(
+                minimum=PublishedFrameCount(int(limit.get("minimum") or 1)),
+                maximum=PublishedFrameCount(int(limit.get("maximum") or generated)),
+                step=int(limit.get("step") or 1),
+                offset=int(limit.get("offset") or 0),
+            ),
+            authored_locked=limit.get("authored_locked") is True,
+            completed_locked=index in {
+                int(value) for value in plan.get("_duration_completed_locks") or []
+                if type(value) is int
+            },
+        ))
+
+    edits: dict[int, int] = {}
+    for item in segment_duration_edits:
+        if not isinstance(item, dict) or set(item) != {
+            "segment_index", "published_frames",
+        }:
+            raise ValueError("segment duration edit is invalid")
+        segment_index = item.get("segment_index")
+        value = item.get("published_frames")
+        if (
+            type(segment_index) is not int
+            or not 1 <= segment_index <= len(segments)
+            or type(value) is not int
+            or value <= 0
+            or segment_index in edits
+        ):
+            raise ValueError("segment duration edit is invalid")
+        edits[segment_index] = value
+
+    result = None
+    current_segments = tuple(segments)
+    ordered_edits = sorted(edits)
+    for edit_position, segment_index in enumerate(ordered_edits):
+        result = redistribute_segment_duration(
+            current_segments,
+            edited_index=segment_index - 1,
+            edited_published_frames=edits[segment_index],
+            target_total_published_frames=target,
+            mode=(
+                redistribution
+                if edit_position == len(ordered_edits) - 1 else "none"
+            ),
+            oracle=_h3_duration_segment_oracle(prepared_params, plan),
+        )
+        if not result.applied or result.confidence != "high":
+            raise ValueError(result.reason)
+        current_segments = result.segments
+
+    if result is not None:
+        director_runtime = isinstance(
+            (plan.get("shot_plan") or {}).get("director_runtime_contract"),
+            dict,
+        )
+        new_generated = [int(item.generated_frames) for item in current_segments]
+        new_published = [int(item.published_frames) for item in current_segments]
+        shot_plan = _replay_h3_duration_shot_plan(
+            plan,
+            generated=new_generated,
+            published=new_published,
+        )
+        plan.update({
+            "requested_frames": sum(new_published),
+            "planned_frames": sum(new_generated),
+            "published_frames": sum(new_published),
+            "final_trim_frames": sum(new_generated) - sum(new_published),
+            "clip_frames": new_generated,
+            "clip_published_frames": new_published,
+            "clip_trim_tail_frames": [
+                generated - visible
+                for generated, visible in zip(new_generated, new_published)
+            ],
+            "clip_prompt_previews": [
+                str(value)[:240] for value in shot_plan.get("clip_prompts") or []
+            ],
+            "clip_boundaries": list(shot_plan.get("clip_boundaries") or []),
+            "shot_plan": shot_plan,
+            "segment_source_indices": [
+                int(item.get("source_index"))
+                for item in shot_plan.get("shots") or []
+            ],
+            "segment_policy": dict(shot_plan.get("segment_policy") or {}),
+            "_duration_outcome": (
+                "exact" if result.residual_frames == 0
+                else "acceptable" if redistribution == "none"
+                else "insufficient_capacity"
+            ),
+            "_duration_reason": str(result.reason),
+            "_duration_residual_published_frames": int(result.residual_frames),
+        })
+        if director_runtime:
+            from services.director_pipeline import (
+                _bind_director_h3_runtime_contract,
+            )
+
+            _bind_director_h3_runtime_contract(plan)
+        prepared_params["prompt"] = _MULTI_CLIP_SEPARATOR.join(
+            list(shot_plan.get("clip_prompts") or [])
+        )
+        prepared_params["per_clip_prompts"] = list(
+            shot_plan.get("clip_prompts") or []
+        )
+        prepared_params["per_clip_frames"] = new_generated
+        prepared_params["video_length"] = sum(new_published)
+    current = sum(int(value) for value in plan.get("clip_published_frames") or [])
+    plan["_duration_target_published_frames"] = target
+    plan["_duration_redistribution_mode"] = redistribution
+    if result is None:
+        plan["_duration_residual_published_frames"] = target - current
+        plan["_duration_outcome"] = (
+            "exact" if current == target else "acceptable"
+        )
+        plan["_duration_reason"] = (
+            "The authoritative H3 plan preserves the requested published duration."
+            if current == target else
+            "The selected duration snap changes the published target explicitly."
+        )
+    _stamp_h3_duration_contract(prepared_params, plan)
+    prepared_params["_h3_longform"] = plan
+    return plan
+
+
 def _approve_waiting_generation_plan(
     job: dict,
     *,
@@ -53037,6 +54196,10 @@ def _approve_waiting_generation_plan(
     boundary_overrides: list,
     accepted: bool | None,
     name_prefix: str,
+    plan_revision: str | None = None,
+    duration_snap_mode: str | None = None,
+    segment_duration_edits: list | None = None,
+    duration_redistribution: str | None = None,
 ) -> dict | None:
     """Promote one immutable prepared plan; the lifecycle decides the race."""
     job_id = str(job.get("id") or "")
@@ -53070,15 +54233,72 @@ def _approve_waiting_generation_plan(
     sealed_params = copy.deepcopy(dict(manifest["params"]))
     prepared_source = sealed_params.pop("_maestro_prepared_source", None)
     if not isinstance(prepared_source, dict):
-        raise ValueError("sealed enhanced source is unavailable")
+        raise TypeError("sealed enhanced source is unavailable")
     if accepted is None and _ref2va_host_terms_accepted():
         # Host acceptance is authoritative for both the timer and a manual
         # unchanged-plan approval.  The frozen geometry remains untouched.
         accepted = True
 
-    has_overrides = bool(segment_overrides or boundary_overrides)
+    duration_controls = bool(
+        duration_snap_mode is not None
+        or segment_duration_edits
+        or duration_redistribution is not None
+    )
+    sealed_plan = sealed_params.get("_h3_longform")
+    if not isinstance(sealed_plan, dict):
+        raise TypeError("sealed plan geometry is unavailable")
+    if duration_controls and plan_revision is None:
+        raise ValueError("duration plan revision is required")
+    if plan_revision is not None:
+        sealed_revision = str(
+            sealed_plan.get("_duration_revision")
+            or _h3_duration_plan_revision(sealed_plan)
+        )
+        if not isinstance(plan_revision, str) or not hmac.compare_digest(
+            plan_revision, sealed_revision,
+        ):
+            raise ValueError("duration plan revision is stale")
+    has_overrides = bool(
+        segment_overrides or boundary_overrides or duration_controls
+    )
     if has_overrides:
-        prepared_params = prepared_source
+        prepared_params = copy.deepcopy(prepared_source)
+        replayed_plan = None
+        replayed_estimate = None
+        if duration_controls:
+            from services.h3_shot_planner import validate_h3_shot_plan_seal
+
+            replayed_plan, replayed_estimate = _plan_generation_submission(
+                prepared_params,
+                request,
+                turbo_validation_authorized=bool(
+                    job.get("_h3_turbo_validation_authorized")
+                ),
+            )
+            sealed_shot_plan = sealed_plan.get("shot_plan")
+            replayed_shot_plan = (
+                replayed_plan.get("shot_plan")
+                if isinstance(replayed_plan, dict) else None
+            )
+            if not isinstance(sealed_shot_plan, dict) or not isinstance(
+                replayed_shot_plan, dict
+            ):
+                raise ValueError("sealed duration prompt source is unavailable")
+            validate_h3_shot_plan_seal(sealed_shot_plan)
+            validate_h3_shot_plan_seal(replayed_shot_plan)
+            if not hmac.compare_digest(
+                str((sealed_shot_plan.get("prompt_contract_seal") or {}).get(
+                    "digest"
+                ) or ""),
+                str((replayed_shot_plan.get("prompt_contract_seal") or {}).get(
+                    "digest"
+                ) or ""),
+            ):
+                raise ValueError("sealed duration prompt source cannot be replayed")
+        if duration_controls and not segment_overrides and not boundary_overrides:
+            plan, estimate = replayed_plan, replayed_estimate
+        else:
+            prepared_params = copy.deepcopy(prepared_source)
         prepared_params["h3_segment_overrides"] = copy.deepcopy(
             segment_overrides
         )
@@ -53087,15 +54307,37 @@ def _approve_waiting_generation_plan(
         )
         if accepted is not None:
             prepared_params["h3_ref2va_terms_accepted"] = accepted
-        plan, estimate = _plan_generation_submission(
-            prepared_params,
-            request,
-            turbo_validation_authorized=bool(
-                job.get("_h3_turbo_validation_authorized")
-            ),
-        )
+        if not duration_controls or segment_overrides or boundary_overrides:
+            plan, estimate = _plan_generation_submission(
+                prepared_params,
+                request,
+                turbo_validation_authorized=bool(
+                    job.get("_h3_turbo_validation_authorized")
+                ),
+            )
         if not plan or int(plan.get("clip_count") or 0) <= 1:
             raise ValueError("approved plan geometry changed")
+        plan = _apply_h3_duration_approval(
+            prepared_params,
+            plan,
+            plan_revision=(
+                str(
+                    plan.get("_duration_revision")
+                    or _h3_duration_plan_revision(plan)
+                )
+                if plan_revision is not None else None
+            ),
+            duration_snap_mode=duration_snap_mode,
+            segment_duration_edits=list(segment_duration_edits or []),
+            duration_redistribution=duration_redistribution,
+        )
+        estimate = _h3_estimate_for_context(
+            _h3_estimate_context(prepared_params, plan),
+            include_residency=not bool(
+                request is not None
+                and getattr(request.state, "maestro_remote", False)
+            ),
+        )
         requirements = _h3_generation_requirements(prepared_params, plan)
         remote_visible = _remote_visible_model_ids(request)
         if remote_visible is not None:
@@ -53115,6 +54357,20 @@ def _approve_waiting_generation_plan(
         plan = prepared_params.get("_h3_longform")
         if not isinstance(plan, dict) or int(plan.get("clip_count") or 0) <= 1:
             raise ValueError("sealed plan geometry is unavailable")
+        plan = _apply_h3_duration_approval(
+            prepared_params,
+            plan,
+            plan_revision=(
+                str(
+                    plan.get("_duration_revision")
+                    or _h3_duration_plan_revision(plan)
+                )
+                if plan_revision is not None else None
+            ),
+            duration_snap_mode=duration_snap_mode,
+            segment_duration_edits=list(segment_duration_edits or []),
+            duration_redistribution=duration_redistribution,
+        )
         _require_h3_generation_terms(prepared_params, plan)
         estimate = job.get("h3_estimate")
         public_plan = copy.deepcopy(job.get("h3_segment_plan"))
@@ -53193,6 +54449,8 @@ async def approve_generation_plan(
     allowed = {
         "workspace", "segment_overrides", "boundary_overrides",
         "h3_ref2va_terms_accepted",
+        "plan_revision", "duration_snap_mode", "segment_duration_edits",
+        "duration_redistribution",
     }
     if set(body).difference(allowed):
         raise HTTPException(status_code=400, detail="Invalid plan approval")
@@ -53225,6 +54483,38 @@ async def approve_generation_plan(
     accepted = body.get("h3_ref2va_terms_accepted")
     if accepted is not None and not isinstance(accepted, bool):
         raise HTTPException(status_code=400, detail="Invalid terms acceptance")
+    plan_revision = body.get("plan_revision")
+    duration_snap_mode = body.get("duration_snap_mode")
+    duration_redistribution = body.get("duration_redistribution")
+    segment_duration_edits = body.get("segment_duration_edits", [])
+    if plan_revision is not None and not isinstance(plan_revision, str):
+        raise HTTPException(status_code=400, detail="Invalid duration plan revision")
+    if duration_snap_mode is not None:
+        if not isinstance(duration_snap_mode, str) or duration_snap_mode not in {
+            "manual", "nearest", "down",
+        }:
+            raise HTTPException(status_code=400, detail="Invalid duration snap mode")
+    if duration_redistribution is not None:
+        if (
+            not isinstance(duration_redistribution, str)
+            or duration_redistribution not in {"none", "next", "future"}
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid duration redistribution",
+            )
+    if not isinstance(segment_duration_edits, list):
+        raise HTTPException(status_code=400, detail="Invalid segment duration edits")
+    if duration_snap_mode in {"nearest", "down"} and (
+        segment_duration_edits or duration_redistribution is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Duration snap cannot be combined with segment edits or "
+                "redistribution"
+            ),
+        )
 
     try:
         result = _approve_waiting_generation_plan(
@@ -53234,6 +54524,10 @@ async def approve_generation_plan(
             boundary_overrides=boundary_overrides,
             accepted=accepted,
             name_prefix="studio-generation-approved",
+            plan_revision=plan_revision,
+            duration_snap_mode=duration_snap_mode,
+            segment_duration_edits=segment_duration_edits,
+            duration_redistribution=duration_redistribution,
         )
     except HTTPException:
         raise

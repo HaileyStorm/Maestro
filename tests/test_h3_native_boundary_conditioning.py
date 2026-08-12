@@ -141,6 +141,12 @@ def _native_admission_namespace():
         "_normalize_video_prompt_type": lambda body: None,
         "_normalize_image_prompt_type": lambda body: None,
         "_jobs": {},
+        "_credit_prepare_admission": lambda job: None,
+        "_credit_prepare_dispatch": lambda job: None,
+        "_credit_block_runtime_error": lambda job: None,
+        "_CREDIT_INTERNAL_PARAMS": frozenset(),
+        "CreditRuntimeError": ValueError,
+        "EntitlementError": ValueError,
         "is_cancel_requested": lambda job: False,
         "update_preparation_job": lambda job, **updates: True,
         "fail_preparation": (

@@ -181,6 +181,9 @@ class GenerationTelemetryTests(unittest.TestCase):
 
     def test_h3_load_and_generation_phases_follow_real_work_order(self):
         main = _source("app/models/minimax_h3/minimax_h3_main.py")
+        final_decode = main.split('report_phase("Decoding H3 video")', 1)[1].split(
+            'report_phase("Decoding H3 audio")', 1
+        )[0]
         load_labels = [
             "Loading H3 transformer checkpoint",
             "Loading H3 conditioner checkpoint",
@@ -201,8 +204,17 @@ class GenerationTelemetryTests(unittest.TestCase):
         )
         self.assertLess(
             main.index('report_phase("Decoding H3 video")'),
-            main.index("self.vae.decode(video_latents"),
+            main.index(
+                "_decode_h3_video_rows(",
+                main.index('report_phase("Decoding H3 video")'),
+            ),
         )
+        self.assertIn("vae=self.vae", final_decode)
+        self.assertIn(
+            "packed_rows=video_rows[layout.num_condition_video_rows :]",
+            final_decode,
+        )
+        self.assertIn("pixel_frames=target_frame_num", final_decode)
         self.assertLess(
             main.index('report_phase("Decoding H3 audio")'),
             main.index("self.audio_vae.decode(audio_latents"),

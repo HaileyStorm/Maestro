@@ -11,8 +11,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import hmac
+import json
 import math
 import os
 from pathlib import Path, PurePath, PurePosixPath
@@ -38,6 +40,9 @@ _PROJECT_PREFIX = "project:v1:"
 _DIGEST_RE = re.compile(r"^(?:owner|project):v1:[0-9a-f]{64}$")
 _MARKER_RE = re.compile(r"^[0-9a-f]{32}$")
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_CREDIT_TRANSITION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{7,127}\Z")
+_CREDIT_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_CREDIT_TRANSITION_HISTORY = 32
 
 # Runtime dictionaries contain prompts, filesystem roots, request objects,
 # tensors, callbacks, credentials, and engine internals.  Only these fields
@@ -72,6 +77,7 @@ _JOB_FIELDS = frozenset({
     "residency_base_key", "residency_affinity_key", "_queue_manual_order",
     "recovery_attempt", "recovery_state", "reruns_denoise",
     "recovery_unit", "recovery_cursor", "_recovery_reason_code",
+    "credit_queue",
 })
 _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
@@ -107,6 +113,14 @@ _RESOURCE_RETRY_PHASES = frozenset({
 _RESOURCE_RETRY_REASONS = frozenset({
     "host_memory_pressure", "generation_oom", "finalization_oom",
 })
+_CREDIT_QUEUE_DECISIONS = frozenset({
+    "unmetered_realm",
+    "hosted_baseline",
+    "hosted_priority_credit",
+    "capability_excluded",
+})
+_CREDIT_RESERVATION_STATES = frozenset({"reserved", "released", "consumed"})
+_CREDIT_REVALIDATION_STATES = frozenset({"valid", "downgraded", "released"})
 
 
 class QueueRecoveryAdapterError(RuntimeError):
@@ -461,6 +475,155 @@ def _safe_h3_checkpoint_options(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _safe_h3_duration_plan(value: Any) -> dict[str, Any]:
+    """Retain only the content-free, server-owned duration approval envelope."""
+    expected = {
+        "revision", "target_published_frames", "current_published_frames",
+        "current_generated_frames", "fps", "snap_candidates", "segments",
+        "redistribution_mode", "outcome", "reason",
+        "residual_published_frames",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise QueueRecoveryAdapterError("job.h3_segment_plan.duration_plan is invalid.")
+
+    def positive_integer(child: Any, path: str) -> int:
+        if type(child) is not int or child <= 0:
+            raise QueueRecoveryAdapterError(f"{path} must be a positive integer.")
+        return child
+
+    revision = value.get("revision")
+    if not isinstance(revision, str) or re.fullmatch(r"h3dp1_[0-9a-f]{64}", revision) is None:
+        raise QueueRecoveryAdapterError("duration plan revision is invalid.")
+    fps = value.get("fps")
+    if type(fps) not in {int, float} or not math.isfinite(fps) or fps <= 0:
+        raise QueueRecoveryAdapterError("duration plan fps is invalid.")
+    result = {
+        "revision": revision,
+        "target_published_frames": positive_integer(
+            value.get("target_published_frames"), "duration target"
+        ),
+        "current_published_frames": positive_integer(
+            value.get("current_published_frames"), "duration current"
+        ),
+        "current_generated_frames": positive_integer(
+            value.get("current_generated_frames"), "duration generated"
+        ),
+        "fps": fps,
+    }
+    candidates = value.get("snap_candidates")
+    if not isinstance(candidates, Mapping) or set(candidates) != {"nearest", "down"}:
+        raise QueueRecoveryAdapterError("duration snap candidates are invalid.")
+    safe_candidates = {}
+    candidate_fields = {
+        "requested_published_frames", "candidate_published_frames",
+        "segment_count", "generated_frames", "segment_published_frames",
+        "confidence", "applied", "reason",
+    }
+    for mode in ("nearest", "down"):
+        candidate = candidates.get(mode)
+        if not isinstance(candidate, Mapping) or set(candidate) != candidate_fields:
+            raise QueueRecoveryAdapterError("duration snap candidate is invalid.")
+        requested = positive_integer(
+            candidate.get("requested_published_frames"),
+            f"duration {mode} requested frames",
+        )
+        selected = candidate.get("candidate_published_frames")
+        count = candidate.get("segment_count")
+        if selected is not None:
+            selected = positive_integer(selected, f"duration {mode} candidate frames")
+        if count is not None:
+            count = positive_integer(count, f"duration {mode} segment count")
+        generated = candidate.get("generated_frames")
+        published = candidate.get("segment_published_frames")
+        if not isinstance(generated, list) or not isinstance(published, list):
+            raise QueueRecoveryAdapterError("duration snap geometry is invalid.")
+        generated = [
+            positive_integer(child, f"duration {mode} generated frame")
+            for child in generated
+        ]
+        published = [
+            positive_integer(child, f"duration {mode} published frame")
+            for child in published
+        ]
+        if len(generated) != len(published):
+            raise QueueRecoveryAdapterError("duration snap geometry is invalid.")
+        confidence = candidate.get("confidence")
+        if confidence not in {"high", "low", "unavailable"}:
+            raise QueueRecoveryAdapterError("duration snap confidence is invalid.")
+        if not isinstance(candidate.get("applied"), bool):
+            raise QueueRecoveryAdapterError("duration snap applied flag is invalid.")
+        safe_candidates[mode] = {
+            "requested_published_frames": requested,
+            "candidate_published_frames": selected,
+            "segment_count": count,
+            "generated_frames": generated,
+            "segment_published_frames": published,
+            "confidence": confidence,
+            "applied": candidate["applied"],
+            "reason": _safe_json(
+                candidate.get("reason"), path=f"duration.{mode}.reason"
+            ),
+        }
+    result["snap_candidates"] = safe_candidates
+
+    duration_segments = value.get("segments")
+    segment_fields = {
+        "index", "published_frames", "min_published_frames",
+        "max_published_frames", "grid_step", "grid_offset",
+        "authored_locked", "completed_locked", "lock_reason",
+    }
+    if not isinstance(duration_segments, list):
+        raise QueueRecoveryAdapterError("duration plan segments are invalid.")
+    safe_segments = []
+    for segment in duration_segments:
+        if not isinstance(segment, Mapping) or set(segment) != segment_fields:
+            raise QueueRecoveryAdapterError("duration plan segment is invalid.")
+        lock_reason = segment.get("lock_reason")
+        if lock_reason not in {None, "authored", "completed", "authored, completed"}:
+            raise QueueRecoveryAdapterError("duration lock reason is invalid.")
+        if not isinstance(segment.get("authored_locked"), bool) or not isinstance(
+            segment.get("completed_locked"), bool
+        ):
+            raise QueueRecoveryAdapterError("duration lock flag is invalid.")
+        offset = segment.get("grid_offset")
+        if type(offset) is not int or offset < 0:
+            raise QueueRecoveryAdapterError("duration grid offset is invalid.")
+        safe_segments.append({
+            "index": positive_integer(segment.get("index"), "duration segment index"),
+            "published_frames": positive_integer(
+                segment.get("published_frames"), "duration segment frames"
+            ),
+            "min_published_frames": positive_integer(
+                segment.get("min_published_frames"), "duration segment minimum"
+            ),
+            "max_published_frames": positive_integer(
+                segment.get("max_published_frames"), "duration segment maximum"
+            ),
+            "grid_step": positive_integer(segment.get("grid_step"), "duration grid step"),
+            "grid_offset": offset,
+            "authored_locked": segment["authored_locked"],
+            "completed_locked": segment["completed_locked"],
+            "lock_reason": lock_reason,
+        })
+    result["segments"] = safe_segments
+    redistribution = value.get("redistribution_mode")
+    if redistribution not in {"none", "next", "future"}:
+        raise QueueRecoveryAdapterError("duration redistribution is invalid.")
+    outcome = value.get("outcome")
+    if outcome not in {"exact", "acceptable", "insufficient_capacity"}:
+        raise QueueRecoveryAdapterError("duration outcome is invalid.")
+    residual = value.get("residual_published_frames")
+    if type(residual) is not int:
+        raise QueueRecoveryAdapterError("duration residual is invalid.")
+    result.update({
+        "redistribution_mode": redistribution,
+        "outcome": outcome,
+        "reason": _safe_json(value.get("reason"), path="duration.reason"),
+        "residual_published_frames": residual,
+    })
+    return result
+
+
 def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
     """Retain restart/UI structure without implicitly persisting prompt previews."""
     if not isinstance(value, Mapping):
@@ -470,7 +633,7 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
         "published_frames",
         "adaptive_conditioning", "checkpoint_switches",
         "effective_model_count", "effective_models", "segments",
-        "checkpoint_options",
+        "checkpoint_options", "duration_plan",
     }
     allowed_segment = {
         "index", "frames", "duration_seconds",
@@ -478,6 +641,9 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
         "generated_duration_seconds", "published_duration_seconds",
         "model_type", "model_reason",
         "edge_anchor_locked", "switch_from_previous", "boundary_from_previous",
+        "duration_min_published_frames", "duration_max_published_frames",
+        "duration_grid_step", "duration_grid_offset", "authored_locked",
+        "completed_locked", "lock_reason",
     }
 
     def positive_number(child: Any, *, path: str) -> int | float:
@@ -497,6 +663,8 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
         path = f"job.h3_segment_plan.{key}"
         if key == "checkpoint_options":
             result[key] = _safe_h3_checkpoint_options(child)
+        elif key == "duration_plan":
+            result[key] = _safe_h3_duration_plan(child)
         elif key in {"fps"}:
             result[key] = positive_number(child, path=path)
         elif key in {"published_frames"}:
@@ -527,6 +695,199 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
             safe_segments.append(safe_segment)
         result["segments"] = safe_segments
     return result
+
+
+def _safe_credit_queue(value: Any) -> dict[str, Any]:
+    """Validate the exact content-free scheduler decision envelope."""
+    expected = {
+        "schema_version",
+        "realm",
+        "enforcement_enabled",
+        "metering_applied",
+        "decision",
+        "requested_units_positive",
+        "queue_band",
+        "reservation_state",
+        "reservation_revision",
+        "revalidation_state",
+        "allowance_revision",
+        "allowance_observed_at",
+        "transition_id",
+        "transition_history",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise QueueRecoveryAdapterError("job.credit_queue schema is invalid.")
+    decision = value["decision"]
+    requested_units_positive = value["requested_units_positive"]
+    queue_band = value["queue_band"]
+    reservation_state = value["reservation_state"]
+    reservation_revision = value["reservation_revision"]
+    revalidation_state = value["revalidation_state"]
+    allowance_revision = value["allowance_revision"]
+    allowance_observed_at = value["allowance_observed_at"]
+    transition_id = value["transition_id"]
+    transition_history = value["transition_history"]
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or not isinstance(value["realm"], str)
+        or value["realm"] not in {"local", "lan", "hosted"}
+        or type(value["enforcement_enabled"]) is not bool
+        or type(value["metering_applied"]) is not bool
+        or not isinstance(decision, str)
+        or decision not in _CREDIT_QUEUE_DECISIONS
+        or type(requested_units_positive) is not bool
+        or type(queue_band) is not int
+        or queue_band not in {-1, 0, 1}
+        or (
+            reservation_state is not None
+            and (
+                not isinstance(reservation_state, str)
+                or reservation_state not in _CREDIT_RESERVATION_STATES
+            )
+        )
+        or (
+            reservation_revision is not None
+            and (
+                not isinstance(reservation_revision, str)
+                or _CREDIT_FINGERPRINT_RE.fullmatch(reservation_revision) is None
+            )
+        )
+        or (reservation_state is None) != (reservation_revision is None)
+        or (
+            revalidation_state is not None
+            and (
+                not isinstance(revalidation_state, str)
+                or revalidation_state not in _CREDIT_REVALIDATION_STATES
+            )
+        )
+        or not isinstance(allowance_revision, str)
+        or _CREDIT_FINGERPRINT_RE.fullmatch(allowance_revision) is None
+        or _safe_credit_allowance_observed_at(allowance_observed_at) is None
+        or not isinstance(transition_id, str)
+        or _CREDIT_TRANSITION_RE.fullmatch(transition_id) is None
+        or not isinstance(transition_history, list)
+        or not 1 <= len(transition_history) <= _MAX_CREDIT_TRANSITION_HISTORY
+    ):
+        raise QueueRecoveryAdapterError("job.credit_queue is invalid.")
+
+    seen_transition_ids: set[str] = set()
+    for item in transition_history:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or _CREDIT_TRANSITION_RE.fullmatch(item[0]) is None
+            or not isinstance(item[1], str)
+            or _CREDIT_FINGERPRINT_RE.fullmatch(item[1]) is None
+            or item[0] in seen_transition_ids
+        ):
+            raise QueueRecoveryAdapterError(
+                "job.credit_queue transition history is invalid.",
+            )
+        seen_transition_ids.add(item[0])
+    if transition_history[-1][0] != transition_id:
+        raise QueueRecoveryAdapterError(
+            "job.credit_queue transition history is inconsistent.",
+        )
+
+    if value["metering_applied"] is False:
+        valid = (
+            queue_band == 0
+            and reservation_state is None
+            and revalidation_state is None
+            and (
+                (
+                    value["realm"] in {"local", "lan"}
+                    and decision == "unmetered_realm"
+                )
+                or (
+                    value["realm"] == "hosted"
+                    and value["enforcement_enabled"] is False
+                    and decision == "hosted_baseline"
+                )
+            )
+        )
+    elif (
+        value["realm"] != "hosted"
+        or value["enforcement_enabled"] is not True
+        or value["metering_applied"] is not True
+    ):
+        valid = False
+    elif decision == "capability_excluded":
+        valid = (
+            queue_band == 0
+            and reservation_state is None
+            and revalidation_state is None
+        )
+    elif decision == "hosted_baseline":
+        valid = (
+            queue_band == (-1 if requested_units_positive else 0)
+            and reservation_state is None
+            and revalidation_state is None
+        )
+    else:
+        active = (
+            requested_units_positive
+            and reservation_state in {"reserved", "consumed"}
+            and revalidation_state in {None, "valid"}
+        )
+        released = (
+            reservation_state == "released"
+            and revalidation_state in {None, "released"}
+        )
+        downgraded = (
+            reservation_state in {"reserved", "consumed"}
+            and revalidation_state == "downgraded"
+        )
+        valid = requested_units_positive and (active or released or downgraded)
+        if valid:
+            valid = queue_band == (1 if active else -1)
+    if not valid:
+        raise QueueRecoveryAdapterError(
+            "job.credit_queue decision is inconsistent.",
+        )
+    fingerprint_payload = {
+        key: value[key]
+        for key in (
+            "schema_version",
+            "realm",
+            "enforcement_enabled",
+            "metering_applied",
+            "decision",
+            "requested_units_positive",
+            "queue_band",
+            "reservation_state",
+            "reservation_revision",
+            "revalidation_state",
+            "allowance_revision",
+            "allowance_observed_at",
+        )
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii"),
+    ).hexdigest()
+    if transition_history[-1][1] != fingerprint:
+        raise QueueRecoveryAdapterError(
+            "job.credit_queue transition fingerprint is inconsistent.",
+        )
+    return dict(value)
+
+
+def _safe_credit_allowance_observed_at(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def serialize_job(
@@ -607,6 +968,8 @@ def serialize_job(
                 raise QueueRecoveryAdapterError(
                     "job.h3_offload_plan is invalid."
                 ) from error
+        elif key == "credit_queue":
+            result[key] = _safe_credit_queue(value)
         elif key == "resource_intent":
             if value not in _RESOURCE_INTENTS:
                 raise QueueRecoveryAdapterError(
@@ -904,7 +1267,7 @@ def _validated_recovered_state(
 
 def _durable_order_key(
     snapshot: Mapping[str, Any], sequence: int,
-) -> tuple[bool, int, int, float, int]:
+) -> tuple[bool, int, int, int, int, float, int]:
     try:
         priority = int(snapshot.get("queue_priority", 0) or 0)
     except (TypeError, ValueError):
@@ -917,13 +1280,16 @@ def _durable_order_key(
         created = float(snapshot.get("created_at", 0) or 0)
     except (TypeError, ValueError):
         created = 0.0
-    return (
-        bool(snapshot.get("source_remote", False)),
-        -priority,
-        -manual,
-        created,
-        sequence,
+    credit_queue = snapshot.get("credit_queue")
+    credit_band = (
+        int(credit_queue.get("queue_band", 0))
+        if isinstance(credit_queue, Mapping)
+        else 0
     )
+    remote = bool(snapshot.get("source_remote", False))
+    if manual:
+        return (remote, 0, 0, -priority, -manual, created, sequence)
+    return (remote, 1, -credit_band, -priority, 0, created, sequence)
 
 
 class QueueRecoveryCoordinator:

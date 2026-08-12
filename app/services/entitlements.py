@@ -12,7 +12,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -46,6 +46,8 @@ EVENT_KINDS = frozenset({
     "chargeback",
     "recurring_canceled",
     "fulfillment_set",
+    "account_link_verified",
+    "account_link_revoked",
 })
 FUNDING_KINDS = frozenset({
     "one_time_contribution", "recurring_started", "recurring_renewed",
@@ -55,6 +57,9 @@ RECURRING_KINDS = frozenset({
     "recurring_started", "recurring_renewed", "recurring_canceled",
 })
 FULFILLMENT_STATES = frozenset({"pending", "complete", "declined"})
+ACCOUNT_LINK_KINDS = frozenset({
+    "account_link_verified", "account_link_revoked",
+})
 _OPAQUE_KEY_RE = re.compile(r"key_[0-9a-f]{64}\Z")
 _PROVIDER_RE = re.compile(r"[a-z][a-z0-9_]{1,47}\Z")
 _ITEM_RE = re.compile(r"[a-z][a-z0-9_]{1,63}\Z")
@@ -248,10 +253,39 @@ class TierRule:
 
 
 @dataclass(frozen=True, slots=True)
+class AllowanceRule:
+    minimum_minor: int
+    allowance_units: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedAllowancePolicy:
+    unit: str
+    free_allowance_units: int
+    one_time_rules: tuple[AllowanceRule, ...]
+    recurring_rules: tuple[AllowanceRule, ...]
+    one_time_cap_units: int
+    one_time_validity_seconds: int
+    recurring_validity_seconds: int
+
+
+DEFAULT_RECORDED_ALLOWANCE_POLICY = RecordedAllowancePolicy(
+    unit="compute_seconds",
+    free_allowance_units=0,
+    one_time_rules=(),
+    recurring_rules=(),
+    one_time_cap_units=0,
+    one_time_validity_seconds=0,
+    recurring_validity_seconds=0,
+)
+
+
+@dataclass(frozen=True, slots=True)
 class BenefitPolicy:
     currency: str
     one_time_rules: tuple[TierRule, ...]
     recurring_rules: tuple[TierRule, ...]
+    allowance_policy: RecordedAllowancePolicy = DEFAULT_RECORDED_ALLOWANCE_POLICY
 
 
 DEFAULT_BENEFIT_POLICY = BenefitPolicy(
@@ -419,9 +453,22 @@ def _normalize_draft(draft: ContributionEventDraft) -> dict[str, Any]:
             raise EntitlementError("adjustments require an amount and related event")
     if draft.kind in RECURRING_KINDS and draft.contract_key is None:
         raise EntitlementError("recurring events require an opaque contract key")
-    if draft.kind in {"recurring_canceled", "fulfillment_set"} and draft.amount_minor:
+    if draft.kind in {
+        "recurring_canceled", "fulfillment_set", *ACCOUNT_LINK_KINDS,
+    } and draft.amount_minor:
         raise EntitlementError(f"{draft.kind} cannot carry money")
-    if draft.kind == "fulfillment_set":
+    if draft.kind in ACCOUNT_LINK_KINDS:
+        if (
+            draft.related_event_key is None
+            or draft.contract_key is None
+            or draft.fulfillment_item is not None
+            or draft.fulfillment_status is not None
+            or draft.actor_key is not None
+        ):
+            raise EntitlementError(
+                "account link events require opaque provider and account subjects"
+            )
+    elif draft.kind == "fulfillment_set":
         if (
             not isinstance(draft.fulfillment_item, str)
             or _ITEM_RE.fullmatch(draft.fulfillment_item) is None
@@ -454,6 +501,283 @@ def _tier(rules: Sequence[TierRule], amount_minor: int) -> TierRule | None:
         if amount_minor >= rule.minimum_minor:
             selected = rule
     return selected
+
+
+def _allowance_units(
+    rules: Sequence[AllowanceRule], amount_minor: int,
+) -> int:
+    selected = 0
+    for rule in rules:
+        if amount_minor >= rule.minimum_minor:
+            selected = rule.allowance_units
+    return selected
+
+
+def _events_for_subject(
+    events: Sequence[ContributionEvent],
+    subject_key: str,
+    *,
+    as_of: datetime,
+) -> tuple[ContributionEvent, ...]:
+    """Resolve provider subjects to one current account without rewriting history."""
+
+    link_events: dict[tuple[str, str], list[ContributionEvent]] = defaultdict(list)
+    for event in events:
+        if (
+            event.kind not in ACCOUNT_LINK_KINDS
+            or event.related_event_key is None
+            or _as_utc(event.occurred_at) > as_of
+        ):
+            continue
+        link_events[(event.provider, event.related_event_key)].append(event)
+    active_links: dict[tuple[str, str], ContributionEvent] = {}
+    for key, items in link_events.items():
+        current: ContributionEvent | None = None
+        for event in sorted(
+            items, key=lambda item: (_as_utc(item.occurred_at), item.sequence),
+        ):
+            if event.kind == "account_link_verified":
+                # Transfers require an explicit revocation of the current owner.
+                if current is None or current.subject_key == event.subject_key:
+                    current = event
+            elif current is not None and current.subject_key == event.subject_key:
+                current = None
+        if current is not None:
+            active_links[key] = current
+    active_provider_subjects = {
+        key for key, event in active_links.items()
+        if event.subject_key == subject_key
+    }
+    selected = {
+        event.event_id: event
+        for event in events
+        if event.subject_key == subject_key
+        and _as_utc(event.occurred_at) <= as_of
+    }
+    selected.update({
+        event.event_id: event
+        for event in events
+        if event.kind not in ACCOUNT_LINK_KINDS
+        and (event.provider, event.subject_key) in active_provider_subjects
+        and _as_utc(event.occurred_at) <= as_of
+    })
+    return tuple(sorted(selected.values(), key=lambda event: event.sequence))
+
+
+def _validate_link_transitions(events: Sequence[ContributionEvent]) -> None:
+    grouped: dict[tuple[str, str], list[ContributionEvent]] = defaultdict(list)
+    for event in events:
+        if event.kind in ACCOUNT_LINK_KINDS and event.related_event_key:
+            grouped[(event.provider, event.related_event_key)].append(event)
+    for items in grouped.values():
+        owner: str | None = None
+        for event in sorted(
+            items, key=lambda item: (_as_utc(item.occurred_at), item.sequence),
+        ):
+            if event.kind == "account_link_verified":
+                if owner is not None and owner != event.subject_key:
+                    raise EntitlementError(
+                        "account link transfer requires an owner revocation"
+                    )
+                owner = event.subject_key
+            elif owner != event.subject_key:
+                raise EntitlementError(
+                    "account link revocation must match the current owner"
+                )
+            else:
+                owner = None
+
+
+def _recorded_allowance_projection(
+    events: Sequence[ContributionEvent],
+    *,
+    policy: RecordedAllowancePolicy,
+    currency: str,
+    as_of: datetime,
+) -> dict[str, Any]:
+    numeric_values = (
+        policy.free_allowance_units,
+        policy.one_time_cap_units,
+        policy.one_time_validity_seconds,
+        policy.recurring_validity_seconds,
+    )
+    rules = (*policy.one_time_rules, *policy.recurring_rules)
+    if (
+        not isinstance(policy.unit, str)
+        or _ITEM_RE.fullmatch(policy.unit) is None
+        or any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            for value in numeric_values
+        )
+        or any(
+            not isinstance(rule, AllowanceRule)
+            or not isinstance(rule.minimum_minor, int)
+            or isinstance(rule.minimum_minor, bool)
+            or rule.minimum_minor <= 0
+            or not isinstance(rule.allowance_units, int)
+            or isinstance(rule.allowance_units, bool)
+            or rule.allowance_units < 0
+            for rule in rules
+        )
+    ):
+        raise EntitlementError("recorded allowance policy is invalid")
+
+    funding = {
+        (event.provider, event.source_event_key): event
+        for event in events
+        if event.kind in FUNDING_KINDS
+        and event.currency == currency
+        and _as_utc(event.occurred_at) <= as_of
+    }
+    adjustments: dict[tuple[str, str], int] = defaultdict(int)
+    for event in events:
+        if event.kind not in ADJUSTMENT_KINDS or _as_utc(event.occurred_at) > as_of:
+            continue
+        target_key = (event.provider, event.related_event_key or "")
+        target = funding.get(target_key)
+        if (
+            target is not None
+            and target.subject_key == event.subject_key
+            and target.currency == event.currency
+        ):
+            adjustments[target_key] += event.amount_minor
+
+    sources: list[dict[str, Any]] = [{
+        "source": "free",
+        "source_event_id": None,
+        "granted_allowance": policy.free_allowance_units,
+        "effective_allowance": policy.free_allowance_units,
+        "expires_at": None,
+        "status": (
+            "active" if policy.free_allowance_units > 0 else "inactive"
+        ),
+        "refund_state": "not_applicable",
+    }]
+    one_time_remaining = policy.one_time_cap_units
+    one_time_events = sorted(
+        (
+            event for event in funding.values()
+            if event.kind == "one_time_contribution"
+        ),
+        key=lambda event: (_as_utc(event.occurred_at), event.sequence),
+    )
+    for event in one_time_events:
+        key = (event.provider, event.source_event_key)
+        adjusted = adjustments.get(key, 0)
+        net_minor = max(0, event.amount_minor - adjusted)
+        granted = _allowance_units(policy.one_time_rules, event.amount_minor)
+        refundable = _allowance_units(policy.one_time_rules, net_minor)
+        expires = (
+            _as_utc(event.occurred_at)
+            + timedelta(seconds=policy.one_time_validity_seconds)
+            if policy.one_time_validity_seconds > 0
+            else None
+        )
+        before_cap = refundable if expires is None or as_of < expires else 0
+        effective = min(before_cap, one_time_remaining)
+        one_time_remaining -= effective
+        if granted == 0:
+            status = "inactive"
+        elif adjusted >= event.amount_minor:
+            status = "refunded"
+        elif expires is not None and as_of >= expires:
+            status = "expired"
+        elif effective < before_cap:
+            status = "capped"
+        else:
+            status = "active"
+        sources.append({
+            "source": "one_time_support",
+            "source_event_id": event.event_id,
+            "granted_allowance": granted,
+            "effective_allowance": effective,
+            "expires_at": None if expires is None else _iso_utc(expires),
+            "status": status,
+            "refund_state": (
+                "none" if adjusted == 0
+                else "partial" if adjusted < event.amount_minor
+                else "full" if adjusted == event.amount_minor
+                else "excess"
+            ),
+        })
+
+    contract_events: dict[tuple[str, str], list[ContributionEvent]] = defaultdict(list)
+    for event in events:
+        if (
+            event.kind in RECURRING_KINDS
+            and event.contract_key
+            and (
+                event.kind == "recurring_canceled"
+                or event.currency == currency
+            )
+            and _as_utc(event.occurred_at) <= as_of
+        ):
+            contract_events[(event.provider, event.contract_key)].append(event)
+    for items in contract_events.values():
+        latest = max(
+            items, key=lambda event: (_as_utc(event.occurred_at), event.sequence),
+        )
+        funding_events = [event for event in items if event.kind in FUNDING_KINDS]
+        if not funding_events:
+            continue
+        source = max(
+            funding_events,
+            key=lambda event: (_as_utc(event.occurred_at), event.sequence),
+        )
+        key = (source.provider, source.source_event_key)
+        adjusted = adjustments.get(key, 0)
+        net_minor = max(0, source.amount_minor - adjusted)
+        granted = _allowance_units(policy.recurring_rules, source.amount_minor)
+        refundable = _allowance_units(policy.recurring_rules, net_minor)
+        expires = (
+            _as_utc(source.occurred_at)
+            + timedelta(seconds=policy.recurring_validity_seconds)
+            if policy.recurring_validity_seconds > 0
+            else None
+        )
+        canceled = latest.kind == "recurring_canceled"
+        effective = (
+            0
+            if canceled or (expires is not None and as_of >= expires)
+            else refundable
+        )
+        if granted == 0:
+            status = "inactive"
+        elif adjusted >= source.amount_minor:
+            status = "refunded"
+        elif canceled:
+            status = "canceled"
+        elif expires is not None and as_of >= expires:
+            status = "expired"
+        else:
+            status = "active"
+        sources.append({
+            "source": "recurring_support",
+            "source_event_id": source.event_id,
+            "granted_allowance": granted,
+            "effective_allowance": effective,
+            "expires_at": None if expires is None else _iso_utc(expires),
+            "status": status,
+            "refund_state": (
+                "none" if adjusted == 0
+                else "partial" if adjusted < source.amount_minor
+                else "full" if adjusted == source.amount_minor
+                else "excess"
+            ),
+        })
+
+    return {
+        "state": "recorded_not_enforced",
+        "enforcement_enabled": False,
+        "unit": policy.unit,
+        "as_of": _iso_utc(as_of),
+        "effective_allowance": sum(
+            source["effective_allowance"] for source in sources
+        ),
+        "sources": sources,
+    }
 
 
 class ContributionLedger:
@@ -601,6 +925,12 @@ class ContributionLedger:
             identities.add((event.provider, event.source_event_key))
             previous = event.event_hmac
             events.append(event)
+        try:
+            _validate_link_transitions(events)
+        except EntitlementError as error:
+            raise LedgerIntegrityError(
+                "stored account link transition is invalid"
+            ) from error
         return tuple(events)
 
     def _write_unlocked(self, events: Sequence[ContributionEvent]) -> None:
@@ -642,6 +972,19 @@ class ContributionLedger:
     def events(self) -> tuple[ContributionEvent, ...]:
         with self._locked():
             return self._read_unlocked()
+
+    def event_for_source(
+        self, provider: str, source_event_key: str,
+    ) -> ContributionEvent | None:
+        if not isinstance(provider, str) or _PROVIDER_RE.fullmatch(provider) is None:
+            raise EntitlementError("provider identifier is invalid")
+        _validate_opaque(source_event_key, name="source event", required=True)
+        with self._locked():
+            return next((
+                event for event in self._read_unlocked()
+                if event.provider == provider
+                and event.source_event_key == source_event_key
+            ), None)
 
     def append(
         self,
@@ -687,6 +1030,7 @@ class ContributionLedger:
                 event_hmac=self._event_hmac(unsigned),
             )
             events.append(event)
+            _validate_link_transitions(events)
             self._write_unlocked(events)
             return event
 
@@ -695,26 +1039,42 @@ class ContributionLedger:
         subject_key: str,
         *,
         policy: BenefitPolicy = DEFAULT_BENEFIT_POLICY,
+        as_of: datetime | str | None = None,
     ) -> dict[str, Any]:
         _validate_opaque(subject_key, name="subject", required=True)
-        events = tuple(
-            event for event in self.events() if event.subject_key == subject_key
+        projected_at = _as_utc(as_of or datetime.now(timezone.utc))
+        events = _events_for_subject(
+            self.events(), subject_key, as_of=projected_at,
         )
-        return _project_events(events, policy=policy, admin=False)
+        return _project_events(
+            events,
+            policy=policy,
+            admin=False,
+            as_of=projected_at,
+            projection_subject_key=subject_key,
+        )
 
     def reauthenticated_admin_projection(
         self,
         subject_key: str,
         *,
         policy: BenefitPolicy = DEFAULT_BENEFIT_POLICY,
+        as_of: datetime | str | None = None,
     ) -> dict[str, Any]:
         """Return opaque reconciliation fields after route-level reauth."""
 
         _validate_opaque(subject_key, name="subject", required=True)
-        events = tuple(
-            event for event in self.events() if event.subject_key == subject_key
+        projected_at = _as_utc(as_of or datetime.now(timezone.utc))
+        events = _events_for_subject(
+            self.events(), subject_key, as_of=projected_at,
         )
-        return _project_events(events, policy=policy, admin=True)
+        return _project_events(
+            events,
+            policy=policy,
+            admin=True,
+            as_of=projected_at,
+            projection_subject_key=subject_key,
+        )
 
 
 def _project_events(
@@ -722,6 +1082,8 @@ def _project_events(
     *,
     policy: BenefitPolicy,
     admin: bool,
+    as_of: datetime,
+    projection_subject_key: str,
 ) -> dict[str, Any]:
     funding = {
         (event.provider, event.source_event_key): event
@@ -830,12 +1192,18 @@ def _project_events(
         "recurring_tier": None if recurring_rule is None else recurring_rule.tier,
         "active_recurring_count": len(active_contracts),
         "benefit_eligibility": list(benefits),
+        "recorded_allowance": _recorded_allowance_projection(
+            events,
+            policy=policy.allowance_policy,
+            currency=policy.currency,
+            as_of=as_of,
+        ),
         "fulfillment": fulfillment,
         "event_count": len(events),
     }
     if admin:
         result.update({
-            "subject_key": events[0].subject_key if events else None,
+            "subject_key": projection_subject_key,
             "unresolved": unresolved,
             "audit": [
                 {

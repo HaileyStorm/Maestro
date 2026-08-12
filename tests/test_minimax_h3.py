@@ -147,6 +147,12 @@ def _w4a8_admission_namespace():
         "_normalize_video_prompt_type": lambda body: None,
         "_normalize_image_prompt_type": lambda body: None,
         "_jobs": {},
+        "_credit_prepare_admission": lambda job: None,
+        "_credit_prepare_dispatch": lambda job: None,
+        "_credit_block_runtime_error": lambda job: None,
+        "_CREDIT_INTERNAL_PARAMS": frozenset(),
+        "CreditRuntimeError": ValueError,
+        "EntitlementError": ValueError,
         "is_cancel_requested": lambda job: False,
         "update_preparation_job": lambda job, **updates: True,
         "fail_preparation": (
@@ -986,6 +992,29 @@ class TestMiniMaxH3RuntimeSource(unittest.TestCase):
         self.assertIn("audio_sampling_rate\": 32000", main)
         self.assertIn("MINIMAX_H3_KEYFRAME_ENCODE_SEED", main)
         self.assertIn("prepare_keyframe_image", main)
+
+    def test_native_preview_reuses_the_final_video_decode_recipe(self):
+        main = _read(_MAIN_PATH)
+        helper = main.split("def _decode_h3_video_rows", 1)[1].split(
+            "def _first_path", 1
+        )[0]
+        preview = main.split("def decode_h3_preview_rows", 1)[1].split(
+            "def _encode_keyframes", 1
+        )[0]
+        final_decode = main.split('report_phase("Decoding H3 video")', 1)[1].split(
+            'report_phase("Decoding H3 audio")', 1
+        )[0]
+
+        self.assertIn("unpatchify_video_tokens(", helper)
+        self.assertIn("VIDEO_LATENTS_MEAN", helper)
+        self.assertIn("VIDEO_LATENTS_STD", helper)
+        self.assertIn("vae.decode(denormalized_latents", helper)
+        self.assertIn("MINIMAX_H3_PIXEL_MEAN", helper)
+        self.assertIn("MINIMAX_H3_PIXEL_STD", helper)
+        self.assertIn("_decode_h3_video_rows(", preview)
+        self.assertIn("_decode_h3_video_rows(", final_decode)
+        self.assertNotIn("vae.decode(", preview)
+        self.assertNotIn("vae.decode(", final_decode)
 
     def test_consumer_checkpoint_shapes_are_kept_native(self):
         transformer = _read(_TRANSFORMER_PATH)

@@ -19,9 +19,10 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from services.entitlements import (
+    ACCOUNT_LINK_KINDS,
     ContributionEvent,
     ContributionEventDraft,
     ContributionLedger,
@@ -38,10 +39,11 @@ DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 300
 DEFAULT_REPLAY_RETENTION_SECONDS = 24 * 60 * 60
 REPLAY_SCHEMA_VERSION = 1
 _SIGNATURE_RE = re.compile(r"v1=([0-9a-f]{64})\Z")
+_OPAQUE_KEY_RE = re.compile(r"key_[0-9a-f]{64}\Z")
 _PAYLOAD_KEYS = frozenset({
     "event_id", "subject_id", "kind", "occurred_at", "amount_minor",
     "currency", "contract_id", "related_event_id", "fulfillment_item",
-    "fulfillment_status", "actor_id",
+    "fulfillment_status", "actor_id", "account_id",
 })
 
 
@@ -137,12 +139,22 @@ class SupportWebhookAdapter(Protocol):
     provider_id: str
     production_ready: bool
 
+    def verified_event_identity(
+        self,
+        raw_body: bytes,
+        headers: Mapping[str, str],
+        *,
+        received_at: datetime | str,
+    ) -> tuple[str, str]:
+        ...
+
     def verify_and_translate(
         self,
         raw_body: bytes,
         headers: Mapping[str, str],
         *,
         received_at: datetime | str,
+        recorded_event: ContributionEvent | None = None,
     ) -> ContributionEventDraft:
         ...
 
@@ -164,6 +176,9 @@ class FakeSignedWebhookAdapter:
 
     signing_secret: bytes = field(repr=False)
     identity_secret: bytes = field(repr=False)
+    account_link_resolver: Callable[[str, str, str], str | None] | None = field(
+        default=None, repr=False,
+    )
     provider_id: str = "fake_support"
     timestamp_tolerance_seconds: int = DEFAULT_TIMESTAMP_TOLERANCE_SECONDS
     production_ready: bool = False
@@ -181,6 +196,10 @@ class FakeSignedWebhookAdapter:
             raise SupportWebhookError("webhook provider identifier is invalid")
         if not 30 <= self.timestamp_tolerance_seconds <= 3_600:
             raise SupportWebhookError("webhook timestamp tolerance is invalid")
+        if self.account_link_resolver is not None and not callable(
+            self.account_link_resolver
+        ):
+            raise SupportWebhookError("account link resolver is invalid")
 
     def signature(self, raw_body: bytes, timestamp: int) -> str:
         signed = str(timestamp).encode("ascii") + b"." + raw_body
@@ -194,13 +213,13 @@ class FakeSignedWebhookAdapter:
             "x-maestro-support-signature": self.signature(raw_body, timestamp),
         }
 
-    def verify_and_translate(
+    def _verified_payload(
         self,
         raw_body: bytes,
         headers: Mapping[str, str],
         *,
         received_at: datetime | str,
-    ) -> ContributionEventDraft:
+    ) -> dict[str, Any]:
         if (
             not isinstance(raw_body, bytes)
             or not raw_body
@@ -231,7 +250,7 @@ class FakeSignedWebhookAdapter:
         for key in (
             "event_id", "subject_id", "kind", "occurred_at", "contract_id",
             "related_event_id", "fulfillment_item", "fulfillment_status",
-            "actor_id", "currency",
+            "actor_id", "currency", "account_id",
         ):
             if key in payload and (
                 not isinstance(payload[key], str) or not 1 <= len(payload[key]) <= 1_024
@@ -240,6 +259,72 @@ class FakeSignedWebhookAdapter:
         amount = payload.get("amount_minor", 0)
         if not isinstance(amount, int) or isinstance(amount, bool):
             raise WebhookPayloadError("webhook amount_minor is invalid")
+        is_account_link = payload["kind"] in ACCOUNT_LINK_KINDS
+        if is_account_link != ("account_id" in payload):
+            raise WebhookPayloadError(
+                "webhook account_id is reserved for account link events"
+            )
+        return payload
+
+    def verified_event_identity(
+        self,
+        raw_body: bytes,
+        headers: Mapping[str, str],
+        *,
+        received_at: datetime | str,
+    ) -> tuple[str, str]:
+        payload = self._verified_payload(
+            raw_body, headers, received_at=received_at,
+        )
+        return self.provider_id, opaque_key(
+            f"{self.provider_id}_event",
+            payload["event_id"],
+            self.identity_secret,
+        )
+
+    def verify_and_translate(
+        self,
+        raw_body: bytes,
+        headers: Mapping[str, str],
+        *,
+        received_at: datetime | str,
+        recorded_event: ContributionEvent | None = None,
+    ) -> ContributionEventDraft:
+        payload = self._verified_payload(
+            raw_body, headers, received_at=received_at,
+        )
+        amount = payload.get("amount_minor", 0)
+        is_account_link = payload["kind"] in ACCOUNT_LINK_KINDS
+        account_subject = None
+        if is_account_link:
+            if (
+                recorded_event is not None
+                and recorded_event.provider == self.provider_id
+                and recorded_event.kind == payload["kind"]
+            ):
+                account_subject = recorded_event.subject_key
+            elif self.account_link_resolver is None:
+                raise WebhookPayloadError(
+                    "webhook account link requires server verification"
+                )
+            else:
+                try:
+                    account_subject = self.account_link_resolver(
+                        self.provider_id,
+                        payload["subject_id"],
+                        payload["account_id"],
+                    )
+                except Exception as error:
+                    raise WebhookPayloadError(
+                        "webhook account link verification failed"
+                    ) from error
+            if (
+                not isinstance(account_subject, str)
+                or _OPAQUE_KEY_RE.fullmatch(account_subject) is None
+            ):
+                raise WebhookPayloadError(
+                    "webhook account link verification failed"
+                )
 
         def optional_key(namespace: str, field: str) -> str | None:
             value = payload.get(field)
@@ -248,6 +333,11 @@ class FakeSignedWebhookAdapter:
             )
 
         try:
+            provider_subject = opaque_key(
+                f"{self.provider_id}_subject",
+                payload["subject_id"],
+                self.identity_secret,
+            )
             return ContributionEventDraft(
                 provider=self.provider_id,
                 source_event_key=opaque_key(
@@ -255,20 +345,29 @@ class FakeSignedWebhookAdapter:
                     payload["event_id"],
                     self.identity_secret,
                 ),
-                subject_key=opaque_key(
-                    f"{self.provider_id}_subject",
-                    payload["subject_id"],
-                    self.identity_secret,
+                subject_key=(
+                    account_subject
+                    if is_account_link else provider_subject
                 ),
                 kind=payload["kind"],
                 occurred_at=payload["occurred_at"],
                 amount_minor=amount,
                 currency=payload.get("currency", "USD"),
-                contract_key=optional_key(
-                    f"{self.provider_id}_contract", "contract_id",
+                contract_key=(
+                    opaque_key(
+                        "maestro_account_claim",
+                        payload["account_id"],
+                        self.identity_secret,
+                    )
+                    if is_account_link else optional_key(
+                        f"{self.provider_id}_contract", "contract_id",
+                    )
                 ),
-                related_event_key=optional_key(
-                    f"{self.provider_id}_event", "related_event_id",
+                related_event_key=(
+                    provider_subject
+                    if is_account_link else optional_key(
+                        f"{self.provider_id}_event", "related_event_id",
+                    )
                 ),
                 fulfillment_item=payload.get("fulfillment_item"),
                 fulfillment_status=payload.get("fulfillment_status"),
@@ -306,6 +405,7 @@ class ManualContributionAdapter:
         fulfillment_item: str | None = None,
         fulfillment_status: str | None = None,
         actor_id: str | None = None,
+        linked_account_id: str | None = None,
     ) -> ContributionEventDraft:
         def keyed(namespace: str, value: str | None) -> str | None:
             return None if value is None else opaque_key(
@@ -313,8 +413,22 @@ class ManualContributionAdapter:
             )
 
         source = keyed("manual_event", event_id)
-        subject = keyed("manual_subject", subject_id)
-        if source is None or subject is None:
+        provider_subject = keyed("manual_subject", subject_id)
+        is_account_link = kind in ACCOUNT_LINK_KINDS
+        if is_account_link != (linked_account_id is not None):
+            raise WebhookPayloadError(
+                "manual linked account is reserved for account link events"
+            )
+        subject = (
+            keyed("maestro_account_support", linked_account_id)
+            if is_account_link else provider_subject
+        )
+        if (
+            source is None
+            or subject is None
+            or provider_subject is None
+            or _OPAQUE_KEY_RE.fullmatch(subject) is None
+        ):
             raise WebhookPayloadError("manual contribution identifiers are required")
         return ContributionEventDraft(
             provider=self.provider_id,
@@ -324,8 +438,14 @@ class ManualContributionAdapter:
             occurred_at=occurred_at,
             amount_minor=amount_minor,
             currency=currency,
-            contract_key=keyed("manual_contract", contract_id),
-            related_event_key=keyed("manual_event", related_event_id),
+            contract_key=(
+                keyed("maestro_account_claim", linked_account_id)
+                if is_account_link else keyed("manual_contract", contract_id)
+            ),
+            related_event_key=(
+                provider_subject
+                if is_account_link else keyed("manual_event", related_event_id)
+            ),
             fulfillment_item=fulfillment_item,
             fulfillment_status=fulfillment_status,
             actor_key=keyed("admin_actor", actor_id),
@@ -482,8 +602,15 @@ def process_signed_webhook(
     completed.  A completed replay is rejected without duplicating benefits.
     """
 
-    draft = adapter.verify_and_translate(
+    provider, source_event_key = adapter.verified_event_identity(
         raw_body, headers, received_at=received_at,
+    )
+    recorded_event = ledger.event_for_source(provider, source_event_key)
+    draft = adapter.verify_and_translate(
+        raw_body,
+        headers,
+        received_at=received_at,
+        recorded_event=recorded_event,
     )
     event = ledger.append(draft, received_at=received_at)
     replay_guard.record(

@@ -604,6 +604,10 @@ export interface GenerationPlanApprovalRequest {
   segment_overrides: NonNullable<import('../types').GenerateParams['h3_segment_overrides']>
   boundary_overrides: NonNullable<import('../types').GenerateParams['h3_boundary_overrides']>
   h3_ref2va_terms_accepted?: boolean
+  plan_revision?: string
+  duration_snap_mode?: 'manual' | 'nearest' | 'down'
+  segment_duration_edits?: Array<{ segment_index: number; published_frames: number }>
+  duration_redistribution?: 'none' | 'next' | 'future'
 }
 
 export async function approveGenerationPlan(
@@ -1266,9 +1270,80 @@ function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
+const SUPPORT_ALLOWANCE_SOURCES = new Set(['free', 'one_time_support', 'recurring_support'])
+const SUPPORT_ALLOWANCE_STATUSES = new Set(['active', 'inactive', 'refunded', 'expired', 'capped', 'canceled'])
+const SUPPORT_ALLOWANCE_REFUND_STATES = new Set(['not_applicable', 'none', 'partial', 'full', 'excess'])
+
+function safeAllowanceNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+function safeAllowanceTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) return null
+  return Number.isNaN(Date.parse(value)) ? null : value
+}
+
+function supportRecordedAllowance(value: unknown): SupportAccountSummary['recorded_allowance'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  const effectiveAllowance = safeAllowanceNumber(raw.effective_allowance)
+  const asOf = safeAllowanceTimestamp(raw.as_of)
+  if (
+    raw.state !== 'recorded_not_enforced'
+    || raw.enforcement_enabled !== false
+    || typeof raw.unit !== 'string'
+    || !/^[a-z][a-z0-9_]{1,63}$/.test(raw.unit)
+    || effectiveAllowance === null
+    || asOf === null
+    || !Array.isArray(raw.sources)
+  ) return undefined
+
+  const sources = raw.sources.flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const source = item as Record<string, unknown>
+    const grantedAllowance = safeAllowanceNumber(source.granted_allowance)
+    const sourceEffectiveAllowance = safeAllowanceNumber(source.effective_allowance)
+    const expiresAt = source.expires_at === null ? null : safeAllowanceTimestamp(source.expires_at)
+    if (
+      typeof source.source !== 'string'
+      || !SUPPORT_ALLOWANCE_SOURCES.has(source.source)
+      || typeof source.status !== 'string'
+      || !SUPPORT_ALLOWANCE_STATUSES.has(source.status)
+      || typeof source.refund_state !== 'string'
+      || !SUPPORT_ALLOWANCE_REFUND_STATES.has(source.refund_state)
+      || grantedAllowance === null
+      || sourceEffectiveAllowance === null
+      || (source.expires_at !== null && expiresAt === null)
+    ) return []
+    return [{
+      source: source.source as NonNullable<SupportAccountSummary['recorded_allowance']>['sources'][number]['source'],
+      granted_allowance: grantedAllowance,
+      effective_allowance: sourceEffectiveAllowance,
+      expires_at: expiresAt,
+      status: source.status as NonNullable<SupportAccountSummary['recorded_allowance']>['sources'][number]['status'],
+      refund_state: source.refund_state as NonNullable<SupportAccountSummary['recorded_allowance']>['sources'][number]['refund_state'],
+    }]
+  })
+  const sourceTotal = sources.reduce((total, source) => total + source.effective_allowance, 0)
+  if (
+    sources.length !== raw.sources.length
+    || !Number.isSafeInteger(sourceTotal)
+    || sourceTotal !== effectiveAllowance
+  ) return undefined
+  return {
+    state: 'recorded_not_enforced',
+    enforcement_enabled: false,
+    unit: raw.unit,
+    as_of: asOf,
+    effective_allowance: effectiveAllowance,
+    sources,
+  }
+}
+
 function supportAccountSummary(value: RawSupportAccountProjection | undefined): SupportAccountSummary {
   const recorded = value?.recorded || {}
   const benefits = value?.benefits || {}
+  const recordedAllowance = supportRecordedAllowance(recorded.recorded_allowance)
   return {
     event_count: typeof recorded.event_count === 'number' ? recorded.event_count : 0,
     one_time_tier: typeof recorded.one_time_tier === 'string' ? recorded.one_time_tier : null,
@@ -1276,6 +1351,7 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
     active_recurring_count: typeof recorded.active_recurring_count === 'number'
       ? recorded.active_recurring_count
       : 0,
+    ...(recordedAllowance ? { recorded_allowance: recordedAllowance } : {}),
     benefits: {
       state: typeof benefits.state === 'string' ? benefits.state : 'recorded_not_enforced',
       scheduler_enforcement_enabled: benefits.scheduler_enforcement_enabled === true,

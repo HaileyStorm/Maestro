@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import (
@@ -24,7 +25,15 @@ from collections.abc import (
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
+
+from services.credit_runtime import (
+    CreditReservationQuote,
+    CreditReservationState,
+    CreditRevalidationResult,
+    public_credit_projection,
+)
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _lifecycle_lock = threading.RLock()
@@ -78,6 +87,19 @@ RESOURCE_STATES = frozenset({
     "released",
 })
 MAX_EXECUTION_ATTEMPT = 1_000_000
+_CREDIT_QUEUE_SCHEMA_VERSION = 1
+_CREDIT_QUEUE_BANDS = frozenset({-1, 0, 1})
+_CREDIT_QUEUE_DECISIONS = frozenset({
+    "unmetered_realm",
+    "hosted_baseline",
+    "hosted_priority_credit",
+    "capability_excluded",
+})
+_CREDIT_RESERVATION_STATES = frozenset({"reserved", "released", "consumed"})
+_CREDIT_REVALIDATION_STATES = frozenset({"valid", "downgraded", "released"})
+_CREDIT_TRANSITION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{7,127}\Z")
+_CREDIT_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_CREDIT_TRANSITION_HISTORY = 32
 _durability_hook: Callable[["DurableTransition"], None] | None = None
 
 # Any transition that changes both scheduler-visible queue membership and job
@@ -96,6 +118,10 @@ class DurableTransition:
     global_state: Mapping[str, Any] | None = None
     tombstones: tuple[str, ...] = ()
     request_manifests: Mapping[str, Mapping[str, Any]] | None = None
+
+
+class CreditQueueTransitionConflict(ValueError):
+    """Raised when a credit transition ID is replayed with different state."""
 
 
 def configure_durability_hook(
@@ -460,6 +486,452 @@ class CancelResult:
     abort_signalled: bool
 
 
+def _validated_credit_queue_metadata(value: Any) -> dict[str, Any]:
+    """Return one exact content-free scheduler envelope or raise."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "realm",
+        "enforcement_enabled",
+        "metering_applied",
+        "decision",
+        "requested_units_positive",
+        "queue_band",
+        "reservation_state",
+        "reservation_revision",
+        "revalidation_state",
+        "allowance_revision",
+        "allowance_observed_at",
+        "transition_id",
+        "transition_history",
+    }:
+        raise ValueError("credit queue metadata schema is invalid")
+    schema_version = value["schema_version"]
+    enforcement_enabled = value["enforcement_enabled"]
+    metering_applied = value["metering_applied"]
+    decision = value["decision"]
+    requested_units_positive = value["requested_units_positive"]
+    queue_band = value["queue_band"]
+    reservation_state = value["reservation_state"]
+    reservation_revision = value["reservation_revision"]
+    revalidation_state = value["revalidation_state"]
+    allowance_revision = value["allowance_revision"]
+    allowance_observed_at = value["allowance_observed_at"]
+    transition_id = value["transition_id"]
+    transition_history = value["transition_history"]
+    if (
+        type(schema_version) is not int
+        or schema_version != _CREDIT_QUEUE_SCHEMA_VERSION
+        or not isinstance(value["realm"], str)
+        or value["realm"] not in {"local", "lan", "hosted"}
+        or type(enforcement_enabled) is not bool
+        or type(metering_applied) is not bool
+        or not isinstance(decision, str)
+        or decision not in _CREDIT_QUEUE_DECISIONS
+        or type(requested_units_positive) is not bool
+        or type(queue_band) is not int
+        or queue_band not in _CREDIT_QUEUE_BANDS
+        or (
+            reservation_state is not None
+            and (
+                not isinstance(reservation_state, str)
+                or reservation_state not in _CREDIT_RESERVATION_STATES
+            )
+        )
+        or (
+            reservation_revision is not None
+            and (
+                not isinstance(reservation_revision, str)
+                or _CREDIT_FINGERPRINT_RE.fullmatch(reservation_revision) is None
+            )
+        )
+        or (reservation_state is None) != (reservation_revision is None)
+        or (
+            revalidation_state is not None
+            and (
+                not isinstance(revalidation_state, str)
+                or revalidation_state not in _CREDIT_REVALIDATION_STATES
+            )
+        )
+        or not isinstance(allowance_revision, str)
+        or _CREDIT_FINGERPRINT_RE.fullmatch(allowance_revision) is None
+        or _credit_allowance_observed_at(allowance_observed_at) is None
+        or not isinstance(transition_id, str)
+        or _CREDIT_TRANSITION_RE.fullmatch(transition_id) is None
+        or not isinstance(transition_history, list)
+        or not 1 <= len(transition_history) <= _MAX_CREDIT_TRANSITION_HISTORY
+    ):
+        raise ValueError("credit queue metadata is invalid")
+
+    seen_transition_ids: set[str] = set()
+    for item in transition_history:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or _CREDIT_TRANSITION_RE.fullmatch(item[0]) is None
+            or not isinstance(item[1], str)
+            or _CREDIT_FINGERPRINT_RE.fullmatch(item[1]) is None
+            or item[0] in seen_transition_ids
+        ):
+            raise ValueError("credit queue transition history is invalid")
+        seen_transition_ids.add(item[0])
+    if transition_history[-1][0] != transition_id:
+        raise ValueError("credit queue transition history is inconsistent")
+
+    if metering_applied is False:
+        valid = (
+            queue_band == 0
+            and reservation_state is None
+            and revalidation_state is None
+            and (
+                (
+                    value["realm"] in {"local", "lan"}
+                    and decision == "unmetered_realm"
+                )
+                or (
+                    value["realm"] == "hosted"
+                    and enforcement_enabled is False
+                    and decision == "hosted_baseline"
+                )
+            )
+        )
+    elif (
+        value["realm"] != "hosted"
+        or enforcement_enabled is not True
+        or metering_applied is not True
+    ):
+        valid = False
+    elif decision == "capability_excluded":
+        valid = (
+            queue_band == 0
+            and reservation_state is None
+            and revalidation_state is None
+        )
+    elif decision == "hosted_baseline":
+        expected_band = -1 if requested_units_positive else 0
+        valid = (
+            queue_band == expected_band
+            and reservation_state is None
+            and revalidation_state is None
+        )
+    else:
+        active = (
+            requested_units_positive
+            and reservation_state in {"reserved", "consumed"}
+            and revalidation_state in {None, "valid"}
+        )
+        released = (
+            reservation_state == "released"
+            and revalidation_state in {None, "released"}
+        )
+        downgraded = (
+            reservation_state in {"reserved", "consumed"}
+            and revalidation_state == "downgraded"
+        )
+        valid = requested_units_positive and (active or released or downgraded)
+        if valid:
+            valid = queue_band == (1 if active else -1)
+    if not valid:
+        raise ValueError("credit queue metadata decision is inconsistent")
+    if transition_history[-1][1] != _credit_queue_fingerprint(value):
+        raise ValueError("credit queue transition fingerprint is inconsistent")
+    return dict(value)
+
+
+def _credit_queue_fingerprint(value: Mapping[str, Any]) -> str:
+    payload = {
+        key: value[key]
+        for key in (
+            "schema_version",
+            "realm",
+            "enforcement_enabled",
+            "metering_applied",
+            "decision",
+            "requested_units_positive",
+            "queue_band",
+            "reservation_state",
+            "reservation_revision",
+            "revalidation_state",
+            "allowance_revision",
+            "allowance_observed_at",
+        )
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _credit_allowance_observed_at(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _credit_queue_metadata_from_quote(
+    quote: CreditReservationQuote,
+    *,
+    transition_id: str,
+    allowance_revision: str,
+    reservation: CreditReservationState | None,
+    revalidation: CreditRevalidationResult | None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(transition_id, str)
+        or _CREDIT_TRANSITION_RE.fullmatch(transition_id) is None
+        or not isinstance(allowance_revision, str)
+        or _CREDIT_FINGERPRINT_RE.fullmatch(allowance_revision) is None
+    ):
+        raise ValueError("credit transition id must be an opaque token")
+    projection = public_credit_projection(
+        quote,
+        reservation=reservation,
+        revalidation=revalidation,
+    )
+    reservation_projection = projection["reservation"]
+    revalidation_projection = projection["revalidation"]
+    reservation_state = (
+        None
+        if reservation_projection is None
+        else reservation_projection["state"]
+    )
+    reservation_revision = (
+        None
+        if reservation is None
+        else hashlib.sha256(
+            (
+                reservation.reservation_id
+                + ":"
+                + reservation.quote_fingerprint
+            ).encode("ascii")
+        ).hexdigest()
+    )
+    revalidation_state = (
+        None
+        if revalidation_projection is None
+        else revalidation_projection["state"]
+    )
+    requested_units_positive = projection["requested_units"] > 0
+    if projection["metering_applied"] is not True:
+        queue_band = 0
+    elif projection["priority_boost"]:
+        queue_band = 1
+    elif projection["decision"] == "capability_excluded":
+        queue_band = 0
+    elif requested_units_positive:
+        queue_band = -1
+    else:
+        queue_band = 0
+    metadata = {
+        "schema_version": _CREDIT_QUEUE_SCHEMA_VERSION,
+        "realm": projection["realm"],
+        "enforcement_enabled": projection["policy_enforcement_enabled"],
+        "metering_applied": projection["metering_applied"],
+        "decision": projection["decision"],
+        "requested_units_positive": requested_units_positive,
+        "queue_band": queue_band,
+        "reservation_state": reservation_state,
+        "reservation_revision": reservation_revision,
+        "revalidation_state": revalidation_state,
+        "allowance_revision": allowance_revision,
+        "allowance_observed_at": quote.snapshot_as_of,
+        "transition_id": transition_id,
+        "transition_history": [],
+    }
+    metadata["transition_history"] = [[
+        transition_id,
+        _credit_queue_fingerprint(metadata),
+    ]]
+    return _validated_credit_queue_metadata(metadata)
+
+
+def apply_credit_queue_decision(
+    job: MutableMapping[str, Any],
+    quote: CreditReservationQuote,
+    *,
+    transition_id: str,
+    allowance_revision: str,
+    reservation: CreditReservationState | None = None,
+    revalidation: CreditRevalidationResult | None = None,
+) -> bool:
+    """Durably stamp one server-owned queue band before admission.
+
+    Disabled enforcement and local/LAN quotes leave a never-stamped job byte
+    equivalent to the legacy scheduler input.  Reusing a transition ID with
+    the same decision is a no-op; rebinding it to different state is rejected.
+    """
+    target = _credit_queue_metadata_from_quote(
+        quote,
+        transition_id=transition_id,
+        allowance_revision=allowance_revision,
+        reservation=reservation,
+        revalidation=revalidation,
+    )
+    return _apply_credit_queue_transition(job, target, running_consume=False)
+
+
+def consume_credit_queue_reservation(
+    job: MutableMapping[str, Any],
+    quote: CreditReservationQuote,
+    *,
+    transition_id: str,
+    allowance_revision: str,
+    reservation: CreditReservationState,
+) -> bool:
+    """Durably consume the current reservation after runtime admission.
+
+    This narrow post-admission transition cannot create priority or reband a
+    job.  It accepts only a running, uncancelled job whose current exact hosted
+    allowance revision is still reserved in the active support band.
+    """
+    target = _credit_queue_metadata_from_quote(
+        quote,
+        transition_id=transition_id,
+        allowance_revision=allowance_revision,
+        reservation=reservation,
+        revalidation=None,
+    )
+    return _apply_credit_queue_transition(job, target, running_consume=True)
+
+
+def _apply_credit_queue_transition(
+    job: MutableMapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    running_consume: bool,
+) -> bool:
+    """Persist one validated queue or running-reservation transition."""
+    target = _validated_credit_queue_metadata(target)
+    transition_id = target["transition_id"]
+    with _queue_condition, _lifecycle_lock:
+        current_raw = job.get("credit_queue")
+        current = (
+            None
+            if current_raw is None
+            else _validated_credit_queue_metadata(current_raw)
+        )
+        if running_consume and current is not None:
+            target = dict(target)
+            target["revalidation_state"] = current["revalidation_state"]
+            target["transition_history"] = [[
+                transition_id,
+                _credit_queue_fingerprint(target),
+            ]]
+            target = _validated_credit_queue_metadata(target)
+        target_fingerprint = _credit_queue_fingerprint(target)
+        if current is not None:
+            previous = next(
+                (
+                    item[1]
+                    for item in current["transition_history"]
+                    if item[0] == transition_id
+                ),
+                None,
+            )
+            if previous == target_fingerprint:
+                return False
+            if previous is not None:
+                raise CreditQueueTransitionConflict(
+                    "credit transition id is already bound",
+                )
+        if running_consume:
+            comparable_fields = (
+                "schema_version",
+                "realm",
+                "enforcement_enabled",
+                "metering_applied",
+                "decision",
+                "requested_units_positive",
+                "queue_band",
+                "reservation_revision",
+                "revalidation_state",
+                "allowance_revision",
+                "allowance_observed_at",
+            )
+            if (
+                current is None
+                or job.get("status") != "running"
+                or is_cancel_requested(job)
+                or current["reservation_state"] != "reserved"
+                or target["reservation_state"] != "consumed"
+                or current["queue_band"] != 1
+                or target["queue_band"] != 1
+                or any(current[key] != target[key] for key in comparable_fields)
+            ):
+                return False
+        else:
+            if target["metering_applied"] is False and current is None:
+                return False
+            if job.get("status") != "queued" or is_cancel_requested(job):
+                return False
+        if current is not None:
+            current_observed = _credit_allowance_observed_at(
+                current["allowance_observed_at"],
+            )
+            target_observed = _credit_allowance_observed_at(
+                target["allowance_observed_at"],
+            )
+            if current_observed is None or target_observed is None:
+                raise CreditQueueTransitionConflict(
+                    "credit allowance observation is invalid",
+                )
+            if target_observed < current_observed or (
+                target_observed == current_observed
+                and target["allowance_revision"] != current["allowance_revision"]
+            ):
+                raise CreditQueueTransitionConflict(
+                    "credit allowance revision is stale or conflicting",
+                )
+        candidate = _copy_job_for_transition(job)
+        history = (
+            []
+            if current is None
+            else list(current["transition_history"])
+        )
+        if len(history) >= _MAX_CREDIT_TRANSITION_HISTORY:
+            raise CreditQueueTransitionConflict(
+                "credit transition history capacity is exhausted",
+            )
+        history.append([transition_id, target_fingerprint])
+        target["transition_history"] = history
+        candidate["credit_queue"] = target
+        expected_status = "running" if running_consume else "queued"
+        _persist_prospective_unlocked(
+            "credit_reservation_consumed" if running_consume else "credit_queue",
+            jobs=(candidate,),
+            global_state=(
+                None
+                if running_consume
+                else _global_state_unlocked(replacements={id(job): candidate})
+            ),
+        )
+        if job.get("status") != expected_status or is_cancel_requested(job):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def _credit_queue_band(job: Mapping[str, Any]) -> int:
+    raw = job.get("credit_queue")
+    if raw is None:
+        return 0
+    try:
+        return int(_validated_credit_queue_metadata(raw)["queue_band"])
+    except (TypeError, ValueError):
+        # Present-but-invalid metadata is conservatively depleted. Recovery
+        # rejects the same malformed envelope before jobs re-enter the queue.
+        return -1
+
+
 def _queue_priority(job: Mapping[str, Any]) -> int:
     try:
         return int(job.get("queue_priority", 0) or 0)
@@ -476,12 +948,23 @@ def _queue_manual_order(job: Mapping[str, Any]) -> int:
 
 def _queue_tier_key(
     entry: tuple[int, MutableMapping[str, Any]],
-) -> tuple[bool, int, int]:
+) -> tuple[bool, str, int, int, int]:
     _, job = entry
+    manual_order = _queue_manual_order(job)
+    if manual_order:
+        return (
+            bool(job.get("source_remote", False)),
+            "manual",
+            _queue_priority(job),
+            manual_order,
+            0,
+        )
     return (
         bool(job.get("source_remote", False)),
+        "automatic",
+        _credit_queue_band(job),
         _queue_priority(job),
-        _queue_manual_order(job),
+        0,
     )
 
 
@@ -497,7 +980,17 @@ def _queue_order_key(entry: tuple[int, MutableMapping[str, Any]]) -> tuple:
     # key is consulted only before admission: an already-running remote job is
     # never preempted or paused.
     remote = bool(job.get("source_remote", False))
-    return (remote, -priority, -manual_order, created_at, sequence)
+    if manual_order:
+        return (remote, 0, 0, -priority, -manual_order, created_at, sequence)
+    return (
+        remote,
+        1,
+        -_credit_queue_band(job),
+        -priority,
+        0,
+        created_at,
+        sequence,
+    )
 
 
 def _eligible_queue_entries() -> list[tuple[int, MutableMapping[str, Any]]]:
@@ -1433,6 +1926,8 @@ def snapshot_job(job: MutableMapping[str, Any]) -> dict[str, Any]:
             snapshot["clip_output_files"] = dict(snapshot["clip_output_files"])
         if isinstance(snapshot.get("events"), list):
             snapshot["events"] = [dict(event) for event in snapshot["events"]]
+        if isinstance(snapshot.get("credit_queue"), dict):
+            snapshot["credit_queue"] = deepcopy(snapshot["credit_queue"])
         return snapshot
 
 

@@ -684,6 +684,11 @@ class TestCPUTextLane(unittest.TestCase):
                     "time": time,
                     "_jobs": {job["id"]: job},
                     "_gen_lock": generation_lock,
+                    "_credit_prepare_admission": lambda _job: False,
+                    "_credit_admission_evaluations": {},
+                    "CreditRuntimeError": ValueError,
+                    "EntitlementError": ValueError,
+                    "_credit_block_runtime_error": lambda _job: None,
                     "_stamp_requested_generation_residency": (
                         lambda _job, replace=False: None
                     ),

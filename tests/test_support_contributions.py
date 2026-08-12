@@ -22,11 +22,15 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from services.entitlements import (  # noqa: E402
+    AllowanceRule,
+    BenefitPolicy,
     ContributionConflict,
     ContributionEventDraft,
     ContributionLedger,
     EntitlementError,
     LedgerIntegrityError,
+    RecordedAllowancePolicy,
+    DEFAULT_BENEFIT_POLICY,
     opaque_key,
     support_priority_capability_marker,
 )
@@ -281,6 +285,198 @@ class ContributionLedgerTests(unittest.TestCase):
         self.assertEqual(projection["active_recurring_count"], 1)
         self.assertEqual(projection["recurring_tier"], "patron")
 
+    def test_verified_links_resolve_one_provider_subject_to_one_account(self):
+        provider_subject = keyed("fake_support_subject", "provider-user")
+        funding = replace(
+            self.draft("linked-gift", "one_time_contribution", amount=2_500),
+            subject_key=provider_subject,
+        )
+        stored_funding = self.ledger.append(
+            funding, received_at="2026-08-11T08:01:00Z",
+        )
+        other_subject = keyed("test_subject", "other-account")
+        self.ledger.append(ContributionEventDraft(
+            provider="fake_support",
+            source_event_key=keyed("fake_event", "link-other"),
+            subject_key=other_subject,
+            kind="account_link_verified",
+            occurred_at="2026-08-11T08:20:00Z",
+            contract_key=keyed("account_claim", "other-account"),
+            related_event_key=provider_subject,
+        ), received_at="2026-08-11T08:30:00Z")
+        # An older same-owner verification may arrive later without changing ownership.
+        self.ledger.append(ContributionEventDraft(
+            provider="fake_support",
+            source_event_key=keyed("fake_event", "link-other-older"),
+            subject_key=other_subject,
+            kind="account_link_verified",
+            occurred_at="2026-08-11T08:10:00Z",
+            contract_key=keyed("account_claim", "other-account"),
+            related_event_key=provider_subject,
+        ), received_at="2026-08-11T08:31:00Z")
+
+        mine = self.ledger.privacy_safe_user_projection(self.subject, as_of=NOW)
+        other = self.ledger.privacy_safe_user_projection(other_subject, as_of=NOW)
+        self.assertEqual(mine["currency_totals_minor"], {})
+        self.assertEqual(other["currency_totals_minor"], {"USD": 2_500})
+        self.assertNotIn(provider_subject, json.dumps(other))
+
+        before_rejected_transitions = self.path.read_bytes()
+        with self.assertRaisesRegex(EntitlementError, "current owner"):
+            self.ledger.append(ContributionEventDraft(
+                provider="fake_support",
+                source_event_key=keyed("fake_event", "foreign-revoke"),
+                subject_key=self.subject,
+                kind="account_link_revoked",
+                occurred_at="2026-08-11T08:35:00Z",
+                contract_key=keyed("account_claim", "private-user@example.test"),
+                related_event_key=provider_subject,
+            ), received_at="2026-08-11T08:36:00Z")
+        with self.assertRaisesRegex(EntitlementError, "owner revocation"):
+            self.ledger.append(ContributionEventDraft(
+                provider="fake_support",
+                source_event_key=keyed("fake_event", "foreign-steal"),
+                subject_key=self.subject,
+                kind="account_link_verified",
+                occurred_at="2026-08-11T08:36:00Z",
+                contract_key=keyed("account_claim", "private-user@example.test"),
+                related_event_key=provider_subject,
+            ), received_at="2026-08-11T08:37:00Z")
+        self.assertEqual(self.path.read_bytes(), before_rejected_transitions)
+        still_other = self.ledger.privacy_safe_user_projection(
+            other_subject, as_of=NOW,
+        )
+        self.assertEqual(still_other["currency_totals_minor"], {"USD": 2_500})
+        self.assertEqual(
+            self.ledger.privacy_safe_user_projection(
+                self.subject, as_of=NOW,
+            )["currency_totals_minor"],
+            {},
+        )
+
+        self.ledger.append(ContributionEventDraft(
+            provider="fake_support",
+            source_event_key=keyed("fake_event", "unlink-other"),
+            subject_key=other_subject,
+            kind="account_link_revoked",
+            occurred_at="2026-08-11T08:40:00Z",
+            contract_key=keyed("account_claim", "other-account"),
+            related_event_key=provider_subject,
+        ), received_at="2026-08-11T08:41:00Z")
+        revoked = self.ledger.privacy_safe_user_projection(
+            other_subject, as_of=NOW,
+        )
+        self.assertEqual(revoked["currency_totals_minor"], {})
+        self.assertEqual(self.ledger.events()[0], stored_funding)
+        self.ledger.append(ContributionEventDraft(
+            provider="fake_support",
+            source_event_key=keyed("fake_event", "link-self-after-revoke"),
+            subject_key=self.subject,
+            kind="account_link_verified",
+            occurred_at="2026-08-11T08:50:00Z",
+            contract_key=keyed("account_claim", "private-user@example.test"),
+            related_event_key=provider_subject,
+        ), received_at="2026-08-11T08:51:00Z")
+        transferred = self.ledger.privacy_safe_user_projection(
+            self.subject, as_of=NOW,
+        )
+        self.assertEqual(transferred["currency_totals_minor"], {"USD": 2_500})
+        admin = self.ledger.reauthenticated_admin_projection(
+            self.subject, as_of=NOW,
+        )
+        self.assertEqual(admin["subject_key"], self.subject)
+
+    def test_recorded_allowance_is_source_distinct_capped_and_time_bounded(self):
+        policy = BenefitPolicy(
+            currency=DEFAULT_BENEFIT_POLICY.currency,
+            one_time_rules=DEFAULT_BENEFIT_POLICY.one_time_rules,
+            recurring_rules=DEFAULT_BENEFIT_POLICY.recurring_rules,
+            allowance_policy=RecordedAllowancePolicy(
+                unit="compute_seconds",
+                free_allowance_units=10,
+                one_time_rules=(
+                    AllowanceRule(500, 100),
+                    AllowanceRule(2_500, 300),
+                ),
+                recurring_rules=(
+                    AllowanceRule(300, 50),
+                    AllowanceRule(1_000, 200),
+                ),
+                one_time_cap_units=400,
+                one_time_validity_seconds=3_600,
+                recurring_validity_seconds=1_800,
+            ),
+        )
+        expired = self.ledger.append(self.draft(
+            "expired-gift", "one_time_contribution", amount=2_500,
+            occurred_at="2026-08-11T08:00:00Z",
+        ), received_at="2026-08-11T08:01:00Z")
+        partial = self.ledger.append(self.draft(
+            "partial-gift", "one_time_contribution", amount=2_500,
+            occurred_at="2026-08-11T08:30:00Z",
+        ), received_at="2026-08-11T08:31:00Z")
+        capped = self.ledger.append(self.draft(
+            "capped-gift", "one_time_contribution", amount=2_500,
+            occurred_at="2026-08-11T08:40:00Z",
+        ), received_at="2026-08-11T08:41:00Z")
+        over_cap = self.ledger.append(self.draft(
+            "over-cap-gift", "one_time_contribution", amount=500,
+            occurred_at="2026-08-11T08:42:00Z",
+        ), received_at="2026-08-11T08:43:00Z")
+        refunded = self.ledger.append(self.draft(
+            "refunded-gift", "one_time_contribution", amount=500,
+            occurred_at="2026-08-11T08:50:00Z",
+        ), received_at="2026-08-11T08:51:00Z")
+        recurring = self.ledger.append(self.draft(
+            "recurring", "recurring_started", amount=1_000,
+            contract="membership", occurred_at="2026-08-11T08:45:00Z",
+        ), received_at="2026-08-11T08:46:00Z")
+        self.ledger.append(self.draft(
+            "partial-refund", "refund", amount=2_000,
+            related="partial-gift", occurred_at="2026-08-11T08:55:00Z",
+        ), received_at="2026-08-11T08:56:00Z")
+        self.ledger.append(self.draft(
+            "full-refund", "refund", amount=500,
+            related="refunded-gift", occurred_at="2026-08-11T08:56:00Z",
+        ), received_at="2026-08-11T08:57:00Z")
+        self.ledger.append(self.draft(
+            "recurring-refund", "refund", amount=700,
+            related="recurring", occurred_at="2026-08-11T08:57:00Z",
+        ), received_at="2026-08-11T08:58:00Z")
+
+        recorded = self.ledger.privacy_safe_user_projection(
+            self.subject, policy=policy, as_of=NOW,
+        )["recorded_allowance"]
+        self.assertEqual(recorded["state"], "recorded_not_enforced")
+        self.assertFalse(recorded["enforcement_enabled"])
+        self.assertEqual(recorded["effective_allowance"], 460)
+        rows = {
+            row["source_event_id"]: row for row in recorded["sources"]
+            if row["source_event_id"] is not None
+        }
+        self.assertEqual(rows[expired.event_id]["status"], "expired")
+        self.assertEqual(rows[partial.event_id]["refund_state"], "partial")
+        self.assertEqual(rows[partial.event_id]["effective_allowance"], 100)
+        self.assertEqual(rows[capped.event_id]["effective_allowance"], 300)
+        self.assertEqual(rows[over_cap.event_id]["status"], "capped")
+        self.assertEqual(rows[over_cap.event_id]["effective_allowance"], 0)
+        self.assertEqual(rows[refunded.event_id]["status"], "refunded")
+        self.assertEqual(rows[recurring.event_id]["effective_allowance"], 50)
+        self.assertTrue(all("provider" not in row for row in recorded["sources"]))
+
+        later = self.ledger.privacy_safe_user_projection(
+            self.subject,
+            policy=policy,
+            as_of="2026-08-11T09:40:00Z",
+        )["recorded_allowance"]
+        self.assertEqual(later["effective_allowance"], 110)
+        expired_boundary = self.ledger.privacy_safe_user_projection(
+            self.subject,
+            policy=policy,
+            as_of="2026-08-11T09:42:00Z",
+        )["recorded_allowance"]
+        self.assertEqual(expired_boundary["effective_allowance"], 10)
+
     def test_refund_and_chargeback_are_compensating_not_destructive(self):
         self.ledger.append(self.draft(
             "gift", "one_time_contribution", amount=10_000,
@@ -297,6 +493,42 @@ class ContributionLedgerTests(unittest.TestCase):
         original = self.ledger.events()[0]
         self.assertEqual(original.kind, "one_time_contribution")
         self.assertEqual(original.amount_minor, 10_000)
+
+    def test_recurring_cancellation_is_currency_independent(self):
+        policy = BenefitPolicy(
+            currency="EUR",
+            one_time_rules=(),
+            recurring_rules=(),
+            allowance_policy=RecordedAllowancePolicy(
+                unit="compute_seconds",
+                free_allowance_units=0,
+                one_time_rules=(),
+                recurring_rules=(AllowanceRule(500, 100),),
+                one_time_cap_units=0,
+                one_time_validity_seconds=0,
+                recurring_validity_seconds=3_600,
+            ),
+        )
+        source = replace(self.draft(
+            "eur-renewal", "recurring_renewed", amount=1_000,
+            contract="eur-membership", occurred_at="2026-08-11T08:00:00Z",
+        ), currency="EUR")
+        self.ledger.append(source, received_at="2026-08-11T08:01:00Z")
+        # Moneyless cancellation defaults to USD but still closes the contract.
+        self.ledger.append(self.draft(
+            "eur-cancel", "recurring_canceled", contract="eur-membership",
+            occurred_at="2026-08-11T08:30:00Z",
+        ), received_at="2026-08-11T08:31:00Z")
+        projection = self.ledger.privacy_safe_user_projection(
+            self.subject, policy=policy, as_of=NOW,
+        )
+        self.assertEqual(projection["active_recurring_count"], 0)
+        recurring = next(
+            row for row in projection["recorded_allowance"]["sources"]
+            if row["source"] == "recurring_support"
+        )
+        self.assertEqual(recurring["status"], "canceled")
+        self.assertEqual(recurring["effective_allowance"], 0)
 
     def test_manual_fulfillment_has_private_user_and_opaque_admin_views(self):
         self.ledger.append(self.draft(
@@ -345,6 +577,10 @@ class ContributionLedgerTests(unittest.TestCase):
         with self.assertRaises(EntitlementError):
             self.ledger.append(self.draft(
                 "bad-cancel", "recurring_canceled",
+            ))
+        with self.assertRaises(EntitlementError):
+            self.ledger.append(self.draft(
+                "bad-link", "account_link_verified",
             ))
         self.ledger.append(self.draft(
             "orphan", "chargeback", amount=100, related="missing",

@@ -40,6 +40,7 @@ function loadDialogModule() {
             return { contents: `
               export const useEffect = () => {}
               export const useMemo = callback => callback()
+              export const useId = () => 'h3-duration-test-id'
               export const useState = initial => globalThis.__maestroPlanHooks.useState(initial)
             ` }
           }
@@ -273,6 +274,10 @@ test('plan approval binds overrides to the exact encoded job and project', async
     segment_overrides: [{ model_type: 'minimax_h3' }],
     boundary_overrides: [{ type: 'cut' }],
     h3_ref2va_terms_accepted: false,
+    plan_revision: 'h3dp1_exact',
+    duration_snap_mode: 'manual',
+    segment_duration_edits: [{ segment_index: 1, published_frames: 23 }],
+    duration_redistribution: 'future',
   })
 
   assert.equal(request.url, '/api/v1/generate/job%2Fid/plan/approve')
@@ -281,6 +286,10 @@ test('plan approval binds overrides to the exact encoded job and project', async
     segment_overrides: [{ model_type: 'minimax_h3' }],
     boundary_overrides: [{ type: 'cut' }],
     h3_ref2va_terms_accepted: false,
+    plan_revision: 'h3dp1_exact',
+    duration_snap_mode: 'manual',
+    segment_duration_edits: [{ segment_index: 1, published_frames: 23 }],
+    duration_redistribution: 'future',
   })
 })
 
@@ -300,6 +309,114 @@ test('stale approval conflicts return one bounded error without reflecting detai
     }),
     /The plan review state changed\. Refresh and try again\./,
   )
+})
+
+test('store maps one revision-fenced duration decision and rejects a stale local plan', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    alert() {},
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+  })
+
+  const currentPlan = {
+    ...plan(),
+    duration_plan: {
+      revision: 'h3dp1_current',
+      target_published_frames: 24,
+      current_published_frames: 24,
+      current_generated_frames: 24,
+      fps: 24,
+      snap_candidates: {},
+      segments: [],
+      redistribution_mode: 'none',
+      outcome: 'exact',
+      reason: 'Exact.',
+      residual_published_frames: 0,
+    },
+  }
+  let requestBody
+  globalThis.fetch = async (url, init) => {
+    assert.match(String(url), /\/api\/v1\/generate\/duration-job\/plan\/approve$/)
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(JSON.stringify({
+      job_id: 'duration-job',
+      status: 'queued',
+      h3_segment_plan: currentPlan,
+      h3_estimate: null,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+
+  const { useStore } = await loadStoreModule()
+  const originalPoll = useStore.getState()._pollRecoveredJob
+  useStore.setState({
+    activeWorkspace: 'project one',
+    jobs: [{ id: 'duration-job', status: 'waiting_for_plan_approval', workspace: 'project one' }],
+    pendingH3Plan: currentPlan,
+    pendingH3PlanEstimate: null,
+    pendingH3PlanJobId: 'duration-job',
+    pendingH3PlanWorkspace: 'project one',
+    h3PlanReviewLoading: false,
+    h3PlanReviewError: null,
+    _pollRecoveredJob() {},
+  })
+
+  await useStore.getState().approveH3Plan({
+    segmentOverrides: [],
+    boundaryOverrides: [],
+    planRevision: 'h3dp1_current',
+    durationSnapMode: 'manual',
+    segmentDurationEdits: [{ segmentIndex: 1, publishedFrames: 23 }],
+    durationRedistribution: 'future',
+  })
+  assert.deepEqual(requestBody, {
+    workspace: 'project one',
+    segment_overrides: [],
+    boundary_overrides: [],
+    h3_ref2va_terms_accepted: false,
+    plan_revision: 'h3dp1_current',
+    duration_snap_mode: 'manual',
+    segment_duration_edits: [{ segment_index: 1, published_frames: 23 }],
+    duration_redistribution: 'future',
+  })
+
+  requestBody = undefined
+  useStore.setState({
+    jobs: [{ id: 'duration-job', status: 'waiting_for_plan_approval', workspace: 'project one' }],
+    pendingH3Plan: currentPlan,
+    pendingH3PlanJobId: 'duration-job',
+    pendingH3PlanWorkspace: 'project one',
+  })
+  await useStore.getState().approveH3Plan({
+    segmentOverrides: [],
+    boundaryOverrides: [],
+    planRevision: 'h3dp1_stale',
+  })
+  assert.equal(requestBody, undefined)
+  assert.match(useStore.getState().h3PlanReviewError, /duration plan changed/i)
+  useStore.setState({ _pollRecoveredJob: originalPoll })
 })
 
 test('plan editor uses a present server catalog verbatim and falls back only for legacy plans', async t => {

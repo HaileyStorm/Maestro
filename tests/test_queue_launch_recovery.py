@@ -60,6 +60,15 @@ from services.h3_offload_plan import (
     seal_h3_offload_plan,
     validate_h3_offload_plan,
 )
+from services.h3_duration_plan import (
+    GeneratedFrameCount,
+    H3DurationOraclePlan,
+    H3SegmentFrameRange,
+    PublishedFrameCount,
+    PublishedFrameGrid,
+    redistribute_segment_duration,
+    snap_published_duration,
+)
 from services.output_access import stamp_sidecar_policy
 from services.job_lifecycle import authorized_logical_queue_projection
 
@@ -885,6 +894,624 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertNotIn("llm_enhance_prompt", approval)
         self.assertNotIn("llm_enhance_prompt", promotion)
 
+    def test_public_h3_plan_exposes_server_owned_duration_contract(self):
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_h3_duration_plan_revision",
+                "_public_h3_boundary",
+                "_public_h3_long_plan",
+            ),
+            {
+                "copy": copy,
+                "hashlib": hashlib,
+                "json": json,
+            },
+        )
+        plan = {
+            "clip_count": 2,
+            "fps": 24,
+            "requested_frames": 265,
+            "planned_frames": 265,
+            "published_frames": 265,
+            "clip_frames": [124, 141],
+            "clip_published_frames": [124, 141],
+            "segment_models": [
+                {"model_type": "minimax_h3", "reason": "test"},
+                {"model_type": "minimax_h3", "reason": "test"},
+            ],
+            "clip_boundaries": [
+                {"type": "continuous", "source": "model_grid"},
+            ],
+            "_duration_target_published_frames": 265,
+            "_duration_segment_limits": [
+                {
+                    "index": 0, "minimum": 124, "maximum": 345,
+                    "step": 1, "offset": 0, "authored_locked": True,
+                },
+                {
+                    "index": 1, "minimum": 124, "maximum": 345,
+                    "step": 1, "offset": 0, "authored_locked": False,
+                },
+            ],
+            "_duration_snap_candidates": {
+                "nearest": {"candidate_published_frames": 345},
+                "down": {"candidate_published_frames": 265},
+            },
+            "_duration_redistribution_mode": "future",
+            "_duration_outcome": "exact",
+            "_duration_reason": "Exact test plan.",
+            "_duration_residual_published_frames": 0,
+            "_duration_completed_locks": [1],
+        }
+        plan["_duration_revision"] = namespace[
+            "_h3_duration_plan_revision"
+        ](plan)
+        public = namespace["_public_h3_long_plan"](plan)
+        duration = public["duration_plan"]
+        self.assertTrue(duration["revision"].startswith("h3dp1_"))
+        self.assertEqual(duration["target_published_frames"], 265)
+        self.assertEqual(duration["current_published_frames"], 265)
+        self.assertEqual(duration["current_generated_frames"], 265)
+        self.assertEqual(duration["residual_published_frames"], 0)
+        self.assertEqual(duration["redistribution_mode"], "future")
+        self.assertEqual(duration["segments"][0]["lock_reason"], "authored")
+        self.assertEqual(duration["segments"][1]["lock_reason"], "completed")
+        changed = copy.deepcopy(plan)
+        changed["clip_published_frames"][1] -= 1
+        self.assertNotEqual(
+            namespace["_h3_duration_plan_revision"](changed),
+            duration["revision"],
+        )
+
+    def test_duration_approval_requires_current_server_revision(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_h3_duration_plan_revision", "_apply_h3_duration_approval"),
+            {"hashlib": hashlib, "hmac": hmac, "json": json},
+        )
+        plan = {
+            "clip_frames": [124, 141],
+            "clip_published_frames": [124, 141],
+            "published_frames": 265,
+        }
+        plan["_duration_revision"] = namespace[
+            "_h3_duration_plan_revision"
+        ](plan)
+        with self.assertRaisesRegex(ValueError, "revision is stale"):
+            namespace["_apply_h3_duration_approval"](
+                {},
+                plan,
+                plan_revision="h3dp1_" + "0" * 64,
+                duration_snap_mode=None,
+                segment_duration_edits=[],
+                duration_redistribution=None,
+            )
+
+    def test_duration_stamp_uses_authoritative_oracle_and_integer_bounds(self):
+        class FakeWgp:
+            @staticmethod
+            def get_model_def(_model_type):
+                return {
+                    "frames_minimum": 124,
+                    "frames_maximum": 345,
+                    "fps": 24,
+                }
+
+        def oracle_factory(_body):
+            def oracle(total):
+                value = int(total)
+                count = (value + 344) // 345
+                base, extra = divmod(value, count)
+                published = tuple(
+                    PublishedFrameCount(base + int(index < extra))
+                    for index in range(count)
+                )
+                return H3DurationOraclePlan(
+                    requested_published_frames=PublishedFrameCount(value),
+                    generated_frames=tuple(
+                        GeneratedFrameCount(int(item)) for item in published
+                    ),
+                    published_frames=published,
+                    confidence="high",
+                    reason="Synthetic authoritative planner evidence.",
+                )
+            return oracle
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_h3_duration_segment_limits",
+                "_h3_duration_plan_revision",
+                "_public_h3_duration_snap_result",
+                "_stamp_h3_duration_contract",
+            ),
+            {
+                "GeneratedFrameCount": GeneratedFrameCount,
+                "H3DurationOraclePlan": H3DurationOraclePlan,
+                "PublishedFrameCount": PublishedFrameCount,
+                "PublishedFrameGrid": PublishedFrameGrid,
+                "copy": copy,
+                "hashlib": hashlib,
+                "json": json,
+                "snap_published_duration": snap_published_duration,
+                "wgp": FakeWgp,
+                "_h3_duration_oracle": oracle_factory,
+            },
+        )
+        plan = {
+            "clip_count": 2,
+            "fps": 24,
+            "requested_frames": 480,
+            "published_frames": 480,
+            "clip_frames": [243, 243],
+            "clip_published_frames": [240, 240],
+            "segment_frames_maximum": 345,
+            "segment_models": [
+                {"model_type": "minimax_h3"},
+                {"model_type": "minimax_h3"},
+            ],
+            "segment_policy": {"id": "native_default"},
+        }
+        namespace["_stamp_h3_duration_contract"](
+            {"model_type": "minimax_h3"}, plan,
+        )
+        self.assertTrue(plan["_duration_revision"].startswith("h3dp1_"))
+        self.assertEqual(plan["_duration_segment_limits"][0]["minimum"], 124)
+        self.assertEqual(plan["_duration_segment_limits"][0]["step"], 1)
+        self.assertEqual(
+            set(plan["_duration_snap_candidates"]), {"nearest", "down"},
+        )
+        self.assertTrue(all(
+            type(candidate["candidate_published_frames"]) in {int, type(None)}
+            for candidate in plan["_duration_snap_candidates"].values()
+        ))
+
+    def test_duration_snap_replans_from_source_not_normalized_multiclip_state(self):
+        oracle_source = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_h3_duration_oracle"),
+        )
+        approval_source = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_apply_h3_duration_approval"),
+        )
+        self.assertIn('candidate["multi_prompts_gen_type"] = 0', oracle_source)
+        self.assertIn('candidate["prompt"] = authoritative_prompt', oracle_source)
+        self.assertLess(
+            oracle_source.index('candidate["multi_prompts_gen_type"] = 0'),
+            oracle_source.index("_prepare_h3_long_studio_request(candidate)"),
+        )
+        self.assertIn("_replay_h3_duration_shot_plan(", approval_source)
+        self.assertNotIn(
+            '_prepare_h3_long_studio_request(prepared_params)',
+            approval_source,
+        )
+
+    def test_one_segment_snap_replays_sealed_sources_and_rejects_hybrids(self):
+        from services.director_pipeline import (
+            _bind_director_h3_runtime_contract,
+            _validate_director_h3_runtime_contract,
+        )
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        class FakeWgp:
+            @staticmethod
+            def get_model_def(_model_type):
+                return {"frames_minimum": 124, "frames_maximum": 345}
+
+            @staticmethod
+            def align_model_frame_count(frame_count, _model_def):
+                return max(124, int(frame_count))
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_h3_duration_segment_limits",
+                "_h3_duration_plan_revision",
+                "_h3_duration_segment_oracle",
+                "_replay_h3_duration_shot_plan",
+                "_apply_h3_duration_approval",
+            ),
+            {
+                "GeneratedFrameCount": GeneratedFrameCount,
+                "H3DurationOraclePlan": H3DurationOraclePlan,
+                "H3SegmentFrameRange": H3SegmentFrameRange,
+                "PublishedFrameCount": PublishedFrameCount,
+                "PublishedFrameGrid": PublishedFrameGrid,
+                "copy": copy,
+                "hashlib": hashlib,
+                "hmac": hmac,
+                "json": json,
+                "redistribute_segment_duration": redistribute_segment_duration,
+                "wgp": FakeWgp,
+                "_MULTI_CLIP_SEPARATOR": "\n---MAESTRO-CLIP---\n",
+                "_plan_h3_adaptive_models": (
+                    lambda _body, *, clip_count, **_kwargs: [
+                        {"model_type": "minimax_h3"}
+                        for _ in range(clip_count)
+                    ]
+                ),
+                "_stamp_h3_duration_contract": (
+                    lambda _body, target: target.update({
+                        "_duration_revision": "h3dp1_resealed",
+                    })
+                ),
+            },
+        )
+        source = "An adult archivist closes a ledger in a quiet archive."
+        shot_plan = plan_h3_native_shots(
+            global_prompt=source,
+            structured_shots=[{
+                "shot_id": "archive",
+                "spatial_setup": "The archivist stands beside the desk",
+                "closing_blocking": "The ledger closes",
+            }],
+            clip_frame_counts=[175, 175],
+            clip_requested_frames=[175, 171],
+            fps=24,
+        )
+        plan = {
+            "clip_count": 2,
+            "fps": 24,
+            "global_prompt": source,
+            "requested_frames": 346,
+            "published_frames": 346,
+            "planned_frames": 350,
+            "clip_frames": [175, 175],
+            "clip_published_frames": [175, 171],
+            "clip_boundaries": list(shot_plan["clip_boundaries"]),
+            "segment_frames_maximum": 345,
+            "segment_models": [
+                {"model_type": "minimax_h3"},
+                {"model_type": "minimax_h3"},
+            ],
+            "segment_source_indices": [0, 0],
+            "h3_style_workflow": {"synthetic": "sealed-style"},
+            "shot_plan": shot_plan,
+            "_duration_target_published_frames": 346,
+            "_duration_segment_limits": [
+                {"minimum": 124, "maximum": 345, "step": 1, "offset": 0},
+                {"minimum": 124, "maximum": 345, "step": 1, "offset": 0},
+            ],
+            "_duration_snap_candidates": {
+                "down": {
+                    "candidate_published_frames": 345,
+                    "segment_count": 1,
+                    "generated_frames": [345],
+                    "segment_published_frames": [345],
+                    "confidence": "high",
+                },
+            },
+        }
+        shot_plan["h3_style_workflow"] = copy.deepcopy(
+            plan["h3_style_workflow"]
+        )
+        _bind_director_h3_runtime_contract(plan)
+        plan["_duration_revision"] = namespace[
+            "_h3_duration_plan_revision"
+        ](plan)
+        params = {"model_type": "minimax_h3"}
+        revised = namespace["_apply_h3_duration_approval"](
+            params,
+            copy.deepcopy(plan),
+            plan_revision=plan["_duration_revision"],
+            duration_snap_mode="down",
+            segment_duration_edits=[],
+            duration_redistribution=None,
+        )
+        self.assertEqual(revised["clip_count"], 1)
+        self.assertEqual(revised["clip_published_frames"], [345])
+        self.assertEqual(
+            revised["shot_plan"]["source_contracts"][0]["authored_prompt"],
+            shot_plan["source_contracts"][0]["authored_prompt"],
+        )
+        self.assertEqual(
+            [shot["source_index"] for shot in revised["shot_plan"]["shots"]],
+            [0],
+        )
+        self.assertEqual(revised["segment_source_indices"], [0])
+        self.assertEqual(
+            revised["shot_plan"]["h3_style_workflow"],
+            plan["h3_style_workflow"],
+        )
+        _validate_director_h3_runtime_contract(revised, revised["shot_plan"])
+
+        manual = copy.deepcopy(plan)
+        manual_revision = namespace["_h3_duration_plan_revision"](manual)
+        manual_revised = namespace["_apply_h3_duration_approval"](
+            {"model_type": "minimax_h3"},
+            manual,
+            plan_revision=manual_revision,
+            duration_snap_mode="manual",
+            segment_duration_edits=[
+                {"segment_index": 2, "published_frames": 170},
+            ],
+            duration_redistribution="none",
+        )
+        _validate_director_h3_runtime_contract(
+            manual_revised, manual_revised["shot_plan"],
+        )
+        self.assertEqual(
+            manual_revised["shot_plan"]["h3_style_workflow"],
+            plan["h3_style_workflow"],
+        )
+        multi_source = plan_h3_native_shots(
+            global_prompt="Two sealed authored sources.",
+            source_prompts=["First authored source.", "Second authored source."],
+            source_indices=[0, 1],
+            clip_frame_counts=[175, 175],
+            fps=24,
+        )
+        with self.assertRaisesRegex(ValueError, "preserve every sealed H3 source"):
+            namespace["_replay_h3_duration_shot_plan"](
+                {
+                    "global_prompt": "Two sealed authored sources.",
+                    "fps": 24,
+                    "segment_frames_maximum": 345,
+                    "shot_plan": multi_source,
+                },
+                generated=[345],
+                published=[345],
+            )
+        for edits, redistribution in (([{"segment_index": 1, "published_frames": 340}], None), ([], "none")):
+            with self.subTest(edits=edits, redistribution=redistribution):
+                with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                    namespace["_apply_h3_duration_approval"](
+                        {}, copy.deepcopy(plan),
+                        plan_revision=plan["_duration_revision"],
+                        duration_snap_mode="down",
+                        segment_duration_edits=edits,
+                        duration_redistribution=redistribution,
+                    )
+
+    def test_manual_duration_edit_replans_generated_and_published_geometry(self):
+        class FakeWgp:
+            @staticmethod
+            def get_model_def(_model_type):
+                return {
+                    "frames_minimum": 124,
+                    "frames_maximum": 345,
+                    "frame_alignment_modulus": 17,
+                    "frame_alignment_remainder": 5,
+                }
+
+            @staticmethod
+            def align_model_frame_count(frame_count, _model_def):
+                value = max(124, int(frame_count))
+                remainder = (value - 5) % 17
+                return value if remainder == 0 else value + 17 - remainder
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_h3_duration_plan_revision",
+                "_h3_duration_segment_oracle",
+                "_apply_h3_duration_approval",
+            ),
+            {
+                "GeneratedFrameCount": GeneratedFrameCount,
+                "H3DurationOraclePlan": H3DurationOraclePlan,
+                "H3SegmentFrameRange": H3SegmentFrameRange,
+                "PublishedFrameCount": PublishedFrameCount,
+                "PublishedFrameGrid": PublishedFrameGrid,
+                "copy": copy,
+                "hashlib": hashlib,
+                "hmac": hmac,
+                "json": json,
+                "redistribute_segment_duration": redistribute_segment_duration,
+                "wgp": FakeWgp,
+                "_MULTI_CLIP_SEPARATOR": "\n---MAESTRO-CLIP---\n",
+                "_replay_h3_duration_shot_plan": (
+                    lambda _plan, *, generated, published: {
+                        "clip_prompts": [f"clip-{index}" for index in range(len(generated))],
+                        "clip_published_frames": list(published),
+                        "clip_boundaries": list(_plan.get("clip_boundaries") or []),
+                        "segment_policy": {
+                            "clip_requested_frames": list(published),
+                        },
+                    }
+                ),
+                "_stamp_h3_duration_contract": (
+                    lambda _body, target: target.update({
+                        "_duration_revision": "h3dp1_resealed",
+                    })
+                ),
+            },
+        )
+        plan = {
+            "clip_count": 2,
+            "fps": 24,
+            "global_prompt": "A camera glides through a quiet room.",
+            "requested_frames": 265,
+            "published_frames": 265,
+            "planned_frames": 265,
+            "clip_frames": [124, 141],
+            "clip_published_frames": [124, 141],
+            "clip_boundaries": [
+                {"type": "continuous", "source": "model_grid"},
+            ],
+            "segment_frames_maximum": 345,
+            "segment_models": [
+                {"model_type": "minimax_h3"},
+                {"model_type": "minimax_h3"},
+            ],
+            "_duration_target_published_frames": 265,
+            "_duration_segment_limits": [
+                {
+                    "minimum": 124, "maximum": 345,
+                    "step": 1, "offset": 0, "authored_locked": False,
+                },
+                {
+                    "minimum": 124, "maximum": 345,
+                    "step": 1, "offset": 0, "authored_locked": False,
+                },
+            ],
+        }
+        plan["_duration_revision"] = namespace[
+            "_h3_duration_plan_revision"
+        ](plan)
+        params = {"model_type": "minimax_h3"}
+        revised = namespace["_apply_h3_duration_approval"](
+            params,
+            plan,
+            plan_revision=plan["_duration_revision"],
+            duration_snap_mode="manual",
+            segment_duration_edits=[
+                {"segment_index": 2, "published_frames": 130},
+            ],
+            duration_redistribution="none",
+        )
+        self.assertEqual(revised["clip_frames"], [124, 141])
+        self.assertEqual(revised["clip_published_frames"], [124, 130])
+        self.assertEqual(revised["published_frames"], 254)
+        self.assertEqual(revised["_duration_residual_published_frames"], 11)
+        self.assertEqual(revised["_duration_outcome"], "acceptable")
+        self.assertEqual(params["video_length"], 254)
+        self.assertEqual(params["_h3_longform"], revised)
+
+    def test_duration_controls_flow_through_the_atomic_approval(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        revision = "h3dp1_" + "a" * 64
+        captured = {}
+
+        class FakeRequest:
+            async def json(self):
+                return {
+                    "workspace": "project-a",
+                    "plan_revision": revision,
+                    "duration_snap_mode": "manual",
+                    "segment_duration_edits": [
+                        {"segment_index": 2, "published_frames": 130},
+                    ],
+                    "duration_redistribution": "future",
+                }
+
+        job = {
+            "id": "job-duration-plan",
+            "status": "waiting_for_plan_approval",
+            "plan_review_deadline": None,
+        }
+
+        def approve(_job, **kwargs):
+            captured.update(kwargs)
+            return {"status": "queued"}
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("approve_generation_plan",),
+            {
+                "api": types.SimpleNamespace(
+                    post=lambda *_args, **_kwargs: lambda function: function,
+                ),
+                "Request": object,
+                "Response": object,
+                "HTTPException": FakeHTTPException,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "math": __import__("math"),
+                "time": time,
+                "_set_recovery_no_store": lambda _response: None,
+                "_require_owned_job_project": lambda *_args: job,
+                "_approve_waiting_generation_plan": approve,
+                "fail_preparation": lambda *_args, **_kwargs: True,
+            },
+        )
+        result = asyncio.run(namespace["approve_generation_plan"](
+            job["id"], FakeRequest(), object(),
+        ))
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(captured["plan_revision"], revision)
+        self.assertEqual(captured["duration_snap_mode"], "manual")
+        self.assertEqual(captured["duration_redistribution"], "future")
+        self.assertEqual(captured["segment_duration_edits"][0]["segment_index"], 2)
+
+    def test_duration_controls_reject_unhashable_values_as_bad_requests(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        job = {
+            "id": "job-duration-plan",
+            "status": "waiting_for_plan_approval",
+            "plan_review_deadline": None,
+        }
+        namespace = _isolated_functions(
+            self.launch,
+            ("approve_generation_plan",),
+            {
+                "api": types.SimpleNamespace(
+                    post=lambda *_args, **_kwargs: lambda function: function,
+                ),
+                "Request": object,
+                "Response": object,
+                "HTTPException": FakeHTTPException,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "math": __import__("math"),
+                "time": time,
+                "_set_recovery_no_store": lambda _response: None,
+                "_require_owned_job_project": lambda *_args: job,
+                "_approve_waiting_generation_plan": lambda *_args, **_kwargs: (
+                    self.fail("invalid duration controls reached approval")
+                ),
+                "fail_preparation": lambda *_args, **_kwargs: True,
+            },
+        )
+
+        for field in ("duration_snap_mode", "duration_redistribution"):
+            class FakeRequest:
+                async def json(self, selected_field=field):
+                    return {"workspace": "project-a", selected_field: []}
+
+            with self.subTest(field=field):
+                with self.assertRaises(FakeHTTPException) as raised:
+                    asyncio.run(namespace["approve_generation_plan"](
+                        job["id"], FakeRequest(), object(),
+                    ))
+                self.assertEqual(raised.exception.status_code, 400)
+
+        hybrid_bodies = [
+            {
+                "workspace": "project-a",
+                "duration_snap_mode": "nearest",
+                "segment_duration_edits": [
+                    {"segment_index": 1, "published_frames": 345},
+                ],
+            },
+            {
+                "workspace": "project-a",
+                "duration_snap_mode": "down",
+                "duration_redistribution": "none",
+            },
+        ]
+        for hybrid_body in hybrid_bodies:
+            class HybridRequest:
+                async def json(self, selected_body=hybrid_body):
+                    return selected_body
+
+            with self.subTest(hybrid_body=hybrid_body):
+                with self.assertRaises(FakeHTTPException) as raised:
+                    asyncio.run(namespace["approve_generation_plan"](
+                        job["id"], HybridRequest(), object(),
+                    ))
+                self.assertEqual(raised.exception.status_code, 400)
+
+    def test_recovery_reseal_refreshes_duration_locks_and_fingerprint(self):
+        recovery = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_replan_h3_final_segment_for_peak"),
+        )
+        self.assertIn(
+            'longform["_duration_completed_locks"] = list(range(completed_prefix))',
+            recovery,
+        )
+        self.assertIn("_stamp_h3_duration_contract(result, longform)", recovery)
+
     def test_corrupt_waiting_manifest_terminalizes_on_manual_approval(self):
         class FakeHTTPException(Exception):
             def __init__(self, *, status_code, detail):
@@ -1011,6 +1638,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             ),
             {
                 "_jobs": registry,
+                "_credit_prepare_submission": lambda _job: False,
                 "_stamp_job_origin": lambda job: job,
                 "_session_secret": lambda: b"queue-recovery-test-secret-32b!",
                 "owner_principal_digest": owner_principal_digest,
@@ -1620,6 +2248,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_H3_REF2VA_MODEL": "minimax_h3_ref2va",
                 "_H3_PEAK_RECOVERY_POLICY_VERSION": 1,
                 "_MULTI_CLIP_SEPARATOR": "\n---MAESTRO-CLIP---\n",
+                "_stamp_h3_duration_contract": lambda _body, _plan: None,
             },
         )
         prefix_frames = [107, 124, 141, 175]
@@ -2402,6 +3031,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 ),
                 "wgp": FakeWGP,
                 "_jobs": {job["id"]: job},
+                "_credit_prepare_admission": lambda _job: False,
+                "_credit_prepare_dispatch": lambda _job: False,
+                "_credit_block_runtime_error": lambda _job: None,
+                "CreditRuntimeError": ValueError,
+                "EntitlementError": ValueError,
+                "_CREDIT_INTERNAL_PARAMS": frozenset(),
                 "_active_gen_states": {},
                 "_gen_lock": object(),
                 "_H3_LONG_STUDIO_MODELS": {"minimax_h3"},

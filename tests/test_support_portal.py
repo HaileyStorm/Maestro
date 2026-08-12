@@ -260,6 +260,64 @@ class SupportPortalTests(unittest.TestCase):
         self.assertNotIn("subject_key", serialized)
         self.assertNotIn("source_event_key", serialized)
 
+    def test_linked_provider_support_stays_recorded_and_non_enforcing(self):
+        provider_subject = opaque_key(
+            "fake_support_subject", "private-provider-user", IDENTITY_KEY,
+        )
+        self.ledger.append(ContributionEventDraft(
+            provider="fake_support",
+            source_event_key=opaque_key(
+                "fake_support_event", "linked-contribution", IDENTITY_KEY,
+            ),
+            subject_key=provider_subject,
+            kind="one_time_contribution",
+            occurred_at="2026-08-11T11:00:00Z",
+            amount_minor=2_500,
+        ), received_at=NOW)
+        self.ledger.append(ContributionEventDraft(
+            provider="fake_support",
+            source_event_key=opaque_key(
+                "fake_support_event", "verified-account-link", IDENTITY_KEY,
+            ),
+            subject_key=self.subject(self.user_id),
+            kind="account_link_verified",
+            occurred_at="2026-08-11T11:01:00Z",
+            contract_key=opaque_key(
+                "account_claim", self.user_id, IDENTITY_KEY,
+            ),
+            related_event_key=provider_subject,
+        ), received_at=NOW)
+
+        account_support = self.portal.self_projection(
+            self.user_session, remote=True,
+        )["account_support"]
+        self.assertEqual(
+            account_support["recorded"]["currency_totals_minor"],
+            {"USD": 2_500},
+        )
+        allowance = account_support["recorded"]["recorded_allowance"]
+        self.assertEqual(allowance["state"], "recorded_not_enforced")
+        self.assertFalse(allowance["enforcement_enabled"])
+        self.assertEqual(allowance["effective_allowance"], 0)
+        self.assertEqual(allowance["sources"][0]["source"], "free")
+        self.assertEqual(allowance["sources"][0]["status"], "inactive")
+        self.assertEqual(
+            account_support["benefits"]["state"], "recorded_not_enforced",
+        )
+        self.assertFalse(
+            account_support["benefits"]["scheduler_enforcement_enabled"],
+        )
+        self.assertEqual(account_support["benefits"]["effective_benefits"], [])
+        serialized = json.dumps(account_support, sort_keys=True)
+        self.assertNotIn("private-provider-user", serialized)
+        self.assertNotIn(provider_subject, serialized)
+        admin = self.portal.owner_admin_projection(
+            self.owner_session,
+            remote=True,
+            target_account_id=self.user_id,
+        )["account_support"]["recorded"]
+        self.assertEqual(admin["subject_key"], self.subject(self.user_id))
+
     def test_recorded_benefits_are_never_advertised_as_effective(self):
         self.add_contribution(self.user_id, "tier", amount=10_000)
         benefits = self.portal.self_projection(self.user_session, remote=True)[

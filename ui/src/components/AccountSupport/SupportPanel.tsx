@@ -16,10 +16,49 @@ function supportErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Support details could not be refreshed.'
 }
 
+const allowanceSourceLabels = {
+  free: 'Free allowance',
+  one_time_support: 'One-time support',
+  recurring_support: 'Recurring support',
+} as const
+
+const allowanceStateText = {
+  active: 'Active',
+  inactive: 'Inactive',
+  refunded: 'Refunded',
+  expired: 'Expired',
+  capped: 'Capped',
+  canceled: 'Canceled',
+} as const
+
+const allowanceRefundLabels = {
+  partial: 'Partial refund recorded',
+  full: 'Full refund recorded',
+  excess: 'Refund exceeds the recorded source',
+} as const
+
+function allowanceUnits(value: number, unit: string): string {
+  const label = unit === 'compute_seconds'
+    ? `compute second${value === 1 ? '' : 's'}`
+    : unit.replaceAll('_', ' ')
+  return `${value.toLocaleString()} ${label}`
+}
+
+function allowanceDate(value: string): string {
+  return new Date(value).toLocaleString(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    timeZone: 'UTC',
+  })
+}
+
 function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
   const recorded = summary.event_count > 0
     || summary.one_time_tier !== null
     || summary.recurring_tier !== null
+  const allowance = summary.recorded_allowance
+  const visibleAllowanceSources = allowance?.sources.slice(0, 20) || []
+  const hiddenAllowanceSourceCount = (allowance?.sources.length || 0) - visibleAllowanceSources.length
   return (
     <section className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
       <div className="flex items-center gap-2">
@@ -32,6 +71,50 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
         <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
           Any listed eligibility is recorded only. Support-derived scheduling and retention benefits are not enforced yet.
         </p>
+      )}
+      {allowance && (
+        <section aria-label="Recorded compute allowance" className="mt-3 min-w-0 rounded-lg border border-border bg-bg-primary/40 p-3">
+          <div className="min-w-0">
+            <h4 className="text-[11px] font-semibold text-text-primary">Current recorded allowance</h4>
+            <p className="mt-1 break-words text-sm font-semibold text-accent-blue">
+              {allowanceUnits(allowance.effective_allowance, allowance.unit)}
+            </p>
+            <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+              Recorded only as of{' '}
+              <time dateTime={allowance.as_of}>{allowanceDate(allowance.as_of)} UTC</time>.
+              {' '}This allowance is not enforced and does not currently change generation, queueing, or retries.
+            </p>
+          </div>
+          <ul aria-label="Recorded allowance sources" className="mt-3 grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
+            {visibleAllowanceSources.map((source, index) => (
+              <li key={`${source.source}-${index}`} className="min-w-0 rounded-md border border-border/70 bg-bg-tertiary/30 p-2">
+                <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
+                  <span className="break-words text-[10px] font-semibold text-text-primary">{allowanceSourceLabels[source.source]}</span>
+                  <span className="text-[9px] font-medium text-text-secondary">{allowanceStateText[source.status]}</span>
+                </div>
+                <p className="mt-1 break-words text-[9px] leading-relaxed text-text-muted">
+                  {allowanceUnits(source.effective_allowance, allowance.unit)} recorded in this snapshot
+                  {' '}from a {allowanceUnits(source.granted_allowance, allowance.unit)} recorded grant.
+                </p>
+                {source.expires_at && (
+                  <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+                    Recorded expiry: <time dateTime={source.expires_at}>{allowanceDate(source.expires_at)} UTC</time>
+                  </p>
+                )}
+                {source.refund_state in allowanceRefundLabels && (
+                  <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+                    {allowanceRefundLabels[source.refund_state as keyof typeof allowanceRefundLabels]}.
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+          {hiddenAllowanceSourceCount > 0 && (
+            <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
+              {hiddenAllowanceSourceCount.toLocaleString()} additional recorded {hiddenAllowanceSourceCount === 1 ? 'source is' : 'sources are'} not shown in this compact view.
+            </p>
+          )}
+        </section>
       )}
     </section>
   )

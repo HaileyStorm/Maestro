@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from mmgp import offload, quant_router
 from shared.utils import files_locator as fl
+from services.h3_preview import H3PreviewGeometryError
 
 from .audio_vae import AutoencoderKLMiniMaxH3Audio
 from .checkpoint import (
@@ -349,6 +350,98 @@ def _keyframe_latent_stats_cpu() -> tuple[torch.Tensor, torch.Tensor]:
     return means, stds
 
 
+def _decode_h3_video_rows(
+    *,
+    vae: AutoencoderKLMiniMaxH3,
+    device: torch.device,
+    packed_rows: torch.Tensor,
+    latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    pixel_frames: int,
+    pixel_height: int,
+    pixel_width: int,
+    channels: int,
+    patch_size: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the exact native H3 video decode recipe for final or preview use."""
+
+    if channels != len(VIDEO_LATENTS_MEAN) or channels != len(VIDEO_LATENTS_STD):
+        raise H3PreviewGeometryError(
+            "MiniMax H3 video latent channel geometry is invalid"
+        )
+    if any(type(value) is not int or value < 1 for value in (
+        latent_frames,
+        latent_height,
+        latent_width,
+        pixel_frames,
+        pixel_height,
+        pixel_width,
+    )):
+        raise H3PreviewGeometryError(
+            "MiniMax H3 video geometry must contain positive integers"
+        )
+    if len(patch_size) != 3 or any(type(value) is not int or value < 1 for value in patch_size):
+        raise H3PreviewGeometryError("MiniMax H3 video patch geometry is invalid")
+    patch_t, patch_h, patch_w = patch_size
+    if latent_frames % patch_t or latent_height % patch_h or latent_width % patch_w:
+        raise H3PreviewGeometryError(
+            "MiniMax H3 video latent geometry is not patch aligned"
+        )
+    expected_rows = (
+        (latent_frames // patch_t)
+        * (latent_height // patch_h)
+        * (latent_width // patch_w)
+    )
+    expected_channels = channels * math.prod(patch_size)
+    if packed_rows.ndim != 2 or tuple(packed_rows.shape) != (
+        expected_rows,
+        expected_channels,
+    ):
+        raise H3PreviewGeometryError(
+            "MiniMax H3 packed video row geometry is invalid"
+        )
+
+    video_latents = unpatchify_video_tokens(
+        packed_rows,
+        latent_frames,
+        latent_height,
+        latent_width,
+        channels,
+        patch_size,
+    )
+    expected_latent_shape = (
+        1,
+        channels,
+        latent_frames,
+        latent_height,
+        latent_width,
+    )
+    if tuple(video_latents.shape) != expected_latent_shape:
+        raise H3PreviewGeometryError(
+            "MiniMax H3 unpacked video latent geometry is invalid"
+        )
+    video_mean = torch.tensor(VIDEO_LATENTS_MEAN, device=device).view(1, -1, 1, 1, 1)
+    video_std = torch.tensor(VIDEO_LATENTS_STD, device=device).view(1, -1, 1, 1, 1)
+    denormalized_latents = video_latents * video_std + video_mean
+    autocast = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+    with autocast:
+        video = vae.decode(denormalized_latents, return_dict=False)[0]
+    expected_pixel_shape = (1, 3, pixel_frames, pixel_height, pixel_width)
+    if tuple(video.shape) != expected_pixel_shape:
+        raise H3PreviewGeometryError(
+            "MiniMax H3 decoded video geometry is invalid"
+        )
+    pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
+    pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
+    video = (video.float() * pixel_std + pixel_mean).clamp(0, 1).mul(2).sub(1)
+    return video, video_latents
+
+
 def _first_path(value):
     if isinstance(value, (list, tuple)):
         return value[0]
@@ -664,6 +757,47 @@ class MiniMaxH3Model:
     @property
     def patch_size(self) -> tuple[int, int, int]:
         return tuple(self.transformer.config.patch_size)
+
+    @torch.inference_mode()
+    def decode_h3_preview_rows(
+        self,
+        *,
+        packed_rows: torch.Tensor,
+        latent_frames: int,
+        latent_height: int,
+        latent_width: int,
+        pixel_frames: int,
+        pixel_height: int,
+        pixel_width: int,
+        channels: int,
+        patch_size: tuple[int, int, int],
+    ) -> torch.Tensor:
+        """Decode detached preview rows through the loaded native video VAE."""
+
+        if self._interrupt:
+            raise InterruptedError("MiniMax H3 preview decode was cancelled")
+        if self.vae is None:
+            raise RuntimeError("MiniMax H3 native video VAE is unavailable")
+        if patch_size != self.patch_size:
+            raise H3PreviewGeometryError(
+                "MiniMax H3 preview patch geometry does not match the model"
+            )
+        video, _normalized_latents = _decode_h3_video_rows(
+            vae=self.vae,
+            device=self.device,
+            packed_rows=packed_rows,
+            latent_frames=latent_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            pixel_frames=pixel_frames,
+            pixel_height=pixel_height,
+            pixel_width=pixel_width,
+            channels=channels,
+            patch_size=patch_size,
+        )
+        if self._interrupt:
+            raise InterruptedError("MiniMax H3 preview decode was cancelled")
+        return video
 
     def _encode_keyframes(
         self,
@@ -1857,28 +1991,19 @@ class MiniMaxH3Model:
         if self._interrupt:
             return None
         report_phase("Decoding H3 video")
-        video_latents = unpatchify_video_tokens(
-            video_rows[layout.num_condition_video_rows :],
-            num_latent_frames,
-            latent_height,
-            latent_width,
-            24,
-            self.patch_size,
+        video, normalized_video_latents = _decode_h3_video_rows(
+            vae=self.vae,
+            device=self.device,
+            packed_rows=video_rows[layout.num_condition_video_rows :],
+            latent_frames=num_latent_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            pixel_frames=target_frame_num,
+            pixel_height=height,
+            pixel_width=width,
+            channels=24,
+            patch_size=self.patch_size,
         )
-        normalized_video_latents = video_latents
-        video_mean = torch.tensor(VIDEO_LATENTS_MEAN, device=self.device).view(1, -1, 1, 1, 1)
-        video_std = torch.tensor(VIDEO_LATENTS_STD, device=self.device).view(1, -1, 1, 1, 1)
-        video_latents = video_latents * video_std + video_mean
-        autocast = (
-            torch.autocast(device_type="cuda", dtype=torch.float16)
-            if self.device.type == "cuda"
-            else nullcontext()
-        )
-        with autocast:
-            video = self.vae.decode(video_latents, return_dict=False)[0]
-        pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=self.device).view(1, -1, 1, 1, 1)
-        pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=self.device).view(1, -1, 1, 1, 1)
-        video = (video.float() * pixel_std + pixel_mean).clamp(0, 1).mul(2).sub(1)
 
         report_phase("Decoding H3 audio")
         audio_latents = unpack_audio_tokens(

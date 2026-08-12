@@ -18,7 +18,11 @@ APP = ROOT / "app"
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
-from services.entitlements import ContributionLedger  # noqa: E402
+from services.entitlements import (  # noqa: E402
+    ContributionConflict,
+    ContributionLedger,
+    opaque_key,
+)
 from services.support_webhooks import (  # noqa: E402
     FakeSignedWebhookAdapter,
     FileWebhookReplayGuard,
@@ -132,6 +136,83 @@ class SupportWebhookTests(unittest.TestCase):
         self.assertNotIn("provider-event-private-1", stored)
         self.assertNotIn("private-user@example.test", stored)
 
+    def test_signed_account_link_projects_provider_support_to_opaque_account(self):
+        account_id = "maestro-private-account"
+        account_subject = opaque_key(
+            "maestro_account_support", account_id, IDENTITY_KEY,
+        )
+        link_adapter = FakeSignedWebhookAdapter(
+            signing_secret=SIGNING_KEY,
+            identity_secret=IDENTITY_KEY,
+            account_link_resolver=lambda provider, provider_subject, claimed: (
+                account_subject
+                if (
+                    provider == "fake_support"
+                    and provider_subject == "private-user@example.test"
+                    and claimed == account_id
+                ) else None
+            ),
+        )
+        link_raw = body(
+            event_id="verified-link-event",
+            kind="account_link_verified",
+            account_id=account_id,
+            amount_minor=0,
+        )
+        link = process_signed_webhook(
+            link_adapter, self.ledger, self.guard,
+            link_raw, link_adapter.headers(link_raw, int(NOW.timestamp())),
+            received_at=NOW,
+        )
+        contribution_raw = body(event_id="linked-contribution")
+        process_signed_webhook(
+            link_adapter, self.ledger, self.guard,
+            contribution_raw,
+            link_adapter.headers(contribution_raw, int(NOW.timestamp())),
+            received_at=NOW,
+        )
+        projection = self.ledger.privacy_safe_user_projection(
+            account_subject, as_of=NOW,
+        )
+        self.assertEqual(projection["currency_totals_minor"], {"USD": 2_500})
+        self.assertEqual(link.subject_key, account_subject)
+        self.assertRegex(link.related_event_key or "", r"^key_[0-9a-f]{64}$")
+        stored = self.ledger_path.read_text(encoding="utf-8")
+        self.assertNotIn(account_id, stored)
+        self.assertNotIn("private-user@example.test", stored)
+
+    def test_account_id_is_required_only_for_account_link_events(self):
+        missing = body(kind="account_link_verified", amount_minor=0)
+        with self.assertRaisesRegex(WebhookPayloadError, "account_id"):
+            self.adapter.verify_and_translate(
+                missing, self.signed(missing), received_at=NOW,
+            )
+        extraneous = body(account_id="not-allowed-here")
+        with self.assertRaisesRegex(WebhookPayloadError, "account_id"):
+            self.adapter.verify_and_translate(
+                extraneous, self.signed(extraneous), received_at=NOW,
+            )
+        unverified = body(
+            kind="account_link_verified",
+            account_id="unverified-account",
+            amount_minor=0,
+        )
+        with self.assertRaisesRegex(WebhookPayloadError, "server verification"):
+            self.adapter.verify_and_translate(
+                unverified, self.signed(unverified), received_at=NOW,
+            )
+        rejecting_adapter = FakeSignedWebhookAdapter(
+            signing_secret=SIGNING_KEY,
+            identity_secret=IDENTITY_KEY,
+            account_link_resolver=lambda provider, subject, account: None,
+        )
+        with self.assertRaisesRegex(WebhookPayloadError, "verification failed"):
+            rejecting_adapter.verify_and_translate(
+                unverified,
+                rejecting_adapter.headers(unverified, int(NOW.timestamp())),
+                received_at=NOW,
+            )
+
     def test_crash_between_ledger_and_replay_seal_can_finish_on_retry(self):
         raw = body(event_id="crash-safe-event")
         headers = self.signed(raw)
@@ -143,6 +224,67 @@ class SupportWebhookTests(unittest.TestCase):
         )
         self.assertEqual(retried, first)
         self.assertEqual(len(self.ledger.events()), 1)
+
+    def test_account_link_crash_retry_survives_resolver_state_change(self):
+        account_id = "crash-retry-account"
+        account_subject = opaque_key(
+            "maestro_account_support", account_id, IDENTITY_KEY,
+        )
+        active = {"value": True}
+
+        def resolver(provider, provider_subject, claimed_account):
+            if (
+                active["value"]
+                and provider == "fake_support"
+                and provider_subject == "private-user@example.test"
+                and claimed_account == account_id
+            ):
+                return account_subject
+            return None
+
+        adapter = FakeSignedWebhookAdapter(
+            signing_secret=SIGNING_KEY,
+            identity_secret=IDENTITY_KEY,
+            account_link_resolver=resolver,
+        )
+        raw = body(
+            event_id="crash-safe-link",
+            kind="account_link_verified",
+            account_id=account_id,
+            amount_minor=0,
+        )
+        headers = adapter.headers(raw, int(NOW.timestamp()))
+        draft = adapter.verify_and_translate(raw, headers, received_at=NOW)
+        first = self.ledger.append(draft, received_at=NOW)
+        active["value"] = False
+
+        altered = body(
+            event_id="crash-safe-link",
+            kind="account_link_verified",
+            account_id="different-account-claim",
+            amount_minor=0,
+        )
+        with self.assertRaises(ContributionConflict):
+            process_signed_webhook(
+                adapter,
+                self.ledger,
+                self.guard,
+                altered,
+                adapter.headers(altered, int(NOW.timestamp())),
+                received_at=NOW,
+            )
+
+        retried = process_signed_webhook(
+            adapter, self.ledger, self.guard,
+            raw, headers, received_at=NOW,
+        )
+        self.assertEqual(retried, first)
+        self.assertEqual(len(self.ledger.events()), 1)
+        with self.assertRaises(WebhookReplayError):
+            process_signed_webhook(
+                adapter, self.ledger, self.guard,
+                raw, headers, received_at=NOW,
+            )
 
     def test_malformed_duplicate_unknown_and_shape_errors_fail_closed(self):
         malformed = b"{not-json"
@@ -283,6 +425,24 @@ class SupportWebhookTests(unittest.TestCase):
         stored = self.ledger_path.read_text(encoding="utf-8")
         self.assertNotIn("manual-private-event", stored)
         self.assertNotIn("manual-private-user", stored)
+        link = adapter.draft(
+            event_id="manual-private-link",
+            subject_id="manual-provider-user",
+            kind="account_link_verified",
+            occurred_at=NOW,
+            linked_account_id="manual-maestro-account",
+        )
+        self.ledger.append(link, received_at=NOW)
+        stored = self.ledger_path.read_text(encoding="utf-8")
+        self.assertNotIn("manual-provider-user", stored)
+        self.assertNotIn("manual-maestro-account", stored)
+        with self.assertRaisesRegex(WebhookPayloadError, "linked account"):
+            adapter.draft(
+                event_id="bad-manual-link",
+                subject_id="manual-provider-user",
+                kind="account_link_verified",
+                occurred_at=NOW,
+            )
 
     def test_invalid_timestamp_header_and_unknown_event_kind_fail(self):
         raw = body()
