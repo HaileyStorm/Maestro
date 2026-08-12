@@ -57,6 +57,20 @@ async function gotoSyntheticApp(page: Page) {
   await hostTermsSettled
 }
 
+async function openAccountSupport(page: Page) {
+  const trigger = page.getByRole('button', { name: /Open Support/ }).first()
+  if (await page.evaluate(() => innerWidth <= 767)) await expectMinimumTarget(trigger)
+  await trigger.click()
+  const drawer = page.locator('#account-support-drawer[role="dialog"]')
+  await expect(drawer).toBeVisible()
+  await expect(page.locator('#root')).toHaveAttribute('inert', '')
+  await expectBodyModalLock(page, true)
+  const close = drawer.getByRole('button', { name: 'Close Support panel' }).last()
+  await expect(close).toBeFocused()
+  if (await page.evaluate(() => innerWidth <= 767)) await expectMinimumTarget(close)
+  return { trigger, drawer }
+}
+
 async function expectNoHorizontalOverflow(page: Page) {
   const geometry = await page.evaluate(() => ({
     viewport: window.innerWidth,
@@ -766,6 +780,115 @@ test('representative shell has no serious or critical axe findings', async ({ pa
   await page.getByRole('button', { name: /Enter the studio/ }).click()
   await expect(page.locator('#root')).not.toHaveAttribute('inert', '')
   await expectNoBlockingAxeFindings(page)
+})
+
+test('accounts-disabled compatibility, local bootstrap, and remote bootstrap boundaries stay explicit', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await skipWelcome(page)
+  api!.setAccountScenario('disabled')
+  await gotoSyntheticApp(page)
+
+  let opened = await openAccountSupport(page)
+  await expect(opened.drawer).toHaveAccessibleName('Support')
+  await expect(opened.drawer.getByRole('tab', { name: 'Account' })).toHaveCount(0)
+  await page.keyboard.press('Escape')
+  await expect(opened.drawer).toHaveCount(0)
+  await expect(opened.trigger).toBeFocused()
+
+  api!.setAccountScenario('local-pristine')
+  await gotoSyntheticApp(page)
+  opened = await openAccountSupport(page)
+  await expect(opened.drawer).toHaveAccessibleName('Support & account')
+  await opened.drawer.getByRole('tab', { name: 'Account' }).click()
+  const bootstrap = opened.drawer.getByRole('heading', { name: 'Create the first owner account' })
+    .locator('xpath=../..')
+  await expect(bootstrap).toContainText('server explicitly offered local bootstrap')
+  await bootstrap.getByLabel('Username', { exact: true }).fill('Synthetic Owner')
+  await bootstrap.getByLabel('Password', { exact: true }).fill('synthetic-bootstrap-password')
+  await bootstrap.getByLabel('Device label', { exact: true }).fill('Synthetic browser')
+  await bootstrap.getByRole('button', { name: 'Create owner account' }).click()
+  await expect(opened.drawer.getByText('Owner account created and signed in.')).toBeVisible()
+  await expect(opened.drawer.getByText('Synthetic Owner', { exact: true }).first()).toBeVisible()
+  await expect(opened.drawer.getByRole('heading', { name: 'Owner recovery codes' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Current project: Synthetic project/ })).toBeVisible()
+  await page.keyboard.press('Escape')
+
+  api!.setAccountScenario('remote-anonymous')
+  await gotoSyntheticApp(page)
+  const remoteBootstrapStatus = await page.evaluate(async () => {
+    const response = await fetch('/api/v1/account/nonce', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ purpose: 'bootstrap' }),
+    })
+    return response.status
+  })
+  expect(remoteBootstrapStatus).toBe(403)
+  opened = await openAccountSupport(page)
+  await opened.drawer.getByRole('tab', { name: 'Account' }).click()
+  await expect(opened.drawer.getByRole('heading', { name: 'Create the first owner account' })).toHaveCount(0)
+  await expect(opened.drawer.getByRole('heading', { name: 'Sign in' })).toBeVisible()
+  await expect(opened.drawer).toContainText('Project access stays separate from this account')
+})
+
+test('anonymous login, owner reauthentication, session revocation, and logout preserve project authority', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await skipWelcome(page)
+  api!.setAccountScenario('local-anonymous')
+  await gotoSyntheticApp(page)
+
+  const projectTrigger = page.getByRole('button', { name: /Current project: Synthetic project/ })
+  await expect(projectTrigger).toBeVisible()
+  const { drawer } = await openAccountSupport(page)
+  await drawer.getByRole('tab', { name: 'Account' }).click()
+  const login = drawer.getByRole('heading', { name: 'Sign in' }).locator('xpath=../..')
+  await login.getByLabel('Username', { exact: true }).fill('Synthetic Owner')
+  await login.getByLabel('Password', { exact: true }).fill('synthetic-owner-password')
+  await login.getByLabel('Device label', { exact: true }).fill('Synthetic browser')
+  await login.getByRole('button', { name: 'Sign in', exact: true }).click()
+
+  await expect(drawer.getByText('Signed in.', { exact: true })).toBeVisible()
+  await expect(drawer.getByText('Confirmation needed for sensitive actions')).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'Active sessions' })).toBeVisible()
+  await expect(drawer.getByText('Synthetic tablet', { exact: false })).toBeVisible()
+  await expect(drawer.getByRole('button', { name: 'Revoke other sessions' })).toBeDisabled()
+
+  const confirmation = drawer.getByRole('heading', { name: 'Confirm your password' }).locator('xpath=..')
+  await confirmation.getByLabel('Current password').fill('synthetic-owner-password')
+  await confirmation.getByRole('button', { name: 'Confirm password' }).click()
+  await expect(drawer.getByText('Sensitive account actions are temporarily unlocked.')).toBeVisible()
+  await expect(drawer.getByText('Recently confirmed')).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'User administration' })).toBeVisible()
+
+  const otherSession = drawer.getByText('Synthetic tablet', { exact: false }).locator('xpath=../..')
+  await otherSession.getByRole('button', { name: 'Revoke' }).click()
+  await expect(drawer.getByText('Session revoked.')).toBeVisible()
+  await expect(drawer.getByText('Synthetic tablet', { exact: false })).toHaveCount(0)
+  await expect(drawer.getByText('Synthetic browser', { exact: false })).toBeVisible()
+
+  await drawer.getByRole('button', { name: 'Sign out', exact: true }).last().click()
+  await expect(drawer.getByText('Signed out. Project and output access were not changed.')).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'Sign in' })).toBeVisible()
+  await expect(projectTrigger).toBeVisible()
+})
+
+test('a normal account gets self-service without owner administration', async ({ page }) => {
+  await page.setViewportSize({ width: 768, height: 900 })
+  await skipWelcome(page)
+  api!.setAccountScenario('user')
+  await gotoSyntheticApp(page)
+
+  const { drawer } = await openAccountSupport(page)
+  await drawer.getByRole('tab', { name: 'Account' }).click()
+  await expect(drawer.getByText('Synthetic User', { exact: true }).first()).toBeVisible()
+  await expect(drawer.getByText('user', { exact: true }).first()).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'Active sessions' })).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'Password and recovery' })).toBeVisible()
+  await expect(drawer.getByRole('heading', { name: 'User administration' })).toHaveCount(0)
+  await expect(drawer.getByRole('button', { name: 'Create user' })).toHaveCount(0)
+  await expect(drawer).toContainText('account cookie does not replace or mutate the browser session')
 })
 
 test('unknown and external requests are blocked before leaving the fixture', async ({ page }) => {

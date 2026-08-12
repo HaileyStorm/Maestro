@@ -69,6 +69,18 @@ reachability; and runs serious/critical axe checks on representative overlays.
 This is representative regression coverage, not an exhaustive proof of every
 conditional control or assistive-technology interaction.
 
+The fixture also exercises the optional account UI without enabling real
+accounts or loading credentials. Deterministic, in-memory scenarios cover the
+accounts-disabled compatibility path, locally offered first-owner bootstrap,
+anonymous sign-in, authenticated owner and normal-user projections, recent
+owner confirmation, session inventory/revocation, sign-out, and the remote
+bootstrap boundary. The synthetic identities, passwords, nonces, sessions, and
+recovery codes exist only in the browser test process; no production account
+flags, cookies, passkeys, provider APIs, payments, or billing are used. These
+journeys verify that project/browser-session authority remains visibly separate
+from account state. They do not claim real credential, passkey, remote-device,
+or production account acceptance.
+
 CI images must provide Playwright's documented Linux browser dependencies.
 Android-like Chromium and iOS-like WebKit are browser emulations, not physical
 device acceptance. This release gate runs Firefox plus Android-like Chromium;

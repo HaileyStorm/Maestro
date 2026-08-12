@@ -116,7 +116,143 @@ const json = (route: Route, body: unknown, status = 200) => route.fulfill({
   body: JSON.stringify(body),
 })
 
+export type SyntheticAccountScenario =
+  | 'disabled'
+  | 'local-pristine'
+  | 'local-anonymous'
+  | 'owner'
+  | 'owner-reauth-required'
+  | 'user'
+  | 'remote-anonymous'
+
+const SYNTHETIC_OWNER = {
+  id: 'synthetic-owner-account',
+  username: 'Synthetic Owner',
+  role: 'owner' as const,
+  disabled: false,
+  created_at: 1_725_000_000,
+  has_email: false,
+  passkey_credentials: 0,
+  passkey_authentication_available: false,
+}
+
+const SYNTHETIC_USER = {
+  id: 'synthetic-user-account',
+  username: 'Synthetic User',
+  role: 'user' as const,
+  disabled: false,
+  created_at: 1_725_000_100,
+  has_email: false,
+  passkey_credentials: 0,
+  passkey_authentication_available: false,
+}
+
+const SYNTHETIC_SESSIONS = [{
+  id: 'synthetic-current-session',
+  device_label: 'Synthetic browser',
+  remote_created: false,
+  created_at: 1_725_000_200,
+  last_seen_at: 1_725_000_300,
+  expires_at: 4_000_000_000,
+  current: true,
+}, {
+  id: 'synthetic-other-session',
+  device_label: 'Synthetic tablet',
+  remote_created: true,
+  created_at: 1_725_000_210,
+  last_seen_at: 1_725_000_290,
+  expires_at: 4_000_000_000,
+  current: false,
+}]
+
+interface SyntheticAccountState {
+  enabled: boolean
+  remote: boolean
+  bootstrapAvailable: boolean
+  account: typeof SYNTHETIC_OWNER | typeof SYNTHETIC_USER | null
+  reauthenticated: boolean
+  sessions: typeof SYNTHETIC_SESSIONS
+}
+
+function accountStateFor(scenario: SyntheticAccountScenario): SyntheticAccountState {
+  const enabled = scenario !== 'disabled'
+  const remote = scenario === 'remote-anonymous'
+  const bootstrapAvailable = scenario === 'local-pristine'
+  const account = scenario === 'owner' || scenario === 'owner-reauth-required'
+    ? SYNTHETIC_OWNER
+    : scenario === 'user'
+      ? SYNTHETIC_USER
+      : null
+  return {
+    enabled,
+    remote,
+    bootstrapAvailable,
+    account,
+    reauthenticated: scenario === 'owner' || scenario === 'user',
+    sessions: account ? SYNTHETIC_SESSIONS.map(session => ({ ...session })) : [],
+  }
+}
+
+function accountProjection(state: SyntheticAccountState, dedicated = false) {
+  const authenticated = state.account !== null
+  const capabilities = !authenticated
+    ? []
+    : state.account?.role === 'owner'
+      ? ['account.self', 'accounts.admin', 'services.admin']
+      : ['account.self']
+  return {
+    enabled: state.enabled,
+    authenticated,
+    account: state.account,
+    capabilities,
+    reauthenticated: authenticated && state.reauthenticated,
+    passkey_authentication_available: false,
+    ...(dedicated ? { bootstrap_available: state.bootstrapAvailable && !state.remote } : {}),
+  }
+}
+
+const SYNTHETIC_SUPPORT_PUBLIC = {
+  schema_version: 1,
+  provider_catalog: {
+    schema_version: 1,
+    provider_neutral: true,
+    providers: [],
+  },
+  benefit_availability: {
+    scheduler_enforcement_enabled: false,
+    effective_benefits: [],
+    state: 'recorded_not_enforced',
+  },
+  support_priority: {
+    scheduler_enforcement_enabled: false,
+    effective_priority_boost: false,
+    state: 'recorded_not_enforced',
+    exclusions: [],
+    notice: 'Synthetic fixture does not apply support priority.',
+  },
+}
+
+const SYNTHETIC_RESPONSIBLE_USE = {
+  notice: {
+    document_id: 'synthetic-responsible-use',
+    version: 1,
+    content_sha256: '0'.repeat(64),
+    digest_algorithm: 'sha256',
+    title: 'Synthetic fixture notice',
+    paragraphs: ['This content-free fixture records no production acknowledgement.'],
+  },
+  status: {
+    document_id: 'synthetic-responsible-use',
+    document_version: 1,
+    content_sha256: '0'.repeat(64),
+    accepted: false,
+    accepted_at: null,
+    state: 'not_accepted',
+  },
+}
+
 export interface SyntheticApiController {
+  setAccountScenario(scenario: SyntheticAccountScenario): void
   setQueueFailure(failing: boolean): void
   setQueueHeld(held: boolean): void
   setQueueDelay(delayMs: number): void
@@ -129,7 +265,37 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
   let queueFailure = false
   let queueHeld = false
   let queueDelayMs = 0
+  let accountState = accountStateFor('disabled')
+  let nonceSequence = 0
+  const accountNonces = new Map<string, string>()
   const context = page.context()
+
+  const rejectAccountContract = async (route: Route, message: string) => {
+    unexpected.push(`account-contract ${message}`)
+    await json(route, { detail: { code: 'synthetic_contract_mismatch', message } }, 400)
+  }
+
+  const accountBody = (route: Route): Record<string, unknown> => {
+    try {
+      const body = route.request().postDataJSON()
+      return body && typeof body === 'object' && !Array.isArray(body)
+        ? body as Record<string, unknown>
+        : {}
+    } catch {
+      return {}
+    }
+  }
+
+  const consumeNonce = async (route: Route, purpose: string) => {
+    const body = accountBody(route)
+    const nonce = typeof body.nonce === 'string' ? body.nonce : ''
+    if (accountNonces.get(nonce) !== purpose) {
+      await rejectAccountContract(route, `${route.request().method()} ${new URL(route.request().url()).pathname} requires one ${purpose} nonce`)
+      return null
+    }
+    accountNonces.delete(nonce)
+    return body
+  }
 
   await context.routeWebSocket(/.*/, async socket => {
     const url = new URL(socket.url())
@@ -172,7 +338,7 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
     switch (key) {
       case 'GET /api/v1/access-context':
         await json(route, {
-          remote: false,
+          remote: accountState.remote,
           project_password_required: false,
           project_names_visible: true,
           machine_controls: false,
@@ -182,6 +348,7 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           cloudflare_enabled: false,
           share_url: '',
           share_flow: 'disabled',
+          accounts: accountProjection(accountState),
         })
         return
       case 'GET /api/v1/workspaces':
@@ -394,27 +561,169 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         await json(route, { pipelines: [] })
         return
       case 'GET /api/v1/support/catalog':
+        await json(route, SYNTHETIC_SUPPORT_PUBLIC)
+        return
+      case 'GET /api/v1/support/self':
+        if (accountState.account === null) {
+          await json(route, { detail: 'Synthetic authentication is required.' }, 401)
+          return
+        }
         await json(route, {
-          schema_version: 1,
-          provider_catalog: {
-            schema_version: 1,
-            provider_neutral: true,
-            providers: [],
+          ...SYNTHETIC_SUPPORT_PUBLIC,
+          account_support: {
+            recorded: {
+              event_count: 0,
+              one_time_tier: null,
+              recurring_tier: null,
+              active_recurring_count: 0,
+            },
+            benefits: {
+              state: 'recorded_not_enforced',
+              scheduler_enforcement_enabled: false,
+              effective_benefits: [],
+              recorded_eligibility: [],
+            },
           },
-          benefit_availability: {
-            scheduler_enforcement_enabled: false,
-            effective_benefits: [],
-            state: 'recorded_not_enforced',
-          },
-          support_priority: {
-            scheduler_enforcement_enabled: false,
-            effective_priority_boost: false,
-            state: 'recorded_not_enforced',
-            exclusions: [],
-            notice: 'Synthetic fixture does not apply support priority.',
-          },
+          responsible_use: SYNTHETIC_RESPONSIBLE_USE,
         })
         return
+      case 'GET /api/v1/support/responsible-use':
+        if (accountState.account === null) {
+          await json(route, { detail: 'Synthetic authentication is required.' }, 401)
+          return
+        }
+        await json(route, SYNTHETIC_RESPONSIBLE_USE)
+        return
+      case 'GET /api/v1/account/context':
+        if (!accountState.enabled) {
+          await json(route, { detail: 'Synthetic accounts are disabled.' }, 404)
+          return
+        }
+        await json(route, accountProjection(accountState, true))
+        return
+      case 'POST /api/v1/account/nonce': {
+        if (!accountState.enabled) {
+          await json(route, { detail: 'Synthetic accounts are disabled.' }, 404)
+          return
+        }
+        const body = accountBody(route)
+        const purpose = typeof body.purpose === 'string' ? body.purpose : ''
+        const allowed = new Set([
+          'bootstrap', 'login', 'reauth', 'revoke_session', 'revoke_all_sessions',
+        ])
+        if (!allowed.has(purpose)) {
+          await rejectAccountContract(route, `unsupported nonce purpose ${purpose || '(missing)'}`)
+          return
+        }
+        if (purpose === 'bootstrap' && (accountState.remote || !accountState.bootstrapAvailable)) {
+          await json(route, {
+            detail: {
+              code: 'bootstrap_unavailable',
+              message: accountState.remote
+                ? 'Synthetic bootstrap requires direct loopback.'
+                : 'Synthetic bootstrap is not available.',
+            },
+          }, accountState.remote ? 403 : 404)
+          return
+        }
+        if (
+          purpose !== 'bootstrap'
+          && purpose !== 'login'
+          && accountState.account === null
+        ) {
+          await json(route, {
+            detail: {
+              code: 'authentication_required',
+              message: 'Synthetic authentication is required.',
+            },
+          }, 401)
+          return
+        }
+        const nonce = `synthetic-${purpose}-nonce-${++nonceSequence}`
+        accountNonces.set(nonce, purpose)
+        await json(route, { nonce, purpose, expires_in: 300 })
+        return
+      }
+      case 'POST /api/v1/account/bootstrap': {
+        const body = await consumeNonce(route, 'bootstrap')
+        if (!body) return
+        if (accountState.remote || !accountState.bootstrapAvailable || accountState.account !== null) {
+          await rejectAccountContract(route, 'bootstrap requires an explicitly offered pristine local server')
+          return
+        }
+        accountState = {
+          ...accountState,
+          bootstrapAvailable: false,
+          account: SYNTHETIC_OWNER,
+          reauthenticated: true,
+          sessions: SYNTHETIC_SESSIONS.map(session => ({ ...session })),
+        }
+        await json(route, {
+          account: SYNTHETIC_OWNER,
+          recovery_codes: ['synthetic-recovery-code-one', 'synthetic-recovery-code-two'],
+        })
+        return
+      }
+      case 'POST /api/v1/account/login': {
+        const body = await consumeNonce(route, 'login')
+        if (!body) return
+        if (body.username !== SYNTHETIC_OWNER.username || body.password !== 'synthetic-owner-password') {
+          await json(route, { detail: { code: 'invalid_credentials', message: 'Synthetic credentials did not match.' } }, 401)
+          return
+        }
+        accountState = {
+          ...accountState,
+          bootstrapAvailable: false,
+          account: SYNTHETIC_OWNER,
+          reauthenticated: false,
+          sessions: SYNTHETIC_SESSIONS.map(session => ({ ...session })),
+        }
+        await json(route, { account: SYNTHETIC_OWNER })
+        return
+      }
+      case 'POST /api/v1/account/reauth': {
+        const body = await consumeNonce(route, 'reauth')
+        if (!body) return
+        if (accountState.account === null || body.password !== 'synthetic-owner-password') {
+          await json(route, { detail: { code: 'invalid_credentials', message: 'Synthetic password did not match.' } }, 401)
+          return
+        }
+        accountState = { ...accountState, reauthenticated: true }
+        await json(route, { account: accountState.account, reauthenticated_until: 4_000_000_000 })
+        return
+      }
+      case 'POST /api/v1/account/logout': {
+        const body = await consumeNonce(route, 'revoke_session')
+        if (!body) return
+        accountState = { ...accountState, account: null, reauthenticated: false, sessions: [] }
+        await json(route, { status: 'logged_out' })
+        return
+      }
+      case 'GET /api/v1/account/sessions':
+        if (accountState.account === null) {
+          await json(route, { detail: 'Synthetic authentication is required.' }, 401)
+          return
+        }
+        await json(route, { sessions: accountState.sessions })
+        return
+      case 'GET /api/v1/account/users':
+        if (accountState.account?.role !== 'owner' || !accountState.reauthenticated) {
+          await json(route, { detail: 'Recent synthetic owner confirmation is required.' }, 403)
+          return
+        }
+        await json(route, { accounts: [SYNTHETIC_OWNER, SYNTHETIC_USER] })
+        return
+      case 'POST /api/v1/account/sessions/revoke-all': {
+        const body = await consumeNonce(route, 'revoke_all_sessions')
+        if (!body) return
+        const retainCurrent = body.retain_current === true
+        const revoked = accountState.sessions.filter(session => !retainCurrent || !session.current).length
+        accountState = retainCurrent
+          ? { ...accountState, sessions: accountState.sessions.filter(session => session.current) }
+          : { ...accountState, account: null, reauthenticated: false, sessions: [] }
+        await json(route, { revoked, current_revoked: !retainCurrent })
+        return
+      }
       case 'GET /api/v1/blender/status':
         await json(route, {
           installed: false,
@@ -579,12 +888,34 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         })
         return
       default:
+        if (request.method() === 'DELETE' && url.pathname.startsWith('/api/v1/account/sessions/')) {
+          const body = await consumeNonce(route, 'revoke_session')
+          if (!body) return
+          const sessionId = decodeURIComponent(url.pathname.slice('/api/v1/account/sessions/'.length))
+          const session = accountState.sessions.find(candidate => candidate.id === sessionId)
+          if (!session) {
+            await json(route, { detail: 'Synthetic session was not found.' }, 404)
+            return
+          }
+          accountState = {
+            ...accountState,
+            account: session.current ? null : accountState.account,
+            reauthenticated: session.current ? false : accountState.reauthenticated,
+            sessions: accountState.sessions.filter(candidate => candidate.id !== sessionId),
+          }
+          await json(route, { revoked: true, current: session.current })
+          return
+        }
         unexpected.push(`unknown ${key}`)
         await route.abort('blockedbyclient')
     }
   })
 
   return {
+    setAccountScenario(scenario) {
+      accountState = accountStateFor(scenario)
+      accountNonces.clear()
+    },
     setQueueFailure(failing) {
       queueFailure = failing
     },
