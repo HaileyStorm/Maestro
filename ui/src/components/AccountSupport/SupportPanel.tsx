@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Check, ExternalLink, HeartHandshake, Loader2, ShieldCheck } from 'lucide-react'
 import { AccountApiError } from '../../api/client'
 import { useStore } from '../../stores/useStore'
-import type { SupportAccountSummary } from '../../types'
+import type { SupportAccountSummary, SupportAdminAudit, SupportAdminEventKind } from '../../types'
 import {
   affectedPriorityNotice,
   availableSupportProviders,
@@ -14,6 +14,13 @@ function supportErrorMessage(error: unknown): string {
     return `${error.message} Try again in about ${error.retryAfter} seconds.`
   }
   return error instanceof Error ? error.message : 'Support details could not be refreshed.'
+}
+
+function adminSupportErrorMessage(error: unknown): string {
+  if (error instanceof AccountApiError && error.retryAfter > 0) {
+    return `Private support audit could not be refreshed. Try again in about ${error.retryAfter} seconds.`
+  }
+  return 'Private support audit could not be refreshed. Confirm recent owner access and try again.'
 }
 
 const allowanceSourceLabels = {
@@ -37,6 +44,8 @@ const allowanceRefundLabels = {
   excess: 'Refund exceeds the recorded source',
 } as const
 
+const PRIVATE_SUPPORT_AUDIT_DISPLAY_TTL_MS = 4 * 60 * 1000
+
 function allowanceUnits(value: number, unit: string): string {
   const label = unit === 'compute_seconds'
     ? `compute second${value === 1 ? '' : 's'}`
@@ -50,6 +59,166 @@ function allowanceDate(value: string): string {
     timeStyle: 'short',
     timeZone: 'UTC',
   })
+}
+
+const auditEventLabels: Record<SupportAdminEventKind, string> = {
+  one_time_contribution: 'One-time contribution',
+  recurring_started: 'Recurring support started',
+  recurring_renewed: 'Recurring support renewed',
+  refund: 'Refund',
+  chargeback: 'Chargeback',
+  recurring_canceled: 'Recurring support canceled',
+  fulfillment_set: 'Fulfillment updated',
+  account_link_verified: 'Account link verified',
+  account_link_revoked: 'Account link revoked',
+}
+
+const discrepancyLabels = {
+  unresolved_or_mismatched_adjustment: 'Adjustment does not match a recorded contribution',
+  adjustments_exceed_contribution: 'Recorded adjustments exceed the contribution',
+} as const
+
+function auditLabel(value: string): string {
+  return value.replaceAll('_', ' ')
+}
+
+function minorUnits(value: number, currency: string): string {
+  return `${value.toLocaleString()} ${currency} minor unit${value === 1 ? '' : 's'}`
+}
+
+function AdminSupportAudit({ audit }: { audit: SupportAdminAudit }) {
+  const totals = Object.entries(audit.currency_totals_minor)
+  const visibleEvents = audit.events.slice(-40).reverse()
+  const hiddenEventCount = audit.events.length - visibleEvents.length
+  const visibleDiscrepancies = audit.discrepancies.slice(0, 20)
+  const hiddenDiscrepancyCount = audit.discrepancies.length - visibleDiscrepancies.length
+  const visibleFulfillment = audit.fulfillment.slice(0, 20)
+  const hiddenFulfillmentCount = audit.fulfillment.length - visibleFulfillment.length
+  return (
+    <section aria-labelledby="private-support-audit-heading" className="rounded-xl border border-border bg-bg-primary/30 p-3">
+      <h4 id="private-support-audit-heading" className="text-[11px] font-semibold text-text-primary">
+        Private contribution and fulfillment audit
+      </h4>
+      <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+        Read-only records shown after recent owner confirmation. State is recorded_not_enforced: this view does not process payments, activate providers, or enforce benefits.
+      </p>
+      {audit.incomplete && (
+        <p className="mt-2 rounded-md border border-indicator-warning/40 bg-indicator-warning/5 px-2 py-1 text-[9px] leading-relaxed text-text-secondary" role="status">
+          Some audit data was unavailable or invalid and was not displayed. Empty sections below are not proof that no records exist.
+        </p>
+      )}
+
+      <section aria-labelledby="audit-totals-heading" className="mt-3">
+        <h5 id="audit-totals-heading" className="text-[10px] font-semibold text-text-secondary">Recorded net totals</h5>
+        {totals.length > 0 ? (
+          <ul className="mt-1 flex flex-wrap gap-2" aria-label="Recorded currency totals">
+            {totals.map(([currency, amount]) => (
+              <li key={currency} className="rounded-md border border-border/70 bg-bg-tertiary/30 px-2 py-1 text-[9px] text-text-secondary">
+                {minorUnits(amount, currency)}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-1 text-[9px] text-text-muted">
+            {audit.incomplete ? 'Recorded total data is incomplete.' : 'No net contribution total is recorded.'}
+          </p>
+        )}
+      </section>
+
+      <section aria-labelledby="audit-events-heading" className="mt-3">
+        <h5 id="audit-events-heading" className="text-[10px] font-semibold text-text-secondary">Source events</h5>
+        {visibleEvents.length > 0 ? (
+          <ul className="mt-2 space-y-2" aria-label="Private contribution source events">
+            {visibleEvents.map(event => (
+              <li key={event.event_id} className="min-w-0 rounded-md border border-border/70 bg-bg-tertiary/20 p-2">
+                <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
+                  <span className="break-words text-[10px] font-semibold text-text-primary">{auditEventLabels[event.kind]}</span>
+                  <span className="text-[9px] text-text-muted">{auditLabel(event.provider)}</span>
+                </div>
+                {event.amount_minor > 0 && (
+                  <p className="mt-1 text-[9px] font-medium text-text-secondary">{minorUnits(event.amount_minor, event.currency)}</p>
+                )}
+                <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+                  Occurred <time dateTime={event.occurred_at}>{allowanceDate(event.occurred_at)} UTC</time>
+                  {' · '}received <time dateTime={event.received_at}>{allowanceDate(event.received_at)} UTC</time>
+                  {' · '}sequence {event.sequence.toLocaleString()}
+                </p>
+                <details className="mt-1 text-[9px] text-text-muted">
+                  <summary className="cursor-pointer select-none">Opaque reconciliation references</summary>
+                  <div className="mt-1 space-y-1 break-all font-mono">
+                    <p>Event: {event.event_id}</p>
+                    <p>Source: {event.source_reference}</p>
+                    {event.contract_reference && <p>Contract: {event.contract_reference}</p>}
+                    {event.related_reference && <p>Related: {event.related_reference}</p>}
+                    {event.actor_reference && <p>Actor: {event.actor_reference}</p>}
+                  </div>
+                </details>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-1 text-[9px] text-text-muted">
+            {audit.incomplete ? 'Contribution event data is incomplete.' : 'No contribution audit events are recorded for this account.'}
+          </p>
+        )}
+        {hiddenEventCount > 0 && (
+          <p className="mt-2 text-[9px] text-text-muted">
+            Showing the 40 newest recorded events; {hiddenEventCount.toLocaleString()} older {hiddenEventCount === 1 ? 'event is' : 'events are'} hidden.
+          </p>
+        )}
+      </section>
+
+      <section aria-labelledby="audit-discrepancies-heading" className="mt-3">
+        <h5 id="audit-discrepancies-heading" className="text-[10px] font-semibold text-text-secondary">Discrepancies and follow-up</h5>
+        {visibleDiscrepancies.length > 0 ? (
+          <ul className="mt-2 space-y-1" aria-label="Recorded support discrepancies">
+            {visibleDiscrepancies.map(row => (
+              <li key={`${row.event_id}-${row.reason}`} className="rounded-md border border-indicator-warning/40 bg-indicator-warning/5 p-2 text-[9px] leading-relaxed text-text-secondary">
+                {discrepancyLabels[row.reason]}. <span className="break-all font-mono text-text-muted">{row.event_id}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-1 text-[9px] text-text-muted">
+            {audit.incomplete ? 'Discrepancy data is incomplete.' : 'No recorded discrepancies need follow-up.'}
+          </p>
+        )}
+        {hiddenDiscrepancyCount > 0 && (
+          <p className="mt-1 text-[9px] text-text-muted">{hiddenDiscrepancyCount.toLocaleString()} additional discrepancy rows are hidden.</p>
+        )}
+      </section>
+
+      <section aria-labelledby="audit-fulfillment-heading" className="mt-3">
+        <h5 id="audit-fulfillment-heading" className="text-[10px] font-semibold text-text-secondary">Fulfillment</h5>
+        {visibleFulfillment.length > 0 ? (
+          <ul className="mt-2 space-y-1" aria-label="Recorded support fulfillment">
+            {visibleFulfillment.map(row => (
+              <li key={row.audit_event_id} className="rounded-md border border-border/70 bg-bg-tertiary/20 p-2 text-[9px] leading-relaxed text-text-secondary">
+                <span className="font-semibold text-text-primary">{auditLabel(row.item)}</span>
+                {' · '}{auditLabel(row.status)}
+                {' · '}<time dateTime={row.changed_at}>{allowanceDate(row.changed_at)} UTC</time>
+                <details className="mt-1 text-text-muted">
+                  <summary className="cursor-pointer select-none">Opaque fulfillment references</summary>
+                  <div className="mt-1 space-y-1 break-all font-mono">
+                    <p>Audit event: {row.audit_event_id}</p>
+                    {row.target_event_id && <p>Target event: {row.target_event_id}</p>}
+                    <p>Actor: {row.actor_reference}</p>
+                  </div>
+                </details>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-1 text-[9px] text-text-muted">
+            {audit.incomplete ? 'Fulfillment data is incomplete.' : 'No fulfillment follow-up is recorded.'}
+          </p>
+        )}
+        {hiddenFulfillmentCount > 0 && (
+          <p className="mt-1 text-[9px] text-text-muted">{hiddenFulfillmentCount.toLocaleString()} additional fulfillment rows are hidden.</p>
+        )}
+      </section>
+    </section>
+  )
 }
 
 function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
@@ -147,9 +316,13 @@ export function SupportPanel() {
     && context.capabilities.includes('account.self')
   const accountId = authenticated ? context.account?.id || null : null
   const ownerSupport = authenticated
+    && context.account?.role === 'owner'
     && context.reauthenticated === true
     && context.capabilities.includes('accounts.admin')
     && context.capabilities.includes('services.admin')
+  const selectedAdminAccountId = selectedUserIndex === ''
+    ? null
+    : users[Number(selectedUserIndex)]?.id ?? null
   const availableProviders = useMemo(() => availableSupportProviders(catalog), [catalog])
   const currentResponsibleUse = responsibleUse || self?.responsible_use || null
   const responsibleUseAccepted = responsibleUseIsAccepted(currentResponsibleUse)
@@ -177,9 +350,44 @@ export function SupportPanel() {
     if (!ownerSupport) {
       adminSelectionEpochRef.current += 1
       setSelectedUserIndex('')
+      setNotice(null)
       clearAdmin()
     }
   }, [clearAdmin, ownerSupport])
+
+  useEffect(() => () => {
+    adminSelectionEpochRef.current += 1
+    clearAdmin()
+  }, [clearAdmin])
+
+  useEffect(() => {
+    if (
+      !ownerSupport
+      || !admin
+      || adminAccountId === null
+    ) return
+    if (adminAccountId !== selectedAdminAccountId) {
+      adminSelectionEpochRef.current += 1
+      setSelectedUserIndex('')
+      setNotice(null)
+      clearAdmin()
+      return
+    }
+    const displayAccountId = adminAccountId
+    const displayProjection = admin
+    const timeout = window.setTimeout(() => {
+      if (
+        useStore.getState().supportAdminAccountId === displayAccountId
+        && useStore.getState().supportAdmin === displayProjection
+      ) {
+        adminSelectionEpochRef.current += 1
+        setSelectedUserIndex('')
+        setNotice(null)
+        clearAdmin()
+      }
+    }, PRIVATE_SUPPORT_AUDIT_DISPLAY_TTL_MS)
+    return () => window.clearTimeout(timeout)
+  }, [admin, adminAccountId, clearAdmin, ownerSupport, selectedAdminAccountId])
 
   const acceptResponsibleUse = async () => {
     if (busy || !currentResponsibleUse) return
@@ -213,7 +421,7 @@ export function SupportPanel() {
       await loadAdmin(account.id)
     } catch (error) {
       if (selectionEpoch === adminSelectionEpochRef.current) {
-        setNotice({ kind: 'error', text: supportErrorMessage(error) })
+        setNotice({ kind: 'error', text: adminSupportErrorMessage(error) })
       }
     }
   }
@@ -341,11 +549,27 @@ export function SupportPanel() {
             </select>
           </label>
           {selectedUserIndex !== ''
+            && detailsLoading
+            && (
+              <p className="mt-3 flex items-center gap-2 rounded-lg bg-bg-primary/40 px-3 py-2 text-[10px] text-text-muted" role="status">
+                <Loader2 size={12} className="animate-spin" aria-hidden="true" /> Loading private support audit…
+              </p>
+            )}
+          {selectedUserIndex !== ''
+            && !detailsLoading
+            && !admin
+            && (
+              <p className="mt-3 rounded-lg bg-bg-primary/40 px-3 py-2 text-[10px] text-text-muted" role="status">
+                Private support audit is unavailable.
+              </p>
+            )}
+          {selectedUserIndex !== ''
             && admin
             && adminAccountId === users[Number(selectedUserIndex)]?.id
             && (
             <div className="mt-3 space-y-2">
               <RecordedSupport summary={admin.account} />
+              <AdminSupportAudit audit={admin.audit} />
               {adminPriorityNotice && (
                 <p className="rounded-lg border border-indicator-warning/40 bg-indicator-warning/5 px-3 py-2 text-[10px] leading-relaxed text-text-secondary">
                   {adminPriorityNotice}

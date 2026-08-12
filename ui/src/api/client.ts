@@ -1273,6 +1273,26 @@ function stringList(value: unknown): string[] {
 const SUPPORT_ALLOWANCE_SOURCES = new Set(['free', 'one_time_support', 'recurring_support'])
 const SUPPORT_ALLOWANCE_STATUSES = new Set(['active', 'inactive', 'refunded', 'expired', 'capped', 'canceled'])
 const SUPPORT_ALLOWANCE_REFUND_STATES = new Set(['not_applicable', 'none', 'partial', 'full', 'excess'])
+const SUPPORT_ADMIN_EVENT_KINDS = new Set([
+  'one_time_contribution',
+  'recurring_started',
+  'recurring_renewed',
+  'refund',
+  'chargeback',
+  'recurring_canceled',
+  'fulfillment_set',
+  'account_link_verified',
+  'account_link_revoked',
+])
+const SUPPORT_FUNDING_EVENT_KINDS = new Set(['one_time_contribution', 'recurring_started', 'recurring_renewed'])
+const SUPPORT_ADJUSTMENT_EVENT_KINDS = new Set(['refund', 'chargeback'])
+const SUPPORT_RECURRING_EVENT_KINDS = new Set(['recurring_started', 'recurring_renewed', 'recurring_canceled'])
+const SUPPORT_ACCOUNT_LINK_EVENT_KINDS = new Set(['account_link_verified', 'account_link_revoked'])
+const SUPPORT_FULFILLMENT_STATUSES = new Set(['pending', 'complete', 'declined'])
+const SUPPORT_DISCREPANCY_REASONS = new Set([
+  'unresolved_or_mismatched_adjustment',
+  'adjustments_exceed_contribution',
+])
 
 function safeAllowanceNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
@@ -1281,6 +1301,208 @@ function safeAllowanceNumber(value: unknown): number | null {
 function safeAllowanceTimestamp(value: unknown): string | null {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) return null
   return Number.isNaN(Date.parse(value)) ? null : value
+}
+
+function safeOpaqueSupportReference(value: unknown): string | null {
+  return typeof value === 'string' && /^key_[0-9a-f]{64}$/.test(value) ? value : null
+}
+
+function safeSupportEventId(value: unknown): string | null {
+  return typeof value === 'string' && /^evt_[0-9a-f]{32}$/.test(value) ? value : null
+}
+
+function safeSupportAuditTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) return null
+  const parsed = new Date(value)
+  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().replace('.000Z', 'Z') === value
+    ? value
+    : null
+}
+
+function supportAdminEventContractIsValid(input: {
+  kind: string
+  amount: number
+  contractReference: string | null
+  relatedReference: string | null
+  fulfillmentItem: string | null
+  fulfillmentStatus: string | null
+  actorReference: string | null
+}): boolean {
+  const hasFulfillmentFields = input.fulfillmentItem !== null
+    || input.fulfillmentStatus !== null
+    || input.actorReference !== null
+  if (SUPPORT_FUNDING_EVENT_KINDS.has(input.kind) && input.amount <= 0) return false
+  if (SUPPORT_ADJUSTMENT_EVENT_KINDS.has(input.kind)) {
+    return input.amount > 0 && input.relatedReference !== null
+      && !hasFulfillmentFields
+  }
+  if (SUPPORT_RECURRING_EVENT_KINDS.has(input.kind) && input.contractReference === null) return false
+  if (input.kind === 'recurring_canceled') {
+    return input.amount === 0 && !hasFulfillmentFields
+  }
+  if (input.kind === 'fulfillment_set') {
+    return input.amount === 0 && input.relatedReference !== null && input.fulfillmentItem !== null
+      && input.fulfillmentStatus !== null && input.actorReference !== null
+  }
+  if (SUPPORT_ACCOUNT_LINK_EVENT_KINDS.has(input.kind)) {
+    return input.amount === 0 && input.contractReference !== null
+      && input.relatedReference !== null && !hasFulfillmentFields
+  }
+  return !hasFulfillmentFields
+}
+
+function supportAdminAudit(recorded: Record<string, unknown>): SupportAdminProjection['audit'] {
+  let incomplete = false
+  const totals = recorded.currency_totals_minor
+  const currency_totals_minor: Record<string, number> = {}
+  if (totals && typeof totals === 'object' && !Array.isArray(totals)) {
+    for (const [currency, amount] of Object.entries(totals)) {
+      if (/^[A-Z]{3}$/.test(currency) && safeAllowanceNumber(amount) !== null) {
+        currency_totals_minor[currency] = amount as number
+      } else {
+        incomplete = true
+      }
+    }
+  } else {
+    incomplete = true
+  }
+
+  if (!Array.isArray(recorded.audit)) incomplete = true
+  const events = Array.isArray(recorded.audit) ? recorded.audit.flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      incomplete = true
+      return []
+    }
+    const event = item as Record<string, unknown>
+    const eventId = safeSupportEventId(event.event_id)
+    const sourceReference = safeOpaqueSupportReference(event.source_event_key)
+    const occurredAt = safeSupportAuditTimestamp(event.occurred_at)
+    const receivedAt = safeSupportAuditTimestamp(event.received_at)
+    const contractReference = event.contract_key === null ? null : safeOpaqueSupportReference(event.contract_key)
+    const relatedReference = event.related_event_key === null ? null : safeOpaqueSupportReference(event.related_event_key)
+    const actorReference = event.actor_key === null ? null : safeOpaqueSupportReference(event.actor_key)
+    const fulfillmentItem = event.fulfillment_item === null
+      ? null
+      : typeof event.fulfillment_item === 'string' && /^[a-z][a-z0-9_]{1,63}$/.test(event.fulfillment_item)
+        ? event.fulfillment_item
+        : undefined
+    const fulfillmentStatus = event.fulfillment_status === null
+      ? null
+      : typeof event.fulfillment_status === 'string' && SUPPORT_FULFILLMENT_STATUSES.has(event.fulfillment_status)
+        ? event.fulfillment_status
+        : undefined
+    const amount = safeAllowanceNumber(event.amount_minor)
+    const kind = typeof event.kind === 'string' && SUPPORT_ADMIN_EVENT_KINDS.has(event.kind)
+      ? event.kind
+      : null
+    if (
+      !Number.isSafeInteger(event.sequence)
+      || (event.sequence as number) < 1
+      || (event.sequence as number) > 50_000
+      || eventId === null
+      || typeof event.provider !== 'string'
+      || !/^[a-z][a-z0-9_]{1,47}$/.test(event.provider)
+      || sourceReference === null
+      || kind === null
+      || occurredAt === null
+      || receivedAt === null
+      || amount === null
+      || amount > 10_000_000_000
+      || typeof event.currency !== 'string'
+      || !/^[A-Z]{3}$/.test(event.currency)
+      || (event.contract_key !== null && contractReference === null)
+      || (event.related_event_key !== null && relatedReference === null)
+      || fulfillmentItem === undefined
+      || fulfillmentStatus === undefined
+      || (event.actor_key !== null && actorReference === null)
+      || !supportAdminEventContractIsValid({
+        kind: kind || '',
+        amount: amount ?? 0,
+        contractReference,
+        relatedReference,
+        fulfillmentItem: fulfillmentItem ?? null,
+        fulfillmentStatus: fulfillmentStatus ?? null,
+        actorReference,
+      })
+    ) {
+      incomplete = true
+      return []
+    }
+    return [{
+      sequence: event.sequence as number,
+      event_id: eventId,
+      provider: event.provider,
+      source_reference: sourceReference,
+      kind: kind as SupportAdminProjection['audit']['events'][number]['kind'],
+      occurred_at: occurredAt,
+      received_at: receivedAt,
+      amount_minor: amount as number,
+      currency: event.currency,
+      contract_reference: contractReference,
+      related_reference: relatedReference,
+      fulfillment_item: fulfillmentItem,
+      fulfillment_status: fulfillmentStatus as SupportAdminProjection['audit']['events'][number]['fulfillment_status'],
+      actor_reference: actorReference,
+    }]
+  }) : []
+
+  if (!Array.isArray(recorded.fulfillment)) incomplete = true
+  const fulfillment = Array.isArray(recorded.fulfillment) ? recorded.fulfillment.flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      incomplete = true
+      return []
+    }
+    const row = item as Record<string, unknown>
+    const targetEventId = row.target_event_id === null ? null : safeSupportEventId(row.target_event_id)
+    const auditEventId = safeSupportEventId(row.audit_event_id)
+    const actorReference = safeOpaqueSupportReference(row.actor_key)
+    const changedAt = safeSupportAuditTimestamp(row.changed_at)
+    if (
+      (row.target_event_id !== null && targetEventId === null)
+      || typeof row.item !== 'string'
+      || !/^[a-z][a-z0-9_]{1,63}$/.test(row.item)
+      || typeof row.status !== 'string'
+      || !SUPPORT_FULFILLMENT_STATUSES.has(row.status)
+      || auditEventId === null
+      || actorReference === null
+      || changedAt === null
+    ) {
+      incomplete = true
+      return []
+    }
+    return [{
+      target_event_id: targetEventId,
+      item: row.item,
+      status: row.status as SupportAdminProjection['audit']['fulfillment'][number]['status'],
+      audit_event_id: auditEventId,
+      actor_reference: actorReference,
+      changed_at: changedAt,
+    }]
+  }) : []
+
+  if (!Array.isArray(recorded.unresolved)) incomplete = true
+  const discrepancies = Array.isArray(recorded.unresolved) ? recorded.unresolved.flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      incomplete = true
+      return []
+    }
+    const row = item as Record<string, unknown>
+    const eventId = safeSupportEventId(row.event_id)
+    if (
+      eventId === null
+      || typeof row.reason !== 'string'
+      || !SUPPORT_DISCREPANCY_REASONS.has(row.reason)
+    ) {
+      incomplete = true
+      return []
+    }
+    return [{
+      event_id: eventId,
+      reason: row.reason as SupportAdminProjection['audit']['discrepancies'][number]['reason'],
+    }]
+  }) : []
+
+  return { currency_totals_minor, events, fulfillment, discrepancies, incomplete }
 }
 
 function supportRecordedAllowance(value: unknown): SupportAccountSummary['recorded_allowance'] {
@@ -1405,8 +1627,10 @@ export async function fetchAdminAccountSupport(accountId: string): Promise<Suppo
     responsible_use: ResponsibleUseStatus
     support_priority: SupportAdminProjection['support_priority']
   }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}`)
+  const recorded = raw.account_support?.recorded || {}
   return {
     account: supportAccountSummary(raw.account_support),
+    audit: supportAdminAudit(recorded),
     responsible_use: raw.responsible_use,
     support_priority: raw.support_priority,
   }

@@ -538,6 +538,9 @@ const recordedAllowance = {
   ],
 }
 
+const opaqueSupportKey = value => `key_${value.repeat(64)}`
+const supportEventId = value => `evt_${value.repeat(32)}`
+
 test('Support wrappers use exact no-store envelopes and discard private contribution fields', async () => {
   const calls = []
   await withFetchMock(async (url, init = {}) => {
@@ -579,7 +582,47 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     if (String(url).includes('/support/admin/accounts/')) return jsonResponse({
       account_support: {
         recorded: {
-          event_count: 1, active_recurring_count: 1, amount_minor: 9999,
+          event_count: 4, active_recurring_count: 0,
+          currency_totals_minor: { USD: 2500, unsafe_currency: 9999 },
+          subject_key: opaqueSupportKey('f'),
+          unresolved: [{
+            event_id: supportEventId('b'), reason: 'unresolved_or_mismatched_adjustment',
+            email: 'private@example.test',
+          }, { event_id: 'raw-event-id', reason: 'private_reason' }],
+          fulfillment: [{
+            target_event_id: supportEventId('a'), item: 'one_time_credit_grant', status: 'complete',
+            audit_event_id: supportEventId('c'), actor_key: opaqueSupportKey('d'),
+            changed_at: '2026-08-11T09:10:00Z', notes: 'private fulfillment note',
+          }],
+          audit: [{
+            sequence: 1, event_id: supportEventId('a'), provider: 'github_sponsors',
+            source_event_key: opaqueSupportKey('a'), kind: 'one_time_contribution',
+            occurred_at: '2026-08-11T09:00:00Z', received_at: '2026-08-11T09:00:01Z',
+            amount_minor: 2500, currency: 'USD', contract_key: null, related_event_key: null,
+            fulfillment_item: null, fulfillment_status: null, actor_key: null,
+            account_id: 'private-account', email: 'private@example.test', invoice: 'private-invoice',
+          }, {
+            sequence: 2, event_id: supportEventId('c'), provider: 'github_sponsors',
+            source_event_key: opaqueSupportKey('e'), kind: 'fulfillment_set',
+            occurred_at: '2026-08-11T09:10:00Z', received_at: '2026-08-11T09:10:01Z',
+            amount_minor: 0, currency: 'USD', contract_key: opaqueSupportKey('c'),
+            related_event_key: opaqueSupportKey('a'), fulfillment_item: 'one_time_credit_grant',
+            fulfillment_status: 'complete', actor_key: opaqueSupportKey('d'),
+          }, {
+            sequence: 3, event_id: supportEventId('d'), provider: 'github_sponsors',
+            source_event_key: opaqueSupportKey('f'), kind: 'refund',
+            occurred_at: '2026-08-11T09:20:00Z', received_at: '2026-08-11T09:20:01Z',
+            amount_minor: 500, currency: 'USD', contract_key: opaqueSupportKey('c'),
+            related_event_key: opaqueSupportKey('a'), fulfillment_item: null,
+            fulfillment_status: null, actor_key: null,
+          }, {
+            sequence: 4, event_id: supportEventId('e'), provider: 'github_sponsors',
+            source_event_key: opaqueSupportKey('0'), kind: 'recurring_canceled',
+            occurred_at: '2026-08-11T09:30:00Z', received_at: '2026-08-11T09:30:01Z',
+            amount_minor: 0, currency: 'USD', contract_key: opaqueSupportKey('c'),
+            related_event_key: opaqueSupportKey('a'), fulfillment_item: null,
+            fulfillment_status: null, actor_key: null,
+          }],
           recorded_allowance: {
             ...recordedAllowance,
             effective_allowance: 350,
@@ -606,15 +649,53 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     assert.equal(self.account.event_count, 2)
     assert.equal(notice.notice.version, 1)
     assert.equal(accepted.status.accepted, true)
-    assert.equal(admin.account.event_count, 1)
+    assert.equal(admin.account.event_count, 4)
     assert.deepEqual(self.account.recorded_allowance, recordedAllowance)
     assert.deepEqual(admin.account.recorded_allowance, {
       ...recordedAllowance,
       effective_allowance: 350,
       sources: [recordedAllowance.sources[2]],
     })
-    const safe = JSON.stringify({ self, admin })
-    assert.doesNotMatch(safe, /currency_totals_minor|amount_minor|subject_key|source_event_id|account_id|"audit"|private@example|provider_secret|private-allowance|private-source/)
+    assert.deepEqual(admin.audit.currency_totals_minor, { USD: 2500 })
+    assert.deepEqual(admin.audit.discrepancies, [{
+      event_id: supportEventId('b'), reason: 'unresolved_or_mismatched_adjustment',
+    }])
+    assert.deepEqual(admin.audit.fulfillment, [{
+      target_event_id: supportEventId('a'), item: 'one_time_credit_grant', status: 'complete',
+      audit_event_id: supportEventId('c'), actor_reference: opaqueSupportKey('d'),
+      changed_at: '2026-08-11T09:10:00Z',
+    }])
+    assert.deepEqual(admin.audit.events, [{
+      sequence: 1, event_id: supportEventId('a'), provider: 'github_sponsors',
+      source_reference: opaqueSupportKey('a'), kind: 'one_time_contribution',
+      occurred_at: '2026-08-11T09:00:00Z', received_at: '2026-08-11T09:00:01Z',
+      amount_minor: 2500, currency: 'USD', contract_reference: null, related_reference: null,
+      fulfillment_item: null, fulfillment_status: null, actor_reference: null,
+    }, {
+      sequence: 2, event_id: supportEventId('c'), provider: 'github_sponsors',
+      source_reference: opaqueSupportKey('e'), kind: 'fulfillment_set',
+      occurred_at: '2026-08-11T09:10:00Z', received_at: '2026-08-11T09:10:01Z',
+      amount_minor: 0, currency: 'USD', contract_reference: opaqueSupportKey('c'),
+      related_reference: opaqueSupportKey('a'), fulfillment_item: 'one_time_credit_grant',
+      fulfillment_status: 'complete', actor_reference: opaqueSupportKey('d'),
+    }, {
+      sequence: 3, event_id: supportEventId('d'), provider: 'github_sponsors',
+      source_reference: opaqueSupportKey('f'), kind: 'refund',
+      occurred_at: '2026-08-11T09:20:00Z', received_at: '2026-08-11T09:20:01Z',
+      amount_minor: 500, currency: 'USD', contract_reference: opaqueSupportKey('c'),
+      related_reference: opaqueSupportKey('a'), fulfillment_item: null,
+      fulfillment_status: null, actor_reference: null,
+    }, {
+      sequence: 4, event_id: supportEventId('e'), provider: 'github_sponsors',
+      source_reference: opaqueSupportKey('0'), kind: 'recurring_canceled',
+      occurred_at: '2026-08-11T09:30:00Z', received_at: '2026-08-11T09:30:01Z',
+      amount_minor: 0, currency: 'USD', contract_reference: opaqueSupportKey('c'),
+      related_reference: opaqueSupportKey('a'), fulfillment_item: null,
+      fulfillment_status: null, actor_reference: null,
+    }])
+    assert.equal(admin.audit.incomplete, true)
+    assert.doesNotMatch(JSON.stringify(self), /currency_totals_minor|amount_minor|subject_key|source_event|account_id|"audit"|private@example|private-allowance|private-source/)
+    assert.doesNotMatch(JSON.stringify(admin), /subject_key|source_event_key|actor_key|account_id|unsafe_currency|private@example|private-invoice|provider_secret|private fulfillment note|private_reason/)
   })
 
   assert.deepEqual(calls.map(call => [call.init.method || 'GET', call.url]), [
@@ -650,6 +731,51 @@ test('Support account mapping preserves legacy responses without a recorded allo
   }), async () => {
     const self = await fetchSupportSelf()
     assert.equal(Object.hasOwn(self.account, 'recorded_allowance'), false)
+  })
+})
+
+test('Support admin audit distinguishes complete empty records from malformed dropped rows', async () => {
+  const base = {
+    account_support: {
+      recorded: {
+        event_count: 0, active_recurring_count: 0,
+        currency_totals_minor: {}, audit: [], fulfillment: [], unresolved: [],
+      },
+      benefits: {
+        state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
+        effective_benefits: [], recorded_eligibility: [],
+      },
+    },
+    responsible_use: responsibleUse.status,
+    support_priority: publicSupport.support_priority,
+  }
+  let malformed = false
+  await withFetchMock(async () => jsonResponse(malformed ? {
+    ...base,
+    account_support: {
+      ...base.account_support,
+      recorded: {
+        ...base.account_support.recorded,
+        audit: [{
+          sequence: 1, event_id: supportEventId('a'), provider: 'github_sponsors',
+          source_event_key: opaqueSupportKey('a'), kind: 'one_time_contribution',
+          occurred_at: '2026-08-11T09:00:00Z', received_at: '2026-08-11T09:00:01Z',
+          amount_minor: 0, currency: 'USD', contract_key: null, related_event_key: null,
+          fulfillment_item: null, fulfillment_status: null, actor_key: null,
+          notes: 'private content must still be dropped',
+        }],
+      },
+    },
+  } : base), async () => {
+    const complete = await fetchAdminAccountSupport('complete')
+    assert.deepEqual(complete.audit, {
+      currency_totals_minor: {}, events: [], fulfillment: [], discrepancies: [], incomplete: false,
+    })
+    malformed = true
+    const incomplete = await fetchAdminAccountSupport('malformed')
+    assert.equal(incomplete.audit.incomplete, true)
+    assert.deepEqual(incomplete.audit.events, [])
+    assert.doesNotMatch(JSON.stringify(incomplete), /private content|notes/)
   })
 })
 
@@ -769,7 +895,15 @@ async function loadSupportPanel() {
             export const useEffect = () => {}
             export const useMemo = value => value()
             export const useRef = value => ({ current: value })
-            export const useState = value => [value, () => {}]
+            export const useState = value => {
+              if (value === '' && globalThis.__supportSelectedUserIndex !== undefined) {
+                return [globalThis.__supportSelectedUserIndex, () => {}]
+              }
+              if (value === null && globalThis.__supportNotice !== undefined) {
+                return [globalThis.__supportNotice, () => {}]
+              }
+              return [value, () => {}]
+            }
           ` }
           if (args.path === 'jsx-runtime') return { contents: `
             export const Fragment = Symbol.for('fragment')
@@ -890,6 +1024,128 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   assert.doesNotMatch(legacyText, /Current recorded allowance|Recorded allowance sources/)
 })
 
+test('Support panel renders a bounded read-only owner audit with loading, empty, error, and stale-selection states', async t => {
+  const { SupportPanel } = await loadSupportPanel()
+  t.after(() => {
+    delete globalThis.__supportSelectedUserIndex
+    delete globalThis.__supportNotice
+    delete globalThis.__supportStore
+  })
+  globalThis.__supportSelectedUserIndex = '0'
+  const account = {
+    id: 'selected-account', username: 'Selected', role: 'user', disabled: false,
+    created_at: 1, has_email: false, passkey_credentials: 0,
+    passkey_authentication_available: false,
+  }
+  const summary = {
+    event_count: 42, one_time_tier: 'supporter', recurring_tier: null, active_recurring_count: 0,
+    benefits: {
+      state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
+      effective_benefits: [], recorded_eligibility: ['one_time_credit_eligibility'],
+    },
+  }
+  const events = Array.from({ length: 42 }, (_, index) => ({
+    sequence: index + 1,
+    event_id: `evt_${(index + 1).toString(16).padStart(32, '0')}`,
+    provider: 'github_sponsors',
+    source_reference: `key_${(index + 1).toString(16).padStart(64, '0')}`,
+    kind: ['one_time_contribution', 'refund', 'chargeback', 'recurring_canceled'][index % 4],
+    occurred_at: '2026-08-11T09:00:00Z', received_at: '2026-08-11T09:00:01Z',
+    amount_minor: index % 4 === 3 ? 0 : 100, currency: 'USD',
+    contract_reference: null, related_reference: null, fulfillment_item: null,
+    fulfillment_status: null, actor_reference: null,
+  }))
+  const audit = {
+    currency_totals_minor: { USD: 2500 },
+    events,
+    discrepancies: [{
+      event_id: supportEventId('b'), reason: 'unresolved_or_mismatched_adjustment',
+    }],
+    fulfillment: [{
+      target_event_id: supportEventId('a'), item: 'one_time_credit_grant', status: 'complete',
+      audit_event_id: supportEventId('c'), actor_reference: opaqueSupportKey('d'),
+      changed_at: '2026-08-11T09:10:00Z',
+    }],
+    incomplete: false,
+  }
+  globalThis.__supportStore = {
+    accountContext: {
+      enabled: true, authenticated: true, account: { id: 'owner-account', role: 'owner' },
+      capabilities: ['account.self', 'accounts.admin', 'services.admin'], reauthenticated: true,
+    },
+    accountUsers: [account], supportCatalog: publicSupport, supportCatalogLoading: false,
+    supportCatalogUnavailable: false, supportSelf: null, responsibleUse: null,
+    supportAdmin: { account: summary, audit, responsible_use: responsibleUse.status, support_priority: publicSupport.support_priority },
+    supportAdminAccountId: account.id, supportDetailsLoading: false,
+    loadSupportCatalog: async () => null, loadSupportSelf: async () => null,
+    loadResponsibleUse: async () => null, acceptResponsibleUse: async () => null,
+    loadSupportAdmin: async () => null, clearSupportAdmin: () => {},
+  }
+
+  const tree = expandElement(SupportPanel())
+  const text = elementText(tree)
+  assert.match(text, /Private contribution and fulfillment audit/)
+  assert.match(text, /recorded_not_enforced/)
+  assert.match(text, /does not process payments, activate providers, or enforce benefits/)
+  assert.match(text, /2,500 USD minor units/)
+  assert.match(text, /One-time contribution|Refund|Chargeback|Recurring support canceled/)
+  assert.match(text, /Adjustment does not match a recorded contribution/)
+  assert.match(text, /one time credit grant · complete/)
+  assert.match(text, /Showing the 40 newest recorded events; 2 older events are hidden/)
+  assert.doesNotMatch(text, /private@example|customer|invoice|payment method|prompt|media|job log/i)
+  const eventLists = findElements(tree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Private contribution source events')
+  assert.equal(eventLists.length, 1)
+  assert.equal(findElements(eventLists[0], node => node.type === 'li').length, 40)
+
+  globalThis.__supportStore.supportAdmin = {
+    ...globalThis.__supportStore.supportAdmin,
+    account: { ...summary, event_count: 0 },
+    audit: { currency_totals_minor: {}, events: [], discrepancies: [], fulfillment: [], incomplete: false },
+  }
+  const emptyText = elementText(expandElement(SupportPanel()))
+  assert.match(emptyText, /No net contribution total is recorded/)
+  assert.match(emptyText, /No contribution audit events are recorded/)
+  assert.match(emptyText, /No recorded discrepancies need follow-up/)
+  assert.match(emptyText, /No fulfillment follow-up is recorded/)
+
+  globalThis.__supportStore.supportAdmin = {
+    ...globalThis.__supportStore.supportAdmin,
+    audit: { currency_totals_minor: {}, events: [], discrepancies: [], fulfillment: [], incomplete: true },
+  }
+  const incompleteText = elementText(expandElement(SupportPanel()))
+  assert.match(incompleteText, /Some audit data was unavailable or invalid/)
+  assert.match(incompleteText, /Empty sections below are not proof that no records exist/)
+  assert.match(incompleteText, /Contribution event data is incomplete/)
+  assert.doesNotMatch(incompleteText, /No contribution audit events are recorded/)
+
+  globalThis.__supportStore.supportAdmin = null
+  globalThis.__supportStore.supportDetailsLoading = true
+  const loadingText = elementText(expandElement(SupportPanel()))
+  assert.match(loadingText, /Loading private support audit/)
+  assert.doesNotMatch(loadingText, /Private support audit is unavailable/)
+
+  globalThis.__supportStore.supportDetailsLoading = false
+  globalThis.__supportNotice = { kind: 'error', text: 'Support details could not be refreshed.' }
+  const errorTree = expandElement(SupportPanel())
+  assert.match(elementText(errorTree), /Support details could not be refreshed/)
+  assert.match(elementText(errorTree), /Private support audit is unavailable/)
+  assert.equal(findElements(errorTree, node => node.props?.role === 'alert').length, 1)
+
+  delete globalThis.__supportNotice
+  globalThis.__supportStore.supportAdmin = { account: summary, audit, responsible_use: responsibleUse.status, support_priority: publicSupport.support_priority }
+  globalThis.__supportStore.supportAdminAccountId = 'stale-account'
+  const staleText = elementText(expandElement(SupportPanel()))
+  assert.doesNotMatch(staleText, /Private contribution and fulfillment audit/)
+
+  globalThis.__supportStore.accountContext = {
+    ...globalThis.__supportStore.accountContext,
+    account: { id: 'ordinary-account', role: 'user' },
+  }
+  globalThis.__supportStore.supportAdminAccountId = account.id
+  const nonOwnerText = elementText(expandElement(SupportPanel()))
+  assert.doesNotMatch(nonOwnerText, /Owner support records|Private contribution and fulfillment audit/)
+})
+
 test('Support trigger stays discoverable with accounts off and describes optional account state truthfully', async () => {
   const { AccountSupportButton } = await loadAccountButton()
   const setOpen = value => { globalThis.__accountOpen = value }
@@ -981,12 +1237,22 @@ test('Support store loads public catalog with accounts off and gates self and ad
   globalThis.document = Object.assign(new EventTarget(), { hidden: false })
   const calls = []
   let deferAdmin = false
+  let deferAccountContext = false
+  let adminErrorStatus = 0
   let deferSelf = false
   let deferAcceptance = false
   let nextAccountContext = null
+  let nextAccessAccounts = null
   const pendingSelf = []
   const pendingAcceptance = []
   const pendingAdmins = []
+  const pendingAccountContexts = []
+  const waitForPendingAdmins = async count => {
+    for (let attempt = 0; attempt < 20 && pendingAdmins.length < count; attempt += 1) {
+      await Promise.resolve()
+    }
+    assert.ok(pendingAdmins.length >= count, `expected ${count} pending admin request(s)`)
+  }
   const allowancePayload = effectiveAllowance => ({
     ...recordedAllowance,
     effective_allowance: effectiveAllowance,
@@ -1029,8 +1295,17 @@ test('Support store loads public catalog with accounts off and gates self and ad
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input)
     calls.push({ url, init })
+    if (url.endsWith('/access-context') && nextAccessAccounts) return jsonResponse({
+      remote: false, project_password_required: false, project_names_visible: true,
+      machine_controls: true, custom_model_sources: true, catalog_model_downloads: true,
+      classic_ui: false, cloudflare_enabled: false, share_url: '', share_flow: '',
+      accounts: nextAccessAccounts,
+    })
     if (url.endsWith('/support/catalog')) return jsonResponse(publicSupport)
-    if (url.endsWith('/account/context') && nextAccountContext) return jsonResponse(nextAccountContext)
+    if (url.endsWith('/account/context') && nextAccountContext) {
+      if (deferAccountContext) return new Promise(resolve => pendingAccountContexts.push(resolve))
+      return jsonResponse(nextAccountContext)
+    }
     if (url.endsWith('/support/self')) {
       if (deferSelf) return new Promise(resolve => { pendingSelf.push({ url, resolve }) })
       return jsonResponse(selfPayload(1))
@@ -1040,6 +1315,9 @@ test('Support store loads public catalog with accounts off and gates self and ad
       return jsonResponse({ status: { ...responsibleUse.status, accepted: true, state: 'accepted' } })
     }
     if (url.includes('/support/admin/accounts/')) {
+      if (adminErrorStatus) return jsonResponse({
+        detail: { code: 'owner_required', message: 'raw private server detail' },
+      }, adminErrorStatus)
       if (deferAdmin) return new Promise(resolve => { pendingAdmins.push({ url, resolve }) })
       return jsonResponse(adminPayload(1))
     }
@@ -1082,31 +1360,50 @@ test('Support store loads public catalog with accounts off and gates self and ad
     created_at: 1, has_email: false, passkey_credentials: 0,
     passkey_authentication_available: false,
   }
+  const restrictedOwnerContext = {
+    enabled: true, authenticated: true, account,
+    capabilities: ['account.self', 'accounts.admin'], reauthenticated: true,
+    passkey_authentication_available: false,
+  }
+  nextAccountContext = restrictedOwnerContext
   useStore.setState({
-    accountContext: {
-      enabled: true, authenticated: true, account,
-      capabilities: ['account.self', 'accounts.admin'], reauthenticated: true,
-      passkey_authentication_available: false,
-    },
+    accessContext: { accounts: restrictedOwnerContext },
+    accountContext: restrictedOwnerContext,
     accountUsers: [account],
     accountDrawerOpen: true,
   })
   await useStore.getState().loadSupportSelf()
-  await assert.rejects(useStore.getState().loadSupportAdmin(account.id), /server-returned account/)
-  assert.deepEqual(calls.map(call => call.url), ['/api/v1/support/catalog', '/api/v1/support/self'])
+  await assert.rejects(useStore.getState().loadSupportAdmin(account.id), /selection changed|server-returned account/)
+  assert.deepEqual(calls.map(call => call.url), [
+    '/api/v1/support/catalog', '/api/v1/support/self', '/api/v1/account/context',
+  ])
 
+  const fullOwnerContext = {
+    ...restrictedOwnerContext,
+    capabilities: ['account.self', 'accounts.admin', 'services.admin'],
+  }
+  nextAccountContext = fullOwnerContext
   useStore.setState(state => ({
-    accountContext: { ...state.accountContext, capabilities: ['account.self', 'accounts.admin', 'services.admin'] },
+    accessContext: { ...(state.accessContext || {}), accounts: fullOwnerContext },
+    accountContext: fullOwnerContext,
   }))
   await useStore.getState().loadSupportAdmin(account.id)
   assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account')
   assert.equal(useStore.getState().supportAdmin.account.recorded_allowance.effective_allowance, 100)
+  const adminCallCount = calls.filter(call => call.url.includes('/support/admin/accounts/')).length
   await assert.rejects(useStore.getState().loadSupportAdmin('not-returned'), /server-returned account/)
-  assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account')
+  assert.equal(calls.filter(call => call.url.includes('/support/admin/accounts/')).length, adminCallCount)
+
+  adminErrorStatus = 403
+  await assert.rejects(useStore.getState().loadSupportAdmin(account.id))
+  assert.equal(useStore.getState().supportAdminAccountId, null)
+  assert.equal(useStore.getState().supportAdmin, null)
+  assert.equal(useStore.getState().supportDetailsLoading, false)
+  adminErrorStatus = 0
 
   deferAdmin = true
   const staleAdmin = useStore.getState().loadSupportAdmin(account.id)
-  await Promise.resolve()
+  await waitForPendingAdmins(1)
   useStore.setState(state => ({
     accountContext: { ...state.accountContext, reauthenticated: false },
   }))
@@ -1119,18 +1416,64 @@ test('Support store loads public catalog with accounts off and gates self and ad
     accountContext: { ...state.accountContext, reauthenticated: true },
     accountUsers: [account, secondAccount],
   }))
+  nextAccountContext = { ...fullOwnerContext, reauthenticated: true }
+  deferAccountContext = true
+  const staleContextSelection = useStore.getState().loadSupportAdmin(account.id)
+  const currentContextSelection = useStore.getState().loadSupportAdmin(secondAccount.id)
+  assert.equal(pendingAccountContexts.length, 2)
+  pendingAccountContexts[1](jsonResponse(nextAccountContext))
+  await waitForPendingAdmins(1)
+  pendingAccountContexts[0](jsonResponse(nextAccountContext))
+  await assert.rejects(staleContextSelection, /selection changed/)
+  pendingAdmins.shift().resolve(jsonResponse(adminPayload(2)))
+  await currentContextSelection
+  assert.equal(useStore.getState().supportAdminAccountId, secondAccount.id)
+  assert.equal(useStore.getState().supportAdmin.account.event_count, 2)
+  pendingAccountContexts.length = 0
+  deferAccountContext = false
+  pendingAdmins.length = 0
+
   const firstSelection = useStore.getState().loadSupportAdmin(account.id)
   const secondSelection = useStore.getState().loadSupportAdmin(secondAccount.id)
+  await waitForPendingAdmins(1)
   assert.equal(useStore.getState().supportAdmin, null, 'a new selection clears the old projection')
+  await assert.rejects(firstSelection, /selection changed/)
   const secondPending = pendingAdmins.find(item => item.url.endsWith('/second-account'))
-  const firstPending = pendingAdmins.find(item => item.url.endsWith('/server-account'))
   secondPending.resolve(jsonResponse(adminPayload(2)))
   await secondSelection
-  firstPending.resolve(jsonResponse(adminPayload(1)))
-  await firstSelection
+  pendingAdmins.length = 0
   assert.equal(useStore.getState().supportAdminAccountId, secondAccount.id)
   assert.equal(useStore.getState().supportAdmin.account.event_count, 2)
   assert.equal(useStore.getState().supportAdmin.account.recorded_allowance.effective_allowance, 200)
+
+  const ownerContext = {
+    ...useStore.getState().accountContext,
+    capabilities: ['account.self', 'accounts.admin', 'services.admin'],
+    reauthenticated: true,
+  }
+  nextAccessAccounts = { ...ownerContext, reauthenticated: false }
+  await useStore.getState().loadAccessContext()
+  assert.equal(useStore.getState().accountContext.account.id, ownerContext.account.id)
+  assert.equal(useStore.getState().supportAdminAccountId, null)
+  assert.equal(useStore.getState().supportAdmin, null)
+  assert.equal(useStore.getState().supportDetailsLoading, false)
+  assert.deepEqual(useStore.getState().accountUsers.map(item => item.id), [account.id, secondAccount.id])
+
+  useStore.setState({
+    accessContext: { ...useStore.getState().accessContext, accounts: ownerContext },
+    accountContext: ownerContext,
+    accountUsers: [account, secondAccount],
+  })
+  nextAccessAccounts = { ...ownerContext, capabilities: ['account.self', 'accounts.admin'] }
+  const capabilityLossAdmin = useStore.getState().loadSupportAdmin(secondAccount.id)
+  await waitForPendingAdmins(1)
+  await useStore.getState().loadAccessContext()
+  assert.equal(useStore.getState().supportDetailsLoading, false)
+  const capabilityLossPending = pendingAdmins.filter(item => item.url.endsWith('/second-account')).at(-1)
+  capabilityLossPending.resolve(jsonResponse(adminPayload(3)))
+  await capabilityLossAdmin
+  assert.equal(useStore.getState().supportAdminAccountId, null)
+  assert.equal(useStore.getState().supportAdmin, null, 'stale admin response stays invalid after access capability loss')
 
   nextAccountContext = {
     enabled: true, authenticated: true, account: secondAccount,
@@ -1224,7 +1567,16 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(supportSource, /already spent hundreds on Codex/)
   assert.match(supportSource, /When support is sufficient, I will host Maestro \/ Continuum with more compute/)
   assert.match(supportSource, /not enforced yet/)
-  assert.doesNotMatch(supportSource, /localStorage|sessionStorage|console\.|currency_totals_minor|amount_minor|subject_key|source_event_(?:id|key)|account_id|@|\$600|SLA|tax|end-to-end|passkey/i)
+  assert.doesNotMatch(supportSource, /localStorage|sessionStorage|console\.|subject_key|source_event_key|account_id|email|customer|invoice|payment_method|credential|secret|@|\$600|SLA|tax|end-to-end|passkey/i)
+  assert.match(supportSource, /read-only records shown after recent owner confirmation/i)
+  assert.match(supportSource, /recorded_not_enforced/)
+  assert.match(supportSource, /function adminSupportErrorMessage[^]*Private support audit could not be refreshed[^]*Confirm recent owner access and try again/)
+  assert.match(supportSource, /const chooseAdminAccount[^]*setNotice\(\{ kind: 'error', text: adminSupportErrorMessage\(error\) \}\)/)
+  assert.match(supportSource, /PRIVATE_SUPPORT_AUDIT_DISPLAY_TTL_MS = 4 \* 60 \* 1000/)
+  assert.match(supportSource, /if \(adminAccountId !== selectedAdminAccountId\) \{[^]*setSelectedUserIndex\(''\)[^]*clearAdmin\(\)/)
+  assert.match(supportSource, /window\.setTimeout[^]*supportAdminAccountId === displayAccountId[^]*supportAdmin === displayProjection[^]*setSelectedUserIndex\(''\)[^]*clearAdmin\(\)/)
+  assert.match(supportSource, /useEffect\(\(\) => \(\) => \{[^]*adminSelectionEpochRef\.current \+= 1[^]*clearAdmin\(\)[^]*\}, \[clearAdmin\]\)/)
+  assert.doesNotMatch(supportSource, /onClick=.*(?:refund|chargeback|fulfill|payment|provider)/i)
   assert.match(appSource, /context\.accounts\?\.enabled === true/)
   assert.match(appSource, /AccountSupportDrawer/)
 })

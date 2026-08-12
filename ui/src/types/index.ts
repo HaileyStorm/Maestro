@@ -821,8 +821,61 @@ export interface SupportSelfProjection {
   responsible_use: ResponsibleUseProjection
 }
 
+export type SupportAdminEventKind =
+  | 'one_time_contribution'
+  | 'recurring_started'
+  | 'recurring_renewed'
+  | 'refund'
+  | 'chargeback'
+  | 'recurring_canceled'
+  | 'fulfillment_set'
+  | 'account_link_verified'
+  | 'account_link_revoked'
+
+export type SupportFulfillmentStatus = 'pending' | 'complete' | 'declined'
+
+export interface SupportAdminAuditEvent {
+  sequence: number
+  event_id: string
+  provider: string
+  source_reference: string
+  kind: SupportAdminEventKind
+  occurred_at: string
+  received_at: string
+  amount_minor: number
+  currency: string
+  contract_reference: string | null
+  related_reference: string | null
+  fulfillment_item: string | null
+  fulfillment_status: SupportFulfillmentStatus | null
+  actor_reference: string | null
+}
+
+export interface SupportAdminFulfillment {
+  target_event_id: string | null
+  item: string
+  status: SupportFulfillmentStatus
+  audit_event_id: string
+  actor_reference: string
+  changed_at: string
+}
+
+export interface SupportAdminDiscrepancy {
+  event_id: string
+  reason: 'unresolved_or_mismatched_adjustment' | 'adjustments_exceed_contribution'
+}
+
+export interface SupportAdminAudit {
+  currency_totals_minor: Record<string, number>
+  events: SupportAdminAuditEvent[]
+  fulfillment: SupportAdminFulfillment[]
+  discrepancies: SupportAdminDiscrepancy[]
+  incomplete: boolean
+}
+
 export interface SupportAdminProjection {
   account: SupportAccountSummary
+  audit: SupportAdminAudit
   responsible_use: ResponsibleUseStatus
   support_priority: SupportPriorityPolicy
 }

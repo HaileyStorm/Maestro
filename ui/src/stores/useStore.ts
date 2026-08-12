@@ -7921,12 +7921,20 @@ export const useStore = create<AppState>((set, get) => ({
       : { ...context, accounts: next ?? undefined }
     const supportIdentityChanged = previous?.account?.id !== next?.account?.id
       || previous?.capabilities.includes('account.self') !== next?.capabilities.includes('account.self')
+    const supportAdminUnavailable = next?.authenticated !== true
+      || next.account?.role !== 'owner'
+      || next.reauthenticated !== true
+      || !next.capabilities.includes('account.self')
+      || !next.capabilities.includes('accounts.admin')
+      || !next.capabilities.includes('services.admin')
     if (supportIdentityChanged) {
       _accountSessionsRequestSequence += 1
       _accountUsersRequestSequence += 1
       _supportSelfRequestSequence += 1
       _responsibleUseRequestSequence += 1
       _responsibleUseAcceptanceSequence += 1
+      _supportAdminRequestSequence += 1
+    } else if (supportAdminUnavailable) {
       _supportAdminRequestSequence += 1
     }
     set({
@@ -7939,6 +7947,11 @@ export const useStore = create<AppState>((set, get) => ({
         accountDetailsLoading: false,
         supportSelf: null,
         responsibleUse: null,
+        supportAdminAccountId: null,
+        supportAdmin: null,
+        supportDetailsLoading: false,
+      } : {}),
+      ...(!supportIdentityChanged && supportAdminUnavailable ? {
         supportAdminAccountId: null,
         supportAdmin: null,
         supportDetailsLoading: false,
@@ -8005,12 +8018,20 @@ export const useStore = create<AppState>((set, get) => ({
       const previous = get().accountContext
       const supportIdentityChanged = previous?.account?.id !== context.account?.id
         || previous?.capabilities.includes('account.self') !== context.capabilities.includes('account.self')
+      const supportAdminUnavailable = context.authenticated !== true
+        || context.account?.role !== 'owner'
+        || context.reauthenticated !== true
+        || !context.capabilities.includes('account.self')
+        || !context.capabilities.includes('accounts.admin')
+        || !context.capabilities.includes('services.admin')
       if (supportIdentityChanged) {
         _accountSessionsRequestSequence += 1
         _accountUsersRequestSequence += 1
         _supportSelfRequestSequence += 1
         _responsibleUseRequestSequence += 1
         _responsibleUseAcceptanceSequence += 1
+        _supportAdminRequestSequence += 1
+      } else if (supportAdminUnavailable) {
         _supportAdminRequestSequence += 1
       }
       set(state => {
@@ -8033,13 +8054,11 @@ export const useStore = create<AppState>((set, get) => ({
             supportAdmin: null,
             supportDetailsLoading: false,
           } : {}),
-          ...(
-            context.reauthenticated !== true
-            || !context.capabilities.includes('accounts.admin')
-            || !context.capabilities.includes('services.admin')
-              ? { supportAdminAccountId: null, supportAdmin: null }
-              : {}
-          ),
+          ...(supportAdminUnavailable ? {
+            supportAdminAccountId: null,
+            supportAdmin: null,
+            supportDetailsLoading: false,
+          } : {}),
         }
       })
       return context
@@ -8379,9 +8398,24 @@ export const useStore = create<AppState>((set, get) => ({
     }))
   },
   loadSupportAdmin: async (accountId) => {
+    const invocationSequence = ++_supportAdminRequestSequence
+    try {
+      await get().loadAccountContext()
+    } catch {
+      if (invocationSequence === _supportAdminRequestSequence) {
+        _supportAdminRequestSequence += 1
+        set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
+      }
+      throw new Error('Recent owner access could not be confirmed for private Support details.')
+    }
+    if (invocationSequence !== _supportAdminRequestSequence) {
+      throw new Error('Support account selection changed before owner access was confirmed.')
+    }
     const context = get().accountContext
     const eligible = context?.authenticated === true
+      && context.account?.role === 'owner'
       && context.reauthenticated === true
+      && context.capabilities.includes('account.self')
       && context.capabilities.includes('accounts.admin')
       && context.capabilities.includes('services.admin')
       && get().accountDrawerOpen
@@ -8391,7 +8425,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
       throw new Error('Choose a server-returned account after confirming owner access.')
     }
-    const requestSequence = ++_supportAdminRequestSequence
+    const requestSequence = invocationSequence
     set({
       supportDetailsLoading: true,
       supportAdminAccountId: accountId,
@@ -8405,12 +8439,15 @@ export const useStore = create<AppState>((set, get) => ({
         || current.supportAdminAccountId !== accountId
       ) return projection
       const stillEligible = current.accountContext?.authenticated === true
+        && current.accountContext.account?.role === 'owner'
         && current.accountContext.reauthenticated === true
+        && current.accountContext.capabilities.includes('account.self')
         && current.accountContext.capabilities.includes('accounts.admin')
         && current.accountContext.capabilities.includes('services.admin')
         && current.accountDrawerOpen
         && current.accountUsers.some(account => account.id === accountId)
       if (!stillEligible) {
+        _supportAdminRequestSequence += 1
         set({ supportAdminAccountId: null, supportAdmin: null, supportDetailsLoading: false })
         throw new Error('Owner access changed while Support details were loading.')
       }
@@ -8418,7 +8455,14 @@ export const useStore = create<AppState>((set, get) => ({
       return projection
     } catch (error) {
       if (requestSequence === _supportAdminRequestSequence) {
-        set({ supportAdmin: null, supportDetailsLoading: false })
+        const accessRejected = error instanceof api.AccountApiError
+          && (error.status === 401 || error.status === 403)
+        if (accessRejected) _supportAdminRequestSequence += 1
+        set({
+          ...(accessRejected ? { supportAdminAccountId: null } : {}),
+          supportAdmin: null,
+          supportDetailsLoading: false,
+        })
       }
       throw error
     }
