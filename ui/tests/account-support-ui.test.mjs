@@ -2105,6 +2105,23 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(source, /aria-labelledby=\{accountTabId\}/)
   assert.match(source, /if \(tab === 'support'\)[^]*lifecycleRef\.current\.closed\(\)[^]*clearSensitive\(\)/)
   assert.match(source, /<SupportPanel \/>/)
+  const submitButtons = [...source.matchAll(/<button\b(?:(?!<\/button>)[\s\S])*?<\/button>/g)]
+    .map(match => match[0])
+    .filter(button => /type="submit"/.test(button))
+  const primaryAuthActions = [
+    'Create owner account',
+    'Sign in',
+    'Confirm password',
+    'Create user',
+  ]
+  for (const label of primaryAuthActions) {
+    const actions = submitButtons.filter(button => button.includes(`\n                    ${label}\n`)
+      || button.includes(`\n                  ${label}\n`)
+      || button.includes(`\n                          ${label}\n`))
+    assert.equal(actions.length, 1, `${label} must remain one exact primary submit action`)
+    assert.match(actions[0], /className="[^"]*\bbg-bg-active\b[^"]*\btext-text-primary\b[^"]*\bhover:bg-bg-hover\b[^"]*\bdisabled:opacity-100\b[^"]*"/)
+    assert.doesNotMatch(actions[0], /\bbg-accent-blue\b|\btext-white\b|\bhover:opacity-90\b|\bdisabled:opacity-50\b/)
+  }
   const headerCloseButton = source.match(/<button\s+ref=\{closeRef\}[^]*?<\/button>/)?.[0]
   assert.ok(headerCloseButton, 'the visible Support drawer close button must remain present')
   assert.match(headerCloseButton, /className="[^"]*\bh-11\b[^"]*\bw-11\b[^"]*\bp-0\b[^"]*\bmd:h-auto\b[^"]*\bmd:w-auto\b[^"]*\bmd:p-1\.5\b[^"]*"/)

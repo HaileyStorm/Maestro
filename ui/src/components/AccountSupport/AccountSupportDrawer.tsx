@@ -495,7 +495,7 @@ export function AccountSupportDrawer() {
                   <button
                     type="submit"
                     disabled={Boolean(busy)}
-                    className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-accent-blue px-3 py-2 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+                    className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-bg-active px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100"
                   >
                     {busy === 'bootstrap' ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
                     Create owner account
@@ -529,7 +529,7 @@ export function AccountSupportDrawer() {
                 <button
                   type="submit"
                   disabled={Boolean(busy)}
-                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-accent-blue px-3 py-2 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-bg-active px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100"
                 >
                   {busy === 'login' ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                   Sign in
@@ -615,7 +615,7 @@ export function AccountSupportDrawer() {
                   <div className="mt-3">
                     <Field label="Current password" value={reauthPassword} onChange={setReauthPassword} type="password" autoComplete="current-password" required />
                   </div>
-                  <button type="submit" disabled={Boolean(busy)} className="mt-3 w-full rounded-lg bg-accent-blue px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                  <button type="submit" disabled={Boolean(busy)} className="mt-3 w-full rounded-lg bg-bg-active px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100">
                     Confirm password
                   </button>
                 </form>
@@ -787,7 +787,7 @@ export function AccountSupportDrawer() {
                             <Field label="Temporary password" value={managedPassword} onChange={setManagedPassword} type="password" autoComplete="new-password" required minLength={12} />
                           </div>
                         </div>
-                        <button type="submit" disabled={Boolean(busy)} className="mt-2 w-full rounded-lg bg-accent-blue px-3 py-2 text-[10px] font-semibold text-white disabled:opacity-50">
+                        <button type="submit" disabled={Boolean(busy)} className="mt-2 w-full rounded-lg bg-bg-active px-3 py-2 text-[10px] font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100">
                           Create user
                         </button>
                       </form>

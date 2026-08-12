@@ -357,6 +357,35 @@ async function expectNoBlockingAxeFindings(page: Page) {
   expect(blocking).toEqual([])
 }
 
+async function expectPrimaryActionContrast(action: Locator) {
+  await expect(action).toBeVisible()
+  const result = await action.evaluate(element => {
+    const parseRgb = (value: string) => {
+      const channels = value.match(/[\d.]+/g)?.map(Number)
+      if (!channels || (channels.length !== 3 && channels.length !== 4)) {
+        throw new Error(`Unsupported computed color: ${value}`)
+      }
+      if (channels.length === 4 && channels[3] !== 1) {
+        throw new Error(`Translucent computed color cannot be measured directly: ${value}`)
+      }
+      return channels.slice(0, 3)
+    }
+    const luminance = (channels: number[]) => channels
+      .map(channel => channel / 255)
+      .map(channel => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4)
+      .reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0)
+    const style = getComputedStyle(element)
+    const foreground = luminance(parseRgb(style.color))
+    const background = luminance(parseRgb(style.backgroundColor))
+    return {
+      backgroundColor: style.backgroundColor,
+      color: style.color,
+      ratio: (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05),
+    }
+  })
+  expect(result.ratio, `${result.color} on ${result.backgroundColor} meets WCAG AA`).toBeGreaterThanOrEqual(4.5)
+}
+
 let api: SyntheticApiController | undefined
 let pageErrors: string[] = []
 
@@ -782,7 +811,7 @@ test('representative shell has no serious or critical axe findings', async ({ pa
   await expectNoBlockingAxeFindings(page)
 })
 
-test('accounts-disabled compatibility, local bootstrap, and remote bootstrap boundaries stay explicit', async ({ page }) => {
+test('accounts-disabled compatibility, local bootstrap, and remote bootstrap boundaries stay explicit', async ({ page, browserName }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await skipWelcome(page)
   api!.setAccountScenario('disabled')
@@ -806,7 +835,12 @@ test('accounts-disabled compatibility, local bootstrap, and remote bootstrap bou
   await bootstrap.getByLabel('Username', { exact: true }).fill('Synthetic Owner')
   await bootstrap.getByLabel('Password', { exact: true }).fill('synthetic-bootstrap-password')
   await bootstrap.getByLabel('Device label', { exact: true }).fill('Synthetic browser')
-  await bootstrap.getByRole('button', { name: 'Create owner account' }).click()
+  const createOwnerAction = bootstrap.getByRole('button', { name: 'Create owner account' })
+  if (browserName !== 'webkit') {
+    await expectPrimaryActionContrast(createOwnerAction)
+    await expectPrimaryActionContrast(opened.drawer.getByRole('button', { name: 'Sign in', exact: true }))
+  }
+  await createOwnerAction.click()
   await expect(opened.drawer.getByText('Owner account created and signed in.')).toBeVisible()
   await expect(opened.drawer.getByText('Synthetic Owner', { exact: true }).first()).toBeVisible()
   await expect(opened.drawer.getByRole('heading', { name: 'Owner recovery codes' })).toBeVisible()
@@ -833,7 +867,7 @@ test('accounts-disabled compatibility, local bootstrap, and remote bootstrap bou
   await expect(opened.drawer).toContainText('Project access stays separate from this account')
 })
 
-test('anonymous login, owner reauthentication, session revocation, and logout preserve project authority', async ({ page }) => {
+test('anonymous login, owner reauthentication, session revocation, and logout preserve project authority', async ({ page, browserName }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await skipWelcome(page)
   api!.setAccountScenario('local-anonymous')
@@ -847,7 +881,9 @@ test('anonymous login, owner reauthentication, session revocation, and logout pr
   await login.getByLabel('Username', { exact: true }).fill('Synthetic Owner')
   await login.getByLabel('Password', { exact: true }).fill('synthetic-owner-password')
   await login.getByLabel('Device label', { exact: true }).fill('Synthetic browser')
-  await login.getByRole('button', { name: 'Sign in', exact: true }).click()
+  const signInAction = login.getByRole('button', { name: 'Sign in', exact: true })
+  if (browserName !== 'webkit') await expectPrimaryActionContrast(signInAction)
+  await signInAction.click()
 
   await expect(drawer.getByText('Signed in.', { exact: true })).toBeVisible()
   await expect(drawer.getByText('Confirmation needed for sensitive actions')).toBeVisible()
@@ -857,10 +893,15 @@ test('anonymous login, owner reauthentication, session revocation, and logout pr
 
   const confirmation = drawer.getByRole('heading', { name: 'Confirm your password' }).locator('xpath=..')
   await confirmation.getByLabel('Current password').fill('synthetic-owner-password')
-  await confirmation.getByRole('button', { name: 'Confirm password' }).click()
+  const confirmPasswordAction = confirmation.getByRole('button', { name: 'Confirm password' })
+  if (browserName !== 'webkit') await expectPrimaryActionContrast(confirmPasswordAction)
+  await confirmPasswordAction.click()
   await expect(drawer.getByText('Sensitive account actions are temporarily unlocked.')).toBeVisible()
   await expect(drawer.getByText('Recently confirmed')).toBeVisible()
   await expect(drawer.getByRole('heading', { name: 'User administration' })).toBeVisible()
+  if (browserName !== 'webkit') {
+    await expectPrimaryActionContrast(drawer.getByRole('button', { name: 'Create user' }))
+  }
 
   const otherSession = drawer.getByText('Synthetic tablet', { exact: false }).locator('xpath=../..')
   await otherSession.getByRole('button', { name: 'Revoke' }).click()
