@@ -48,6 +48,26 @@ class TestContinuationDocs(unittest.TestCase):
             with self.subTest(account_contract=required):
                 self.assertIn(required, accounts)
 
+        sso = self.guide_section("Preserve a future SSO migration path")
+        for required in (
+            "opaque internal `account_id`",
+            "provider-neutral OIDC",
+            "not a selected dependency or release commitment",
+            "`(issuer, subject)`",
+            "Never create, merge, or link accounts solely by email",
+            "never from provider claims",
+            "project permissions from the sealed membership store",
+            "local password and recovery codes as a break-glass path",
+            "Do not initially treat an OIDC login as recent privileged reauthentication",
+            "Contribution events never grant login",
+            "fixed algorithm policy",
+            "case-folding or normalization",
+            "must not re-key projects, credits, jobs, or historical data",
+            "bird-in-the-hand account activation milestone",
+        ):
+            with self.subTest(sso_contract=required):
+                self.assertIn(required, sso)
+
         credits = self.guide_section("Credits remain a separate activation gate")
         self.assertIn(
             "Runtime credit accounting is currently compiled hard-off",
@@ -120,11 +140,14 @@ class TestContinuationDocs(unittest.TestCase):
             "Primary fresh-thread prompt",
             "Post-owner prompt",
             "Deferred credit prompt",
+            "Deferred SSO prompt",
             "historical SQLite",
             "explicitly transfers/releases",
             "zero quarantine",
             "Do not reintroduce flat 402",
             "one writer per file",
+            "not a hard dependency or final product choice",
+            "auto-link by email",
         ):
             with self.subTest(handoff_contract=required):
                 self.assertIn(required, HANDOFF)

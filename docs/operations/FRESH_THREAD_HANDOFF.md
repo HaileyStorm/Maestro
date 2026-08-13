@@ -60,6 +60,17 @@ owner and local/authenticated-LAN work are exempt. Do not reintroduce flat 402
 credit rejection. Duration shaping and other entitlements require a separate,
 explicit server-authored design after accounts/projects are live.
 
+Future optional SSO is also deferred, but current account work must preserve its
+migration path. Keep Maestro's opaque internal `account_id` as the permanent
+owner of projects, roles, credits, and history. Later provider-neutral OIDC may
+link a canonical `(issuer, subject)` to that existing account; it must not
+auto-link by email or rewrite project/account IDs. Authentik is a promising
+self-hosted candidate, including for brokering Google sign-in.
+It is not a hard dependency or final product choice. Preserve local password and recovery
+access as break-glass until the future link/unlink and provider-outage contract
+is implemented and proven. The full deferred contract and test matrix live in
+`docs/operations/CONTINUATION.md` under **Preserve a future SSO migration path**.
+
 ## Parallelization contract
 
 - For any multi-file or cross-layer change, use three bounded read-only scouts:
@@ -108,6 +119,15 @@ explicit server-authored design after accounts/projects are live.
 > funded work gets bounded priority; owner and local/authenticated-LAN work are
 > exempt. Re-scout current code and tests before editing and keep activation off
 > until the full contract is verified.
+
+### Deferred SSO prompt
+
+> Accounts and project migration are live and accepted. Read **Preserve a future
+> SSO migration path** in `docs/operations/CONTINUATION.md`, then re-scout the
+> current account schema before planning optional provider-neutral OIDC.
+> Authentik is a candidate, not a commitment. Link canonical issuer+subject to
+> the existing Maestro account ID; never auto-link by email or re-key projects,
+> credits, jobs, or history. Retain and test local break-glass recovery.
 
 ## Completion evidence for the fresh thread
 

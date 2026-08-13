@@ -88,6 +88,65 @@ activation state. Relevant values are `disabled`, `setup_available`,
 `setup_requires_loopback`, `disable_bootstrap`, and `ready`; do not infer them
 from client state.
 
+## Preserve a future SSO migration path
+
+Current account work must keep Maestro's opaque internal `account_id` as the
+permanent identity for project membership, roles, credit lineage, contribution
+history, and audit provenance. A future SSO provider must authenticate an
+existing Maestro account; it must not replace that ID or trigger another
+project migration.
+
+Queue optional OpenID Connect support as a later design and implementation
+wave, after the local owner/project flow is live. Authentik is a promising
+self-hosted candidate and can broker providers such as Google.
+It is not a selected dependency or release commitment. Implement
+provider-neutral OIDC rather than provider-specific sign-in code.
+
+The future contract is:
+
+- Add a versioned, sealed external-identity mapping from the canonical pair
+  `(issuer, subject)` to exactly one existing internal `account_id`.
+- Never create, merge, or link accounts solely by email, username, provider
+  groups, or display claims. Email remains optional profile data, not identity
+  authority.
+- Require an authenticated, recently reauthenticated local account for initial
+  linking. Global roles/capabilities continue to come from Maestro's sealed
+  local account store and project permissions from the sealed membership store,
+  never from provider claims.
+- Issue the normal Maestro browser session after successful OIDC authentication
+  so project permissions and credit ownership keep using the same account ID.
+- Preserve the local password and recovery codes as a break-glass path until
+  unlink, provider-outage, sole-owner, backup/restore, and recovery behavior are
+  proven safe. Linking or unlinking must not strand the only owner.
+- Do not initially treat an OIDC login as recent privileged reauthentication.
+  The later design must record enough authentication-source provenance to
+  revoke affected sessions after unlink/deprovision, or conservatively revoke
+  every session for that account.
+- Keep authentication links separate from existing contribution/support
+  provider links and their opaque keys. Contribution events never grant login
+  authority or create an OIDC identity mapping.
+- Keep project-password/browser grants, queue/recovery ownership, and account
+  sessions as distinct compatibility layers unless a separate migration proves
+  otherwise.
+- Use OIDC state, nonce, PKCE, exact redirect origins, and conservative proxy
+  handling. Treat issuer and subject as exact validated strings without local
+  case-folding or normalization. Verify signed ID tokens against fail-closed
+  discovery/JWKS and a fixed algorithm policy, with exact issuer, audience,
+  authorized-party, nonce, and lifetime checks. Verify direct, LAN, and
+  Cloudflare behavior separately; first-owner bootstrap and project cutover
+  remain direct-loopback-only.
+- Preserve immutable project migration records and existing project bindings.
+  Provider changes must not re-key projects, credits, jobs, or historical data.
+
+Before implementation, re-scout the then-current account-store schema and add
+regressions for duplicate issuer/subject links, same subject under different
+issuers, email collisions, link races and rollback, disabled/deprovisioned
+accounts, provider outage, safe unlink, session revocation, origin-specific
+callbacks, forged signatures/algorithm confusion, wrong or unavailable token
+authority, issuer/subject normalization collisions, contribution-link
+non-authority, unchanged project/credit IDs, and local recovery. Keep this
+deferred wave out of the current bird-in-the-hand account activation milestone.
+
 ## Credits remain a separate activation gate
 
 Runtime credit accounting is currently compiled hard-off. Do not describe an
