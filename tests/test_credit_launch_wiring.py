@@ -23,6 +23,7 @@ APP = ROOT / "app"
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
+from services.account_auth import AccountAuthError
 from services.credit_accounting import (
     CreditAccountingError,
     CreditAccountingJournal,
@@ -30,6 +31,7 @@ from services.credit_accounting import (
     CreditSourceBalance,
 )
 from services.credit_runtime import (
+    CreditRuntimeError,
     CreditRuntimePolicy,
     quote_reservation,
     reserve_quote,
@@ -41,6 +43,7 @@ from services.entitlements import (
     support_priority_capability_marker,
 )
 from services.job_lifecycle import (
+    _credit_queue_fingerprint,
     _credit_queue_metadata_from_quote,
     _reset_queue_state_for_tests,
     apply_credit_queue_decision,
@@ -49,6 +52,11 @@ from services.job_lifecycle import (
     consume_credit_queue_reservation,
     finish_job,
     update_job,
+)
+from services.queue_recovery_adapter import (
+    owner_principal_digest,
+    project_instance_digest,
+    serialize_job,
 )
 from services.queue_recovery_runtime import (
     QueueRecoveryRuntimeError,
@@ -62,6 +70,7 @@ SOURCE = (APP / "launch.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE, filename=str(APP / "launch.py"))
 ACCOUNT_PARAM = "_maestro_credit_account_id"
 REALM_PARAM = "_maestro_credit_execution_realm"
+OWNER_LINEAGE_PARAM = "_maestro_credit_owner_lineage"
 BASELINE_PARAM = "_maestro_credit_accounting_baseline"
 CLEANUP_PARAM = "_maestro_credit_accounting_cleanup"
 ENFORCED = CreditRuntimePolicy(enforcement_enabled=True)
@@ -141,8 +150,18 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "CreditRuntimePolicy": CreditRuntimePolicy,
             "_CREDIT_ACCOUNT_PARAM": ACCOUNT_PARAM,
             "_CREDIT_REALM_PARAM": REALM_PARAM,
+            "_CREDIT_OWNER_LINEAGE_PARAM": OWNER_LINEAGE_PARAM,
             "_CREDIT_BASELINE_PARAM": BASELINE_PARAM,
             "_CREDIT_CLEANUP_PARAM": CLEANUP_PARAM,
+            "_CREDIT_INTERNAL_PARAMS": frozenset(
+                {
+                    ACCOUNT_PARAM,
+                    REALM_PARAM,
+                    OWNER_LINEAGE_PARAM,
+                    BASELINE_PARAM,
+                    CLEANUP_PARAM,
+                }
+            ),
             "_CREDIT_EXEMPT_JOB_KINDS": frozenset({
                 "tool_upscale", "tool_revoice",
             }),
@@ -150,17 +169,32 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "_credit_runtime_policy": lambda: ENFORCED,
             "_credit_server_execution_realm": lambda: "hosted",
             "_credit_account_id": lambda _job, persisted=True: "a" * 32,
+            "_credit_owner_exempt": lambda _job, persisted=True: False,
+            "_accounts_enabled": lambda: True,
+            "_account_auth_store": lambda: types.SimpleNamespace(
+                resolve_account=lambda account_id: {
+                    "id": account_id,
+                    "role": "user",
+                    "disabled": False,
+                },
+            ),
+            "AccountAuthError": AccountAuthError,
+            "CreditAccountingError": CreditAccountingError,
+            "CreditRuntimeError": CreditRuntimeError,
+            "EntitlementError": EntitlementError,
             "_credit_evaluation": lambda _job: (quote, "a" * 64),
             "_job_model_term_ids": lambda job: [
                 str((job.get("params") or {}).get("model_type") or "standard")
             ],
             "_credit_queue_metadata_from_quote": _credit_queue_metadata_from_quote,
+            "_credit_queue_fingerprint": _credit_queue_fingerprint,
             "_credit_transition_id": None,
             "_credit_reservation": None,
             "reserve_quote": reserve_quote,
             "transition_reservation": transition_reservation,
             "hashlib": hashlib,
             "json": json,
+            "re": re,
             "apply_credit_queue_decision": apply_credit_queue_decision,
             "configure_credit_lifecycle_callback": (
                 configure_credit_lifecycle_callback
@@ -178,6 +212,12 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "_credit_accounting_reservation_id",
             "_credit_transition_id",
             "_credit_reservation",
+            "_credit_restore_recovery_lineage",
+            "_credit_owner_exempt",
+            "_credit_clear_owner_artifacts",
+            "_credit_require_linked_reclassified_lineage",
+            "_credit_owner_release_tombstone",
+            "_credit_retire_owner_state",
             "_credit_job_exempt",
             "_credit_prepare_submission_manifest",
             "_credit_prepare_submission",
@@ -238,6 +278,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "_credit_accounting_operation_id",
             "_credit_accounting_reservation_id",
             "_credit_accounting_receipt_projection",
+            "_credit_restore_recovery_lineage",
             "_credit_accounting_lifecycle_callback",
             "_credit_accounting_reserve",
             "_credit_accounting_revalidate",
@@ -245,6 +286,11 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "_credit_release_accounting",
             "_credit_transition_id",
             "_credit_reservation",
+            "_credit_owner_exempt",
+            "_credit_clear_owner_artifacts",
+            "_credit_require_linked_reclassified_lineage",
+            "_credit_owner_release_tombstone",
+            "_credit_retire_owner_state",
             "_credit_job_exempt",
             "_credit_job_lineage_only",
             "_credit_prepare_submission_manifest",
@@ -502,6 +548,208 @@ class CreditLaunchWiringTests(unittest.TestCase):
         self.assertEqual(callbacks, [None])
         self.assertEqual(list(Path(self.temporary.name).iterdir()), [])
 
+    def test_owner_exemption_uses_fresh_store_role_and_ignores_job_tampering(self):
+        account_id = "a" * 32
+        state = {"role": "owner", "disabled": False, "missing": False}
+        lookups = []
+
+        def resolve_account(candidate):
+            lookups.append(candidate)
+            if state["missing"]:
+                return None
+            return {
+                "id": candidate,
+                "role": state["role"],
+                "disabled": state["disabled"],
+            }
+
+        namespace = self._namespace(_quote(units=20))
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=resolve_account,
+        )
+        _functions({"_credit_owner_exempt"}, namespace)
+        job = {
+            "_credit_account_id": account_id,
+            "role": "user",
+            "params": {"role": "user"},
+        }
+        self.assertTrue(namespace["_credit_owner_exempt"](job))
+        state["role"] = "user"
+        job["role"] = "owner"
+        job["params"]["role"] = "owner"
+        self.assertFalse(namespace["_credit_owner_exempt"](job))
+        state.update(role="owner", disabled=True)
+        self.assertFalse(namespace["_credit_owner_exempt"](job))
+        state.update(disabled=False, missing=True)
+        self.assertFalse(namespace["_credit_owner_exempt"](job))
+        self.assertEqual(lookups, [account_id] * 4)
+
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=lambda _account_id: (_ for _ in ()).throw(
+                AccountAuthError("unavailable")
+            ),
+        )
+        self.assertFalse(namespace["_credit_owner_exempt"](job))
+
+    def test_fresh_owner_physical_submission_creates_no_credit_state(self):
+        namespace = self._orchestrator(_quote(units=20))
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=lambda account_id: {
+                "id": account_id,
+                "role": "owner",
+                "disabled": False,
+            },
+        )
+        namespace["_credit_evaluation"] = lambda _job: (_ for _ in ()).throw(
+            AssertionError("owner allowance must not be read")
+        )
+        job = {
+            "id": "fresh-owner",
+            "kind": "studio_generation",
+            "_credit_account_id": "a" * 32,
+            "params": {
+                "model_type": "standard",
+                "role": "user",
+                ACCOUNT_PARAM: "b" * 32,
+                REALM_PARAM: "client",
+                BASELINE_PARAM: True,
+                CLEANUP_PARAM: {"client": True},
+            },
+        }
+        self.assertFalse(namespace["_credit_prepare_submission"](job))
+        self.assertNotIn("credit_queue", job)
+        self.assertNotIn("_credit_submission_preflight", job)
+        for key in (BASELINE_PARAM, CLEANUP_PARAM):
+            self.assertNotIn(key, job["params"])
+        self.assertEqual(job["params"][ACCOUNT_PARAM], "a" * 32)
+        self.assertEqual(job["params"][REALM_PARAM], "hosted")
+        self.assertEqual(job["params"]["role"], "user")
+
+    def test_owner_promotion_between_preflight_and_submission_avoids_journal(self):
+        state = {"role": "user"}
+        namespace = self._orchestrator(_quote(units=20))
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=lambda account_id: {
+                "id": account_id,
+                "role": state["role"],
+                "disabled": False,
+            },
+        )
+        calls = []
+        namespace["_credit_accounting_reserve"] = lambda *_args: calls.append("reserve")
+        job = {
+            "id": "promoted-owner",
+            "kind": "studio_generation",
+            "_credit_account_id": "a" * 32,
+            "params": {"model_type": "standard"},
+        }
+        self.assertTrue(namespace["_credit_prepare_submission_manifest"](job))
+        state["role"] = "owner"
+        self.assertFalse(namespace["_credit_prepare_submission"](job))
+        self.assertEqual(calls, [])
+        self.assertNotIn("credit_queue", job)
+        self.assertNotIn(CLEANUP_PARAM, job["params"])
+        self.assertEqual(job["params"][ACCOUNT_PARAM], "a" * 32)
+        self.assertEqual(job["params"][REALM_PARAM], "hosted")
+
+    def test_owner_lineage_reclassifies_after_role_or_store_change(self):
+        for label in ("user", "disabled", "missing", "corrupt"):
+            with self.subTest(label=label):
+                state = {"mode": "owner"}
+                evaluations = []
+                namespace = self._orchestrator(_quote(units=20))
+
+                def resolve_account(account_id, state=state):
+                    if state["mode"] == "corrupt":
+                        raise AccountAuthError("unavailable")
+                    if state["mode"] == "missing":
+                        return None
+                    return {
+                        "id": account_id,
+                        "role": "user" if state["mode"] == "user" else "owner",
+                        "disabled": state["mode"] == "disabled",
+                    }
+
+                namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+                    resolve_account=resolve_account,
+                )
+                quote = _quote(units=20)
+
+                def evaluate(_job, evaluations=evaluations, label=label, quote=quote):
+                    return evaluations.append(label) or quote, "a" * 64
+
+                namespace["_credit_evaluation"] = evaluate
+                job = {
+                    "id": "reclassify-" + label,
+                    "kind": "studio_generation",
+                    "status": "queued",
+                    "_credit_account_id": "a" * 32,
+                    "params": {"model_type": "standard"},
+                }
+                self.assertFalse(namespace["_credit_prepare_submission"](job))
+                self.assertEqual(evaluations, [])
+                self.assertEqual(job["params"][ACCOUNT_PARAM], "a" * 32)
+                self.assertIs(job["params"][OWNER_LINEAGE_PARAM], True)
+                state["mode"] = label
+                with self.assertRaises(CreditRuntimeError):
+                    namespace["_credit_prepare_admission"](job)
+                with self.assertRaises(CreditRuntimeError):
+                    namespace["_credit_prepare_dispatch"](job)
+                self.assertEqual(evaluations, [])
+                self.assertNotIn("credit_queue", job)
+
+    def test_recovered_owner_lineage_is_rechecked_without_request_context(self):
+        namespace = self._orchestrator(_quote(units=20))
+        namespace["_request_account_id"] = types.SimpleNamespace(get=lambda: None)
+        namespace["_credit_account_id"] = None
+        _functions({"_credit_account_id"}, namespace)
+        state = {"mode": "owner"}
+
+        def resolve_account(account_id):
+            if state["mode"] == "corrupt":
+                raise AccountAuthError("unavailable")
+            if state["mode"] == "missing":
+                return None
+            return {
+                "id": account_id,
+                "role": "user" if state["mode"] == "user" else "owner",
+                "disabled": state["mode"] == "disabled",
+            }
+
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=resolve_account,
+        )
+        evaluations = []
+        namespace["_credit_evaluation"] = lambda _job: (
+            evaluations.append(state["mode"]) or _quote(units=20),
+            "a" * 64,
+        )
+        recovered = {
+            "id": "recovered-owner-lineage",
+            "kind": "studio_generation",
+            "status": "queued",
+            "params": {
+                "model_type": "standard",
+                ACCOUNT_PARAM: "a" * 32,
+                REALM_PARAM: "hosted",
+                OWNER_LINEAGE_PARAM: True,
+            },
+        }
+        recovered["_credit_account_id"] = "f" * 32
+        self.assertTrue(namespace["_credit_restore_recovery_lineage"](recovered))
+        self.assertEqual(recovered["_credit_account_id"], "a" * 32)
+        self.assertFalse(namespace["_credit_prepare_admission"](recovered))
+        self.assertEqual(evaluations, [])
+        for mode in ("user", "disabled", "missing", "corrupt"):
+            with self.subTest(mode=mode):
+                state["mode"] = mode
+                with self.assertRaises(CreditRuntimeError):
+                    namespace["_credit_prepare_admission"](recovered)
+                with self.assertRaises(CreditRuntimeError):
+                    namespace["_credit_prepare_dispatch"](recovered)
+        self.assertEqual(evaluations, [])
+        self.assertNotIn("credit_queue", recovered)
+
     def test_private_lineage_precedence_and_recovery_hydration(self):
         parent = {"params": {ACCOUNT_PARAM: "b" * 32}}
         jobs = {"parent": parent}
@@ -512,6 +760,8 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "re": re,
             "_credit_accounting_lock": threading.RLock(),
             "_credit_accounting_reservation_accounts": {},
+            "_credit_owner_exempt": lambda _job: False,
+            "_credit_restore_recovery_lineage": lambda _job: False,
         }
         _functions({"_credit_account_id"}, namespace)
         child = {
@@ -818,6 +1068,301 @@ class CreditLaunchWiringTests(unittest.TestCase):
         self.assertEqual(journal.public_projection(ACCOUNTING_ACCOUNT)[
             "pending_reservations"
         ], 0)
+
+    def test_owner_lineage_child_rechecks_current_role_before_reserving(self):
+        namespace, journal, jobs = self._real_accounting(units=30)
+        state = {"role": "owner"}
+        request_account = ["a" * 32]
+        namespace.update(
+            {
+                "_request_account_id": types.SimpleNamespace(
+                    get=lambda: request_account[0],
+                ),
+                "_account_auth_store": lambda: types.SimpleNamespace(
+                    resolve_account=lambda account_id: {
+                        "id": account_id,
+                        "role": state["role"],
+                        "disabled": False,
+                    },
+                ),
+            }
+        )
+        _functions({"_credit_account_id"}, namespace)
+        parent = {
+            "id": "owner-lineage-parent",
+            "kind": "director_pipeline",
+            "status": "queued",
+            "workspace": "default",
+            "created_at": 20.0,
+            "params": {"model_type": "standard"},
+        }
+        jobs[parent["id"]] = parent
+        self.assertTrue(namespace["_credit_prepare_submission"](parent))
+        self.assertNotIn("credit_queue", parent)
+        self.assertEqual(parent["params"][ACCOUNT_PARAM], "a" * 32)
+
+        request_account[0] = ""
+        owner_child = {
+            "id": "owner-lineage-child",
+            "parent_job_id": parent["id"],
+            "kind": "director_child",
+            "status": "queued",
+            "workspace": "default",
+            "created_at": 21.0,
+            "params": {"model_type": "standard"},
+        }
+        jobs[owner_child["id"]] = owner_child
+        self.assertFalse(namespace["_credit_prepare_submission"](owner_child))
+        self.assertNotIn("credit_queue", owner_child)
+        self.assertEqual(owner_child["params"][ACCOUNT_PARAM], "a" * 32)
+        self.assertEqual(owner_child["params"][REALM_PARAM], "hosted")
+
+        state["role"] = "user"
+        user_child = {
+            **owner_child,
+            "id": "user-lineage-child",
+            "params": {"model_type": "standard"},
+        }
+        jobs[user_child["id"]] = user_child
+        self.assertTrue(namespace["_credit_prepare_submission"](user_child))
+        self.assertEqual(user_child["credit_queue"]["schema_version"], 2)
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 10
+        )
+
+    def test_historical_owner_hold_is_retained_then_released_before_dispatch(self):
+        namespace, journal, jobs = self._real_accounting(units=20)
+        state = {"role": "user"}
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=lambda account_id: {
+                "id": account_id,
+                "role": state["role"],
+                "disabled": False,
+            },
+        )
+        job = {
+            "id": "historical-owner-hold",
+            "kind": "studio_generation",
+            "status": "queued",
+            "workspace": "default",
+            "created_at": 22.0,
+            "params": {"model_type": "standard"},
+        }
+        jobs[job["id"]] = job
+        self.assertTrue(namespace["_credit_prepare_submission"](job))
+        manifest_pointer = atomic_write_request_manifest(
+            self.temporary.name,
+            job_id=job["id"],
+            params=copy.deepcopy(job["params"]),
+            inputs=[],
+        )
+        snapshots = []
+
+        def checkpoint(candidate, **updates):
+            persisted = copy.deepcopy(candidate)
+            persisted.update(updates)
+            snapshots.append(
+                serialize_job(
+                    persisted,
+                    owner_digest=owner_principal_digest(
+                        ACCOUNTING_SECRET,
+                        "owner-session",
+                    ),
+                    project_digest=project_instance_digest(
+                        ACCOUNTING_SECRET,
+                        "c" * 32,
+                    ),
+                    request_manifest=manifest_pointer,
+                )
+            )
+            candidate.update(updates)
+            return True
+
+        namespace["_queue_recovery_checkpoint"] = checkpoint
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 10
+        )
+        state["role"] = "owner"
+
+        class UnavailableJournal:
+            def release(self, **_kwargs):
+                raise OSError("offline")
+
+        namespace["_credit_accounting_existing_journal"] = lambda: UnavailableJournal()
+        self.assertFalse(namespace["_credit_prepare_admission"](job))
+        self.assertEqual(job["credit_queue"]["reservation_state"], "reserved")
+        self.assertIn(CLEANUP_PARAM, job["params"])
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 10
+        )
+
+        # Owner work advances while cleanup is offline, retaining its durable
+        # reservation link for terminal/startup retry.
+        self.assertFalse(namespace["_credit_prepare_dispatch"](job))
+        self.assertEqual(job["credit_queue"]["reservation_state"], "reserved")
+        self.assertIn(CLEANUP_PARAM, job["params"])
+
+        namespace["_credit_accounting_existing_journal"] = lambda: journal
+        self.assertFalse(namespace["_credit_prepare_dispatch"](job))
+        self.assertEqual(job["credit_queue"]["decision"], "owner_exempt_release")
+        self.assertEqual(job["credit_queue"]["queue_band"], 0)
+        self.assertEqual(job["credit_queue"]["reservation_state"], "released")
+        self.assertEqual(job["credit_queue"]["revalidation_state"], "released")
+        self.assertNotIn(CLEANUP_PARAM, job["params"])
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 0
+        )
+
+        sealed = load_request_manifest(
+            self.temporary.name,
+            manifest_pointer,
+            expected_job_id=job["id"],
+        )
+        self.assertNotIn(OWNER_LINEAGE_PARAM, sealed["params"])
+        recovered = copy.deepcopy(snapshots[-1])
+        recovered["params"] = sealed["params"]
+        self.assertEqual(recovered["credit_queue"]["reservation_state"], "released")
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=lambda _account_id: None,
+        )
+        namespace["CreditRuntimeError"] = CreditRuntimeError
+        self.assertTrue(namespace["_credit_restore_recovery_lineage"](recovered))
+        with self.assertRaises(CreditRuntimeError):
+            namespace["_credit_prepare_admission"](recovered)
+
+    def test_recovery_hydration_rechecks_owner_and_releases_existing_hold(self):
+        namespace, journal, jobs = self._real_accounting(units=20)
+        state = {"role": "user"}
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=lambda account_id: {
+                "id": account_id,
+                "role": state["role"],
+                "disabled": False,
+            },
+        )
+        job = {
+            "id": "owner-recovery-hold",
+            "kind": "studio_generation",
+            "status": "queued",
+            "workspace": "default",
+            "created_at": 23.0,
+            "params": {"model_type": "standard"},
+        }
+        jobs[job["id"]] = job
+        self.assertTrue(namespace["_credit_prepare_submission"](job))
+        state["role"] = "owner"
+        _functions({"_credit_accounting_hydrate_job"}, namespace)
+        self.assertFalse(namespace["_credit_accounting_hydrate_job"](job))
+        self.assertEqual(job["credit_queue"]["reservation_state"], "released")
+        self.assertNotIn(CLEANUP_PARAM, job["params"])
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 0
+        )
+
+    def test_owner_terminalization_defers_unavailable_release_to_recovery(self):
+        namespace, journal, jobs = self._real_accounting(units=20)
+        state = {"role": "user"}
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=lambda account_id: {
+                "id": account_id,
+                "role": state["role"],
+                "disabled": False,
+            },
+        )
+        job = {
+            "id": "owner-terminal-outage",
+            "kind": "studio_generation",
+            "status": "queued",
+            "workspace": "default",
+            "created_at": 24.0,
+            "params": {"model_type": "standard"},
+        }
+        jobs[job["id"]] = job
+        self.assertTrue(namespace["_credit_prepare_submission"](job))
+        cleanup = copy.deepcopy(job["params"][CLEANUP_PARAM])
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 10
+        )
+        state["role"] = "owner"
+
+        class UnavailableJournal:
+            def release(self, **_kwargs):
+                raise OSError("offline")
+
+        namespace["_credit_accounting_existing_journal"] = lambda: UnavailableJournal()
+        persisted = []
+
+        def lifecycle_finish(job, status):
+            self.assertEqual(job["credit_queue"]["reservation_state"], "released")
+            self.assertEqual(job["params"][CLEANUP_PARAM], cleanup)
+            job["status"] = status
+            persisted.append(copy.deepcopy(job))
+            return True
+
+        namespace["_lifecycle_finish_job"] = lifecycle_finish
+        namespace["_stamp_job_output_access"] = lambda _job: None
+        _functions(
+            {
+                "_credit_prepare_owner_completion",
+                "finish_job",
+            },
+            namespace,
+        )
+        job["status"] = "running"
+        self.assertTrue(namespace["finish_job"](job, "completed"))
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["credit_queue"]["reservation_state"], "released")
+        self.assertEqual(job["params"][CLEANUP_PARAM], cleanup)
+        self.assertEqual(persisted[0]["params"][ACCOUNT_PARAM], "a" * 32)
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 10
+        )
+
+        namespace["_credit_accounting_existing_journal"] = lambda: journal
+        recovered = persisted[0]
+        _functions({"_credit_accounting_hydrate_job"}, namespace)
+        self.assertFalse(namespace["_credit_accounting_hydrate_job"](recovered))
+        self.assertNotIn(CLEANUP_PARAM, recovered["params"])
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 0
+        )
+
+    def test_owner_terminal_persistence_failure_restores_credit_queue(self):
+        credit_queue = {
+            "schema_version": 2,
+            "reservation_state": "reserved",
+            "accounting_reservation_revision": 1,
+        }
+        namespace = {
+            "_CREDIT_CLEANUP_PARAM": CLEANUP_PARAM,
+            "_credit_owner_exempt": lambda _job: True,
+            "_credit_retire_owner_state": lambda _job: False,
+            "_credit_owner_release_tombstone": lambda current, _revision: {
+                **current,
+                "reservation_state": "released",
+                "revalidation_state": "released",
+            },
+            "_lifecycle_finish_job": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("persistence unavailable")
+            ),
+            "_stamp_job_output_access": lambda _job: None,
+        }
+        _functions(
+            {
+                "_credit_prepare_owner_completion",
+                "finish_job",
+            },
+            namespace,
+        )
+        job = {
+            "id": "owner-terminal-persistence-failure",
+            "status": "running",
+            "params": {CLEANUP_PARAM: {"retry": True}},
+            "credit_queue": credit_queue,
+        }
+        with self.assertRaises(OSError):
+            namespace["finish_job"](job, "completed")
+        self.assertEqual(job["credit_queue"], credit_queue)
 
     def test_registration_failure_path_compensates_reserved_credit(self):
         function = next(
@@ -1165,16 +1710,29 @@ class CreditLaunchWiringTests(unittest.TestCase):
                 namespace = {
                     "_CREDIT_ACCOUNT_PARAM": ACCOUNT_PARAM,
                     "_CREDIT_REALM_PARAM": REALM_PARAM,
+                    "_CREDIT_INTERNAL_PARAMS": frozenset(
+                        {
+                            ACCOUNT_PARAM,
+                            REALM_PARAM,
+                            OWNER_LINEAGE_PARAM,
+                            BASELINE_PARAM,
+                            CLEANUP_PARAM,
+                        }
+                    ),
                     "_credit_runtime_policy": lambda policy=policy: policy,
                     "_credit_server_execution_realm": lambda realm=realm: realm,
-                    "_request_account_id": types.SimpleNamespace(
-                        get=lambda: "c" * 32
-                    ),
+                    "_request_account_id": types.SimpleNamespace(get=lambda: "c" * 32),
                     "re": re,
                 }
                 _functions({"_credit_prepare_director_pipeline"}, namespace)
-                params = {"video_model": "standard"}
-                before = copy.deepcopy(params)
+                params = {
+                    "video_model": "standard",
+                    ACCOUNT_PARAM: "d" * 32,
+                    REALM_PARAM: "client",
+                    OWNER_LINEAGE_PARAM: True,
+                    BASELINE_PARAM: True,
+                    CLEANUP_PARAM: {"client": True},
+                }
                 changed = namespace["_credit_prepare_director_pipeline"](params)
                 if label == "hosted":
                     self.assertTrue(changed)
@@ -1182,27 +1740,41 @@ class CreditLaunchWiringTests(unittest.TestCase):
                     self.assertEqual(params[REALM_PARAM], "hosted")
                 else:
                     self.assertFalse(changed)
-                    self.assertEqual(params, before)
+                    self.assertEqual(params, {"video_model": "standard"})
 
     def test_director_public_state_does_not_expose_credit_lineage(self):
         namespace = {
-            "_CREDIT_INTERNAL_PARAMS": frozenset({ACCOUNT_PARAM, REALM_PARAM}),
+            "_CREDIT_INTERNAL_PARAMS": frozenset(
+                {
+                    ACCOUNT_PARAM,
+                    REALM_PARAM,
+                    OWNER_LINEAGE_PARAM,
+                    BASELINE_PARAM,
+                    CLEANUP_PARAM,
+                }
+            ),
             "_strip_director_image_role_internals": lambda _snapshot: None,
             "_redact_local_paths": lambda state: state,
             "_sanitize_director_public_failures": lambda state: state,
         }
         _functions({"_public_pipeline_state"}, namespace)
-        public = namespace["_public_pipeline_state"]({
-            "llm_log": {"private": "content"},
-            "_params_snapshot": {
-                ACCOUNT_PARAM: "b" * 32,
-                REALM_PARAM: "hosted",
-                "video_model": "standard",
-            },
-        })
+        public = namespace["_public_pipeline_state"](
+            {
+                "llm_log": {"private": "content"},
+                "_params_snapshot": {
+                    ACCOUNT_PARAM: "b" * 32,
+                    REALM_PARAM: "hosted",
+                    OWNER_LINEAGE_PARAM: True,
+                    BASELINE_PARAM: True,
+                    CLEANUP_PARAM: {"private": True},
+                    "video_model": "standard",
+                },
+            }
+        )
         self.assertIsNone(public["llm_log"])
         self.assertEqual(
-            public["_params_snapshot"], {"video_model": "standard"},
+            public["_params_snapshot"],
+            {"video_model": "standard"},
         )
 
     def test_requested_units_exclude_ordinary_model_load(self):

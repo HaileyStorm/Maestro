@@ -1492,6 +1492,14 @@ class AccountAuthStore:
         with self._lock:
             return bool(self._load()["accounts"])
 
+    def resolve_account(self, account_id: Any) -> dict[str, Any] | None:
+        """Resolve one opaque account ID from the freshly verified store."""
+        if not self._valid_hex(account_id, 32):
+            return None
+        with self._lock:
+            account = self._account_by_id(self._load(), account_id)
+            return None if account is None else self._public_account(account)
+
     def bootstrap_owner(
         self,
         *,

@@ -167,6 +167,19 @@ class AccountAuthStoreTests(unittest.TestCase):
             )
         self.assertEqual(duplicate.exception.code, "bootstrap_complete")
 
+    def test_opaque_account_lookup_revalidates_the_sealed_store(self):
+        result = self._bootstrap()
+        account_id = result["account"]["id"]
+        self.assertEqual(self.store.resolve_account(account_id)["role"], "owner")
+        self.assertIsNone(self.store.resolve_account("f" * 32))
+        self.assertIsNone(self.store.resolve_account("not-an-account-id"))
+
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        payload["accounts"][0]["role"] = "user"
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(AccountStoreCorruptError):
+            self.store.resolve_account(account_id)
+
     def test_legacy_nonempty_store_creates_missing_completion_marker(self):
         result = self._bootstrap()
         self.marker_path.unlink()

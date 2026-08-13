@@ -1259,6 +1259,7 @@ def _safe_join(base: str, *parts: str) -> str | None:
 # --- Generation job tracking ---
 from services.job_lifecycle import (
     CreditLifecycleCallbackError,
+    _credit_queue_fingerprint,
     _credit_queue_metadata_from_quote,
     apply_credit_queue_decision,
     authorized_logical_queue_projection,
@@ -1534,11 +1535,13 @@ def _stamp_job_origin(job: dict) -> dict:
 
 _CREDIT_ACCOUNT_PARAM = "_maestro_credit_account_id"
 _CREDIT_REALM_PARAM = "_maestro_credit_execution_realm"
+_CREDIT_OWNER_LINEAGE_PARAM = "_maestro_credit_owner_lineage"
 _CREDIT_BASELINE_PARAM = "_maestro_credit_accounting_baseline"
 _CREDIT_CLEANUP_PARAM = "_maestro_credit_accounting_cleanup"
 _CREDIT_INTERNAL_PARAMS = frozenset({
     _CREDIT_ACCOUNT_PARAM,
     _CREDIT_REALM_PARAM,
+    _CREDIT_OWNER_LINEAGE_PARAM,
     _CREDIT_BASELINE_PARAM,
     _CREDIT_CLEANUP_PARAM,
 })
@@ -1678,6 +1681,131 @@ def _credit_account_id(job: dict, *, persisted: bool = True) -> str:
     return ""
 
 
+def _credit_owner_exempt(job: dict, *, persisted: bool = True) -> bool:
+    """Resolve owner exemption from the sealed account store each time."""
+    account_id = _credit_account_id(job, persisted=persisted)
+    if not account_id or not _accounts_enabled():
+        return False
+    try:
+        store = _account_auth_store()
+        account = None if store is None else store.resolve_account(account_id)
+    except (AccountAuthError, OSError, ValueError):
+        return False
+    return bool(
+        isinstance(account, dict)
+        and account.get("id") == account_id
+        and account.get("role") == "owner"
+        and account.get("disabled") is False
+    )
+
+
+def _credit_clear_owner_artifacts(job: dict) -> None:
+    """Remove credit artifacts while retaining server-carried lineage."""
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    for key in (_CREDIT_BASELINE_PARAM, _CREDIT_CLEANUP_PARAM):
+        params.pop(key, None)
+    params[_CREDIT_OWNER_LINEAGE_PARAM] = True
+    job.pop("_credit_submission_preflight", None)
+    current = job.get("credit_queue")
+    if not (
+        isinstance(current, dict)
+        and current.get("schema_version") == 2
+        and current.get("reservation_state") == "released"
+        and current.get("revalidation_state") == "released"
+    ):
+        job.pop("credit_queue", None)
+    _credit_admission_evaluations.pop(str(job.get("id") or ""), None)
+
+
+def _credit_require_linked_reclassified_lineage(job: dict) -> None:
+    """Block former-owner work until a fresh submission can reserve it."""
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    current = job.get("credit_queue")
+    released_owner_tombstone = bool(
+        isinstance(current, dict)
+        and current.get("schema_version") == 2
+        and current.get("reservation_state") == "released"
+        and current.get("revalidation_state") == "released"
+    )
+    if (
+        params.get(_CREDIT_OWNER_LINEAGE_PARAM) is not True
+        and not released_owner_tombstone
+    ):
+        return
+    cleanup = params.get(_CREDIT_CLEANUP_PARAM)
+    if (
+        isinstance(current, dict)
+        and current.get("schema_version") == 2
+        and current.get("reservation_state") == "reserved"
+        and isinstance(cleanup, dict)
+        and current.get("accounting_reservation_id") == cleanup.get("reservation_id")
+        and current.get("accounting_reservation_revision")
+        == cleanup.get("reservation_revision")
+    ):
+        return
+    raise CreditRuntimeError(
+        "account credit eligibility changed; submit the work again"
+    )
+
+
+def _credit_owner_release_tombstone(current: dict, revision: int) -> dict:
+    """Build durable released-v2 provenance from an exact prior hold."""
+    target = dict(current)
+    target["decision"] = "owner_exempt_release"
+    target["reservation_state"] = "released"
+    target["accounting_reservation_revision"] = revision
+    target["queue_band"] = 0
+    target["revalidation_state"] = "released"
+    transition_id = _credit_accounting_operation_id(
+        "owner-release-tombstone",
+        target["accounting_reservation_id"],
+        revision,
+    )
+    target["transition_id"] = transition_id
+    target["transition_history"] = [[transition_id, _credit_queue_fingerprint(target)]]
+    return target
+
+
+def _credit_retire_owner_state(job: dict) -> bool:
+    """Release an old hold before removing obsolete owner credit state."""
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    current = job.get("credit_queue")
+    linked_hold = bool(
+        isinstance(current, dict)
+        and current.get("schema_version") == 2
+        and current.get("reservation_state") == "reserved"
+    )
+    cleanup = params.get(_CREDIT_CLEANUP_PARAM)
+    if cleanup is not None and not isinstance(cleanup, dict):
+        return False
+    if linked_hold or isinstance(cleanup, dict):
+        credit_release = globals().get("_credit_release_accounting")
+        try:
+            released = bool(
+                callable(credit_release)
+                and credit_release(
+                    job,
+                    persist_baseline=False,
+                    preserve_owner_lineage=True,
+                )
+            )
+        except (
+            CreditAccountingError,
+            CreditRuntimeError,
+            EntitlementError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ):
+            released = False
+        if not released:
+            # Exemption callers still let owner work advance; retaining both
+            # links makes terminalization and startup recovery retryable.
+            return False
+    _credit_clear_owner_artifacts(job)
+    return True
+
+
 def _credit_recorded_allowance(job: dict) -> dict:
     """Read one current privacy-safe projection; no contribution data escapes."""
     account_id = _credit_account_id(job)
@@ -1770,8 +1898,25 @@ def _credit_accounting_receipt_projection(receipt) -> dict:
     }
 
 
+def _credit_restore_recovery_lineage(job: dict) -> bool:
+    """Restore opaque lineage only from a verified recovery manifest."""
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    account_id = str(params.get(_CREDIT_ACCOUNT_PARAM) or "")
+    if (
+        str(params.get(_CREDIT_REALM_PARAM) or "") != "hosted"
+        or re.fullmatch(r"[0-9a-f]{32}", account_id) is None
+    ):
+        return False
+    job["_credit_account_id"] = account_id
+    return True
+
+
 def _credit_accounting_hydrate_job(job: dict) -> bool:
     """Recover the private reservation/account association server-side."""
+    _credit_restore_recovery_lineage(job)
+    if _credit_owner_exempt(job):
+        _credit_retire_owner_state(job)
+        return False
     credit_queue = job.get("credit_queue")
     if not isinstance(credit_queue, dict) or credit_queue.get(
         "schema_version"
@@ -2015,6 +2160,7 @@ def _credit_release_accounting(
     *,
     persist_baseline: bool,
     defer_cleanup_baseline: bool = False,
+    preserve_owner_lineage: bool = False,
 ) -> bool:
     """Best-effort release, then restore ordinary queue eligibility."""
     current = job.get("credit_queue")
@@ -2042,6 +2188,7 @@ def _credit_release_accounting(
     else:
         return False
     released = False
+    released_revision = None
     try:
         journal = _credit_accounting_existing_journal()
         account_key = _credit_accounting_account_key(job)
@@ -2058,21 +2205,37 @@ def _credit_release_accounting(
                 as_of=observed_at,
             )
             released = receipt.terminal_satisfied is True
+            released_revision = receipt.reservation_revision
     except (CreditAccountingError, EntitlementError, OSError):
         released = False
-    if not released and not (
-        linked_v2 and persist_baseline and defer_cleanup_baseline
-    ):
+    if not released and not (linked_v2 and persist_baseline and defer_cleanup_baseline):
         return False
     if released:
+        if preserve_owner_lineage and linked_v2:
+            tombstone = _credit_owner_release_tombstone(
+                current,
+                released_revision,
+            )
+            checkpoint = globals().get("_queue_recovery_checkpoint")
+            if not callable(checkpoint):
+                checkpoint = globals().get("checkpoint_recovery_job")
+            if callable(checkpoint):
+                if not checkpoint(job, credit_queue=tombstone):
+                    return False
+            else:
+                job["credit_queue"] = tombstone
         with _credit_accounting_lock:
             _credit_accounting_reservation_accounts.pop(reservation_id, None)
         params.pop(_CREDIT_CLEANUP_PARAM, None)
-        job["_credit_accounting_attempt"] = max(
-            0, int(job.get("_credit_accounting_attempt") or 0),
-        ) + 1
+        job["_credit_accounting_attempt"] = (
+            max(
+                0,
+                int(job.get("_credit_accounting_attempt") or 0),
+            )
+            + 1
+        )
     if not persist_baseline:
-        if linked_v2:
+        if linked_v2 and not preserve_owner_lineage:
             job.pop("credit_queue", None)
         return released
     if not linked_v2:
@@ -2082,7 +2245,11 @@ def _credit_release_accounting(
         baseline = _credit_baseline_quote(job, recorded)
         allowance_revision = _credit_allowance_revision(recorded)
         transition_id = _credit_transition_id(
-            job, "baseline", baseline, "none", allowance_revision,
+            job,
+            "baseline",
+            baseline,
+            "none",
+            allowance_revision,
         )
         baseline_metadata = _credit_queue_metadata_from_quote(
             baseline,
@@ -2235,6 +2402,7 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
     # request manifest when hosted enforcement is explicitly active.
     params.pop(_CREDIT_ACCOUNT_PARAM, None)
     params.pop(_CREDIT_REALM_PARAM, None)
+    params.pop(_CREDIT_OWNER_LINEAGE_PARAM, None)
     params.pop(_CREDIT_BASELINE_PARAM, None)
     params.pop(_CREDIT_CLEANUP_PARAM, None)
     policy = _credit_runtime_policy()
@@ -2242,7 +2410,9 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
     if not policy.enforcement_enabled or realm != "hosted":
         return False
     account_id = _credit_account_id(job, persisted=False)
+    owner_exempt = _credit_owner_exempt(job, persisted=False)
     if account_id:
+        job["_credit_account_id"] = account_id
         params[_CREDIT_ACCOUNT_PARAM] = account_id
     params[_CREDIT_REALM_PARAM] = realm
     if not account_id:
@@ -2250,6 +2420,9 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
     lineage_only = globals().get("_credit_job_lineage_only")
     if callable(lineage_only) and lineage_only(job):
         return True
+    if owner_exempt:
+        params[_CREDIT_OWNER_LINEAGE_PARAM] = True
+        return False
     quote, allowance_revision = _credit_evaluation(job)
     job["_credit_submission_preflight"] = (quote, allowance_revision)
     if quote.reservation_required:
@@ -2272,6 +2445,11 @@ def _credit_prepare_submission(job: dict) -> bool:
         if not _credit_prepare_submission_manifest(job):
             return False
         preflight = job.pop("_credit_submission_preflight", None)
+    elif _credit_owner_exempt(job):
+        # Preflight never reserves: an account promoted to owner between the
+        # manifest and registration stages has no durable hold to settle.
+        _credit_clear_owner_artifacts(job)
+        return False
     if not isinstance(preflight, tuple) or len(preflight) != 2:
         # Lineage-only orchestration parents never reserve.
         return True
@@ -2343,6 +2521,14 @@ def _credit_prepare_admission(job: dict) -> bool:
     _credit_admission_evaluations.pop(job_id, None)
     if _credit_job_exempt(job):
         return False
+    if _credit_owner_exempt(job):
+        _credit_retire_owner_state(job)
+        return False
+    reclassified_guard = globals().get(
+        "_credit_require_linked_reclassified_lineage"
+    )
+    if callable(reclassified_guard):
+        reclassified_guard(job)
     params = job.get("params") if isinstance(job.get("params"), dict) else {}
     if "credit_queue" not in job and not (
         _credit_runtime_policy().enforcement_enabled
@@ -2471,6 +2657,14 @@ def _credit_prepare_dispatch(job: dict) -> bool:
     evaluation = _credit_admission_evaluations.pop(job_id, None)
     if _credit_job_exempt(job):
         return False
+    if _credit_owner_exempt(job):
+        _credit_retire_owner_state(job)
+        return False
+    reclassified_guard = globals().get(
+        "_credit_require_linked_reclassified_lineage"
+    )
+    if callable(reclassified_guard):
+        reclassified_guard(job)
     current = job.get("credit_queue")
     if not isinstance(current, dict) or current.get("reservation_state") != (
         "reserved"
@@ -2541,8 +2735,8 @@ def _credit_block_runtime_error(job: dict) -> None:
 
 def _credit_prepare_director_pipeline(params: dict) -> bool:
     """Carry private lineage only for the same explicit hosted policy."""
-    params.pop(_CREDIT_ACCOUNT_PARAM, None)
-    params.pop(_CREDIT_REALM_PARAM, None)
+    for key in _CREDIT_INTERNAL_PARAMS:
+        params.pop(key, None)
     if (
         not _credit_runtime_policy().enforcement_enabled
         or _credit_server_execution_realm() != "hosted"
@@ -5678,6 +5872,7 @@ def _restore_queue_recovery_on_startup() -> None:
             and (
                 not isinstance(credit_queue, dict)
                 or credit_queue.get("schema_version") != 2
+                or credit_queue.get("reservation_state") == "released"
             )
         ):
             credit_release = globals().get("_credit_release_accounting")
@@ -8800,9 +8995,42 @@ def _stamp_job_output_access(job: dict) -> None:
 _lifecycle_finish_job = finish_job
 
 
+def _credit_prepare_owner_completion(job: dict) -> dict | None:
+    """Keep owner completion non-blocking while preserving cleanup retry."""
+    if not _credit_owner_exempt(job):
+        return None
+    current = job.get("credit_queue")
+    linked_hold = bool(
+        isinstance(current, dict)
+        and current.get("schema_version") == 2
+        and current.get("reservation_state") == "reserved"
+    )
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    cleanup_retained = isinstance(params.get(_CREDIT_CLEANUP_PARAM), dict)
+    if _credit_retire_owner_state(job):
+        return None
+    if linked_hold and cleanup_retained:
+        # The request manifest retains the cleanup tuple and account lineage.
+        # A released-v2 tombstone skips the optional lifecycle callback while
+        # retaining durable former-owner provenance. The cleanup tuple remains
+        # authoritative and startup recovery retries the idempotent release.
+        job["credit_queue"] = _credit_owner_release_tombstone(
+            current,
+            current["accounting_reservation_revision"],
+        )
+        return current
+    return None
+
+
 def finish_job(job, *args, **kwargs):
     """Lifecycle finish plus producer-parity access metadata stamping."""
-    result = _lifecycle_finish_job(job, *args, **kwargs)
+    deferred_credit_queue = _credit_prepare_owner_completion(job)
+    try:
+        result = _lifecycle_finish_job(job, *args, **kwargs)
+    except Exception:
+        if deferred_credit_queue is not None:
+            job["credit_queue"] = deferred_credit_queue
+        raise
     _stamp_job_output_access(job)
     return result
 

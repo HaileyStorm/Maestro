@@ -29,8 +29,11 @@ from services.credit_runtime import (
 from services.job_lifecycle import (
     CreditQueueTransitionConflict,
     _credit_queue_band,
+    _credit_queue_fingerprint,
+    _queue_order_key,
     _reset_queue_state_for_tests,
     _select_next_waiter,
+    _validated_credit_queue_metadata,
     apply_credit_queue_decision,
     block_resource_admission_failure,
     configure_credit_lifecycle_callback,
@@ -47,7 +50,12 @@ from services.job_lifecycle import (
     try_start,
 )
 from services.queue_recovery import QueueRecoveryJournal
-from services.queue_recovery_adapter import QueueRecoveryCoordinator
+from services.queue_recovery_adapter import (
+    QueueRecoveryAdapterError,
+    QueueRecoveryCoordinator,
+    _durable_order_key,
+    _safe_credit_queue,
+)
 
 _STANDARD_CAPABILITY = {
     "capability_id": "video.generate",
@@ -179,6 +187,125 @@ class CreditRuntimeWiringTests(unittest.TestCase):
             accounting_reservation_revision=revision,
         ))
         return quote, reservation
+
+    def _released_v2(
+        self,
+        job: dict,
+        *,
+        owner_exempt: bool,
+        suffix: str,
+    ) -> dict:
+        target = copy.deepcopy(job["credit_queue"])
+        target["decision"] = (
+            "owner_exempt_release"
+            if owner_exempt
+            else "hosted_priority_credit"
+        )
+        target["queue_band"] = 0 if owner_exempt else -1
+        target["reservation_state"] = "released"
+        target["revalidation_state"] = "released"
+        target["accounting_reservation_revision"] += 1
+        target["transition_id"] = f"transition_released_{suffix}"
+        target["transition_history"] = [[
+            target["transition_id"],
+            _credit_queue_fingerprint(target),
+        ]]
+        job["credit_queue"] = target
+        return target
+
+    def test_owner_release_tombstone_is_neutral_and_round_trips(self):
+        active = _job("owner-release-active", created_at=3.0)
+        owner = _job("owner-release-neutral", created_at=2.0)
+        released = _job("ordinary-release-depleted", created_at=1.0)
+        self._stamp_v2(active, "owner_release_active")
+        self._stamp_v2(owner, "owner_release_neutral")
+        self._stamp_v2(released, "ordinary_release_depleted")
+        owner_metadata = self._released_v2(
+            owner,
+            owner_exempt=True,
+            suffix="owner_neutral",
+        )
+        self._released_v2(
+            released,
+            owner_exempt=False,
+            suffix="ordinary_depleted",
+        )
+
+        self.assertEqual(_credit_queue_band(active), 1)
+        self.assertEqual(_credit_queue_band(owner), 0)
+        self.assertEqual(_credit_queue_band(released), -1)
+        jobs = [released, owner, active]
+        runtime_order = [
+            job["id"]
+            for _, job in sorted(
+                enumerate(jobs),
+                key=_queue_order_key,
+            )
+        ]
+        durable_order = [
+            job["id"]
+            for _, job in sorted(
+                enumerate(jobs),
+                key=lambda entry: _durable_order_key(entry[1], entry[0]),
+            )
+        ]
+        expected = [active["id"], owner["id"], released["id"]]
+        self.assertEqual(runtime_order, expected)
+        self.assertEqual(durable_order, expected)
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+            QueueRecoveryCoordinator(journal).register_job(
+                owner,
+                owner_digest="owner:v1:" + "c" * 64,
+                project_digest="project:v1:" + "d" * 64,
+                request_manifest={"kind": "synthetic"},
+            )
+            recovered = QueueRecoveryCoordinator(journal).restore().jobs[owner["id"]]
+        self.assertEqual(recovered["credit_queue"], owner_metadata)
+        self.assertNotIn("_credit_revalidation_required", recovered)
+
+    def test_owner_release_tombstone_rejects_forged_combinations(self):
+        job = _job("owner-release-forgery", created_at=1.0)
+        self._stamp_v2(job, "owner_release_forgery")
+        valid = self._released_v2(
+            job,
+            owner_exempt=True,
+            suffix="valid_owner",
+        )
+        self.assertEqual(_validated_credit_queue_metadata(valid), valid)
+        self.assertEqual(_safe_credit_queue(valid), valid)
+
+        forged = []
+        for updates in (
+            {"queue_band": -1},
+            {"reservation_state": "consumed"},
+            {"revalidation_state": None},
+            {"requested_units_positive": False},
+        ):
+            candidate = copy.deepcopy(valid)
+            candidate.update(updates)
+            candidate["transition_history"][-1][1] = _credit_queue_fingerprint(
+                candidate
+            )
+            forged.append(candidate)
+        v1 = copy.deepcopy(valid)
+        v1["schema_version"] = 1
+        v1.pop("accounting_reservation_id")
+        v1.pop("accounting_reservation_revision")
+        v1["transition_history"][-1][1] = _credit_queue_fingerprint(v1)
+        forged.append(v1)
+
+        for candidate in forged:
+            with (
+                self.subTest(candidate=candidate),
+                self.assertRaises(
+                    ValueError,
+                ),
+            ):
+                _validated_credit_queue_metadata(candidate)
+            with self.assertRaises(QueueRecoveryAdapterError):
+                _safe_credit_queue(candidate)
 
     def test_disabled_and_unmetered_quotes_leave_legacy_job_bytes_unchanged(self):
         for label, quote in (

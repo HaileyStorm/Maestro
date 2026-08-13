@@ -93,6 +93,7 @@ _CREDIT_QUEUE_DECISIONS = frozenset({
     "hosted_baseline",
     "hosted_priority_credit",
     "capability_excluded",
+    "owner_exempt_release",
 })
 _CREDIT_RESERVATION_STATES = frozenset({"reserved", "released", "consumed"})
 _CREDIT_REVALIDATION_STATES = frozenset({"valid", "downgraded", "released"})
@@ -677,6 +678,14 @@ def _validated_credit_queue_metadata(value: Any) -> dict[str, Any]:
             queue_band == expected_band
             and reservation_state is None
             and revalidation_state is None
+        )
+    elif decision == "owner_exempt_release":
+        valid = (
+            schema_version == 2
+            and requested_units_positive
+            and queue_band == 0
+            and reservation_state == "released"
+            and revalidation_state == "released"
         )
     else:
         active = (
