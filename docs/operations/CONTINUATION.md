@@ -13,25 +13,28 @@ test -f "$REPO_ROOT/AGENTS.md" && test -d "$REPO_ROOT/.beads" || exit 1
 cd "$REPO_ROOT"
 ```
 
-Then read `AGENTS.md`, this guide, and `CONTRIBUTING.md`. Inventory the shared
-workspace before changing it:
+Then read `AGENTS.md`, `docs/operations/FRESH_THREAD_HANDOFF.md`, this guide,
+and `CONTRIBUTING.md`. Before any Beads lifecycle action, perform the shared
+read-only activation audit: record the exact root, composed policy hashes,
+installed `bd` version, static tracker/redirect metadata, workspace status, and
+reservation state. Inventory the shared workspace without invoking Beads:
 
 ```bash
-bd where
-bd prime
-bd show ISSUE_ID
+bd --version
 git status --short --branch
+find .beads -maxdepth 2 -type f -printf '%s %P\n' | sort
 ```
 
-Inspect `.working`. Create a short scope/owner sentinel only when none exists;
-never overwrite another active owner. Preserve every pre-existing dirty path,
+Inspect `.working` without rewriting it. Use the shared `working_sentinel.py`
+tool for new structured claims; a legacy or malformed sentinel fails closed
+until explicit owner/recovery review. Preserve every pre-existing dirty path,
 reserve one writer per file or symbol cluster, and stage only owned files.
 
-Some older checkouts can contain Beads data that the installed `bd` cannot open
-without a historical database migration. If a command above fails for that
-reason, do not initialize a second tracker or delete, move, or rewrite `.beads`.
-Record the exact blocker for the coordinating owner and preserve the canonical
-repo-root tracker.
+This checkout currently contains a preserved historical SQLite tracker. Do not
+run `bd where`, `bd init`, migration, sync, hooks, or any other Beads lifecycle
+mutation. Record/queue the condition, preserve the canonical repo-root tracker,
+and continue independent work. Normal Beads commands may resume only after a
+separately controlled tracker migration is verified.
 
 ## Accounts and existing projects
 
@@ -89,7 +92,8 @@ from client state.
 
 Runtime credit accounting is currently compiled hard-off. Do not describe an
 environment flag, support contribution, or account activation as credit
-enforcement.
+enforcement. Credit work is deferred until the account/project milestone is
+live and verified.
 
 Before credits can be enabled, a separate release must prove both sides of the
 contract:
@@ -98,9 +102,15 @@ contract:
   reservation, allowance consumption, journaling, and credit denial. Client
   fields and persisted job parameters are not authority. Historical owner holds
   still need their normal release path.
-- Non-owner hosted jobs follow one validated allowance and denial contract,
-  including recovery and child-job behavior, with no accidental local or
-  project-password bypass.
+- Otherwise-valid zero/partial/refunded/expired-credit hosted work must still
+  create a durable job. It receives the lowest ordinary FIFO queue band with a
+  starvation-bound capacity path; it is not flatly rejected or made a paid-only
+  feature. Fully funded work may receive bounded priority. Local/authenticated
+  LAN and owner work remain exempt, and exact capability exclusions remain
+  baseline.
+- Under demand, later entitlement work may impose model-valid duration shaping
+  (the recovered intent was approximately 15/10/5-second bands), but that is a
+  separate server-authored contract, not permission to deny submission.
 
 Keep credit activation off until the implementation, regression matrix, and
 live acceptance for that contract are complete.
@@ -165,6 +175,7 @@ Do not record project names, credentials, cookies, private URLs, ports, process
 IDs, or secrets in the handoff. Static checks and tests are not live acceptance;
 automated browser evidence is not human acceptance.
 
-Finish with the quality and serial Git/Beads closure procedure in
-`CONTRIBUTING.md`. Remove `.working` only when its coordinated scope is truly
-complete.
+Finish with the quality and serial Git closure procedure in `CONTRIBUTING.md`.
+Do not run Beads sync while the historical tracker is preserved. Remove only a
+structured `.working` claim you own; never clear the current legacy sentinel
+without explicit recovery review.

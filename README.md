@@ -569,14 +569,15 @@ Click **Reset** to wipe the install and start over. Removes `app/env/`, `ui/node
 ### Continuing development work
 
 Start with the durable [Maestro continuation guide](docs/operations/CONTINUATION.md)
-for the current account, project-migration, credit, restart, and verification
-contracts.
+and [fresh-thread handoff](docs/operations/FRESH_THREAD_HANDOFF.md) for the
+current account, project-migration, credit, restart, and verification contracts.
 
 Continuation is repository-rooted, not machine-path-rooted. Resolve the Git root
-and require both `AGENTS.md` and `.beads/`; then run `bd where`, `bd prime`,
-`bd show ISSUE_ID`, and `git status --short --branch`, and inspect `.working`
-before editing. Preserve every pre-existing dirty path and keep one writer per
-file or symbol cluster.
+and require both `AGENTS.md` and `.beads/`; then perform the read-only activation
+audit described in the continuation guide and inspect `.working` before editing.
+This checkout's preserved historical SQLite tracker must not be initialized,
+migrated, synced, hooked, or otherwise mutated. Preserve every pre-existing
+dirty path and keep one writer per file or symbol cluster.
 
 For coordinated restarts, use `app/scripts/restart_status.py` to set and show a
 bounded public notice under one untracked generation value. Clear only that
@@ -588,7 +589,8 @@ checkout-specific host paths in tracked files or logs.
 Before handoff, run the full applicable tests and all CI-equivalent checks.
 Report source/static, mocked, local-runtime, live-access, and human-acceptance
 evidence separately. After the intended work is committed, perform
-`git pull --rebase`, `bd sync`, `git push`, and the final Git status serially.
+`git pull --rebase`, `git push`, and the final Git status serially; skip Beads
+sync while the historical tracker is preserved.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the exact continuation, verification,
 and closure procedure.
 

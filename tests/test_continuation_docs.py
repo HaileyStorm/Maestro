@@ -7,6 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 GUIDE_PATH = ROOT / "docs/operations/CONTINUATION.md"
 GUIDE = GUIDE_PATH.read_text(encoding="utf-8")
+HANDOFF_PATH = ROOT / "docs/operations/FRESH_THREAD_HANDOFF.md"
+HANDOFF = HANDOFF_PATH.read_text(encoding="utf-8")
 
 
 class TestContinuationDocs(unittest.TestCase):
@@ -52,7 +54,7 @@ class TestContinuationDocs(unittest.TestCase):
             credits,
         )
         self.assertIn("sealed account store", credits)
-        self.assertIn("Non-owner hosted jobs", credits)
+        self.assertIn("Otherwise-valid zero/partial/refunded/expired-credit", credits)
         self.assertIn("Keep credit activation off", credits)
 
         restart = self.guide_section("Coordinated restart and status")
@@ -107,6 +109,44 @@ class TestContinuationDocs(unittest.TestCase):
             private_assignment.search(GUIDE),
             "continuation guide must not contain credential or recovery-code values",
         )
+
+    def test_fresh_thread_handoff_covers_checkpoint_and_priority(self):
+        self.assertTrue(HANDOFF_PATH.is_file())
+        for required in (
+            "019fd895-21e8-7f03-86ea-a1296103337e",
+            "b528ab7fd467be21c0567f6a619ef1d33208df2b",
+            "Bird-in-the-hand next milestone",
+            "Prior thread reference",
+            "Primary fresh-thread prompt",
+            "Post-owner prompt",
+            "Deferred credit prompt",
+            "historical SQLite",
+            "explicitly transfers/releases",
+            "zero quarantine",
+            "Do not reintroduce flat 402",
+            "one writer per file",
+        ):
+            with self.subTest(handoff_contract=required):
+                self.assertIn(required, HANDOFF)
+
+        self.assertNotRegex(
+            HANDOFF,
+            r"(?i)(?:/home/[a-z0-9._-]+/|/media/[a-z0-9._-]+/|"
+            r"[a-z]:\\users\\[a-z0-9._-]+\\)",
+        )
+
+    def test_handoff_shell_blocks_do_not_run_beads_lifecycle(self):
+        shell_blocks = re.findall(r"(?ms)```(?:bash|sh)\s*\n(.*?)```", HANDOFF)
+        runnable = "\n".join(shell_blocks)
+        for forbidden in (
+            "bd where",
+            "bd init",
+            "bd migrate",
+            "bd sync",
+            "bd hook",
+        ):
+            with self.subTest(forbidden_command=forbidden):
+                self.assertNotIn(forbidden, runnable)
 
 
 if __name__ == "__main__":

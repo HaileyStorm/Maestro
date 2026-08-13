@@ -38,20 +38,24 @@ test -f "$REPO_ROOT/AGENTS.md" && test -d "$REPO_ROOT/.beads" || exit 1
 cd "$REPO_ROOT"
 ```
 
-Then recover the current contract and inventory the workspace before editing:
+Then recover the current contract and inventory the workspace before editing.
+Run the shared read-only activation audit before any Beads lifecycle action:
 
 ```bash
-bd where
-bd prime
-bd show ISSUE_ID
+bd --version
 git status --short --branch
+find .beads -maxdepth 2 -type f -printf '%s %P\n' | sort
 ```
 
-Read `AGENTS.md`, the issue, and `.working`. If `.working` is absent, create a
-short ownership/scope sentinel before edits; if it belongs to another active
-owner, coordinate instead of overwriting it. Record all pre-existing dirty
-paths and preserve them. Do not reset, checkout, clean, or implicitly stash
-someone else's changes, and stage only the exact paths you own.
+Read `AGENTS.md`, `docs/operations/FRESH_THREAD_HANDOFF.md`,
+`docs/operations/CONTINUATION.md`, and `.working`. This checkout currently has a
+preserved historical SQLite tracker: do not run `bd where`, `bd init`,
+migration, sync, hooks, or other Beads mutations. Report/queue that condition
+and continue independent work. Use the shared `working_sentinel.py` for new
+structured claims; never overwrite or remove a legacy/malformed claim without
+explicit recovery review. Record and preserve all pre-existing dirty paths.
+Do not reset, checkout, clean, or implicitly stash someone else's changes, and
+stage only the exact paths you own.
 
 For a coordinated restart, keep the operator configuration and a newly
 generated status-generation value in the untracked runtime environment. Do not
@@ -116,10 +120,13 @@ serially—never in parallel:
 
 ```bash
 git pull --rebase
-bd sync
 git push
 git status --short --branch
 ```
+
+Skip Beads sync while the historical SQLite tracker is preserved. If the
+configured remote or branch authority differs from the current task, stop the
+Git closure at status/reporting rather than inventing or replacing a remote.
 
 The final status must show the intended branch up to date with its remote. If
 unrelated dirty work prevents a safe rebase or push, coordinate with its owner;
