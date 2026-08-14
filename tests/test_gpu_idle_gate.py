@@ -12,9 +12,11 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from services.gpu_idle_gate import (  # noqa: E402
+    ForeignGpuSignificance,
     GIBIBYTE,
     GpuIdleSnapshot,
     SustainedGpuIdleGate,
+    capture_foreign_gpu_significance,
     capture_gpu_idle_snapshot,
 )
 
@@ -613,6 +615,164 @@ class GpuIdleSnapshotTests(unittest.TestCase):
                 )
                 self.assertFalse(snapshot.available)
                 self.assertFalse(snapshot.attribution_complete)
+
+
+class ForeignGpuSignificanceTests(unittest.TestCase):
+    def test_result_invariants_reject_contradictory_positive_evidence(self):
+        for values in (
+            (False, True, "foreign_compute_activity"),
+            (True, True, "device_utilization_only"),
+            (True, False, "foreign_graphics_memory"),
+        ):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    ForeignGpuSignificance(*values)
+
+    def test_running_maestro_utilization_does_not_prove_external_significance(self):
+        result = capture_foreign_gpu_significance(
+            nvml_module=_Nvml(
+                utilization=90,
+                used_memory=GIBIBYTE,
+                compute=(_ProcessRecord(100, 768 * 1024 ** 2),),
+                graphics=(_ProcessRecord(200, 256 * 1024 ** 2),),
+            ),
+            psutil_module=_Psutil(),
+            own_pid=100,
+            wall_clock=lambda: 10.0,
+        )
+        self.assertFalse(result.known)
+        self.assertFalse(result.significant)
+        self.assertEqual(result.reason, "device_utilization_only")
+
+    def test_graphics_memory_remains_significant_when_device_is_busy(self):
+        result = capture_foreign_gpu_significance(
+            nvml_module=_Nvml(
+                utilization=90,
+                used_memory=5 * GIBIBYTE,
+                compute=(_ProcessRecord(100, GIBIBYTE - 1),),
+                graphics=(_ProcessRecord(200, 4 * GIBIBYTE + 1),),
+            ),
+            psutil_module=_Psutil(),
+            own_pid=100,
+            wall_clock=lambda: 10.0,
+        )
+        self.assertTrue(result.known)
+        self.assertTrue(result.significant)
+        self.assertEqual(result.reason, "foreign_graphics_memory")
+
+    def test_compute_memory_or_activity_is_significant(self):
+        cases = (
+            (
+                _Nvml(
+                    used_memory=GIBIBYTE,
+                    compute=(_ProcessRecord(200, GIBIBYTE),),
+                ),
+                "foreign_compute_memory",
+            ),
+            (
+                _Nvml(
+                    used_memory=1,
+                    compute=(_ProcessRecord(200, 1),),
+                    process_utilization=(
+                        _ProcessUtilization(200, 9_000_000, smUtil=1.1),
+                    ),
+                ),
+                "foreign_compute_activity",
+            ),
+        )
+        for nvml, reason in cases:
+            with self.subTest(reason=reason):
+                result = capture_foreign_gpu_significance(
+                    nvml_module=nvml,
+                    psutil_module=_Psutil(),
+                    own_pid=100,
+                    wall_clock=lambda: 10.0,
+                )
+                self.assertTrue(result.known)
+                self.assertTrue(result.significant)
+                self.assertEqual(result.reason, reason)
+
+    def test_unknown_telemetry_is_explicit_and_never_triggers_preemption(self):
+        fresh_race = _Nvml(process_utilization=(
+            _ProcessUtilization(987654, 9_000_000, smUtil=2),
+        ))
+        stale_race = _Nvml(process_utilization=(
+            _ProcessUtilization(987654, 6_000_000, smUtil=2),
+        ))
+        missing_api = _Nvml()
+        missing_api.nvmlDeviceGetProcessUtilization = None
+        for nvml in (fresh_race, stale_race, missing_api):
+            with self.subTest(nvml=nvml):
+                result = capture_foreign_gpu_significance(
+                    nvml_module=nvml,
+                    psutil_module=_Psutil(),
+                    own_pid=100,
+                    wall_clock=lambda: 10.0,
+                )
+                self.assertFalse(result.known)
+                self.assertFalse(result.significant)
+                self.assertEqual(
+                    result.reason,
+                    "telemetry_or_attribution_unavailable",
+                )
+
+        release_snapshot = capture_gpu_idle_snapshot(
+            nvml_module=stale_race,
+            psutil_module=_Psutil(),
+            own_pid=100,
+            wall_clock=lambda: 10.0,
+        )
+        self.assertFalse(release_snapshot.available)
+        self.assertFalse(release_snapshot.idle)
+
+    def test_clean_incidental_contexts_are_known_not_significant(self):
+        result = capture_foreign_gpu_significance(
+            nvml_module=_Nvml(
+                utilization=21,
+                used_memory=512 * 1024 ** 2,
+                graphics=(_ProcessRecord(200, 512 * 1024 ** 2),),
+            ),
+            psutil_module=_Psutil(),
+            own_pid=100,
+            wall_clock=lambda: 10.0,
+        )
+        self.assertTrue(result.known)
+        self.assertFalse(result.significant)
+        self.assertEqual(result.reason, "no_significant_foreign_work")
+
+    def test_public_result_never_exposes_process_identity(self):
+        result = capture_foreign_gpu_significance(
+            nvml_module=_Nvml(
+                used_memory=GIBIBYTE,
+                compute=(_ProcessRecord(987654, GIBIBYTE),),
+            ),
+            psutil_module=_Psutil(),
+            own_pid=100,
+            wall_clock=lambda: 10.0,
+        )
+        rendered = repr(result)
+        self.assertNotIn("987654", rendered)
+        self.assertNotIn("Warp", rendered)
+        self.assertEqual(
+            set(ForeignGpuSignificance.__dataclass_fields__),
+            {"known", "significant", "reason"},
+        )
+
+    def test_release_snapshot_reason_remains_device_utilization_first(self):
+        nvml = _Nvml(
+            utilization=90,
+            used_memory=5 * GIBIBYTE,
+            compute=(_ProcessRecord(100, GIBIBYTE - 1),),
+            graphics=(_ProcessRecord(200, 4 * GIBIBYTE + 1),),
+        )
+        snapshot = capture_gpu_idle_snapshot(
+            nvml_module=nvml,
+            psutil_module=_Psutil(),
+            own_pid=100,
+            wall_clock=lambda: 10.0,
+        )
+        self.assertFalse(snapshot.idle)
+        self.assertEqual(snapshot.reason, "gpu_utilization_busy")
 
 
 class SustainedGpuIdleGateTests(unittest.TestCase):

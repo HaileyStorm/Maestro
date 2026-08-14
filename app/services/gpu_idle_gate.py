@@ -90,11 +90,45 @@ class GpuIdleDecision:
     idle_window_seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class ForeignGpuSignificance:
+    """PID-free preemption evidence projected from one attributed capture."""
+
+    known: bool
+    significant: bool
+    reason: str
+
+    def __post_init__(self) -> None:
+        significant_reasons = {
+            "foreign_compute_memory",
+            "foreign_compute_activity",
+            "foreign_graphics_memory",
+        }
+        if type(self.known) is not bool or type(self.significant) is not bool:
+            raise ValueError("foreign GPU significance flags are invalid")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("foreign GPU significance reason is invalid")
+        if self.significant and not self.known:
+            raise ValueError("unknown foreign GPU significance cannot be positive")
+        if self.significant and self.reason not in significant_reasons:
+            raise ValueError("positive foreign GPU significance reason is invalid")
+        if not self.significant and self.reason in significant_reasons:
+            raise ValueError("negative foreign GPU significance reason is invalid")
+
+
 def _unavailable(reason: str) -> GpuIdleSnapshot:
     return GpuIdleSnapshot(
         available=False,
         attribution_complete=False,
         idle=False,
+        reason=reason,
+    )
+
+
+def _unknown_significance(reason: str) -> ForeignGpuSignificance:
+    return ForeignGpuSignificance(
+        known=False,
+        significant=False,
         reason=reason,
     )
 
@@ -260,7 +294,7 @@ def _utilization_percent(sample: Any) -> float:
     return max(values)
 
 
-def capture_gpu_idle_snapshot(
+def _capture_gpu_classifications(
     *,
     nvml_module: ModuleType | Any | None = None,
     psutil_module: ModuleType | Any | None = None,
@@ -273,8 +307,8 @@ def capture_gpu_idle_snapshot(
         DEFAULT_PROCESS_UTILIZATION_FRESHNESS_SECONDS
     ),
     wall_clock: Callable[[], float] = time.time,
-) -> GpuIdleSnapshot:
-    """Capture one GPU-0 snapshot; every ambiguity returns an explicit denial."""
+) -> tuple[GpuIdleSnapshot, ForeignGpuSignificance]:
+    """Capture once, then project release readiness and foreign significance."""
 
     for value, field, maximum in (
         (
@@ -309,7 +343,8 @@ def capture_gpu_idle_snapshot(
         raise ValueError("GPU telemetry clock is invalid")
     resolved = _resolve_modules(nvml_module, psutil_module)
     if resolved is None:
-        return _unavailable("telemetry_import_unavailable")
+        reason = "telemetry_import_unavailable"
+        return _unavailable(reason), _unknown_significance(reason)
     nvml, psutil = resolved
 
     initialized = False
@@ -377,11 +412,11 @@ def capture_gpu_idle_snapshot(
                 or timestamp > observed_at_microseconds
             ):
                 raise ValueError("GPU process utilization attribution is ambiguous")
+            if pid not in observed:
+                raise ValueError("GPU process utilization raced process attribution")
             if timestamp < oldest_fresh_timestamp:
                 stale_utilization_pids.add(pid)
                 continue
-            if pid not in observed:
-                raise ValueError("GPU process utilization raced process attribution")
             fresh_utilization_by_pid[pid] = max(
                 fresh_utilization_by_pid.get(pid, 0.0),
                 _utilization_percent(sample),
@@ -425,7 +460,8 @@ def capture_gpu_idle_snapshot(
             # conservative aggregate upper bound for all unknown contexts.
             graphics_memory_bytes += used_memory_bytes - known_process_bytes
     except Exception:
-        return _unavailable("telemetry_or_attribution_unavailable")
+        reason = "telemetry_or_attribution_unavailable"
+        return _unavailable(reason), _unknown_significance(reason)
     finally:
         shutdown = getattr(nvml, "nvmlShutdown", None)
         if initialized and callable(shutdown):
@@ -438,8 +474,49 @@ def capture_gpu_idle_snapshot(
         GIBIBYTE,
         total_memory_bytes * 0.10,
     )
-    if compute_memory_bytes >= compute_memory_threshold:
-        return GpuIdleSnapshot(
+    compute_memory_significant = compute_memory_bytes >= compute_memory_threshold
+    compute_activity_significant = any(
+        fresh_utilization_by_pid.get(pid, 0.0)
+        > float(max_foreign_compute_utilization_percent)
+        for pid in foreign_compute
+    )
+    graphics_memory_threshold = min(
+        4 * GIBIBYTE,
+        total_memory_bytes * 0.15,
+    )
+    graphics_memory_significant = (
+        graphics_memory_bytes > graphics_memory_threshold
+    )
+
+    if compute_memory_significant:
+        significance = ForeignGpuSignificance(
+            known=True,
+            significant=True,
+            reason="foreign_compute_memory",
+        )
+    elif compute_activity_significant:
+        significance = ForeignGpuSignificance(
+            known=True,
+            significant=True,
+            reason="foreign_compute_activity",
+        )
+    elif graphics_memory_significant:
+        significance = ForeignGpuSignificance(
+            known=True,
+            significant=True,
+            reason="foreign_graphics_memory",
+        )
+    elif utilization > float(max_gpu_utilization_percent):
+        significance = _unknown_significance("device_utilization_only")
+    else:
+        significance = ForeignGpuSignificance(
+            known=True,
+            significant=False,
+            reason="no_significant_foreign_work",
+        )
+
+    if compute_memory_significant:
+        snapshot = GpuIdleSnapshot(
             available=True,
             attribution_complete=True,
             idle=False,
@@ -448,12 +525,8 @@ def capture_gpu_idle_snapshot(
             observed_process_count=len(observed),
             foreign_process_count=len(foreign),
         )
-    if any(
-        fresh_utilization_by_pid.get(pid, 0.0)
-        > float(max_foreign_compute_utilization_percent)
-        for pid in foreign_compute
-    ):
-        return GpuIdleSnapshot(
+    elif compute_activity_significant:
+        snapshot = GpuIdleSnapshot(
             available=True,
             attribution_complete=True,
             idle=False,
@@ -462,8 +535,8 @@ def capture_gpu_idle_snapshot(
             observed_process_count=len(observed),
             foreign_process_count=len(foreign),
         )
-    if utilization > float(max_gpu_utilization_percent):
-        return GpuIdleSnapshot(
+    elif utilization > float(max_gpu_utilization_percent):
+        snapshot = GpuIdleSnapshot(
             available=True,
             attribution_complete=True,
             idle=False,
@@ -472,12 +545,8 @@ def capture_gpu_idle_snapshot(
             observed_process_count=len(observed),
             foreign_process_count=len(foreign),
         )
-    graphics_memory_threshold = min(
-        4 * GIBIBYTE,
-        total_memory_bytes * 0.15,
-    )
-    if graphics_memory_bytes > graphics_memory_threshold:
-        return GpuIdleSnapshot(
+    elif graphics_memory_significant:
+        snapshot = GpuIdleSnapshot(
             available=True,
             attribution_complete=True,
             idle=False,
@@ -486,15 +555,81 @@ def capture_gpu_idle_snapshot(
             observed_process_count=len(observed),
             foreign_process_count=len(foreign),
         )
-    return GpuIdleSnapshot(
-        available=True,
-        attribution_complete=True,
-        idle=True,
-        reason="idle_snapshot",
-        gpu_utilization_percent=utilization,
-        observed_process_count=len(observed),
-        foreign_process_count=len(foreign),
+    else:
+        snapshot = GpuIdleSnapshot(
+            available=True,
+            attribution_complete=True,
+            idle=True,
+            reason="idle_snapshot",
+            gpu_utilization_percent=utilization,
+            observed_process_count=len(observed),
+            foreign_process_count=len(foreign),
+        )
+    return snapshot, significance
+
+
+def capture_gpu_idle_snapshot(
+    *,
+    nvml_module: ModuleType | Any | None = None,
+    psutil_module: ModuleType | Any | None = None,
+    own_pid: int | None = None,
+    max_gpu_utilization_percent: float = DEFAULT_MAX_GPU_UTILIZATION_PERCENT,
+    max_foreign_compute_utilization_percent: float = (
+        DEFAULT_MAX_FOREIGN_COMPUTE_UTILIZATION_PERCENT
+    ),
+    process_utilization_freshness_seconds: float = (
+        DEFAULT_PROCESS_UTILIZATION_FRESHNESS_SECONDS
+    ),
+    wall_clock: Callable[[], float] = time.time,
+) -> GpuIdleSnapshot:
+    """Capture one GPU-0 snapshot; every ambiguity denies release."""
+
+    snapshot, _significance = _capture_gpu_classifications(
+        nvml_module=nvml_module,
+        psutil_module=psutil_module,
+        own_pid=own_pid,
+        max_gpu_utilization_percent=max_gpu_utilization_percent,
+        max_foreign_compute_utilization_percent=(
+            max_foreign_compute_utilization_percent
+        ),
+        process_utilization_freshness_seconds=(
+            process_utilization_freshness_seconds
+        ),
+        wall_clock=wall_clock,
     )
+    return snapshot
+
+
+def capture_foreign_gpu_significance(
+    *,
+    nvml_module: ModuleType | Any | None = None,
+    psutil_module: ModuleType | Any | None = None,
+    own_pid: int | None = None,
+    max_gpu_utilization_percent: float = DEFAULT_MAX_GPU_UTILIZATION_PERCENT,
+    max_foreign_compute_utilization_percent: float = (
+        DEFAULT_MAX_FOREIGN_COMPUTE_UTILIZATION_PERCENT
+    ),
+    process_utilization_freshness_seconds: float = (
+        DEFAULT_PROCESS_UTILIZATION_FRESHNESS_SECONDS
+    ),
+    wall_clock: Callable[[], float] = time.time,
+) -> ForeignGpuSignificance:
+    """Return only positively attributed foreign-work preemption evidence."""
+
+    _snapshot, significance = _capture_gpu_classifications(
+        nvml_module=nvml_module,
+        psutil_module=psutil_module,
+        own_pid=own_pid,
+        max_gpu_utilization_percent=max_gpu_utilization_percent,
+        max_foreign_compute_utilization_percent=(
+            max_foreign_compute_utilization_percent
+        ),
+        process_utilization_freshness_seconds=(
+            process_utilization_freshness_seconds
+        ),
+        wall_clock=wall_clock,
+    )
+    return significance
 
 
 class SustainedGpuIdleGate:
