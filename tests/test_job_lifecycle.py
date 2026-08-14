@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,11 +47,14 @@ from services.job_lifecycle import (  # noqa: E402
     record_job_outputs,
     resource_descriptor,
     register_abort_state,
+    request_sample_preemption,
     residency_configuration_update,
     request_cancel,
     set_job_hold,
     set_queue_pause_after_current,
     set_queue_paused,
+    settle_sample_preemption,
+    sample_retry_delay_seconds,
     snapshot_job,
     stamp_job_residency,
     try_requeue,
@@ -79,6 +83,499 @@ class TestJobLifecycle(unittest.TestCase):
             ".mov", ".mp3", ".mp4", ".ogg", ".png", ".wav", ".webm",
             ".webp",
         }))
+
+    @staticmethod
+    def _running_sample(*, attempt=3):
+        job = {
+            "id": "sample-arm-opaque",
+            "kind": "sample_campaign_generation",
+            "queue_class": "background_sample",
+            "queue_priority": -1000,
+            "queue_held": False,
+            "status": "running",
+            "resource_state": "running",
+            "resource_intent": "generation",
+            "resource_execution": "standard",
+            "preemption_mode": "none",
+            "execution_attempt": attempt,
+            "sample_retry": {"attempt": 0, "not_before": None},
+            "output_files": ["committed.mp4"],
+            "artifact_files": ["committed.mp4"],
+            "recovery_cursor": {
+                "sample_campaign": {
+                    "arm": "maestro",
+                    "peer_job_id": "sample-peer-opaque",
+                },
+            },
+        }
+        states = {}
+        state = {"abort": False}
+        return job, states, state
+
+    def test_sample_retry_delay_is_exact_deterministic_bounded_and_capped(self):
+        key = "sample-arm-opaque"
+        for attempt in (0, 1, 6, 7, 100):
+            with self.subTest(attempt=attempt):
+                base = min(1800.0, 30.0 * (2 ** min(attempt, 6)))
+                digest = hashlib.sha256(
+                    f"sample-retry-v1:{key}:{attempt}".encode("utf-8"),
+                ).digest()
+                fraction = int.from_bytes(digest[:8], "big") / ((1 << 64) - 1)
+                expected = min(1800.0, base + base * 0.25 * fraction)
+                self.assertEqual(
+                    sample_retry_delay_seconds(key, attempt), expected,
+                )
+                self.assertGreaterEqual(expected, min(base, 1800.0))
+                self.assertLessEqual(expected, 1800.0)
+        self.assertEqual(
+            sample_retry_delay_seconds(key, 7),
+            sample_retry_delay_seconds(key, 100),
+        )
+
+    def test_sample_preemption_persists_before_abort_and_callback(self):
+        job, states, state = self._running_sample()
+        order = []
+
+        def persist(proposal):
+            if proposal.name == "sample_preemption_requested":
+                order.append("persist")
+                self.assertFalse(state["abort"])
+                self.assertEqual(job["resource_state"], "running")
+                self.assertEqual(
+                    proposal.jobs[0]["resource_state"],
+                    "preemption_requested",
+                )
+
+        def interrupt():
+            order.append("interrupt")
+            self.assertTrue(state["abort"])
+            self.assertEqual(job["resource_state"], "preemption_requested")
+
+        configure_durability_hook(persist)
+        self.assertTrue(register_abort_state(
+            job,
+            job["id"],
+            states,
+            state,
+            interrupt_model=interrupt,
+            expected_execution_attempt=3,
+        ))
+        result = request_sample_preemption(
+            job,
+            job_id=job["id"],
+            active_states=states,
+            expected_execution_attempt=3,
+            now=1000.0,
+        )
+        self.assertTrue(result.changed)
+        self.assertTrue(result.abort_signalled)
+        self.assertEqual(result.retry_attempt, 1)
+        self.assertEqual(order, ["persist", "interrupt"])
+        self.assertEqual(job["sample_retry"], {
+            "attempt": 1,
+            "not_before": 1000.0 + sample_retry_delay_seconds(job["id"], 0),
+        })
+
+    def test_sample_preemption_persistence_failure_never_aborts(self):
+        job, states, state = self._running_sample()
+        interrupt = Mock()
+        self.assertTrue(register_abort_state(
+            job, job["id"], states, state, interrupt_model=interrupt,
+            expected_execution_attempt=3,
+        ))
+
+        def fail(proposal):
+            if proposal.name == "sample_preemption_requested":
+                raise OSError("durability unavailable")
+
+        configure_durability_hook(fail)
+        with self.assertRaisesRegex(OSError, "durability unavailable"):
+            request_sample_preemption(
+                job,
+                job_id=job["id"],
+                active_states=states,
+                expected_execution_attempt=3,
+                now=1000.0,
+            )
+        self.assertEqual(job["resource_state"], "running")
+        self.assertEqual(job["sample_retry"], {"attempt": 0, "not_before": None})
+        self.assertFalse(state["abort"])
+        interrupt.assert_not_called()
+
+    def test_sample_preemption_settlement_preserves_identity_peer_and_outputs(self):
+        job, states, state = self._running_sample()
+        self.assertTrue(register_abort_state(
+            job, job["id"], states, state, interrupt_model=lambda: None,
+            expected_execution_attempt=3,
+        ))
+        self.assertTrue(request_sample_preemption(
+            job,
+            job_id=job["id"],
+            active_states=states,
+            expected_execution_attempt=3,
+            now=1000.0,
+        ).changed)
+        retry = dict(job["sample_retry"])
+        self.assertTrue(settle_sample_preemption(
+            job,
+            job_id=job["id"],
+            active_states=states,
+            state=state,
+            expected_execution_attempt=3,
+        ))
+        self.assertEqual(job["id"], "sample-arm-opaque")
+        self.assertEqual(job["status"], "queued")
+        self.assertTrue(job["queue_held"])
+        self.assertEqual(job["resource_state"], "queued")
+        self.assertEqual(job["execution_attempt"], 4)
+        self.assertEqual(job["sample_retry"], retry)
+        self.assertEqual(job["output_files"], ["committed.mp4"])
+        self.assertEqual(job["artifact_files"], ["committed.mp4"])
+        self.assertEqual(
+            job["recovery_cursor"]["sample_campaign"]["peer_job_id"],
+            "sample-peer-opaque",
+        )
+        self.assertNotIn(job["id"], states)
+
+        self.assertFalse(update_job(
+            job, expected_execution_attempt=3, progress=99,
+        ))
+        self.assertEqual(record_job_outputs(
+            job, ["stale.mp4"], expected_execution_attempt=3,
+        ), ["committed.mp4"])
+        self.assertFalse(checkpoint_recovery_job(
+            job,
+            expected_execution_attempt=3,
+            recovery_state="stale",
+        ))
+        self.assertFalse(finish_job(
+            job, "completed", expected_execution_attempt=3,
+        ))
+        self.assertTrue(request_cancel(job).changed)
+        self.assertEqual(job["status"], "cancelled")
+
+    def test_sample_preemption_settlement_failure_preserves_requested_state(self):
+        job, states, state = self._running_sample()
+        self.assertTrue(register_abort_state(
+            job, job["id"], states, state, interrupt_model=lambda: None,
+            expected_execution_attempt=3,
+        ))
+        self.assertTrue(request_sample_preemption(
+            job,
+            job_id=job["id"],
+            active_states=states,
+            expected_execution_attempt=3,
+            now=1000.0,
+        ).changed)
+
+        def fail(proposal):
+            if proposal.name == "sample_preemption_settled":
+                raise OSError("settlement unavailable")
+
+        configure_durability_hook(fail)
+        with self.assertRaisesRegex(OSError, "settlement unavailable"):
+            settle_sample_preemption(
+                job,
+                job_id=job["id"],
+                active_states=states,
+                state=state,
+                expected_execution_attempt=3,
+            )
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["resource_state"], "preemption_requested")
+        self.assertFalse(job["queue_held"])
+        self.assertEqual(job["execution_attempt"], 3)
+        self.assertIs(states[job["id"]], state)
+
+    def test_terminal_reentrant_from_preemption_persistence_never_aborts(self):
+        job, states, state = self._running_sample()
+        interrupt = Mock()
+        self.assertTrue(register_abort_state(
+            job, job["id"], states, state, interrupt_model=interrupt,
+            expected_execution_attempt=3,
+        ))
+
+        def finish_during_persistence(proposal):
+            if proposal.name == "sample_preemption_requested":
+                finish_job(
+                    job, "completed", expected_execution_attempt=3,
+                )
+
+        configure_durability_hook(finish_during_persistence)
+        result = request_sample_preemption(
+            job,
+            job_id=job["id"],
+            active_states=states,
+            expected_execution_attempt=3,
+            now=1000.0,
+        )
+        self.assertFalse(result.changed)
+        self.assertEqual(job["status"], "completed")
+        self.assertFalse(state["abort"])
+        interrupt.assert_not_called()
+
+    def test_sample_preemption_terminal_races_keep_the_winner(self):
+        job, states, state = self._running_sample()
+        self.assertTrue(finish_job(
+            job, "completed", expected_execution_attempt=3,
+        ))
+        self.assertFalse(request_sample_preemption(
+            job,
+            job_id=job["id"],
+            active_states=states,
+            expected_execution_attempt=3,
+        ).changed)
+
+        for winner in ("finish", "cancel"):
+            with self.subTest(winner=winner):
+                self.setUp()
+                job, states, state = self._running_sample()
+                self.assertTrue(register_abort_state(
+                    job, job["id"], states, state,
+                    interrupt_model=lambda: None,
+                    expected_execution_attempt=3,
+                ))
+                self.assertTrue(request_sample_preemption(
+                    job,
+                    job_id=job["id"],
+                    active_states=states,
+                    expected_execution_attempt=3,
+                    now=1000.0,
+                ).changed)
+                if winner == "finish":
+                    self.assertTrue(finish_job(
+                        job, "completed", expected_execution_attempt=3,
+                    ))
+                    expected = "completed"
+                else:
+                    self.assertTrue(request_cancel(job).changed)
+                    expected = "cancelled"
+                self.assertFalse(settle_sample_preemption(
+                    job,
+                    job_id=job["id"],
+                    active_states=states,
+                    state=state,
+                    expected_execution_attempt=3,
+                ))
+                self.assertEqual(job["status"], expected)
+
+    def test_sample_preemption_rejects_user_jobs_and_malformed_retry(self):
+        job, states, state = self._running_sample()
+        interrupt = Mock()
+        self.assertTrue(register_abort_state(
+            job, job["id"], states, state, interrupt_model=interrupt,
+            expected_execution_attempt=3,
+        ))
+        job["queue_class"] = "user"
+        self.assertFalse(request_sample_preemption(
+            job,
+            job_id=job["id"],
+            active_states=states,
+            expected_execution_attempt=3,
+        ).changed)
+        job["queue_class"] = "background_sample"
+        job["sample_retry"] = {"attempt": True, "not_before": None}
+        with self.assertRaisesRegex(ValueError, "attempt"):
+            request_sample_preemption(
+                job,
+                job_id=job["id"],
+                active_states=states,
+                expected_execution_attempt=3,
+            )
+        self.assertFalse(state["abort"])
+        interrupt.assert_not_called()
+
+        job["sample_retry"] = {"attempt": 1, "not_before": None}
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            request_sample_preemption(
+                job,
+                job_id=job["id"],
+                active_states=states,
+                expected_execution_attempt=3,
+            )
+
+    def test_sample_output_commit_resets_retry_only_for_current_attempt(self):
+        job, _states, _state = self._running_sample(attempt=4)
+        job["sample_retry"] = {"attempt": 3, "not_before": 2000.0}
+        self.assertEqual(record_job_outputs(
+            job, ["fresh.mp4"], expected_execution_attempt=3,
+        ), ["committed.mp4"])
+        self.assertEqual(job["sample_retry"]["attempt"], 3)
+        self.assertEqual(record_job_outputs(
+            job, ["fresh.mp4"], expected_execution_attempt=4,
+        ), ["committed.mp4", "fresh.mp4"])
+        self.assertEqual(job["sample_retry"], {
+            "attempt": 0, "not_before": None,
+        })
+
+    def test_sample_output_publishers_require_attempt_and_reset_only_final_output(self):
+        publishers = (
+            lambda job: record_job_outputs(job, ["fresh.mp4"]),
+            lambda job: update_job(job, output_files=["fresh.mp4"]),
+        )
+        for publish in publishers:
+            with self.subTest(publish=publish):
+                job, _states, _state = self._running_sample(attempt=4)
+                job["sample_retry"] = {"attempt": 2, "not_before": 2000.0}
+                with self.assertRaisesRegex(ValueError, "execution attempt"):
+                    publish(job)
+                self.assertEqual(job["output_files"], ["committed.mp4"])
+                self.assertEqual(job["sample_retry"]["attempt"], 2)
+
+        job, _states, _state = self._running_sample(attempt=4)
+        job["sample_retry"] = {"attempt": 2, "not_before": 2000.0}
+        self.assertTrue(update_job(
+            job,
+            expected_execution_attempt=4,
+            progress=50,
+            message="Incidental progress",
+        ))
+        self.assertEqual(job["sample_retry"]["attempt"], 2)
+        self.assertTrue(update_job(
+            job,
+            expected_execution_attempt=4,
+            output_files=["updated-final.mp4"],
+        ))
+        self.assertEqual(job["sample_retry"], {
+            "attempt": 0, "not_before": None,
+        })
+
+        completed, _states, _state = self._running_sample(attempt=4)
+        completed["output_files"] = []
+        completed["artifact_files"] = []
+        completed["sample_retry"] = {"attempt": 2, "not_before": 2000.0}
+        self.assertTrue(finish_job(
+            completed,
+            "completed",
+            expected_execution_attempt=4,
+            output_files=["completed-final.mp4"],
+        ))
+        self.assertEqual(completed["sample_retry"], {
+            "attempt": 0, "not_before": None,
+        })
+
+        failed, _states, _state = self._running_sample(attempt=4)
+        failed["output_files"] = []
+        failed["artifact_files"] = []
+        failed["sample_retry"] = {"attempt": 2, "not_before": 2000.0}
+        self.assertTrue(finish_job(
+            failed,
+            "failed",
+            expected_execution_attempt=4,
+            output_files=["partial.mp4"],
+        ))
+        self.assertEqual(failed["sample_retry"]["attempt"], 2)
+
+    def test_stale_sample_completion_without_new_outputs_cannot_win(self):
+        job, _states, _state = self._running_sample(attempt=4)
+        job["sample_retry"] = {"attempt": 2, "not_before": 2000.0}
+
+        with self.assertRaisesRegex(ValueError, "execution attempt"):
+            finish_job(job, "completed")
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["sample_retry"], {
+            "attempt": 2, "not_before": 2000.0,
+        })
+        self.assertEqual(job["output_files"], ["committed.mp4"])
+
+        self.assertFalse(finish_job(
+            job, "completed", expected_execution_attempt=3,
+        ))
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["sample_retry"]["attempt"], 2)
+
+        self.assertTrue(finish_job(
+            job, "completed", expected_execution_attempt=4,
+        ))
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["sample_retry"], {
+            "attempt": 0, "not_before": None,
+        })
+
+    def test_sample_preemption_rejects_nonfinite_computed_not_before(self):
+        job, states, state = self._running_sample()
+        interrupt = Mock()
+        self.assertTrue(register_abort_state(
+            job, job["id"], states, state, interrupt_model=interrupt,
+            expected_execution_attempt=3,
+        ))
+        with patch(
+            "services.job_lifecycle.sample_retry_delay_seconds",
+            return_value=float("inf"),
+        ), self.assertRaisesRegex(ValueError, "retry time"):
+            request_sample_preemption(
+                job,
+                job_id=job["id"],
+                active_states=states,
+                expected_execution_attempt=3,
+                now=sys.float_info.max,
+            )
+        self.assertEqual(job["resource_state"], "running")
+        self.assertFalse(state["abort"])
+        interrupt.assert_not_called()
+
+    def test_reentrant_scheduling_mutation_wins_preemption_request(self):
+        mutations = (
+            {"queue_held": True},
+            {"queue_priority": -999},
+            {"resource_execution": "cpu"},
+            {"sample_retry": {"attempt": 1, "not_before": 1500.0}},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                job, states, state = self._running_sample()
+                interrupt = Mock()
+                self.assertTrue(register_abort_state(
+                    job, job["id"], states, state,
+                    interrupt_model=interrupt,
+                    expected_execution_attempt=3,
+                ))
+
+                def mutate(proposal):
+                    if proposal.name == "sample_preemption_requested":
+                        job.update(mutation)
+
+                configure_durability_hook(mutate)
+                result = request_sample_preemption(
+                    job,
+                    job_id=job["id"],
+                    active_states=states,
+                    expected_execution_attempt=3,
+                    now=1000.0,
+                )
+                self.assertFalse(result.changed)
+                self.assertEqual(job["resource_state"], "running")
+                self.assertFalse(state["abort"])
+                interrupt.assert_not_called()
+
+    def test_reentrant_public_running_hold_wins_preemption_request(self):
+        job, states, state = self._running_sample()
+        interrupt = Mock()
+        self.assertTrue(register_abort_state(
+            job, job["id"], states, state,
+            interrupt_model=interrupt,
+            expected_execution_attempt=3,
+        ))
+
+        def hold_during_persistence(proposal):
+            if proposal.name == "sample_preemption_requested":
+                self.assertEqual(set_job_hold(job, True), "after_output")
+
+        configure_durability_hook(hold_during_persistence)
+        result = request_sample_preemption(
+            job,
+            job_id=job["id"],
+            active_states=states,
+            expected_execution_attempt=3,
+            now=1000.0,
+        )
+        self.assertFalse(result.changed)
+        self.assertTrue(job["hold_after_output"])
+        self.assertEqual(job["resource_state"], "running")
+        self.assertEqual(job["message"], "Will hold after the current output")
+        self.assertFalse(state["abort"])
+        interrupt.assert_not_called()
 
     def test_sticky_interrupt_survives_model_entry_reset(self):
         state = {"abort": False}

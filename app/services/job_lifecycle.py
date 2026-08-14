@@ -43,6 +43,7 @@ _registrations: dict[
         MutableMapping[str, Any],
         MutableMapping[str, Any],
         Callable[[], None] | None,
+        int,
     ],
 ] = {}
 _queue_condition = threading.Condition(threading.RLock())
@@ -90,6 +91,12 @@ RESOURCE_STATES = frozenset({
     "released",
 })
 MAX_EXECUTION_ATTEMPT = 1_000_000
+SAMPLE_CAMPAIGN_JOB_KIND = "sample_campaign_generation"
+SAMPLE_CAMPAIGN_QUEUE_CLASS = "background_sample"
+SAMPLE_CAMPAIGN_QUEUE_PRIORITY = -1000
+SAMPLE_RETRY_BASE_SECONDS = 30.0
+SAMPLE_RETRY_CAP_SECONDS = 1800.0
+SAMPLE_RETRY_MAX_ATTEMPT = 1_000_000
 _CREDIT_QUEUE_BANDS = frozenset({-1, 0, 1})
 _CREDIT_QUEUE_DECISIONS = frozenset({
     "unmetered_realm",
@@ -533,6 +540,61 @@ class CancelResult:
     changed: bool
     was_running: bool
     abort_signalled: bool
+
+
+@dataclass(frozen=True)
+class SamplePreemptionResult:
+    """Result of a persistence-first background sample preemption request."""
+
+    changed: bool
+    abort_signalled: bool
+    retry_attempt: int | None = None
+    not_before: float | None = None
+
+
+def _validated_sample_retry(value: Any) -> dict[str, int | float | None]:
+    """Return the exact content-free retry envelope or raise."""
+    if value is None:
+        return {"attempt": 0, "not_before": None}
+    if not isinstance(value, Mapping) or set(value) != {"attempt", "not_before"}:
+        raise ValueError("sample retry metadata schema is invalid")
+    attempt = value.get("attempt")
+    not_before = value.get("not_before")
+    if type(attempt) is not int or not 0 <= attempt <= SAMPLE_RETRY_MAX_ATTEMPT:
+        raise ValueError("sample retry attempt is invalid")
+    if not_before is not None and (
+        type(not_before) not in {int, float}
+        or not math.isfinite(float(not_before))
+        or float(not_before) < 0.0
+    ):
+        raise ValueError("sample retry time is invalid")
+    if (attempt == 0) != (not_before is None):
+        raise ValueError("sample retry attempt and time disagree")
+    return {
+        "attempt": attempt,
+        "not_before": None if not_before is None else float(not_before),
+    }
+
+
+def sample_retry_delay_seconds(scheduling_key: str, attempt: int) -> float:
+    """Return the canonical deterministic content-free retry delay.
+
+    Only the opaque durable job identity and zero-based retry attempt enter the
+    digest. Prompts, paths, model settings, and media never influence timing.
+    """
+    if not isinstance(scheduling_key, str) or not scheduling_key:
+        raise ValueError("sample retry scheduling key is invalid")
+    if type(attempt) is not int or not 0 <= attempt <= SAMPLE_RETRY_MAX_ATTEMPT:
+        raise ValueError("sample retry attempt is invalid")
+    base = min(
+        SAMPLE_RETRY_CAP_SECONDS,
+        SAMPLE_RETRY_BASE_SECONDS * (2 ** min(attempt, 6)),
+    )
+    digest = hashlib.sha256(
+        f"sample-retry-v1:{scheduling_key}:{attempt}".encode("utf-8"),
+    ).digest()
+    fraction = int.from_bytes(digest[:8], "big") / ((1 << 64) - 1)
+    return min(SAMPLE_RETRY_CAP_SECONDS, base + (base * 0.25 * fraction))
 
 
 def _validated_credit_queue_metadata(value: Any) -> dict[str, Any]:
@@ -2177,8 +2239,9 @@ def _reset_queue_state_for_tests() -> None:
     global _queue_paused, _pause_after_current
     global _resident_base_key, _resident_affinity_key
     global _durability_hook, _credit_lifecycle_callback
-    with _queue_condition:
+    with _queue_condition, _lifecycle_lock:
         _queue_waiters.clear()
+        _registrations.clear()
         _queue_sequence = 0
         _queue_manual_order_sequence = 0
         _queue_paused = False
@@ -2462,9 +2525,30 @@ def record_job_outputs(
     clip_output_files: Mapping[int | str, str] | None = None,
     join_output_file: str | None = None,
     final_output_files: list[str] | None = None,
+    expected_execution_attempt: int | None = None,
 ) -> list[str]:
     """Merge final outputs and complete artifact lineage without status changes."""
     with _lifecycle_lock:
+        if (
+            job.get("kind") == SAMPLE_CAMPAIGN_JOB_KIND
+            and expected_execution_attempt is None
+        ):
+            raise ValueError(
+                "Sample output publication requires an execution attempt"
+            )
+        if (
+            not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+            or (
+                expected_execution_attempt is not None
+                and (
+                    is_cancel_requested(job)
+                    or str(job.get("status") or "") in TERMINAL_STATUSES
+                )
+            )
+        ):
+            return list(job.get("output_files") or [])
         candidate = _copy_job_for_transition(job)
         candidate["artifact_files"] = _merge_unique_filenames(
             _merge_unique_filenames(
@@ -2493,7 +2577,25 @@ def record_job_outputs(
             candidate["clip_output_files"] = clip_outputs
         if join_output_file:
             candidate["join_output_file"] = join_output_file
+        if (
+            candidate.get("kind") == SAMPLE_CAMPAIGN_JOB_KIND
+            and final_files
+        ):
+            candidate["sample_retry"] = {"attempt": 0, "not_before": None}
         _persist_prospective_unlocked("record_outputs", jobs=(candidate,))
+        if (
+            not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+            or (
+                expected_execution_attempt is not None
+                and (
+                    is_cancel_requested(job)
+                    or str(job.get("status") or "") in TERMINAL_STATUSES
+                )
+            )
+        ):
+            return list(job.get("output_files") or [])
         _publish_job_unlocked(job, candidate)
         return list(candidate["output_files"])
 
@@ -2534,6 +2636,8 @@ def update_preparation_job(
 
 def checkpoint_recovery_job(
     job: MutableMapping[str, Any],
+    *,
+    expected_execution_attempt: int | None = None,
     **updates: Any,
 ) -> bool:
     """Durably checkpoint recovery without reviving a terminal winner."""
@@ -2545,6 +2649,16 @@ def checkpoint_recovery_job(
             and target_status != current_status
         ) or (
             is_cancel_requested(job) and target_status != "cancelled"
+        ) or (
+            not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ) or (
+            expected_execution_attempt is not None
+            and (
+                is_cancel_requested(job)
+                or current_status in TERMINAL_STATUSES
+            )
         ):
             return False
         candidate = _copy_job_for_transition(job)
@@ -2554,6 +2668,18 @@ def checkpoint_recovery_job(
         # adapters can re-enter through the RLock). Preserve that later winner
         # instead of publishing this older recovery candidate in memory.
         if is_cancel_requested(job) and target_status != "cancelled":
+            return False
+        if not _valid_expected_execution_attempt(
+            job, expected_execution_attempt,
+        ):
+            return False
+        if (
+            expected_execution_attempt is not None
+            and (
+                is_cancel_requested(job)
+                or str(job.get("status") or "") in TERMINAL_STATUSES
+            )
+        ):
             return False
         _publish_job_unlocked(job, candidate)
         _queue_condition.notify_all()
@@ -3109,14 +3235,36 @@ def update_job(
             return False
         replacement_outputs = updates.pop("output_files", None)
         if replacement_outputs is not None:
+            if (
+                job.get("kind") == SAMPLE_CAMPAIGN_JOB_KIND
+                and expected_execution_attempt is None
+            ):
+                raise ValueError(
+                    "Sample output publication requires an execution attempt"
+                )
             candidate = _copy_job_for_transition(job)
             next_phase = updates.get("phase")
             if next_phase is not None and next_phase != candidate.get("phase"):
                 candidate["phase_started_at"] = time.time()
             candidate.update(updates)
             _replace_job_outputs_unlocked(candidate, replacement_outputs)
+            if (
+                candidate.get("kind") == SAMPLE_CAMPAIGN_JOB_KIND
+                and candidate.get("output_files")
+            ):
+                candidate["sample_retry"] = {
+                    "attempt": 0, "not_before": None,
+                }
             _append_job_event_unlocked(candidate, **updates)
             _persist_prospective_unlocked("replace_outputs", jobs=(candidate,))
+            if (
+                is_cancel_requested(job)
+                or job.get("status") != "running"
+                or not _valid_expected_execution_attempt(
+                    job, expected_execution_attempt,
+                )
+            ):
+                return False
             _publish_job_unlocked(job, candidate)
             return True
         next_phase = updates.get("phase")
@@ -3134,6 +3282,7 @@ def register_abort_state(
     state: MutableMapping[str, Any],
     *,
     interrupt_model: Callable[[], None] | None = None,
+    expected_execution_attempt: int | None = None,
 ) -> bool:
     """Register a worker's abort dictionary unless cancellation won first.
 
@@ -3143,11 +3292,25 @@ def register_abort_state(
     """
     with _lifecycle_lock:
         state.setdefault("abort", False)
-        if is_cancel_requested(job) or job.get("status") != "running":
+        raw_attempt = job.get("execution_attempt", 1)
+        if (
+            is_cancel_requested(job)
+            or job.get("status") != "running"
+            or type(raw_attempt) is not int
+            or not 1 <= raw_attempt <= MAX_EXECUTION_ATTEMPT
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+        ):
             state["abort"] = True
             return False
         active_states[job_id] = state
-        _registrations[job_id] = (job, state, interrupt_model)
+        _registrations[job_id] = (
+            job,
+            state,
+            interrupt_model,
+            raw_attempt,
+        )
         return True
 
 
@@ -3166,6 +3329,218 @@ def unregister_abort_state(
             state is None or registration[1] is state
         ):
             _registrations.pop(job_id, None)
+
+
+def request_sample_preemption(
+    job: MutableMapping[str, Any],
+    *,
+    job_id: str,
+    active_states: MutableMapping[str, MutableMapping[str, Any]],
+    expected_execution_attempt: int,
+    now: float | None = None,
+) -> SamplePreemptionResult:
+    """Durably request one running background sample to yield and retry.
+
+    Persistence and in-memory publication both precede abort signalling. A
+    stale worker, terminal/cancel winner, unregistered state, missing callback,
+    malformed retry envelope, or durability failure can never signal abort.
+    """
+    if (
+        type(expected_execution_attempt) is not int
+        or not 1 <= expected_execution_attempt <= MAX_EXECUTION_ATTEMPT
+    ):
+        raise ValueError("Invalid expected execution attempt")
+    requested_at = time.time() if now is None else now
+    if (
+        type(requested_at) not in {int, float}
+        or not math.isfinite(float(requested_at))
+        or float(requested_at) < 0.0
+    ):
+        raise ValueError("Invalid sample preemption time")
+    with _queue_condition, _lifecycle_lock:
+        state = active_states.get(job_id)
+        registration = _registrations.get(job_id)
+        if (
+            job.get("id") != job_id
+            or job.get("kind") != SAMPLE_CAMPAIGN_JOB_KIND
+            or job.get("queue_class") != SAMPLE_CAMPAIGN_QUEUE_CLASS
+            or job.get("queue_priority") != SAMPLE_CAMPAIGN_QUEUE_PRIORITY
+            or job.get("status") != "running"
+            or job.get("queue_held") is True
+            or job.get("resource_state", "running") != "running"
+            or job.get("resource_intent") != RESOURCE_INTENT_GENERATION
+            or job.get("resource_execution") != RESOURCE_EXECUTION_STANDARD
+            or job.get("preemption_mode") != PREEMPTION_MODE_NONE
+            or is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+            or state is None
+            or registration is None
+            or registration[0] is not job
+            or registration[1] is not state
+            or registration[2] is None
+            or registration[3] != expected_execution_attempt
+            or state.get("abort") is not False
+        ):
+            return SamplePreemptionResult(False, False)
+        retry = _validated_sample_retry(job.get("sample_retry"))
+        hold_after_output = bool(job.get("hold_after_output", False))
+        attempt = int(retry["attempt"])
+        if attempt >= SAMPLE_RETRY_MAX_ATTEMPT:
+            return SamplePreemptionResult(False, False)
+        delay = sample_retry_delay_seconds(job_id, attempt)
+        not_before = float(requested_at) + delay
+        if not math.isfinite(not_before):
+            raise ValueError("Invalid sample preemption retry time")
+        candidate = _copy_job_for_transition(job)
+        candidate["resource_state"] = "preemption_requested"
+        candidate["sample_retry"] = {
+            "attempt": attempt + 1,
+            "not_before": not_before,
+        }
+        candidate["message"] = "Yielding to higher-priority GPU work"
+        _append_job_event_unlocked(
+            candidate,
+            resource_state="preemption_requested",
+            message=candidate["message"],
+        )
+        _persist_prospective_unlocked(
+            "sample_preemption_requested",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+        )
+        if (
+            job.get("id") != job_id
+            or job.get("kind") != SAMPLE_CAMPAIGN_JOB_KIND
+            or job.get("queue_class") != SAMPLE_CAMPAIGN_QUEUE_CLASS
+            or job.get("queue_priority") != SAMPLE_CAMPAIGN_QUEUE_PRIORITY
+            or job.get("status") != "running"
+            or job.get("queue_held") is True
+            or job.get("resource_state", "running") != "running"
+            or job.get("resource_intent") != RESOURCE_INTENT_GENERATION
+            or job.get("resource_execution") != RESOURCE_EXECUTION_STANDARD
+            or job.get("preemption_mode") != PREEMPTION_MODE_NONE
+            or is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+            or active_states.get(job_id) is not state
+            or _registrations.get(job_id) is not registration
+            or state.get("abort") is not False
+            or bool(job.get("hold_after_output", False)) != hold_after_output
+            or _validated_sample_retry(job.get("sample_retry")) != retry
+        ):
+            return SamplePreemptionResult(False, False)
+        _publish_job_unlocked(job, candidate)
+        state["abort"] = True
+        try:
+            registration[2]()
+        except Exception:
+            pass
+        _queue_condition.notify_all()
+        return SamplePreemptionResult(
+            True, True, attempt + 1, not_before,
+        )
+
+
+def settle_sample_preemption(
+    job: MutableMapping[str, Any],
+    *,
+    job_id: str,
+    active_states: MutableMapping[str, MutableMapping[str, Any]],
+    state: MutableMapping[str, Any],
+    expected_execution_attempt: int,
+) -> bool:
+    """Return a preempted sample to the same durable held queue identity."""
+    with _queue_condition, _lifecycle_lock:
+        registration = _registrations.get(job_id)
+        if (
+            job.get("id") != job_id
+            or job.get("kind") != SAMPLE_CAMPAIGN_JOB_KIND
+            or job.get("queue_class") != SAMPLE_CAMPAIGN_QUEUE_CLASS
+            or job.get("queue_priority") != SAMPLE_CAMPAIGN_QUEUE_PRIORITY
+            or job.get("status") != "running"
+            or job.get("queue_held") is True
+            or job.get("resource_state") != "preemption_requested"
+            or job.get("resource_intent") != RESOURCE_INTENT_GENERATION
+            or job.get("resource_execution") != RESOURCE_EXECUTION_STANDARD
+            or job.get("preemption_mode") != PREEMPTION_MODE_NONE
+            or is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+            or active_states.get(job_id) is not state
+            or registration is None
+            or registration[0] is not job
+            or registration[1] is not state
+            or registration[2] is None
+            or registration[3] != expected_execution_attempt
+            or state.get("abort") is not True
+            or expected_execution_attempt >= MAX_EXECUTION_ATTEMPT
+        ):
+            return False
+        retry = _validated_sample_retry(job.get("sample_retry"))
+        if retry["attempt"] < 1 or retry["not_before"] is None:
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update({
+            "status": "queued",
+            "queue_held": True,
+            "resource_state": "queued",
+            "execution_attempt": expected_execution_attempt + 1,
+            "message": "Waiting to retry after GPU preemption",
+            "progress": 0,
+            "step": 0,
+            "overall_progress": 0,
+            "window_progress": 0,
+            "clip_progress": 0,
+        })
+        _append_job_event_unlocked(
+            candidate,
+            status="queued",
+            resource_state="queued",
+            execution_attempt=candidate["execution_attempt"],
+            message=candidate["message"],
+        )
+        _persist_prospective_unlocked(
+            "sample_preemption_settled",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+        )
+        if (
+            job.get("id") != job_id
+            or job.get("kind") != SAMPLE_CAMPAIGN_JOB_KIND
+            or job.get("queue_class") != SAMPLE_CAMPAIGN_QUEUE_CLASS
+            or job.get("queue_priority") != SAMPLE_CAMPAIGN_QUEUE_PRIORITY
+            or job.get("status") != "running"
+            or job.get("queue_held") is True
+            or job.get("resource_state") != "preemption_requested"
+            or job.get("resource_intent") != RESOURCE_INTENT_GENERATION
+            or job.get("resource_execution") != RESOURCE_EXECUTION_STANDARD
+            or job.get("preemption_mode") != PREEMPTION_MODE_NONE
+            or is_cancel_requested(job)
+            or not _valid_expected_execution_attempt(
+                job, expected_execution_attempt,
+            )
+            or active_states.get(job_id) is not state
+            or _registrations.get(job_id) is not registration
+            or state.get("abort") is not True
+            or _validated_sample_retry(job.get("sample_retry")) != retry
+        ):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_waiters.pop(id(job), None)
+        if active_states.get(job_id) is state:
+            active_states.pop(job_id, None)
+        if _registrations.get(job_id) is registration:
+            _registrations.pop(job_id, None)
+        _queue_condition.notify_all()
+        return True
 
 
 def request_cancel(
@@ -3262,6 +3637,14 @@ def finish_job(
     if "status" in updates:
         raise ValueError("status must be changed through a lifecycle transition")
     with _queue_condition, _lifecycle_lock:
+        if (
+            status == "completed"
+            and job.get("kind") == SAMPLE_CAMPAIGN_JOB_KIND
+            and expected_execution_attempt is None
+        ):
+            raise ValueError(
+                "Sample completion requires an execution attempt"
+            )
         if is_cancel_requested(job):
             candidate = _copy_job_for_transition(job)
             candidate["status"] = "cancelled"
@@ -3290,9 +3673,25 @@ def finish_job(
             return False
         candidate = _copy_job_for_transition(job)
         replacement_outputs = updates.pop("output_files", None)
+        if (
+            replacement_outputs is not None
+            and job.get("kind") == SAMPLE_CAMPAIGN_JOB_KIND
+            and expected_execution_attempt is None
+        ):
+            raise ValueError(
+                "Sample output publication requires an execution attempt"
+            )
         candidate.update(updates)
         if replacement_outputs is not None:
             _replace_job_outputs_unlocked(candidate, replacement_outputs)
+        if (
+            status == "completed"
+            and candidate.get("kind") == SAMPLE_CAMPAIGN_JOB_KIND
+            and candidate.get("output_files")
+        ):
+            candidate["sample_retry"] = {
+                "attempt": 0, "not_before": None,
+            }
         candidate["status"] = status
         if candidate.get("resource_intent") in _RESOURCE_INTENTS:
             candidate["resource_state"] = "released"

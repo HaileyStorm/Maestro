@@ -184,6 +184,125 @@ class LogicalReferenceRecoveryTests(unittest.TestCase):
                     "queue_class": invalid,
                 })
 
+    def test_sample_retry_defaults_and_strict_allowlist(self):
+        defaulted = _serialize({
+            "id": "sample-default",
+            "kind": "sample_campaign_generation",
+            "status": "queued",
+            "queue_class": "background_sample",
+        })
+        self.assertEqual(defaulted["sample_retry"], {
+            "attempt": 0, "not_before": None,
+        })
+        scheduled = _serialize({
+            **defaulted,
+            "id": "sample-scheduled",
+            "sample_retry": {"attempt": 2, "not_before": 1234.5},
+        })
+        self.assertEqual(scheduled["sample_retry"], {
+            "attempt": 2, "not_before": 1234.5,
+        })
+        invalid = (
+            ({"attempt": 1}, "sample_retry"),
+            ({"attempt": 0, "not_before": 1.0}, "sample_retry"),
+            ({"attempt": 1, "not_before": None}, "sample_retry"),
+            ({"attempt": True, "not_before": 1.0}, "sample_retry"),
+            ({"attempt": 1, "not_before": float("nan")}, "sample_retry"),
+        )
+        for retry, message in invalid:
+            with self.subTest(retry=retry), self.assertRaisesRegex(
+                QueueRecoveryAdapterError, message,
+            ):
+                _serialize({
+                    "id": "sample-invalid",
+                    "kind": "sample_campaign_generation",
+                    "status": "queued",
+                    "queue_class": "background_sample",
+                    "sample_retry": retry,
+                })
+        with self.assertRaisesRegex(QueueRecoveryAdapterError, "reserved"):
+            _serialize({
+                "id": "user-invalid",
+                "kind": "generation",
+                "status": "queued",
+                "queue_class": "user",
+                "sample_retry": {"attempt": 1, "not_before": 10.0},
+            })
+
+    def test_preemption_requested_sample_restores_same_job_held(self):
+        job = {
+            "id": "sample-preempted",
+            "kind": "sample_campaign_generation",
+            "status": "running",
+            "queue_class": "background_sample",
+            "queue_priority": -1000,
+            "queue_held": False,
+            "resource_intent": "generation",
+            "resource_execution": "standard",
+            "preemption_mode": "none",
+            "resource_state": "preemption_requested",
+            "execution_attempt": 7,
+            "sample_retry": {"attempt": 3, "not_before": 2000.0},
+            "progress": 91,
+            "step": 17,
+            "overall_progress": 80,
+            "window_progress": 70,
+            "clip_progress": 60,
+            "output_files": ["committed.mp4"],
+            "artifact_files": ["committed.mp4"],
+            "recovery_cursor": {
+                "sample_campaign": {
+                    "peer_job_id": "sample-peer",
+                    "arm": "control",
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.json")
+            QueueRecoveryCoordinator(journal).register_job(
+                job,
+                owner_digest=OWNER,
+                project_digest=PROJECT,
+                request_manifest={"kind": "sample-arm"},
+            )
+            recovered = QueueRecoveryCoordinator(journal).restore().jobs[
+                job["id"]
+            ]
+        self.assertEqual(recovered["id"], job["id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertTrue(recovered["queue_held"])
+        self.assertEqual(recovered["resource_state"], "queued")
+        self.assertEqual(recovered["execution_attempt"], 8)
+        for field in (
+            "progress", "step", "overall_progress",
+            "window_progress", "clip_progress",
+        ):
+            self.assertEqual(recovered[field], 0)
+        self.assertEqual(recovered["sample_retry"], job["sample_retry"])
+        self.assertEqual(recovered["output_files"], ["committed.mp4"])
+        self.assertEqual(
+            recovered["recovery_cursor"]["sample_campaign"]["peer_job_id"],
+            "sample-peer",
+        )
+
+    def test_sample_preemption_restart_state_is_strict(self):
+        base = {
+            "id": "sample-invalid-preemption",
+            "kind": "sample_campaign_generation",
+            "status": "running",
+            "queue_class": "background_sample",
+            "resource_state": "preemption_requested",
+            "execution_attempt": 1,
+        }
+        with self.assertRaisesRegex(QueueRecoveryAdapterError, "preemption"):
+            _serialize(base)
+        with self.assertRaisesRegex(QueueRecoveryAdapterError, "preemption"):
+            _serialize({
+                **base,
+                "status": "queued",
+                "sample_retry": {"attempt": 1, "not_before": 50.0},
+            })
+
     def test_resource_retry_state_is_complete_bounded_and_round_trips(self):
         retry = _serialize({
             "id": "resource-retry", "status": "queued",

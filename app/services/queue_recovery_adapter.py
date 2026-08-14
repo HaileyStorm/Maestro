@@ -70,6 +70,7 @@ _JOB_FIELDS = frozenset({
     "resource_state", "execution_attempt", "parent_job_id",
     "resource_retry_attempt", "resource_retry_limit",
     "resource_retry_phase", "resource_retry_reason",
+    "sample_retry",
     "logical_job_kind",
     "failure_details", "oom_info", "failed_child_job_id", "failed_child_status",
     "failed_child_reason",
@@ -108,6 +109,8 @@ _LOGICAL_JOB_KINDS = frozenset({
 })
 _MAX_EXECUTION_ATTEMPT = 1_000_000
 _MAX_RESOURCE_RETRY_ATTEMPT = 8
+_SAMPLE_CAMPAIGN_JOB_KIND = "sample_campaign_generation"
+_MAX_SAMPLE_RETRY_ATTEMPT = 1_000_000
 _RESOURCE_RETRY_PHASES = frozenset({
     "model_load", "generation", "finalization",
 })
@@ -142,6 +145,32 @@ def _valid_job_id(value: Any) -> bool:
         and "\\" not in value
         and not any(ord(character) < 32 for character in value)
     )
+
+
+def _safe_sample_retry(value: Any) -> dict[str, int | float | None]:
+    """Validate the exact content-free sample retry envelope."""
+    if not isinstance(value, Mapping) or set(value) != {"attempt", "not_before"}:
+        raise QueueRecoveryAdapterError("job.sample_retry is invalid.")
+    attempt = value.get("attempt")
+    not_before = value.get("not_before")
+    if (
+        type(attempt) is not int
+        or not 0 <= attempt <= _MAX_SAMPLE_RETRY_ATTEMPT
+        or (
+            not_before is not None
+            and (
+                type(not_before) not in {int, float}
+                or not math.isfinite(float(not_before))
+                or float(not_before) < 0.0
+            )
+        )
+        or (attempt == 0) != (not_before is None)
+    ):
+        raise QueueRecoveryAdapterError("job.sample_retry is invalid.")
+    return {
+        "attempt": attempt,
+        "not_before": None if not_before is None else float(not_before),
+    }
 
 
 @dataclass(frozen=True)
@@ -1052,6 +1081,8 @@ def serialize_job(
                     "job.execution_attempt is invalid."
                 )
             result[key] = value
+        elif key == "sample_retry":
+            result[key] = _safe_sample_retry(value)
         elif key in {"resource_retry_attempt", "resource_retry_limit"}:
             minimum = 0 if key == "resource_retry_attempt" else 1
             if (
@@ -1129,6 +1160,24 @@ def serialize_job(
         "failed_child_job_id", "failed_child_status", "failed_child_reason",
     }
     present_child_fields = child_fields.intersection(result)
+    if result.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND:
+        result.setdefault("sample_retry", {"attempt": 0, "not_before": None})
+        if result.get("queue_class") != "background_sample":
+            raise QueueRecoveryAdapterError(
+                "job sample campaign queue class is invalid."
+            )
+        if result.get("resource_state") == "preemption_requested" and (
+            result.get("status") != "running"
+            or result["sample_retry"]["attempt"] < 1
+            or result["sample_retry"]["not_before"] is None
+        ):
+            raise QueueRecoveryAdapterError(
+                "job sample preemption state is invalid."
+            )
+    elif "sample_retry" in result:
+        raise QueueRecoveryAdapterError(
+            "job.sample_retry is reserved for sample campaigns."
+        )
     resource_retry_fields = {
         "resource_retry_attempt", "resource_retry_limit",
         "resource_retry_phase", "resource_retry_reason",
@@ -1277,6 +1326,11 @@ def _validated_recovered_state(
         )
         if clean.get("id") != job_id:
             raise QueueRecoveryAdapterError("Recovered queue identity is invalid.")
+        sample_preemption_requested = bool(
+            clean.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+            and clean.get("status") == "running"
+            and clean.get("resource_state") == "preemption_requested"
+        )
         if clean.get("status") not in _TERMINAL:
             # Process-local leases never survive restart. Pre-contract and
             # explicit CPU snapshots both reacquire from the standard queued
@@ -1286,6 +1340,22 @@ def _validated_recovered_state(
             clean["preemption_mode"] = "none"
             clean["resource_state"] = "queued"
             clean.setdefault("execution_attempt", 1)
+            if sample_preemption_requested:
+                if clean["execution_attempt"] >= _MAX_EXECUTION_ATTEMPT:
+                    raise QueueRecoveryAdapterError(
+                        "Recovered sample execution attempt is exhausted."
+                    )
+                clean["status"] = "queued"
+                clean["queue_held"] = True
+                clean["execution_attempt"] += 1
+                clean["message"] = "Waiting to retry after GPU preemption"
+                clean.update({
+                    "progress": 0,
+                    "step": 0,
+                    "overall_progress": 0,
+                    "window_progress": 0,
+                    "clip_progress": 0,
+                })
             credit_queue = clean.get("credit_queue")
             if (
                 isinstance(credit_queue, Mapping)
