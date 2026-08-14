@@ -121,10 +121,10 @@ committed. The watcher must not poll a held campaign more often than once every
 
 | Rank | Campaign | Format | Maestro intervention | Control | Review focus | State |
 |---:|---|---|---|---|---|---|
-| 1 | Reference Lock | 15 s | Reference-sheet selection plus locked subject, wardrobe, prop, and palette constraints | Same source references passed directly without the reference-lock workflow | Identity, wardrobe, prop, palette, camera continuity, temporal stability | `design_ready`; blocked on launch coordinator |
-| 2 | One Idea, Four Roles | 6 s | Director role planning converts one brief into explicit visual, motion, camera, and sound responsibilities | Same brief sent through the direct generation path without role planning | Whether the requested beat reads clearly; motion/camera agreement; prompt drift | `design_ready`; blocked on launch coordinator |
-| 3 | Recovery Is a Feature | 6 s plus recovery evidence | Durable held job, safe output-boundary yield, restart recovery, and same-job continuation | Direct generation without the recovery workflow, using the same creative inputs | Output continuity plus queue/restart provenance; no VLM claim if the control has no complete output | `design_ready`; blocked on launch coordinator and recovery dispatch |
-| 4 | Pocket to Picture Lock | 30–45 s | Mobile brief capture, Director plan, reference lock, queued generation, and review handoff | Same brief and assets submitted through the direct desktop generation path without the coordinated workflow | End-to-end intent survival, continuity, and reviewability rather than UI speed alone | `design_ready`; blocked on launch coordinator and capture script |
+| 1 | Reference Lock | 15 s | Reference-sheet selection plus locked subject, wardrobe, prop, and palette constraints | Same source references passed directly without the reference-lock workflow | Identity, wardrobe, prop, palette, camera continuity, temporal stability | `design_ready`; launch substrate verified model-free; waits for live authenticated browser/NVML/model acceptance and VLM execution |
+| 2 | One Idea, Four Roles | 6 s | Director role planning converts one brief into explicit visual, motion, camera, and sound responsibilities | Same brief sent through the direct generation path without role planning | Whether the requested beat reads clearly; motion/camera agreement; prompt drift | `design_ready`; launch substrate verified model-free; waits for live authenticated browser/NVML/model acceptance and VLM execution |
+| 3 | Recovery Is a Feature | 6 s plus recovery evidence | Durable held job, safe output-boundary yield, restart recovery, and same-job continuation | Direct generation without the recovery workflow, using the same creative inputs | Output continuity plus queue/restart provenance; no VLM claim if the control has no complete output | `design_ready`; preemption/retry verified model-free; waits for live authenticated browser/model/restart acceptance and durable receipt storage |
+| 4 | Pocket to Picture Lock | 30–45 s | Mobile brief capture, Director plan, reference lock, queued generation, and review handoff | Same brief and assets submitted through the direct desktop generation path without the coordinated workflow | End-to-end intent survival, continuity, and reviewability rather than UI speed alone | `design_ready`; waits for the capture script, live authenticated browser/NVML/model acceptance, and VLM execution |
 
 Wave 1 releases one pair at a time in rank order. Reference Lock is the first
 GPU candidate because it has a strong visual hypothesis, an honest matched
@@ -193,7 +193,30 @@ Workflows**, and **Safe Cross-Project Borrowing**.
 - `background_sample` is a durable queue class that sorts behind every user job
   across live admission, recovery ordering, credit-starvation guards, and queue
   position simulation.
-- The recovery coordinator can atomically register multiple held jobs or none.
-- Launch-side pair submission, allocator-gated release, post-slot recheck,
-  sample-specific recovery dispatch, VLM execution, and the human review UI are
-  not yet live. Consequently no Wave 1 item is claimed as queued or generated.
+- Launch-side atomic pair submission registers both held arms or neither.
+  Guarded one-arm release revalidates the pair, ordinary work, sustained NVML
+  evidence, allocator headroom, and the acquired slot before generation.
+- Durable preemption/retry requests cancellation only through Maestro, fences
+  one execution attempt across checkpoint publishers, reholds the exact job,
+  persists bounded `not_before` backoff, and retries only after a new sustained
+  idle window. These submission, release, and preemption/retry paths are
+  implemented and model-free verified.
+- A local, recently reauthenticated owner can see an owner/project-authorized,
+  read-only paired queue projection in the ordinary UI. It exposes bounded
+  pair, arm, progress, and manifest-only evaluation state without prompts,
+  input paths, digests, private evidence, raw errors, or queue mutation
+  controls. This projection is implemented and model-free verified.
+
+This evidence is static/model-free, not live acceptance. The remaining gaps are:
+
+- no live authenticated browser/NVML/model acceptance;
+- no VLM execution;
+- no durable receipt/CAS store; and
+- no human review decision mutations or human-review UI.
+
+Completed outputs therefore remain `outputs_unbound`, and no Wave 1 item is
+claimed as queued, generated, VLM-reviewed, or human-reviewed. The queue access
+gate is independent of the account/project migration action. That migration's
+existing recent-password-reauthentication gate remains separate and unchanged;
+none of this evidence bypasses it or mutates the preserved historical SQLite
+tracker.

@@ -254,11 +254,31 @@ output is provisional and never substitutes for creator acceptance. The exact
 nearby-window geometry and receipt requirements are canonical in
 `docs/operations/SAMPLE_CAMPAIGN_QUEUE.md`.
 
-Do not start GPU work merely because the queue exists. The first implementation
-unit is the content-free pair manifest/coordinator, fail-closed idle gate, frame
-sampler, VLM report, and human-review projection. After its focused tests pass,
-queue the first Reference Lock pair and let the scheduler release it only at an
-observed idle boundary.
+Current model-free implementation evidence now covers atomic two-arm held
+submission, guarded one-arm release with allocator and post-slot rechecks,
+durable sample-specific preemption/retry, and an
+owner/project-authorized read-only paired queue projection visible only to a
+local, recently reauthenticated owner. The projection is content-free and
+deliberately has no hold, resume, priority, release, rerun, or review-decision
+controls. Completed arm outputs remain `outputs_unbound` until review evidence
+can be durably bound.
+
+Do not start GPU work merely because that substrate exists. The remaining gaps
+are:
+
+- no live authenticated browser/NVML/model acceptance;
+- no VLM execution;
+- no durable receipt/CAS store; and
+- no human review decision mutations or human-review UI.
+
+The model-free evidence is not authority to claim a Wave 1 pair as queued,
+generated, VLM-reviewed, or human-reviewed. Before releasing Reference Lock,
+exercise the authenticated owner flow and fail-closed NVML/model path live at
+an observed idle boundary, then implement and verify durable receipt binding,
+VLM execution, and explicit human keep/reject/rerun decisions. None of this
+changes the separate, existing recent-password-reauthentication gate for the
+account/project migration action or permits a historical SQLite tracker
+mutation.
 
 ## Coordinated restart and status
 

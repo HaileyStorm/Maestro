@@ -111,9 +111,21 @@ class TestContinuationDocs(unittest.TestCase):
             "normalized sampling positions",
             "human review",
             "control",
+            "atomic two-arm held",
+            "guarded one-arm release",
+            "durable sample-specific preemption/retry",
+            "owner/project-authorized read-only paired queue projection",
+            "local, recently",
+            "reauthenticated owner",
+            "no live authenticated browser/NVML/model acceptance",
+            "no VLM execution",
+            "no durable receipt/CAS store",
+            "no human review decision mutations or human-review UI",
+            "existing recent-password-reauthentication gate",
+            "historical SQLite tracker mutation",
         ):
             with self.subTest(sample_campaign_contract=required):
-                self.assertIn(required, samples)
+                self.assertIn(required, " ".join(samples.split()))
 
         for required in (
             "stride = max(2, (last_index + 10) // 20)",
@@ -141,9 +153,55 @@ class TestContinuationDocs(unittest.TestCase):
             "five qualifying snapshots spanning at least 8 seconds",
             "positive adjacent gap at most 3 seconds",
             "No PID, process name, raw memory",
+            "Launch-side atomic pair submission",
+            "Guarded one-arm release",
+            "preemption/retry paths are",
+            "implemented and model-free verified",
+            "owner/project-authorized, read-only paired",
+            "no live authenticated browser/NVML/model acceptance",
+            "no VLM execution",
+            "no durable receipt/CAS store",
+            "no human review decision mutations or human-review UI",
+            "outputs_unbound",
+            "recent-password-reauthentication gate",
+            "preserved historical SQLite tracker",
         ):
             with self.subTest(sample_queue_contract=required):
-                self.assertIn(required, SAMPLE_QUEUE)
+                self.assertIn(required, " ".join(SAMPLE_QUEUE.split()))
+
+        wave_one = re.search(
+            r"(?ms)^## Wave 1 .*?^## Wave 2 ", SAMPLE_QUEUE,
+        )
+        self.assertIsNotNone(wave_one)
+        self.assertNotIn("blocked on launch coordinator", wave_one.group())
+        self.assertIn("launch substrate verified model-free", wave_one.group())
+        self.assertIn("preemption/retry verified model-free", wave_one.group())
+
+        implementation = re.search(
+            r"(?ms)^## Current implementation evidence\s*$\n(?P<body>.*)\Z",
+            SAMPLE_QUEUE,
+        )
+        self.assertIsNotNone(implementation)
+        implementation_body = implementation.group("body")
+        normalized_implementation = " ".join(implementation_body.split())
+        for required in (
+            "Launch-side atomic pair submission",
+            "Guarded one-arm release",
+            "implemented and model-free verified",
+            "local, recently reauthenticated owner",
+            "owner/project-authorized",
+            "read-only paired queue projection",
+            "no durable receipt/CAS store",
+        ):
+            with self.subTest(sample_implementation_contract=required):
+                self.assertIn(required, normalized_implementation)
+        for obsolete in (
+            "blocked on launch coordinator",
+            "Launch-side pair submission, allocator-gated release",
+            "sample-specific recovery dispatch, VLM execution",
+        ):
+            with self.subTest(obsolete_sample_claim=obsolete):
+                self.assertNotIn(obsolete, SAMPLE_QUEUE)
 
         restart = self.guide_section("Coordinated restart and status")
         for required in (
