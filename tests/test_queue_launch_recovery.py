@@ -5206,6 +5206,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             select({"kind": "studio_outpaint_preparation"}), outpaint,
         )
         for kind in (
+            "sample_campaign_generation",
             "studio_project_asset_preparation",
             "studio_repaint_preparation",
             "studio_recast_preparation",
@@ -6055,6 +6056,351 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(registry["first"]["recovery_state"], "blocked")
         self.assertTrue(registry["first"]["queue_held"])
         self.assertTrue(FakeThread.created[1].started)
+
+    def test_sample_pair_owner_gate_precedes_private_body_parsing_and_submission(self):
+        submit = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "submit_sample_campaign_pair"),
+        )
+        owner = submit.index("_require_sample_campaign_owner(request)")
+        body = submit.index("body = await request.json()")
+        project = submit.index("_require_project_access(", body)
+        prepare = submit.index("_prepare_sample_campaign_arm(", project)
+        atomic = submit.index("HeldSamplePairCoordinator(", prepare)
+        result = submit.index("coordinator.submit(", atomic)
+        self.assertLess(owner, body)
+        self.assertLess(body, project)
+        self.assertLess(project, prepare)
+        self.assertLess(prepare, atomic)
+        self.assertLess(atomic, result)
+        self.assertIn('permission="project.generate"', submit)
+        self.assertNotIn("thread.start", submit)
+        self.assertNotIn("_run_generation(", submit)
+
+        prepare_arm = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_prepare_sample_campaign_arm"),
+        )
+        authorize = prepare_arm.index("_authorize_generation_media_inputs(")
+        descriptors = prepare_arm.index(
+            "_queue_recovery_input_descriptors(job, owner_digest)", authorize,
+        )
+        manifest_check = prepare_arm.index(
+            "validate_private_arm_request(", descriptors,
+        )
+        self.assertLess(authorize, descriptors)
+        self.assertLess(descriptors, manifest_check)
+        self.assertNotIn("_recovery_sha256_file", prepare_arm)
+        self.assertNotIn("_sample_campaign_private_inputs", self.launch_source)
+
+    def test_sample_pair_route_is_direct_loopback_only_before_session_and_body(self):
+        middleware = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_maestro_session_middleware"),
+        )
+        route_gate = middleware.index('request.url.path == "/api/v1/sample-campaign"')
+        session = middleware.index("_attach_account_request_state(")
+        self.assertLess(route_gate, session)
+        self.assertIn("_sample_campaign_control_denial(request)", middleware[route_gate:session])
+
+    def test_sample_pair_owner_gate_denies_lan_nonowner_and_stale_reauth(self):
+        class Denied(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code = status_code
+                self.detail = detail
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("_require_sample_campaign_owner",),
+            {
+                "Request": object,
+                "HTTPException": Denied,
+                "_runtime_share_registration_is_local": (
+                    lambda request: request.local
+                ),
+                "_request_is_cloudflare_remote": (
+                    lambda request: request.remote
+                ),
+                "_request_has_account_capability": (
+                    lambda request, capability: capability == "owner.admin"
+                    and request.owner
+                ),
+                "_request_has_recent_account_reauth": (
+                    lambda request: request.recent
+                ),
+            },
+        )
+        require = namespace["_require_sample_campaign_owner"]
+        allowed = types.SimpleNamespace(
+            local=True, remote=False, owner=True, recent=True,
+        )
+        require(allowed)
+        for change in (
+            {"local": False},
+            {"remote": True},
+            {"owner": False},
+            {"recent": False},
+        ):
+            with self.subTest(change=change), self.assertRaises(Denied) as raised:
+                require(types.SimpleNamespace(**{**vars(allowed), **change}))
+            self.assertEqual(raised.exception.status_code, 403)
+            self.assertEqual(
+                raised.exception.detail,
+                "Sample campaign controls are unavailable",
+            )
+
+    def test_sample_pair_registry_batch_validates_every_job_before_visibility(self):
+        registry_node = next(
+            node for node in self.launch.body
+            if isinstance(node, ast.ClassDef) and node.name == "_JobRegistry"
+        )
+        module = ast.Module(body=[registry_node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        observed = []
+
+        def admission(job):
+            observed.append(job["id"])
+            if job["id"] == "second":
+                raise RuntimeError("injected second admission failure")
+
+        namespace = {
+            "threading": threading,
+            "_workspace_lifecycle_lock": threading.RLock(),
+            "_require_job_workspace_available": admission,
+            "QueueRecoveryRuntimeError": RuntimeError,
+            "_request_remote": types.SimpleNamespace(get=lambda: False),
+            "HTTPException": RuntimeError,
+            "output_policy_from_request": lambda *_args, **_kwargs: {},
+        }
+        exec(compile(module, "sample-registry", "exec"), namespace)
+        registry = namespace["_JobRegistry"]()
+        with self.assertRaisesRegex(RuntimeError, "second admission"):
+            registry.publish_prepared_many((
+                ("first", {"id": "first"}),
+                ("second", {"id": "second"}),
+            ))
+        self.assertEqual(observed, ["first", "second"])
+        self.assertEqual(registry, {})
+
+    def test_sample_pair_ref2va_revision_comes_from_server_pinned_url(self):
+        class Invalid(ValueError):
+            pass
+
+        model_def = {
+            "URLs": [
+                "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/"
+                "eb8a16107c595128b3a578f82d2ce2f75920c355/"
+                "diffusion_models/ref2va.safetensors"
+            ],
+        }
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_model_revision",),
+            {
+                "wgp": types.SimpleNamespace(
+                    get_model_def=lambda model_type: (
+                        model_def if model_type == "minimax_h3_ref2va" else {}
+                    ),
+                ),
+                "Mapping": dict,
+                "re": re,
+                "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
+                "SampleCampaignSubmissionError": Invalid,
+            },
+        )
+        resolve = namespace["_sample_campaign_model_revision"]
+        self.assertEqual(
+            resolve("minimax_h3_ref2va"),
+            "eb8a16107c595128b3a578f82d2ce2f75920c355",
+        )
+        with self.assertRaises(Invalid):
+            resolve("minimax_h3")
+
+    def test_sample_pair_recovery_groups_require_exact_reciprocal_peers(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_valid_sample_campaign_recovery_groups",),
+            {
+                "Sequence": list,
+                "Mapping": dict,
+                "Any": object,
+                "_SAMPLE_CAMPAIGN_QUEUE_CLASS": "background_sample",
+                "_SAMPLE_CAMPAIGN_QUEUE_PRIORITY": -1000,
+            },
+        )
+        validate = namespace["_valid_sample_campaign_recovery_groups"]
+        digest = "d" * 64
+
+        def snapshot(job_id, arm, peer):
+            return {
+                "id": job_id,
+                "kind": "sample_campaign_generation",
+                "status": "queued",
+                "workspace": "default",
+                "owner_principal": "owner",
+                "project_instance": "project",
+                "queue_class": "background_sample",
+                "queue_priority": -1000,
+                "queue_held": True,
+                "recovery_cursor": {"sample_campaign": {
+                    "schema": 1,
+                    "pair_id": "pair-1",
+                    "pair_manifest_digest": digest,
+                    "arm": arm,
+                    "peer_job_id": peer,
+                }},
+            }
+
+        maestro = snapshot("maestro-job", "maestro", "control-job")
+        control = snapshot("control-job", "control", "maestro-job")
+        self.assertEqual(validate((maestro, control)), ((maestro, control),))
+        self.assertEqual(validate((maestro,)), ())
+        self.assertEqual(
+            validate((maestro, {**control, "owner_principal": "other"})), (),
+        )
+        nonreciprocal = copy.deepcopy(control)
+        nonreciprocal["recovery_cursor"]["sample_campaign"]["peer_job_id"] = "missing"
+        self.assertEqual(validate((maestro, nonreciprocal)), ())
+        duplicate_arm = snapshot("control-job", "maestro", "maestro-job")
+        self.assertEqual(validate((maestro, duplicate_arm)), ())
+
+        startup = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_restore_queue_recovery_on_startup"),
+        )
+        self.assertIn("_valid_sample_campaign_recovery_groups", startup)
+        self.assertIn("_jobs.publish_prepared_many", startup)
+        self.assertIn('if snapshot.get("kind") == "sample_campaign_generation"', startup)
+
+    def test_sample_pair_generic_controls_cannot_release_held_jobs(self):
+        class Denied(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code = status_code
+                self.detail = detail
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("_reject_generic_sample_campaign_release",),
+            {"Mapping": dict, "Any": object, "HTTPException": Denied},
+        )
+        reject = namespace["_reject_generic_sample_campaign_release"]
+        reject({"kind": "studio_generation"})
+        with self.assertRaises(Denied) as raised:
+            reject({"kind": "sample_campaign_generation"})
+        self.assertEqual(raised.exception.status_code, 409)
+        for name in (
+            "set_job_queue_priority", "hold_queued_job", "resume_held_job",
+            "start_queued_job_next", "set_job_output_count",
+        ):
+            source = ast.get_source_segment(
+                self.launch_source, _function(self.launch, name),
+            )
+            self.assertIn("_reject_generic_sample_campaign_release(job)", source)
+        cancel = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "cancel_job"),
+        )
+        self.assertLess(
+            cancel.index('job.get("kind") == "sample_campaign_generation"'),
+            cancel.index("request_cancel("),
+        )
+        cancel_namespace = _isolated_functions(
+            self.launch,
+            ("cancel_job",),
+            {
+                "api": types.SimpleNamespace(
+                    post=lambda *_args, **_kwargs: lambda function: function,
+                ),
+                "Request": object,
+                "Response": object,
+                "HTTPException": Denied,
+                "_jobs": {
+                    "sample": {"kind": "sample_campaign_generation"},
+                },
+                "_set_recovery_no_store": lambda _response: None,
+                "_job_owned_by_request": lambda *_args: True,
+                "request_cancel": lambda *_args, **_kwargs: self.fail(
+                    "generic cancellation reached the sample job"
+                ),
+                "_active_gen_states": {},
+            },
+        )
+        with self.assertRaises(Denied) as cancelled:
+            cancel_namespace["cancel_job"]("sample", object(), object())
+        self.assertEqual(cancelled.exception.status_code, 409)
+        resume = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_resume_recovered_job"),
+        )
+        self.assertIn('job.get("kind") == "sample_campaign_generation"', resume)
+
+    def test_sample_pair_recovery_linkage_tamper_fails_closed(self):
+        arm = types.SimpleNamespace(
+            private_input_paths=("/private/input.png",),
+            input_fingerprints=("a" * 64,),
+        )
+        pair = types.SimpleNamespace(
+            pair_id="pair-1", maestro=arm, control=arm,
+        )
+        namespace = _isolated_functions(
+            self.launch,
+            ("_validate_sample_campaign_recovery_linkage",),
+            {
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_SAMPLE_CAMPAIGN_LINKAGE_SCHEMA": 1,
+                "_SAMPLE_CAMPAIGN_QUEUE_CLASS": "background_sample",
+                "_SAMPLE_CAMPAIGN_QUEUE_PRIORITY": -1000,
+                "Mapping": dict,
+                "parse_private_pair_manifest": lambda _value: pair,
+                "pair_manifest_digest": lambda _pair: "b" * 64,
+                "SampleCampaignSubmissionError": ValueError,
+            },
+        )
+        validate = namespace["_validate_sample_campaign_recovery_linkage"]
+        linkage = {
+            "schema": 1,
+            "pair_id": "pair-1",
+            "pair_manifest_digest": "b" * 64,
+            "arm": "maestro",
+            "peer_job_id": "control-job",
+        }
+        snapshot = {
+            "id": "maestro-job",
+            "kind": "sample_campaign_generation",
+            "queue_class": "background_sample",
+            "queue_priority": -1000,
+            "queue_held": True,
+            "recovery_cursor": {"sample_campaign": copy.deepcopy(linkage)},
+        }
+        private = {
+            "pair_manifest": {"private": True},
+            "pair_manifest_digest": "b" * 64,
+            "linkage": copy.deepcopy(linkage),
+        }
+        params = {"prompt": "private", "_sample_campaign_private": private}
+        inputs = ({"path": "/private/input.png", "sha256": "a" * 64},)
+        self.assertEqual(validate(snapshot, params, inputs), {"prompt": "private"})
+        for tampered_snapshot, tampered_params in (
+            ({**snapshot, "queue_held": False}, params),
+            (snapshot, {**params, "_sample_campaign_private": {
+                **private, "pair_manifest_digest": "c" * 64,
+            }}),
+            (snapshot, {}),
+        ):
+            with self.assertRaises(QueueRecoveryRuntimeError):
+                validate(tampered_snapshot, tampered_params, inputs)
+
+        materialize = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_queue_recovery_materialize_job"),
+        )
+        loaded = materialize.index('manifest_params = dict(manifest["params"])')
+        linkage_check = materialize.index(
+            "manifest_params = sample_linkage_validator(", loaded,
+        )
+        stripped = materialize.index('runtime["params"] = manifest_params', linkage_check)
+        unblocked = materialize.index('blocked_reason = ""', linkage_check)
+        self.assertLess(loaded, linkage_check)
+        self.assertLess(linkage_check, stripped)
+        self.assertLess(linkage_check, unblocked)
 
 
 if __name__ == "__main__":
