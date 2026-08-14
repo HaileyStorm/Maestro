@@ -18,22 +18,22 @@ operations checkpoint, not evidence that the post-reboot runtime is live.
   `app/services/storage_janitor.py`, and `tests/test_storage_janitor.py`. They
   are not part of the handoff and must not be overwritten, removed, staged, or
   claimed without explicit ownership recovery.
-- The legacy sentinel covers the same accounts/projects scope as the next
-  milestone. This handoff does not clear or transfer it. The fresh thread must
-  stop after its audit until the human owner explicitly transfers/releases that
-  scope; only then may account/project work begin.
+- The human owner explicitly transferred the legacy account/project scope to
+  this task after the activation audit. Preserve the sentinel as provenance and
+  use structured reservations for each current writer; do not reinterpret or
+  remove unrelated claims.
 - The repo-root tracker is preserved historical SQLite. Run only the read-only
   activation audit described in `AGENTS.md`; do not invoke Beads lifecycle,
   migration, sync, or hooks.
 
-## Bird-in-the-hand next milestone
+## Active owner, projects, and hosted-credit milestone
 
-Make the pushed accounts/project flow usable before expanding dormant credit or
-security policy:
+Finish the already-started owner/project cutover and optional hosted-credit
+scheduler without expanding into SSO or unrelated policy:
 
 1. Re-read `AGENTS.md`, this handoff, `docs/operations/CONTINUATION.md`, and
    `CONTRIBUTING.md`; perform the read-only activation audit and inventory all
-   dirty/reserved paths. Obtain an explicit transfer/release of the legacy
+   dirty/reserved paths. Confirm the recorded explicit transfer of the legacy
    `.working` account/project scope before continuing this list.
 2. Verify the source/launcher state, then start Maestro through its existing
    Pinokio flow and dynamically discover the current URL/port. Do not reuse old
@@ -48,17 +48,26 @@ security policy:
    to connect every valid existing project to that owner. The action performs
    its own artifact-free inventory check and refuses any quarantine before
    publication. Never silently orphan, hide, rename, or delete a project.
-6. Verify the same intended project inventory on each configured surface. Keep
-   account login, project-password sessions, and transport authorization as
-   distinct layers.
+6. Verify the same intended project inventory on each configured surface. In
+   active migration state, account membership is the only project authorization
+   path; project-password prompts and unlock calls are legacy pre-cutover only.
 
-Credits are not part of this milestone. Runtime accounting remains hard-off.
-The recovered later intent is soft prioritization, not pay-to-generate: every
+Hosted credits are part of this milestone as soft prioritization, not
+pay-to-generate. They activate only for the explicit hosted realm plus operator
+flag; local/LAN and owner execution remain exempt. Every
 otherwise-valid zero-credit job remains durable and eligible at the bottom FIFO
 band with starvation-bound capacity; funded work may receive bounded priority;
-owner and local/authenticated-LAN work are exempt. Do not reintroduce flat 402
-credit rejection. Duration shaping and other entitlements require a separate,
-explicit server-authored design after accounts/projects are live.
+do not reintroduce flat 402 credit rejection. Duration shaping and other
+entitlements remain a separate, explicit server-authored design.
+
+The next durable background lane is historical issue `Maestro.git-134`: paired
+Maestro-versus-control sample generations, gated by `Maestro.git-28` so owner,
+agent, and external GPU work always wins. Start with Reference Lock, continuity
+change propagation, role-aware planning, and recovery comparisons. Each video
+VLM review uses the same 2–5 sequential, non-adjacent, nearby frame positions in
+both arms, followed by explicit human keep/reject/rerun review. Do not submit
+random showcase generations or start GPU work before the fail-closed idle gate
+and durable pair/review pipeline are verified.
 
 Future optional SSO is also deferred, but current account work must preserve its
 migration path. Keep Maestro's opaque internal `account_id` as the permanent
@@ -94,7 +103,7 @@ is implemented and proven. The full deferred contract and test matrix live in
 > read-only activation audit; preserve the historical SQLite tracker, legacy
 > `.working`, and all dirty paths. The existing legacy reservation overlaps the
 > next milestone: stop after the audit and ask the human owner to explicitly
-> transfer/release its account/project scope. Do not resume credit work. After
+> transfer/release its account/project scope. After
 > that transfer, use bird-in-the-hand priority to get accounts and the complete
 > existing-project inventory live, with the user performing owner
 > credential/recovery-code steps. Use three focused scouts only where the
@@ -109,16 +118,17 @@ is implemented and proven. The full deferred contract and test matrix live in
 > workspace census, and invoke the guarded migration action. It must refuse any
 > quarantine before publication; proceed only with zero quarantine and no
 > orphaned/hidden projects. Then verify the intended inventory on every
-> configured access surface. Keep credits hard-off.
+> configured access surface. In active state, use account membership without a
+> project-password prompt.
 
-### Deferred credit prompt
+### Hosted credit prompt
 
-> Accounts and project migration are live and accepted. Recover the soft-credit
+> Accounts and project migration are active. Recover the soft-credit
 > contract from this handoff before planning: zero credit never rejects an
 > otherwise-valid job; bottom-FIFO work must have starvation-bound capacity;
 > funded work gets bounded priority; owner and local/authenticated-LAN work are
-> exempt. Re-scout current code and tests before editing and keep activation off
-> until the full contract is verified.
+> exempt. Enable only through the explicit operator flag plus hosted execution
+> realm, and verify the durable journal and restart/recovery contract.
 
 ### Deferred SSO prompt
 

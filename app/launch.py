@@ -446,9 +446,12 @@ class _PublicSupportCatalogProjectionAdapter:
     def _catalog_snapshot(self):
         return self._catalog
 
+    def _priority_policy(self) -> dict:
+        return SupportPortal._priority_policy(self)
+
     @staticmethod
-    def _priority_policy() -> dict:
-        return SupportPortal._priority_policy()
+    def _scheduler_enforcement_enabled() -> bool:
+        return _credit_support_scheduler_enforcement_enabled()
 
     def project(self) -> dict:
         return SupportPortal.public_catalog_projection(self)
@@ -496,6 +499,9 @@ def _support_portal() -> SupportPortal | None:
                     ),
                     identity_key=_support_domain_key("account-identity"),
                     catalog_loader=_load_server_support_catalog,
+                    scheduler_enforcement_resolver=(
+                        lambda: _credit_support_scheduler_enforcement_enabled()
+                    ),
                 )
     return _support_portal_value
 
@@ -1552,19 +1558,20 @@ _CREDIT_LINEAGE_JOB_KINDS = frozenset({
     "studio_generation_preparation",
     "studio_project_asset_preparation",
 })
-# Runtime credit enforcement is intentionally unavailable until Maestro has
-# one durable account/source debit ledger and a validated nonzero policy.  An
-# environment flag alone must never contradict the recorded_not_enforced API.
-_CREDIT_RUNTIME_ACCOUNTING_DURABLE = False
-_CREDIT_RUNTIME_VALIDATED_POLICY_UNITS = 0
+# Runtime credit enforcement has a durable account/source debit ledger and a
+# validated nonzero policy, but remains operator opt-in.  The environment flag
+# is deliberately absent/off by default.
+_CREDIT_RUNTIME_ACCOUNTING_DURABLE = True
+_CREDIT_RUNTIME_VALIDATED_POLICY_UNITS = 400
 _credit_admission_evaluations: dict[str, tuple] = {}
 _credit_accounting_lock = threading.RLock()
 _credit_accounting_value: CreditAccountingJournal | None = None
+_credit_accounting_healthy = False
 _credit_accounting_reservation_accounts: dict[str, str] = {}
 
 
 def _credit_runtime_policy() -> CreditRuntimePolicy:
-    """Remain advisory until durable accounting and policy both exist."""
+    """Require compiled readiness plus explicit hosted operator opt-in."""
     policy_ready = bool(
         _CREDIT_RUNTIME_ACCOUNTING_DURABLE is True
         and type(_CREDIT_RUNTIME_VALIDATED_POLICY_UNITS) is int
@@ -1602,20 +1609,39 @@ def _credit_accounting_journal() -> CreditAccountingJournal | None:
     with _credit_accounting_lock:
         if _credit_accounting_value is None:
             try:
-                _credit_accounting_value = CreditAccountingJournal(
+                journal = CreditAccountingJournal(
                     os.path.join(
                         _app_dir, "storage", "credit-accounting.json",
                     ),
                     integrity_key=_support_domain_key("credit-accounting"),
                     policy=CreditAccountingPolicy(enforcement_enabled=True),
                 )
+                journal.probe_readiness()
             except (CreditAccountingError, OSError):
+                _credit_mark_accounting_health(False)
                 configure_credit_lifecycle_callback(None)
                 return None
+            _credit_accounting_value = journal
+            _credit_mark_accounting_health(True)
         configure_credit_lifecycle_callback(
             _credit_accounting_lifecycle_callback,
         )
         return _credit_accounting_value
+
+
+def _credit_support_scheduler_enforcement_enabled() -> bool:
+    """Project active priority only after the hosted journal opens cleanly."""
+    if not _credit_accounting_enabled():
+        return False
+    if _credit_accounting_value is None:
+        _credit_accounting_journal()
+    return bool(_credit_accounting_value is not None and _credit_accounting_healthy)
+
+
+def _credit_mark_accounting_health(healthy: bool) -> None:
+    global _credit_accounting_healthy
+    with _credit_accounting_lock:
+        _credit_accounting_healthy = bool(healthy)
 
 
 def _credit_accounting_existing_journal() -> CreditAccountingJournal | None:
@@ -1628,13 +1654,17 @@ def _credit_accounting_existing_journal() -> CreditAccountingJournal | None:
         if not os.path.isfile(path) or os.path.islink(path):
             return None
         try:
-            _credit_accounting_value = CreditAccountingJournal(
+            journal = CreditAccountingJournal(
                 path,
                 integrity_key=_support_domain_key("credit-accounting"),
                 policy=CreditAccountingPolicy(enforcement_enabled=True),
             )
+            journal.probe_readiness()
         except (CreditAccountingError, OSError):
+            _credit_mark_accounting_health(False)
             return None
+        _credit_accounting_value = journal
+        _credit_mark_accounting_health(True)
         return _credit_accounting_value
 
 
@@ -1963,10 +1993,12 @@ def _credit_accounting_lifecycle_callback(event: dict) -> dict:
             expected_revision=event.get("expected_revision"),
             as_of=str(event.get("as_of") or ""),
         )
-    except OSError as error:
+    except (CreditAccountingError, OSError) as error:
+        _credit_mark_accounting_health(False)
         raise CreditAccountingError(
             "credit accounting is unavailable"
         ) from error
+    _credit_mark_accounting_health(True)
     if (
         action == "consume" and receipt.allocation_satisfied is True
     ) or (
@@ -2113,9 +2145,11 @@ def _credit_accounting_reserve(job: dict, quote, allowance_revision: str):
                 expected_revision=receipt.reservation_revision,
                 as_of=as_of,
             )
+        _credit_mark_accounting_health(True)
         return None
     with _credit_accounting_lock:
         _credit_accounting_reservation_accounts[reservation_id] = account_key
+    _credit_mark_accounting_health(True)
     return reservation_id, receipt.reservation_revision
 
 
@@ -2133,7 +2167,7 @@ def _credit_accounting_revalidate(job: dict, allowance_revision: str):
         return None
     with _credit_accounting_lock:
         _credit_accounting_reservation_accounts[reservation_id] = account_key
-    return journal.revalidate_reservation(
+    receipt = journal.revalidate_reservation(
         account_key=account_key,
         reservation_id=reservation_id,
         operation_id=_credit_accounting_operation_id(
@@ -2143,6 +2177,8 @@ def _credit_accounting_revalidate(job: dict, allowance_revision: str):
         sources=sources,
         as_of=as_of,
     )
+    _credit_mark_accounting_health(True)
+    return receipt
 
 
 def _credit_baseline_quote(job: dict, recorded_allowance: dict):
@@ -2155,14 +2191,44 @@ def _credit_baseline_quote(job: dict, recorded_allowance: dict):
     )
 
 
+def _credit_unfunded_hosted_quote(quote):
+    """Keep an otherwise-valid hosted submission in the lowest FIFO band."""
+    if (
+        quote.realm != "hosted"
+        or quote.policy_enforcement_enabled is not True
+        or quote.metering_applied is not True
+        or quote.decision == "capability_excluded"
+        or quote.requested_units <= 0
+    ):
+        return quote
+    return type(quote)(
+        schema_version=quote.schema_version,
+        realm=quote.realm,
+        unit=quote.unit,
+        snapshot_as_of=quote.snapshot_as_of,
+        submission_allowed=True,
+        decision="hosted_baseline",
+        policy_enforcement_enabled=True,
+        metering_applied=True,
+        capability_priority_eligible=quote.capability_priority_eligible,
+        priority_boost=False,
+        reservation_required=False,
+        requested_units=quote.requested_units,
+        reserved_units=0,
+        allocations=(),
+    )
+
+
 def _credit_release_accounting(
     job: dict,
     *,
     persist_baseline: bool,
     defer_cleanup_baseline: bool = False,
     preserve_owner_lineage: bool = False,
+    fallback_quote=None,
+    fallback_allowance_revision: str | None = None,
 ) -> bool:
-    """Best-effort release, then restore ordinary queue eligibility."""
+    """Best-effort release, then preserve the applicable runnable band."""
     current = job.get("credit_queue")
     linked_v2 = bool(
         isinstance(current, dict)
@@ -2207,10 +2273,12 @@ def _credit_release_accounting(
             released = receipt.terminal_satisfied is True
             released_revision = receipt.reservation_revision
     except (CreditAccountingError, EntitlementError, OSError):
+        _credit_mark_accounting_health(False)
         released = False
     if not released and not (linked_v2 and persist_baseline and defer_cleanup_baseline):
         return False
     if released:
+        _credit_mark_accounting_health(True)
         if preserve_owner_lineage and linked_v2:
             tombstone = _credit_owner_release_tombstone(
                 current,
@@ -2240,10 +2308,33 @@ def _credit_release_accounting(
         return released
     if not linked_v2:
         return released
+    marker_missing = object()
+    previous_baseline_marker = params.get(
+        _CREDIT_BASELINE_PARAM, marker_missing,
+    )
+    baseline_transition_persisted = False
     try:
-        recorded = _credit_recorded_allowance(job)
-        baseline = _credit_baseline_quote(job, recorded)
-        allowance_revision = _credit_allowance_revision(recorded)
+        if fallback_quote is not None:
+            baseline = _credit_unfunded_hosted_quote(fallback_quote)
+            allowance_revision = str(fallback_allowance_revision or "")
+            if not allowance_revision:
+                raise CreditRuntimeError(
+                    "credit fallback allowance revision is unavailable"
+                )
+        else:
+            recorded = _credit_recorded_allowance(job)
+            baseline = _credit_baseline_quote(job, recorded)
+            allowance_revision = _credit_allowance_revision(recorded)
+        if (
+            baseline.realm == "hosted"
+            and baseline.policy_enforcement_enabled is True
+            and baseline.metering_applied is True
+            and baseline.decision == "hosted_baseline"
+            and baseline.requested_units > 0
+        ):
+            params[_CREDIT_BASELINE_PARAM] = True
+        else:
+            params.pop(_CREDIT_BASELINE_PARAM, None)
         transition_id = _credit_transition_id(
             job,
             "baseline",
@@ -2268,8 +2359,23 @@ def _credit_release_accounting(
                 allowance_revision=allowance_revision,
                 reservation=None,
             )
-    except (CreditAccountingError, CreditRuntimeError, EntitlementError, ValueError):
+        persisted = job.get("credit_queue")
+        baseline_transition_persisted = not (
+            isinstance(persisted, dict)
+            and persisted.get("schema_version") == 2
+            and persisted.get("reservation_state") == "reserved"
+        )
+    except (
+        CreditAccountingError, CreditRuntimeError, EntitlementError,
+        OSError, ValueError,
+    ):
         pass
+    finally:
+        if not baseline_transition_persisted:
+            if previous_baseline_marker is marker_missing:
+                params.pop(_CREDIT_BASELINE_PARAM, None)
+            else:
+                params[_CREDIT_BASELINE_PARAM] = previous_baseline_marker
     return released
 
 
@@ -2390,6 +2496,11 @@ def _credit_job_lineage_only(job: dict) -> bool:
     return str(job.get("kind") or "") in _CREDIT_LINEAGE_JOB_KINDS
 
 
+def _credit_job_is_remote_origin(job: dict) -> bool:
+    """Meter only Cloudflare-origin work; direct and LAN work stay exempt."""
+    return bool(job.get("source_remote"))
+
+
 def _credit_prepare_submission_manifest(job: dict) -> bool:
     """Seal exact private cleanup identity before any journal reservation."""
     if _credit_job_exempt(job):
@@ -2408,6 +2519,8 @@ def _credit_prepare_submission_manifest(job: dict) -> bool:
     policy = _credit_runtime_policy()
     realm = _credit_server_execution_realm()
     if not policy.enforcement_enabled or realm != "hosted":
+        return False
+    if not _credit_job_is_remote_origin(job):
         return False
     account_id = _credit_account_id(job, persisted=False)
     owner_exempt = _credit_owner_exempt(job, persisted=False)
@@ -2464,6 +2577,7 @@ def _credit_prepare_submission(job: dict) -> bool:
                 job, quote, allowance_revision,
             )
     except (CreditAccountingError, EntitlementError, OSError):
+        _credit_mark_accounting_health(False)
         accounting = None
     if (
         quote.reservation_required
@@ -2472,7 +2586,7 @@ def _credit_prepare_submission(job: dict) -> bool:
     ):
         params.pop(_CREDIT_CLEANUP_PARAM, None)
         params[_CREDIT_BASELINE_PARAM] = True
-        baseline = _credit_baseline_quote(job, _credit_recorded_allowance(job))
+        baseline = _credit_unfunded_hosted_quote(quote)
         job["credit_queue"] = _credit_queue_metadata_from_quote(
             baseline,
             transition_id=_credit_transition_id(
@@ -2538,7 +2652,7 @@ def _credit_prepare_admission(job: dict) -> bool:
     quote, allowance_revision = _credit_evaluation(job)
     current = job.get("credit_queue")
     if params.get(_CREDIT_BASELINE_PARAM) is True:
-        baseline = _credit_baseline_quote(job, _credit_recorded_allowance(job))
+        baseline = _credit_unfunded_hosted_quote(quote)
         changed = apply_credit_queue_decision(
             job,
             baseline,
@@ -2563,6 +2677,8 @@ def _credit_prepare_admission(job: dict) -> bool:
                 job,
                 persist_baseline=True,
                 defer_cleanup_baseline=True,
+                fallback_quote=quote,
+                fallback_allowance_revision=allowance_revision,
             )
             downgraded = job.get("credit_queue")
             if (
@@ -2579,6 +2695,7 @@ def _credit_prepare_admission(job: dict) -> bool:
                 job, allowance_revision,
             )
         except (CreditAccountingError, EntitlementError, OSError):
+            _credit_mark_accounting_health(False)
             receipt = None
         if (
             receipt is None
@@ -2591,6 +2708,8 @@ def _credit_prepare_admission(job: dict) -> bool:
                 job,
                 persist_baseline=True,
                 defer_cleanup_baseline=True,
+                fallback_quote=quote,
+                fallback_allowance_revision=allowance_revision,
             )
             downgraded = job.get("credit_queue")
             if (
@@ -2704,7 +2823,12 @@ def _credit_prepare_dispatch(job: dict) -> bool:
     ):
         # A valid admitted generation must not be denied because the optional
         # accounting store became unavailable after queue revalidation.
-        if not _credit_release_accounting(job, persist_baseline=True):
+        if not _credit_release_accounting(
+            job,
+            persist_baseline=True,
+            fallback_quote=quote,
+            fallback_allowance_revision=allowance_revision,
+        ):
             # Retain the durable v2 cleanup obligation on the job, but prevent
             # the same unavailable callback from poisoning terminalization.
             configure_credit_lifecycle_callback(None)
@@ -8824,12 +8948,14 @@ def _require_project_access(
             in {"GET", "HEAD"}
             else "project.mutate"
         )
-    _require_account_project_permission(
+    membership = _require_account_project_permission(
         request,
         workspace_dir,
         permission,
         state=account_project_state,
     )
+    if membership is not None:
+        return workspace_dir
     access_method = (
         _project_access.authorize
         if str(getattr(request, "method", "GET") or "GET").upper()
@@ -19544,6 +19670,7 @@ async def record_admin_account_contribution(
 def get_access_context(request: Request):
     """Expose non-sensitive UI capabilities for local vs tunnel clients."""
     remote = bool(getattr(request.state, "maestro_remote", False))
+    account_project_state = _account_project_access_state()
     account_context_resolver = globals().get("_public_account_context")
     account_context = (
         account_context_resolver(request)
@@ -19577,7 +19704,13 @@ def get_access_context(request: Request):
     ]
     return {
         "remote": remote,
-        "project_password_required": remote,
+        "account_project_access_active": bool(account_project_state["enforced"]),
+        "account_project_creation_requires_account": (
+            account_project_state.get("state") in {"active", "needs_attention"}
+        ),
+        "project_password_required": (
+            remote and not account_project_state["enforced"]
+        ),
         "project_names_visible": True,
         # Complete host controls remain local. Remote owner parity is bounded
         # to the exact, recently reauthenticated routes enumerated here.
@@ -19639,7 +19772,11 @@ def get_access_context(request: Request):
         "classic_ui": not remote,
         "cloudflare_enabled": _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE"),
         "share_url": _public_share_url() if not remote else "",
-        "share_flow": "Select a project name, then enter that project's password",
+        "share_flow": (
+            "Sign in and select a project"
+            if account_project_state["enforced"]
+            else "Select a project name, then enter that project's password"
+        ),
         "accounts": account_context,
     }
 
@@ -19804,19 +19941,31 @@ def list_workspaces_endpoint(request: Request):
             project_membership = visible_projects.get(project_instance)
             if project_membership is None:
                 continue
-        status = _project_access.status(
-            item["name"], item["path"], request.state.maestro_session_id,
-            remote,
-        )
-        entry = {
-            "name": item["name"],
-            "password_protected": status.protected,
-            "unlocked": status.unlocked and (status.protected if remote else True),
-            **_workspace_access_fields(status),
-        }
         if project_membership is not None:
-            entry["project_role"] = project_membership["role"]
-            entry["project_permissions"] = project_membership["permissions"]
+            entry = {
+                "name": item["name"],
+                "password_protected": False,
+                "unlocked": True,
+                "remember_policy": None,
+                "unlock_expires_at": None,
+                "unlock_idle_expires_at": None,
+                "project_role": project_membership["role"],
+                "project_permissions": project_membership["permissions"],
+            }
+        else:
+            status = _project_access.status(
+                item["name"], item["path"],
+                request.state.maestro_session_id, remote,
+            )
+            entry = {
+                "name": item["name"],
+                "password_protected": status.protected,
+                "unlocked": (
+                    status.unlocked
+                    and (status.protected if remote else True)
+                ),
+                **_workspace_access_fields(status),
+            }
         # Project names form the remote sign-in directory. Counts are project
         # content and remain hidden until this browser unlocks that project.
         if not remote or entry["unlocked"]:
@@ -19881,10 +20030,12 @@ async def create_workspace(request: Request):
     remote = bool(getattr(request.state, "maestro_remote", False))
     password = str(body.get("password") or "")
     remember = _workspace_remember_policy(body)
+    project_account_state = _account_project_access_state()
+    account_projects_enforced = project_account_state["enforced"]
 
     if not name:
         raise HTTPException(status_code=400, detail="Workspace name is required")
-    if remote and not password:
+    if remote and not account_projects_enforced and not password:
         raise HTTPException(
             status_code=400,
             detail="Remote projects require a password",
@@ -19895,7 +20046,6 @@ async def create_workspace(request: Request):
         raise HTTPException(status_code=400, detail="Invalid workspace name. Use letters, numbers, hyphens, underscores.")
 
     from services.win_safe_files import safe_join_under
-    project_account_state = _account_project_access_state()
     project_account_id = None
     project_membership_store = None
     if project_account_state["state"] in {"active", "needs_attention"}:
@@ -19931,7 +20081,7 @@ async def create_workspace(request: Request):
                 status_code=500,
                 detail="Project identity could not be initialized",
             ) from error
-        if password:
+        if password and not account_projects_enforced:
             try:
                 _project_access.set_password(
                     name, ws_dir, request.state.maestro_session_id, password,
@@ -20021,12 +20171,20 @@ async def set_workspace_password(name: str, request: Request):
         if remote or account_project_state["enforced"]
         else _workspace_dir(name)
     )
-    _require_account_project_permission(
+    membership = _require_account_project_permission(
         request,
         workspace_dir,
         "project.lifecycle",
         state=account_project_state,
     )
+    if membership is not None:
+        return {
+            "password_protected": False,
+            "unlocked": True,
+            "remember_policy": None,
+            "unlock_expires_at": None,
+            "unlock_idle_expires_at": None,
+        }
     current = _require_remote_project_mutation_access(
         request, name, workspace_dir,
     )
@@ -20034,7 +20192,9 @@ async def set_workspace_password(name: str, request: Request):
         raise HTTPException(status_code=423, detail="Unlock the project first")
     body = await request.json()
     remember = _workspace_remember_policy(body)
-    if remote and not str(body.get("password") or ""):
+    if (
+        remote and not str(body.get("password") or "")
+    ):
         raise HTTPException(
             status_code=400,
             detail="Remote projects must remain password protected",
@@ -20061,11 +20221,18 @@ async def unlock_workspace(name: str, request: Request):
     if remote and name == "default":
         raise HTTPException(status_code=404, detail="Project not found")
     workspace_dir = _existing_workspace_dir(name)
-    _require_account_project_permission(
+    membership = _require_account_project_permission(
         request,
         workspace_dir,
         "project.open",
     )
+    if membership is not None:
+        return {
+            "unlocked": True,
+            "remember_policy": None,
+            "unlock_expires_at": None,
+            "unlock_idle_expires_at": None,
+        }
     if remote and not _project_access.status(
         name, workspace_dir, request.state.maestro_session_id,
         remote,
@@ -20115,6 +20282,16 @@ async def unlock_workspace(name: str, request: Request):
 
 @api.post("/api/v1/workspaces/{name}/lock")
 def lock_workspace(name: str, request: Request):
+    account_project_state = _account_project_access_state()
+    if account_project_state["enforced"]:
+        workspace_dir = _existing_workspace_dir(name)
+        _require_account_project_permission(
+            request,
+            workspace_dir,
+            "project.open",
+            state=account_project_state,
+        )
+        return {"unlocked": True, "locked_count": 0}
     remote = bool(getattr(request.state, "maestro_remote", False))
     locked_count = _project_access.lock(
         name, request.state.maestro_session_id, remote,
@@ -20127,6 +20304,8 @@ def lock_workspace(name: str, request: Request):
 
 @api.post("/api/v1/workspaces/lock-all")
 def lock_all_workspaces(request: Request):
+    if _account_project_access_state()["enforced"]:
+        return {"unlocked": True, "locked_count": 0}
     remote = bool(getattr(request.state, "maestro_remote", False))
     locked_count = _project_access.lock_all(
         request.state.maestro_session_id, remote,
@@ -20215,24 +20394,32 @@ def delete_workspace(name: str, request: Request):
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', name):
         raise HTTPException(status_code=400, detail="Invalid workspace name.")
     base = os.path.realpath(wgp.server_config.get("save_path", "outputs"))
+    account_project_state = _account_project_access_state()
     with _workspace_creation_lock:
         lexical = os.path.abspath(os.path.join(base, name))
         # Reject final-component symlinks/junctions even when they resolve to
         # another directory still inside outputs/. Recursive deletion must
         # never follow a project-name alias into a different project.
         if os.path.normcase(os.path.realpath(lexical)) != os.path.normcase(lexical):
+            if account_project_state["enforced"]:
+                raise HTTPException(status_code=404, detail="Project not found")
             raise HTTPException(status_code=400, detail="Invalid workspace path.")
         ws_dir = _safe_join(base, name)
         if ws_dir is None:
+            if account_project_state["enforced"]:
+                raise HTTPException(status_code=404, detail="Project not found")
             raise HTTPException(status_code=400, detail="Invalid workspace path.")
         if not os.path.isdir(ws_dir):
+            if account_project_state["enforced"]:
+                raise HTTPException(status_code=404, detail="Project not found")
             raise HTTPException(status_code=404, detail=f"Workspace not found: {name}")
         membership = _require_account_project_permission(
             request,
             ws_dir,
             "project.delete",
+            state=account_project_state,
         )
-        if membership is None or membership["state"] == "active":
+        if membership is None:
             access = _require_remote_project_mutation_access(
                 request, name, ws_dir,
             )
@@ -54846,7 +55033,7 @@ def _recovered_job_remote_project_accessible(
         return True
     try:
         project_dir = _existing_workspace_dir(workspace)
-        _require_account_project_permission(
+        membership = _require_account_project_permission(
             request,
             project_dir,
             "project.read",
@@ -54860,11 +55047,12 @@ def _recovered_job_remote_project_accessible(
     if active_workspace != workspace:
         return False
     try:
-        access = _project_access.status(
-            workspace, project_dir, session_id, True,
-        )
-        if not access.protected or not access.unlocked:
-            return False
+        if membership is None:
+            access = _project_access.status(
+                workspace, project_dir, session_id, True,
+            )
+            if not access.protected or not access.unlocked:
+                return False
         if os.path.normcase(os.path.realpath(project_dir)) != os.path.normcase(
             os.path.realpath(str(job.get("out_dir") or "")),
         ):
@@ -55468,20 +55656,21 @@ def _require_owned_job_project(
         raise HTTPException(status_code=404, detail="Job not found")
     try:
         out_dir = _existing_workspace_dir(expected)
-        _require_account_project_permission(
+        membership = _require_account_project_permission(
             request,
             out_dir,
             "project.read",
         )
-        remote = bool(getattr(request.state, "maestro_remote", False))
-        access = _project_access.status(
-            expected,
-            out_dir,
-            request.state.maestro_session_id,
-            remote,
-        )
-        if (remote and not access.protected) or not access.unlocked:
-            raise ValueError("project unavailable")
+        if membership is None:
+            remote = bool(getattr(request.state, "maestro_remote", False))
+            access = _project_access.status(
+                expected,
+                out_dir,
+                request.state.maestro_session_id,
+                remote,
+            )
+            if (remote and not access.protected) or not access.unlocked:
+                raise ValueError("project unavailable")
         if os.path.normcase(os.path.realpath(out_dir)) != os.path.normcase(
             os.path.realpath(str(job.get("out_dir") or ""))
         ):
@@ -56310,18 +56499,21 @@ def _require_h3_delivery_recovery_job(
         # Recovery must never create a missing local project as a side effect
         # of an authorization probe. All access denials share one opaque shape.
         out_dir = _existing_workspace_dir(expected_workspace)
-        _require_account_project_permission(
+        membership = _require_account_project_permission(
             request,
             out_dir,
             "project.read",
         )
-        remote = bool(getattr(request.state, "maestro_remote", False))
-        status = _project_access.status(
-            expected_workspace, out_dir, request.state.maestro_session_id,
-            remote,
-        )
-        if (remote and not status.protected) or not status.unlocked:
-            raise HTTPException(status_code=404, detail="Job not found")
+        if membership is None:
+            remote = bool(getattr(request.state, "maestro_remote", False))
+            status = _project_access.status(
+                expected_workspace,
+                out_dir,
+                request.state.maestro_session_id,
+                remote,
+            )
+            if (remote and not status.protected) or not status.unlocked:
+                raise HTTPException(status_code=404, detail="Job not found")
     except Exception as error:
         raise HTTPException(status_code=404, detail="Job not found") from error
     if os.path.normcase(os.path.realpath(out_dir)) != os.path.normcase(
@@ -56479,7 +56671,7 @@ async def retry_h3_delivery_postprocess(
 
 
 def _require_remote_queue_project(request: Request) -> None:
-    """Require an active, still-unlocked protected project for remote counts."""
+    """Require the remote session's active authorized project for counts."""
     if not bool(getattr(request.state, "maestro_remote", False)):
         return
     session_id = request.state.maestro_session_id
@@ -56493,14 +56685,16 @@ def _require_remote_queue_project(request: Request) -> None:
 
     try:
         workspace_dir = _existing_workspace_dir(project)
-        _require_account_project_permission(
+        membership = _require_account_project_permission(
             request,
             workspace_dir,
             "project.list",
         )
-        access = _project_access.status(
-            project, workspace_dir, session_id, True,
-        )
+        access = None
+        if membership is None:
+            access = _project_access.status(
+                project, workspace_dir, session_id, True,
+            )
     except HTTPException as error:
         with _remote_active_projects_lock:
             if _remote_active_projects.get(session_id) == project:
@@ -56514,7 +56708,10 @@ def _require_remote_queue_project(request: Request) -> None:
 
     with _remote_active_projects_lock:
         still_active = _remote_active_projects.get(session_id) == project
-        if not still_active or not access.protected or not access.unlocked:
+        if not still_active or (
+            membership is None
+            and (not access.protected or not access.unlocked)
+        ):
             if still_active:
                 _remote_active_projects.pop(session_id, None)
             raise HTTPException(

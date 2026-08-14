@@ -6,6 +6,7 @@ import test from 'node:test'
 import { build } from 'esbuild'
 
 import {
+  isAccountProjectAccessActive,
   lockAllWorkspaces,
   lockWorkspace,
   unlockWorkspace,
@@ -16,12 +17,51 @@ const storeUrl = new URL('../src/stores/useStore.ts', import.meta.url)
 const appUrl = new URL('../src/App.tsx', import.meta.url)
 const accountDrawerUrl = new URL('../src/components/AccountSupport/AccountSupportDrawer.tsx', import.meta.url)
 const toolsPanelUrl = new URL('../src/components/Sidebar/ToolsPanel.tsx', import.meta.url)
+const sidebarUrl = new URL('../src/components/Sidebar/Sidebar.tsx', import.meta.url)
+const referenceLibraryUrl = new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url)
 const clientUrl = new URL('../src/api/client.ts', import.meta.url)
 const uiRoot = new URL('..', import.meta.url).pathname
 
 function asDataModule(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 }
+
+test('server-authored account cutover decides whether project passwords apply', () => {
+  const accounts = {
+    enabled: true,
+    authenticated: true,
+    account: null,
+    capabilities: [],
+    reauthenticated: false,
+    passkey_authentication_available: false,
+    activation_state: 'ready',
+  }
+  const context = {
+    accounts,
+    account_project_access_active: true,
+    project_password_required: false,
+  }
+
+  assert.equal(isAccountProjectAccessActive(context), true)
+  assert.equal(isAccountProjectAccessActive({ ...context, accounts: { ...accounts, enabled: false } }), false)
+  assert.equal(isAccountProjectAccessActive({ ...context, account_project_access_active: false }), false)
+  assert.equal(isAccountProjectAccessActive({ accounts, project_password_required: false }), false)
+  assert.equal(isAccountProjectAccessActive(context, {
+    state: 'disabled', enforced: false, project_count: 0, needs_attention: 0,
+  }), false)
+  assert.equal(isAccountProjectAccessActive(context, {
+    state: 'not_started', enforced: false, project_count: 1, needs_attention: 0,
+  }), false)
+  assert.equal(isAccountProjectAccessActive(context, {
+    state: 'needs_attention', enforced: false, project_count: 1, needs_attention: 1,
+  }), false)
+  assert.equal(isAccountProjectAccessActive({ ...context, account_project_access_active: false }, {
+    state: 'active', enforced: true, project_count: 1, needs_attention: 0,
+  }), true)
+  assert.equal(isAccountProjectAccessActive(context, {
+    state: 'active', enforced: false, project_count: 1, needs_attention: 0,
+  }), false)
+})
 
 test('workspace access API sends explicit remember policy and server-side revocations', async t => {
   const originalFetch = globalThis.fetch
@@ -85,13 +125,22 @@ test('selector keeps row selection separate from independent project locks', asy
   )
 
   assert.match(selector, /workspaces\.map\(ws =>/)
+  assert.match(selector, /accountProjectAccessActive = api\.isAccountProjectAccessActive\(accessContext, accountProjectMigration\)/)
+  assert.match(selector, /legacyProjectPasswordAccess = !accountProjectAccessActive/)
+  assert.match(selector, /legacyProjectPasswordAccess && ws\.password_protected && !ws\.unlocked/)
+  assert.match(selector, /legacyProjectPasswordAccess && ws\.password_protected && \(/)
+  assert.match(selector, /legacyProjectPasswordAccess && !remote && \(!ws\.password_protected \|\| ws\.unlocked\)/)
+  assert.match(selector, /legacyProjectPasswordAccess && unlockTarget/)
+  assert.match(selector, /legacyProjectPasswordAccess && <input[\s\S]*type="password"[\s\S]*Required password/)
+  assert.match(selector, /createWorkspace\(name, accountProjectAccessActive \? undefined : newPassword \|\| undefined\)/)
+  assert.match(selector, /accountProjectAccessActive \? 'New project' : 'New Workspace'/)
   assert.match(selector, /ws\.password_protected && ws\.unlocked/)
   assert.match(selector, /<LockOpen size=\{12\}/)
   assert.match(selector, /aria-label=\{ws\.unlocked \? `Lock \$\{ws\.name\}` : `Unlock \$\{ws\.name\}`\}/)
   assert.match(selector, /event\.stopPropagation\(\)/)
   assert.match(selector, /await lockWorkspace\(name\)/)
   assert.match(selector, /await lockAllWorkspaces\(\)/)
-  assert.match(selector, /if \(unlockingTarget \|\| lockingAll \|\| lockingTarget\) return/)
+  assert.match(selector, /if \(accountProjectAccessActive \|\| unlockingTarget \|\| lockingAll \|\| lockingTarget\) return/)
   assert.match(selector, /disabled=\{unlockingTarget !== null \|\| lockingAll \|\| lockingTarget !== null\}/)
   assert.match(selector, /Remember this device/)
   assert.match(selector, /setUnlockRemember\(event\.target\.checked \? 'device' : 'session'\)/)
@@ -104,18 +153,34 @@ test('selector keeps row selection separate from independent project locks', asy
   assert.match(selector, /nextExpiry <= nowSeconds[\s\S]*\? 5000/)
   assert.match(selector, /await switchWorkspace\(ws\.name\)/)
   assert.doesNotMatch(selector, /localStorage|sessionStorage/)
+  assert.match(main, /accountProjectAccessActive \? 'Open project and resume' : 'Unlock project and resume'/)
 
   assert.match(store, /const result = await api\.lockWorkspace\(name\)[\s\S]*await get\(\)\.loadWorkspaces\(\)/)
   assert.match(store, /const result = await api\.lockAllWorkspaces\(\)[\s\S]*await get\(\)\.loadWorkspaces\(\)/)
+  assert.match(store, /api\.isAccountProjectAccessActive\([\s\S]*before\.accountProjectMigration/)
+  assert.match(store, /nextActiveWorkspace === undefined[\s\S]*!accountProjectAccessActive && nextActiveWorkspace\.unlocked === false/)
+  assert.match(store, /api\.createWorkspace\(name, accountProjectAccessActive \? undefined : password, 'device'\)/)
   assert.match(store, /outputs: \[\],[\s\S]*selectedOutputKeys: \[\]/)
   assert.match(store, /pendingH3Plan: null,[\s\S]*pendingH3PlanWorkspace: null/)
   assert.match(store, /workspaces: state\.workspaces\.map\(workspace => workspace\.name === name[\s\S]*unlocked: false/)
   assert.match(store, /if \(!await get\(\)\.loadWorkspaces\(\)\) \{[\s\S]*current access state could not be refreshed/)
-  assert.match(store, /const previousAccessRevoked = Boolean\(previousActive\)[\s\S]*workspace\.unlocked !== false/)
+  assert.match(store, /const previousAccessRevoked = Boolean\(previousActive\)[\s\S]*nextActiveWorkspace === undefined[\s\S]*nextActiveWorkspace\.unlocked === false/)
   assert.match(store, /const requestSequence = \+\+_workspaceLoadSequence[\s\S]*requestSequence !== _workspaceLoadSequence/)
   assert.match(store, /previousAccessRevoked[\s\S]*state\.jobs\.filter\(job => job\.workspace && job\.workspace !== previousActive\)/)
   assert.match(store, /job\.workspace \? job\.workspace !== name : !lockedActiveWorkspace/)
   assert.match(store, /job\.workspace[\s\S]*!lockedWorkspaces\.has\(job\.workspace\)[\s\S]*!lockedActiveWorkspace/)
+})
+
+test('active account access removes project-password locks from reference entry points', async () => {
+  const [sidebar, referenceLibrary] = await Promise.all([
+    readFile(sidebarUrl, 'utf8'),
+    readFile(referenceLibraryUrl, 'utf8'),
+  ])
+
+  assert.match(sidebar, /isAccountProjectAccessActive\(accessContext, accountProjectMigration\)/)
+  assert.match(sidebar, /referenceLocked = !accountProjectAccessActive && workspaces\.some/)
+  assert.match(referenceLibrary, /isAccountProjectAccessActive\(accessContext, accountProjectMigration\)/)
+  assert.match(referenceLibrary, /projectExplicitlyLocked = !accountProjectAccessActive && workspaces\.some/)
 })
 
 test('account identity is established before the store-fenced startup project load', async () => {
@@ -154,7 +219,7 @@ test('project actions use exact per-project permissions without account-role inf
   assert.doesNotMatch(permissionHelper, /account.*role|role.*account/i)
   assert.match(selector, /workspaceAllowsPermission\(ws, 'project\.lifecycle'\)/)
   assert.match(selector, /workspaceAllowsPermission\(ws, 'project\.delete'\)/)
-  assert.match(selector, /canCreateProject = !accountsEnabled \|\| accessContext\?\.accounts\?\.authenticated === true/)
+  assert.match(selector, /canCreateProject = accessContext\?\.account_project_creation_requires_account !== true[\s\S]*accessContext\?\.accounts\?\.authenticated === true/)
   assert.match(queue, /workspaceAllowsPermission\([\s\S]*'project\.generate'/)
   assert.match(queue, /canManageGeneration && info\.status === 'queued'/)
   assert.match(queue, /canManageGeneration=\{canManageGeneration\}/)

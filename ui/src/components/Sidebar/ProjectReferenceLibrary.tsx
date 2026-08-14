@@ -34,6 +34,7 @@ import {
   isProjectReferenceCharacterReplayReady,
   isProjectReferenceStyleReplayReady,
   isProjectReferenceReviewerEligible,
+  isAccountProjectAccessActive,
   isProjectAssetOperationCurrent,
   lockProjectAssetVariantOperation,
   loadLlm,
@@ -908,6 +909,8 @@ function ProjectAssetPreview({ project, assetId, output, label }: {
 export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const project = useStore(s => s.activeWorkspace)
   const workspaces = useStore(s => s.workspaces)
+  const accessContext = useStore(s => s.accessContext)
+  const accountProjectMigration = useStore(s => s.accountProjectMigration)
   const jobs = useStore(s => s.jobs)
   const browsingUploads = useStore(s => s.browsingUploads)
   const privateOutput = useStore(s => s.privateOutput)
@@ -1029,7 +1032,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const authoredSettingsSnapshots = useRef(new Map<string, ReferenceAuthoredSnapshot>())
   const loraParameterSnapshots = useRef(new Map<string, ProjectReferenceAdditionalLora[]>())
   const authoringAvailabilityRef = useRef(new Map<string, ReferenceAuthoringAvailability>())
-  const projectExplicitlyLocked = workspaces.some(workspace => (
+  const accountProjectAccessActive = isAccountProjectAccessActive(accessContext, accountProjectMigration)
+  const projectExplicitlyLocked = !accountProjectAccessActive && workspaces.some(workspace => (
     workspace.name === project && workspace.unlocked === false
   ))
   const privateAuthoringTargets = useMemo(() => assets.flatMap(asset => (

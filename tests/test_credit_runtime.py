@@ -140,6 +140,36 @@ class CreditRuntimeTests(unittest.TestCase):
         self.assertFalse(default.metering_applied)
         self.assertTrue(explicitly_enabled.metering_applied)
 
+    def test_partial_refunded_and_expired_hosted_allowance_never_denies(self):
+        cases = {
+            "partial": snapshot(source(
+                "one_time_support", "evt_partial_0001", 10,
+                granted=20, refund_state="partial",
+            )),
+            "refunded": snapshot(source(
+                "one_time_support", "evt_refunded_0001", 0,
+                granted=20, status="refunded", refund_state="full",
+            )),
+            "expired": snapshot(source(
+                "recurring_support", "evt_expired_0001", 0,
+                granted=20, expires_at="2026-08-11T09:00:00Z",
+                status="expired",
+            )),
+        }
+        for label, allowance in cases.items():
+            with self.subTest(label=label):
+                quote = self.quote(
+                    allowance,
+                    policy=CreditRuntimePolicy(enforcement_enabled=True),
+                )
+                self.assertTrue(quote.submission_allowed)
+                self.assertTrue(quote.metering_applied)
+                self.assertEqual(quote.decision, "hosted_baseline")
+                self.assertFalse(quote.priority_boost)
+                self.assertFalse(quote.reservation_required)
+                self.assertEqual(quote.reserved_units, 0)
+                self.assertEqual(quote.allocations, ())
+
     def test_exact_capability_exclusion_neutralizes_boost_not_submission(self):
         excluded = self.quote(
             self.funded_snapshot(),

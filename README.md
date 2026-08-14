@@ -106,10 +106,10 @@ Appearance mode is **Dark / Light / Auto** — Auto follows your system's appear
 ### 📂 Workspaces
 Multiple isolated output directories with a quick switcher in the sidebar. Useful for separating client projects, NSFW vs SFW, or experiments. Pinned and favorited outputs are tracked per workspace.
 
-- Cloudflare access is enabled by default. Remote visitors see project names, then unlock only the project they know the password for; counts, prompts, assets, jobs, and media stay hidden until unlock.
+- Cloudflare access is enabled by default. After account migration is active, signed-in members see only projects granted to their Maestro account; counts, prompts, assets, jobs, and media stay hidden from nonmembers.
 - Remote visitors cannot change machine settings, start/stop services, browse storage/model folders, or import arbitrary Hugging Face/CivitAI URLs. Curated model weights may still download when their generation needs them.
 - After unlocking a project, remote visitors can browse and apply Maestro's bundled Recipes in Generate. Host-global user recipes are never listed remotely; saving, importing, deleting, and installing recipe LoRAs remain local host-owner actions.
-- Project passwords protect access through Maestro and its remote-sharing flow.
+- Project passwords are retained only for the bounded accounts-off or pre-migration compatibility path. Active account-migrated projects use sealed membership instead.
 - **Reference** is a persistent sidebar peer to Generate and Director. Its create/manage workspace stays mounted while inactive so authored state survives navigation; Queue leaves Reference only after the submission and job reconnect are durably confirmed. Locked projects disable entry, and a newly locked active project returns to the prior workspace after clearing private Reference state.
 - Reference makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Generate semantic-reference workflows. The catalog includes explicit Moody Krea 2 quick-select cards when a recipe is enabled and present; disabled, missing, and manual-install states remain visible and are never auto-enabled or auto-selected.
 - Gallery selection supports bulk move, privacy, and deletion. Finals are shown by default; All, Components, Windows, and Temporary views expose intermediate artifacts when needed. Deleting a final can atomically include its linked parts.
@@ -606,7 +606,9 @@ After clicking **Start**, the launcher shows an **Open Web UI** button once the 
 
 ## Optional Support links
 
-Maestro can show three operator-configured ways to support the project: **Buy Me a Coffee**, **Patreon**, and **direct compute sponsorship**. Support first helps recoup the hundreds spent on Codex while building Maestro; when that becomes sustainable, it can help fund hosting Maestro Continuum with more compute. These are passive links to external pages, not payment integrations: Maestro does not call provider APIs, receive webhooks, process billing, or automatically activate hosting, benefits, allowances, queue priority, or credits. Any recorded allowances or benefits remain `recorded_not_enforced`.
+Maestro can show three operator-configured ways to support the project: **Buy Me a Coffee**, **Patreon**, and **direct compute sponsorship**. Support first helps recoup the hundreds spent on Codex while building Maestro; when that becomes sustainable, it can help fund hosting Maestro Continuum with more compute. These are passive links to external pages, not payment integrations: Maestro does not call provider APIs, receive webhooks, or process billing. Owner-recorded contribution events can produce a bounded compute allowance from Maestro's server-owned policy. That allowance affects queue priority only when accounts are enabled, `MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true`, and `MAESTRO_COMPUTE_EXECUTION_REALM=hosted`; otherwise it remains recorded but unenforced.
+
+Hosted credits are never a paywall. Fully funded work can receive bounded priority, while zero, partial, refunded, or expired allowance still creates an otherwise-valid durable job in the lowest ordinary queue band with starvation-bounded capacity. The sealed owner account and local/authenticated-LAN execution are exempt. Safe defaults are credit enforcement off and execution realm `local`.
 
 All three options default to `disabled`. Enabling an option without a URL makes it truthfully `unconfigured`; a malformed or disallowed URL makes the catalog configuration fail closed. Only an enabled option with a valid URL is `available` and actionable. Configure the links in Pinokio's per-app **Configure** tab:
 
@@ -647,17 +649,17 @@ Only `enabled` and `support_url` are accepted for each provider; do not put cred
 
 ## Remote and local-network sharing
 
-Cloudflare sharing is enabled by default through `PINOKIO_SHARE_CLOUDFLARE=true`. After Maestro starts, the live URL appears both in Pinokio and as **Cloudflare · Copy link** in Maestro's top bar. Give another person that URL; their first visit immediately opens the project chooser, where they can unlock an existing project or create a new password-protected project (minimum 8 characters).
+Cloudflare sharing is enabled by default through `PINOKIO_SHARE_CLOUDFLARE=true`. After Maestro starts, the live URL appears both in Pinokio and as **Cloudflare · Copy link** in Maestro's top bar. With active account migration, visitors sign in and see only projects granted to their account; project creation binds the creator as owner without a project-password prompt. Before migration, the legacy project-password chooser remains available as a rollback-compatible access path.
 
 When a verified stable Worker URL is active, Pinokio shows it as the primary Cloudflare address and also keeps the current direct `*.trycloudflare.com` Quick Tunnel visible as a separate copyable fallback. The direct URL bypasses the Worker proxy hop and remains available for Worker-quota or stable-route emergencies. If both sources report the same URL, Pinokio shows only one entry.
 
 For a reusable address without buying a domain, Maestro includes a minimal Cloudflare Workers Free stable-share Worker in [`cloudflare/stable-share-worker`](cloudflare/stable-share-worker/README.md). It keeps Pinokio's existing Quick Tunnel and updates a canonical KV-stored target after each launch. KV may also contain one optional, bounded, expiring public restart-status record; it stores no secret or private state. Maestro displays the `*.workers.dev` address only after an authenticated update plus health/target verification at the updating edge; if that check fails, the current `*.trycloudflare.com` URL remains available. The default `SHARE_MODE=proxy` streams polling, uploads, downloads, and other HTTP traffic so the stable hostname survives page refreshes across Maestro restarts; `SHARE_MODE=redirect` is the configuration-only rollback. Proxying adds a Cloudflare Worker transit hop: bodies and session headers are not logged or stored, observability is disabled, and responses are `no-store`, but the traffic does pass through Cloudflare's Worker runtime. Cloudflare Free inbound requests are capped at 100 MB; that ceiling applies to the Worker and is also expected at the Quick Tunnel edge, so larger uploads require local/LAN access or a future chunked-upload path. The Workers Free allowance is 100,000 requests/day and 10 ms CPU/invocation. The landed remote idle cadence is 2,880 requests/day per visible tab and zero while hidden, below the 25,000/day enablement gate. Periodic upper bounds are 56,160/day for one continuously active remote job and 59,040/day for one running plus ten queued, before bounded event-driven refreshes. Multiple active tabs can still exhaust the allowance, so the independently surfaced Quick Tunnel remains the quota/extra-hop fallback. The Worker's `/direct` convenience route only works while the Worker is healthy; it is not usable after quota exhaustion. In proxy mode upstream redirects are never auto-followed, only same-target redirects are rewritten to the stable host, and cross-target redirects are rejected. Because Workers KV is eventually consistent across edge locations, another region can briefly retain the prior (normally expired) Quick Tunnel until KV converges. Keep the Worker update secret only in the ignored local `ENVIRONMENT`; the one-time Cloudflare provisioning credential is removed after setup. Do not enable a paid Workers plan for this setup.
 
-Remote access is deliberately not an administration surface. It exposes the app but denies Classic UI, system/storage/model-source settings, arbitrary model links/paths, and service load/unload. New remote projects require a password. A browser may keep several projects unlocked at once. An explicit `device` unlock is cached server-side across ordinary reloads and Maestro restarts for at most 30 days locally (7 days idle) or 7 days remotely (24 hours idle); `session` grants are shorter and process-local. Deliberate project selection and authorized project mutations slide the idle deadline without moving its absolute cap. Read-only listing, media, gallery, queue, job, and status polls validate grants but never extend them, so a tab left polling cannot stay unlocked forever. Relocking, password changes/removal, project deletion/recreation, expiry, or invalid grant data revokes access. The owner-only cache contains HMAC identities and expiry metadata, never passwords, raw session cookies, or bearer credentials. LAN binding remains disabled by default.
+Remote access is deliberately not a machine-administration surface. It exposes the app but denies Classic UI, system/storage/model-source settings, arbitrary model links/paths, and service load/unload. In active migration state, sealed account membership authorizes project access across direct, LAN, and Cloudflare surfaces; project-password unlock, relock, and password-management routes are not part of that experience. The legacy browser grant cache remains only for accounts-off or incomplete-migration rollback compatibility. LAN binding remains disabled by default.
 
 ### Optional host accounts
 
-Host accounts are disabled by default and remain separate from project passwords and browser project sessions. Maestro ships no default account or password, and passkey authentication is not available. Enabling accounts does not activate any external provider.
+Host accounts are disabled by default. Maestro ships no default account or password, and passkey authentication is not available. Enabling accounts does not activate any external provider. After the explicit zero-quarantine existing-project migration becomes active, sealed account membership replaces project passwords as the project authorization boundary.
 
 To create the first owner account:
 
@@ -670,13 +672,13 @@ Explicitly setting either flag is preserved by later installs and updates. A par
 
 After the first owner is created, Maestro records bootstrap completion beside the account store. Deleting only the account store does not reopen owner setup while the sibling `.bootstrap-complete` marker remains. Prefer restoring a known-good backup. If a deliberate full account reset is unavoidable, stop Maestro first, then remove both the account store and its sibling `.bootstrap-complete` marker. Remove the session secret only when you also intend to invalidate all sealed account state, then re-enable bootstrap and perform owner setup again through the direct local loopback Web UI. This destructive reset removes account sessions and recovery state; there is no automatic reset or CLI for it. Never put credentials, recovery codes, or secret values in commands or logs.
 
-Lawful-use, separately licensed Ref2VA, and applicable BFL/Krea model-license notices are versioned once per Maestro host, not per browser, project, or device. Any current local project user or password-unlocked remote project user may record the exact displayed version; doing so grants no project or machine-control capability. A notice version change requires a fresh acceptance, and any required manual-review commitment is user-confirmed before the selected model or paired recipe can run. Mature prompt guidance is a separate host setting and is applied only when the current Generate or Director job is explicitly marked **Explicit**. Maestro does not inspect local prompts or outputs to make that choice. External LLM providers remain separately disclosed and subject to their own terms and privacy policies.
+Lawful-use, separately licensed Ref2VA, and applicable BFL/Krea model-license notices are versioned once per Maestro host, not per browser, project, or device. Any currently authorized project member, or a legacy password-authorized user before migration, may record the exact displayed version; doing so grants no project or machine-control capability. A notice version change requires a fresh acceptance, and any required manual-review commitment is user-confirmed before the selected model or paired recipe can run. Mature prompt guidance is a separate host setting and is applied only when the current Generate or Director job is explicitly marked **Explicit**. Maestro does not inspect local prompts or outputs to make that choice. External LLM providers remain separately disclosed and subject to their own terms and privacy policies.
 
 Maestro respects Pinokio's `PINOKIO_SHARE_LOCAL` environment variable. Set it to `false` (in the per-app or global ENVIRONMENT file) to bind the server to loopback only; set to `true` for LAN access. Pinokio's own daemon proxy is a separate concern that may also need to honor the variable depending on your setup.
 
 ## API examples
 
-The React UI uses the same project-scoped API. A browser must first unlock a protected project; the signed `maestro_session` cookie identifies that browser while the server validates its independently revocable project grant on every later request.
+The React UI uses the same project-scoped API. In active migration state, sign in first; the signed `maestro_account_session` cookie identifies the account session while the server validates sealed project membership on every request. The legacy `maestro_session` project-grant cookie applies only before account migration is active.
 
 ```bash
 # Resolve whichever surface is active. Default proxy mode remains on the stable
@@ -689,18 +691,9 @@ BASE=${EFFECTIVE%/api/v1/access-context}
 # Discover access capabilities without exposing host paths or secrets
 curl -fsS -b cookies.txt "$BASE/api/v1/access-context"
 
-# Unlock a known project, then list only its authorized final outputs
-curl -fsS -b cookies.txt -c cookies.txt -H "Origin: $BASE" \
-  -H 'Content-Type: application/json' \
-  -d '{"password":"PROJECT_PASSWORD","remember":"device"}' \
-  "$BASE/api/v1/workspaces/my-project/unlock"
+# After signing in through the account UI, list only an account-authorized
+# project's final outputs. The browser session cookie is revocable server state.
 curl -fsS -b cookies.txt "$BASE/api/v1/outputs?workspace=my-project&artifact_scope=final"
-
-# Relock one project, or every project unlocked by this browser on this access surface
-curl -fsS -b cookies.txt -H "Origin: $BASE" -X POST \
-  "$BASE/api/v1/workspaces/my-project/lock"
-curl -fsS -b cookies.txt -H "Origin: $BASE" -X POST \
-  "$BASE/api/v1/workspaces/lock-all"
 
 # Create and animate a bounded Blender scene; no Python/code field is accepted
 curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \

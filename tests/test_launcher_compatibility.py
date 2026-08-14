@@ -82,6 +82,18 @@ Promise.resolve(launcher.menu({}, info))
         self.assertIn("Open / copy Cloudflare stable URL", launcher)
         self.assertIn("Open / copy direct Quick Tunnel URL", launcher)
 
+    def test_optional_hosted_credit_operator_defaults_are_safe_and_copy_is_current(self):
+        environment = (_ROOT / "ENVIRONMENT.example").read_text(encoding="utf-8")
+        launcher = (_ROOT / "pinokio.js").read_text(encoding="utf-8")
+
+        self.assertIn("MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=false", environment)
+        self.assertIn("MAESTRO_COMPUTE_EXECUTION_REALM=local", environment)
+        self.assertIn("remote visitors sign in", launcher)
+        self.assertIn("With active accounts", launcher)
+        self.assertIn("only assigned projects", launcher)
+        self.assertIn("pre-migration compatibility path uses project passwords", launcher)
+        self.assertNotIn("password-protected projects", launcher)
+
     def test_verified_stable_share_never_erases_direct_quick_tunnel(self):
         local_url = "http://127.0.0.1:7860"
         stable = "https://maestro.example.workers.dev"
@@ -381,6 +393,8 @@ Promise.resolve(build())
                     "PINOKIO_SHARE_CLOUDFLARE=true",
                     "MAESTRO_ACCOUNTS_ENABLED=false",
                     "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false",
+                    "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=false",
+                    "MAESTRO_COMPUTE_EXECUTION_REALM=local",
                 },
             )
 
@@ -388,7 +402,9 @@ Promise.resolve(build())
             explicit.write_text(
                 "PINOKIO_SHARE_CLOUDFLARE=false\n"
                 "MAESTRO_ACCOUNTS_ENABLED=true\n"
-                "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=true\n",
+                "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=true\n"
+                "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true\n"
+                "MAESTRO_COMPUTE_EXECUTION_REALM=hosted\n",
                 encoding="utf-8",
             )
             before = explicit.read_text(encoding="utf-8")
@@ -411,12 +427,16 @@ Promise.resolve(build())
             partial_text = partial.read_text(encoding="utf-8")
             self.assertIn("MAESTRO_ACCOUNTS_ENABLED=true\n", partial_text)
             self.assertIn("MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false\n", partial_text)
+            self.assertIn("MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=false\n", partial_text)
+            self.assertIn("MAESTRO_COMPUTE_EXECUTION_REALM=local\n", partial_text)
 
             malformed = Path(directory) / "MALFORMED_ENVIRONMENT"
             malformed.write_text(
                 "PINOKIO_SHARE_CLOUDFLARE=false\n"
                 "MAESTRO_ACCOUNTS_ENABLED=maybe\n"
-                "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=\n",
+                "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=\n"
+                "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=maybe\n"
+                "MAESTRO_COMPUTE_EXECUTION_REALM=remote\n",
                 encoding="utf-8",
             )
             before = malformed.read_text(encoding="utf-8")
@@ -486,7 +506,8 @@ Promise.resolve(build())
             "PINOKIO_SHARE_LOCAL='true' # local policy",
             'PINOKIO_STABLE_SHARE_URL="https://first.example.workers.dev/# release one" # stable policy',
             "MAESTRO_ENVIRONMENT_SENTINEL=app-first",
-            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true",
+            'MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED="true" # hosted policy',
+            "MAESTRO_COMPUTE_EXECUTION_REALM='hosted' # hosted policy",
             "CLOUDFLARE_API_TOKEN=app-first-token",
             "PINOKIO_STABLE_SHARE_UPDATE_SECRET=app-first-secret",
             "SERVER_PORT=1111",
@@ -499,7 +520,8 @@ Promise.resolve(build())
             "PINOKIO_SHARE_LOCAL='' # explicit local empty",
             'PINOKIO_STABLE_SHARE_URL="" # explicit local empty',
             "MAESTRO_ENVIRONMENT_SENTINEL=app-second",
-            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED='false' # safe off",
+            'MAESTRO_COMPUTE_EXECUTION_REALM="local" # local policy',
             "CLOUDFLARE_API_TOKEN=app-second-token",
             "PINOKIO_STABLE_SHARE_UPDATE_SECRET=app-second-secret",
             "SERVER_PORT=2222",
@@ -513,6 +535,7 @@ Promise.resolve(build())
             "PINOKIO_STABLE_SHARE_URL": "https://global.example.workers.dev",
             "MAESTRO_ENVIRONMENT_SENTINEL": "global",
             "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED": "true",
+            "MAESTRO_COMPUTE_EXECUTION_REALM": "hosted",
             "CLOUDFLARE_API_TOKEN": "global-token",
             "PINOKIO_STABLE_SHARE_UPDATE_SECRET": "global-secret",
             "SERVER_PORT": "3333",
@@ -565,6 +588,8 @@ const explicitBackendEnvironment = (definition) => {
         expected_params_env_keys = {
             "MAESTRO_ACCOUNTS_ENABLED",
             "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED",
+            "MAESTRO_COMPUTE_EXECUTION_REALM",
             "PINOKIO_SHARE_CLOUDFLARE",
             "PINOKIO_SHARE_LOCAL",
             "PINOKIO_STABLE_SHARE_URL",
@@ -578,6 +603,8 @@ const explicitBackendEnvironment = (definition) => {
         self.assertEqual(set(captured["second"]), expected_params_env_keys)
         self.assertEqual(captured["first"]["MAESTRO_ACCOUNTS_ENABLED"], "true")
         self.assertEqual(captured["first"]["MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"], "true")
+        self.assertEqual(captured["first"]["MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED"], "true")
+        self.assertEqual(captured["first"]["MAESTRO_COMPUTE_EXECUTION_REALM"], "hosted")
         self.assertEqual(captured["first"]["PINOKIO_SHARE_CLOUDFLARE"], "true")
         self.assertEqual(captured["first"]["PINOKIO_SHARE_LOCAL"], "true")
         self.assertEqual(
@@ -586,15 +613,13 @@ const explicitBackendEnvironment = (definition) => {
         )
         self.assertEqual(captured["second"]["MAESTRO_ACCOUNTS_ENABLED"], "false")
         self.assertEqual(captured["second"]["MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"], "")
+        self.assertEqual(captured["second"]["MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED"], "false")
+        self.assertEqual(captured["second"]["MAESTRO_COMPUTE_EXECUTION_REALM"], "local")
         self.assertEqual(captured["second"]["PINOKIO_SHARE_CLOUDFLARE"], "false")
         self.assertEqual(captured["second"]["PINOKIO_SHARE_LOCAL"], "")
         self.assertEqual(captured["second"]["PINOKIO_STABLE_SHARE_URL"], "")
         for params_environment in captured.values():
             self.assertNotIn("MAESTRO_ENVIRONMENT_SENTINEL", params_environment)
-            self.assertNotIn(
-                "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED",
-                params_environment,
-            )
             self.assertEqual(params_environment["CLOUDFLARE_API_TOKEN"], "")
             self.assertEqual(
                 params_environment["PINOKIO_STABLE_SHARE_UPDATE_SECRET"],

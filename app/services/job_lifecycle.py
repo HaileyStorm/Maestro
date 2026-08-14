@@ -56,6 +56,9 @@ _resident_affinity_key: str | None = None
 _MAX_JOB_EVENTS = 250
 MAX_RESIDENCY_BYPASSES = 2
 RESIDENCY_AGE_CEILING_SECONDS = 120.0
+MAX_CREDIT_PRIORITY_BYPASSES = 3
+CREDIT_PRIORITY_AGE_CEILING_SECONDS = 120.0
+_DURABLE_QUEUE_EPOCH_FLOOR = 946_684_800.0
 MAX_RECORDED_RESIDENCY_BYPASSED_WAITERS = 10_000
 _OPAQUE_RESIDENCY_KEY_PREFIX = "r1:"
 RESOURCE_INTENT_GENERATION = "generation"
@@ -329,6 +332,8 @@ def restore_scheduler_state(
             # Fresh process-local starvation age: monotonic values are never
             # serialized or restored across boots.
             job["_queue_enqueued_monotonic"] = time.monotonic()
+            job.pop("_credit_priority_bypass_count", None)
+            job["_credit_queue_restored"] = True
             _queue_waiters[id(job)] = (index, job)
         missing = [
             job for job_id, job in candidates.items()
@@ -341,6 +346,8 @@ def restore_scheduler_state(
             _queue_sequence += 1
             job["_queue_restore_sequence"] = _queue_sequence
             job["_queue_enqueued_monotonic"] = time.monotonic()
+            job.pop("_credit_priority_bypass_count", None)
+            job["_credit_queue_restored"] = True
             _queue_waiters[id(job)] = (_queue_sequence, job)
         _queue_manual_order_sequence = max(
             int(state.get("manual_order_sequence", 0) or 0),
@@ -1220,6 +1227,20 @@ def _queue_manual_order(job: Mapping[str, Any]) -> int:
         return 0
 
 
+def _credit_priority_bypass_count(job: Mapping[str, Any]) -> int:
+    try:
+        count = int(job.get("_credit_priority_bypass_count", 0) or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return max(0, min(MAX_CREDIT_PRIORITY_BYPASSES, count))
+
+
+def _automatic_remote_credit_band(job: Mapping[str, Any]) -> int | None:
+    if not job.get("source_remote", False) or _queue_manual_order(job):
+        return None
+    return _credit_queue_band(job)
+
+
 def _queue_tier_key(
     entry: tuple[int, MutableMapping[str, Any]],
 ) -> tuple[bool, str, int, int, int]:
@@ -1233,11 +1254,12 @@ def _queue_tier_key(
             manual_order,
             0,
         )
+    credit_band = _credit_queue_band(job)
     return (
         bool(job.get("source_remote", False)),
         "automatic",
-        _credit_queue_band(job),
-        _queue_priority(job),
+        credit_band,
+        0 if credit_band == -1 else _queue_priority(job),
         0,
     )
 
@@ -1256,11 +1278,12 @@ def _queue_order_key(entry: tuple[int, MutableMapping[str, Any]]) -> tuple:
     remote = bool(job.get("source_remote", False))
     if manual_order:
         return (remote, 0, 0, -priority, -manual_order, created_at, sequence)
+    credit_band = _credit_queue_band(job)
     return (
         remote,
         1,
-        -_credit_queue_band(job),
-        -priority,
+        -credit_band,
+        0 if credit_band == -1 else -priority,
         0,
         created_at,
         sequence,
@@ -1458,17 +1481,76 @@ def _select_next_waiter(
     eligible: list[tuple[int, MutableMapping[str, Any]]],
     *,
     bypass_counts: Mapping[int, int] | None = None,
+    credit_bypass_counts: Mapping[int, int] | None = None,
     now: float | None = None,
+    wall_now: float | None = None,
 ) -> tuple[
     tuple[int, MutableMapping[str, Any]] | None,
     str | None,
     list[tuple[int, MutableMapping[str, Any]]],
 ]:
-    """Select without mutation; affinity can only reorder the head's tier."""
+    """Select without mutation; bound credit and residency bypasses."""
     if not eligible:
         return None, None, []
     ordered = sorted(eligible, key=_queue_order_key)
     head = ordered[0]
+    credit_guarded = False
+    if _automatic_remote_credit_band(head[1]) == 1:
+        check_wall_time = time.time() if wall_now is None else wall_now
+
+        def credit_priority_spent(entry: tuple[int, MutableMapping[str, Any]]) -> bool:
+            job = entry[1]
+            if _automatic_remote_credit_band(job) != -1:
+                return False
+            count = (
+                credit_bypass_counts.get(id(job), 0)
+                if credit_bypass_counts is not None
+                else _credit_priority_bypass_count(job)
+            )
+            try:
+                created_at = float(job["created_at"])
+            except (KeyError, TypeError, ValueError):
+                created_at = math.nan
+            valid_durable_age = (
+                math.isfinite(created_at)
+                and _DURABLE_QUEUE_EPOCH_FLOOR <= created_at <= check_wall_time
+            )
+            return (
+                count >= MAX_CREDIT_PRIORITY_BYPASSES
+                or (
+                    valid_durable_age
+                    and check_wall_time - created_at
+                    >= CREDIT_PRIORITY_AGE_CEILING_SECONDS
+                )
+                or (
+                    job.get("_credit_queue_restored") is True
+                    and not valid_durable_age
+                )
+            )
+
+        depleted_at_limit = any(
+            credit_priority_spent(entry) for entry in ordered
+        )
+        if depleted_at_limit:
+            # Preserve ordinary band ordering. Once funded priority is spent,
+            # the next remote automatic non-funded waiter receives capacity;
+            # the oldest depleted FIFO head follows any already-waiting band 0.
+            head = next(
+                entry for entry in ordered
+                if (
+                    _automatic_remote_credit_band(entry[1]) is not None
+                    and _automatic_remote_credit_band(entry[1]) < 1
+                )
+            )
+            credit_guarded = True
+    # Depleted hosted work is the lowest ordinary FIFO band. It deliberately
+    # does not inherit mutable priority or residency-affinity reordering.
+    if _automatic_remote_credit_band(head[1]) == -1:
+        return (
+            head,
+            "credit_starvation_guard" if credit_guarded else "queue_order",
+            [],
+        )
     head_tier = _queue_tier_key(head)
     tier = [entry for entry in ordered if _queue_tier_key(entry) == head_tier]
     match = next(
@@ -1481,7 +1563,11 @@ def _select_next_waiter(
             None,
         )
     if match is None or match is head:
-        return head, "queue_order", []
+        return (
+            head,
+            "credit_starvation_guard" if credit_guarded else "queue_order",
+            [],
+        )
 
     match_index = tier.index(match)
     skipped = tier[:match_index]
@@ -1511,6 +1597,7 @@ def _record_queue_admission(
     selected: MutableMapping[str, Any],
     reason: str,
     skipped: list[tuple[int, MutableMapping[str, Any]]],
+    eligible: Iterable[tuple[int, MutableMapping[str, Any]]] = (),
 ) -> None:
     previous_bypasses = _residency_bypass_count(selected)
     selected["queue_reorder_reason"] = reason
@@ -1520,6 +1607,18 @@ def _record_queue_admission(
     )
     selected["_residency_bypass_count"] = 0
     selected.pop("_queue_enqueued_monotonic", None)
+    selected.pop("_credit_priority_bypass_count", None)
+    selected.pop("_credit_queue_restored", None)
+    if _automatic_remote_credit_band(selected) == 1:
+        for _, waiting_job in eligible:
+            if (
+                waiting_job is not selected
+                and _automatic_remote_credit_band(waiting_job) == -1
+            ):
+                waiting_job["_credit_priority_bypass_count"] = min(
+                    MAX_CREDIT_PRIORITY_BYPASSES,
+                    _credit_priority_bypass_count(waiting_job) + 1,
+                )
     for _, skipped_job in skipped:
         bypasses = _residency_bypass_count(skipped_job)
         skipped_job["_residency_bypass_count"] = min(
@@ -1733,13 +1832,20 @@ def _queue_positions_unlocked() -> dict[int, int]:
         id(candidate): _residency_bypass_count(candidate)
         for _, candidate in remaining
     }
+    simulated_credit_bypasses = {
+        id(candidate): _credit_priority_bypass_count(candidate)
+        for _, candidate in remaining
+    }
     check_time = time.monotonic()
+    check_wall_time = time.time()
     positions: dict[int, int] = {}
     for index in range(1, len(remaining) + 1):
         selected, _, skipped = _select_next_waiter(
             remaining,
             bypass_counts=simulated_bypasses,
+            credit_bypass_counts=simulated_credit_bypasses,
             now=check_time,
+            wall_now=check_wall_time,
         )
         if selected is None:
             break
@@ -1750,6 +1856,17 @@ def _queue_positions_unlocked() -> dict[int, int]:
                 MAX_RESIDENCY_BYPASSES,
                 simulated_bypasses.get(key, 0) + 1,
             )
+        if _automatic_remote_credit_band(selected[1]) == 1:
+            for _, waiting_job in remaining:
+                if (
+                    waiting_job is not selected[1]
+                    and _automatic_remote_credit_band(waiting_job) == -1
+                ):
+                    key = id(waiting_job)
+                    simulated_credit_bypasses[key] = min(
+                        MAX_CREDIT_PRIORITY_BYPASSES,
+                        simulated_credit_bypasses.get(key, 0) + 1,
+                    )
         remaining.remove(selected)
     return positions
 
@@ -3205,9 +3322,8 @@ def acquire_generation_slot(
                 _queue_waiters[waiter_key] = (waiter_sequence, job)
         try:
             while not is_cancel_requested(job):
-                selected, reason, skipped = _select_next_waiter(
-                    _eligible_queue_entries(),
-                )
+                eligible = _eligible_queue_entries()
+                selected, reason, skipped = _select_next_waiter(eligible)
                 is_next = bool(selected and selected[1] is job)
                 if is_next and not _queue_paused and generation_lock.acquire(blocking=False):
                     with _lifecycle_lock:
@@ -3221,7 +3337,7 @@ def acquire_generation_slot(
                                 return False
                             continue
                         _record_queue_admission(
-                            job, reason or "queue_order", skipped,
+                            job, reason or "queue_order", skipped, eligible,
                         )
                         _queue_waiters.pop(waiter_key, None)
                         return True

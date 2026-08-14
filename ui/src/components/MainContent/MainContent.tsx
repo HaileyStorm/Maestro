@@ -443,9 +443,12 @@ function WorkspaceSelector() {
   const reconnectJobs = useStore(s => s.reconnectJobs)
   const resumeJobRecovery = useStore(s => s.resumeJobRecovery)
   const accessContext = useStore(s => s.accessContext)
+  const accountProjectMigration = useStore(s => s.accountProjectMigration)
   const remote = accessContext?.remote === true
-  const accountsEnabled = accessContext?.accounts?.enabled === true
-  const canCreateProject = !accountsEnabled || accessContext?.accounts?.authenticated === true
+  const accountProjectAccessActive = api.isAccountProjectAccessActive(accessContext, accountProjectMigration)
+  const legacyProjectPasswordAccess = !accountProjectAccessActive
+  const canCreateProject = accessContext?.account_project_creation_requires_account !== true
+    || accessContext?.accounts?.authenticated === true
   const [open, setOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
@@ -473,10 +476,13 @@ function WorkspaceSelector() {
   const dropdownRef = useRef<HTMLDivElement>(null)
   const projectDialogRef = useRef<HTMLDivElement>(null)
   const projectDialogTitleId = useId()
-  const requiredProject = remote && (
+  const requiredProject = remote
+    && (!accountProjectAccessActive || accessContext?.accounts?.authenticated === true)
+    && (
     !activeWorkspace
     || !workspaces.some(workspace => (
-      workspace.name === activeWorkspace && workspace.unlocked !== false
+      workspace.name === activeWorkspace
+      && (accountProjectAccessActive || workspace.unlocked !== false)
     ))
   )
   const projectTriggerLabel = browsingUploads ? 'Uploads' : (activeWorkspace || 'Select project')
@@ -485,9 +491,9 @@ function WorkspaceSelector() {
     : activeWorkspace
       ? `Current project: ${activeWorkspace}. Open project selector`
       : 'Select or create a project'
-  const unlockedProtectedCount = workspaces.filter(workspace => (
+  const unlockedProtectedCount = legacyProjectPasswordAccess ? workspaces.filter(workspace => (
     workspace.password_protected && workspace.unlocked
-  )).length
+  )).length : 0
 
   const resetPasswordEditor = useCallback(() => {
     setPasswordTarget(null)
@@ -505,6 +511,12 @@ function WorkspaceSelector() {
     setUnlockRecoveryJobId(null)
     setUnlockSelectAfter(false)
   }, [])
+
+  useEffect(() => {
+    if (!accountProjectAccessActive) return
+    resetPasswordEditor()
+    resetUnlockEditor()
+  }, [accountProjectAccessActive, resetPasswordEditor, resetUnlockEditor])
 
   const beginUnlock = useCallback((
     workspace: string,
@@ -570,6 +582,7 @@ function WorkspaceSelector() {
   }, [open, requiredProject, workspaces.length])
 
   useEffect(() => {
+    if (accountProjectAccessActive) return
     const nowSeconds = Date.now() / 1000
     const expiries = workspaces.flatMap(workspace => {
       if (!workspace.password_protected || !workspace.unlocked) return []
@@ -596,19 +609,35 @@ function WorkspaceSelector() {
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [loadWorkspaces, workspaces])
+  }, [accountProjectAccessActive, loadWorkspaces, workspaces])
 
   useEffect(() => {
     const requestUnlock = (event: Event) => {
       const detail = (event as CustomEvent<{ workspace?: string; jobId?: string }>).detail
       const workspace = detail?.workspace || ''
       if (!workspace) return
+      if (accountProjectAccessActive) {
+        setDeleteError(null)
+        void (async () => {
+          const switched = await switchWorkspace(workspace)
+          if (!switched) {
+            setDeleteError('Could not open this project. Try again.')
+            return
+          }
+          if (detail?.jobId) await resumeJobRecovery(detail.jobId)
+          window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
+          setOpen(false)
+        })().catch(error => {
+          setDeleteError(error instanceof Error ? error.message : 'Could not open this project. Try again.')
+        })
+        return
+      }
       setOpen(true)
       beginUnlock(workspace, detail?.jobId || null, true)
     }
     window.addEventListener(REQUEST_WORKSPACE_UNLOCK_EVENT, requestUnlock)
     return () => window.removeEventListener(REQUEST_WORKSPACE_UNLOCK_EVENT, requestUnlock)
-  }, [beginUnlock])
+  }, [accountProjectAccessActive, beginUnlock, resumeJobRecovery, switchWorkspace])
 
   useEffect(() => {
     if (!open || !requiredProject) return
@@ -650,11 +679,14 @@ function WorkspaceSelector() {
 
   const handleCreate = async () => {
     const name = newName.trim().replace(/\s+/g, '-')
-    if (!canCreateProject || !name || (newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword) || creatingProject) return
+    const legacyPasswordInvalid = legacyProjectPasswordAccess && (
+      (newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword)
+    )
+    if (!canCreateProject || !name || legacyPasswordInvalid || creatingProject) return
     setCreateError(null)
     setCreatingProject(true)
     try {
-      await createWorkspace(name, newPassword || undefined)
+      await createWorkspace(name, accountProjectAccessActive ? undefined : newPassword || undefined)
       setNewName('')
       setNewPassword('')
       setCreating(false)
@@ -667,7 +699,7 @@ function WorkspaceSelector() {
   }
 
   const handleUnlock = async () => {
-    if (!unlockTarget || unlockingTarget || lockingTarget || lockingAll) return
+    if (accountProjectAccessActive || !unlockTarget || unlockingTarget || lockingTarget || lockingAll) return
     const target = unlockTarget
     const password = unlockPassword
     const remember = unlockRemember
@@ -700,7 +732,7 @@ function WorkspaceSelector() {
 
   const handleLock = async (name: string, event: React.MouseEvent) => {
     event.stopPropagation()
-    if (unlockingTarget || lockingTarget || lockingAll) return
+    if (accountProjectAccessActive || unlockingTarget || lockingTarget || lockingAll) return
     setLockingTarget(name)
     setDeleteError(null)
     try {
@@ -715,7 +747,7 @@ function WorkspaceSelector() {
   }
 
   const handleLockAll = async () => {
-    if (unlockingTarget || lockingAll || lockingTarget) return
+    if (accountProjectAccessActive || unlockingTarget || lockingAll || lockingTarget) return
     setLockingAll(true)
     setDeleteError(null)
     try {
@@ -731,7 +763,7 @@ function WorkspaceSelector() {
 
   const openPasswordEditor = (workspace: api.Workspace, event: React.MouseEvent) => {
     event.stopPropagation()
-    if (!workspaceAllowsPermission(workspace, 'project.lifecycle')) return
+    if (accountProjectAccessActive || !workspaceAllowsPermission(workspace, 'project.lifecycle')) return
     setPasswordTarget({ name: workspace.name, password_protected: workspace.password_protected })
     setPasswordValue('')
     setPasswordConfirm('')
@@ -743,7 +775,7 @@ function WorkspaceSelector() {
   }
 
   const handlePasswordUpdate = async (remove = false) => {
-    if (!passwordTarget || remote || passwordSaving) return
+    if (accountProjectAccessActive || !passwordTarget || remote || passwordSaving) return
     if (!remove) {
       if (passwordValue.length < 8) {
         setPasswordError('Enter a password with at least 8 characters.')
@@ -817,7 +849,11 @@ function WorkspaceSelector() {
           <div className="px-2 py-1.5 border-b border-border">
             <div className="flex items-center justify-between gap-2">
               <span id={projectDialogTitleId} className="text-[10px] text-text-muted uppercase tracking-wider">
-                {requiredProject ? 'Choose a project to enter Maestro' : remote ? 'Projects — unlock with password' : 'Workspaces'}
+                {requiredProject
+                  ? 'Choose a project to enter Maestro'
+                  : accountProjectAccessActive
+                    ? 'Projects'
+                    : remote ? 'Projects — unlock with password' : 'Workspaces'}
               </span>
               {unlockedProtectedCount > 0 && (
                 <button
@@ -835,7 +871,9 @@ function WorkspaceSelector() {
             </div>
             {requiredProject && (
               <p className="mt-1 text-[10px] leading-relaxed text-text-secondary">
-                Unlock an available project, or create a password-protected project for this browser.
+                {accountProjectAccessActive
+                  ? 'Choose a project available to your account, or create a new project.'
+                  : 'Unlock an available project, or create a password-protected project for this browser.'}
               </p>
             )}
           </div>
@@ -853,7 +891,7 @@ function WorkspaceSelector() {
                 <button
                   onClick={async () => {
                     if (lockingAll || lockingTarget) return
-                    if (ws.password_protected && !ws.unlocked) {
+                    if (legacyProjectPasswordAccess && ws.password_protected && !ws.unlocked) {
                       beginUnlock(ws.name, null, true)
                     } else {
                       await switchWorkspace(ws.name)
@@ -870,7 +908,7 @@ function WorkspaceSelector() {
                 >
                   <span className="flex min-w-0 items-center gap-1.5 truncate">
                     <span className="truncate">{ws.name}</span>
-                    {ws.password_protected && ws.unlocked && (
+                    {legacyProjectPasswordAccess && ws.password_protected && ws.unlocked && (
                       <span className="shrink-0 text-[8px] uppercase tracking-wide text-accent-green">
                         {ws.remember_policy === 'device' ? 'remembered' : 'session'}
                       </span>
@@ -878,7 +916,7 @@ function WorkspaceSelector() {
                   </span>
                   {ws.name === activeWorkspace && !browsingUploads && <Check size={12} className="shrink-0" />}
                 </button>
-                {ws.password_protected && (
+                {legacyProjectPasswordAccess && ws.password_protected && (
                   <button
                     type="button"
                     onClick={event => {
@@ -903,7 +941,7 @@ function WorkspaceSelector() {
                       : ws.unlocked ? <LockOpen size={12} /> : <Lock size={12} />}
                   </button>
                 )}
-                {!remote && (!ws.password_protected || ws.unlocked) && workspaceAllowsPermission(ws, 'project.lifecycle') && (
+                {legacyProjectPasswordAccess && !remote && (!ws.password_protected || ws.unlocked) && workspaceAllowsPermission(ws, 'project.lifecycle') && (
                   <button
                     onClick={event => openPasswordEditor(ws, event)}
                     disabled={passwordSaving && passwordTarget?.name === ws.name}
@@ -919,7 +957,7 @@ function WorkspaceSelector() {
                   </button>
                 )}
                 {/* default IS the outputs folder itself — not deletable */}
-                {ws.name !== 'default' && (!remote || ws.unlocked) && workspaceAllowsPermission(ws, 'project.delete') && (
+                {ws.name !== 'default' && (accountProjectAccessActive || !remote || ws.unlocked) && workspaceAllowsPermission(ws, 'project.delete') && (
                   <button
                     onClick={e => handleDelete(ws.name, e)}
                     disabled={deleting === ws.name}
@@ -941,7 +979,7 @@ function WorkspaceSelector() {
               )
             })}
           </div>
-          {!remote && passwordTarget && (
+          {legacyProjectPasswordAccess && !remote && passwordTarget && (
             <div className="border-t border-border p-2 space-y-2">
               <div className="flex items-start justify-between gap-2">
                 <div>
@@ -1044,7 +1082,7 @@ function WorkspaceSelector() {
               )}
             </div>
           )}
-          {unlockTarget && (
+          {legacyProjectPasswordAccess && unlockTarget && (
             <div className="border-t border-border p-2 space-y-1.5">
               <p className="text-[10px] text-text-muted">Enter the project password to unlock <span className="font-medium text-text-secondary">{unlockTarget}</span>.</p>
               <div className="flex gap-1.5">
@@ -1111,16 +1149,16 @@ function WorkspaceSelector() {
                   className="w-full bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
                   autoFocus
                 />
-                <input
-                  type="password"
-                  value={newPassword}
-                  onChange={event => setNewPassword(event.target.value)}
-                  onKeyDown={event => event.key === 'Enter' && void handleCreate()}
-                  placeholder={remote ? 'Required password (8+ chars)' : 'Optional password (8+ chars)'}
-                  className="w-full bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
-                />
+                {legacyProjectPasswordAccess && <input
+                    type="password"
+                    value={newPassword}
+                    onChange={event => setNewPassword(event.target.value)}
+                    onKeyDown={event => event.key === 'Enter' && void handleCreate()}
+                    placeholder={remote ? 'Required password (8+ chars)' : 'Optional password (8+ chars)'}
+                    className="w-full bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
+                  />}
                 {createError && <p className="text-[10px] leading-snug text-red-400">{createError}</p>}
-                <button onClick={() => void handleCreate()} disabled={creatingProject || !newName.trim() || (newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword)} className="flex w-full items-center justify-center gap-1 px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover disabled:opacity-50">
+                <button onClick={() => void handleCreate()} disabled={creatingProject || !newName.trim() || (legacyProjectPasswordAccess && ((newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword)))} className="flex w-full items-center justify-center gap-1 px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover disabled:opacity-50">
                   {creatingProject && <Loader2 size={11} className="animate-spin" />} {creatingProject ? 'Creating…' : 'Create project'}
                 </button>
               </div>
@@ -1129,7 +1167,7 @@ function WorkspaceSelector() {
                 onClick={() => setCreating(true)}
                 className="w-full text-left px-1 py-1 text-xs text-accent-blue hover:text-accent-blue-hover flex items-center gap-1"
               >
-                <Plus size={12} /> {remote ? 'New project' : 'New Workspace'}
+                <Plus size={12} /> {remote || accountProjectAccessActive ? 'New project' : 'New Workspace'}
               </button>
             )}
           </div>}
@@ -1139,7 +1177,7 @@ function WorkspaceSelector() {
                 Cloudflare access {accessContext.cloudflare_enabled ? 'enabled' : 'disabled'}.
               </span>{' '}
               {accessContext.cloudflare_enabled
-                ? <>Share {accessContext.share_url ? <button onClick={() => void navigator.clipboard?.writeText(accessContext.share_url)} className="text-accent-blue underline">the configured URL</button> : 'the Cloudflare URL shown by Pinokio'}, then have the user select a project and enter its password.</>
+                ? <>Share {accessContext.share_url ? <button onClick={() => void navigator.clipboard?.writeText(accessContext.share_url)} className="text-accent-blue underline">the configured URL</button> : 'the Cloudflare URL shown by Pinokio'}, then have the user {accountProjectAccessActive ? 'sign in and choose a project available to their account.' : 'select a project and enter its password.'}</>
                 : 'Enable it locally in Maestro’s Pinokio Configure/ENVIRONMENT settings; remote users never receive machine controls.'}
             </div>
           )}
@@ -1193,6 +1231,9 @@ function JobPlaceholder({
 }) {
   const models = useStore(s => s.models ?? [])
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
+  const accessContext = useStore(s => s.accessContext)
+  const accountProjectMigration = useStore(s => s.accountProjectMigration)
+  const accountProjectAccessActive = api.isAccountProjectAccessActive(accessContext, accountProjectMigration)
   const ref2vaTermsAccepted = useStore(s => s.hostTerms?.minimax_h3_ref2va.accepted === true)
   const [reviewNowMs, setReviewNowMs] = useState(() => Date.now())
   useEffect(() => {
@@ -1430,7 +1471,9 @@ function JobPlaceholder({
                         className="rounded bg-amber-300/15 px-2.5 py-1 text-[10px] font-medium text-amber-200 hover:bg-amber-300/25"
                       >
                         {action === 'resume'
-                          ? recoveryState === 'blocked_remote_reauth' ? 'Unlock project and resume' : 'Resume recovery'
+                          ? recoveryState === 'blocked_remote_reauth'
+                            ? accountProjectAccessActive ? 'Open project and resume' : 'Unlock project and resume'
+                            : 'Resume recovery'
                           : 'Retry recovery'}
                       </button>
                     ))}
@@ -1991,6 +2034,8 @@ function GalleryBulkToolbar() {
   const outputs = useStore(s => s.filteredOutputs())
   const workspaces = useStore(s => s.workspaces) ?? []
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const accessContext = useStore(s => s.accessContext)
+  const accountProjectMigration = useStore(s => s.accountProjectMigration)
   const selectAll = useStore(s => s.selectAllLoadedOutputs)
   const clear = useStore(s => s.clearOutputSelection)
   const setSelectionMode = useStore(s => s.setGallerySelectionMode)
@@ -2001,6 +2046,7 @@ function GalleryBulkToolbar() {
   const [busy, setBusy] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [errors, setErrors] = useState<string[]>([])
+  const accountProjectAccessActive = api.isAccountProjectAccessActive(accessContext, accountProjectMigration)
   const workspaceByName = new Map(workspaces.map(workspace => [workspace.name, workspace]))
   const selectedOutputs = outputs.filter(output => selected.includes(`${output.workspace}\0${output.name}`))
   const canMutateSelection = selected.length > 0
@@ -2011,7 +2057,7 @@ function GalleryBulkToolbar() {
     ))
   const mutableTargets = workspaces.filter(workspace => (
     workspace.name !== activeWorkspace
-    && workspace.unlocked !== false
+    && (accountProjectAccessActive || workspace.unlocked !== false)
     && workspaceAllowsPermission(workspace, 'project.mutate')
   ))
   const canMoveSelection = canMutateSelection

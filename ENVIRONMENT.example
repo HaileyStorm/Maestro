@@ -41,3 +41,10 @@ MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL=
 # or signing secrets in this file.
 MAESTRO_ACCOUNTS_ENABLED=false
 MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false
+
+# Hosted credit enforcement is an optional operator policy and remains off for
+# local installs. Enabling it is meaningful only with accounts, a hosted
+# execution realm, and backend accounting readiness; these values are not
+# credentials and must not contain secrets.
+MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=false
+MAESTRO_COMPUTE_EXECUTION_REALM=local

@@ -339,6 +339,7 @@ class SupportPortal:
         identity_key: bytes | str,
         catalog: SupportCatalog | None = None,
         catalog_loader: Callable[[], SupportCatalog] | None = None,
+        scheduler_enforcement_resolver: Callable[[], bool] | None = None,
     ) -> None:
         if not isinstance(account_store, AccountAuthStore):
             raise SupportPortalError("A server account store is required")
@@ -354,6 +355,12 @@ class SupportPortal:
         )
         self._catalog = catalog
         self._catalog_loader = catalog_loader
+        if (
+            scheduler_enforcement_resolver is not None
+            and not callable(scheduler_enforcement_resolver)
+        ):
+            raise SupportPortalError("Scheduler enforcement resolver is invalid")
+        self._scheduler_enforcement_resolver = scheduler_enforcement_resolver
         if self._catalog is None and self._catalog_loader is None:
             self._catalog = load_support_catalog()
 
@@ -392,21 +399,43 @@ class SupportPortal:
             raise SupportAuthorizationError("Account self access is required")
         return principal, capabilities
 
-    @staticmethod
-    def _priority_policy() -> dict[str, Any]:
+    def _scheduler_enforcement_enabled(self) -> bool:
+        if self._scheduler_enforcement_resolver is not None:
+            try:
+                return bool(self._scheduler_enforcement_resolver())
+            except Exception:
+                return False
+
+        def enabled(name: str) -> bool:
+            return str(os.environ.get(name) or "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+
+        return bool(
+            enabled("MAESTRO_ACCOUNTS_ENABLED")
+            and enabled("MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED")
+            and str(
+                os.environ.get("MAESTRO_COMPUTE_EXECUTION_REALM") or "local"
+            ).strip().lower() == "hosted"
+        )
+
+    def _priority_policy(self) -> dict[str, Any]:
+        enforcement_enabled = self._scheduler_enforcement_enabled()
         exclusions = [
             support_priority_capability_marker(capability_id)
             for capability_id in sorted(SUPPORT_PRIORITY_IDENTITY_CONTRACTS)
         ]
         return {
-            "scheduler_enforcement_enabled": False,
+            "scheduler_enforcement_enabled": enforcement_enabled,
             "effective_priority_boost": False,
-            "state": "not_enabled",
+            "state": "enabled" if enforcement_enabled else "not_enabled",
             "exclusions": exclusions,
             "notice": (
-                "Some exact models, including Moody, are excluded from any "
-                "future support-derived queue priority by their terms or "
-                "creator policy. Submission remains available."
+                "Eligible hosted work may receive bounded support-derived "
+                "queue priority when enforcement is enabled. Some exact "
+                "models, including Moody, are excluded by their terms or "
+                "creator policy. Submission remains available for every "
+                "otherwise-valid job."
             ),
         }
 
@@ -432,6 +461,7 @@ class SupportPortal:
                     else None
                 ),
             })
+        enforcement_enabled = self._scheduler_enforcement_enabled()
         return {
             "schema_version": SUPPORT_PORTAL_SCHEMA_VERSION,
             "provider_catalog": {
@@ -440,21 +470,75 @@ class SupportPortal:
                 "providers": providers,
             },
             "benefit_availability": {
-                "scheduler_enforcement_enabled": False,
+                "scheduler_enforcement_enabled": enforcement_enabled,
                 "effective_benefits": [],
-                "state": "recorded_not_enforced",
+                "state": (
+                    "hosted_priority_available"
+                    if enforcement_enabled else "recorded_not_enforced"
+                ),
             },
             "support_priority": self._priority_policy(),
         }
 
-    @staticmethod
-    def _benefit_projection(recorded: Mapping[str, Any]) -> dict[str, Any]:
+    def _benefit_projection(
+        self,
+        recorded: Mapping[str, Any],
+        *,
+        priority_eligible: bool = True,
+    ) -> dict[str, Any]:
+        enforcement_enabled = self._scheduler_enforcement_enabled()
+        allowance = recorded.get("recorded_allowance")
+        effective_allowance = (
+            allowance.get("effective_allowance", 0)
+            if isinstance(allowance, Mapping) else 0
+        )
+        priority_active = bool(
+            priority_eligible
+            and enforcement_enabled
+            and type(effective_allowance) is int
+            and effective_allowance > 0
+        )
         return {
-            "state": "recorded_not_enforced",
-            "scheduler_enforcement_enabled": False,
-            "effective_benefits": [],
+            "state": "owner_exempt" if (
+                enforcement_enabled and not priority_eligible
+            ) else (
+                "active" if priority_active else (
+                "hosted_priority_available"
+                if enforcement_enabled else "recorded_not_enforced"
+                )
+            ),
+            "scheduler_enforcement_enabled": enforcement_enabled,
+            "effective_benefits": (
+                ["bounded_queue_priority"] if priority_active else []
+            ),
             "recorded_eligibility": list(recorded["benefit_eligibility"]),
         }
+
+    def _recorded_projection(
+        self,
+        recorded: Mapping[str, Any],
+        *,
+        priority_eligible: bool = True,
+    ) -> dict[str, Any]:
+        projection = {
+            key: value
+            for key, value in recorded.items()
+            if key != "benefit_eligibility"
+        }
+        allowance = projection.get("recorded_allowance")
+        if (
+            self._scheduler_enforcement_enabled()
+            and priority_eligible
+            and isinstance(allowance, Mapping)
+            and type(allowance.get("effective_allowance")) is int
+            and allowance["effective_allowance"] > 0
+        ):
+            projection["recorded_allowance"] = {
+                **allowance,
+                "state": "active",
+                "enforcement_enabled": True,
+            }
+        return projection
 
     def self_projection(
         self,
@@ -465,15 +549,16 @@ class SupportPortal:
         principal, _ = self._resolve_access(account_session_id, remote=remote)
         subject_key = self._subject_key(principal["id"])
         recorded = self._ledger.privacy_safe_user_projection(subject_key)
+        priority_eligible = principal.get("role") != "owner"
         return {
             **self.public_catalog_projection(),
             "account_support": {
-                "recorded": {
-                    key: value
-                    for key, value in recorded.items()
-                    if key != "benefit_eligibility"
-                },
-                "benefits": self._benefit_projection(recorded),
+                "recorded": self._recorded_projection(
+                    recorded, priority_eligible=priority_eligible,
+                ),
+                "benefits": self._benefit_projection(
+                    recorded, priority_eligible=priority_eligible,
+                ),
             },
             "responsible_use": {
                 "notice": responsible_use_notice(),
@@ -513,12 +598,14 @@ class SupportPortal:
         or provider identity from the request.
         """
 
-        _, subject_key = self._resolve_owner_target(
+        _, subject_key, target_role = self._resolve_owner_target(
             actor_session_id,
             remote=remote,
             target_account_id=target_account_id,
         )
-        return self._admin_projection_for_subject(subject_key)
+        return self._admin_projection_for_subject(
+            subject_key, priority_eligible=target_role != "owner",
+        )
 
     def _resolve_owner_target(
         self,
@@ -526,7 +613,7 @@ class SupportPortal:
         *,
         remote: bool,
         target_account_id: str,
-    ) -> tuple[dict[str, Any], str]:
+    ) -> tuple[dict[str, Any], str, str]:
         actor, capabilities = self._resolve_access(
             actor_session_id, remote=remote,
         )
@@ -550,21 +637,30 @@ class SupportPortal:
             raise SupportAuthorizationError(
                 "Recent owner authentication is required"
             ) from error
-        if not any(account.get("id") == target_account_id for account in accounts):
+        target = next(
+            (account for account in accounts if account.get("id") == target_account_id),
+            None,
+        )
+        if target is None:
             raise SupportAuthorizationError("The target account is unavailable")
-        return actor, self._subject_key(target_account_id)
+        return actor, self._subject_key(target_account_id), str(target.get("role") or "")
 
-    def _admin_projection_for_subject(self, subject_key: str) -> dict[str, Any]:
+    def _admin_projection_for_subject(
+        self,
+        subject_key: str,
+        *,
+        priority_eligible: bool,
+    ) -> dict[str, Any]:
         recorded = self._ledger.reauthenticated_admin_projection(subject_key)
         return {
             "schema_version": SUPPORT_PORTAL_SCHEMA_VERSION,
             "account_support": {
-                "recorded": {
-                    key: value
-                    for key, value in recorded.items()
-                    if key != "benefit_eligibility"
-                },
-                "benefits": self._benefit_projection(recorded),
+                "recorded": self._recorded_projection(
+                    recorded, priority_eligible=priority_eligible,
+                ),
+                "benefits": self._benefit_projection(
+                    recorded, priority_eligible=priority_eligible,
+                ),
             },
             "responsible_use": self._acceptance_store.status(subject_key),
             "support_priority": self._priority_policy(),
@@ -584,7 +680,7 @@ class SupportPortal:
     ) -> dict[str, Any]:
         """Append one server-derived fulfillment transition and refresh audit."""
 
-        actor, subject_key = self._resolve_owner_target(
+        actor, subject_key, target_role = self._resolve_owner_target(
             actor_session_id,
             remote=remote,
             target_account_id=target_account_id,
@@ -625,7 +721,9 @@ class SupportPortal:
             ),
             occurred_at=datetime.now(timezone.utc),
         )
-        return self._admin_projection_for_subject(subject_key)
+        return self._admin_projection_for_subject(
+            subject_key, priority_eligible=target_role != "owner",
+        )
 
     def record_owner_contribution(
         self,
@@ -642,7 +740,7 @@ class SupportPortal:
     ) -> dict[str, Any]:
         """Append one owner-recorded contribution and refresh its audit view."""
 
-        actor, subject_key = self._resolve_owner_target(
+        actor, subject_key, target_role = self._resolve_owner_target(
             actor_session_id,
             remote=remote,
             target_account_id=target_account_id,
@@ -702,7 +800,9 @@ class SupportPortal:
             ),
             occurred_at=datetime.now(timezone.utc),
         )
-        return self._admin_projection_for_subject(subject_key)
+        return self._admin_projection_for_subject(
+            subject_key, priority_eligible=target_role != "owner",
+        )
 
 
 __all__ = [

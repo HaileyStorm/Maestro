@@ -11507,16 +11507,22 @@ export const useStore = create<AppState>((set, get) => ({
       const previousActive = before.activeWorkspace
       const projectChanged = data.active !== previousActive
       const nextWorkspaces = new Map(data.workspaces.map(workspace => [workspace.name, workspace]))
-      const revokedWorkspaces = before.workspaces
+      const accountProjectAccessActive = api.isAccountProjectAccessActive(
+        before.accessContext,
+        before.accountProjectMigration,
+      )
+      const revokedWorkspaces = accountProjectAccessActive ? [] : before.workspaces
         .filter(workspace => (
           workspace.password_protected
           && workspace.unlocked === true
           && nextWorkspaces.get(workspace.name)?.unlocked !== true
         ))
         .map(workspace => workspace.name)
-      const previousAccessRevoked = Boolean(previousActive) && !data.workspaces.some(workspace => (
-        workspace.name === previousActive && workspace.unlocked !== false
-      ))
+      const nextActiveWorkspace = nextWorkspaces.get(previousActive)
+      const previousAccessRevoked = Boolean(previousActive) && (
+        nextActiveWorkspace === undefined
+        || (!accountProjectAccessActive && nextActiveWorkspace.unlocked === false)
+      )
       const clearPendingPlan = before.pendingH3PlanWorkspace != null && (
         projectChanged || (
           previousAccessRevoked && before.pendingH3PlanWorkspace === previousActive
@@ -11633,7 +11639,12 @@ export const useStore = create<AppState>((set, get) => ({
     _dashboardPipelineListLoadToken += 1
     try {
       const previousWorkspace = get().activeWorkspace
-      await api.createWorkspace(name, password, 'device')
+      const state = get()
+      const accountProjectAccessActive = api.isAccountProjectAccessActive(
+        state.accessContext,
+        state.accountProjectMigration,
+      )
+      await api.createWorkspace(name, accountProjectAccessActive ? undefined : password, 'device')
       await api.setActiveWorkspace(name)
       if (previousWorkspace && previousWorkspace !== name) {
         hidePrivatePreviewsForWorkspace(previousWorkspace)

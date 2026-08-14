@@ -1027,6 +1027,10 @@ export async function submitToolRevoice(params: {
 
 export interface AccessContext {
   remote: boolean
+  /** Explicit server-authored membership cutover state. Missing means fail closed. */
+  account_project_access_active?: boolean
+  /** New projects require a signed-in owner while cutover is active or recovering. */
+  account_project_creation_requires_account?: boolean
   project_password_required: boolean
   project_names_visible: boolean
   machine_controls: boolean
@@ -1038,6 +1042,22 @@ export interface AccessContext {
   share_flow: string
   /** Optional for compatibility with hosts predating the account layer. */
   accounts?: AccountContext
+}
+
+/**
+ * Whether project membership, rather than the legacy browser password grant,
+ * is the server-authored access boundary. An explicit migration projection is
+ * authoritative when available; other surfaces use the explicit access-context
+ * cutover flag so authenticated members do not have to fetch the owner-only
+ * migration API. Older hosts without that flag fail closed into legacy access.
+ */
+export function isAccountProjectAccessActive(
+  context: AccessContext | null,
+  migration: AccountProjectMigrationStatus | null = null,
+): boolean {
+  if (context?.accounts?.enabled !== true) return false
+  if (migration !== null) return migration.state === 'active' && migration.enforced === true
+  return context.account_project_access_active === true
 }
 
 export function getDirectorHostActionAccessState(
@@ -1558,9 +1578,10 @@ function supportRecordedAllowance(value: unknown): SupportAccountSummary['record
   const raw = value as Record<string, unknown>
   const effectiveAllowance = safeAllowanceNumber(raw.effective_allowance)
   const asOf = safeAllowanceTimestamp(raw.as_of)
+  const active = raw.state === 'active' && raw.enforcement_enabled === true
+  const recordedOnly = raw.state === 'recorded_not_enforced' && raw.enforcement_enabled === false
   if (
-    raw.state !== 'recorded_not_enforced'
-    || raw.enforcement_enabled !== false
+    (!active && !recordedOnly)
     || typeof raw.unit !== 'string'
     || !/^[a-z][a-z0-9_]{1,63}$/.test(raw.unit)
     || effectiveAllowance === null
@@ -1601,8 +1622,8 @@ function supportRecordedAllowance(value: unknown): SupportAccountSummary['record
     || sourceTotal !== effectiveAllowance
   ) return undefined
   return {
-    state: 'recorded_not_enforced',
-    enforcement_enabled: false,
+    state: active ? 'active' : 'recorded_not_enforced',
+    enforcement_enabled: active,
     unit: raw.unit,
     as_of: asOf,
     effective_allowance: effectiveAllowance,
@@ -1614,6 +1635,32 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
   const recorded = value?.recorded || {}
   const benefits = value?.benefits || {}
   const recordedAllowance = supportRecordedAllowance(recorded.recorded_allowance)
+  const benefitState = typeof benefits.state === 'string' ? benefits.state : ''
+  const schedulerEnforcementEnabled = benefits.scheduler_enforcement_enabled === true
+  const effectiveBenefits = stringList(benefits.effective_benefits)
+  const recordedEligibility = stringList(benefits.recorded_eligibility)
+  const benefitsCoherent = (
+    benefitState === 'active'
+      ? schedulerEnforcementEnabled
+        && effectiveBenefits.length === 1
+        && effectiveBenefits[0] === 'bounded_queue_priority'
+        && recordedAllowance?.state === 'active'
+        && recordedAllowance.enforcement_enabled === true
+        && recordedAllowance.effective_allowance > 0
+      : benefitState === 'hosted_priority_available'
+        ? schedulerEnforcementEnabled
+          && effectiveBenefits.length === 0
+          && recordedAllowance?.enforcement_enabled !== true
+          && (recordedAllowance?.effective_allowance ?? 0) === 0
+        : benefitState === 'owner_exempt'
+          ? schedulerEnforcementEnabled
+            && effectiveBenefits.length === 0
+            && recordedAllowance?.enforcement_enabled !== true
+        : benefitState === 'recorded_not_enforced'
+          && !schedulerEnforcementEnabled
+          && effectiveBenefits.length === 0
+          && recordedAllowance?.enforcement_enabled !== true
+  )
   return {
     event_count: typeof recorded.event_count === 'number' ? recorded.event_count : 0,
     one_time_tier: typeof recorded.one_time_tier === 'string' ? recorded.one_time_tier : null,
@@ -1621,13 +1668,20 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
     active_recurring_count: typeof recorded.active_recurring_count === 'number'
       ? recorded.active_recurring_count
       : 0,
-    ...(recordedAllowance ? { recorded_allowance: recordedAllowance } : {}),
-    benefits: {
-      state: typeof benefits.state === 'string' ? benefits.state : 'recorded_not_enforced',
-      scheduler_enforcement_enabled: benefits.scheduler_enforcement_enabled === true,
-      effective_benefits: stringList(benefits.effective_benefits),
-      recorded_eligibility: stringList(benefits.recorded_eligibility),
-    },
+    ...(benefitsCoherent && recordedAllowance ? { recorded_allowance: recordedAllowance } : {}),
+    benefits: benefitsCoherent
+      ? {
+          state: benefitState,
+          scheduler_enforcement_enabled: schedulerEnforcementEnabled,
+          effective_benefits: effectiveBenefits,
+          recorded_eligibility: recordedEligibility,
+        }
+      : {
+          state: 'recorded_not_enforced',
+          scheduler_enforcement_enabled: false,
+          effective_benefits: [],
+          recorded_eligibility: recordedEligibility,
+        },
   }
 }
 

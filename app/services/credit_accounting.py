@@ -332,6 +332,23 @@ class CreditAccountingJournal:
             lease.__exit__(None, None, None)
             raise
 
+    def probe_readiness(self) -> None:
+        """Validate existing state and destination access without publishing it."""
+        with self._thread_lock:
+            try:
+                with exclusive_file_lease(self.lock_path):
+                    self._read_unlocked()
+            except CreditAccountingError:
+                raise
+            except (OSError, ValueError) as error:
+                raise CreditAccountingIntegrityError(
+                    "accounting destination is unavailable",
+                ) from error
+            if not os.access(self.path.parent, os.W_OK | os.X_OK):
+                raise CreditAccountingIntegrityError(
+                    "accounting destination is unavailable",
+                )
+
     def _close_locked_state(
         self, lease: Any, state: dict[str, Any], *, write: bool,
     ) -> None:

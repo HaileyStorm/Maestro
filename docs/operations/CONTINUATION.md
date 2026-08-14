@@ -39,8 +39,9 @@ separately controlled tracker migration is verified.
 ## Accounts and existing projects
 
 Accounts are an optional host feature. They may be enabled in an operator's
-ignored configuration, but no tracked document should claim their current live
-state. Project passwords and browser project sessions remain separate.
+ignored configuration, but no tracked document should claim a particular
+deployment's live state. Before project migration becomes active, project
+passwords and browser project sessions remain the bounded legacy access path.
 
 The first-owner procedure is:
 
@@ -82,6 +83,12 @@ Migration states are:
 Do not bypass `needs_attention`, silently orphan a folder, or treat a partial
 census as success. Repair an invalid project or resolve an explicitly approved,
 recoverable removal, then rerun the normal flow.
+
+Once the migration state is `active`, sealed account membership is the only
+project authorization path. The active owner/member experience must not ask for,
+set, unlock, relock, or depend on a project password. Keep the legacy password
+manager reachable only while accounts are disabled or migration is incomplete,
+so an operator can roll back without exposing or stranding pre-migration data.
 
 `GET /api/v1/account/context` is the server-authored source for account
 activation state. Relevant values are `disabled`, `setup_available`,
@@ -125,9 +132,9 @@ The future contract is:
 - Keep authentication links separate from existing contribution/support
   provider links and their opaque keys. Contribution events never grant login
   authority or create an OIDC identity mapping.
-- Keep project-password/browser grants, queue/recovery ownership, and account
-  sessions as distinct compatibility layers unless a separate migration proves
-  otherwise.
+- Keep legacy project-password/browser grants isolated from queue/recovery
+  ownership and account sessions. They remain a pre-cutover rollback layer, not
+  an additional authorization requirement after account migration is active.
 - Use OIDC state, nonce, PKCE, exact redirect origins, and conservative proxy
   handling. Treat issuer and subject as exact validated strings without local
   case-folding or normalization. Verify signed ID tokens against fail-closed
@@ -147,18 +154,18 @@ authority, issuer/subject normalization collisions, contribution-link
 non-authority, unchanged project/credit IDs, and local recovery. Keep this
 deferred wave out of the current bird-in-the-hand account activation milestone.
 
-## Credits remain a separate activation gate
+## Optional hosted credit scheduling
 
-Runtime credit accounting is currently compiled hard-off. Do not describe an
-environment flag, support contribution, or account activation as credit
-enforcement. Credit work is deferred until the account/project milestone is
-live and verified.
+Maestro has an operator-controlled hosted-credit scheduler. It activates only
+when accounts are enabled, `MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true`, and
+`MAESTRO_COMPUTE_EXECUTION_REALM=hosted`. The safe tracked defaults are `false`
+and `local`; account activation or a recorded contribution alone never changes
+the runtime policy. Local and authenticated-LAN execution remain unmetered.
 
-Before credits can be enabled, a separate release must prove both sides of the
-contract:
+The activation contract is:
 
 - A freshly resolved owner role from the sealed account store bypasses new-job
-  reservation, allowance consumption, journaling, and credit denial. Client
+  reservation, allowance consumption, and journaling. Client
   fields and persisted job parameters are not authority. Historical owner holds
   still need their normal release path.
 - Otherwise-valid zero/partial/refunded/expired-credit hosted work must still
@@ -171,8 +178,75 @@ contract:
   (the recovered intent was approximately 15/10/5-second bands), but that is a
   separate server-authored contract, not permission to deny submission.
 
-Keep credit activation off until the implementation, regression matrix, and
-live acceptance for that contract are complete.
+Support contribution records may produce a bounded compute allowance only from
+the server-owned allowance policy. Fully funded hosted work receives bounded
+priority, while zero, partial, refunded, or expired allowance never causes a
+flat `402` or rejects an otherwise-valid submission. The durable credit journal
+must conserve units across reserve, consume, release, restart, and recovery.
+
+For a release, verify the configured realm, all three queue bands, the
+cross-band starvation bound, owner exemption from the sealed account store,
+local/LAN exemptions, and restart/recovery behavior. Duration shaping and SSO
+remain separate later waves.
+
+## GPU-idle comparative sample campaign
+
+Historical issue `Maestro.git-134` is the campaign queue and
+`Maestro.git-28` is its GPU-yield dependency. Preserve those IDs through the
+controlled Beads importer repair; do not mutate the historical SQLite tracker
+or duplicate the issues while the 160-record round-trip is not lossless.
+
+This campaign exists to demonstrate Maestro-specific improvements, not to fill
+a gallery with unrelated attractive generations. Every high-priority candidate
+needs a credible control: use the same normalized prompt/input, model revision,
+steps, resolution, frame rate, seed, and output index where technically
+possible. The `maestro` arm enables the named recipe, reference, planning,
+continuity, recovery, or creator workflow; the `control` arm uses the direct
+path without that intervention. Record exactly which intervention differs.
+
+Work the slate in these waves:
+
+1. **Reference lock / Pocket to Picture Lock** — compare a reference-locked
+   subject or product across motion with the same direct generation lacking the
+   reference workflow. This is the first visual-quality proof.
+2. **Continuity Rescue / Change One Fact / One Note Three Consequences** — make
+   one controlled story or direction change and compare how identity, setting,
+   action, and downstream beats remain coherent.
+3. **One Idea Four Roles / Brief to Beat Sheet** — compare Maestro's explicit
+   role and planning handoffs with a direct one-prompt generation, keeping the
+   creative brief fixed.
+4. **Recovery Is a Feature / Break It on Purpose / Cold Restart Recovery** —
+   demonstrate durable queue and output-boundary recovery without killing a
+   running diffusion step or corrupting the control. Treat this as workflow
+   evidence, not an invitation to manufacture an unsafe failure.
+5. Only after the paired pipeline is credible, expand to the 90-second and
+   3–12-minute formats such as **Brief Survived Reality**, **Commercial in One
+   Sitting**, and **Brief to Campaign**. Recipe-only glamour samples are lower
+   priority unless they isolate a newly added capability with no meaningful
+   baseline.
+
+Queue each arm as an ordinary durable generation job at the lowest manual
+priority and hold it until the GPU-idle gate passes. Release one arm at a time.
+Never preempt a running GPU generation; the owner's active work, agent-required
+verification, and meaningful external GPU work take precedence. Require a
+sustained low-utilization window plus no foreign compute/graphics process;
+missing or ambiguous GPU telemetry fails closed and retries later. If contention
+appears, finish or cancel only at the next safe output/job boundary, preserve the
+durable checkpoint, and requeue without duplicating the pair.
+
+For each video arm, VLM review uses 2–5 sequential, non-adjacent, nearby frames.
+The frames must be spread enough to show motion and temporal coherence, but not
+so far apart that they become unrelated stills. Both arms use identical
+normalized sampling positions. Preserve private per-arm manifests, frame and
+output digests, VLM evidence, and an evidence-class label. The human review
+queue must show the pair together and allow keep, reject, or request-rerun; VLM
+output is provisional and never substitutes for creator acceptance.
+
+Do not start GPU work merely because the queue exists. The first implementation
+unit is the content-free pair manifest/coordinator, fail-closed idle gate, frame
+sampler, VLM report, and human-review projection. After its focused tests pass,
+queue the first Reference Lock pair and let the scheduler release it only at an
+observed idle boundary.
 
 ## Coordinated restart and status
 

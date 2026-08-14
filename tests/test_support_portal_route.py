@@ -766,6 +766,7 @@ class SupportPortalRouteTests(unittest.TestCase):
                 "_raise_account_http_error": lambda error: (
                     (_ for _ in ()).throw(error)
                 ),
+                "_credit_support_scheduler_enforcement_enabled": lambda: False,
             }
             exec(compile(module, str(path), "exec"), namespace)
             disabled_config = str(Path(directory) / "missing-support.json")

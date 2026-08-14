@@ -99,6 +99,11 @@ async function loadJobPlaceholder() {
             return { contents: `
               const record = (name, ...args) => globalThis.__resourceWaitApiCalls?.push([name, ...args])
               export const isBackendJobId = jobId => /^[0-9a-f]{8}$/i.test(jobId)
+              export const isAccountProjectAccessActive = (context, migration = null) => {
+                if (context?.accounts?.enabled !== true) return false
+                if (migration !== null) return migration.state === 'active' && migration.enforced === true
+                return context.account_project_access_active === true
+              }
               export const fetchJobLog = async () => ({ events: [] })
               export const fetchProjectAssets = async project => globalThis.__resourceWaitFetchProjectAssets?.(project) ?? []
               export const projectReferenceJobQualitySummary = (assets, jobId) => globalThis.__resourceWaitSummarizeQuality?.(assets, jobId) ?? null
@@ -1063,6 +1068,54 @@ test('running recovery never presents itself as merely queued', async t => {
   })
   assert.match(elementText(tree), /Recovery Running/)
   assert.doesNotMatch(elementText(tree), /Recovery Queued/)
+})
+
+test('project recovery follows active account access while retaining legacy unlock copy', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const job = {
+    id: 'blocked-account-recovery',
+    status: 'queued',
+    recoveryState: 'blocked_remote_reauth',
+    recoveryBlocked: true,
+    recoveryReasonText: 'Choose the project before recovery.',
+    recoveryAttempt: 1,
+    recoveryAttemptLimit: 3,
+    recoveryActions: ['resume'],
+    progress: 0,
+    step: 0,
+    totalSteps: 0,
+    phase: '',
+    message: '',
+    outputFiles: [],
+    error: null,
+  }
+  const accessContext = {
+    machine_controls: false,
+    account_project_access_active: true,
+    project_password_required: false,
+    accounts: { enabled: true },
+  }
+
+  globalThis.__resourceWaitStore = {
+    accessContext,
+    accountProjectMigration: null,
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  const activeTree = JobPlaceholder({ job, canManageGeneration: true, onStop() {}, onDismiss() {} })
+  assert.match(elementText(activeTree), /Open project and resume/)
+  assert.doesNotMatch(elementText(activeTree), /Unlock project and resume/)
+
+  globalThis.__resourceWaitStore = {
+    accessContext,
+    accountProjectMigration: { state: 'needs_attention', enforced: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  const legacyTree = JobPlaceholder({ job, canManageGeneration: true, onStop() {}, onDismiss() {} })
+  assert.match(elementText(legacyTree), /Unlock project and resume/)
+  assert.doesNotMatch(elementText(legacyTree), /Open project and resume/)
 })
 
 test('plan-terms wait renders explicit bounded card copy instead of a generic phase', async t => {

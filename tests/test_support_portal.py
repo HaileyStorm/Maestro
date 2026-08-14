@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import os
 import sys
 import tempfile
 import unittest
@@ -324,9 +325,11 @@ class SupportPortalTests(unittest.TestCase):
         allowance = account_support["recorded"]["recorded_allowance"]
         self.assertEqual(allowance["state"], "recorded_not_enforced")
         self.assertFalse(allowance["enforcement_enabled"])
-        self.assertEqual(allowance["effective_allowance"], 0)
+        self.assertEqual(allowance["effective_allowance"], 300)
         self.assertEqual(allowance["sources"][0]["source"], "free")
         self.assertEqual(allowance["sources"][0]["status"], "inactive")
+        self.assertEqual(allowance["sources"][1]["source"], "one_time_support")
+        self.assertEqual(allowance["sources"][1]["status"], "active")
         self.assertEqual(
             account_support["benefits"]["state"], "recorded_not_enforced",
         )
@@ -374,6 +377,84 @@ class SupportPortalTests(unittest.TestCase):
         ))
         self.assertIn("Submission remains available", policy["notice"])
         self.assertNotIn("prompt", json.dumps(policy).lower())
+
+    def test_hosted_credit_policy_projects_active_allowance_truthfully(self):
+        self.add_contribution(self.user_id, "hosted-credit-active")
+        with mock.patch.dict(os.environ, {
+            "MAESTRO_ACCOUNTS_ENABLED": "true",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED": "true",
+            "MAESTRO_COMPUTE_EXECUTION_REALM": "hosted",
+        }, clear=False):
+            projection = self.portal.self_projection(
+                self.user_session,
+                remote=True,
+            )
+
+        public = projection["benefit_availability"]
+        account = projection["account_support"]
+        allowance = account["recorded"]["recorded_allowance"]
+        self.assertTrue(public["scheduler_enforcement_enabled"])
+        self.assertEqual(public["state"], "hosted_priority_available")
+        self.assertEqual(allowance["state"], "active")
+        self.assertTrue(allowance["enforcement_enabled"])
+        self.assertEqual(account["benefits"]["state"], "active")
+        self.assertEqual(
+            account["benefits"]["effective_benefits"],
+            ["bounded_queue_priority"],
+        )
+
+    def test_hosted_credit_projection_keeps_owner_and_zero_allowance_exempt(self):
+        self.add_contribution(self.owner_id, "owner-hosted-credit")
+        default_owner = self.portal.self_projection(
+            self.owner_session, remote=True,
+        )["account_support"]
+        self.assertEqual(
+            default_owner["benefits"]["state"], "recorded_not_enforced",
+        )
+        self.assertIn("recorded_allowance", default_owner["recorded"])
+        hosted = {
+            "MAESTRO_ACCOUNTS_ENABLED": "true",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED": "true",
+            "MAESTRO_COMPUTE_EXECUTION_REALM": "hosted",
+        }
+        with mock.patch.dict(os.environ, hosted, clear=False):
+            owner = self.portal.self_projection(
+                self.owner_session, remote=True,
+            )["account_support"]
+            zero = self.portal.self_projection(
+                self.other_session, remote=True,
+            )["account_support"]
+
+        self.assertEqual(owner["benefits"]["state"], "owner_exempt")
+        self.assertEqual(owner["benefits"]["effective_benefits"], [])
+        self.assertEqual(
+            owner["recorded"]["recorded_allowance"]["state"],
+            "recorded_not_enforced",
+        )
+        self.assertEqual(
+            zero["benefits"]["state"], "hosted_priority_available",
+        )
+        self.assertEqual(zero["benefits"]["effective_benefits"], [])
+        self.assertEqual(
+            zero["recorded"]["recorded_allowance"]["state"],
+            "recorded_not_enforced",
+        )
+
+    def test_scheduler_resolver_failure_fails_closed(self):
+        portal = SupportPortal(
+            account_store=self.account_store,
+            ledger=self.ledger,
+            acceptance_store=self.store,
+            identity_key=IDENTITY_KEY,
+            catalog=load_support_catalog(env={}, local_config_path=None),
+            scheduler_enforcement_resolver=lambda: (_ for _ in ()).throw(
+                OSError("synthetic journal outage")
+            ),
+        )
+        projection = portal.public_catalog_projection()
+        self.assertFalse(
+            projection["benefit_availability"]["scheduler_enforcement_enabled"],
+        )
 
     def test_live_session_identity_and_revocation_fail_closed(self):
         with self.assertRaises(SupportAuthorizationError):

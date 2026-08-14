@@ -937,6 +937,85 @@ test('a normal account gets self-service without owner administration', async ({
   )
 })
 
+test('active account project access opens and creates member projects without project passwords', async ({ page }) => {
+  await page.setViewportSize({ width: 768, height: 900 })
+  await skipWelcome(page)
+  api!.setAccountScenario('user')
+  const projectPermissions = [
+    'project.open', 'project.read', 'project.mutate', 'project.generate', 'project.lifecycle', 'project.delete',
+  ]
+  let activeProject = 'Member project'
+  const workspaces = [{
+    name: 'Member project',
+    password_protected: true,
+    unlocked: false,
+    project_role: 'owner',
+    project_permissions: projectPermissions,
+  }, {
+    name: 'Second member project',
+    password_protected: true,
+    unlocked: false,
+    project_role: 'owner',
+    project_permissions: projectPermissions,
+  }]
+  const createdBodies: Array<Record<string, unknown>> = []
+  const openedProjects: string[] = []
+
+  await page.route('**/api/v1/workspaces', async route => {
+    const request = route.request()
+    if (request.method() === 'GET') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ workspaces, active: activeProject }),
+      })
+      return
+    }
+    if (request.method() === 'POST') {
+      const body = request.postDataJSON() as Record<string, unknown>
+      createdBodies.push(body)
+      const name = String(body.name || '')
+      workspaces.push({
+        name,
+        password_protected: false,
+        unlocked: false,
+        project_role: 'owner',
+        project_permissions: projectPermissions,
+      })
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
+      return
+    }
+    await route.abort('blockedbyclient')
+  })
+  await page.route('**/api/v1/workspaces/active', async route => {
+    const body = route.request().postDataJSON() as { name?: unknown }
+    activeProject = String(body.name || '')
+    openedProjects.push(activeProject)
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
+  })
+
+  await gotoSyntheticApp(page)
+  const projectTrigger = page.getByRole('button', { name: /Current project: Member project/ })
+  await projectTrigger.click()
+  const selector = page.getByRole('dialog', { name: 'Projects' })
+  await expect(selector).toBeVisible()
+  await expect(selector.getByRole('button', { name: /Unlock|Lock/ })).toHaveCount(0)
+  await expect(selector.locator('input[type="password"]')).toHaveCount(0)
+
+  await selector.getByRole('button', { name: 'Second member project' }).click()
+  await expect(page.getByRole('button', { name: /Current project: Second member project/ })).toBeVisible()
+  expect(openedProjects).toContain('Second member project')
+
+  await page.getByRole('button', { name: /Current project: Second member project/ }).click()
+  const reopenedSelector = page.getByRole('dialog', { name: 'Projects' })
+  await reopenedSelector.getByRole('button', { name: 'New project' }).click()
+  await expect(reopenedSelector.locator('input[type="password"]')).toHaveCount(0)
+  await reopenedSelector.getByPlaceholder('workspace-name').fill('Created member project')
+  await reopenedSelector.getByRole('button', { name: 'Create project' }).click()
+  await expect(page.getByRole('button', { name: /Current project: Created-member-project/ })).toBeVisible()
+  expect(createdBodies).toEqual([{ name: 'Created-member-project', remember: 'device' }])
+})
+
 test('unknown and external requests are blocked before leaving the fixture', async ({ page }) => {
   await skipWelcome(page)
   await gotoSyntheticApp(page)

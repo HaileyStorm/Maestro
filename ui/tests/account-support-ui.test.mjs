@@ -1128,6 +1128,121 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
   assert.equal(calls[0].init.body, undefined)
 })
 
+test('Support self preserves a server-authored active hosted allowance', async () => {
+  await withFetchMock(async () => jsonResponse({
+    ...publicSupport,
+    account_support: {
+      recorded: {
+        event_count: 1,
+        one_time_tier: 'backer',
+        recurring_tier: null,
+        active_recurring_count: 0,
+        recorded_allowance: {
+          ...recordedAllowance,
+          state: 'active',
+          enforcement_enabled: true,
+        },
+      },
+      benefits: {
+        state: 'active',
+        scheduler_enforcement_enabled: true,
+        effective_benefits: ['bounded_queue_priority'],
+        recorded_eligibility: ['one_time_credit_eligibility'],
+      },
+    },
+    responsible_use: responsibleUse,
+  }), async () => {
+    const self = await fetchSupportSelf()
+    assert.equal(self.account.recorded_allowance.state, 'active')
+    assert.equal(self.account.recorded_allowance.enforcement_enabled, true)
+    assert.equal(self.account.recorded_allowance.effective_allowance, 460)
+    assert.deepEqual(self.account.recorded_allowance.sources, recordedAllowance.sources)
+  })
+})
+
+test('Support self fails closed on incoherent hosted benefit claims', async () => {
+  await withFetchMock(async () => jsonResponse({
+    ...publicSupport,
+    account_support: {
+      recorded: {
+        event_count: 1,
+        active_recurring_count: 0,
+        recorded_allowance: {
+          ...recordedAllowance,
+          state: 'active',
+          enforcement_enabled: true,
+        },
+      },
+      benefits: {
+        state: 'active',
+        scheduler_enforcement_enabled: true,
+        effective_benefits: [],
+        recorded_eligibility: [],
+      },
+    },
+    responsible_use: responsibleUse,
+  }), async () => {
+    const self = await fetchSupportSelf()
+    assert.equal(self.account.benefits.state, 'recorded_not_enforced')
+    assert.equal(self.account.benefits.scheduler_enforcement_enabled, false)
+    assert.equal(Object.hasOwn(self.account, 'recorded_allowance'), false)
+  })
+})
+
+test('Support self rejects an active hosted claim with zero allowance', async () => {
+  await withFetchMock(async () => jsonResponse({
+    ...publicSupport,
+    account_support: {
+      recorded: {
+        event_count: 0,
+        active_recurring_count: 0,
+        recorded_allowance: {
+          ...recordedAllowance,
+          state: 'active',
+          enforcement_enabled: true,
+          effective_allowance: 0,
+          sources: [],
+        },
+      },
+      benefits: {
+        state: 'active',
+        scheduler_enforcement_enabled: true,
+        effective_benefits: ['bounded_queue_priority'],
+        recorded_eligibility: [],
+      },
+    },
+    responsible_use: responsibleUse,
+  }), async () => {
+    const self = await fetchSupportSelf()
+    assert.equal(self.account.benefits.state, 'recorded_not_enforced')
+    assert.equal(Object.hasOwn(self.account, 'recorded_allowance'), false)
+  })
+})
+
+test('Support self rejects no-allowance priority copy with a positive allowance', async () => {
+  await withFetchMock(async () => jsonResponse({
+    ...publicSupport,
+    account_support: {
+      recorded: {
+        event_count: 1,
+        active_recurring_count: 0,
+        recorded_allowance: recordedAllowance,
+      },
+      benefits: {
+        state: 'hosted_priority_available',
+        scheduler_enforcement_enabled: true,
+        effective_benefits: [],
+        recorded_eligibility: [],
+      },
+    },
+    responsible_use: responsibleUse,
+  }), async () => {
+    const self = await fetchSupportSelf()
+    assert.equal(self.account.benefits.state, 'recorded_not_enforced')
+    assert.equal(Object.hasOwn(self.account, 'recorded_allowance'), false)
+  })
+})
+
 test('Support account mapping preserves legacy responses without a recorded allowance', async () => {
   await withFetchMock(async () => jsonResponse({
     ...publicSupport,
@@ -1372,6 +1487,7 @@ async function loadAccountButton() {
           if (args.path === 'api') return { contents: `
             export class AccountApiError extends Error {}
             export const isDirectLoopbackHostname = hostname => hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1'
+            export const isAccountProjectAccessActive = (context, migration = null) => context?.accounts?.enabled === true && (migration !== null ? migration.state === 'active' && migration.enforced === true : context.account_project_access_active === true)
           ` }
           if (args.path === 'focus') return { contents: 'export const closeModalIfTop = () => true; export const installModalFocus = () => () => {}' }
           if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__accountStore)' }
@@ -1424,7 +1540,10 @@ async function loadSupportPanel() {
           if (args.path === 'lucide') return { contents: `
             export const Check='Check', ExternalLink='ExternalLink', HeartHandshake='HeartHandshake', Loader2='Loader2', ShieldCheck='ShieldCheck'
           ` }
-          if (args.path === 'api') return { contents: 'export class AccountApiError extends Error {}' }
+          if (args.path === 'api') return { contents: `
+            export class AccountApiError extends Error {}
+            export const isAccountProjectAccessActive = (context, migration = null) => context?.accounts?.enabled === true && (migration !== null ? migration.state === 'active' && migration.enforced === true : context.account_project_access_active === true)
+          ` }
           if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__supportStore)' }
           return null
         })
@@ -1508,6 +1627,20 @@ test('Support renders only server-authored account activation readiness as passi
     assert.doesNotMatch(readinessText, /credential|passkey|account count|created at|timestamp|store path|provider|payment|credit/i)
   }
 
+  globalThis.__supportStore.accountContext = { ...context, enabled: true, activation_state: 'ready' }
+  globalThis.__supportStore.accessContext = {
+    accounts: { enabled: true },
+    account_project_access_active: true,
+    project_password_required: false,
+  }
+  const activeReadinessText = elementText(findElements(
+    expandElement(SupportPanel()),
+    node => node.props?.['aria-label'] === 'Account setup status',
+  )[0])
+  assert.match(activeReadinessText, /Project access follows your account membership/)
+  assert.doesNotMatch(activeReadinessText, /project password/)
+  globalThis.__supportStore.accessContext = undefined
+
   globalThis.__supportStore.accountContext = { ...context, activation_state: 'unknown_future_state' }
   const malformedText = elementText(findElements(
     expandElement(SupportPanel()),
@@ -1578,7 +1711,7 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   assert.match(text, /Recorded amount: 460 compute seconds/)
   assert.match(text, /460 compute seconds/)
   assert.match(text, /Recorded as of/)
-  assert.match(text, /not an active balance and does not change generation, queueing, or retries/)
+  assert.match(text, /not active on the current host and does not change generation, queueing, or retries/)
   assert.match(text, /Recorded status: active/)
   assert.match(text, /Recorded informational amount:/)
   assert.match(text, /Free allowance/)
@@ -1595,6 +1728,32 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   assert.match(sourceList[0].props.className, /\bgrid-cols-1\b/)
   assert.match(sourceList[0].props.className, /\bmin-w-0\b/)
   assert.equal(findElements(sourceList[0], node => node.type === 'li').length, 3)
+
+  globalThis.__supportStore.supportSelf = {
+    public: publicSupport,
+    account: {
+      ...account,
+      benefits: {
+        state: 'active', scheduler_enforcement_enabled: true,
+        effective_benefits: ['bounded_queue_priority'], recorded_eligibility: [],
+      },
+      recorded_allowance: {
+        ...recordedAllowance,
+        state: 'active',
+        enforcement_enabled: true,
+      },
+    },
+    responsible_use: responsibleUse,
+  }
+  const activeTree = expandElement(SupportPanel())
+  const activeText = elementText(activeTree)
+  assert.match(activeText, /active hosted compute allowance/i)
+  assert.match(activeText, /Eligible jobs can receive bounded queue priority/)
+  assert.match(activeText, /jobs without enough allowance still remain eligible/)
+  assert.equal(findElements(
+    activeTree,
+    node => node.props?.['aria-label'] === 'Active hosted compute allowance',
+  ).length, 1)
 
   globalThis.__supportStore.supportSelf = {
     public: publicSupport,
@@ -1708,8 +1867,9 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   const tree = expandElement(SupportPanel())
   const text = elementText(tree)
   assert.match(text, /Private support history and follow-up/)
-  assert.match(text, /do not process payments, enable support services, apply credits, or provide benefits/)
-  assert.match(text, /saves a record only[^]*does not process a payment or apply credits or benefits/i)
+  assert.match(text, /never processes a payment here/i)
+  assert.match(text, /Contribution records can update the compute allowance/i)
+  assert.match(text, /does not process a payment[^]*may update the account's compute allowance/i)
   assert.doesNotMatch(text, /recorded_not_enforced|opaque|audit|proof|loopback|cookie|fulfillment|minor unit|terminal|sequence/i)
   const manualOptionValues = findElements(tree, node => node.type === 'option')
     .map(node => node.props.value)
@@ -2589,7 +2749,9 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(supportSource, /After support becomes sustainable, it will fund hosting Maestro Continuum with more compute/)
   assert.match(supportSource, /offers no guarantees or perks/)
   assert.match(supportSource, /Support benefits are not active/)
-  assert.match(supportSource, /not an active balance and does not change generation, queueing, or retries/)
+  assert.match(supportSource, /not active on the current host and does not change generation, queueing, or retries/)
+  assert.match(supportSource, /summary\.benefits\.state === 'active'/)
+  assert.match(supportSource, /Active hosted compute allowance/)
   assert.doesNotMatch(supportSource, /localStorage|sessionStorage|console\.|subject_key|source_event_key|account_id|email|customer|invoice|payment_method|credential|secret|@|\$600|tax|end-to-end|passkey/i)
   assert.doesNotMatch(supportSource, /['"]SLA['"]/)
   assert.match(supportSource, /available only after the owner recently confirmed their password/i)

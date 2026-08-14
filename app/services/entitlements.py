@@ -303,11 +303,17 @@ class RecordedAllowancePolicy:
 DEFAULT_RECORDED_ALLOWANCE_POLICY = RecordedAllowancePolicy(
     unit="compute_seconds",
     free_allowance_units=0,
-    one_time_rules=(),
-    recurring_rules=(),
-    one_time_cap_units=0,
-    one_time_validity_seconds=0,
-    recurring_validity_seconds=0,
+    one_time_rules=(
+        AllowanceRule(500, 100),
+        AllowanceRule(2_500, 300),
+    ),
+    recurring_rules=(
+        AllowanceRule(300, 50),
+        AllowanceRule(1_000, 200),
+    ),
+    one_time_cap_units=400,
+    one_time_validity_seconds=90 * 24 * 60 * 60,
+    recurring_validity_seconds=35 * 24 * 60 * 60,
 )
 
 

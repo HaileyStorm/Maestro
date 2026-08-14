@@ -41,6 +41,8 @@ def main() -> int:
     ensure_default(path, "PINOKIO_SHARE_CLOUDFLARE", "true")
     ensure_default(path, "MAESTRO_ACCOUNTS_ENABLED", "false")
     ensure_default(path, "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED", "false")
+    ensure_default(path, "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED", "false")
+    ensure_default(path, "MAESTRO_COMPUTE_EXECUTION_REALM", "local")
     return 0
 
 

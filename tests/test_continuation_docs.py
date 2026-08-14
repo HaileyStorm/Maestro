@@ -68,14 +68,30 @@ class TestContinuationDocs(unittest.TestCase):
             with self.subTest(sso_contract=required):
                 self.assertIn(required, sso)
 
-        credits = self.guide_section("Credits remain a separate activation gate")
-        self.assertIn(
-            "Runtime credit accounting is currently compiled hard-off",
-            credits,
-        )
+        credits = self.guide_section("Optional hosted credit scheduling")
+        self.assertIn("MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true", credits)
+        self.assertIn("MAESTRO_COMPUTE_EXECUTION_REALM=hosted", credits)
+        self.assertIn("safe tracked defaults", credits)
         self.assertIn("sealed account store", credits)
         self.assertIn("Otherwise-valid zero/partial/refunded/expired-credit", credits)
-        self.assertIn("Keep credit activation off", credits)
+        self.assertIn("flat `402`", credits)
+        self.assertIn("cross-band starvation bound", credits)
+
+        samples = self.guide_section("GPU-idle comparative sample campaign")
+        for required in (
+            "Maestro.git-134",
+            "Maestro.git-28",
+            "Reference lock / Pocket to Picture Lock",
+            "same normalized prompt/input",
+            "ordinary durable generation job",
+            "Never preempt a running GPU generation",
+            "2–5 sequential, non-adjacent, nearby frames",
+            "normalized sampling positions",
+            "human review",
+            "control",
+        ):
+            with self.subTest(sample_campaign_contract=required):
+                self.assertIn(required, samples)
 
         restart = self.guide_section("Coordinated restart and status")
         for required in (
@@ -135,16 +151,16 @@ class TestContinuationDocs(unittest.TestCase):
         for required in (
             "019fd895-21e8-7f03-86ea-a1296103337e",
             "b528ab7fd467be21c0567f6a619ef1d33208df2b",
-            "Bird-in-the-hand next milestone",
+            "Active owner, projects, and hosted-credit milestone",
             "Prior thread reference",
             "Primary fresh-thread prompt",
             "Post-owner prompt",
-            "Deferred credit prompt",
+            "Hosted credit prompt",
             "Deferred SSO prompt",
             "historical SQLite",
-            "explicitly transfers/releases",
+            "explicitly transferred",
             "zero quarantine",
-            "Do not reintroduce flat 402",
+            "do not reintroduce flat 402",
             "one writer per file",
             "not a hard dependency or final product choice",
             "auto-link by email",

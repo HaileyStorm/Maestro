@@ -166,10 +166,12 @@ class CreditLaunchWiringTests(unittest.TestCase):
                 "tool_upscale", "tool_revoice",
             }),
             "_credit_admission_evaluations": {},
+            "_credit_mark_accounting_health": lambda _healthy: None,
             "_credit_runtime_policy": lambda: ENFORCED,
             "_credit_server_execution_realm": lambda: "hosted",
             "_credit_account_id": lambda _job, persisted=True: "a" * 32,
             "_credit_owner_exempt": lambda _job, persisted=True: False,
+            "_credit_job_is_remote_origin": lambda _job: True,
             "_accounts_enabled": lambda: True,
             "_account_auth_store": lambda: types.SimpleNamespace(
                 resolve_account=lambda account_id: {
@@ -283,6 +285,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "_credit_accounting_reserve",
             "_credit_accounting_revalidate",
             "_credit_baseline_quote",
+            "_credit_unfunded_hosted_quote",
             "_credit_release_accounting",
             "_credit_transition_id",
             "_credit_reservation",
@@ -349,6 +352,28 @@ class CreditLaunchWiringTests(unittest.TestCase):
                 self.assertEqual(job["status"], "queued")
                 self.assertEqual(job["params"][REALM_PARAM], "hosted")
                 self.assertEqual(job["params"][ACCOUNT_PARAM], "a" * 32)
+
+    def test_direct_or_lan_origin_on_hosted_runtime_stays_unmetered(self):
+        namespace = self._namespace(_quote(units=20))
+        namespace["_credit_job_is_remote_origin"] = (
+            lambda job: bool(job.get("source_remote"))
+        )
+        _functions({
+            "_credit_accounting_reservation_id",
+            "_credit_job_exempt",
+            "_credit_prepare_submission_manifest",
+            "_credit_prepare_submission",
+        }, namespace)
+        job = {
+            "id": "direct-hosted-runtime",
+            "status": "queued",
+            "source_remote": False,
+            "params": {"model_type": "standard"},
+        }
+        before = copy.deepcopy(job)
+
+        self.assertFalse(namespace["_credit_prepare_submission"](job))
+        self.assertEqual(job, before)
 
     def test_dispatch_consumes_once_and_replay_is_idempotent(self):
         namespace = self._orchestrator(_quote(units=20))
@@ -522,16 +547,46 @@ class CreditLaunchWiringTests(unittest.TestCase):
             with self.subTest(label=label):
                 assert_case(label)
 
-    def test_production_runtime_policy_is_hard_off(self):
+    def test_production_runtime_policy_is_ready_but_environment_default_off(self):
+        assignments = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in TREE.body
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in {
+                    "_CREDIT_RUNTIME_ACCOUNTING_DURABLE",
+                    "_CREDIT_RUNTIME_VALIDATED_POLICY_UNITS",
+                }
+            )
+        }
+        self.assertIs(
+            assignments["_CREDIT_RUNTIME_ACCOUNTING_DURABLE"], True,
+        )
+        self.assertEqual(
+            assignments["_CREDIT_RUNTIME_VALIDATED_POLICY_UNITS"], 400,
+        )
+        environment = {"enabled": False, "names": []}
         namespace = {
             "CreditRuntimePolicy": CreditRuntimePolicy,
-            "_CREDIT_RUNTIME_ACCOUNTING_DURABLE": False,
-            "_CREDIT_RUNTIME_VALIDATED_POLICY_UNITS": 0,
+            **assignments,
             "_accounts_enabled": lambda: True,
-            "_env_flag_enabled": lambda _name: True,
+            "_env_flag_enabled": lambda name: (
+                environment["names"].append(name)
+                or environment["enabled"]
+            ),
         }
         _functions({"_credit_runtime_policy"}, namespace)
         self.assertFalse(
+            namespace["_credit_runtime_policy"]().enforcement_enabled
+        )
+        self.assertEqual(
+            environment["names"],
+            ["MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED"],
+        )
+        environment["enabled"] = True
+        self.assertTrue(
             namespace["_credit_runtime_policy"]().enforcement_enabled
         )
 
@@ -547,6 +602,105 @@ class CreditLaunchWiringTests(unittest.TestCase):
         self.assertIsNone(namespace["_credit_accounting_journal"]())
         self.assertEqual(callbacks, [None])
         self.assertEqual(list(Path(self.temporary.name).iterdir()), [])
+
+    def test_hosted_accounting_fails_closed_on_corrupt_startup_state(self):
+        app_dir = Path(self.temporary.name)
+        storage = app_dir / "storage"
+        storage.mkdir()
+        (storage / "credit-accounting.json").write_text(
+            "not a sealed journal",
+            encoding="utf-8",
+        )
+        callbacks = []
+        health = []
+        namespace = {
+            "os": os,
+            "CreditAccountingError": CreditAccountingError,
+            "CreditAccountingJournal": CreditAccountingJournal,
+            "CreditAccountingPolicy": CreditAccountingPolicy,
+            "_app_dir": str(app_dir),
+            "_credit_accounting_enabled": lambda: True,
+            "_credit_accounting_value": None,
+            "_credit_accounting_lock": threading.RLock(),
+            "_credit_mark_accounting_health": health.append,
+            "_support_domain_key": lambda _purpose: ACCOUNTING_SECRET,
+            "configure_credit_lifecycle_callback": callbacks.append,
+        }
+        _functions({"_credit_accounting_journal"}, namespace)
+
+        self.assertIsNone(namespace["_credit_accounting_journal"]())
+        self.assertIsNone(namespace["_credit_accounting_value"])
+        self.assertEqual(health, [False])
+        self.assertEqual(callbacks, [None])
+
+    def test_existing_accounting_fails_closed_on_corrupt_startup_state(self):
+        app_dir = Path(self.temporary.name)
+        storage = app_dir / "storage"
+        storage.mkdir()
+        (storage / "credit-accounting.json").write_text(
+            "not a sealed journal",
+            encoding="utf-8",
+        )
+        health = []
+        namespace = {
+            "os": os,
+            "CreditAccountingError": CreditAccountingError,
+            "CreditAccountingJournal": CreditAccountingJournal,
+            "CreditAccountingPolicy": CreditAccountingPolicy,
+            "_app_dir": str(app_dir),
+            "_credit_accounting_value": None,
+            "_credit_accounting_lock": threading.RLock(),
+            "_credit_mark_accounting_health": health.append,
+            "_support_domain_key": lambda _purpose: ACCOUNTING_SECRET,
+        }
+        _functions({"_credit_accounting_existing_journal"}, namespace)
+
+        self.assertIsNone(namespace["_credit_accounting_existing_journal"]())
+        self.assertIsNone(namespace["_credit_accounting_value"])
+        self.assertEqual(health, [False])
+
+    def test_hosted_accounting_fails_closed_on_unsafe_lock_path(self):
+        app_dir = Path(self.temporary.name)
+        storage = app_dir / "storage"
+        storage.mkdir()
+        (storage / "credit-accounting.json.lock").mkdir()
+        callbacks = []
+        health = []
+        namespace = {
+            "os": os,
+            "CreditAccountingError": CreditAccountingError,
+            "CreditAccountingJournal": CreditAccountingJournal,
+            "CreditAccountingPolicy": CreditAccountingPolicy,
+            "_app_dir": str(app_dir),
+            "_credit_accounting_enabled": lambda: True,
+            "_credit_accounting_value": None,
+            "_credit_accounting_lock": threading.RLock(),
+            "_credit_mark_accounting_health": health.append,
+            "_support_domain_key": lambda _purpose: ACCOUNTING_SECRET,
+            "configure_credit_lifecycle_callback": callbacks.append,
+        }
+        _functions({"_credit_accounting_journal"}, namespace)
+
+        self.assertIsNone(namespace["_credit_accounting_journal"]())
+        self.assertIsNone(namespace["_credit_accounting_value"])
+        self.assertEqual(health, [False])
+        self.assertEqual(callbacks, [None])
+
+    def test_support_projection_fails_closed_after_cached_journal_outage(self):
+        namespace = {
+            "_credit_accounting_enabled": lambda: True,
+            "_credit_accounting_value": object(),
+            "_credit_accounting_healthy": False,
+            "_credit_accounting_journal": lambda: object(),
+        }
+        _functions({"_credit_support_scheduler_enforcement_enabled"}, namespace)
+        self.assertFalse(
+            namespace["_credit_support_scheduler_enforcement_enabled"](),
+        )
+        namespace["_credit_accounting_healthy"] = True
+        self.assertTrue(
+            namespace["_credit_support_scheduler_enforcement_enabled"](),
+        )
 
     def test_owner_exemption_uses_fresh_store_role_and_ignores_job_tampering(self):
         account_id = "a" * 32
@@ -862,7 +1016,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "reserved_units"
         ], 10)
 
-    def test_partial_reserve_degrades_to_schema_v1_baseline(self):
+    def test_partial_reserve_stays_durable_in_lowest_hosted_band(self):
         namespace, journal, jobs = self._real_accounting(units=15)
         first = {
             "id": "partial-first", "kind": "studio_generation",
@@ -878,14 +1032,33 @@ class CreditLaunchWiringTests(unittest.TestCase):
         self.assertTrue(namespace["_credit_prepare_submission"](first))
         self.assertTrue(namespace["_credit_prepare_submission"](second))
         self.assertEqual(second["credit_queue"]["schema_version"], 1)
-        self.assertEqual(second["credit_queue"]["queue_band"], 0)
+        self.assertEqual(second["credit_queue"]["decision"], "hosted_baseline")
+        self.assertTrue(second["credit_queue"]["metering_applied"])
+        self.assertEqual(second["credit_queue"]["queue_band"], -1)
         self.assertIsNone(second["credit_queue"]["reservation_state"])
         self.assertTrue(namespace["_credit_prepare_admission"](second))
-        self.assertEqual(second["credit_queue"]["queue_band"], 0)
+        self.assertEqual(second["credit_queue"]["decision"], "hosted_baseline")
+        self.assertTrue(second["credit_queue"]["metering_applied"])
+        self.assertEqual(second["credit_queue"]["queue_band"], -1)
         self.assertIsNone(second["credit_queue"]["reservation_state"])
         self.assertEqual(journal.public_projection(ACCOUNTING_ACCOUNT)[
             "reserved_units"
         ], 10)
+
+        local_quote = quote_reservation(
+            realm="local",
+            requested_units=10,
+            recorded_allowance=_allowance(15),
+            capability_priority=STANDARD,
+            policy=ENFORCED,
+        )
+        namespace["_credit_evaluation"] = lambda _job: (
+            local_quote, "a" * 64,
+        )
+        self.assertTrue(namespace["_credit_prepare_admission"](second))
+        self.assertEqual(second["credit_queue"]["realm"], "local")
+        self.assertFalse(second["credit_queue"]["metering_applied"])
+        self.assertEqual(second["credit_queue"]["queue_band"], 0)
 
     def test_dispatch_journal_outage_downgrades_running_job_then_finishes(self):
         namespace, journal, jobs = self._real_accounting(units=20)
@@ -905,7 +1078,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
         )
         self.assertFalse(namespace["_credit_prepare_dispatch"](job))
         self.assertEqual(job["credit_queue"]["schema_version"], 1)
-        self.assertEqual(job["credit_queue"]["queue_band"], 0)
+        self.assertEqual(job["credit_queue"]["queue_band"], -1)
         self.assertTrue(finish_job(job, "failed"))
         self.assertEqual(job["status"], "failed")
         self.assertEqual(journal.public_projection(ACCOUNTING_ACCOUNT)[
@@ -953,7 +1126,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
             "reserved_units"
         ], 0)
 
-    def test_admission_journal_outage_runs_at_baseline_and_retries_cleanup(self):
+    def test_admission_journal_outage_runs_in_lowest_band_and_retries_cleanup(self):
         namespace, journal, jobs = self._real_accounting(units=20)
         job = {
             "id": "admission-store-outage", "kind": "studio_generation",
@@ -975,12 +1148,21 @@ class CreditLaunchWiringTests(unittest.TestCase):
         )
         self.assertTrue(namespace["_credit_prepare_admission"](job))
         self.assertEqual(job["credit_queue"]["schema_version"], 1)
-        self.assertEqual(job["credit_queue"]["queue_band"], 0)
+        self.assertEqual(job["credit_queue"]["queue_band"], -1)
         self.assertIsNone(job["credit_queue"]["reservation_state"])
+        self.assertTrue(job["params"][BASELINE_PARAM])
         self.assertIn(CLEANUP_PARAM, job["params"])
         self.assertEqual(journal.public_projection(ACCOUNTING_ACCOUNT)[
             "reserved_units"
         ], 10)
+
+        # A retry/restart admission must not reconstruct a logical funded
+        # reservation after the durable hold was released or became partial.
+        self.assertTrue(namespace["_credit_prepare_admission"](job))
+        self.assertEqual(job["credit_queue"]["schema_version"], 1)
+        self.assertEqual(job["credit_queue"]["queue_band"], -1)
+        self.assertIsNone(job["credit_queue"]["reservation_state"])
+        self.assertTrue(job["params"][BASELINE_PARAM])
 
         job["status"] = "running"
         self.assertTrue(finish_job(job, "failed"))
@@ -989,6 +1171,72 @@ class CreditLaunchWiringTests(unittest.TestCase):
             job, persist_baseline=True,
         ))
         self.assertNotIn(CLEANUP_PARAM, job["params"])
+        self.assertEqual(journal.public_projection(ACCOUNTING_ACCOUNT)[
+            "reserved_units"
+        ], 0)
+
+    def test_admission_fallback_does_not_reread_an_unavailable_allowance(self):
+        namespace, journal, jobs = self._real_accounting(units=20)
+        job = {
+            "id": "allowance-reread-outage", "kind": "studio_generation",
+            "status": "queued", "workspace": "default",
+            "created_at": 12.0, "params": {"model_type": "standard"},
+        }
+        jobs[job["id"]] = job
+        self.assertTrue(namespace["_credit_prepare_submission"](job))
+        namespace["_credit_accounting_revalidate"] = lambda *_args: None
+        namespace["_credit_recorded_allowance"] = (
+            lambda _job: (_ for _ in ()).throw(OSError("allowance offline"))
+        )
+
+        self.assertTrue(namespace["_credit_prepare_admission"](job))
+
+        self.assertEqual(job["credit_queue"]["schema_version"], 1)
+        self.assertEqual(job["credit_queue"]["queue_band"], -1)
+        self.assertIsNone(job["credit_queue"]["reservation_state"])
+        self.assertTrue(job["params"][BASELINE_PARAM])
+        self.assertEqual(journal.public_projection(ACCOUNTING_ACCOUNT)[
+            "reserved_units"
+        ], 0)
+
+    def test_failed_baseline_persistence_retries_the_durable_release(self):
+        namespace, journal, jobs = self._real_accounting(units=20)
+        job = {
+            "id": "baseline-persistence-retry", "kind": "studio_generation",
+            "status": "queued", "workspace": "default",
+            "created_at": 13.0, "params": {"model_type": "standard"},
+        }
+        jobs[job["id"]] = job
+        self.assertTrue(namespace["_credit_prepare_submission"](job))
+        namespace["_credit_accounting_revalidate"] = lambda *_args: None
+
+        class UnavailableJournal:
+            def release(self, **_kwargs):
+                raise OSError("release offline")
+
+        namespace["_credit_accounting_existing_journal"] = (
+            lambda: UnavailableJournal()
+        )
+        configure_durability_hook(
+            lambda _transition: (_ for _ in ()).throw(
+                OSError("persistence offline")
+            ),
+        )
+        with self.assertRaises(namespace["CreditRuntimeError"]):
+            namespace["_credit_prepare_admission"](job)
+        self.assertEqual(job["credit_queue"]["schema_version"], 2)
+        self.assertEqual(job["credit_queue"]["queue_band"], 1)
+        self.assertNotIn(BASELINE_PARAM, job["params"])
+        self.assertEqual(journal.public_projection(ACCOUNTING_ACCOUNT)[
+            "reserved_units"
+        ], 10)
+
+        configure_durability_hook(None)
+        namespace["_credit_accounting_existing_journal"] = lambda: journal
+        self.assertTrue(namespace["_credit_prepare_admission"](job))
+        self.assertEqual(job["credit_queue"]["schema_version"], 1)
+        self.assertEqual(job["credit_queue"]["queue_band"], -1)
+        self.assertTrue(job["params"][BASELINE_PARAM])
         self.assertEqual(journal.public_projection(ACCOUNTING_ACCOUNT)[
             "reserved_units"
         ], 0)

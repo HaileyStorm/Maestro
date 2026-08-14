@@ -120,6 +120,7 @@ def _security_namespace():
         "_runtime_share_url": "",
         "_runtime_share_quick_tunnel_url": "",
         "_runtime_share_stable_verified": False,
+        "_account_project_access_state": lambda: {"enforced": False},
     }
     exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
     namespace["FakeHTTPException"] = FakeHTTPException
@@ -183,6 +184,9 @@ class OriginPolicyTests(unittest.TestCase):
             self.security["_runtime_share_url"] = ""
             self.security["_runtime_share_quick_tunnel_url"] = ""
             self.security["_runtime_share_stable_verified"] = False
+        self.security["_account_project_access_state"] = lambda: {
+            "enforced": False,
+        }
 
     def _register_runtime_share(
         self,
@@ -268,11 +272,33 @@ class OriginPolicyTests(unittest.TestCase):
             self.assertIsNone(reject(request))
 
         self.assertTrue(context["remote"])
+        self.assertFalse(context["account_project_access_active"])
+        self.assertFalse(context["account_project_creation_requires_account"])
         self.assertTrue(context["project_password_required"])
+        self.assertEqual(
+            context["share_flow"],
+            "Select a project name, then enter that project's password",
+        )
         self.assertFalse(context["machine_controls"])
         self.assertFalse(context["custom_model_sources"])
         self.assertFalse(context["classic_ui"])
         self.assertEqual(context["share_url"], "")
+
+    def test_active_account_projects_remove_remote_project_password_requirement(self):
+        request = _Request(base_url="https://maestro.account.workers.dev/")
+        request.state = types.SimpleNamespace(maestro_remote=True)
+        self.security["_account_project_access_state"] = lambda: {
+            "state": "active",
+            "enforced": True,
+        }
+
+        context = self.security["get_access_context"](request)
+
+        self.assertTrue(context["remote"])
+        self.assertTrue(context["account_project_access_active"])
+        self.assertTrue(context["account_project_creation_requires_account"])
+        self.assertFalse(context["project_password_required"])
+        self.assertEqual(context["share_flow"], "Sign in and select a project")
 
     def test_other_workers_dev_origin_is_rejected_on_registered_quick_target(self):
         reject = self.security["_reject_cross_origin_mutation"]
@@ -974,6 +1000,177 @@ class LaunchSecurityContractTests(unittest.TestCase):
             require.index("_project_access.authorize"),
         )
 
+    def test_active_membership_bypasses_project_password_checks(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        member = {"state": "active"}
+        calls = {
+            "status": 0,
+            "authorize": 0,
+            "unlock": 0,
+            "set_password": 0,
+            "lock": 0,
+            "lock_all": 0,
+        }
+
+        def password_call(kind):
+            def fail(*_args, **_kwargs):
+                calls[kind] += 1
+                raise AssertionError(f"active membership called password {kind}")
+            return fail
+
+        project_access = types.SimpleNamespace(
+            status=password_call("status"),
+            authorize=password_call("authorize"),
+            unlock=password_call("unlock"),
+            set_password=password_call("set_password"),
+            lock=password_call("lock"),
+            lock_all=password_call("lock_all"),
+        )
+        access = self._function_namespace(
+            ("_require_project_access",),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "_account_project_access_state": lambda: {
+                    "state": "active", "enforced": True,
+                },
+                "_existing_workspace_dir": lambda _name: "/outputs/project-a",
+                "_workspace_dir": lambda _name: (_ for _ in ()).throw(
+                    AssertionError("active access used a creating path")
+                ),
+                "_require_account_project_permission": (
+                    lambda *_args, **_kwargs: member
+                ),
+                "_project_access": project_access,
+                "_STATE_CHANGING_METHODS": frozenset({"POST", "PUT", "DELETE"}),
+            },
+        )["_require_project_access"]
+        for method in ("GET", "POST"):
+            request = types.SimpleNamespace(
+                method=method,
+                state=types.SimpleNamespace(
+                    maestro_remote=True,
+                    maestro_session_id="account-browser",
+                ),
+            )
+            self.assertEqual(
+                access(request, "project-a"), "/outputs/project-a",
+            )
+        self.assertTrue(all(count == 0 for count in calls.values()))
+
+        class NoBodyRequest:
+            state = types.SimpleNamespace(
+                maestro_remote=True,
+                maestro_session_id="account-browser",
+            )
+
+            async def json(self):
+                raise AssertionError("membership unlock read a password body")
+
+        unlock = self._function_namespace(
+            ("unlock_workspace",),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "_existing_workspace_dir": lambda _name: "/outputs/project-a",
+                "_require_account_project_permission": (
+                    lambda *_args, **_kwargs: member
+                ),
+                "_project_access": project_access,
+            },
+        )["unlock_workspace"]
+        self.assertEqual(
+            asyncio.run(unlock("project-a", NoBodyRequest()))["unlocked"],
+            True,
+        )
+        self.assertTrue(all(count == 0 for count in calls.values()))
+
+        active_namespace = self._function_namespace(
+            (
+                "set_workspace_password",
+                "lock_workspace",
+                "lock_all_workspaces",
+            ),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "_account_project_access_state": lambda: {
+                    "state": "active", "enforced": True,
+                },
+                "_existing_workspace_dir": lambda _name: "/outputs/project-a",
+                "_workspace_dir": lambda _name: (_ for _ in ()).throw(
+                    AssertionError("active password route used a creating path")
+                ),
+                "_require_account_project_permission": (
+                    lambda *_args, **_kwargs: member
+                ),
+                "_project_access": project_access,
+                "_remote_active_projects": {"account-browser": "project-a"},
+                "_remote_active_projects_lock": threading.RLock(),
+            },
+        )
+        password_result = asyncio.run(active_namespace[
+            "set_workspace_password"
+        ]("project-a", NoBodyRequest()))
+        self.assertFalse(password_result["password_protected"])
+        self.assertTrue(password_result["unlocked"])
+        self.assertEqual(
+            active_namespace["lock_workspace"]("project-a", NoBodyRequest()),
+            {"unlocked": True, "locked_count": 0},
+        )
+        self.assertEqual(
+            active_namespace["lock_all_workspaces"](NoBodyRequest()),
+            {"unlocked": True, "locked_count": 0},
+        )
+        self.assertTrue(all(count == 0 for count in calls.values()))
+
+        legacy_calls = {"lock": 0, "lock_all": 0}
+        legacy_access = types.SimpleNamespace(
+            lock=lambda *_args: (
+                legacy_calls.__setitem__("lock", legacy_calls["lock"] + 1)
+                or 1
+            ),
+            lock_all=lambda *_args: (
+                legacy_calls.__setitem__(
+                    "lock_all", legacy_calls["lock_all"] + 1,
+                )
+                or 2
+            ),
+        )
+        legacy_namespace = self._function_namespace(
+            ("lock_workspace", "lock_all_workspaces"),
+            {
+                "Request": object,
+                "_account_project_access_state": lambda: {
+                    "state": "needs_attention", "enforced": False,
+                },
+                "_project_access": legacy_access,
+                "_remote_active_projects": {"account-browser": "project-a"},
+                "_remote_active_projects_lock": threading.RLock(),
+            },
+        )
+        self.assertFalse(legacy_namespace[
+            "lock_workspace"
+        ]("project-a", NoBodyRequest())["unlocked"])
+        self.assertFalse(legacy_namespace[
+            "lock_all_workspaces"
+        ](NoBodyRequest())["unlocked"])
+        self.assertEqual(legacy_calls, {"lock": 1, "lock_all": 1})
+
+        create = self._function_source("create_workspace")
+        delete = self._function_source("delete_workspace")
+        self.assertIn(
+            "remote and not account_projects_enforced and not password",
+            create,
+        )
+        self.assertIn("password and not account_projects_enforced", create)
+        self.assertIn("if membership is None:", delete)
+
     def test_pending_project_setup_keeps_legacy_password_access(self):
         class FakeHTTPException(Exception):
             def __init__(self, *, status_code, detail):
@@ -1168,15 +1365,11 @@ class LaunchSecurityContractTests(unittest.TestCase):
                     {"name": "a", "path": "/outputs/project-a", "file_count": 1},
                     {"name": "b", "path": "/outputs/project-b", "file_count": 2},
                 ],
-                "_project_access": types.SimpleNamespace(status=lambda *_args: (
-                    types.SimpleNamespace(
-                        protected=False,
-                        unlocked=True,
-                        remember_policy=None,
-                        unlock_expires_at=None,
-                        unlock_idle_expires_at=None,
-                    )
-                )),
+                "_project_access": types.SimpleNamespace(
+                    status=lambda *_args: (_ for _ in ()).throw(
+                        AssertionError("membership listing checked a password")
+                    ),
+                ),
                 "_remote_active_projects": {},
                 "_remote_active_projects_lock": threading.RLock(),
                 "_get_active_workspace": lambda: "b",
@@ -1240,9 +1433,12 @@ class LaunchSecurityContractTests(unittest.TestCase):
             "_require_h3_delivery_recovery_job",
             "_require_remote_queue_project",
         ):
-            self.assertIn(
-                "_require_account_project_permission",
-                self._function_source(helper),
+            source = self._function_source(helper)
+            self.assertIn("_require_account_project_permission", source)
+            self.assertIn("if membership is None:", source)
+            self.assertLess(
+                source.index("if membership is None:"),
+                source.index("_project_access.status"),
             )
 
     def test_generation_admission_uses_generate_permission(self):
@@ -1538,6 +1734,24 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIsNone(gate(request))
         self.assertEqual(active_projects["owner"], "project")
 
+        project_access.status = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("active membership checked a project password")
+        )
+        namespace["_require_account_project_permission"] = (
+            lambda *_args: {"state": "active"}
+        )
+        self.assertIsNone(gate(request))
+        self.assertEqual(active_projects["owner"], "project")
+
+        def deny_nonmember(*_args):
+            raise FakeHTTPException(status_code=404, detail="Project not found")
+
+        namespace["_require_account_project_permission"] = deny_nonmember
+        with self.assertRaises(FakeHTTPException) as hidden:
+            gate(request)
+        self.assertEqual(hidden.exception.status_code, 404)
+        self.assertNotIn("owner", active_projects)
+
     def test_remote_uploads_are_forced_private_and_paths_are_redacted(self):
         for name in ("upload_audio", "upload_image"):
             source = self._function_source(name)
@@ -1553,7 +1767,15 @@ class LaunchSecurityContractTests(unittest.TestCase):
             ROOT / "ui/src/components/Sidebar/GenerateButton.tsx"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("await createWorkspace(name, newPassword || undefined)", selector)
+        self.assertIn(
+            "await createWorkspace(name, accountProjectAccessActive "
+            "? undefined : newPassword || undefined)",
+            selector,
+        )
+        self.assertIn(
+            "const legacyProjectPasswordAccess = !accountProjectAccessActive",
+            selector,
+        )
         self.assertIn("newPassword.length > 0 && newPassword.length < 8", selector)
         self.assertIn("remote && !newPassword", selector)
         self.assertIn("Required password (8+ chars)", selector)
@@ -2351,7 +2573,12 @@ class LaunchSecurityContractTests(unittest.TestCase):
                     "_require_remote_project_mutation_access": (
                         lambda *_args: types.SimpleNamespace(unlocked=True)
                     ),
-                    "_require_account_project_permission": lambda *_args: None,
+                    "_require_account_project_permission": (
+                        lambda *_args, **_kwargs: None
+                    ),
+                    "_account_project_access_state": lambda: {
+                        "state": "disabled", "enforced": False,
+                    },
                     "_get_active_workspace": lambda: "default",
                     "_persist_active_workspace": lambda *_args, **_kwargs: root,
                     "_project_asset_store": lambda: types.SimpleNamespace(
@@ -2396,6 +2623,60 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 namespace["delete_workspace"]("project-link", request)
             self.assertEqual(raised.exception.status_code, 400)
             self.assertTrue(os.path.isdir(project_b))
+
+    def test_active_delete_keeps_missing_and_nonmember_targets_opaque(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        def deny_nonmember(*_args, **_kwargs):
+            raise FakeHTTPException(status_code=404, detail="Project not found")
+
+        with tempfile.TemporaryDirectory() as root:
+            existing = os.path.join(root, "existing-project")
+            os.mkdir(existing)
+            aliases = []
+            try:
+                os.symlink(existing, os.path.join(root, "project-alias"))
+                aliases.append("project-alias")
+            except (OSError, NotImplementedError):
+                pass
+            namespace = self._function_namespace(
+                ("_safe_join", "delete_workspace"),
+                {
+                    "Request": object,
+                    "HTTPException": FakeHTTPException,
+                    "os": os,
+                    "wgp": types.SimpleNamespace(
+                        server_config={"save_path": root},
+                    ),
+                    "_workspace_creation_lock": threading.RLock(),
+                    "_account_project_access_state": lambda: {
+                        "state": "active", "enforced": True,
+                    },
+                    "_require_account_project_permission": deny_nonmember,
+                },
+            )
+            request = types.SimpleNamespace(state=types.SimpleNamespace(
+                maestro_remote=True,
+                maestro_session_id="nonmember",
+            ))
+
+            errors = []
+            for name in (
+                "missing-project", "existing-project", *aliases,
+            ):
+                with self.assertRaises(FakeHTTPException) as raised:
+                    namespace["delete_workspace"](name, request)
+                errors.append(
+                    (raised.exception.status_code, raised.exception.detail)
+                )
+            self.assertEqual(
+                errors,
+                [(404, "Project not found")] * (2 + len(aliases)),
+            )
 
 
 if __name__ == "__main__":

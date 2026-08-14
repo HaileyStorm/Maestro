@@ -118,7 +118,7 @@ ordinary sequential stale or altered replays at the edge handling the write,
 but KV is not a transactional compare-and-swap store and cannot provide global
 linearizability. Overlapping writes or clears are unsupported and can race even
 when they came from the same logical caller. The proxy never
-weakens the backend's project passwords or remote restrictions, and target
+weakens the backend's account membership or legacy pre-migration restrictions, and target
 validation prevents KV from sending traffic outside canonical Quick Tunnel
 origins.
 

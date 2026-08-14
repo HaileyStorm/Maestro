@@ -4646,9 +4646,28 @@ class QueueLaunchWiringTests(unittest.TestCase):
             {"/projects/project-a"},
         )
 
+        # After account-project cutover, membership is the sole project gate.
+        # Legacy project-password state must not be consulted for a member,
+        # while a nonmember remains indistinguishable from a missing job.
+        current_digest["value"] = project_digest
+        access.status = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("active membership checked a project password")
+        )
+        namespace["_require_account_project_permission"] = (
+            lambda *_args: {"state": "active"}
+        )
+        self.assertTrue(owned(job, remote))
+        namespace["_require_account_project_permission"] = (
+            lambda *_args: (_ for _ in ()).throw(Exception("not a member"))
+        )
+        self.assertFalse(owned(job, remote))
+
         # Local ownership compatibility does not depend on the remote active
         # project map, while still requiring the exact recovered principal.
         active.clear()
+        namespace["_require_account_project_permission"] = (
+            lambda *_args: {"state": "active"}
+        )
         local = types.SimpleNamespace(state=types.SimpleNamespace(
             maestro_remote=False, maestro_session_id=owner,
         ))

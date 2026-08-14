@@ -815,8 +815,8 @@ export interface SupportRecordedAllowanceSource {
 }
 
 export interface SupportRecordedAllowance {
-  state: 'recorded_not_enforced'
-  enforcement_enabled: false
+  state: 'recorded_not_enforced' | 'active'
+  enforcement_enabled: boolean
   unit: string
   as_of: string
   effective_allowance: number

@@ -109,7 +109,10 @@ async function loadAccountSupportRuntime() {
               LogIn='LogIn', LogOut='LogOut', RefreshCw='RefreshCw', ShieldCheck='ShieldCheck',
               UserCog='UserCog', UserPlus='UserPlus', UserRound='UserRound', X='X'
           ` }
-          if (args.path === 'client') return { contents: 'export class AccountApiError extends Error { retryAfter = 0 }' }
+          if (args.path === 'client') return { contents: `
+            export class AccountApiError extends Error { retryAfter = 0 }
+            export const isAccountProjectAccessActive = () => false
+          ` }
           if (args.path === 'focus') return { contents: 'export const closeModalIfTop = () => true; export const installModalFocus = () => () => {}' }
           if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__mobileHeaderAccountStore)' }
           if (args.path === 'lifecycle') return { contents: `

@@ -3218,6 +3218,9 @@ class AccountCapabilityTests(unittest.TestCase):
         namespace = {
             "Request": object,
             "_public_account_context": lambda _request: projected_accounts,
+            "_account_project_access_state": lambda: {
+                "state": "needs_attention", "enforced": False,
+            },
             "_request_has_account_capability": lambda _request, capability: (
                 capability == "owner.remote_parity"
             ),
@@ -3245,6 +3248,9 @@ class AccountCapabilityTests(unittest.TestCase):
         )
         namespace = {
             "Request": object,
+            "_account_project_access_state": lambda: {
+                "state": "disabled", "enforced": False,
+            },
             "_env_flag_enabled": lambda _name: False,
             "_public_share_url": lambda: "",
         }

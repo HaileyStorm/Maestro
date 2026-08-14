@@ -6,6 +6,7 @@ import copy
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -27,10 +28,13 @@ from services.credit_runtime import (
     transition_reservation,
 )
 from services.job_lifecycle import (
+    CREDIT_PRIORITY_AGE_CEILING_SECONDS,
+    MAX_CREDIT_PRIORITY_BYPASSES,
     CreditQueueTransitionConflict,
     _credit_queue_band,
     _credit_queue_fingerprint,
     _queue_order_key,
+    _record_queue_admission,
     _reset_queue_state_for_tests,
     _select_next_waiter,
     _validated_credit_queue_metadata,
@@ -386,8 +390,8 @@ class CreditRuntimeWiringTests(unittest.TestCase):
         self.assertIs(selected[1], remote_manual)
 
     def test_depleted_jobs_remain_automatic_fifo_within_their_band(self):
-        older = _job("depleted-old", created_at=10.0)
-        newer = _job("depleted-new", created_at=20.0)
+        older = _job("depleted-old", created_at=10.0, priority=-999_999)
+        newer = _job("depleted-new", created_at=20.0, priority=999_999)
         self._stamp(older, _quote(units=0), "depleted_old")
         self._stamp(newer, _quote(units=0), "depleted_new")
         selected, reason, skipped = _select_next_waiter(
@@ -399,6 +403,93 @@ class CreditRuntimeWiringTests(unittest.TestCase):
         self.assertIs(selected[1], older)
         self.assertEqual(reason, "queue_order")
         self.assertEqual(skipped, [])
+
+    def test_continuous_funded_arrivals_yield_bounded_fifo_capacity(self):
+        depleted_old = _job(
+            "depleted-old", created_at=1.0, priority=-999_999,
+        )
+        depleted_new = _job(
+            "depleted-new", created_at=2.0, priority=999_999,
+        )
+        self._stamp(depleted_old, _quote(units=0), "starved_old")
+        self._stamp(depleted_new, _quote(units=0), "starved_new")
+        eligible = [(1, depleted_old), (2, depleted_new)]
+
+        for index in range(MAX_CREDIT_PRIORITY_BYPASSES):
+            funded = _job(
+                f"funded-{index}", created_at=10.0 + index,
+            )
+            self._stamp(funded, _quote(), f"funded_{index}")
+            eligible.append((10 + index, funded))
+            selected, reason, skipped = _select_next_waiter(eligible)
+            self.assertIs(selected[1], funded)
+            _record_queue_admission(selected[1], reason, skipped, eligible)
+            eligible.remove(selected)
+
+        next_funded = _job("funded-next", created_at=20.0)
+        self._stamp(next_funded, _quote(), "funded_next")
+        eligible.append((20, next_funded))
+        selected, reason, skipped = _select_next_waiter(eligible)
+        self.assertIs(selected[1], depleted_old)
+        self.assertEqual(reason, "credit_starvation_guard")
+        self.assertEqual(skipped, [])
+
+        _record_queue_admission(selected[1], reason, skipped, eligible)
+        eligible.remove(selected)
+        selected, reason, skipped = _select_next_waiter(eligible)
+        self.assertIs(selected[1], depleted_new)
+        self.assertEqual(reason, "credit_starvation_guard")
+        self.assertEqual(skipped, [])
+
+    def test_depleted_age_bound_survives_scheduler_restore(self):
+        depleted = _job(
+            "depleted-restored",
+            created_at=time.time() - CREDIT_PRIORITY_AGE_CEILING_SECONDS - 1,
+        )
+        funded = _job("funded-restored", created_at=time.time())
+        depleted["_credit_priority_bypass_count"] = (
+            MAX_CREDIT_PRIORITY_BYPASSES - 1
+        )
+        restore_scheduler_state(
+            [depleted, funded],
+            {"queue_order": [depleted["id"], funded["id"]]},
+        )
+        self.assertNotIn("_credit_priority_bypass_count", depleted)
+        self._stamp(depleted, _quote(units=0), "restored_depleted")
+        self._stamp(funded, _quote(), "restored_funded")
+
+        self.assertEqual(queue_position(depleted), 1)
+        self.assertEqual(queue_position(funded), 2)
+
+    def test_restored_invalid_depleted_age_conservatively_spends_priority(self):
+        for label, created_at in (
+            ("missing", None),
+            ("nonfinite", float("nan")),
+            ("future", time.time() + 3600),
+        ):
+            with self.subTest(label=label):
+                depleted = _job(
+                    f"depleted-{label}", created_at=1.0,
+                )
+                if created_at is None:
+                    depleted.pop("created_at")
+                else:
+                    depleted["created_at"] = created_at
+                funded = _job(
+                    f"funded-{label}", created_at=time.time(),
+                )
+                restore_scheduler_state(
+                    [depleted, funded],
+                    {"queue_order": [depleted["id"], funded["id"]]},
+                )
+                self._stamp(
+                    depleted, _quote(units=0), f"restored_{label}_depleted",
+                )
+                self._stamp(
+                    funded, _quote(), f"restored_{label}_funded",
+                )
+                self.assertEqual(queue_position(depleted), 1)
+                self.assertEqual(queue_position(funded), 2)
 
     def test_job_snapshot_cannot_mutate_server_owned_credit_metadata(self):
         job = _job("snapshot", created_at=1.0)

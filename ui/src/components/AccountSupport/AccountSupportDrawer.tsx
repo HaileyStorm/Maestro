@@ -14,7 +14,7 @@ import {
   UserRound,
   X,
 } from 'lucide-react'
-import { AccountApiError } from '../../api/client'
+import { AccountApiError, isAccountProjectAccessActive } from '../../api/client'
 import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import { useStore } from '../../stores/useStore'
 import { createAccountDrawerLifecycle } from './accountDrawerLifecycle'
@@ -283,6 +283,10 @@ export function AccountSupportDrawer() {
     && context.account!.role === 'owner'
     && context.capabilities.includes('owner.admin')
   const directLoopback = accessContext?.remote === false
+  const accountProjectAccessActive = isAccountProjectAccessActive(
+    accessContext,
+    projectMigration,
+  )
     && directLoopbackBrowser()
   const migrationAvailable = migrationOwner && context.reauthenticated && directLoopback
 
@@ -480,7 +484,9 @@ export function AccountSupportDrawer() {
             </h2>
             <p id={descriptionId} className="mt-0.5 text-[10px] leading-relaxed text-text-muted">
               {accountsEnabled
-                ? 'Support Maestro or manage your account. Existing project access may also depend on this browser or a project password.'
+                ? accountProjectAccessActive
+                  ? 'Support Maestro or manage your account. Project access follows your account membership.'
+                  : 'Support Maestro or manage your account. Existing project access may also depend on this browser or a project password.'
                 : 'View optional ways to support Maestro. Support does not change access or available controls.'}
             </p>
           </div>
@@ -699,7 +705,9 @@ export function AccountSupportDrawer() {
                   </span>
                 </div>
                 <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
-                  Signing in identifies your account. Access to existing projects may still depend on this browser or a project password.
+                  {accountProjectAccessActive
+                    ? 'Signing in identifies your account and grants access to projects assigned to it.'
+                    : 'Signing in identifies your account. Access to existing projects may still depend on this browser or a project password.'}
                 </p>
               </section>
 
@@ -866,7 +874,9 @@ export function AccountSupportDrawer() {
                     </button>
                   </div>
                   <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
-                    These controls affect account sign-in only. Separate browser or project-password access is unchanged.
+                    {accountProjectAccessActive
+                      ? 'These controls end account membership access in the affected browsers.'
+                      : 'These controls affect account sign-in only. Separate browser or project-password access is unchanged.'}
                   </p>
                 </section>
               )}
@@ -982,7 +992,12 @@ export function AccountSupportDrawer() {
                   await logout()
                   if (!isCurrent()) return
                   clearSensitive()
-                  setNotice({ kind: 'success', text: 'Signed out. Any separate browser or project-password access remains unchanged.' })
+                  setNotice({
+                    kind: 'success',
+                    text: accountProjectAccessActive
+                      ? 'Signed out. Project access from this browser now requires account sign-in.'
+                      : 'Signed out. Any separate browser or project-password access remains unchanged.',
+                  })
                 })}
                 disabled={Boolean(busy)}
                 className="flex w-full items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-xs font-semibold text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-50"

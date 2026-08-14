@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Check, ExternalLink, HeartHandshake, Loader2, ShieldCheck } from 'lucide-react'
-import { AccountApiError } from '../../api/client'
+import { AccountApiError, isAccountProjectAccessActive } from '../../api/client'
 import { useStore } from '../../stores/useStore'
 import type {
   AccountActivationState,
@@ -51,7 +51,16 @@ const accountActivationReadinessByState: Record<AccountActivationState, AccountA
   },
 }
 
-function accountActivationReadiness(state: unknown): AccountActivationReadiness {
+function accountActivationReadiness(
+  state: unknown,
+  accountProjectAccessActive = false,
+): AccountActivationReadiness {
+  if (state === 'ready' && accountProjectAccessActive) {
+    return {
+      label: 'Account access is ready',
+      detail: 'Sign-in and account controls are available. Project access follows your account membership.',
+    }
+  }
   return typeof state === 'string' && Object.hasOwn(accountActivationReadinessByState, state)
     ? accountActivationReadinessByState[state as AccountActivationState]
     : accountActivationReadinessByState.unavailable
@@ -437,7 +446,7 @@ function AdminSupportAudit({
       setManualTarget('')
       setManualNotice({
         kind: 'success',
-        text: 'Contribution record saved. No payment was processed, and no credits or benefits were applied.',
+        text: 'Contribution record saved. No payment was processed. Any resulting compute allowance is shown below and is used only when hosted credit priority is enabled.',
       })
     } catch (error) {
       if (error instanceof AccountApiError && [400, 401, 403, 404, 409].includes(error.status)) {
@@ -509,7 +518,7 @@ function AdminSupportAudit({
         Private support history and follow-up
       </h4>
       <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-        Available only after the owner recently confirmed their password. These records are for tracking only: they do not process payments, enable support services, apply credits, or provide benefits.
+        Available only after the owner recently confirmed their password. Maestro never processes a payment here. Contribution records can update the compute allowance used by optional hosted queue priority; follow-up records do not change benefits.
       </p>
       {transitionNotice && (
         <p
@@ -535,7 +544,7 @@ function AdminSupportAudit({
         </summary>
         <div className="space-y-2 pb-3">
           <p className="leading-relaxed">
-            This saves a record only. It does not process a payment or apply credits or benefits.
+            This does not process a payment. It records an owner-verified contribution and may update the account's compute allowance for optional hosted queue priority.
           </p>
           {manualNotice && (
             <p
@@ -900,6 +909,7 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
     || summary.one_time_tier !== null
     || summary.recurring_tier !== null
   const allowance = summary.recorded_allowance
+  const allowanceActive = allowance?.enforcement_enabled === true
   const visibleAllowanceSources = allowance?.sources.slice(0, 20) || []
   const hiddenAllowanceSourceCount = (allowance?.sources.length || 0) - visibleAllowanceSources.length
   return (
@@ -915,17 +925,36 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
           Support benefits are not active. Any eligibility shown here is informational and does not change scheduling or how long results are kept.
         </p>
       )}
+      {summary.benefits.state === 'hosted_priority_available' && (
+        <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+          Hosted credit priority is enabled, but this account has no current allowance. Jobs still remain eligible in the ordinary queue.
+        </p>
+      )}
+      {summary.benefits.state === 'owner_exempt' && (
+        <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+          Owner jobs stay outside hosted credit accounting and use the ordinary owner scheduling path.
+        </p>
+      )}
+      {summary.benefits.state === 'active' && (
+        <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+          This account has active hosted compute allowance. Eligible jobs can receive bounded queue priority; jobs without enough allowance still remain eligible.
+        </p>
+      )}
       {allowance && (
-        <section aria-label="Recorded informational compute allowance" className="mt-3 min-w-0 rounded-lg border border-border bg-bg-primary/40 p-3">
+        <section aria-label={allowanceActive ? 'Active hosted compute allowance' : 'Recorded informational compute allowance'} className="mt-3 min-w-0 rounded-lg border border-border bg-bg-primary/40 p-3">
           <div className="min-w-0">
-            <h4 className="text-[11px] font-semibold text-text-primary">Recorded informational compute allowance</h4>
+            <h4 className="text-[11px] font-semibold text-text-primary">
+              {allowanceActive ? 'Active hosted compute allowance' : 'Recorded informational compute allowance'}
+            </h4>
             <p className="mt-1 break-words text-sm font-semibold text-accent-blue">
-              Recorded amount: {allowanceUnits(allowance.effective_allowance, allowance.unit)}
+              {allowanceActive ? 'Available amount' : 'Recorded amount'}: {allowanceUnits(allowance.effective_allowance, allowance.unit)}
             </p>
             <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
               Recorded as of{' '}
               <time dateTime={allowance.as_of}>{allowanceDate(allowance.as_of)} UTC</time>.
-              {' '}This is not an active balance and does not change generation, queueing, or retries.
+              {allowanceActive
+                ? ' Eligible hosted jobs can reserve this allowance for bounded queue priority.'
+                : ' This is not active on the current host and does not change generation, queueing, or retries.'}
             </p>
           </div>
           <ul aria-label="Allowance breakdown" className="mt-3 grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
@@ -965,6 +994,8 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
 
 export function SupportPanel() {
   const context = useStore(state => state.accountContext)
+  const accessContext = useStore(state => state.accessContext)
+  const projectMigration = useStore(state => state.accountProjectMigration)
   const users = useStore(state => state.accountUsers)
   const catalog = useStore(state => state.supportCatalog)
   const catalogLoading = useStore(state => state.supportCatalogLoading)
@@ -986,7 +1017,14 @@ export function SupportPanel() {
   const adminSelectionEpochRef = useRef(0)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
-  const activationReadiness = accountActivationReadiness(context?.activation_state)
+  const accountProjectAccessActive = isAccountProjectAccessActive(
+    accessContext,
+    projectMigration,
+  )
+  const activationReadiness = accountActivationReadiness(
+    context?.activation_state,
+    accountProjectAccessActive,
+  )
 
   const authenticated = context?.enabled === true
     && context.authenticated === true

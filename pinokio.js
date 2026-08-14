@@ -135,7 +135,7 @@ module.exports = {
       } else {
         return [{
           icon: "fa-solid fa-power-off",
-          text: "<div><strong>Start</strong><div>Cloudflare app sharing is enabled by default; LAN binding stays off. Remote visitors unlock password-protected projects and cannot access machine controls. The live share URL appears after launch.</div></div>",
+          text: "<div><strong>Start</strong><div>Cloudflare app sharing is enabled by default; LAN binding stays off. With active accounts, remote visitors sign in and can access only assigned projects. The pre-migration compatibility path uses project passwords. Remote visitors cannot access machine controls. The live share URL appears after launch.</div></div>",
           href: "start.js",
         }, {
           icon: "fa-solid fa-display",

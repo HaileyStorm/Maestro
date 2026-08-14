@@ -39,6 +39,7 @@ import { HardwareStatusBar } from './HardwareStatusBar'
 import { GenerationPrivacyControls } from './GenerationPrivacyControls'
 import { ProjectReferenceLibrary } from './ProjectReferenceLibrary'
 import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
+import { isAccountProjectAccessActive } from '../../api/client'
 
 export function Sidebar() {
   const toggleSettings = useStore(s => s.toggleSettings)
@@ -83,7 +84,10 @@ export function Sidebar() {
   const activeWorkspace = useStore(s => s.activeWorkspace)
   const workspaces = useStore(s => s.workspaces)
   const browsingUploads = useStore(s => s.browsingUploads)
-  const referenceLocked = workspaces.some(workspace => (
+  const accessContext = useStore(s => s.accessContext)
+  const accountProjectMigration = useStore(s => s.accountProjectMigration)
+  const accountProjectAccessActive = isAccountProjectAccessActive(accessContext, accountProjectMigration)
+  const referenceLocked = !accountProjectAccessActive && workspaces.some(workspace => (
     workspace.name === activeWorkspace && workspace.unlocked === false
   ))
   const isI2vOnly = modelOptions?.i2v_class && !modelOptions?.t2v_class
