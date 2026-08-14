@@ -70,19 +70,19 @@ function App() {
     let cancelled = false
     void bootstrapWithin(
       loadAccessContext(false),
-      `${PRODUCT_NAME} did not respond while checking access.`,
+      `${PRODUCT_NAME} is taking too long to connect.`,
     ).then(async context => {
       if (context.accounts?.enabled === true) {
         await bootstrapWithin(
           loadAccountContext(false),
-          `${PRODUCT_NAME} did not respond while checking your account.`,
+          `${PRODUCT_NAME} is taking too long to load your account.`,
         )
       }
       const workspacesLoaded = await bootstrapWithin(
         loadWorkspaces(),
-        `${PRODUCT_NAME} did not respond while loading projects.`,
+        `${PRODUCT_NAME} is taking too long to load your projects.`,
       )
-      if (!workspacesLoaded) throw new Error(`${PRODUCT_NAME} could not load projects.`)
+      if (!workspacesLoaded) throw new Error(`${PRODUCT_NAME} couldn't load your projects.`)
       if (cancelled) return
       const workspaceState = useStore.getState()
       loadModels()
@@ -100,7 +100,7 @@ function App() {
       setBootstrapState('ready')
     }).catch(error => {
       if (cancelled) return
-      setBootstrapError(error instanceof Error ? error.message : `${PRODUCT_NAME} did not respond`)
+      setBootstrapError(error instanceof Error ? error.message : `${PRODUCT_NAME} couldn't open.`)
       setBootstrapState('error')
     })
     return () => { cancelled = true }
@@ -130,13 +130,16 @@ function App() {
           </div>
           <h1 className="text-base font-semibold" aria-label={bootstrapState === 'loading'
             ? `Connecting to ${PRODUCT_NAME}`
-            : `${PRODUCT_NAME} is not ready`}>
+            : `${PRODUCT_NAME} couldn't open`}>
             <span aria-hidden="true">
               {bootstrapState === 'loading'
                 ? `Connecting to ${PRODUCT_NAME_VISUAL}…`
-                : `${PRODUCT_NAME_VISUAL} is not ready`}
+                : `${PRODUCT_NAME_VISUAL} couldn't open`}
             </span>
           </h1>
+          {bootstrapState === 'loading' && (
+            <p className="mt-2 text-sm text-text-secondary">Checking your connection and projects.</p>
+          )}
           {bootstrapState === 'error' && (
             <>
               <p className="mt-2 text-sm text-text-secondary">{bootstrapError}</p>

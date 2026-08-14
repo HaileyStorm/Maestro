@@ -124,7 +124,7 @@ export function WelcomeModal() {
               </h2>
               <p className="mt-0.5 text-[9px] font-medium text-text-muted sm:text-[10px]">{PRODUCT_PROVENANCE}</p>
               <p id={descriptionId} className="mt-1 max-w-2xl text-xs leading-relaxed text-text-secondary sm:text-sm">
-                Move from a single idea to finished images, video, audio, and connected stories—without losing sight of the work between.
+                Turn an idea into images, video, audio, and connected scenes while keeping every step in one place.
               </p>
             </div>
             <button
@@ -153,22 +153,22 @@ export function WelcomeModal() {
           <ModeCard icon={<Clapperboard size={17} />} title="Director" eyebrow="Build connected work">
             Turn a brief or song into a planned sequence, then guide clips from first frame through final assembly.
           </ModeCard>
-          <ModeCard icon={<MessageSquare size={17} />} title="Chat" eyebrow="Think with your tools">
+          <ModeCard icon={<MessageSquare size={17} />} title="Chat" eyebrow="Develop ideas">
             {accessContext?.remote
-              ? `Develop concepts and production plans with the AI assistant selected by the person running this copy of ${PRODUCT_NAME}.`
-              : 'Develop concepts and production plans with the AI assistant you choose in Settings.'}
+              ? `Develop concepts and production plans with the writing assistant chosen on the computer running ${PRODUCT_NAME}.`
+              : 'Develop concepts and production plans with the writing assistant you choose in Settings.'}
           </ModeCard>
           <ModeCard icon={<FolderLock size={17} />} title="Projects" eyebrow="Keep context together">
             Keep outputs, references, remote access, and share links organized by project. Preview blur is a separate privacy choice.
           </ModeCard>
           <div className="grid gap-2.5 sm:col-span-2 sm:grid-cols-3">
-            <FeaturePoint icon={<Gauge size={15} />} title="H3 control">
-              Choose a speed or quality profile, review the suggested shot plan, and adjust it before generation.
+            <FeaturePoint icon={<Gauge size={15} />} title="Supported generation controls">
+              For supported models, choose a speed or quality profile, review the suggested shot plan, and adjust it before generation.
             </FeaturePoint>
-            <FeaturePoint icon={<ListRestart size={15} />} title="Queue + resume">
+            <FeaturePoint icon={<ListRestart size={15} />} title="Queue and resume">
               Queue multiple generations, hold work, and resume supported queued jobs.
             </FeaturePoint>
-            <FeaturePoint icon={<Cuboid size={15} />} title="Blender guidance">
+            <FeaturePoint icon={<Cuboid size={15} />} title="Use Blender scenes">
               Use Blender scene context to guide camera, subject, and object motion.
             </FeaturePoint>
           </div>

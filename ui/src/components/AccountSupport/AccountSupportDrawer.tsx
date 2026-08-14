@@ -14,9 +14,14 @@ import {
   UserRound,
   X,
 } from 'lucide-react'
-import { AccountApiError, isAccountProjectAccessActive } from '../../api/client'
+import {
+  AccountApiError,
+  isAccountProjectAccessActive,
+  type AccessContext,
+} from '../../api/client'
 import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import { useStore } from '../../stores/useStore'
+import type { AccountProjectMigrationStatus } from '../../types'
 import { createAccountDrawerLifecycle } from './accountDrawerLifecycle'
 import { SupportPanel } from './SupportPanel'
 import { nextAccountSupportTab, type AccountSupportTab } from './supportPresentation'
@@ -117,6 +122,17 @@ function directLoopbackBrowser(): boolean {
   if (typeof window === 'undefined') return false
   const hostname = window.location.hostname.trim().toLowerCase().replace(/^\[|\]$/g, '')
   return hostname === 'localhost' || hostname === '::1' || /^127(?:\.\d{1,3}){3}$/.test(hostname)
+}
+
+// A sealed active cutover is monotonic. Keep a fresh server access projection
+// authoritative even if the owner-only migration detail cache is older.
+// eslint-disable-next-line react-refresh/only-export-components
+export function isAccountProjectAccessActiveForDrawer(
+  accessContext: AccessContext | null,
+  projectMigration: AccountProjectMigrationStatus | null,
+): boolean {
+  return isAccountProjectAccessActive(accessContext)
+    || isAccountProjectAccessActive(accessContext, projectMigration)
 }
 
 function Field({
@@ -283,11 +299,11 @@ export function AccountSupportDrawer() {
     && context.account!.role === 'owner'
     && context.capabilities.includes('owner.admin')
   const directLoopback = accessContext?.remote === false
-  const accountProjectAccessActive = isAccountProjectAccessActive(
+    && directLoopbackBrowser()
+  const accountProjectAccessActive = isAccountProjectAccessActiveForDrawer(
     accessContext,
     projectMigration,
   )
-    && directLoopbackBrowser()
   const migrationAvailable = migrationOwner && context.reauthenticated && directLoopback
 
   const clearSensitive = useCallback(() => {
@@ -411,12 +427,12 @@ export function AccountSupportDrawer() {
   }, [accountIdentity, clearSensitive])
 
   useEffect(() => {
-    if (!open || activeTab !== 'account' || !migrationAvailable) return
+    if (!open || activeTab !== 'account' || !migrationAvailable || accountProjectAccessActive) return
     const isCurrent = lifecycleRef.current.operationLease()
     void loadProjectMigration().catch(error => {
       if (isCurrent()) setNotice({ kind: 'error', text: projectMigrationErrorMessage(error) })
     })
-  }, [activeTab, loadProjectMigration, migrationAvailable, open])
+  }, [accountProjectAccessActive, activeTab, loadProjectMigration, migrationAvailable, open])
 
   useEffect(() => {
     if (!open || !dialogRef.current || !closeRef.current) return
@@ -711,7 +727,7 @@ export function AccountSupportDrawer() {
                 </p>
               </section>
 
-              {migrationOwner && (
+              {migrationOwner && !accountProjectAccessActive && (
                 <section className="rounded-xl border border-border bg-bg-tertiary/20 p-3" aria-label="Existing project account setup">
                   <div className="flex items-center gap-2">
                     <ShieldCheck size={14} className="text-accent-blue" aria-hidden="true" />
@@ -767,10 +783,6 @@ export function AccountSupportDrawer() {
                   ) : projectMigration?.state === 'needs_attention' ? (
                     <p className="mt-2 text-[10px] leading-relaxed text-indicator-warning">
                       Account-based project filtering is not enabled yet. {projectMigration.needs_attention} existing project folder{projectMigration.needs_attention === 1 ? '' : 's'} need attention. Fix or remove {projectMigration.needs_attention === 1 ? 'it' : 'them'} on this computer, then retry. Existing browser and project-password access stays unchanged.
-                    </p>
-                  ) : projectMigration?.state === 'active' ? (
-                    <p className="mt-2 text-[10px] leading-relaxed text-indicator-success">
-                      Project access is ready for {projectMigration.project_count} project{projectMigration.project_count === 1 ? '' : 's'}.
                     </p>
                   ) : (
                     <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
@@ -933,7 +945,10 @@ export function AccountSupportDrawer() {
                           <div key={user.id} className="flex items-center gap-2 rounded-lg border border-border/80 bg-bg-primary/40 p-2.5">
                             <div className="min-w-0 flex-1">
                               <p className="truncate text-[10px] font-semibold text-text-primary">{user.username}</p>
-                              <p className="text-[9px] text-text-muted">{user.role}{user.has_email ? ' · email recorded' : ''}</p>
+                              <p className="text-[9px] text-text-muted">
+                                {user.role}{user.has_email ? ' · email recorded' : ''}
+                                {user.id === context.account!.id ? ' · current owner account cannot be disabled' : ''}
+                              </p>
                             </div>
                             <button
                               type="button"

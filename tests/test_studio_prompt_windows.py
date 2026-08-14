@@ -1355,7 +1355,7 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("Full-video timing detected", prompt_ui)
         self.assertIn("[00:00-00:10]", prompt_ui)
 
-    def test_studio_enhancement_is_explicit_and_names_the_effective_model(self):
+    def test_studio_prompt_improvement_is_explicit_and_uses_plain_status_copy(self):
         with open(os.path.join(ROOT, "ui", "src", "stores", "useStore.ts"), encoding="utf-8") as handle:
             store = handle.read()
         with open(os.path.join(ROOT, "ui", "src", "components", "Sidebar", "PromptInput.tsx"), encoding="utf-8") as handle:
@@ -1374,9 +1374,12 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("usesDedicatedGenerationEndpoint", generation)
         self.assertIn("enhanceRequested && !state.params.prompt.trim()", generation)
         self.assertIn("Enter a prompt before using Enhance before Generate.", generation)
-        self.assertIn("Enhance before Generate", prompt_ui)
-        self.assertIn("Model: ${enhancerModelLabel}", prompt_ui)
-        self.assertIn("global timeline is preserved as authored", prompt_ui)
+        self.assertIn("Improve before Generate", prompt_ui)
+        self.assertIn("Adds detail and structure to your prompt", prompt_ui)
+        self.assertIn("Keeps your full-video timing and timestamps", prompt_ui)
+        self.assertIn("Working on your prompt", prompt_ui)
+        self.assertNotIn("loadingPhase.replaceAll", prompt_ui)
+        self.assertNotIn("vision projector", prompt_ui)
         self.assertIn("modelOptions?.prompt_enhancer_model", prompt_ui)
 
     def test_backend_slicing_is_gated_to_structured_studio_prompt_mode(self):

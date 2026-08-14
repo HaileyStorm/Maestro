@@ -1808,7 +1808,9 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn("setBootstrapState('error')", app)
         self.assertIn("Try again", app)
         self.assertIn("BOOTSTRAP_TIMEOUT_MS", app)
-        self.assertIn("did not respond while loading projects", app)
+        self.assertIn("taking too long to load your projects", app)
+        self.assertIn("Checking your connection and projects", app)
+        self.assertIn("couldn't open", app)
         self.assertIn("!remoteProjectRequired && <WelcomeModal />", app)
 
         self.assertIn("if (requiredProject) return", selector)
@@ -1829,8 +1831,10 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn("Private previews start blurred", welcome)
         self.assertIn("Project access controls who can open the project", welcome)
         self.assertIn("Local access · on this computer", welcome)
-        for capability in ("H3 control", "Queue + resume", "Blender guidance"):
+        for capability in ("Supported generation controls", "Queue and resume", "Use Blender scenes"):
             self.assertIn(capability, welcome)
+        self.assertIn("For supported models", welcome)
+        self.assertIn("writing assistant chosen on the computer running", welcome)
         self.assertIn("remote access, and share links", welcome)
         self.assertIn(
             "the computer running {PRODUCT_NAME} downloads and prepares model files",

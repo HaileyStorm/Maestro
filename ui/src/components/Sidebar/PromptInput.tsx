@@ -12,13 +12,6 @@ const placeholders: Record<string, string> = {
   avatar: 'Describe your avatar animation...',
 }
 
-function compactBytes(value: number): string {
-  if (value < 1024) return `${value} B`
-  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`
-  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MiB`
-  return `${(value / 1024 ** 3).toFixed(1)} GiB`
-}
-
 export function H3StyleWorkflowField({
   effectiveVideoModel,
   surface,
@@ -102,8 +95,9 @@ function useEnhanceStatus(
   useEffect(() => {
     if (!isEnhancing) return
     let active = true
+    const assistantLabel = expectedModelLabel ? 'your writing assistant' : 'the writing assistant'
     const initialStatusTimer = window.setTimeout(() => {
-      if (active) setStatus({ phase: 'loading', chars: 0, detail: `Preparing ${expectedModelLabel}...` })
+      if (active) setStatus({ phase: 'loading', chars: 0, detail: `Preparing ${assistantLabel}…` })
     }, 0)
     const poll = async () => {
       let streamStarted = false
@@ -119,28 +113,23 @@ function useEnhanceStatus(
               const total = Number(download?.total_bytes || 0)
               const downloaded = Number(download?.downloaded_bytes || 0)
               const percent = total > 0 ? Math.min(100, Math.round(downloaded * 100 / total)) : null
-              const byteProgress = downloaded > 0
-                ? ` · ${compactBytes(downloaded)}${total > 0 ? ` / ${compactBytes(total)}` : ''}`
-                : ''
               const percentProgress = percent != null ? ` · ${percent}%` : ''
               const filename = String(download?.filename || '').toLowerCase()
               const loadingPhase = String(llmData.loading_phase || download?.phase || '')
-              let activity = `Preparing ${expectedModelLabel}`
+              let activity = `Preparing ${assistantLabel}`
               if (matchesExpected && (filename.includes('mmproj') || filename.includes('projector'))) {
-                activity = 'Downloading vision projector'
+                activity = 'Preparing image support'
               } else if (matchesExpected && loadingPhase === 'downloading_runtime') {
-                activity = 'Downloading writing-assistant tools'
+                activity = 'Preparing writing tools'
               } else if (matchesExpected && loadingPhase === 'building_runtime') {
-                activity = 'Preparing writing-assistant tools'
+                activity = 'Preparing writing tools'
               } else if (matchesExpected && loadingPhase === 'downloading') {
-                activity = `Downloading ${expectedModelLabel}`
-              } else if (matchesExpected && loadingPhase) {
-                activity = `${loadingPhase.replaceAll('_', ' ')} · ${expectedModelLabel}`
+                activity = `Downloading ${assistantLabel}`
               }
               setStatus({
                 phase: 'loading',
                 chars: 0,
-                detail: `${activity}${byteProgress}${percentProgress}`,
+                detail: `${activity}${percentProgress}`,
               })
               await new Promise(r => setTimeout(r, 800))
               continue
@@ -158,7 +147,7 @@ function useEnhanceStatus(
             } else if (text.length > 0) {
               setStatus({ phase: 'writing', chars: text.length, detail: expectedModelLabel })
             } else if (!streamStarted) {
-              setStatus({ phase: 'loading', chars: 0, detail: `Preparing ${expectedModelLabel}...` })
+              setStatus({ phase: 'loading', chars: 0, detail: `Preparing ${assistantLabel}…` })
             }
             if (data.done) break
           }
@@ -265,7 +254,7 @@ export function PromptInput() {
   const configuredEnhancerLabel = llmModels.find(model => model.id === configuredEnhancerId)?.label || configuredEnhancerId
   const enhancerModelLabel = wangpEnhancerMode > 0 && !needsH3Guide
     ? enhancerModeLabels[wangpEnhancerMode] || `Wan2GP enhancer mode ${wangpEnhancerMode}`
-    : configuredEnhancerLabel || 'Configured writing assistant'
+    : configuredEnhancerLabel || 'Writing assistant'
   const tracksEnhancerLlm = !(wangpEnhancerMode > 0 && !needsH3Guide)
   const enhanceStatus = useEnhanceStatus(
     isEnhancing,
@@ -329,12 +318,12 @@ export function PromptInput() {
           ) : enhanceStatus.phase === 'thinking' ? (
             <>
               <Brain size={10} className="text-chip-purple animate-pulse" />
-              <span>{`Thinking with ${enhanceStatus.detail || enhancerModelLabel}...`}</span>
+              <span>Working on your prompt…</span>
             </>
           ) : (
             <>
               <PenLine size={10} className="text-accent-blue animate-pulse" />
-              <span>{`Writing with ${enhanceStatus.detail || enhancerModelLabel}...`}</span>
+              <span>Writing your revision…</span>
             </>
           )}
         </div>
@@ -358,7 +347,7 @@ export function PromptInput() {
       {enhancerFooter && (
         <label
           className="mobile-control-target mt-1 flex cursor-pointer items-start gap-2 rounded-md px-1 py-1 text-[10px] text-text-muted"
-          title={`Enhance once before generation with ${enhancerModelLabel}`}
+          title="Improve the prompt once before generation"
         >
           <input
             type="checkbox"
@@ -368,9 +357,9 @@ export function PromptInput() {
             className="mt-0.5 h-3.5 w-3.5 accent-accent-blue"
           />
           <span className="min-w-0 leading-tight">
-            <span className="block text-text-secondary">Enhance before Generate</span>
+            <span className="block text-text-secondary">Improve before Generate</span>
             <span className="block break-words md:truncate">
-              {usesGlobalTimeline ? `Model: ${enhancerModelLabel} · global timeline is preserved as authored (timestamps locked)` : `Model: ${enhancerModelLabel}`}
+              {usesGlobalTimeline ? 'Keeps your full-video timing and timestamps' : 'Adds detail and structure to your prompt'}
             </span>
           </span>
         </label>
@@ -406,7 +395,7 @@ export function PromptInput() {
                 type="button"
                 onClick={() => setTtsMenuOpen(!ttsMenuOpen)}
                 disabled={isEnhancing}
-                aria-label="Choose prompt enhancement mode"
+                aria-label="Choose writing mode"
                 aria-expanded={ttsMenuOpen}
                 aria-controls="prompt-enhancement-menu"
                 className="mobile-control-target flex items-center justify-center rounded-r-md border-l border-border p-1.5 text-text-muted transition-colors hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
@@ -422,7 +411,7 @@ export function PromptInput() {
                   className="mobile-control-target w-full px-3 py-2 text-left text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
                 >
                   Write Speech
-                  <span className="block text-[9px] text-text-muted">Single speaker, with thinking</span>
+                  <span className="block text-[9px] text-text-muted">Single speaker, more detailed</span>
                 </button>
                 <button
                   type="button"
@@ -440,7 +429,7 @@ export function PromptInput() {
                       className="mobile-control-target w-full border-t border-border px-3 py-2 text-left text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
                     >
                       {voiceCount >= 2 ? `Write ${voiceCount}-Person Dialogue` : 'Write Dialogue (2 speakers)'}
-                      <span className="block text-[9px] text-text-muted">With thinking — more creative</span>
+                      <span className="block text-[9px] text-text-muted">More detailed and creative</span>
                     </button>
                     <button
                       type="button"
@@ -448,7 +437,7 @@ export function PromptInput() {
                       className="mobile-control-target w-full border-t border-border px-3 py-2 text-left text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
                     >
                       {voiceCount >= 2 ? `Write ${voiceCount}-Person Dialogue` : 'Write Dialogue (2 speakers)'}
-                      <span className="block text-[9px] text-text-muted">No thinking — faster</span>
+                      <span className="block text-[9px] text-text-muted">Faster draft</span>
                     </button>
                   </>
                 )}
@@ -460,8 +449,8 @@ export function PromptInput() {
             type="button"
             onClick={() => enhancePrompt()}
             disabled={isEnhancing}
-            title="Enhance prompt with AI"
-            aria-label="Enhance prompt with AI"
+            title="Improve prompt"
+            aria-label="Improve prompt"
             className={`mobile-control-target absolute right-2 ${usesWindows ? 'bottom-[72px] md:bottom-12' : 'bottom-[52px] md:bottom-7'} flex items-center justify-center rounded-md p-1.5 text-text-muted transition-colors hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50`}
           >
             {isEnhancing ? (

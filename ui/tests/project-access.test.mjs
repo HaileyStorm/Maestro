@@ -26,6 +26,88 @@ function asDataModule(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 }
 
+async function loadAccountDrawerRuntime() {
+  const bundled = await build({
+    stdin: {
+      contents: "export { AccountSupportDrawer } from './src/components/AccountSupport/AccountSupportDrawer.tsx'",
+      resolveDir: uiRoot,
+      loader: 'js',
+    },
+    bundle: true,
+    format: 'esm',
+    jsx: 'automatic',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+    plugins: [{
+      name: 'account-drawer-access-runtime',
+      setup(bundle) {
+        bundle.onResolve({ filter: /^react$/ }, () => ({ path: 'react', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /^react\/jsx-runtime$/ }, () => ({ path: 'jsx-runtime', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /^react-dom$/ }, () => ({ path: 'react-dom', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /^lucide-react$/ }, () => ({ path: 'lucide', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /api\/client$/ }, () => ({ path: 'api', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /lib\/modalFocus$/ }, () => ({ path: 'focus', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /stores\/useStore$/ }, () => ({ path: 'store', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /accountDrawerLifecycle$/ }, () => ({ path: 'lifecycle', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /\.\/SupportPanel$/ }, () => ({ path: 'support-panel', namespace: 'drawer-test' }))
+        bundle.onResolve({ filter: /\.\/supportPresentation$/ }, () => ({ path: 'presentation', namespace: 'drawer-test' }))
+        bundle.onLoad({ filter: /.*/, namespace: 'drawer-test' }, args => {
+          if (args.path === 'react') return { contents: `
+            export const useCallback = value => value
+            export const useEffect = effect => globalThis.__drawerEffects.push(effect)
+            export const useId = () => 'drawer-test-id'
+            export const useRef = value => ({ current: value })
+            export const useState = value => [value === 'support' ? 'account' : value, () => {}]
+          ` }
+          if (args.path === 'jsx-runtime') return { contents: `
+            export const Fragment = Symbol.for('fragment')
+            export const jsx = (type, props, key) => ({ type, key, props: props || {} })
+            export const jsxs = jsx
+          ` }
+          if (args.path === 'react-dom') return { contents: 'export const createPortal = value => value' }
+          if (args.path === 'lucide') return { contents: `
+            export const Check='Check', HeartHandshake='HeartHandshake', KeyRound='KeyRound', Loader2='Loader2', LogIn='LogIn', LogOut='LogOut', RefreshCw='RefreshCw', ShieldCheck='ShieldCheck', UserCog='UserCog', UserPlus='UserPlus', UserRound='UserRound', X='X'
+          ` }
+          if (args.path === 'api') return { contents: `
+            export class AccountApiError extends Error {}
+            export const isAccountProjectAccessActive = (context, migration = null) => context?.accounts?.enabled === true && (migration !== null ? migration.state === 'active' && migration.enforced === true : context.account_project_access_active === true)
+          ` }
+          if (args.path === 'focus') return { contents: 'export const closeModalIfTop = () => true; export const installModalFocus = () => () => {}' }
+          if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__drawerStore)' }
+          if (args.path === 'lifecycle') return { contents: `
+            export const createAccountDrawerLifecycle = () => ({
+              opened() {}, closed() {}, operationLease: () => () => true,
+            })
+          ` }
+          if (args.path === 'support-panel') return { contents: 'export const SupportPanel = () => null' }
+          if (args.path === 'presentation') return { contents: 'export const nextAccountSupportTab = () => null' }
+          return null
+        })
+      },
+    }],
+  })
+  return import(`${asDataModule(bundled.outputFiles[0].text)}#drawer-access`)
+}
+
+function renderedText(node) {
+  if (node == null || typeof node === 'boolean') return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(renderedText).join(' ')
+  return renderedText(node.props?.children)
+}
+
+function renderedElements(node, predicate, found = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) renderedElements(child, predicate, found)
+  } else if (node && typeof node === 'object') {
+    if (predicate(node)) found.push(node)
+    renderedElements(node.props?.children, predicate, found)
+  }
+  return found
+}
+
 test('server-authored account cutover decides whether project passwords apply', () => {
   const accounts = {
     enabled: true,
@@ -61,6 +143,217 @@ test('server-authored account cutover decides whether project passwords apply', 
   assert.equal(isAccountProjectAccessActive(context, {
     state: 'active', enforced: false, project_count: 1, needs_attention: 0,
   }), false)
+})
+
+test('account drawer keeps sealed active access authoritative over stale migration detail', async () => {
+  const bundled = await build({
+    stdin: {
+      contents: "export { isAccountProjectAccessActiveForDrawer } from './src/components/AccountSupport/AccountSupportDrawer.tsx'",
+      resolveDir: uiRoot,
+      loader: 'js',
+    },
+    bundle: true,
+    format: 'esm',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+  })
+  const { isAccountProjectAccessActiveForDrawer } = await import(asDataModule(bundled.outputFiles[0].text))
+  const context = {
+    accounts: { enabled: true },
+    account_project_access_active: true,
+  }
+
+  assert.equal(isAccountProjectAccessActiveForDrawer(context, null), true)
+  assert.equal(isAccountProjectAccessActiveForDrawer(context, {
+    state: 'not_started', enforced: false, project_count: 3, needs_attention: 0,
+  }), true)
+  assert.equal(isAccountProjectAccessActiveForDrawer(context, {
+    state: 'needs_attention', enforced: false, project_count: 3, needs_attention: 1,
+  }), true)
+  assert.equal(isAccountProjectAccessActiveForDrawer({
+    ...context, account_project_access_active: false,
+  }, {
+    state: 'active', enforced: true, project_count: 3, needs_attention: 0,
+  }), true)
+})
+
+test('stable active account access renders no migration setup and schedules no detail request', async t => {
+  const { AccountSupportDrawer } = await loadAccountDrawerRuntime()
+  const previousWindow = globalThis.window
+  const previousDocument = globalThis.document
+  const previousHTMLElement = globalThis.HTMLElement
+  t.after(() => {
+    globalThis.window = previousWindow
+    globalThis.document = previousDocument
+    globalThis.HTMLElement = previousHTMLElement
+    delete globalThis.__drawerEffects
+    delete globalThis.__drawerStore
+  })
+  globalThis.HTMLElement = class HTMLElement {}
+  globalThis.document = {
+    activeElement: null,
+    getElementById: () => null,
+  }
+
+  for (const testCase of [
+    {
+      hostname: 'maestro.example.test',
+      remote: true,
+      reauthenticated: false,
+      migration: null,
+    },
+    {
+      hostname: '127.0.0.1',
+      remote: false,
+      reauthenticated: true,
+      migration: { state: 'needs_attention', enforced: false, project_count: 3, needs_attention: 1 },
+    },
+  ]) {
+    globalThis.window = { location: { hostname: testCase.hostname } }
+    let migrationRequests = 0
+    const accountContext = {
+      enabled: true,
+      authenticated: true,
+      account: { id: 'owner', username: 'Owner', role: 'owner' },
+      capabilities: ['account.self', 'owner.admin'],
+      reauthenticated: testCase.reauthenticated,
+      passkey_authentication_available: false,
+      activation_state: 'ready',
+    }
+    const asyncNoop = async () => undefined
+    globalThis.__drawerEffects = []
+    globalThis.__drawerStore = {
+      accountDrawerOpen: true,
+      setAccountDrawerOpen() {},
+      accountContext,
+      accessContext: {
+        remote: testCase.remote,
+        accounts: accountContext,
+        account_project_access_active: true,
+      },
+      accountContextLoading: false,
+      accountProjectMigration: testCase.migration,
+      accountProjectMigrationLoading: false,
+      accountSessions: [],
+      accountUsers: [],
+      accountDetailsLoading: false,
+      loadAccountContext: async () => accountContext,
+      loadAccountProjectMigration: async () => { migrationRequests += 1 },
+      migrateAccountProjects: asyncNoop,
+      bootstrapAccount: asyncNoop,
+      loginAccount: asyncNoop,
+      logoutAccount: asyncNoop,
+      reauthenticateAccount: asyncNoop,
+      recoverAccount: asyncNoop,
+      changeAccountPassword: asyncNoop,
+      rotateAccountRecoveryCodes: asyncNoop,
+      loadAccountSessions: asyncNoop,
+      revokeAccountSession: asyncNoop,
+      revokeAllAccountSessions: asyncNoop,
+      loadAccountUsers: asyncNoop,
+      createServerAccount: asyncNoop,
+      setServerAccountDisabled: asyncNoop,
+    }
+
+    const text = renderedText(AccountSupportDrawer())
+    for (const effect of globalThis.__drawerEffects) effect()
+    await new Promise(resolve => setImmediate(resolve))
+
+    assert.match(text, /Project access follows your account membership/)
+    assert.doesNotMatch(text, /Connect existing projects/)
+    assert.doesNotMatch(text, /Confirm the owner password above before connecting existing projects/)
+    assert.doesNotMatch(text, /Account-based project filtering is not enabled yet/)
+    assert.equal(migrationRequests, 0)
+  }
+})
+
+test('account drawer explains and disables the sole owner row', async t => {
+  const { AccountSupportDrawer } = await loadAccountDrawerRuntime()
+  const previousWindow = globalThis.window
+  const previousDocument = globalThis.document
+  const previousHTMLElement = globalThis.HTMLElement
+  t.after(() => {
+    globalThis.window = previousWindow
+    globalThis.document = previousDocument
+    globalThis.HTMLElement = previousHTMLElement
+    delete globalThis.__drawerEffects
+    delete globalThis.__drawerStore
+  })
+  globalThis.window = { location: { hostname: '127.0.0.1' } }
+  globalThis.HTMLElement = class HTMLElement {}
+  globalThis.document = { activeElement: null, getElementById: () => null }
+
+  const owner = {
+    id: 'owner', username: 'Owner', role: 'owner', disabled: false,
+    created_at: 1, has_email: false, passkey_credentials: 0,
+    passkey_authentication_available: false,
+  }
+  const user = { ...owner, id: 'user', username: 'Creator', role: 'user' }
+  const accountContext = {
+    enabled: true,
+    authenticated: true,
+    account: owner,
+    capabilities: ['account.self', 'accounts.admin', 'services.admin'],
+    reauthenticated: true,
+    passkey_authentication_available: false,
+    activation_state: 'ready',
+  }
+  const asyncNoop = async () => undefined
+  globalThis.__drawerEffects = []
+  globalThis.__drawerStore = {
+    accountDrawerOpen: true,
+    setAccountDrawerOpen() {},
+    accountContext,
+    accessContext: {
+      remote: false,
+      accounts: accountContext,
+      account_project_access_active: true,
+    },
+    accountContextLoading: false,
+    accountProjectMigration: null,
+    accountProjectMigrationLoading: false,
+    accountSessions: [],
+    accountUsers: [owner, user],
+    accountDetailsLoading: false,
+    loadAccountContext: async () => accountContext,
+    loadAccountProjectMigration: asyncNoop,
+    migrateAccountProjects: asyncNoop,
+    bootstrapAccount: asyncNoop,
+    loginAccount: asyncNoop,
+    logoutAccount: asyncNoop,
+    reauthenticateAccount: asyncNoop,
+    recoverAccount: asyncNoop,
+    changeAccountPassword: asyncNoop,
+    rotateAccountRecoveryCodes: asyncNoop,
+    loadAccountSessions: asyncNoop,
+    revokeAccountSession: asyncNoop,
+    revokeAllAccountSessions: asyncNoop,
+    loadAccountUsers: asyncNoop,
+    createServerAccount: asyncNoop,
+    setServerAccountDisabled: asyncNoop,
+  }
+
+  const tree = AccountSupportDrawer()
+  const ownerRows = renderedElements(tree, node => node.type === 'div' && node.key === owner.id)
+  const userRows = renderedElements(tree, node => node.type === 'div' && node.key === user.id)
+  assert.equal(ownerRows.length, 1)
+  assert.equal(userRows.length, 1)
+  assert.match(renderedText(ownerRows[0]), /current owner account cannot be disabled/)
+  assert.doesNotMatch(renderedText(userRows[0]), /cannot be disabled/)
+  const ownerButtons = renderedElements(
+    ownerRows[0],
+    node => node.type === 'button' && renderedText(node) === 'Disable',
+  )
+  const userButtons = renderedElements(
+    userRows[0],
+    node => node.type === 'button' && renderedText(node) === 'Disable',
+  )
+  assert.equal(ownerButtons.length, 1)
+  assert.equal(userButtons.length, 1)
+  assert.equal(ownerButtons[0].props.disabled, true)
+  assert.equal(userButtons[0].props.disabled, false)
 })
 
 test('workspace access API sends explicit remember policy and server-side revocations', async t => {
@@ -277,8 +570,11 @@ test('migration is explicit, loopback-owner gated, and accounts-off paths make n
   assert.match(store, /context\.account\?\.role !== 'owner'/)
   assert.match(store, /!context\.capabilities\.includes\('owner\.admin'\)/)
   assert.match(store, /api\.isDirectLoopbackHostname\(window\.location\.hostname\)/)
+  assert.match(drawer, /const directLoopback = accessContext\?\.remote === false[^]*&& directLoopbackBrowser\(\)[^]*const accountProjectAccessActive = isAccountProjectAccessActiveForDrawer/)
+  assert.doesNotMatch(drawer, /isAccountProjectAccessActive\([^]*?\)\s*&& directLoopbackBrowser\(\)/)
   assert.match(drawer, /Maestro will not make this change automatically/)
   assert.match(drawer, /Connect existing projects to this owner/)
+  assert.match(drawer, /\{migrationOwner && !accountProjectAccessActive && \(/)
   assert.match(drawer, /projectMigration\?\.state === 'needs_attention'/)
   assert.match(drawer, /Account-based project filtering is not enabled yet/)
   assert.match(drawer, /Existing browser and project-password access stays unchanged/)
@@ -286,10 +582,20 @@ test('migration is explicit, loopback-owner gated, and accounts-off paths make n
   assert.match(drawer, /project_migration_needs_attention/)
   const identityScrub = drawer.slice(
     drawer.indexOf('const previousIdentity = accountIdentityRef.current'),
-    drawer.indexOf("if (!open || activeTab !== 'account' || !migrationAvailable)"),
+    drawer.indexOf("if (!open || activeTab !== 'account' || !migrationAvailable || accountProjectAccessActive)"),
   )
   assert.match(identityScrub, /previousIdentity === accountIdentity[^]*clearSensitive\(\)[^]*setNotice\(null\)/)
   assert.doesNotMatch(identityScrub, /lifecycleRef\.current\.(?:closed|opened)/)
+  assert.match(drawer, /if \(!open \|\| activeTab !== 'account' \|\| !migrationAvailable \|\| accountProjectAccessActive\) return/)
+  const migrationSurface = drawer.slice(
+    drawer.indexOf('{migrationOwner && !accountProjectAccessActive && ('),
+    drawer.indexOf('{selfService && !context.reauthenticated && ('),
+  )
+  assert.match(migrationSurface, /Connect existing projects/)
+  assert.match(migrationSurface, /migrationAvailable &&/)
+  assert.match(migrationSurface, /!directLoopback \? \(/)
+  assert.match(migrationSurface, /!context\.reauthenticated \? \(/)
+  assert.doesNotMatch(migrationSurface, /projectMigration\?\.state === 'active'/)
   assert.doesNotMatch(drawer, /Project access is on/)
   assert.doesNotMatch(store.slice(store.indexOf('loadAccountProjectMigration:'), store.indexOf('bootstrapAccount:')), /lockAllWorkspaces|lockWorkspace/)
 })

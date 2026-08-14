@@ -580,6 +580,54 @@ class AccountAuthStoreTests(unittest.TestCase):
             )
         self.assertEqual(rejected.exception.code, "invalid_credentials")
 
+    def test_sole_owner_cannot_be_disabled_and_rejection_consumes_nonce(self):
+        boot = self._bootstrap()
+        owner_session = boot["account_session_id"]
+        owner_id = boot["account"]["id"]
+        nonce = self.store.issue_nonce(
+            owner_session, "disable_account",
+        )["nonce"]
+
+        with self.assertRaises(AccountAuthError) as rejected:
+            self.store.set_account_disabled(
+                actor_session_id=owner_session,
+                account_id=owner_id,
+                disabled=True,
+                nonce=nonce,
+            )
+        self.assertEqual(rejected.exception.code, "self_disable_rejected")
+
+        principal = self.store.resolve_session(owner_session)
+        self.assertIsNotNone(principal)
+        self.assertEqual(principal["id"], owner_id)
+        self.assertEqual(principal["role"], "owner")
+        self.assertFalse(principal["disabled"])
+        self.assertTrue(principal["recently_reauthenticated"])
+        self.assertEqual(self.store.list_accounts(owner_session), [boot["account"]])
+
+        with self.assertRaises(AccountAuthError) as replay:
+            self.store.set_account_disabled(
+                actor_session_id=owner_session,
+                account_id=owner_id,
+                disabled=True,
+                nonce=nonce,
+            )
+        self.assertEqual(replay.exception.code, "invalid_nonce")
+
+        with self.assertRaises(AccountAuthError) as fresh_rejection:
+            self.store.set_account_disabled(
+                actor_session_id=owner_session,
+                account_id=owner_id,
+                disabled=True,
+                nonce=self.store.issue_nonce(
+                    owner_session, "disable_account",
+                )["nonce"],
+            )
+        self.assertEqual(
+            fresh_rejection.exception.code, "self_disable_rejected",
+        )
+        self.assertIsNotNone(self.store.resolve_session(owner_session))
+
     def test_recovery_consumes_code_revokes_sessions_and_rotates_credentials(self):
         boot = self._bootstrap()
         old_session = boot["account_session_id"]
@@ -2564,7 +2612,11 @@ class AccountCapabilityTests(unittest.TestCase):
                 return json.loads(event.get("body", b"{}").decode("utf-8"))
 
         class _HTTPException(Exception):
-            pass
+            def __init__(self, *, status_code, detail, headers=None):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+                self.headers = headers
 
         names = (
             "_set_maestro_session_cookie", "_set_maestro_account_session_cookie",
@@ -2576,6 +2628,7 @@ class AccountCapabilityTests(unittest.TestCase):
             "change_account_password", "rotate_account_recovery_codes",
             "revoke_account_session", "revoke_all_account_sessions",
             "create_server_account", "update_server_account",
+            "_raise_account_http_error",
         )
         module, path = self._launch_subset(*names)
         temporary = tempfile.TemporaryDirectory()
@@ -2638,7 +2691,6 @@ class AccountCapabilityTests(unittest.TestCase):
             "_attach_account_request_state": attach,
             "_require_account_store": lambda _request: store,
             "_require_account_principal": require_principal,
-            "_raise_account_http_error": lambda error: (_ for _ in ()).throw(error),
             "_account_bootstrap_enabled": lambda: True,
             "_account_local_bootstrap_allowed": lambda _request: True,
         }
@@ -2809,6 +2861,40 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertIsNotNone(decode_account_session_cookie(
                 jar[ACCOUNT_SESSION_COOKIE_NAME], secret,
             ))
+
+            owner_session = decode_account_session_cookie(
+                jar[ACCOUNT_SESSION_COOKIE_NAME], secret,
+            )
+            owner_account_id = store.resolve_session(owner_session)["id"]
+            self_disable_nonce = await request(
+                "/api/v1/account/nonce", {"purpose": "disable_account"},
+            )
+            with self.assertRaises(_HTTPException) as rejected:
+                await request(
+                    f"/api/v1/account/users/{owner_account_id}",
+                    {"disabled": True, "nonce": self_disable_nonce["nonce"]},
+                    method="PUT",
+                )
+            self.assertEqual(rejected.exception.status_code, 400)
+            self.assertEqual(rejected.exception.detail, {
+                "code": "self_disable_rejected",
+                "message": "The active owner cannot disable itself.",
+            })
+            principal = store.resolve_session(owner_session)
+            self.assertIsNotNone(principal)
+            self.assertEqual(principal["id"], owner_account_id)
+            self.assertEqual(principal["role"], "owner")
+            self.assertFalse(principal["disabled"])
+
+            with self.assertRaises(_HTTPException) as replay:
+                await request(
+                    f"/api/v1/account/users/{owner_account_id}",
+                    {"disabled": True, "nonce": self_disable_nonce["nonce"]},
+                    method="PUT",
+                )
+            self.assertEqual(replay.exception.status_code, 409)
+            self.assertEqual(replay.exception.detail["code"], "invalid_nonce")
+            self.assertIsNotNone(store.resolve_session(owner_session))
 
             created = await request_nonce_and_mutate(
                 "create_account", "/api/v1/account/users", {
