@@ -1097,6 +1097,8 @@ class LaunchSecurityContractTests(unittest.TestCase):
             owner,
         )
         self.assertIn("_request_has_recent_account_reauth(request)", owner)
+        self.assertIn('request.method == "GET"', owner)
+        self.assertIn("_account_activation_read_allowed(request)", owner)
         self.assertIn("_account_local_bootstrap_allowed(request)", owner)
         self.assertIn("_workspace_creation_lock", migration)
         self.assertIn("_workspace_lifecycle_lock", migration)

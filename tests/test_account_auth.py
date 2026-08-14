@@ -127,6 +127,30 @@ class AccountAuthStoreTests(unittest.TestCase):
         self.assertFalse(self.marker_path.exists())
         self.assertFalse(self.store.has_accounts())
 
+    def test_manual_account_password_length_boundary(self):
+        with self.assertRaises(AccountAuthError) as rejected:
+            self.store.bootstrap_owner(
+                username="Owner",
+                password="1234567",
+                email="",
+                device_label="Desktop browser",
+                nonce_session_id=self.browser_session,
+                nonce=self._nonce("bootstrap"),
+                remote=False,
+            )
+        self.assertEqual(rejected.exception.code, "invalid_password")
+
+        accepted = self.store.bootstrap_owner(
+            username="Owner",
+            password="12345678",
+            email="",
+            device_label="Desktop browser",
+            nonce_session_id=self.browser_session,
+            nonce=self._nonce("bootstrap"),
+            remote=False,
+        )
+        self.assertEqual(accepted["account"]["username"], "Owner")
+
     def test_bootstrap_is_sealed_private_and_restart_persistent(self):
         result = self._bootstrap()
         principal = self.store.resolve_session(result["account_session_id"])
@@ -2197,6 +2221,7 @@ class AccountCapabilityTests(unittest.TestCase):
             "_configured_app_origins", "_matches_verified_stable_redirect_origin",
             "_account_exact_origin_allowed", "_account_local_bootstrap_allowed",
             "_account_activation_read_allowed", "_account_activation_context",
+            "_require_account_project_migration_owner",
             "_reject_cross_origin_mutation",
         )
         module, path = self._launch_subset(
@@ -2208,6 +2233,12 @@ class AccountCapabilityTests(unittest.TestCase):
                 self.body = body
                 self.status_code = status_code
 
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
         namespace = {
             "os": os,
             "socket": __import__("socket"),
@@ -2215,6 +2246,7 @@ class AccountCapabilityTests(unittest.TestCase):
             "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
             "Request": object,
             "JSONResponse": _Response,
+            "HTTPException": FakeHTTPException,
             "_runtime_share_registration": lambda: ("", "", False),
             "AccountAuthError": AccountAuthError,
             "_accounts_enabled": lambda: True,
@@ -2223,6 +2255,11 @@ class AccountCapabilityTests(unittest.TestCase):
                 getattr(request, "cloudflare", False)
             ),
             "_is_loopback_request_client": lambda request: request.client.host == "127.0.0.1",
+            "_require_account_principal": lambda _request: {"id": "1" * 32},
+            "_request_has_account_capability": lambda _request, capability: (
+                capability == "owner.admin"
+            ),
+            "_request_has_recent_account_reauth": lambda _request: True,
             "_raise_account_http_error": lambda error: (_ for _ in ()).throw(error),
         }
         exec(compile(module, str(path), "exec"), namespace)
@@ -2259,11 +2296,15 @@ class AccountCapabilityTests(unittest.TestCase):
         bootstrap = namespace["_account_local_bootstrap_allowed"]
         readiness = namespace["_account_activation_read_allowed"]
         activation = namespace["_account_activation_context"]
+        require_migration_owner = namespace[
+            "_require_account_project_migration_owner"
+        ]
         with patch.dict(os.environ, {"SERVER_PORT": "7860"}, clear=True):
             exact = request("http://127.0.0.1:7860/", "http://127.0.0.1:7860")
             self.assertTrue(allowed(exact))
             self.assertTrue(bootstrap(exact))
             self.assertTrue(readiness(exact))
+            self.assertEqual(require_migration_owner(exact)["id"], "1" * 32)
             self.assertIsNone(namespace["_reject_cross_origin_mutation"](exact))
 
             headerless = request(
@@ -2272,8 +2313,14 @@ class AccountCapabilityTests(unittest.TestCase):
             )
             self.assertTrue(readiness(headerless))
             self.assertEqual(activation(headerless)["activation_state"], "setup_available")
+            self.assertEqual(
+                require_migration_owner(headerless)["id"], "1" * 32,
+            )
             self.assertEqual(store.reads, 1)
             headerless_mutation = request("http://127.0.0.1:7860/")
+            with self.assertRaises(FakeHTTPException) as denied_post:
+                require_migration_owner(headerless_mutation)
+            self.assertEqual(denied_post.exception.status_code, 403)
             self.assertEqual(
                 namespace["_reject_cross_origin_mutation"](
                     headerless_mutation
@@ -2309,6 +2356,36 @@ class AccountCapabilityTests(unittest.TestCase):
                     activation(rejected)["activation_state"],
                     "setup_requires_loopback",
                 )
+            rejected_migration_reads = (
+                request(
+                    "http://127.0.0.1:7860/",
+                    origin="https://attacker.example",
+                    method="GET",
+                    path_name="/api/v1/account/projects/migration",
+                ),
+                request(
+                    "http://127.0.0.1:7860/",
+                    forwarded_host="attacker.example",
+                    method="GET",
+                    path_name="/api/v1/account/projects/migration",
+                ),
+                request(
+                    "http://127.0.0.1:7860/",
+                    client="192.0.2.10",
+                    method="GET",
+                    path_name="/api/v1/account/projects/migration",
+                ),
+                request(
+                    "http://127.0.0.1:7860/",
+                    cloudflare=True,
+                    method="GET",
+                    path_name="/api/v1/account/projects/migration",
+                ),
+            )
+            for rejected in rejected_migration_reads:
+                with self.assertRaises(FakeHTTPException) as denied_get:
+                    require_migration_owner(rejected)
+                self.assertEqual(denied_get.exception.status_code, 403)
             self.assertEqual(store.reads, 1)
             origins = namespace["_configured_app_origins"]()
             self.assertIn("http://127.0.0.1:7860", origins)

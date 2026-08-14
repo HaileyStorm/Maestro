@@ -531,7 +531,7 @@ export function AccountSupportDrawer() {
         <div
           role="region"
           aria-label={accountsEnabled ? 'Support and account content' : 'Support content'}
-          tabIndex={0}
+          tabIndex={activeTab === 'support' ? 0 : -1}
           className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 [-webkit-overflow-scrolling:touch] sm:px-5"
         >
           {activeTab === 'support' || !accountsEnabled ? (
@@ -597,7 +597,7 @@ export function AccountSupportDrawer() {
                   <div className="mt-3 grid gap-3 sm:grid-cols-2">
                     <Field label="Username" value={username} onChange={setUsername} autoComplete="username" required />
                     <Field label="Device label" value={deviceLabel} onChange={setDeviceLabel} autoComplete="off" required />
-                    <Field label="Password" value={password} onChange={setPassword} type="password" autoComplete="new-password" required minLength={12} />
+                    <Field label="Password" value={password} onChange={setPassword} type="password" autoComplete="new-password" required minLength={8} />
                     <Field label="Email (optional)" value={email} onChange={setEmail} type="email" autoComplete="email" />
                   </div>
                   <button
@@ -667,7 +667,7 @@ export function AccountSupportDrawer() {
                     <Field label="Username" value={username} onChange={setUsername} autoComplete="username" required />
                     <Field label="Device label" value={deviceLabel} onChange={setDeviceLabel} autoComplete="off" required />
                     <Field label="Recovery code" value={recoveryCode} onChange={setRecoveryCode} autoComplete="one-time-code" required />
-                    <Field label="New password" value={newPassword} onChange={setNewPassword} type="password" autoComplete="new-password" required minLength={12} />
+                    <Field label="New password" value={newPassword} onChange={setNewPassword} type="password" autoComplete="new-password" required minLength={8} />
                   </div>
                   <button
                     type="submit"
@@ -886,7 +886,7 @@ export function AccountSupportDrawer() {
                       })
                     }}
                   >
-                    <Field label="New password" value={newPassword} onChange={setNewPassword} type="password" autoComplete="new-password" required minLength={12} />
+                    <Field label="New password" value={newPassword} onChange={setNewPassword} type="password" autoComplete="new-password" required minLength={8} />
                     <button type="submit" disabled={Boolean(busy) || !context.reauthenticated} className="mt-2 w-full rounded-lg border border-border px-3 py-2 text-[10px] font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-40">
                       Change password
                     </button>
@@ -964,7 +964,7 @@ export function AccountSupportDrawer() {
                           <Field label="Username" value={managedUsername} onChange={setManagedUsername} autoComplete="off" required />
                           <Field label="Email (optional)" value={managedEmail} onChange={setManagedEmail} type="email" autoComplete="off" />
                           <div className="sm:col-span-2">
-                            <Field label="Temporary password" value={managedPassword} onChange={setManagedPassword} type="password" autoComplete="new-password" required minLength={12} />
+                            <Field label="Temporary password" value={managedPassword} onChange={setManagedPassword} type="password" autoComplete="new-password" required minLength={8} />
                           </div>
                         </div>
                         <button type="submit" disabled={Boolean(busy)} className="mt-2 w-full rounded-lg bg-bg-active px-3 py-2 text-[10px] font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100">

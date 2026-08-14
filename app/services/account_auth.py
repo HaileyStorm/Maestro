@@ -32,7 +32,7 @@ from collections.abc import Mapping
 from typing import Any
 
 ACCOUNT_STORE_VERSION = 1
-MIN_ACCOUNT_PASSWORD_LENGTH = 12
+MIN_ACCOUNT_PASSWORD_LENGTH = 8
 MAX_ACCOUNT_PASSWORD_BYTES = 1024
 ACCOUNT_ROLES = frozenset({"owner", "user"})
 ACCOUNT_NONCE_PURPOSES = frozenset({

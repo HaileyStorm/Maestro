@@ -2582,7 +2582,7 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   const scrollRegion = source.match(/<div\s+role="region"[^]*?className="[^"]*\boverflow-y-auto\b[^"]*"\s*>/)?.[0]
   assert.ok(scrollRegion, 'the drawer scroll container must remain an explicit accessible region')
   assert.match(scrollRegion, /aria-label=\{accountsEnabled \? 'Support and account content' : 'Support content'\}/)
-  assert.match(scrollRegion, /tabIndex=\{0\}/)
+  assert.match(scrollRegion, /tabIndex=\{activeTab === 'support' \? 0 : -1\}/)
   assert.match(supportSource, /rel="noopener noreferrer"/)
   assert.match(supportSource, /Acknowledging this notice does not review, restrict, or approve what you create/)
   assert.match(supportSource, /hundreds already spent on Codex while building Maestro/)
@@ -2620,4 +2620,25 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.doesNotMatch(source, /account cookie|local bootstrap|same-origin secure cookies|Project access stays separate|signing out other devices/i)
   assert.match(appSource, /context\.accounts\?\.enabled === true/)
   assert.match(appSource, /AccountSupportDrawer/)
+})
+
+test('account drawer uses the eight-character minimum for every account password-setting field', async () => {
+  const source = await readFile(componentUrl, 'utf8')
+  assert.equal([...source.matchAll(/minLength=\{8\}/g)].length, 4)
+  assert.doesNotMatch(source, /minLength=\{12\}/)
+})
+
+test('account tab skips the scroll region while keeping the first sign-in field tabbable', async () => {
+  const source = await readFile(componentUrl, 'utf8')
+  const scrollRegion = source.match(/<div\s+role="region"[^]*?className="[^"]*\boverflow-y-auto\b[^"]*"\s*>/)?.[0]
+  assert.ok(scrollRegion, 'the shared drawer scroll region must remain present')
+  assert.match(scrollRegion, /tabIndex=\{activeTab === 'support' \? 0 : -1\}/)
+
+  const fieldInput = source.match(/function Field\([^]*?return \([^]*?<input[^]*?\/>/)?.[0]
+  assert.ok(fieldInput, 'the shared Field input must remain present')
+  assert.match(fieldInput, /tabIndex=\{0\}/)
+
+  const signInForm = source.match(/<h3 className="text-xs font-semibold text-text-primary">Sign in<\/h3>[^]*?<\/form>/)?.[0]
+  assert.ok(signInForm, 'the account sign-in form must remain present')
+  assert.match(signInForm.match(/<Field\b[^>]*\/>/)?.[0] || '', /label="Username"/)
 })

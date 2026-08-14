@@ -18927,7 +18927,12 @@ def _require_account_project_migration_owner(request: Request) -> dict:
             status_code=403,
             detail="Confirm your password before setting up project access",
         )
-    if not _account_local_bootstrap_allowed(request):
+    locality_allowed = (
+        _account_activation_read_allowed(request)
+        if request.method == "GET"
+        else _account_local_bootstrap_allowed(request)
+    )
+    if not locality_allowed:
         raise HTTPException(
             status_code=403,
             detail="Open Maestro directly on this computer to set up project access",
