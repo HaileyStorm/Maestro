@@ -1318,16 +1318,19 @@ from services.job_lifecycle import (
     record_job_outputs,
     residency_configuration_update,
     register_abort_state,
+    request_sample_preemption,
     request_cancel,
     restore_scheduler_state,
     RESOURCE_EXECUTION_CPU,
     RESOURCE_EXECUTION_STANDARD,
     RESOURCE_INTENT_GENERATION,
     RESOURCE_INTENT_TEXT,
+    SAMPLE_RETRY_MAX_ATTEMPT,
     set_job_hold,
     snapshot_job,
     set_queue_pause_after_current,
     set_queue_paused,
+    settle_sample_preemption,
     stamp_job_residency,
     try_requeue,
     try_resource_retry,
@@ -1392,8 +1395,21 @@ from services.sample_campaign_release import (
 )
 from services.gpu_idle_gate import (
     SustainedGpuIdleGate,
+    capture_foreign_gpu_significance,
     capture_gpu_idle_snapshot,
 )
+from services.sample_campaign_preemption import (
+    SampleCampaignPreemptionCoordinator,
+)
+
+_lifecycle_finish_job = finish_job
+_lifecycle_record_job_outputs = record_job_outputs
+_lifecycle_register_abort_state = register_abort_state
+_lifecycle_update_job = update_job
+_sample_campaign_execution_attempt = contextvars.ContextVar(
+    "sample_campaign_execution_attempt", default=None,
+)
+_sample_campaign_transition_lock = threading.RLock()
 from services.reference_admission import (
     ReferenceAdmissionCapacityError,
     ReferenceAdmissionCorruptionError,
@@ -3045,6 +3061,14 @@ def _start_queue_recovery_before_background_workers() -> None:
 
 
 @api.on_event("startup")
+def _start_sample_campaign_preemption_after_recovery() -> None:
+    """Start the low-frequency watcher only after durable jobs are restored."""
+    starter = globals().get("_start_sample_campaign_preemption_watcher")
+    if callable(starter):
+        starter()
+
+
+@api.on_event("startup")
 def _start_versioned_model_updates() -> None:
     _model_update_stop.clear()
     threading.Thread(
@@ -3057,6 +3081,13 @@ def _start_versioned_model_updates() -> None:
 @api.on_event("shutdown")
 def _stop_versioned_model_updates() -> None:
     _model_update_stop.set()
+
+
+@api.on_event("shutdown")
+def _stop_sample_campaign_preemption_on_shutdown() -> None:
+    stopper = globals().get("_stop_sample_campaign_preemption_watcher")
+    if callable(stopper):
+        stopper()
 
 
 _research_runtime_lock = threading.Lock()
@@ -4137,6 +4168,26 @@ def _queue_recovery_worker(job: dict):
 
 def _queue_recovery_checkpoint(job: dict, **updates) -> bool:
     """Persist an allowlisted recovery transition before mutating the job."""
+    if job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND:
+        context_attempt = _sample_campaign_execution_attempt.get()
+        supplied_attempt = updates.get("expected_execution_attempt")
+        if supplied_attempt is None:
+            supplied_attempt = context_attempt
+            updates["expected_execution_attempt"] = supplied_attempt
+        if (
+            type(supplied_attempt) is not int
+            or supplied_attempt < 1
+            or (
+                context_attempt is not None
+                and supplied_attempt != context_attempt
+            )
+        ):
+            return False
+        with _sample_campaign_transition_lock:
+            if job.get("resource_state") == "preemption_requested":
+                return False
+            with _queue_recovery_checkpoint_lock:
+                return checkpoint_recovery_job(job, **updates)
     with _queue_recovery_checkpoint_lock:
         return checkpoint_recovery_job(job, **updates)
 
@@ -4258,7 +4309,7 @@ def _director_runtime_parent_from_snapshot(
     identity_value: str,
     state_descriptor: dict,
     unit_kind: str,
-) -> dict:
+) -> dict | None:
     """Strip legacy artifact names/content before any new parent checkpoint."""
     return {
         "id": str(snapshot.get("id") or ""),
@@ -5568,6 +5619,7 @@ def _queue_recovery_materialize_job(
         runtime.update({
             "status": "queued",
             "queue_held": True,
+            "resource_state": "queued",
             "recovery_state": (
                 "sample_campaign_held" if not blocked_reason else "blocked"
             ),
@@ -6197,6 +6249,42 @@ def _director_recovery_restore_preparation(
     return True
 
 
+def _safe_sample_campaign_restart_snapshot(snapshot: Mapping[str, Any]) -> bool:
+    """Accept only exact durable sample states before materialization."""
+    status = str(snapshot.get("status") or "").casefold()
+    recovery_state = str(snapshot.get("recovery_state") or "")
+    if status == "completed":
+        return recovery_state == "terminal"
+    retry = snapshot.get("sample_retry")
+    retry_is_valid = bool(
+        isinstance(retry, Mapping)
+        and set(retry) == {"attempt", "not_before"}
+        and type(retry.get("attempt")) is int
+        and 1 <= retry["attempt"] <= SAMPLE_RETRY_MAX_ATTEMPT
+        and type(retry.get("not_before")) in {int, float}
+        and math.isfinite(float(retry["not_before"]))
+        and float(retry["not_before"]) >= 0.0
+    )
+    if status == "queued" and snapshot.get("queue_held") is True:
+        return bool(
+            recovery_state == "sample_campaign_held"
+            or (
+                recovery_state == "sample_campaign_released"
+                and retry_is_valid
+            )
+        )
+    # A crash can split the durable request from settlement.  Only this exact
+    # preemption-requested state is normalized into the same held retry that
+    # settlement would have committed; arbitrary running samples stay inert.
+    return bool(
+        status == "running"
+        and snapshot.get("queue_held") is False
+        and snapshot.get("resource_state") == "preemption_requested"
+        and recovery_state == "sample_campaign_released"
+        and retry_is_valid
+    )
+
+
 def _restore_queue_recovery_on_startup() -> None:
     """Restore scheduler membership before starting any recovered workers."""
     global _queue_recovery_workers_started
@@ -6234,7 +6322,15 @@ def _restore_queue_recovery_on_startup() -> None:
         sample_group_validator(sample_snapshots)
         if callable(sample_group_validator) else ()
     )
+
     for sample_group in sample_groups:
+        if any(
+            not _safe_sample_campaign_restart_snapshot(snapshot)
+            for snapshot in sample_group
+        ):
+            # Validate the journal bytes before the generic materializer can
+            # normalize a malformed state into a conservative held runtime.
+            continue
         materialized = tuple(
             _queue_recovery_materialize_job(snapshot, projects)[0]
             for snapshot in sample_group
@@ -6242,12 +6338,16 @@ def _restore_queue_recovery_on_startup() -> None:
         if any(
             not job.get("out_dir")
             or (
-                job.get("status") == "completed"
+                str(job.get("status") or "").casefold() == "completed"
                 and job.get("recovery_state") != "terminal"
             )
             or (
-                job.get("status") != "completed"
-                and job.get("recovery_state") != "sample_campaign_held"
+                str(job.get("status") or "").casefold() != "completed"
+                and (
+                    job.get("status") != "queued"
+                    or job.get("queue_held") is not True
+                    or job.get("recovery_state") != "sample_campaign_held"
+                )
             )
             for job in materialized
         ):
@@ -6765,14 +6865,14 @@ def _queue_recovery_checkpoint_unit(
     cursor["completed_units"] = units[-2048:]
     if ordinary_repeat_offset is not None:
         cursor["ordinary_repeat_offset"] = max(0, int(ordinary_repeat_offset))
-    _queue_recovery_checkpoint(
+    committed = _queue_recovery_checkpoint(
         job,
         recovery_unit=unit,
         recovery_cursor=cursor,
         recovery_state="restored",
         reruns_denoise=False,
     )
-    return unit
+    return unit if committed is True else None
 
 
 def _queue_recovery_checkpoint_staged_premux(
@@ -9180,7 +9280,7 @@ def _queue_recovery_checkpoint_delivery_completed(
     project_dir: str,
     file_names: list[str],
     pending: dict,
-) -> dict:
+) -> dict | None:
     """Seal final delivery sidecars, then journal the completed delivery unit."""
     unit_id = str(pending.get("unit_id") or "")
     for file_name in file_names:
@@ -9224,6 +9324,8 @@ def _queue_recovery_checkpoint_delivery_completed(
         dependencies=list(pending.get("dependencies") or []),
         settings=dict(pending.get("settings") or {}),
     )
+    if unit is None:
+        return None
     if unit.get("unit_id") != unit_id:
         raise QueueRecoveryRuntimeError("Completed delivery identity changed.")
     return unit
@@ -35875,6 +35977,16 @@ async def submit_sample_campaign_pair(request: Request):
 
 _sample_campaign_idle_gate = SustainedGpuIdleGate()
 _sample_campaign_idle_gate_lock = threading.Lock()
+_sample_campaign_preemption_stop = threading.Event()
+_sample_campaign_preemption_thread: threading.Thread | None = None
+_sample_campaign_preemption_thread_lock = threading.Lock()
+_sample_campaign_retry_sampler_lock = threading.Lock()
+_sample_campaign_retry_sampler_identity: tuple | None = None
+_sample_campaign_retry_ready_identity: tuple | None = None
+_sample_campaign_retry_sampler_thread: threading.Thread | None = None
+_SAMPLE_CAMPAIGN_RETRY_SNAPSHOTS = 5
+_SAMPLE_CAMPAIGN_RETRY_SNAPSHOT_GAP_SECONDS = 2.0
+_SAMPLE_CAMPAIGN_PREEMPTION_POLL_SECONDS = 15.0
 
 
 def _sample_campaign_ordinary_work_present() -> bool:
@@ -35894,6 +36006,345 @@ def _sample_campaign_ordinary_work_present() -> bool:
         ):
             return True
     return False
+
+
+def _sample_campaign_urgent_ordinary_work_present() -> bool:
+    """Yield only for runnable ordinary accelerator work already queued."""
+    for candidate in list(_jobs.values()):
+        if (
+            not isinstance(candidate, Mapping)
+            or candidate.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+            or str(candidate.get("status") or "").casefold() != "queued"
+            or candidate.get("queue_held") is True
+            or candidate.get("resource_intent", "generation")
+                != RESOURCE_INTENT_GENERATION
+            or candidate.get("resource_execution", RESOURCE_EXECUTION_STANDARD)
+                != RESOURCE_EXECUTION_STANDARD
+            or candidate.get("queue_class") not in {None, "user"}
+            or candidate.get("cancel_requested") is True
+        ):
+            continue
+        return True
+    return False
+
+
+def _sample_campaign_request_preemption(
+    job: Mapping[str, Any],
+    *,
+    job_id: str,
+    expected_execution_attempt: int,
+):
+    """Serialize the durable request against sample finality publication."""
+    if not isinstance(job, dict):
+        return None
+    with _sample_campaign_transition_lock:
+        return request_sample_preemption(
+            job,
+            job_id=job_id,
+            active_states=_active_gen_states,
+            expected_execution_attempt=expected_execution_attempt,
+        )
+
+
+def _sample_campaign_due_retry_identity() -> tuple | None:
+    """Return one deterministic due retry without mutating queue state."""
+    now = time.time()
+    candidates = []
+    for job in list(_jobs.values()):
+        if not isinstance(job, Mapping):
+            continue
+        cursor = job.get("recovery_cursor")
+        linkage = (
+            cursor.get("sample_campaign")
+            if isinstance(cursor, Mapping) else None
+        )
+        retry = job.get("sample_retry")
+        attempt = job.get("execution_attempt")
+        if (
+            job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND
+            or job.get("queue_class") != _SAMPLE_CAMPAIGN_QUEUE_CLASS
+            or job.get("queue_priority") != _SAMPLE_CAMPAIGN_QUEUE_PRIORITY
+            or str(job.get("status") or "").casefold() != "queued"
+            or job.get("queue_held") is not True
+            or not isinstance(linkage, Mapping)
+            or not isinstance(linkage.get("pair_id"), str)
+            or not linkage["pair_id"]
+            or linkage.get("arm") not in {"maestro", "control"}
+            or not isinstance(linkage.get("peer_job_id"), str)
+            or not linkage["peer_job_id"]
+            or not isinstance(linkage.get("pair_manifest_digest"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", linkage["pair_manifest_digest"],
+            ) is None
+            or not isinstance(retry, Mapping)
+            or set(retry) != {"attempt", "not_before"}
+            or type(retry.get("attempt")) is not int
+            or not 1 <= retry["attempt"] <= SAMPLE_RETRY_MAX_ATTEMPT
+            or type(retry.get("not_before")) not in {int, float}
+            or not math.isfinite(float(retry["not_before"]))
+            or float(retry["not_before"]) < 0.0
+            or float(retry["not_before"]) > now
+            or type(attempt) is not int
+            or attempt < 1
+            or not isinstance(job.get("id"), str)
+            or not job["id"]
+        ):
+            continue
+        candidates.append((
+            float(retry["not_before"]),
+            str(linkage["pair_id"]),
+            str(job["id"]),
+            attempt,
+            retry["attempt"],
+            str(linkage["pair_manifest_digest"]),
+            str(linkage["arm"]),
+            str(linkage["peer_job_id"]),
+        ))
+    return min(candidates) if candidates else None
+
+
+def _sample_campaign_retry_identity_current(identity: tuple) -> bool:
+    if not isinstance(identity, tuple) or len(identity) != 8:
+        return False
+    (
+        not_before, pair_id, job_id, execution_attempt, retry_attempt,
+        pair_digest, arm, peer_job_id,
+    ) = identity
+    job = _jobs.get(job_id)
+    cursor = job.get("recovery_cursor") if isinstance(job, Mapping) else None
+    linkage = cursor.get("sample_campaign") if isinstance(cursor, Mapping) else None
+    retry = job.get("sample_retry") if isinstance(job, Mapping) else None
+    return bool(
+        isinstance(job, Mapping)
+        and job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+        and job.get("queue_class") == _SAMPLE_CAMPAIGN_QUEUE_CLASS
+        and job.get("queue_priority") == _SAMPLE_CAMPAIGN_QUEUE_PRIORITY
+        and str(job.get("status") or "").casefold() == "queued"
+        and job.get("queue_held") is True
+        and job.get("execution_attempt") == execution_attempt
+        and isinstance(linkage, Mapping)
+        and linkage.get("pair_id") == pair_id
+        and linkage.get("pair_manifest_digest") == pair_digest
+        and linkage.get("arm") == arm
+        and linkage.get("peer_job_id") == peer_job_id
+        and isinstance(retry, Mapping)
+        and retry.get("attempt") == retry_attempt
+        and retry.get("not_before") == not_before
+        and float(not_before) <= time.time()
+    )
+
+
+def _sample_campaign_reset_idle_gate() -> None:
+    with _sample_campaign_idle_gate_lock:
+        _sample_campaign_idle_gate.reset()
+
+
+def _sample_campaign_run_due_retry_sampler(identity: tuple) -> None:
+    """Prove one bounded idle window, then use the dedicated release path."""
+    global _sample_campaign_retry_sampler_identity
+    global _sample_campaign_retry_ready_identity
+    global _sample_campaign_retry_sampler_thread
+    pair_id = identity[1]
+    job_id = identity[2]
+    try:
+        _sample_campaign_reset_idle_gate()
+        ready = False
+        for index in range(_SAMPLE_CAMPAIGN_RETRY_SNAPSHOTS):
+            if (
+                _sample_campaign_preemption_stop.is_set()
+                or _sample_campaign_urgent_ordinary_work_present()
+                or not _sample_campaign_retry_identity_current(identity)
+            ):
+                return
+            try:
+                significance = capture_foreign_gpu_significance()
+            except Exception:
+                return
+            if (
+                significance.known is not True
+                or significance.significant is True
+            ):
+                return
+            job = _jobs.get(job_id)
+            if not isinstance(job, Mapping):
+                return
+            ready, reason = _sample_campaign_release_readiness(job)
+            if not ready and reason != "idle_window_pending":
+                return
+            if index + 1 < _SAMPLE_CAMPAIGN_RETRY_SNAPSHOTS:
+                if _sample_campaign_preemption_stop.wait(
+                    _SAMPLE_CAMPAIGN_RETRY_SNAPSHOT_GAP_SECONDS
+                ):
+                    return
+        if not ready or not _sample_campaign_retry_identity_current(identity):
+            return
+        with _sample_campaign_release_lock:
+            if (
+                _sample_campaign_preemption_stop.is_set()
+                or _sample_campaign_urgent_ordinary_work_present()
+                or not _sample_campaign_retry_identity_current(identity)
+            ):
+                return
+            with _sample_campaign_retry_sampler_lock:
+                _sample_campaign_retry_ready_identity = identity
+            coordinator = SampleCampaignReleaseCoordinator(
+                ordinary_work_present=_sample_campaign_ordinary_work_present,
+                another_sample_active=_sample_campaign_other_arm_active,
+                validate_pair_requests=_sample_campaign_validate_live_pair,
+                readiness=_sample_campaign_release_readiness,
+                persist_hold=_sample_campaign_persist_hold,
+                force_hold=_sample_campaign_force_hold,
+                start_worker=_start_sample_campaign_worker,
+            )
+            result = coordinator.release_one(pair_id, tuple(_jobs.values()))
+            if result.status != "released":
+                with _sample_campaign_retry_sampler_lock:
+                    if _sample_campaign_retry_ready_identity == identity:
+                        _sample_campaign_retry_ready_identity = None
+                _sample_campaign_reset_idle_gate()
+    finally:
+        with _sample_campaign_retry_sampler_lock:
+            if _sample_campaign_retry_sampler_identity == identity:
+                _sample_campaign_retry_sampler_identity = None
+            proof_pending = _sample_campaign_retry_ready_identity == identity
+        # A released asynchronous worker owns the gate until its post-slot
+        # guard consumes the exact proof.  Every unsuccessful path resets it
+        # here so stale samples cannot accumulate readiness.
+        if not proof_pending:
+            _sample_campaign_reset_idle_gate()
+        with _sample_campaign_retry_sampler_lock:
+            if _sample_campaign_retry_sampler_thread is threading.current_thread():
+                _sample_campaign_retry_sampler_thread = None
+
+
+def _sample_campaign_maybe_start_due_retry_sampler() -> None:
+    global _sample_campaign_retry_sampler_identity
+    global _sample_campaign_retry_sampler_thread
+    identity = _sample_campaign_due_retry_identity()
+    if identity is None:
+        return
+    with _sample_campaign_retry_sampler_lock:
+        if _sample_campaign_retry_sampler_identity is not None:
+            return
+        _sample_campaign_retry_sampler_identity = identity
+    try:
+        thread = threading.Thread(
+            target=_sample_campaign_run_due_retry_sampler,
+            args=(identity,),
+            daemon=True,
+            name="sample-campaign-retry-window",
+        )
+        _sample_campaign_retry_sampler_thread = thread
+        thread.start()
+    except Exception:
+        with _sample_campaign_retry_sampler_lock:
+            if _sample_campaign_retry_sampler_identity == identity:
+                _sample_campaign_retry_sampler_identity = None
+
+
+def _sample_campaign_preemption_loop() -> None:
+    coordinator = SampleCampaignPreemptionCoordinator(
+        jobs=lambda: tuple(_jobs.values()),
+        active_states=lambda: _active_gen_states,
+        urgent_ordinary_work_present=(
+            _sample_campaign_urgent_ordinary_work_present
+        ),
+        capture_foreign_significance=capture_foreign_gpu_significance,
+        request_preemption=_sample_campaign_request_preemption,
+    )
+    while not _sample_campaign_preemption_stop.is_set():
+        _sample_campaign_settle_requested_jobs()
+        coordinator.poll_once()
+        _sample_campaign_maybe_start_due_retry_sampler()
+        if _sample_campaign_preemption_stop.wait(
+            _SAMPLE_CAMPAIGN_PREEMPTION_POLL_SECONDS
+        ):
+            return
+
+
+def _sample_campaign_settle_requested_jobs() -> None:
+    """Retry interrupted settlement at the watcher's bounded cadence."""
+    for job_id, state in list(_active_gen_states.items()):
+        job = _jobs.get(job_id)
+        attempt = job.get("execution_attempt") if isinstance(job, Mapping) else None
+        if (
+            not isinstance(job, dict)
+            or job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND
+            or job.get("resource_state") != "preemption_requested"
+            or not isinstance(state, dict)
+            or state.get("abort") is not True
+            or type(attempt) is not int
+            or attempt < 1
+        ):
+            continue
+        try:
+            with _sample_campaign_transition_lock:
+                settled = settle_sample_preemption(
+                    job,
+                    job_id=job_id,
+                    active_states=_active_gen_states,
+                    state=state,
+                    expected_execution_attempt=attempt,
+                )
+            if settled:
+                _sample_campaign_persist_hold(
+                    job, True, "sample_campaign_held",
+                )
+        except Exception:
+            # Preserve the exact registration for the next low-frequency
+            # watcher pass; never turn a durable request into an orphan.
+            continue
+
+
+def _start_sample_campaign_preemption_watcher() -> None:
+    global _sample_campaign_preemption_thread
+    with _sample_campaign_preemption_thread_lock:
+        if (
+            _sample_campaign_preemption_thread is not None
+            and _sample_campaign_preemption_thread.is_alive()
+        ):
+            return
+        with _sample_campaign_retry_sampler_lock:
+            if (
+                _sample_campaign_retry_sampler_thread is not None
+                and _sample_campaign_retry_sampler_thread.is_alive()
+            ):
+                return
+        _sample_campaign_preemption_stop.clear()
+        thread = threading.Thread(
+            target=_sample_campaign_preemption_loop,
+            daemon=True,
+            name="sample-campaign-preemption",
+        )
+        _sample_campaign_preemption_thread = thread
+        thread.start()
+
+
+def _stop_sample_campaign_preemption_watcher() -> None:
+    global _sample_campaign_preemption_thread
+    global _sample_campaign_retry_ready_identity
+    global _sample_campaign_retry_sampler_thread
+    _sample_campaign_preemption_stop.set()
+    current = threading.current_thread()
+    with _sample_campaign_preemption_thread_lock:
+        watcher = _sample_campaign_preemption_thread
+    with _sample_campaign_retry_sampler_lock:
+        sampler = _sample_campaign_retry_sampler_thread
+    for thread in (watcher, sampler):
+        if thread is not None and thread is not current and thread.is_alive():
+            thread.join(timeout=5.0)
+    with _sample_campaign_preemption_thread_lock:
+        if watcher is _sample_campaign_preemption_thread and (
+            watcher is None or not watcher.is_alive()
+        ):
+            _sample_campaign_preemption_thread = None
+    with _sample_campaign_retry_sampler_lock:
+        if sampler is _sample_campaign_retry_sampler_thread and (
+            sampler is None or not sampler.is_alive()
+        ):
+            _sample_campaign_retry_sampler_thread = None
+        _sample_campaign_retry_ready_identity = None
+    _sample_campaign_reset_idle_gate()
 
 
 def _sample_campaign_other_arm_active(pair_id: str) -> bool:
@@ -36000,8 +36451,35 @@ def _sample_campaign_persist_hold(
 ) -> bool:
     if not isinstance(job, dict) or type(held) is not bool:
         return False
+    execution_attempt = job.get("execution_attempt")
+    retry = job.get("sample_retry", {"attempt": 0, "not_before": None})
+    if (
+        type(execution_attempt) is not int
+        or execution_attempt < 1
+        or not isinstance(retry, Mapping)
+        or set(retry) != {"attempt", "not_before"}
+        or type(retry.get("attempt")) is not int
+        or not 0 <= retry["attempt"] <= SAMPLE_RETRY_MAX_ATTEMPT
+        or (retry["attempt"] == 0) != (retry.get("not_before") is None)
+        or (
+            retry.get("not_before") is not None
+            and (
+                type(retry["not_before"]) not in {int, float}
+                or not math.isfinite(float(retry["not_before"]))
+                or float(retry["not_before"]) < 0.0
+            )
+        )
+    ):
+        return False
+    if (
+        held is False
+        and retry["attempt"] > 0
+        and float(retry["not_before"]) > time.time()
+    ):
+        return False
     return _queue_recovery_checkpoint(
         job,
+        expected_execution_attempt=execution_attempt,
         status="queued",
         queue_class=_SAMPLE_CAMPAIGN_QUEUE_CLASS,
         queue_priority=_SAMPLE_CAMPAIGN_QUEUE_PRIORITY,
@@ -36024,11 +36502,28 @@ def _sample_campaign_force_hold(job: Mapping[str, Any]) -> None:
 
 def _sample_campaign_post_slot_guard(job: Mapping[str, Any]) -> bool:
     """Recheck evidence and contention after scheduler slot acquisition."""
-    valid = _sample_campaign_validate_live_request(job)
-    ready, _reason = (
-        _sample_campaign_release_readiness(job)
-        if valid else (False, "private_evidence_invalid")
-    )
+    global _sample_campaign_retry_ready_identity
+    job_id = str(job.get("id") or "") if isinstance(job, Mapping) else ""
+    with _sample_campaign_retry_sampler_lock:
+        proof = _sample_campaign_retry_ready_identity
+        owns_retry_proof = bool(
+            proof is not None
+            and len(proof) == 8
+            and proof[2] == job_id
+            and proof[3] == job.get("execution_attempt")
+        )
+    try:
+        valid = _sample_campaign_validate_live_request(job)
+        ready, _reason = (
+            _sample_campaign_release_readiness(job)
+            if valid else (False, "private_evidence_invalid")
+        )
+    finally:
+        if owns_retry_proof:
+            with _sample_campaign_retry_sampler_lock:
+                if _sample_campaign_retry_ready_identity == proof:
+                    _sample_campaign_retry_ready_identity = None
+            _sample_campaign_reset_idle_gate()
     if valid and ready:
         return True
     try:
@@ -36051,34 +36546,42 @@ def _run_sample_campaign_generation(job_id: str) -> None:
         or job.get("queue_class") != _SAMPLE_CAMPAIGN_QUEUE_CLASS
     ):
         return
+    execution_attempt = job.get("execution_attempt")
+    if type(execution_attempt) is not int or execution_attempt < 1:
+        return
     reached_start = False
 
     def mark_started() -> None:
         nonlocal reached_start
         reached_start = True
 
+    token = _sample_campaign_execution_attempt.set(execution_attempt)
     try:
         _run_generation(
             job_id,
             admission_guard=_sample_campaign_post_slot_guard,
             on_started=mark_started,
+            expected_execution_attempt=execution_attempt,
         )
     finally:
-        current = _jobs.get(job_id)
-        if (
-            isinstance(current, dict)
-            and not reached_start
-            and str(current.get("status") or "").casefold() == "queued"
-            and current.get("queue_held") is not True
-        ):
-            try:
-                persisted = _sample_campaign_persist_hold(
-                    current, True, "sample_campaign_held",
-                )
-            except Exception:
-                persisted = False
-            if not persisted:
-                _sample_campaign_force_hold(current)
+        try:
+            current = _jobs.get(job_id)
+            if (
+                isinstance(current, dict)
+                and not reached_start
+                and str(current.get("status") or "").casefold() == "queued"
+                and current.get("queue_held") is not True
+            ):
+                try:
+                    persisted = _sample_campaign_persist_hold(
+                        current, True, "sample_campaign_held",
+                    )
+                except Exception:
+                    persisted = False
+                if not persisted:
+                    _sample_campaign_force_hold(current)
+        finally:
+            _sample_campaign_execution_attempt.reset(token)
 
 
 def _start_sample_campaign_worker(job_id: str) -> None:
@@ -47686,7 +48189,10 @@ def _run_sfx_generation(job: dict, raw_params: dict, start_time: float):
         return False
 
 
-def _chunked_flashvsr_upscale(video_path: str, method: str, *, job: dict = None, abort_check=None, progress_callback=None):
+def _chunked_flashvsr_upscale(
+    video_path: str, method: str, *, job: dict = None, abort_check=None,
+    progress_callback=None, update_job_fn=None,
+):
     """Chunked FlashVSR upscale of a saved video -> tmp VIDEO-ONLY file.
 
     Shared engine for the post-generation in-place pass
@@ -47717,6 +48223,7 @@ def _chunked_flashvsr_upscale(video_path: str, method: str, *, job: dict = None,
     from postprocessing.flashvsr.runtime import FLASHVSR_CONTINUE_CACHE_FRAMES
 
     fps, width, height, total_frames = get_video_info(video_path)
+    publisher = update_job if update_job_fn is None else update_job_fn
     scale = wgp.flashvsr.scale_for_upsampling(method) or 2.0
     out_h, out_w = max(1, int(height * scale)), max(1, int(width * scale))
 
@@ -47763,7 +48270,7 @@ def _chunked_flashvsr_upscale(video_path: str, method: str, *, job: dict = None,
         except (TypeError, ValueError):
             pass
         if changes:
-            update_job(job, **changes)
+            publisher(job, **changes)
 
     output_fps = round(fps)
     container = wgp.server_config.get("video_container", "mp4")
@@ -47802,7 +48309,7 @@ def _chunked_flashvsr_upscale(video_path: str, method: str, *, job: dict = None,
             last = take_new < chunk_frames
             if n_chunks > 1:
                 if job is not None:
-                    if not update_job(
+                    if not publisher(
                         job,
                         message=f"Upscaling chunk {seg_idx + 1}/{n_chunks} (FlashVSR)...",
                     ):
@@ -47844,7 +48351,7 @@ def _chunked_flashvsr_upscale(video_path: str, method: str, *, job: dict = None,
             segment_paths = []
         else:
             if job is not None:
-                if not update_job(job, message="Joining upscaled segments..."):
+                if not publisher(job, message="Joining upscaled segments..."):
                     return None
             if callable(abort_check) and abort_check():
                 return None
@@ -47880,7 +48387,10 @@ def _chunked_flashvsr_upscale(video_path: str, method: str, *, job: dict = None,
                     pass
 
 
-def _apply_spatial_upsampling_to_file(video_path: str, method: str, job: dict = None):
+def _apply_spatial_upsampling_to_file(
+    video_path: str, method: str, job: dict = None, *,
+    abort_check=None, update_job_fn=None,
+):
     """Upscale an already-saved video file IN PLACE (post-generation pass).
 
     Used to defer FlashVSR from the per-sliding-window inline path to a
@@ -47901,11 +48411,13 @@ def _apply_spatial_upsampling_to_file(video_path: str, method: str, job: dict = 
     tmp_video = None
     tmp_muxed = None
     try:
-        abort_check = (
-            (lambda: is_cancel_requested(job)) if job is not None else None
-        )
+        if abort_check is None:
+            abort_check = (
+                (lambda: is_cancel_requested(job)) if job is not None else None
+            )
         tmp_video = _chunked_flashvsr_upscale(
             video_path, method, job=job, abort_check=abort_check,
+            update_job_fn=update_job_fn,
         )
         if tmp_video is None:
             raise RuntimeError("FlashVSR upscale was aborted")
@@ -48389,12 +48901,15 @@ def _publish_h3_delivery_outputs(
     *,
     recovery_action: str = "",
     requested_target: str = "",
+    update_job_fn=None,
+    publication_commit_fn=None,
 ) -> list[str]:
     """Commit sidecars-before-media and roll back every partial publication."""
     import shutil
 
     final_names = [item["file_name"] for item in staged]
     published_items = []
+    publisher = update_job if update_job_fn is None else update_job_fn
     final_policy = dict(job.get("access_policy") or {})
     owner = str(job.get("session_id") or "")
 
@@ -48498,31 +49013,57 @@ def _publish_h3_delivery_outputs(
             published_items.append(item)
         if is_cancel_requested(job):
             raise InterruptedError("H3 delivery cancelled")
-        # This lifecycle update and request_cancel share one lock. If
-        # cancellation won at the commit boundary, remove every prepared final
-        # below and retain the hidden native sources.
-        if not update_job(job, output_files=final_names):
-            raise InterruptedError("H3 delivery cancelled")
-        if is_cancel_requested(job):
-            # update_job and request_cancel serialize, but the job remains
-            # running until all postpasses finish. Retract this just-committed
-            # view when cancellation lands in that narrow interval.
-            job["output_files"] = []
-            raise InterruptedError("H3 delivery cancelled")
-        for item in staged:
-            if is_cancel_requested(job):
+        # Keep the exact-attempt lifecycle publication and final sidecar
+        # promotion in the same transition transaction as preemption.
+        with _sample_campaign_transition_lock:
+            if (
+                job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+                and job.get("resource_state") == "preemption_requested"
+            ):
+                raise InterruptedError("H3 delivery preempted")
+            if not publisher(job, output_files=final_names):
                 raise InterruptedError("H3 delivery cancelled")
-            _atomic_write_json(
-                item["source_meta"],
-                _publication_sidecar(item, final=True),
-            )
-        if is_cancel_requested(job):
-            raise InterruptedError("H3 delivery cancelled")
+            if is_cancel_requested(job):
+                if job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+                    job["output_files"] = []
+                else:
+                    publisher(job, output_files=[])
+                raise InterruptedError("H3 delivery cancelled")
+            for item in staged:
+                if is_cancel_requested(job):
+                    if job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+                        job["output_files"] = []
+                    else:
+                        publisher(job, output_files=[])
+                    raise InterruptedError("H3 delivery cancelled")
+                _atomic_write_json(
+                    item["source_meta"],
+                    _publication_sidecar(item, final=True),
+                )
+            if (
+                callable(publication_commit_fn)
+                and publication_commit_fn(final_names) is not True
+            ):
+                raise InterruptedError("H3 delivery checkpoint rejected")
+            if is_cancel_requested(job):
+                if job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+                    job["output_files"] = []
+                else:
+                    publisher(job, output_files=[])
+                raise InterruptedError("H3 delivery cancelled")
+            job["_h3_delivery_publication"] = {
+                "staged": staged,
+                "final_names": final_names,
+            }
     except Exception:
         # The lifecycle record may have succeeded before a later sidecar or
         # cancellation fault. Retract the public job view before filesystem
         # rollback; artifact lineage remains available for local diagnostics.
-        job["output_files"] = []
+        with _sample_campaign_transition_lock:
+            if job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+                job["output_files"] = []
+            else:
+                publisher(job, output_files=[])
         # Prefer a recoverable hidden rename over deletion. If a viewer has the
         # file locked and even the rename fails, keep the basename behind an
         # owner-private temporary sidecar; never leave fail-open media.
@@ -48559,28 +49100,33 @@ def _publish_h3_delivery_outputs(
     # Native bytes and byte-exact temporary sidecars stay protected until the
     # lifecycle transitions terminal-completed.  A cancel racing immediately
     # after publication can therefore retract every public basename.
-    job["_h3_delivery_publication"] = {
-        "staged": staged,
-        "final_names": final_names,
-    }
     return final_names
 
 
-def _rollback_h3_delivery_publication(job: dict) -> None:
+def _rollback_h3_delivery_publication(job: dict, *, update_job_fn=None) -> None:
     publication = job.pop("_h3_delivery_publication", None)
     if not isinstance(publication, dict):
         return
-    job["output_files"] = []
-    for item in publication.get("staged") or []:
-        if os.path.isfile(item["source_path"]):
-            try:
-                os.replace(item["source_path"], item["work_path"])
-            except OSError:
-                # Fail closed: retain a private temporary policy at a locked
-                # public basename.  The rollback bytes below are byte-exact.
-                pass
-        if os.path.isfile(item["rollback_meta"]):
-            os.replace(item["rollback_meta"], item["source_meta"])
+    publisher = update_job if update_job_fn is None else update_job_fn
+    with _sample_campaign_transition_lock:
+        if job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+            job["output_files"] = []
+        elif not publisher(job, output_files=[]):
+            # A newer attempt or a committed preemption owns these outputs.
+            # Restore the marker and leave both lifecycle and filesystem bytes
+            # untouched for retry/finality recovery.
+            job["_h3_delivery_publication"] = publication
+            return
+        for item in publication.get("staged") or []:
+            if os.path.isfile(item["source_path"]):
+                try:
+                    os.replace(item["source_path"], item["work_path"])
+                except OSError:
+                    # Fail closed: retain a private temporary policy at a locked
+                    # public basename.  The rollback bytes below are byte-exact.
+                    pass
+            if os.path.isfile(item["rollback_meta"]):
+                os.replace(item["rollback_meta"], item["source_meta"])
 
 
 def _finalize_h3_delivery_publication(job: dict) -> bool:
@@ -48635,6 +49181,8 @@ def _process_h3_delivery_from_protected_native(
     spatial_upsampling: str,
     delivery_resolution: str,
     delivery_fit: str,
+    update_job_fn=None,
+    publication_commit_fn=None,
 ) -> list[str]:
     """Run no operation except delivery from hash-verified native bytes."""
     for item in staged:
@@ -48646,7 +49194,18 @@ def _process_h3_delivery_from_protected_native(
             shutil.copy2(source_path, staging_path)
             try:
                 _apply_spatial_upsampling_to_file(
-                    staging_path, spatial_upsampling, job=job,
+                    staging_path,
+                    spatial_upsampling,
+                    job=job,
+                    abort_check=lambda: bool(
+                        is_cancel_requested(job)
+                        or (
+                            job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+                            and job.get("resource_state")
+                                == "preemption_requested"
+                        )
+                    ),
+                    update_job_fn=update_job_fn,
                 )
             except InterruptedError:
                 raise
@@ -48656,7 +49215,8 @@ def _process_h3_delivery_from_protected_native(
                     stage="flashvsr",
                     code="flashvsr_failed",
                 ) from error
-            if not update_job(
+            publisher = update_job if update_job_fn is None else update_job_fn
+            if not publisher(
                 job,
                 message=f"Fitting exact {delivery_resolution} delivery...",
                 phase="Delivery fit",
@@ -48683,7 +49243,12 @@ def _process_h3_delivery_from_protected_native(
             deliver=deliver_native,
         )
     try:
-        return _publish_h3_delivery_outputs(job, staged)
+        return _publish_h3_delivery_outputs(
+            job,
+            staged,
+            update_job_fn=update_job_fn,
+            publication_commit_fn=publication_commit_fn,
+        )
     except InterruptedError:
         raise
     except Exception as error:
@@ -48701,6 +49266,8 @@ def _deliver_h3_outputs_transactionally(
     spatial_upsampling: str,
     delivery_resolution: str,
     delivery_fit: str,
+    update_job_fn=None,
+    publication_commit_fn=None,
 ) -> list[str]:
     """Deliver all H3 finals from protected native bytes with one OOM retry."""
     from services.oom_detect import delivery_oom_info, is_oom
@@ -48760,7 +49327,9 @@ def _deliver_h3_outputs_transactionally(
         "restart_supported": True,
         "unsupported_after_restart_reason": "",
     }
-    update_job(job, output_files=[])
+    publisher = update_job if update_job_fn is None else update_job_fn
+    if not publisher(job, output_files=[]):
+        raise InterruptedError("H3 delivery preempted")
     actions = _release_h3_delivery_vram()
     retry_count = 0
     for attempt in range(2):
@@ -48783,6 +49352,8 @@ def _deliver_h3_outputs_transactionally(
                     spatial_upsampling=spatial_upsampling,
                     delivery_resolution=delivery_resolution,
                     delivery_fit=delivery_fit,
+                    update_job_fn=update_job_fn,
+                    publication_commit_fn=publication_commit_fn,
                 )
             _reset_h3_delivery_work(staged)
             for item in staged:
@@ -48791,9 +49362,20 @@ def _deliver_h3_outputs_transactionally(
                 active_stage = "flashvsr"
                 active_code = "flashvsr_failed"
                 _apply_spatial_upsampling_to_file(
-                    item["work_path"], spatial_upsampling, job=job,
+                    item["work_path"],
+                    spatial_upsampling,
+                    job=job,
+                    abort_check=lambda: bool(
+                        is_cancel_requested(job)
+                        or (
+                            job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+                            and job.get("resource_state")
+                                == "preemption_requested"
+                        )
+                    ),
+                    update_job_fn=update_job_fn,
                 )
-                if not update_job(
+                if not publisher(
                     job,
                     message=f"Fitting exact {delivery_resolution} delivery...",
                     phase="Delivery fit",
@@ -48806,7 +49388,12 @@ def _deliver_h3_outputs_transactionally(
                 )
             active_stage = "publication"
             active_code = "publication_failed"
-            return _publish_h3_delivery_outputs(job, staged)
+            return _publish_h3_delivery_outputs(
+                job,
+                staged,
+                update_job_fn=update_job_fn,
+                publication_commit_fn=publication_commit_fn,
+            )
         except InterruptedError:
             for item in staged:
                 try:
@@ -48876,7 +49463,9 @@ def _deliver_h3_outputs_transactionally(
     raise AssertionError("unreachable H3 delivery retry state")
 
 
-def _resume_pending_h3_delivery_only(job: dict) -> bool:
+def _resume_pending_h3_delivery_only(
+    job: dict, *, update_job_fn=None, finish_job_fn=None,
+) -> bool:
     """Resume a crash-interrupted delivery without reaching concat/denoise."""
     pending = _queue_recovery_delivery_pending(job)
     if pending is None:
@@ -48935,7 +49524,8 @@ def _resume_pending_h3_delivery_only(job: dict) -> bool:
             "staged": staged,
             "final_names": delivered,
         }
-        completed = finish_job(
+        finisher = finish_job if finish_job_fn is None else finish_job_fn
+        completed = finisher(
             job,
             "completed",
             output_files=delivered,
@@ -48955,7 +49545,9 @@ def _resume_pending_h3_delivery_only(job: dict) -> bool:
                 reruns_denoise=False,
             )
             return True
-        _rollback_h3_delivery_publication(job)
+        _rollback_h3_delivery_publication(
+            job, update_job_fn=update_job_fn,
+        )
         return False
     job["_h3_delivery_recovery"] = {
         "nonce": uuid.uuid4().hex,
@@ -48971,13 +49563,20 @@ def _resume_pending_h3_delivery_only(job: dict) -> bool:
         "unsupported_after_restart_reason": "",
     }
     try:
-        update_job(
+        publisher = update_job if update_job_fn is None else update_job_fn
+        if not publisher(
             job,
             output_files=[],
             phase="Delivery recovery",
             message="Resuming delivery from protected native output...",
-        )
+        ):
+            raise InterruptedError("H3 delivery preempted")
         _release_h3_delivery_vram()
+        def commit_delivery_publication(delivered_files):
+            return bool(_queue_recovery_checkpoint_delivery_completed(
+                job, out_dir, delivered_files, pending,
+            ))
+
         delivered = _process_h3_delivery_from_protected_native(
             job,
             out_dir,
@@ -48985,11 +49584,11 @@ def _resume_pending_h3_delivery_only(job: dict) -> bool:
             spatial_upsampling=str(settings.get("spatial_upsampling") or ""),
             delivery_resolution=str(settings.get("delivery_resolution") or ""),
             delivery_fit=str(settings.get("delivery_fit") or ""),
+            update_job_fn=update_job_fn,
+            publication_commit_fn=commit_delivery_publication,
         )
-        _queue_recovery_checkpoint_delivery_completed(
-            job, out_dir, delivered, pending,
-        )
-        completed = finish_job(
+        finisher = finish_job if finish_job_fn is None else finish_job_fn
+        completed = finisher(
             job,
             "completed",
             output_files=delivered,
@@ -49009,13 +49608,19 @@ def _resume_pending_h3_delivery_only(job: dict) -> bool:
                 reruns_denoise=False,
             )
             return True
-        _rollback_h3_delivery_publication(job)
+        _rollback_h3_delivery_publication(
+            job, update_job_fn=update_job_fn,
+        )
         return False
     except InterruptedError:
-        _rollback_h3_delivery_publication(job)
+        _rollback_h3_delivery_publication(
+            job, update_job_fn=update_job_fn,
+        )
         return False
     except Exception:
-        _rollback_h3_delivery_publication(job)
+        _rollback_h3_delivery_publication(
+            job, update_job_fn=update_job_fn,
+        )
         if try_requeue(
             job,
             queue_held=True,
@@ -50790,6 +51395,7 @@ def _run_generation(
     finalize: bool = True,
     admission_guard: Callable[[Mapping[str, Any]], bool] | None = None,
     on_started: Callable[[], None] | None = None,
+    expected_execution_attempt: int | None = None,
 ) -> bool:
     """Build and run a job, optionally deferring success finalization."""
     from shared.utils.thread_utils import AsyncStream, async_run
@@ -50797,6 +51403,158 @@ def _run_generation(
     import inspect
 
     job = _jobs[job_id]
+    sample_worker = job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+    worker_execution_attempt = expected_execution_attempt
+    if sample_worker and (
+        type(worker_execution_attempt) is not int
+        or worker_execution_attempt < 1
+        or job.get("execution_attempt") != worker_execution_attempt
+        or _sample_campaign_execution_attempt.get()
+            != worker_execution_attempt
+    ):
+        return False
+
+    def _sample_attempt(
+        target: Mapping[str, Any], supplied: int | None,
+    ) -> int | None:
+        if target.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+            return supplied
+        if (
+            type(worker_execution_attempt) is not int
+            or worker_execution_attempt < 1
+            or supplied not in {None, worker_execution_attempt}
+        ):
+            return None
+        return worker_execution_attempt
+
+    def update_job(
+        target: dict,
+        *,
+        expected_execution_attempt: int | None = None,
+        **updates: Any,
+    ) -> bool:
+        attempt = _sample_attempt(target, expected_execution_attempt)
+        if target.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+            return _lifecycle_update_job(
+                target, expected_execution_attempt=attempt, **updates,
+            )
+        if attempt is None:
+            return False
+        with _sample_campaign_transition_lock:
+            if target.get("resource_state") == "preemption_requested":
+                return False
+            return _lifecycle_update_job(
+                target, expected_execution_attempt=attempt, **updates,
+            )
+
+    def record_job_outputs(
+        target: dict,
+        output_files: list[str],
+        *,
+        clip_output_files=None,
+        join_output_file=None,
+        final_output_files=None,
+        expected_execution_attempt: int | None = None,
+    ) -> list[str]:
+        attempt = _sample_attempt(target, expected_execution_attempt)
+        if target.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+            return _lifecycle_record_job_outputs(
+                target,
+                output_files,
+                clip_output_files=clip_output_files,
+                join_output_file=join_output_file,
+                final_output_files=final_output_files,
+                expected_execution_attempt=attempt,
+            )
+        if attempt is None:
+            return list(target.get("output_files") or [])
+        with _sample_campaign_transition_lock:
+            if target.get("resource_state") == "preemption_requested":
+                return list(target.get("output_files") or [])
+            return _lifecycle_record_job_outputs(
+                target,
+                output_files,
+                clip_output_files=clip_output_files,
+                join_output_file=join_output_file,
+                final_output_files=final_output_files,
+                expected_execution_attempt=attempt,
+            )
+
+    def finish_job(
+        target: dict,
+        status: str,
+        *,
+        expected_execution_attempt: int | None = None,
+        **updates: Any,
+    ) -> bool:
+        attempt = _sample_attempt(target, expected_execution_attempt)
+        if target.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+            return _lifecycle_finish_job(
+                target, status,
+                expected_execution_attempt=attempt,
+                **updates,
+            )
+        if attempt is None:
+            return False
+        with _sample_campaign_transition_lock:
+            if target.get("resource_state") == "preemption_requested":
+                return False
+            return _lifecycle_finish_job(
+                target, status,
+                expected_execution_attempt=attempt,
+                **updates,
+            )
+
+    def register_abort_state(
+        target: dict,
+        target_id: str,
+        active_states: dict,
+        state: dict,
+        *,
+        interrupt_model=None,
+        expected_execution_attempt: int | None = None,
+    ) -> bool:
+        attempt = _sample_attempt(target, expected_execution_attempt)
+        if target.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
+            return _lifecycle_register_abort_state(
+                target,
+                target_id,
+                active_states,
+                state,
+                interrupt_model=interrupt_model,
+                expected_execution_attempt=attempt,
+            )
+        if attempt is None:
+            state["abort"] = True
+            return False
+        with _sample_campaign_transition_lock:
+            if target.get("resource_state") == "preemption_requested":
+                state["abort"] = True
+                return False
+            return _lifecycle_register_abort_state(
+                target,
+                target_id,
+                active_states,
+                state,
+                interrupt_model=interrupt_model,
+                expected_execution_attempt=attempt,
+            )
+
+    def sample_safe_unit_current(state: Mapping[str, Any] | None) -> bool:
+        """Validate the captured attempt and registration under transition lock."""
+        if not sample_worker:
+            return True
+        return bool(
+            type(worker_execution_attempt) is int
+            and job.get("execution_attempt") == worker_execution_attempt
+            and job.get("status") == "running"
+            and job.get("queue_held") is False
+            and job.get("resource_state") == "running"
+            and isinstance(state, Mapping)
+            and state.get("abort") is False
+            and _active_gen_states.get(job_id) is state
+        )
+
     start_time = time.time()
     abort_state = None
 
@@ -50831,6 +51589,9 @@ def _run_generation(
             if not try_start(
                 job,
                 generation_lock=_gen_lock,
+                expected_execution_attempt=(
+                    worker_execution_attempt if sample_worker else None
+                ),
                 block_on_persistence_failure=True,
                 message="Preparing...",
             ):
@@ -50900,7 +51661,11 @@ def _run_generation(
                     abort_state,
                 ):
                     return False
-                return _resume_pending_h3_delivery_only(job)
+                return _resume_pending_h3_delivery_only(
+                    job,
+                    update_job_fn=update_job,
+                    finish_job_fn=finish_job,
+                )
 
             # Build minimal state (same structure as CLI mode, line 11935 of wgp.py)
             state = {
@@ -52430,39 +53195,44 @@ def _run_generation(
                     output_basename=output_name,
                     concatenate=concatenate,
                 )
-                producer_artifact_roles[output_name] = "final"
-                _write_output_sidecars(
-                    [output_name],
-                    native_source=h3_delivery_request,
-                    recovery_units={
-                        output_name: {
-                            "dependencies": list(dependencies),
-                            "index": 0,
-                            "kind": "h3_concat",
-                            "settings": dict(settings),
-                            "unit_id": unit_id,
-                            "variant": variant,
+                with _sample_campaign_transition_lock:
+                    if not sample_safe_unit_current(abort_state):
+                        raise InterruptedError("H3 concat preempted")
+                    _write_output_sidecars(
+                        [output_name],
+                        native_source=h3_delivery_request,
+                        recovery_units={
+                            output_name: {
+                                "dependencies": list(dependencies),
+                                "index": 0,
+                                "kind": "h3_concat",
+                                "settings": dict(settings),
+                                "unit_id": unit_id,
+                                "variant": variant,
+                            },
                         },
-                    },
-                    task_params={
-                        **raw_params,
-                        "multi_clip_info": dict(clip_info),
-                    },
-                )
-                unit = _queue_recovery_checkpoint_unit(
-                    job,
-                    kind="h3_concat",
-                    variant=variant,
-                    index=0,
-                    project_dir=out_dir,
-                    artifact_names=[output_name],
-                    dependencies=dependencies,
-                    settings=settings,
-                )
-                path = os.path.join(out_dir, output_name)
-                if path not in gen["file_list"]:
-                    gen["file_list"].append(path)
-                return unit
+                        task_params={
+                            **raw_params,
+                            "multi_clip_info": dict(clip_info),
+                        },
+                    )
+                    unit = _queue_recovery_checkpoint_unit(
+                        job,
+                        kind="h3_concat",
+                        variant=variant,
+                        index=0,
+                        project_dir=out_dir,
+                        artifact_names=[output_name],
+                        dependencies=dependencies,
+                        settings=settings,
+                    )
+                    if not unit:
+                        raise InterruptedError("H3 concat checkpoint rejected")
+                    producer_artifact_roles[output_name] = "final"
+                    path = os.path.join(out_dir, output_name)
+                    if path not in gen["file_list"]:
+                        gen["file_list"].append(path)
+                    return unit
 
             def _h3_verified_segment_dependency_evidence(
                 variant: int, segment_index: int,
@@ -52828,67 +53598,76 @@ def _run_generation(
                         # Access policy must be durable before the filename is
                         # exposed on the job; otherwise a remote request could
                         # observe a private output during the sidecar gap.
-                        _write_output_sidecars(
-                            new_artifacts,
-                            native_source=h3_delivery_request,
-                            recovery_units=recovery_units,
-                            media_paths={
-                                name: staged_media[name]
-                                for name in new_artifacts
-                                if name in staged_media
-                            },
-                        )
-                        if staged_media:
-                            _queue_recovery_promote_staged_outputs(
-                                gen,
-                                out_dir,
-                                {
+                        with _sample_campaign_transition_lock:
+                            if not sample_safe_unit_current(abort_state):
+                                return False
+                            _write_output_sidecars(
+                                new_artifacts,
+                                native_source=h3_delivery_request,
+                                recovery_units=recovery_units,
+                                media_paths={
                                     name: staged_media[name]
                                     for name in new_artifacts
                                     if name in staged_media
                                 },
                             )
-                        repeat_index = max(0, completed_repeats - 1)
-                        cursor_without_premux = dict(
-                            job.get("recovery_cursor") or {}
-                        )
-                        cursor_without_premux["completed_units"] = [
-                            unit for unit in _queue_recovery_units(job)
-                            if not (
-                                unit.get("kind")
-                                == "h3_source_audio_premux"
-                                and unit.get("variant") == 0
-                                and unit.get("index") == repeat_index
+                            if staged_media:
+                                _queue_recovery_promote_staged_outputs(
+                                    gen,
+                                    out_dir,
+                                    {
+                                        name: staged_media[name]
+                                        for name in new_artifacts
+                                        if name in staged_media
+                                    },
+                                )
+                            repeat_index = max(0, completed_repeats - 1)
+                            prior_cursor = job.get("recovery_cursor")
+                            cursor_without_premux = dict(prior_cursor or {})
+                            cursor_without_premux["completed_units"] = [
+                                unit for unit in _queue_recovery_units(job)
+                                if not (
+                                    unit.get("kind")
+                                    == "h3_source_audio_premux"
+                                    and unit.get("variant") == 0
+                                    and unit.get("index") == repeat_index
+                                )
+                            ]
+                            job["recovery_cursor"] = cursor_without_premux
+                            if not _queue_recovery_checkpoint_unit(
+                                job,
+                                kind="ordinary_repeat",
+                                variant=0,
+                                index=repeat_index,
+                                project_dir=out_dir,
+                                artifact_names=new_artifacts,
+                                ordinary_repeat_offset=completed_repeats,
+                            ):
+                                job["recovery_cursor"] = prior_cursor
+                                return False
+                            published = record_job_outputs(
+                                job,
+                                new_artifacts,
+                                final_output_files=(
+                                    [] if h3_delivery_request else final_files
+                                ),
                             )
-                        ]
-                        job["recovery_cursor"] = cursor_without_premux
-                        _queue_recovery_checkpoint_unit(
-                            job,
-                            kind="ordinary_repeat",
-                            variant=0,
-                            index=repeat_index,
-                            project_dir=out_dir,
-                            artifact_names=new_artifacts,
-                            ordinary_repeat_offset=completed_repeats,
-                        )
-                        record_job_outputs(
-                            job,
-                            new_artifacts,
-                            final_output_files=(
-                                [] if h3_delivery_request else final_files
-                            ),
-                        )
-                        repeat_published_artifacts.update(new_artifacts)
+                            if not all(
+                                name in published for name in new_artifacts
+                            ):
+                                return False
+                            repeat_published_artifacts.update(new_artifacts)
                     # No model call is active at this returned WGP boundary.
                     # Temporarily close live-counter mutation while deciding
                     # whether another repeat exists; held jobs remain editable
                     # through their queued request state and are reconciled on
                     # resume below.
-                    unregister_abort_state(
-                        job_id,
-                        _active_gen_states,
-                        abort_state,
-                    )
+                    if not sample_worker:
+                        unregister_abort_state(
+                            job_id,
+                            _active_gen_states,
+                            abort_state,
+                        )
                     try:
                         pending_repeats = int(gen.get("extra_orders", 0) or 0)
                         current_total = max(
@@ -52946,7 +53725,15 @@ def _run_generation(
                             gen["extra_orders"] = requested_total - active_total
                         except (TypeError, ValueError):
                             pass
-                        if not register_abort_state(
+                        if sample_worker:
+                            # Keep the exact registration continuously live
+                            # across a held repeat boundary.  Otherwise a
+                            # watcher request can win after unregister and
+                            # become impossible for the outer finally block to
+                            # settle into its durable retry.
+                            if _active_gen_states.get(job_id) is not abort_state:
+                                return False
+                        elif not register_abort_state(
                             job,
                             job_id,
                             _active_gen_states,
@@ -53021,47 +53808,52 @@ def _run_generation(
                         settings=segment_settings,
                     )
                     producer_artifact_roles[name] = "component"
-                    update_job(
-                        job,
-                        message="Sealing rendered segment before final join...",
-                        phase="Segment checkpoint",
-                    )
-                    _write_output_sidecars(
-                        [name],
-                        native_source=h3_delivery_request,
-                        recovery_units={
-                            name: {
-                                "continuation": None,
-                                "dependencies": list(dependencies),
-                                "index": segment_index,
-                                "kind": "h3_segment",
-                                "settings": dict(segment_settings),
-                                "unit_id": unit_id,
-                                "variant": variant,
+                    with _sample_campaign_transition_lock:
+                        if not sample_safe_unit_current(abort_state):
+                            raise InterruptedError("H3 segment preempted")
+                        if not update_job(
+                            job,
+                            message="Sealing rendered segment before final join...",
+                            phase="Segment checkpoint",
+                        ):
+                            raise InterruptedError("H3 segment preempted")
+                        _write_output_sidecars(
+                            [name],
+                            native_source=h3_delivery_request,
+                            recovery_units={
+                                name: {
+                                    "continuation": None,
+                                    "dependencies": list(dependencies),
+                                    "index": segment_index,
+                                    "kind": "h3_segment",
+                                    "settings": dict(segment_settings),
+                                    "unit_id": unit_id,
+                                    "variant": variant,
+                                },
                             },
-                        },
-                        media_paths=(
-                            {name: staged_media[name]}
-                            if name in staged_media else None
-                        ),
-                        task_params=task_sidecar_params,
-                    )
-                    if name in staged_media:
-                        _queue_recovery_promote_staged_outputs(
-                            gen, out_dir, {name: staged_media[name]},
+                            media_paths=(
+                                {name: staged_media[name]}
+                                if name in staged_media else None
+                            ),
+                            task_params=task_sidecar_params,
                         )
-                    _queue_recovery_checkpoint_unit(
-                        job,
-                        kind="h3_segment",
-                        variant=variant,
-                        index=segment_index,
-                        project_dir=out_dir,
-                        artifact_names=[name],
-                        dependencies=dependencies,
-                        settings=segment_settings,
-                    )
-                    clip_output_files[segment_index] = name
-                    return os.path.join(out_dir, name)
+                        if name in staged_media:
+                            _queue_recovery_promote_staged_outputs(
+                                gen, out_dir, {name: staged_media[name]},
+                            )
+                        if not _queue_recovery_checkpoint_unit(
+                            job,
+                            kind="h3_segment",
+                            variant=variant,
+                            index=segment_index,
+                            project_dir=out_dir,
+                            artifact_names=[name],
+                            dependencies=dependencies,
+                            settings=segment_settings,
+                        ):
+                            raise InterruptedError("H3 segment checkpoint rejected")
+                        clip_output_files[segment_index] = name
+                        return os.path.join(out_dir, name)
 
                 if not is_multiclip and not defer_output_publication:
                     params["after_repeat_output"] = (
@@ -53658,12 +54450,6 @@ def _run_generation(
                         index=failed_segment,
                         project_dir=out_dir,
                     )
-                    if sealed_failed_unit is None and not update_job(
-                        job,
-                        message="Sealing rendered segment...",
-                        phase="Segment checkpoint",
-                    ):
-                        return False
                     failed_units = {
                         name: {
                             "continuation": None,
@@ -53677,38 +54463,47 @@ def _run_generation(
                         for name in failed_segment_names
                     }
                     if sealed_failed_unit is None:
-                        _write_output_sidecars(
-                            failed_segment_names,
-                            native_source=h3_delivery_request,
-                            recovery_units=failed_units,
-                            media_paths={
-                                name: task_staged_media[name]
-                                for name in failed_segment_names
-                                if name in task_staged_media
-                            },
-                            task_params=task_sidecar_params,
-                        )
-                    if sealed_failed_unit is None and task_staged_media:
-                        _queue_recovery_promote_staged_outputs(
-                            gen,
-                            out_dir,
-                            {
-                                name: task_staged_media[name]
-                                for name in failed_segment_names
-                                if name in task_staged_media
-                            },
-                        )
-                    if sealed_failed_unit is None:
-                        _queue_recovery_checkpoint_unit(
-                            job,
-                            kind="h3_segment",
-                            variant=failed_variant,
-                            index=failed_segment,
-                            project_dir=out_dir,
-                            artifact_names=failed_segment_names,
-                            dependencies=failed_dependencies,
-                            settings=failed_settings,
-                        )
+                        with _sample_campaign_transition_lock:
+                            if not sample_safe_unit_current(abort_state):
+                                return False
+                            if not update_job(
+                                job,
+                                message="Sealing rendered segment...",
+                                phase="Segment checkpoint",
+                            ):
+                                return False
+                            _write_output_sidecars(
+                                failed_segment_names,
+                                native_source=h3_delivery_request,
+                                recovery_units=failed_units,
+                                media_paths={
+                                    name: task_staged_media[name]
+                                    for name in failed_segment_names
+                                    if name in task_staged_media
+                                },
+                                task_params=task_sidecar_params,
+                            )
+                            if task_staged_media:
+                                _queue_recovery_promote_staged_outputs(
+                                    gen,
+                                    out_dir,
+                                    {
+                                        name: task_staged_media[name]
+                                        for name in failed_segment_names
+                                        if name in task_staged_media
+                                    },
+                                )
+                            if not _queue_recovery_checkpoint_unit(
+                                job,
+                                kind="h3_segment",
+                                variant=failed_variant,
+                                index=failed_segment,
+                                project_dir=out_dir,
+                                artifact_names=failed_segment_names,
+                                dependencies=failed_dependencies,
+                                settings=failed_settings,
+                            ):
+                                return False
 
                 premux_settings = _h3_source_audio_premux_settings(task_params)
                 if (
@@ -53983,12 +54778,6 @@ def _run_generation(
                             project_dir=out_dir,
                         )
                         if segment_names and sealed_segment_unit is None:
-                            if not update_job(
-                                job,
-                                message="Sealing rendered segment...",
-                                phase="Segment checkpoint",
-                            ):
-                                return False
                             segment_units = {
                                 name: {
                                     "continuation": continuation_descriptor,
@@ -54001,38 +54790,48 @@ def _run_generation(
                                 }
                                 for name in segment_names
                             }
-                            _write_output_sidecars(
-                                segment_names,
-                                native_source=h3_delivery_request,
-                                recovery_units=segment_units,
-                                media_paths={
-                                    name: task_staged_media[name]
-                                    for name in segment_names
-                                    if name in task_staged_media
-                                },
-                                task_params=task_sidecar_params,
-                            )
-                            if task_staged_media:
-                                _queue_recovery_promote_staged_outputs(
-                                    gen,
-                                    out_dir,
-                                    {
+                            with _sample_campaign_transition_lock:
+                                if not sample_safe_unit_current(abort_state):
+                                    return False
+                                if not update_job(
+                                    job,
+                                    message="Sealing rendered segment...",
+                                    phase="Segment checkpoint",
+                                ):
+                                    return False
+                                _write_output_sidecars(
+                                    segment_names,
+                                    native_source=h3_delivery_request,
+                                    recovery_units=segment_units,
+                                    media_paths={
                                         name: task_staged_media[name]
                                         for name in segment_names
                                         if name in task_staged_media
                                     },
+                                    task_params=task_sidecar_params,
                                 )
-                            _queue_recovery_checkpoint_unit(
-                                job,
-                                kind="h3_segment",
-                                variant=h3_variant,
-                                index=h3_segment,
-                                project_dir=out_dir,
-                                artifact_names=segment_names,
-                                dependencies=h3_dependencies,
-                                continuation=continuation_descriptor,
-                                settings=h3_segment_settings,
-                            )
+                                if task_staged_media:
+                                    _queue_recovery_promote_staged_outputs(
+                                        gen,
+                                        out_dir,
+                                        {
+                                            name: task_staged_media[name]
+                                            for name in segment_names
+                                            if name in task_staged_media
+                                        },
+                                    )
+                                if not _queue_recovery_checkpoint_unit(
+                                    job,
+                                    kind="h3_segment",
+                                    variant=h3_variant,
+                                    index=h3_segment,
+                                    project_dir=out_dir,
+                                    artifact_names=segment_names,
+                                    dependencies=h3_dependencies,
+                                    continuation=continuation_descriptor,
+                                    settings=h3_segment_settings,
+                                ):
+                                    return False
                         if concat_names and not task_error:
                             concat_dependencies = []
                             clip_start_frames = []
@@ -54102,37 +54901,41 @@ def _run_generation(
                                 }
                                 for name in concat_names
                             }
-                            _write_output_sidecars(
-                                concat_names,
-                                native_source=h3_delivery_request,
-                                recovery_units=concat_units,
-                                media_paths={
-                                    name: task_staged_media[name]
-                                    for name in concat_names
-                                    if name in task_staged_media
-                                },
-                                task_params=task_sidecar_params,
-                            )
-                            if task_staged_media:
-                                _queue_recovery_promote_staged_outputs(
-                                    gen,
-                                    out_dir,
-                                    {
+                            with _sample_campaign_transition_lock:
+                                if not sample_safe_unit_current(abort_state):
+                                    return False
+                                _write_output_sidecars(
+                                    concat_names,
+                                    native_source=h3_delivery_request,
+                                    recovery_units=concat_units,
+                                    media_paths={
                                         name: task_staged_media[name]
                                         for name in concat_names
                                         if name in task_staged_media
                                     },
+                                    task_params=task_sidecar_params,
                                 )
-                            _queue_recovery_checkpoint_unit(
-                                job,
-                                kind="h3_concat",
-                                variant=h3_variant,
-                                index=0,
-                                project_dir=out_dir,
-                                artifact_names=concat_names,
-                                dependencies=concat_dependencies,
-                                settings=concat_settings,
-                            )
+                                if task_staged_media:
+                                    _queue_recovery_promote_staged_outputs(
+                                        gen,
+                                        out_dir,
+                                        {
+                                            name: task_staged_media[name]
+                                            for name in concat_names
+                                            if name in task_staged_media
+                                        },
+                                    )
+                                if not _queue_recovery_checkpoint_unit(
+                                    job,
+                                    kind="h3_concat",
+                                    variant=h3_variant,
+                                    index=0,
+                                    project_dir=out_dir,
+                                    artifact_names=concat_names,
+                                    dependencies=concat_dependencies,
+                                    settings=concat_settings,
+                                ):
+                                    return False
 
                     # A complete H3 variant is a safe scheduler boundary only
                     # after its final native segment has returned and WGP has
@@ -54149,7 +54952,7 @@ def _run_generation(
                             or ""
                         )
                         if current_group and next_group and current_group != next_group:
-                            update_job(
+                            if not update_job(
                                 job,
                                 message="Preparing next output…",
                                 phase="Preparing next output",
@@ -54159,7 +54962,8 @@ def _run_generation(
                                 window_total_steps=0,
                                 window_progress=0,
                                 progress_indeterminate=True,
-                            )
+                            ):
+                                return False
                             inactive_started = time.time()
                             if not yield_generation_slot_after_output(
                                 _gen_lock, job,
@@ -54210,44 +55014,55 @@ def _run_generation(
                     _verified_h3_concat_output_names(job, out_dir, new_files)
                     if automatic_h3_longform else []
                 )
-                record_job_outputs(
-                    job,
-                    [] if defer_output_publication else new_files,
-                    clip_output_files=(
-                        None
-                        if defer_output_publication
-                        else clip_output_files
-                    ),
-                    join_output_file=(
-                        None
-                        if defer_output_publication
-                        else (
-                            join_output_file
-                            if not automatic_h3_longform
-                            or join_output_file in verified_h3_final_files
+                with _sample_campaign_transition_lock:
+                    if not sample_safe_unit_current(abort_state):
+                        return False
+                    published_outputs = record_job_outputs(
+                        job,
+                        [] if defer_output_publication else new_files,
+                        clip_output_files=(
+                            None
+                            if defer_output_publication
+                            else clip_output_files
+                        ),
+                        join_output_file=(
+                            None
+                            if defer_output_publication
+                            else (
+                                join_output_file
+                                if not automatic_h3_longform
+                                or join_output_file in verified_h3_final_files
+                                else None
+                            )
+                        ),
+                        final_output_files=(
+                            None
+                            if defer_output_publication
+                            else []
+                            if h3_delivery_request
+                            else verified_h3_final_files
+                            if automatic_h3_longform
                             else None
+                            if is_multiclip
+                            else [
+                                filename for filename in new_files
+                                if producer_artifact_roles.get(filename) == "final"
+                            ]
+                        ),
+                    )
+                    if (
+                        sample_worker
+                        and not defer_output_publication
+                        and not all(
+                            name in published_outputs for name in new_files
                         )
-                    ),
-                    final_output_files=(
-                        None
-                        if defer_output_publication
-                        else []
-                        if h3_delivery_request
-                        else verified_h3_final_files
-                        if automatic_h3_longform
-                        else None
-                        if is_multiclip
-                        else [
-                            filename for filename in new_files
-                            if producer_artifact_roles.get(filename) == "final"
-                        ]
-                    ),
-                )
-                if not defer_output_publication:
-                    if h3_delivery_request:
-                        _write_output_sidecars(new_files, native_source=True)
-                    else:
-                        _write_output_sidecars(new_files)
+                    ):
+                        return False
+                    if not defer_output_publication:
+                        if h3_delivery_request:
+                            _write_output_sidecars(new_files, native_source=True)
+                        else:
+                            _write_output_sidecars(new_files)
 
                 if (
                     automatic_h3_longform
@@ -54708,6 +55523,16 @@ def _run_generation(
                                 phase="Upscaling",
                             ):
                                 return False
+
+                            def commit_h3_delivery_publication(files):
+                                pending = _queue_recovery_delivery_pending(job)
+                                return bool(
+                                    pending is not None
+                                    and _queue_recovery_checkpoint_delivery_completed(
+                                        job, out_dir, files, pending,
+                                    )
+                                )
+
                             delivered_files = _deliver_h3_outputs_transactionally(
                                 job,
                                 out_dir,
@@ -54715,17 +55540,10 @@ def _run_generation(
                                 pp_spatial_upsampling,
                                 pp_delivery_resolution,
                                 pp_delivery_fit,
-                            )
-                            delivery_pending = _queue_recovery_delivery_pending(job)
-                            if delivery_pending is None:
-                                raise QueueRecoveryRuntimeError(
-                                    "Protected H3 delivery checkpoint is missing."
-                                )
-                            _queue_recovery_checkpoint_delivery_completed(
-                                job,
-                                out_dir,
-                                delivered_files,
-                                delivery_pending,
+                                update_job_fn=update_job,
+                                publication_commit_fn=(
+                                    commit_h3_delivery_publication
+                                ),
                             )
                             if director_postprocess_files is not None:
                                 director_postprocess_files = list(delivered_files)
@@ -54968,7 +55786,9 @@ def _run_generation(
                         reruns_denoise=False,
                     )
                 else:
-                    _rollback_h3_delivery_publication(job)
+                    _rollback_h3_delivery_publication(
+                        job, update_job_fn=update_job,
+                    )
             if success and job.get("status") == "completed":
                 _record_h3_allocation_success_observations(
                     job, allocation_success_observations,
@@ -55016,7 +55836,9 @@ def _run_generation(
                 if job.get("status") == "completed" and not is_cancel_requested(job):
                     _finalize_h3_delivery_publication(job)
                 else:
-                    _rollback_h3_delivery_publication(job)
+                    _rollback_h3_delivery_publication(
+                        job, update_job_fn=update_job,
+                    )
             # Required H3 continuation frames are disposable worker inputs.
             # Clean them even when decoding/concatenation raises before the
             # ordinary post-loop cleanup path.
@@ -55032,7 +55854,52 @@ def _run_generation(
             except Exception:
                 pass
             if abort_state is not None:
-                unregister_abort_state(job_id, _active_gen_states, abort_state)
+                settled = False
+                if (
+                    sample_worker
+                    and job.get("resource_state") == "preemption_requested"
+                    and type(worker_execution_attempt) is int
+                ):
+                    try:
+                        with _sample_campaign_transition_lock:
+                            settled = settle_sample_preemption(
+                                job,
+                                job_id=job_id,
+                                active_states=_active_gen_states,
+                                state=abort_state,
+                                expected_execution_attempt=(
+                                    worker_execution_attempt
+                                ),
+                            )
+                            if settled:
+                                # Settlement is already a durable held retry.
+                                # Restamp the launch recovery label for the
+                                # common path; startup also recognizes the
+                                # exact crash window between these commits.
+                                _sample_campaign_persist_hold(
+                                    job, True, "sample_campaign_held",
+                                )
+                    except Exception:
+                        # A successful settlement remains authoritative even
+                        # if the follow-up recovery label cannot be written.
+                        settled = bool(
+                            job.get("status") == "queued"
+                            and job.get("queue_held") is True
+                            and job.get("execution_attempt")
+                                == worker_execution_attempt + 1
+                        )
+                if (
+                    not settled
+                    and not (
+                        sample_worker
+                        and job.get("resource_state")
+                            == "preemption_requested"
+                        and _active_gen_states.get(job_id) is abort_state
+                    )
+                ):
+                    unregister_abort_state(
+                        job_id, _active_gen_states, abort_state,
+                    )
             # Restore the persisted base coefficient so the next job
             # starts from the user's auto-tuned value, not whatever
             # this job's adjustment left it at.

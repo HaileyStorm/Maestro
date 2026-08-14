@@ -5,6 +5,7 @@ import ast
 import asyncio
 import base64
 import contextlib
+import contextvars
 import copy
 import hashlib
 import hmac
@@ -3031,6 +3032,20 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 ),
                 "wgp": FakeWGP,
                 "_jobs": {job["id"]: job},
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "_sample_campaign_execution_attempt": contextvars.ContextVar(
+                    "test_sample_attempt", default=None,
+                ),
+                "_sample_campaign_transition_lock": threading.RLock(),
+                "_lifecycle_update_job": lambda *_args, **_kwargs: True,
+                "_lifecycle_register_abort_state": (
+                    lambda *_args, **_kwargs: True
+                ),
+                "_lifecycle_record_job_outputs": (
+                    lambda _job, outputs, **_kwargs: list(outputs)
+                ),
+                "_lifecycle_finish_job": lambda *_args, **_kwargs: False,
+                "settle_sample_preemption": lambda *_args, **_kwargs: False,
                 "_credit_prepare_admission": lambda _job: False,
                 "_credit_prepare_dispatch": lambda _job: False,
                 "_credit_block_runtime_error": lambda _job: None,
@@ -6452,6 +6467,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_sample_campaign_force_hold": lambda job: job.update(
                     queue_held=True,
                 ),
+                "_sample_campaign_retry_sampler_lock": threading.Lock(),
+                "_sample_campaign_retry_ready_identity": None,
+                "_sample_campaign_reset_idle_gate": lambda: None,
             },
         )
         job = {"queue_held": False}
@@ -6619,6 +6637,11 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
                     "_SAMPLE_CAMPAIGN_QUEUE_CLASS": "background_sample",
                     "_sample_campaign_post_slot_guard": lambda _job: True,
+                    "_sample_campaign_execution_attempt": (
+                        contextvars.ContextVar(
+                            "test_sample_worker_attempt", default=None,
+                        )
+                    ),
                     "_run_generation": runner,
                     "_sample_campaign_persist_hold": (
                         lambda current, held, state: persisted.append(
@@ -6642,6 +6665,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             "queue_class": "background_sample",
             "status": "queued",
             "queue_held": False,
+            "execution_attempt": 1,
         }
         pending = {**base, "started_at": 1.0}
         self.assertEqual(
@@ -6680,6 +6704,722 @@ class QueueLaunchWiringTests(unittest.TestCase):
             {"id": "control", "valid": False},
         ))
         self.assertEqual(observed, ["maestro", "control"])
+
+    def test_sample_preemption_watcher_starts_after_recovery_and_stops(self):
+        source = self.launch_source
+        recovery = source.index(
+            "def _start_queue_recovery_before_background_workers"
+        )
+        watcher = source.index(
+            "def _start_sample_campaign_preemption_after_recovery"
+        )
+        updater = source.index("def _start_versioned_model_updates")
+        self.assertLess(recovery, watcher)
+        self.assertLess(watcher, updater)
+        watcher_source = ast.get_source_segment(
+            source,
+            _function(self.launch, "_sample_campaign_preemption_loop"),
+        )
+        self.assertIn("SampleCampaignPreemptionCoordinator(", watcher_source)
+        self.assertIn("capture_foreign_gpu_significance", watcher_source)
+        self.assertIn("_sample_campaign_preemption_stop", watcher_source)
+        stop_source = ast.get_source_segment(
+            source,
+            _function(self.launch, "_stop_sample_campaign_preemption_watcher"),
+        )
+        self.assertIn(".set()", stop_source)
+
+    def test_sample_release_enforces_retry_time_and_attempt_cas(self):
+        checkpoints = []
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_persist_hold",),
+            {
+                "Mapping": dict,
+                "math": __import__("math"),
+                "time": types.SimpleNamespace(time=lambda: 100.0),
+                "_SAMPLE_CAMPAIGN_QUEUE_CLASS": "background_sample",
+                "_SAMPLE_CAMPAIGN_QUEUE_PRIORITY": -1000,
+                "SAMPLE_RETRY_MAX_ATTEMPT": 1_000_000,
+                "_queue_recovery_checkpoint": (
+                    lambda job, **updates: checkpoints.append(
+                        (job, updates)
+                    ) or True
+                ),
+            },
+        )
+        persist = namespace["_sample_campaign_persist_hold"]
+        job = {
+            "execution_attempt": 7,
+            "sample_retry": {"attempt": 2, "not_before": 101.0},
+        }
+        self.assertFalse(persist(job, False, "sample_campaign_released"))
+        self.assertEqual(checkpoints, [])
+        job["sample_retry"]["not_before"] = 100.0
+        self.assertTrue(persist(job, False, "sample_campaign_released"))
+        self.assertEqual(
+            checkpoints[0][1]["expected_execution_attempt"], 7,
+        )
+        self.assertFalse(persist(
+            {**job, "execution_attempt": True},
+            False,
+            "sample_campaign_released",
+        ))
+
+    def test_sample_worker_carries_one_attempt_through_all_publishers(self):
+        worker = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_run_generation"),
+        )
+        dedicated = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_run_sample_campaign_generation"),
+        )
+        checkpoint = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_queue_recovery_checkpoint"),
+        )
+        self.assertIn("expected_execution_attempt=execution_attempt", dedicated)
+        self.assertIn("_sample_campaign_execution_attempt.set", dedicated)
+        self.assertIn("_sample_campaign_execution_attempt.reset", dedicated)
+        for publisher in (
+            "def update_job(",
+            "def record_job_outputs(",
+            "def finish_job(",
+            "def register_abort_state(",
+        ):
+            self.assertIn(publisher, worker)
+        self.assertIn("settle_sample_preemption(", worker)
+        self.assertLess(
+            worker.rindex("settle_sample_preemption("),
+            worker.rindex("unregister_abort_state("),
+        )
+        self.assertIn("context_attempt", checkpoint)
+        self.assertIn("expected_execution_attempt", checkpoint)
+
+    def test_preemption_path_has_no_foreign_process_control(self):
+        service = (ROOT / "app/services/sample_campaign_preemption.py").read_text(
+            encoding="utf-8",
+        )
+        for forbidden in (
+            "os.kill", "signal.", "terminate(", "kill(", "process_name",
+            "import os", "import signal", "import subprocess", "import psutil",
+        ):
+            self.assertNotIn(forbidden, service)
+
+    def test_urgent_work_projection_never_mutates_user_job(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_urgent_ordinary_work_present",),
+            {
+                "Mapping": dict,
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "RESOURCE_INTENT_GENERATION": "generation",
+                "RESOURCE_EXECUTION_STANDARD": "standard",
+                "_jobs": {},
+            },
+        )
+        user = {
+            "id": "user",
+            "kind": "studio_generation",
+            "status": "queued",
+            "queue_held": False,
+            "queue_class": "user",
+            "resource_intent": "generation",
+            "resource_execution": "standard",
+        }
+        namespace["_jobs"]["user"] = user
+        before = copy.deepcopy(user)
+        self.assertTrue(
+            namespace["_sample_campaign_urgent_ordinary_work_present"]()
+        )
+        self.assertEqual(user, before)
+
+    def test_due_retry_sampler_uses_bounded_two_second_window_then_release(self):
+        waits = []
+        releases = []
+        resets = []
+        identity = (
+            90.0, "pair", "sample", 4, 2, "a" * 64, "maestro", "peer",
+        )
+
+        class _Stop:
+            def is_set(self):
+                return False
+
+            def wait(self, delay):
+                waits.append(delay)
+                return False
+
+        class _Coordinator:
+            def __init__(self, **_kwargs):
+                pass
+
+            def release_one(self, pair_id, jobs):
+                releases.append((pair_id, tuple(jobs)))
+                return types.SimpleNamespace(status="released")
+
+        readiness = iter((
+            (False, "idle_window_pending"),
+            (False, "idle_window_pending"),
+            (False, "idle_window_pending"),
+            (False, "idle_window_pending"),
+            (True, "ready"),
+        ))
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_run_due_retry_sampler",),
+            {
+                "_sample_campaign_retry_sampler_identity": identity,
+                "_sample_campaign_retry_ready_identity": None,
+                "_sample_campaign_retry_sampler_thread": None,
+                "threading": threading,
+                "_sample_campaign_reset_idle_gate": lambda: resets.append(True),
+                "_sample_campaign_preemption_stop": _Stop(),
+                "_sample_campaign_urgent_ordinary_work_present": lambda: False,
+                "_sample_campaign_retry_identity_current": lambda value: value == identity,
+                "capture_foreign_gpu_significance": lambda: types.SimpleNamespace(
+                    known=True, significant=False,
+                ),
+                "_jobs": {"sample": {"id": "sample"}},
+                "Mapping": dict,
+                "_sample_campaign_release_readiness": lambda _job: next(readiness),
+                "_SAMPLE_CAMPAIGN_RETRY_SNAPSHOTS": 5,
+                "_SAMPLE_CAMPAIGN_RETRY_SNAPSHOT_GAP_SECONDS": 2.0,
+                "_sample_campaign_release_lock": threading.Lock(),
+                "SampleCampaignReleaseCoordinator": _Coordinator,
+                "_sample_campaign_ordinary_work_present": lambda: False,
+                "_sample_campaign_other_arm_active": lambda _pair: False,
+                "_sample_campaign_validate_live_pair": lambda *_args: True,
+                "_sample_campaign_persist_hold": lambda *_args: True,
+                "_sample_campaign_force_hold": lambda *_args: None,
+                "_start_sample_campaign_worker": lambda *_args: None,
+                "_sample_campaign_retry_sampler_lock": threading.Lock(),
+            },
+        )
+        namespace["_sample_campaign_run_due_retry_sampler"](identity)
+        self.assertEqual(waits, [2.0, 2.0, 2.0, 2.0])
+        self.assertEqual(releases[0][0], "pair")
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(
+            namespace["_sample_campaign_retry_ready_identity"], identity,
+        )
+        self.assertIsNone(namespace["_sample_campaign_retry_sampler_identity"])
+
+    def test_due_retry_sampler_stops_on_unknown_external_telemetry(self):
+        resets = []
+        identity = (
+            90.0, "pair", "sample", 4, 2, "a" * 64, "maestro", "peer",
+        )
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_run_due_retry_sampler",),
+            {
+                "_sample_campaign_retry_sampler_identity": identity,
+                "_sample_campaign_retry_ready_identity": None,
+                "_sample_campaign_retry_sampler_thread": None,
+                "threading": threading,
+                "_sample_campaign_reset_idle_gate": lambda: resets.append(True),
+                "_sample_campaign_preemption_stop": types.SimpleNamespace(
+                    is_set=lambda: False,
+                    wait=lambda _delay: self.fail("unknown telemetry must stop"),
+                ),
+                "_sample_campaign_urgent_ordinary_work_present": lambda: False,
+                "_sample_campaign_retry_identity_current": lambda _value: True,
+                "capture_foreign_gpu_significance": lambda: types.SimpleNamespace(
+                    known=False, significant=False,
+                ),
+                "_jobs": {"sample": {"id": "sample"}},
+                "Mapping": dict,
+                "_SAMPLE_CAMPAIGN_RETRY_SNAPSHOTS": 5,
+                "_SAMPLE_CAMPAIGN_RETRY_SNAPSHOT_GAP_SECONDS": 2.0,
+                "_sample_campaign_retry_sampler_lock": threading.Lock(),
+            },
+        )
+        namespace["_sample_campaign_run_due_retry_sampler"](identity)
+        self.assertEqual(len(resets), 2)
+        self.assertIsNone(namespace["_sample_campaign_retry_sampler_identity"])
+
+    def test_retry_ready_proof_survives_async_start_until_worker_guard(self):
+        resets = []
+        identity = (
+            90.0, "pair", "sample", 4, 2, "a" * 64, "maestro", "peer",
+        )
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_post_slot_guard",),
+            {
+                "Mapping": dict,
+                "Any": object,
+                "_sample_campaign_retry_sampler_lock": threading.Lock(),
+                "_sample_campaign_retry_ready_identity": identity,
+                "_sample_campaign_validate_live_request": lambda _job: True,
+                "_sample_campaign_release_readiness": (
+                    lambda _job: (True, "ready")
+                ),
+                "_sample_campaign_reset_idle_gate": (
+                    lambda: resets.append(True)
+                ),
+                "_sample_campaign_persist_hold": lambda *_args: True,
+                "_sample_campaign_force_hold": lambda *_args: None,
+            },
+        )
+        job = {"id": "sample", "execution_attempt": 4}
+        self.assertTrue(namespace["_sample_campaign_post_slot_guard"](job))
+        self.assertIsNone(namespace["_sample_campaign_retry_ready_identity"])
+        self.assertEqual(resets, [True])
+
+    def test_retry_sampler_is_separate_and_main_poll_remains_fifteen_seconds(self):
+        source = self.launch_source
+        loop = ast.get_source_segment(
+            source, _function(self.launch, "_sample_campaign_preemption_loop"),
+        )
+        starter = ast.get_source_segment(
+            source,
+            _function(self.launch, "_sample_campaign_maybe_start_due_retry_sampler"),
+        )
+        self.assertIn("_SAMPLE_CAMPAIGN_PREEMPTION_POLL_SECONDS", loop)
+        self.assertIn("_sample_campaign_maybe_start_due_retry_sampler()", loop)
+        self.assertIn("threading.Thread(", starter)
+        self.assertIn('name="sample-campaign-retry-window"', starter)
+        self.assertIn("daemon=True", starter)
+
+    def test_settled_retry_restart_accepts_only_exact_crash_window(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_safe_sample_campaign_restart_snapshot",),
+            {
+                "Mapping": dict,
+                "Any": object,
+                "math": __import__("math"),
+                "SAMPLE_RETRY_MAX_ATTEMPT": 1_000_000,
+            },
+        )
+        safe = namespace["_safe_sample_campaign_restart_snapshot"]
+        held = {
+            "status": "queued", "queue_held": True,
+            "recovery_state": "sample_campaign_held",
+            "sample_retry": {"attempt": 0, "not_before": None},
+        }
+        crash_window = {
+            **held,
+            "recovery_state": "sample_campaign_released",
+            "sample_retry": {"attempt": 2, "not_before": 100.0},
+        }
+        self.assertTrue(safe(held))
+        self.assertTrue(safe(crash_window))
+        requested_crash = {
+            **crash_window,
+            "status": "running",
+            "queue_held": False,
+            "resource_state": "preemption_requested",
+        }
+        self.assertTrue(safe(requested_crash))
+        for invalid in (
+            {**crash_window, "queue_held": False},
+            {**crash_window, "status": "running"},
+            {**requested_crash, "resource_state": "running"},
+            {**crash_window, "sample_retry": {
+                "attempt": 0, "not_before": None,
+            }},
+            {**crash_window, "sample_retry": {
+                "attempt": 2, "not_before": float("nan"),
+            }},
+        ):
+            self.assertFalse(safe(invalid))
+        worker = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_run_generation"),
+        )
+        settle = worker.rindex("settle_sample_preemption(")
+        restamp = worker.index("_sample_campaign_persist_hold(", settle)
+        unregister = worker.rindex("unregister_abort_state(")
+        self.assertLess(settle, restamp)
+        self.assertLess(restamp, unregister)
+        materialize = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_queue_recovery_materialize_job"),
+        )
+        self.assertIn('"resource_state": "queued"', materialize)
+        restore = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_restore_queue_recovery_on_startup"),
+        )
+        self.assertLess(
+            restore.index("_safe_sample_campaign_restart_snapshot(snapshot)"),
+            restore.index("_queue_recovery_materialize_job(snapshot, projects)"),
+        )
+
+    def test_sample_repeat_registration_and_failed_settlement_remain_recoverable(self):
+        worker = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_run_generation"),
+        )
+        boundary = worker.index("# No model call is active")
+        resumed = worker.index("if resumed:", boundary)
+        boundary_source = worker[boundary:resumed]
+        self.assertIn("if not sample_worker:", boundary_source)
+        finalizer = worker[worker.rindex("finally:"):]
+        self.assertIn('job.get("resource_state")', finalizer)
+        self.assertIn('== "preemption_requested"', finalizer)
+        retry = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_sample_campaign_settle_requested_jobs"),
+        )
+        self.assertIn("settle_sample_preemption(", retry)
+        self.assertIn("_sample_campaign_persist_hold(", retry)
+
+    def test_watcher_retries_failed_sample_settlement_without_orphaning_state(self):
+        job = {
+            "id": "sample", "kind": "sample_campaign_generation",
+            "resource_state": "preemption_requested", "execution_attempt": 3,
+        }
+        state = {"abort": True}
+        active = {"sample": state}
+        attempts = []
+
+        def settle(target, **kwargs):
+            attempts.append(kwargs["expected_execution_attempt"])
+            if len(attempts) == 1:
+                raise OSError("journal unavailable")
+            active.pop("sample")
+            target.update({
+                "status": "queued", "queue_held": True,
+                "resource_state": "queued", "execution_attempt": 4,
+            })
+            return True
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_settle_requested_jobs",),
+            {
+                "Mapping": dict,
+                "_active_gen_states": active,
+                "_jobs": {"sample": job},
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "_sample_campaign_transition_lock": threading.RLock(),
+                "settle_sample_preemption": settle,
+                "_sample_campaign_persist_hold": lambda *_args: True,
+            },
+        )
+        namespace["_sample_campaign_settle_requested_jobs"]()
+        self.assertIs(active["sample"], state)
+        namespace["_sample_campaign_settle_requested_jobs"]()
+        self.assertNotIn("sample", active)
+        self.assertEqual(attempts, [3, 3])
+
+    def test_sample_h3_delivery_receives_attempt_fenced_publishers(self):
+        worker = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_run_generation"),
+        )
+        self.assertIn("update_job_fn=update_job", worker)
+        self.assertIn("finish_job_fn=finish_job", worker)
+        delivery = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_deliver_h3_outputs_transactionally"),
+        )
+        self.assertIn("update_job_fn=None", delivery)
+        self.assertIn("publisher(job, output_files=[])", delivery)
+        publication = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_publish_h3_delivery_outputs"),
+        )
+        self.assertIn("publisher(job, output_files=final_names)", publication)
+        protected = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_process_h3_delivery_from_protected_native"),
+        )
+        self.assertIn("update_job_fn=update_job_fn", protected)
+        self.assertIn('== "preemption_requested"', protected)
+        flashvsr = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_chunked_flashvsr_upscale"),
+        )
+        self.assertIn("publisher(job, **changes)", flashvsr)
+        self.assertIn("if not publisher(", flashvsr)
+
+    def test_sample_abort_registration_executes_the_attempt_fenced_branch(self):
+        runner = _function(self.launch, "_run_generation")
+        nested = {
+            node.name: node
+            for node in ast.walk(runner)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_sample_attempt", "register_abort_state"}
+        }
+        module = ast.Module(
+            body=[nested["_sample_attempt"], nested["register_abort_state"]],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(module)
+        calls = []
+
+        def lifecycle_register(target, target_id, active, state, **kwargs):
+            calls.append(kwargs["expected_execution_attempt"])
+            active[target_id] = state
+            return True
+
+        namespace = {
+            "Any": object,
+            "Mapping": dict,
+            "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+            "worker_execution_attempt": 3,
+            "_sample_campaign_transition_lock": threading.RLock(),
+            "_lifecycle_register_abort_state": lifecycle_register,
+        }
+        exec(compile(module, "sample-register-abort", "exec"), namespace)
+        job = {
+            "kind": "sample_campaign_generation",
+            "resource_state": "running",
+        }
+        active = {}
+        state = {"abort": False}
+        self.assertTrue(namespace["register_abort_state"](
+            job, "sample", active, state,
+        ))
+        self.assertIs(active["sample"], state)
+        self.assertEqual(calls, [3])
+
+    def test_safe_unit_checkpoint_propagates_persistence_failure(self):
+        job = {
+            "id": "sample",
+            "recovery_cursor": {"ordinary_repeat_offset": 1},
+        }
+        before = copy.deepcopy(job["recovery_cursor"])
+        namespace = _isolated_functions(
+            self.launch,
+            ("_queue_recovery_checkpoint_unit",),
+            {
+                "recovery_unit_id": lambda *_args, **_kwargs: "unit",
+                "_recovery_artifact_descriptor": (
+                    lambda *_args, **kwargs: {"basename": kwargs["basename"]}
+                ),
+                "_queue_recovery_units": lambda _job: [],
+                "_queue_recovery_checkpoint": lambda *_args, **_kwargs: False,
+                "os": os,
+            },
+        )
+        committed = namespace["_queue_recovery_checkpoint_unit"](
+            job,
+            kind="ordinary_repeat",
+            variant=0,
+            index=2,
+            project_dir="/tmp",
+            artifact_names=["output.mp4"],
+            ordinary_repeat_offset=2,
+        )
+        self.assertIsNone(committed)
+        self.assertEqual(job["recovery_cursor"], before)
+
+    def test_h3_delivery_forwards_the_exact_injected_publisher(self):
+        calls = []
+
+        def fenced(*_args, **_kwargs):
+            return True
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("_deliver_h3_outputs_transactionally",),
+            {
+                "_H3DeliveryFailure": RuntimeError,
+                "uuid": uuid,
+                "_queue_recovery_delivery_plan": lambda *_args, **_kwargs: {},
+                "_queue_recovery_checkpoint_delivery_intent": (
+                    lambda *_args: True
+                ),
+                "_queue_recovery_checkpoint_delivery_pending": (
+                    lambda *_args: True
+                ),
+                "_stage_h3_delivery_native_outputs": (
+                    lambda *_args: [{"recovery_descriptor": {}}]
+                ),
+                "_release_h3_delivery_vram": lambda: [],
+                "is_cancel_requested": lambda _job: False,
+                "_process_h3_delivery_from_protected_native": (
+                    lambda *_args, **kwargs: calls.append(
+                        kwargs["update_job_fn"]
+                    ) or ["final.mp4"]
+                ),
+                "update_job": lambda *_args, **_kwargs: True,
+            },
+        )
+        delivered = namespace["_deliver_h3_outputs_transactionally"](
+            {"id": "sample"}, "/tmp", ["native.mp4"], "off",
+            "1920x1080", "upscale_exact", update_job_fn=fenced,
+        )
+        self.assertEqual(delivered, ["final.mp4"])
+        self.assertEqual(calls, [fenced])
+
+    def test_h3_publication_holds_preemption_lock_through_final_sidecar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            native_meta = root / "native.meta.json"
+            source_meta = root / "final.meta.json"
+            rollback_meta = root / "rollback.meta.json"
+            work_path = root / "work.mp4"
+            source_path = root / "final.mp4"
+            native_meta.write_text(
+                json.dumps({"job_id": "sample", "explicit": False}),
+                encoding="utf-8",
+            )
+            work_path.write_bytes(b"media")
+            staged = [{
+                "file_name": "final.mp4",
+                "native_meta": str(native_meta),
+                "source_meta": str(source_meta),
+                "rollback_meta": str(rollback_meta),
+                "work_path": str(work_path),
+                "source_path": str(source_path),
+            }]
+            transition = threading.RLock()
+            publisher_entered = threading.Event()
+            allow_publisher = threading.Event()
+            preemption_acquired = threading.Event()
+            descriptors = []
+            producer_unit = recovery_unit_id("sample", "h3_delivery")
+            job = {
+                "id": "sample", "kind": "sample_campaign_generation",
+                "workspace": "default", "session_id": "owner",
+                "resource_state": "running", "output_files": [],
+                "access_policy": {"private": True, "explicit": False},
+            }
+
+            def publisher(target, **updates):
+                publisher_entered.set()
+                self.assertTrue(allow_publisher.wait(2.0))
+                target.update(updates)
+                return True
+
+            def atomic_json(path, payload):
+                Path(path).write_text(json.dumps(payload), encoding="utf-8")
+
+            def commit_final_sidecar(_names):
+                sidecar = json.loads(source_meta.read_text(encoding="utf-8"))
+                self.assertEqual(sidecar["artifact_class"], "final")
+                self.assertTrue(sidecar["private"])
+                sidecar.update({
+                    "producer_unit_id": producer_unit,
+                    "producer_unit_kind": "h3_delivery",
+                })
+                atomic_json(source_meta, sidecar)
+                descriptors.append(artifact_descriptor(
+                    root,
+                    basename="final.mp4",
+                    sidecar_basename="final.meta.json",
+                    producer_unit_id=producer_unit,
+                ))
+                return True
+
+            namespace = _isolated_functions(
+                self.launch,
+                ("_publish_h3_delivery_outputs",),
+                {
+                    "os": os, "json": json, "time": time,
+                    "_sample_campaign_transition_lock": transition,
+                    "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                    "update_job": publisher,
+                    "is_cancel_requested": lambda _job: False,
+                    "_atomic_write_json": atomic_json,
+                    "stamp_sidecar_policy": stamp_sidecar_policy,
+                },
+            )
+            result = []
+            publication = threading.Thread(
+                target=lambda: result.extend(
+                    namespace["_publish_h3_delivery_outputs"](
+                        job,
+                        staged,
+                        update_job_fn=publisher,
+                        publication_commit_fn=commit_final_sidecar,
+                    )
+                ),
+            )
+            publication.start()
+            self.assertTrue(publisher_entered.wait(2.0))
+
+            def preempt():
+                with transition:
+                    preemption_acquired.set()
+                    job["resource_state"] = "preemption_requested"
+
+            contender = threading.Thread(target=preempt)
+            contender.start()
+            self.assertFalse(preemption_acquired.wait(0.05))
+            allow_publisher.set()
+            publication.join(2.0)
+            contender.join(2.0)
+            self.assertEqual(result, ["final.mp4"])
+            self.assertTrue(preemption_acquired.is_set())
+            final_sidecar = json.loads(source_meta.read_text(encoding="utf-8"))
+            self.assertEqual(final_sidecar["artifact_class"], "final")
+            self.assertTrue(final_sidecar["private"])
+            self.assertTrue(validate_artifact_descriptor(root, descriptors[0]))
+
+    def test_h3_rejected_initial_publisher_aborts_before_gpu_release(self):
+        released = []
+        namespace = _isolated_functions(
+            self.launch,
+            ("_deliver_h3_outputs_transactionally",),
+            {
+                "_H3DeliveryFailure": RuntimeError,
+                "uuid": uuid,
+                "update_job": lambda *_args, **_kwargs: False,
+                "_release_h3_delivery_vram": lambda: released.append(True),
+                "_stage_h3_delivery_native_outputs": lambda *_args: [],
+            },
+        )
+        with self.assertRaises(InterruptedError):
+            namespace["_deliver_h3_outputs_transactionally"](
+                {"id": "sample"}, "/tmp", ["native.mp4"], "off",
+                "1920x1080", "upscale_exact",
+                update_job_fn=lambda *_args, **_kwargs: False,
+            )
+        self.assertEqual(released, [])
+
+    def test_h3_stale_rollback_never_clears_new_attempt_outputs(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_rollback_h3_delivery_publication",),
+            {
+                "os": os,
+                "_sample_campaign_transition_lock": threading.RLock(),
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "update_job": lambda *_args, **_kwargs: False,
+            },
+        )
+        job = {
+            "kind": "sample_campaign_generation",
+            "execution_attempt": 4,
+            "output_files": ["new-attempt.mp4"],
+            "_h3_delivery_publication": {"staged": []},
+        }
+        namespace["_rollback_h3_delivery_publication"](
+            job, update_job_fn=lambda *_args, **_kwargs: False,
+        )
+        self.assertEqual(job["output_files"], ["new-attempt.mp4"])
+
+    def test_watcher_stop_joins_and_retires_both_threads(self):
+        stop = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_stop_sample_campaign_preemption_watcher"),
+        )
+        self.assertIn("thread.join(timeout=5.0)", stop)
+        self.assertIn("_sample_campaign_retry_sampler_thread", stop)
+        start = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_start_sample_campaign_preemption_watcher"),
+        )
+        self.assertIn("_sample_campaign_retry_sampler_thread.is_alive()", start)
+
+    def test_sample_sidecars_require_successful_attempt_fenced_publication(self):
+        worker = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_run_generation"),
+        )
+        publish = worker.index("published_outputs = record_job_outputs(")
+        sidecar = worker.index("_write_output_sidecars(new_files", publish)
+        gate = worker.index("name in published_outputs", publish)
+        self.assertLess(gate, sidecar)
+        lock = worker.rfind("with _sample_campaign_transition_lock:", 0, publish)
+        self.assertGreater(lock, 0)
+        self.assertLess(lock, publish)
+        self.assertGreaterEqual(worker.count("sample_safe_unit_current(abort_state)"), 7)
+        self.assertNotIn("\n                        _queue_recovery_checkpoint_unit(", worker)
 
 
 if __name__ == "__main__":
