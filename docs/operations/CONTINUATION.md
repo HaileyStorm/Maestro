@@ -204,35 +204,35 @@ possible. The `maestro` arm enables the named recipe, reference, planning,
 continuity, recovery, or creator workflow; the `control` arm uses the direct
 path without that intervention. Record exactly which intervention differs.
 
-Work the slate in these waves:
+The authoritative priority, intervention matrix, historical alias map, and
+release states live in `docs/operations/SAMPLE_CAMPAIGN_QUEUE.md`. Wave 1 is
+**Reference Lock**, **One Idea, Four Roles**, **Recovery Is a Feature**, then
+**Pocket to Picture Lock**. Continuity and correction proofs follow in Wave 2;
+90-second and 3–12-minute stories are assembled only after their shorter
+component evidence is accepted. Recovery tests use safe durable boundaries and
+must not manufacture an unsafe failure. Real external contention or urgent
+owner/agent work may still cancel a running sample through Maestro, accept the
+in-flight loss, and requeue it as specified below.
 
-1. **Reference lock / Pocket to Picture Lock** — compare a reference-locked
-   subject or product across motion with the same direct generation lacking the
-   reference workflow. This is the first visual-quality proof.
-2. **Continuity Rescue / Change One Fact / One Note Three Consequences** — make
-   one controlled story or direction change and compare how identity, setting,
-   action, and downstream beats remain coherent.
-3. **One Idea Four Roles / Brief to Beat Sheet** — compare Maestro's explicit
-   role and planning handoffs with a direct one-prompt generation, keeping the
-   creative brief fixed.
-4. **Recovery Is a Feature / Break It on Purpose / Cold Restart Recovery** —
-   demonstrate durable queue and output-boundary recovery without killing a
-   running diffusion step or corrupting the control. Treat this as workflow
-   evidence, not an invitation to manufacture an unsafe failure.
-5. Only after the paired pipeline is credible, expand to the 90-second and
-   3–12-minute formats such as **Brief Survived Reality**, **Commercial in One
-   Sitting**, and **Brief to Campaign**. Recipe-only glamour samples are lower
-   priority unless they isolate a newly added capability with no meaningful
-   baseline.
-
-Queue each arm as an ordinary durable generation job at the lowest manual
-priority and hold it until the GPU-idle gate passes. Release one arm at a time.
-Never preempt a running GPU generation; the owner's active work, agent-required
-verification, and meaningful external GPU work take precedence. Require a
-sustained low-utilization window plus no foreign compute/graphics process;
-missing or ambiguous GPU telemetry fails closed and retries later. If contention
-appears, finish or cancel only at the next safe output/job boundary, preserve the
-durable checkpoint, and requeue without duplicating the pair.
+Queue each arm as an ordinary durable generation job with
+`queue_class=background_sample`, at the lowest manual priority, and hold it
+until the GPU-idle gate passes. Release one arm at a time.
+The owner's active work, agent-required verification, and meaningful external
+GPU work take precedence. Require a sustained low-utilization window plus no
+foreign compute/graphics process; missing or ambiguous GPU telemetry fails
+closed and retries later. Every deferral or interruption records a durable
+`not_before` time and uses bounded exponential backoff with jitter; a
+low-frequency watcher rechecks telemetry and ordinary work without busy
+polling. The exact 30-second base, 1800-second cap, zero-to-25-percent
+deterministic jitter, durable attempt progression, 15-second minimum poll
+interval, and reset-after-durable-arm-commit rule are canonical in
+`docs/operations/SAMPLE_CAMPAIGN_QUEUE.md`. If meaningful external contention
+appears, preserve the newest
+durable checkpoint, request cancellation only through Maestro, accept loss of
+the in-flight arm, and requeue the same job without duplicating the pair; never
+signal or control the foreign process. For owner- or agent-required GPU work,
+prefer the next completed generation boundary when urgency permits, otherwise
+use the same durable cancel/requeue path.
 
 For each video arm, VLM review uses 2–5 sequential, non-adjacent, nearby frames.
 The frames must be spread enough to show motion and temporal coherence, but not
@@ -240,7 +240,9 @@ so far apart that they become unrelated stills. Both arms use identical
 normalized sampling positions. Preserve private per-arm manifests, frame and
 output digests, VLM evidence, and an evidence-class label. The human review
 queue must show the pair together and allow keep, reject, or request-rerun; VLM
-output is provisional and never substitutes for creator acceptance.
+output is provisional and never substitutes for creator acceptance. The exact
+nearby-window geometry and receipt requirements are canonical in
+`docs/operations/SAMPLE_CAMPAIGN_QUEUE.md`.
 
 Do not start GPU work merely because the queue exists. The first implementation
 unit is the content-free pair manifest/coordinator, fail-closed idle gate, frame

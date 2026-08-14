@@ -9,6 +9,8 @@ GUIDE_PATH = ROOT / "docs/operations/CONTINUATION.md"
 GUIDE = GUIDE_PATH.read_text(encoding="utf-8")
 HANDOFF_PATH = ROOT / "docs/operations/FRESH_THREAD_HANDOFF.md"
 HANDOFF = HANDOFF_PATH.read_text(encoding="utf-8")
+SAMPLE_QUEUE_PATH = ROOT / "docs/operations/SAMPLE_CAMPAIGN_QUEUE.md"
+SAMPLE_QUEUE = SAMPLE_QUEUE_PATH.read_text(encoding="utf-8")
 
 
 class TestContinuationDocs(unittest.TestCase):
@@ -81,10 +83,21 @@ class TestContinuationDocs(unittest.TestCase):
         for required in (
             "Maestro.git-134",
             "Maestro.git-28",
-            "Reference lock / Pocket to Picture Lock",
+            "Reference Lock",
+            "Pocket to Picture Lock",
             "same normalized prompt/input",
             "ordinary durable generation job",
-            "Never preempt a running GPU generation",
+            "`queue_class=background_sample`",
+            "request cancellation only through Maestro",
+            "in-flight loss",
+            "`not_before` time",
+            "bounded exponential backoff with jitter",
+            "low-frequency watcher",
+            "30-second base",
+            "1800-second cap",
+            "zero-to-25-percent",
+            "15-second minimum poll",
+            "reset-after-durable-arm-commit",
             "2–5 sequential, non-adjacent, nearby frames",
             "normalized sampling positions",
             "human review",
@@ -92,6 +105,24 @@ class TestContinuationDocs(unittest.TestCase):
         ):
             with self.subTest(sample_campaign_contract=required):
                 self.assertIn(required, samples)
+
+        for required in (
+            "stride = max(2, (last_index + 10) // 20)",
+            "start = (last_index - span) // 2",
+            "half-up integer rounding",
+            "one quarter of normalized duration",
+            "two frames after",
+            "`queue_class=background_sample`",
+            "min(1800, 30 * 2 ** min(attempt, 6))",
+            "zero through 25 percent",
+            "compute the delay with the current",
+            "persist `attempt + 1` with `not_before`",
+            "first failure therefore waits 30 seconds",
+            "Reset the attempt only after",
+            "15 seconds and must never release",
+        ):
+            with self.subTest(sample_queue_contract=required):
+                self.assertIn(required, SAMPLE_QUEUE)
 
         restart = self.guide_section("Coordinated restart and status")
         for required in (
