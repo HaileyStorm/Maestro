@@ -659,6 +659,30 @@ def _runtime_share_registration_is_local(request: Request) -> bool:
         return False
 
 
+def _sample_campaign_request_is_local(request: Request) -> bool:
+    """Admit a headerless browser GET without weakening mutation origins."""
+    if (
+        request.method.upper() != "GET"
+        or request.url.path != "/api/v1/sample-campaign/queue"
+    ):
+        return _runtime_share_registration_is_local(request)
+    if not _is_loopback_request_client(request):
+        return False
+    direct = _canonical_http_origin(str(request.base_url), allow_path=True)
+    try:
+        if not direct or (urlsplit(direct).hostname or "") not in {
+            "localhost", "127.0.0.1", "::1",
+        }:
+            return False
+    except ValueError:
+        return False
+    supplied_raw = request.headers.get("origin")
+    if supplied_raw is None:
+        return True
+    supplied = _canonical_http_origin(str(supplied_raw), allow_path=False)
+    return bool(supplied and hmac.compare_digest(supplied, direct))
+
+
 def _request_is_cloudflare_remote(request: Request) -> bool:
     """Classify requests arriving through any opt-in external surface.
 
@@ -848,7 +872,7 @@ def _sample_campaign_control_denial(request: Request) -> JSONResponse | None:
     """Keep private comparative manifests on the exact direct-loopback origin."""
     if (
         _request_is_cloudflare_remote(request)
-        or not _runtime_share_registration_is_local(request)
+        or not _sample_campaign_request_is_local(request)
     ):
         return JSONResponse(
             {"detail": "Sample campaign controls are unavailable"},
@@ -1099,6 +1123,8 @@ def _recovery_response_requires_no_store(path: str) -> bool:
         or path.startswith("/api/v1/research/")
         or path == "/api/v1/local-recovery"
         or path.startswith("/api/v1/local-recovery/")
+        or path == "/api/v1/sample-campaign"
+        or path.startswith("/api/v1/sample-campaign/")
         or path in {"/api/v1/jobs", "/api/v1/queue"}
         or path.startswith("/api/v1/status/")
         or path.startswith("/api/v1/cancel/")
@@ -1400,6 +1426,10 @@ from services.gpu_idle_gate import (
 )
 from services.sample_campaign_preemption import (
     SampleCampaignPreemptionCoordinator,
+)
+from services.sample_campaign_queue import (
+    project_sample_campaign_queue,
+    valid_sample_pair_lifecycle,
 )
 
 _lifecycle_finish_job = finish_job
@@ -5392,16 +5422,6 @@ def _valid_sample_campaign_recovery_groups(
             continue
         maestro_link = maestro["recovery_cursor"]["sample_campaign"]
         control_link = control["recovery_cursor"]["sample_campaign"]
-        states = (
-            (
-                str(maestro.get("status") or "").casefold(),
-                maestro.get("queue_held") is True,
-            ),
-            (
-                str(control.get("status") or "").casefold(),
-                control.get("queue_held") is True,
-            ),
-        )
         if (
             maestro.get("id") == control.get("id")
             or maestro_link.get("peer_job_id") != control.get("id")
@@ -5412,15 +5432,7 @@ def _valid_sample_campaign_recovery_groups(
                     != _SAMPLE_CAMPAIGN_QUEUE_PRIORITY
                 for candidate in candidates
             )
-            or states not in {
-                (("queued", True), ("queued", True)),
-                (("queued", False), ("queued", True)),
-                (("running", False), ("queued", True)),
-                (("completed", False), ("queued", True)),
-                (("completed", False), ("queued", False)),
-                (("completed", False), ("running", False)),
-                (("completed", False), ("completed", False)),
-            }
+            or not valid_sample_pair_lifecycle(maestro, control)
         ):
             continue
         valid.append((maestro, control))
@@ -35606,7 +35618,7 @@ def _run_generation_preparation(
 def _require_sample_campaign_owner(request: Request) -> None:
     """Require local, recently reauthenticated owner authority before parsing."""
     if (
-        not _runtime_share_registration_is_local(request)
+        not _sample_campaign_request_is_local(request)
         or _request_is_cloudflare_remote(request)
         or not _request_has_account_capability(request, "owner.admin")
         or not _request_has_recent_account_reauth(request)
@@ -35886,6 +35898,137 @@ def _existing_sample_campaign_pair(
             for arm in ("maestro", "control")
         ],
     }
+
+
+def _sample_campaign_queue_pair_manifest(job: Mapping[str, Any]):
+    """Load only the sealed pair contract needed by the public projection."""
+    job_id = job.get("id") if isinstance(job, Mapping) else None
+    project_dir = job.get("out_dir") if isinstance(job, Mapping) else None
+    pointer = (
+        job.get("_recovery_manifest_pointer")
+        if isinstance(job, Mapping) else None
+    )
+    if (
+        not isinstance(job_id, str)
+        or not job_id
+        or not isinstance(project_dir, str)
+        or not project_dir
+        or not isinstance(pointer, Mapping)
+    ):
+        raise QueueRecoveryRuntimeError(
+            "Sample campaign queue evidence is unavailable."
+        )
+    manifest = load_request_manifest(
+        project_dir, dict(pointer), expected_job_id=job_id,
+    )
+    params = manifest.get("params")
+    private = (
+        params.get(_SAMPLE_CAMPAIGN_PRIVATE_MANIFEST_KEY)
+        if isinstance(params, Mapping) else None
+    )
+    cursor = job.get("recovery_cursor")
+    linkage = (
+        cursor.get("sample_campaign")
+        if isinstance(cursor, Mapping) else None
+    )
+    if (
+        not isinstance(private, Mapping)
+        or set(private) != {
+            "pair_manifest", "pair_manifest_digest", "linkage",
+        }
+        or not isinstance(linkage, Mapping)
+        or private.get("linkage") != linkage
+        or private.get("pair_manifest_digest")
+            != linkage.get("pair_manifest_digest")
+    ):
+        raise QueueRecoveryRuntimeError(
+            "Sample campaign queue evidence is invalid."
+        )
+    try:
+        return parse_private_pair_manifest(private.get("pair_manifest"))
+    except (SampleCampaignSubmissionError, TypeError, ValueError) as error:
+        raise QueueRecoveryRuntimeError(
+            "Sample campaign queue evidence is invalid."
+        ) from error
+
+
+def _sample_campaign_queue_authorized_jobs(
+    request: Request,
+    workspace: str | None,
+) -> tuple[dict[str, Any], ...]:
+    """Return project-authorized samples without binding to browser session."""
+    if workspace is not None and (not isinstance(workspace, str) or not workspace):
+        raise HTTPException(status_code=400, detail="Invalid project")
+    samples = tuple(
+        snapshot_job(job)
+        for job in list(_jobs.values())
+        if isinstance(job, dict) and job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+    )
+    candidate_workspaces = sorted({
+        str(job.get("workspace") or "")
+        for job in samples
+        if isinstance(job.get("workspace"), str) and job.get("workspace")
+        and (workspace is None or job.get("workspace") == workspace)
+    })
+    if workspace is not None and workspace not in candidate_workspaces:
+        # Resolve the explicit project even when it currently has no samples;
+        # callers must not use this endpoint to enumerate project names.
+        candidate_workspaces.append(workspace)
+    authorized: dict[str, tuple[str, str]] = {}
+    for candidate in candidate_workspaces:
+        try:
+            project_dir = _require_project_access(
+                request,
+                candidate,
+                existing_only=True,
+                permission="project.read",
+            )
+            authorized[candidate] = (
+                project_dir,
+                _queue_recovery_existing_project_identity(project_dir),
+            )
+        except HTTPException:
+            if workspace is not None:
+                raise
+        except (QueueRecoveryAdapterError, OSError, ValueError):
+            if workspace is not None:
+                raise HTTPException(
+                    status_code=404, detail="Project not found",
+                ) from None
+    result = []
+    for job in samples:
+        allowed = authorized.get(str(job.get("workspace") or ""))
+        if allowed is None:
+            continue
+        project_dir, project_digest = allowed
+        captured_dir = job.get("out_dir")
+        captured_digest = job.get("_recovery_project_digest")
+        if (
+            not isinstance(captured_dir, str)
+            or not isinstance(captured_digest, str)
+            or not hmac.compare_digest(captured_digest, project_digest)
+            or os.path.normcase(os.path.realpath(captured_dir))
+                != os.path.normcase(os.path.realpath(project_dir))
+        ):
+            continue
+        result.append(job)
+    return tuple(result)
+
+
+@api.get("/api/v1/sample-campaign/queue")
+def get_sample_campaign_queue(
+    request: Request,
+    response: Response,
+    workspace: str | None = None,
+):
+    """List exact owner/project campaign pairs without private evidence."""
+    _require_sample_campaign_owner(request)
+    _set_recovery_no_store(response)
+    jobs = _sample_campaign_queue_authorized_jobs(request, workspace)
+    return project_sample_campaign_queue(
+        jobs,
+        load_pair_manifest=_sample_campaign_queue_pair_manifest,
+    )
 
 
 @api.post("/api/v1/sample-campaign/pairs")
@@ -57134,12 +57277,17 @@ def _public_job_created_at(job: dict) -> float:
     return 0.0
 
 
+def _generic_job_visible(job: Mapping[str, Any]) -> bool:
+    """Keep comparative arms on their dedicated content-free projection."""
+    return job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND
+
+
 @api.get("/api/v1/status/{job_id}")
 def get_status(job_id: str, request: Request, response: Response):
     """Get generation job status."""
     _set_recovery_no_store(response)
     job = _jobs.get(job_id)
-    if job is None:
+    if job is None or not _generic_job_visible(job):
         raise HTTPException(status_code=404, detail="Job not found")
     if not _job_owned_by_request(job, request):
         raise HTTPException(status_code=404, detail="Job not found")
@@ -57325,7 +57473,11 @@ def list_jobs(
     authorized_jobs = []
     for job in physical_jobs:
         snapshot = scheduler["states"].get(id(job))
-        if snapshot and _job_owned_by_request(snapshot, request):
+        if (
+            snapshot
+            and _generic_job_visible(snapshot)
+            and _job_owned_by_request(snapshot, request)
+        ):
             authorized_jobs.append(job)
     projection = authorized_logical_queue_projection(
         authorized_jobs, scheduler,
@@ -58550,6 +58702,7 @@ def get_queue_state(request: Request, response: Response):
         job for job in active_jobs
         if (
             scheduler["states"].get(id(job))
+            and _generic_job_visible(scheduler["states"][id(job)])
             and _job_owned_by_request(
                 scheduler["states"][id(job)], request,
             )

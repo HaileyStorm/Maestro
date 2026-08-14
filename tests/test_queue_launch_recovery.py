@@ -72,6 +72,7 @@ from services.h3_duration_plan import (
 )
 from services.output_access import stamp_sidecar_policy
 from services.job_lifecycle import authorized_logical_queue_projection
+from services.sample_campaign_queue import valid_sample_pair_lifecycle
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1940,15 +1941,17 @@ class QueueLaunchWiringTests(unittest.TestCase):
 
             return await middleware_call(request, call_next)
 
-        for status_code in (200, 404, 409, 503):
-            with self.subTest(status_code=status_code):
-                response = asyncio.run(exercise(
-                    "/api/v1/queue/job-a/recovery-retry", status_code,
-                ))
-                self.assertEqual(
-                    response.headers["Cache-Control"], "private, no-store",
-                )
-                self.assertEqual(response.headers["Pragma"], "no-cache")
+        for path in (
+            "/api/v1/queue/job-a/recovery-retry",
+            "/api/v1/sample-campaign/queue",
+        ):
+            for status_code in (200, 404, 409, 503):
+                with self.subTest(path=path, status_code=status_code):
+                    response = asyncio.run(exercise(path, status_code))
+                    self.assertEqual(
+                        response.headers["Cache-Control"], "private, no-store",
+                    )
+                    self.assertEqual(response.headers["Pragma"], "no-cache")
         unrelated = asyncio.run(exercise("/api/v1/outputs", 404))
         self.assertEqual(unrelated.headers, {})
 
@@ -4851,7 +4854,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.launch,
             (
                 "_public_h3_boundary", "_public_job_prompt_fields",
-                "_public_job_created_at", "get_status", "list_jobs",
+                "_public_job_created_at", "_generic_job_visible",
+                "get_status", "list_jobs",
             ),
             {
                 "api": fake_api,
@@ -4859,6 +4863,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "Response": object,
                 "HTTPException": Exception,
                 "_jobs": jobs,
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
                 "_set_recovery_no_store": lambda response: response.headers.update({
                     "Cache-Control": "private, no-store",
                 }),
@@ -5049,7 +5054,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     "_job_owned_by_request", "_public_parent_job_id",
                     "_public_logical_job_kind",
                     "_public_failed_child_metadata", "_public_job_prompt_fields",
-                    "_public_job_created_at", "get_status", "list_jobs",
+                    "_public_job_created_at", "_generic_job_visible",
+                    "get_status", "list_jobs",
                 ),
                 {
                     "api": fake_api,
@@ -5057,6 +5063,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     "Response": object,
                     "HTTPException": Exception,
                     "_jobs": jobs,
+                    "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
                     "hmac": hmac,
                     "math": __import__("math"),
                     "re": re,
@@ -6118,6 +6125,61 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertLess(route_gate, session)
         self.assertIn("_sample_campaign_control_denial(request)", middleware[route_gate:session])
 
+    def test_headerless_same_origin_sample_queue_get_passes_asgi_locality_gate(self):
+        from starlette.requests import Request as ASGIRequest
+        from starlette.responses import JSONResponse
+        from urllib.parse import urlsplit
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_canonical_http_origin",
+                "_is_loopback_request_client",
+                "_runtime_share_registration_is_local",
+                "_sample_campaign_request_is_local",
+                "_sample_campaign_control_denial",
+            ),
+            {
+                "Request": object,
+                "JSONResponse": JSONResponse,
+                "hmac": hmac,
+                "ipaddress": __import__("ipaddress"),
+                "urlsplit": urlsplit,
+                "_request_is_cloudflare_remote": lambda _request: False,
+            },
+        )
+
+        def request(method="GET", *, client="127.0.0.1", origin=None):
+            headers = [(b"host", b"127.0.0.1:42005")]
+            if origin is not None:
+                headers.append((b"origin", origin.encode("ascii")))
+            return ASGIRequest({
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": method,
+                "scheme": "http",
+                "path": "/api/v1/sample-campaign/queue",
+                "raw_path": b"/api/v1/sample-campaign/queue",
+                "query_string": b"",
+                "headers": headers,
+                "client": (client, 32100),
+                "server": ("127.0.0.1", 42005),
+            })
+
+        local = namespace["_sample_campaign_request_is_local"]
+        denial = namespace["_sample_campaign_control_denial"]
+        headerless_get = request()
+        self.assertTrue(local(headerless_get))
+        self.assertIsNone(denial(headerless_get))
+        self.assertFalse(local(request(origin="http://attacker.invalid")))
+        self.assertIsNotNone(denial(request(origin="http://attacker.invalid")))
+        self.assertFalse(local(request(method="POST")))
+        self.assertTrue(local(request(
+            method="POST", origin="http://127.0.0.1:42005",
+        )))
+        self.assertFalse(local(request(client="192.168.1.25")))
+
     def test_sample_pair_owner_gate_denies_lan_nonowner_and_stale_reauth(self):
         class Denied(Exception):
             def __init__(self, *, status_code, detail):
@@ -6130,7 +6192,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             {
                 "Request": object,
                 "HTTPException": Denied,
-                "_runtime_share_registration_is_local": (
+                "_sample_campaign_request_is_local": (
                     lambda request: request.local
                 ),
                 "_request_is_cloudflare_remote": (
@@ -6163,6 +6225,230 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 raised.exception.detail,
                 "Sample campaign controls are unavailable",
             )
+
+    def test_sample_queue_route_is_owner_first_read_only_and_no_store(self):
+        route = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "get_sample_campaign_queue"),
+        )
+        owner = route.index("_require_sample_campaign_owner(request)")
+        no_store = route.index("_set_recovery_no_store(response)")
+        authorize = route.index("_sample_campaign_queue_authorized_jobs(")
+        project = route.index("project_sample_campaign_queue(")
+        self.assertLess(owner, no_store)
+        self.assertLess(no_store, authorize)
+        self.assertLess(authorize, project)
+        self.assertNotIn("_job_owned_by_request", route)
+        self.assertNotIn("session_id", route)
+        self.assertIn(
+            '@api.get("/api/v1/sample-campaign/queue")', self.launch_source,
+        )
+
+        calls = []
+        namespace = _isolated_functions(
+            self.launch,
+            ("get_sample_campaign_queue",),
+            {
+                "api": types.SimpleNamespace(
+                    get=lambda _path: (lambda function: function),
+                ),
+                "Request": object,
+                "Response": object,
+                "_require_sample_campaign_owner": (
+                    lambda request: calls.append(("owner", request))
+                ),
+                "_set_recovery_no_store": (
+                    lambda response: calls.append(("no_store", response))
+                ),
+                "_sample_campaign_queue_authorized_jobs": (
+                    lambda request, workspace: (
+                        calls.append(("authorized", workspace))
+                        or ({"id": "job"},)
+                    )
+                ),
+                "_sample_campaign_queue_pair_manifest": object(),
+                "project_sample_campaign_queue": (
+                    lambda jobs, **kwargs: {
+                        "schema_version": 1,
+                        "pairs": [],
+                        "jobs": jobs,
+                        "loader": kwargs["load_pair_manifest"],
+                    }
+                ),
+            },
+        )
+        request = object()
+        response = object()
+        result = namespace["get_sample_campaign_queue"](
+            request, response, workspace="project-a",
+        )
+        self.assertEqual(
+            [call[0] for call in calls],
+            ["owner", "no_store", "authorized"],
+        )
+        self.assertEqual(calls[-1][1], "project-a")
+        self.assertEqual(result["schema_version"], 1)
+
+    def test_sample_queue_authorization_uses_owner_project_not_browser_session(self):
+        class Denied(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code = status_code
+                self.detail = detail
+
+        project_digest = "project:v1:" + "c" * 64
+        old_session_job = {
+            "id": "sample-pair-maestro",
+            "kind": "sample_campaign_generation",
+            "workspace": "project-a",
+            "session_id": "old-browser-session",
+            "out_dir": "/projects/project-a",
+            "_recovery_project_digest": project_digest,
+        }
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_queue_authorized_jobs",),
+            {
+                "Request": object,
+                "HTTPException": Denied,
+                "QueueRecoveryAdapterError": ValueError,
+                "_jobs": {"sample": old_session_job},
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "snapshot_job": lambda job: dict(job),
+                "_require_project_access": (
+                    lambda _request, workspace, **_kwargs:
+                    f"/projects/{workspace}"
+                ),
+                "_queue_recovery_existing_project_identity": (
+                    lambda _path: project_digest
+                ),
+                "hmac": hmac,
+                "os": os,
+                "Any": object,
+            },
+        )
+        request = types.SimpleNamespace(
+            state=types.SimpleNamespace(maestro_session_id="new-browser-session"),
+        )
+        authorized = namespace["_sample_campaign_queue_authorized_jobs"](
+            request, None,
+        )
+        self.assertEqual(len(authorized), 1)
+        self.assertEqual(authorized[0]["session_id"], "old-browser-session")
+        self.assertEqual(
+            namespace["_sample_campaign_queue_authorized_jobs"](
+                request, "project-b",
+            ),
+            (),
+        )
+
+    def test_sample_queue_manifest_loader_reads_only_sealed_pair_contract(self):
+        linkage = {
+            "schema": 1,
+            "pair_id": "pair-1",
+            "pair_manifest_digest": "d" * 64,
+            "arm": "maestro",
+            "peer_job_id": "sample-control",
+        }
+        private = {
+            "pair_manifest": {"PRIVATE_PROMPT_SENTINEL": True},
+            "pair_manifest_digest": "d" * 64,
+            "linkage": copy.deepcopy(linkage),
+        }
+        calls = []
+
+        class Invalid(Exception):
+            pass
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_queue_pair_manifest",),
+            {
+                "Mapping": dict,
+                "Any": object,
+                "QueueRecoveryRuntimeError": Invalid,
+                "SampleCampaignSubmissionError": ValueError,
+                "load_request_manifest": lambda project, pointer, **kwargs: (
+                    calls.append((project, pointer, kwargs))
+                    or {
+                        "params": {
+                            "prompt": "PRIVATE_PROMPT_SENTINEL",
+                            "input": "/private/input.png",
+                            "_sample_campaign_private": private,
+                        },
+                    }
+                ),
+                "_SAMPLE_CAMPAIGN_PRIVATE_MANIFEST_KEY": (
+                    "_sample_campaign_private"
+                ),
+                "parse_private_pair_manifest": (
+                    lambda value: ("parsed", value)
+                ),
+            },
+        )
+        job = {
+            "id": "sample-maestro",
+            "out_dir": "/private/project",
+            "_recovery_manifest_pointer": {"sha256": "e" * 64},
+            "recovery_cursor": {"sample_campaign": linkage},
+        }
+        parsed = namespace["_sample_campaign_queue_pair_manifest"](job)
+        self.assertEqual(parsed, ("parsed", private["pair_manifest"]))
+        self.assertEqual(calls[0][0], "/private/project")
+        self.assertEqual(calls[0][2]["expected_job_id"], "sample-maestro")
+        tampered = copy.deepcopy(job)
+        tampered["recovery_cursor"]["sample_campaign"]["peer_job_id"] = "other"
+        with self.assertRaises(Invalid):
+            namespace["_sample_campaign_queue_pair_manifest"](tampered)
+
+    def test_sample_arms_are_excluded_from_generic_public_job_projections(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_generic_job_visible",),
+            {
+                "Mapping": dict,
+                "Any": object,
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+            },
+        )
+        visible = namespace["_generic_job_visible"]
+        sample = {
+            "kind": "sample_campaign_generation",
+            "prompt_preview": "PRIVATE_PROMPT_SENTINEL",
+            "output_files": ["/private/sample.mp4"],
+            "error": "PRIVATE_ERROR_SENTINEL",
+        }
+        ordinary = {
+            "kind": "studio_generation",
+            "prompt_preview": "ordinary preview",
+        }
+        self.assertFalse(visible(sample))
+        self.assertTrue(visible(ordinary))
+
+        status = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "get_status"),
+        )
+        jobs = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "list_jobs"),
+        )
+        queue = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "get_queue_state"),
+        )
+        self.assertLess(
+            status.index("not _generic_job_visible(job)"),
+            status.index("public_prompt_fields ="),
+        )
+        self.assertLess(
+            jobs.index("_generic_job_visible(snapshot)"),
+            jobs.index("authorized_jobs.append(job)"),
+        )
+        self.assertLess(
+            jobs.index("_generic_job_visible(snapshot)"),
+            jobs.index('"output_files": j["output_files"]'),
+        )
+        self.assertIn(
+            "_generic_job_visible(scheduler[\"states\"][id(job)])",
+            queue,
+        )
 
     def test_sample_pair_registry_batch_validates_every_job_before_visibility(self):
         registry_node = next(
@@ -6241,6 +6527,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "Any": object,
                 "_SAMPLE_CAMPAIGN_QUEUE_CLASS": "background_sample",
                 "_SAMPLE_CAMPAIGN_QUEUE_PRIORITY": -1000,
+                "valid_sample_pair_lifecycle": valid_sample_pair_lifecycle,
             },
         )
         validate = namespace["_valid_sample_campaign_recovery_groups"]
@@ -6487,6 +6774,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "Any": object,
                 "_SAMPLE_CAMPAIGN_QUEUE_CLASS": "background_sample",
                 "_SAMPLE_CAMPAIGN_QUEUE_PRIORITY": -1000,
+                "valid_sample_pair_lifecycle": valid_sample_pair_lifecycle,
             },
         )
         digest = "d" * 64

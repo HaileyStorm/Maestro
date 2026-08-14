@@ -2288,6 +2288,9 @@ interface AppState {
   // Generation state (queue)
   jobs: GenerationJob[]
   isGenerating: boolean
+  sampleCampaignPairs: api.SampleCampaignQueuePair[]
+  refreshSampleCampaignQueue: (signal?: AbortSignal) => Promise<void>
+  clearSampleCampaignQueue: () => void
   pendingH3Plan: H3SegmentPlan | null
   pendingH3PlanEstimate: H3PerformanceEstimate | null
   pendingH3PlanJobId: string | null
@@ -3165,6 +3168,8 @@ let _accountUsersRequestSequence = 0
 let _accountMutationRequestSequence = 0
 let _accessContextRequestSequence = 0
 let _accountProjectMigrationRequestSequence = 0
+let _sampleCampaignQueueRequestSequence = 0
+const _sampleCampaignKnownJobIds = new Set<string>()
 let _accountIdentityEpoch = 0
 
 function _accountIdentity(context: AccountContext | null | undefined): string {
@@ -3175,10 +3180,18 @@ function _advanceAccountIdentityEpoch(): void {
   _accountIdentityEpoch += 1
   _workspaceLoadSequence += 1
   _accountProjectMigrationRequestSequence += 1
+  _sampleCampaignQueueRequestSequence += 1
+  _sampleCampaignKnownJobIds.clear()
 }
 
 function _accountIdentityIsCurrent(epoch: number): boolean {
   return epoch === _accountIdentityEpoch
+}
+
+function _sampleCampaignJobIds(
+  pairs: readonly api.SampleCampaignQueuePair[],
+): Set<string> {
+  return new Set(pairs.flatMap(entry => entry.arms.map(arm => arm.job_id)))
 }
 
 function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
@@ -3211,6 +3224,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     gallerySelectionMode: false,
     jobs: [],
     isGenerating: false,
+    sampleCampaignPairs: [],
     params: { ...state.params, ...BLANK_VIDEO_INPUT_PARAMS },
     startImage: null,
     endImage: null,
@@ -5685,6 +5699,67 @@ export const useStore = create<AppState>((set, get) => ({
 
   jobs: [],
   isGenerating: false,
+  sampleCampaignPairs: [],
+  refreshSampleCampaignQueue: async (signal) => {
+    const requestSequence = ++_sampleCampaignQueueRequestSequence
+    const accountIdentityEpoch = _accountIdentityEpoch
+    try {
+      const projection = await api.fetchSampleCampaignQueue(signal)
+      if (
+        signal?.aborted
+        || requestSequence !== _sampleCampaignQueueRequestSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+      ) return
+      const sampleCampaignPairs = projection?.pairs ?? []
+      const currentJobIds = _sampleCampaignJobIds([
+        ...get().sampleCampaignPairs,
+        ...sampleCampaignPairs,
+      ])
+      for (const jobId of currentJobIds) _sampleCampaignKnownJobIds.add(jobId)
+      for (const jobId of _sampleCampaignKnownJobIds) _recoveryJobPolls.get(jobId)?.stop()
+      set(state => {
+        const jobs = state.jobs.filter(job => !_sampleCampaignKnownJobIds.has(job.id))
+        return {
+          sampleCampaignPairs,
+          jobs,
+          isGenerating: jobs.some(_isActiveGenerationJob),
+        }
+      })
+    } catch {
+      if (
+        signal?.aborted
+        || requestSequence !== _sampleCampaignQueueRequestSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+      ) return
+      for (const jobId of _sampleCampaignJobIds(get().sampleCampaignPairs)) {
+        _sampleCampaignKnownJobIds.add(jobId)
+      }
+      for (const jobId of _sampleCampaignKnownJobIds) _recoveryJobPolls.get(jobId)?.stop()
+      set(state => {
+        const jobs = state.jobs.filter(job => !_sampleCampaignKnownJobIds.has(job.id))
+        return {
+          sampleCampaignPairs: [],
+          jobs,
+          isGenerating: jobs.some(_isActiveGenerationJob),
+        }
+      })
+    }
+  },
+  clearSampleCampaignQueue: () => {
+    _sampleCampaignQueueRequestSequence += 1
+    for (const jobId of _sampleCampaignJobIds(get().sampleCampaignPairs)) {
+      _sampleCampaignKnownJobIds.add(jobId)
+    }
+    for (const jobId of _sampleCampaignKnownJobIds) _recoveryJobPolls.get(jobId)?.stop()
+    set(state => {
+      const jobs = state.jobs.filter(job => !_sampleCampaignKnownJobIds.has(job.id))
+      return {
+        sampleCampaignPairs: [],
+        jobs,
+        isGenerating: jobs.some(_isActiveGenerationJob),
+      }
+    })
+  },
   pendingH3Plan: null,
   pendingH3PlanEstimate: null,
   pendingH3PlanJobId: null,
@@ -7413,16 +7488,21 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const data = await api.fetchActiveJobs()
       if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
-      if (data.jobs.length > 0) {
-        const serverJobs = new Map(data.jobs.map(job => [job.job_id, job]))
-        set(s => ({
-          jobs: s.jobs.map(job => {
+      const ordinaryStatuses = data.jobs.filter(status => (
+        !_sampleCampaignKnownJobIds.has(status.job_id)
+      ))
+      for (const jobId of _sampleCampaignKnownJobIds) _recoveryJobPolls.get(jobId)?.stop()
+      if (data.jobs.length > 0 || _sampleCampaignKnownJobIds.size > 0) {
+        const serverJobs = new Map(ordinaryStatuses.map(job => [job.job_id, job]))
+        set(s => {
+          const jobs = s.jobs.filter(job => !_sampleCampaignKnownJobIds.has(job.id)).map(job => {
             const status = serverJobs.get(job.id)
             return status ? _mergeJobStatus(job, status) : job
-          }),
-        }))
+          })
+          return { jobs, isGenerating: jobs.some(_isActiveGenerationJob) }
+        })
         const existingIds = new Set(get().jobs.map(j => j.id))
-        const newJobs: GenerationJob[] = data.jobs
+        const newJobs: GenerationJob[] = ordinaryStatuses
           .filter(j => !existingIds.has(j.job_id))
           .map(_newGenerationJobFromStatus)
         if (newJobs.length > 0) {
@@ -7435,12 +7515,12 @@ export const useStore = create<AppState>((set, get) => ({
         }
         // Queue snapshots keep ordinary queued cards current; preparation,
         // review, execution, and retry states use the fast per-card poller.
-        for (const status of data.jobs) {
+        for (const status of ordinaryStatuses) {
           if (ACTIVE_GENERATION_JOB_STATUSES.has(status.status)) {
             get()._pollRecoveredJob(status.job_id)
           }
         }
-        if (data.jobs.some(status => (
+        if (ordinaryStatuses.some(status => (
           status.status === 'completed'
           || status.status === 'failed'
           || status.status === 'cancelled'

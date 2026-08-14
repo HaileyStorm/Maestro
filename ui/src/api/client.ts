@@ -302,6 +302,351 @@ export interface QueueState {
   jobs: QueueJobState[]
 }
 
+export type SampleCampaignQueueState = 'held' | 'running_arm' | 'outputs_unbound' | 'blocked'
+export type SampleCampaignArmName = 'maestro' | 'control'
+export type SampleCampaignArmStatus = 'queued' | 'running' | 'completed' | 'failed'
+export type SampleCampaignRecoveryState =
+  | 'sample_campaign_held'
+  | 'sample_campaign_released'
+  | 'terminal'
+  | 'blocked'
+  | null
+export type SampleCampaignResourceState =
+  | 'queued'
+  | 'running'
+  | 'preemption_requested'
+  | 'released'
+  | 'blocked'
+
+export interface SampleCampaignPublicPairProjection {
+  schema_version: 1
+  pair_id: string
+  case_id: string
+  arms: ['maestro', 'control']
+  shared_generation: {
+    same_normalized_prompt: true
+    same_normalized_inputs: true
+    same_model_revision: true
+    same_settings: true
+    same_seed: true
+    same_output_index: true
+    model_revision: string
+    seed: string
+    output_index: number
+    input_count: number
+  }
+  intervention_delta: {
+    maestro_only: string[]
+    control_only: string[]
+  }
+  evaluation: {
+    evidence_class: 'manifest_only'
+    vlm_verdict: 'not_reviewed'
+    human_verdict: 'not_reviewed'
+  }
+}
+
+export interface SampleCampaignQueueArm {
+  job_id: string
+  arm: SampleCampaignArmName
+  status: SampleCampaignArmStatus
+  queue_held: boolean
+  recovery_state: SampleCampaignRecoveryState
+  resource_state: SampleCampaignResourceState
+  progress: number
+  output_available: boolean
+  output_count: number
+}
+
+export interface SampleCampaignQueuePair {
+  pair: SampleCampaignPublicPairProjection
+  queue_state: SampleCampaignQueueState
+  arms: [SampleCampaignQueueArm, SampleCampaignQueueArm]
+}
+
+export interface SampleCampaignQueueProjection {
+  schema_version: 1
+  pairs: SampleCampaignQueuePair[]
+}
+
+const SAMPLE_CAMPAIGN_MAX_PAIRS = 100
+const SAMPLE_CAMPAIGN_MAX_OUTPUTS = 1_000
+const SAMPLE_CAMPAIGN_ID = /^[A-Za-z0-9][A-Za-z0-9_.+@~-]{0,255}$/
+const SAMPLE_CAMPAIGN_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$/
+const SAMPLE_CAMPAIGN_INTERVENTION = /^[A-Za-z0-9][A-Za-z0-9_.:+~-]{0,127}$/
+const SAMPLE_CAMPAIGN_UINT64_MAX = '18446744073709551615'
+
+function _sampleCampaignRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function _sampleCampaignHasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  const actual = Object.keys(value)
+  return actual.length === keys.length && keys.every(key => Object.hasOwn(value, key))
+}
+
+function _sampleCampaignInteger(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === 'number'
+    && Number.isFinite(value)
+    && Number.isInteger(value)
+    && value >= minimum
+    && value <= maximum
+}
+
+function _sampleCampaignUint64(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]{0,19})$/.test(value)) return false
+  return value.length < SAMPLE_CAMPAIGN_UINT64_MAX.length
+    || value.length === SAMPLE_CAMPAIGN_UINT64_MAX.length
+      && value <= SAMPLE_CAMPAIGN_UINT64_MAX
+}
+
+function _sampleCampaignStringList(
+  value: unknown,
+  pattern: RegExp,
+  maximum: number,
+): string[] | null {
+  if (!Array.isArray(value) || value.length > maximum) return null
+  const result: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || !pattern.test(item)) return null
+    result.push(item)
+  }
+  if (new Set(result).size !== result.length) return null
+  if (result.some((item, index) => index > 0 && result[index - 1] >= item)) return null
+  return result
+}
+
+function _decodeSampleCampaignPair(value: unknown): SampleCampaignPublicPairProjection | null {
+  const pair = _sampleCampaignRecord(value)
+  if (!pair || !_sampleCampaignHasExactKeys(pair, [
+    'schema_version', 'pair_id', 'case_id', 'arms', 'shared_generation',
+    'intervention_delta', 'evaluation',
+  ])) return null
+  if (
+    pair.schema_version !== 1
+    || typeof pair.pair_id !== 'string'
+    || !SAMPLE_CAMPAIGN_ID.test(pair.pair_id)
+    || typeof pair.case_id !== 'string'
+    || !SAMPLE_CAMPAIGN_ID.test(pair.case_id)
+    || !Array.isArray(pair.arms)
+    || pair.arms.length !== 2
+    || pair.arms[0] !== 'maestro'
+    || pair.arms[1] !== 'control'
+  ) return null
+
+  const shared = _sampleCampaignRecord(pair.shared_generation)
+  if (!shared || !_sampleCampaignHasExactKeys(shared, [
+    'same_normalized_prompt', 'same_normalized_inputs', 'same_model_revision',
+    'same_settings', 'same_seed', 'same_output_index', 'model_revision',
+    'seed', 'output_index', 'input_count',
+  ])) return null
+  if (
+    shared.same_normalized_prompt !== true
+    || shared.same_normalized_inputs !== true
+    || shared.same_model_revision !== true
+    || shared.same_settings !== true
+    || shared.same_seed !== true
+    || shared.same_output_index !== true
+    || typeof shared.model_revision !== 'string'
+    || !SAMPLE_CAMPAIGN_ID.test(shared.model_revision)
+    || !_sampleCampaignUint64(shared.seed)
+    || !_sampleCampaignInteger(shared.output_index, 0, Number.MAX_SAFE_INTEGER)
+    || !_sampleCampaignInteger(shared.input_count, 0, 10_000)
+  ) return null
+
+  const delta = _sampleCampaignRecord(pair.intervention_delta)
+  if (!delta || !_sampleCampaignHasExactKeys(delta, ['maestro_only', 'control_only'])) return null
+  const maestroOnly = _sampleCampaignStringList(delta.maestro_only, SAMPLE_CAMPAIGN_INTERVENTION, 100)
+  const controlOnly = _sampleCampaignStringList(delta.control_only, SAMPLE_CAMPAIGN_INTERVENTION, 100)
+  if (!maestroOnly || !controlOnly || maestroOnly.length + controlOnly.length === 0) return null
+  if (maestroOnly.some(item => controlOnly.includes(item))) return null
+
+  const evaluation = _sampleCampaignRecord(pair.evaluation)
+  if (!evaluation || !_sampleCampaignHasExactKeys(
+    evaluation,
+    ['evidence_class', 'vlm_verdict', 'human_verdict'],
+  )) return null
+  if (
+    evaluation.evidence_class !== 'manifest_only'
+    || evaluation.vlm_verdict !== 'not_reviewed'
+    || evaluation.human_verdict !== 'not_reviewed'
+  ) return null
+
+  return {
+    schema_version: 1,
+    pair_id: pair.pair_id,
+    case_id: pair.case_id,
+    arms: ['maestro', 'control'],
+    shared_generation: {
+      same_normalized_prompt: true,
+      same_normalized_inputs: true,
+      same_model_revision: true,
+      same_settings: true,
+      same_seed: true,
+      same_output_index: true,
+      model_revision: shared.model_revision,
+      seed: shared.seed,
+      output_index: shared.output_index,
+      input_count: shared.input_count,
+    },
+    intervention_delta: {
+      maestro_only: maestroOnly,
+      control_only: controlOnly,
+    },
+    evaluation: {
+      evidence_class: 'manifest_only',
+      vlm_verdict: 'not_reviewed',
+      human_verdict: 'not_reviewed',
+    },
+  }
+}
+
+function _decodeSampleCampaignArm(
+  value: unknown,
+  expectedArm: SampleCampaignArmName,
+): SampleCampaignQueueArm | null {
+  const arm = _sampleCampaignRecord(value)
+  if (!arm || !_sampleCampaignHasExactKeys(arm, [
+    'job_id', 'arm', 'status', 'queue_held', 'recovery_state', 'resource_state',
+    'progress', 'output_available', 'output_count',
+  ])) return null
+  const statuses: readonly SampleCampaignArmStatus[] = ['queued', 'running', 'completed', 'failed']
+  const recoveryStates: readonly Exclude<SampleCampaignRecoveryState, null>[] = [
+    'sample_campaign_held', 'sample_campaign_released', 'terminal', 'blocked',
+  ]
+  const resourceStates: readonly SampleCampaignResourceState[] = [
+    'queued', 'running', 'preemption_requested', 'released', 'blocked',
+  ]
+  if (
+    typeof arm.job_id !== 'string'
+    || !SAMPLE_CAMPAIGN_JOB_ID.test(arm.job_id)
+    || arm.arm !== expectedArm
+    || !statuses.includes(arm.status as SampleCampaignArmStatus)
+    || typeof arm.queue_held !== 'boolean'
+    || !(arm.recovery_state === null || recoveryStates.includes(arm.recovery_state as Exclude<SampleCampaignRecoveryState, null>))
+    || !resourceStates.includes(arm.resource_state as SampleCampaignResourceState)
+    || typeof arm.progress !== 'number'
+    || !Number.isFinite(arm.progress)
+    || arm.progress < 0
+    || arm.progress > 100
+    || typeof arm.output_available !== 'boolean'
+    || !_sampleCampaignInteger(arm.output_count, 0, SAMPLE_CAMPAIGN_MAX_OUTPUTS)
+    || arm.output_available !== (arm.output_count > 0)
+  ) return null
+  const status = arm.status as SampleCampaignArmStatus
+  const recoveryState = arm.recovery_state as SampleCampaignRecoveryState
+  const resourceState = arm.resource_state as SampleCampaignResourceState
+  if (status === 'queued' && (
+    resourceState !== 'queued'
+    || !(
+      arm.queue_held === true
+        ? recoveryState === null
+          || recoveryState === 'sample_campaign_held'
+          || recoveryState === 'sample_campaign_released'
+        : recoveryState === 'sample_campaign_released'
+    )
+  )) return null
+  if (status === 'completed' && (
+    arm.queue_held || recoveryState !== 'terminal' || resourceState !== 'released' || arm.output_count < 1
+  )) return null
+  if (status === 'failed' && (
+    !['terminal', 'blocked'].includes(recoveryState ?? '')
+    || !['released', 'blocked'].includes(resourceState)
+  )) return null
+  if (status === 'running' && (
+    arm.queue_held
+    || recoveryState !== 'sample_campaign_released'
+    || !['running', 'preemption_requested'].includes(resourceState)
+  )) return null
+
+  return {
+    job_id: arm.job_id,
+    arm: expectedArm,
+    status,
+    queue_held: arm.queue_held,
+    recovery_state: recoveryState,
+    resource_state: resourceState,
+    progress: arm.progress,
+    output_available: arm.output_available,
+    output_count: arm.output_count,
+  }
+}
+
+function _decodeSampleCampaignQueuePair(value: unknown): SampleCampaignQueuePair | null {
+  const entry = _sampleCampaignRecord(value)
+  if (!entry || !_sampleCampaignHasExactKeys(entry, ['pair', 'queue_state', 'arms'])) return null
+  const pair = _decodeSampleCampaignPair(entry.pair)
+  const states: readonly SampleCampaignQueueState[] = ['held', 'running_arm', 'outputs_unbound', 'blocked']
+  if (!pair || !states.includes(entry.queue_state as SampleCampaignQueueState)) return null
+  if (!Array.isArray(entry.arms) || entry.arms.length !== 2) return null
+  const maestro = _decodeSampleCampaignArm(entry.arms[0], 'maestro')
+  const control = _decodeSampleCampaignArm(entry.arms[1], 'control')
+  if (!maestro || !control || maestro.job_id === control.job_id) return null
+  const queueState = entry.queue_state as SampleCampaignQueueState
+  const expectedQueueState: SampleCampaignQueueState = [maestro, control].some(arm => arm.status === 'failed')
+    ? 'blocked'
+    : maestro.status === 'completed' && control.status === 'completed'
+      ? 'outputs_unbound'
+      : maestro.status === 'queued' && control.status === 'queued' && maestro.queue_held
+        ? 'held'
+        : maestro.status === 'completed' && control.status === 'queued' && control.queue_held
+          ? 'held'
+          : 'running_arm'
+  if (queueState !== expectedQueueState) return null
+
+  return { pair, queue_state: queueState, arms: [maestro, control] }
+}
+
+export function decodeSampleCampaignQueue(value: unknown): SampleCampaignQueueProjection {
+  const root = _sampleCampaignRecord(value)
+  if (
+    !root
+    || !_sampleCampaignHasExactKeys(root, ['schema_version', 'pairs'])
+    || root.schema_version !== 1
+    || !Array.isArray(root.pairs)
+    || root.pairs.length > SAMPLE_CAMPAIGN_MAX_PAIRS
+  ) throw new Error('Sample campaign queue response is invalid')
+
+  const pairs: SampleCampaignQueuePair[] = []
+  const pairIds = new Set<string>()
+  const jobIds = new Set<string>()
+  let previousSortKey = ''
+  for (const value of root.pairs) {
+    const decoded = _decodeSampleCampaignQueuePair(value)
+    if (!decoded) throw new Error('Sample campaign queue response is invalid')
+    const sortKey = `${decoded.pair.case_id}\u0000${decoded.pair.pair_id}`
+    if (
+      pairIds.has(decoded.pair.pair_id)
+      || (previousSortKey && previousSortKey >= sortKey)
+      || decoded.arms.some(arm => jobIds.has(arm.job_id))
+    ) throw new Error('Sample campaign queue response is invalid')
+    pairIds.add(decoded.pair.pair_id)
+    decoded.arms.forEach(arm => jobIds.add(arm.job_id))
+    previousSortKey = sortKey
+    pairs.push(decoded)
+  }
+  return { schema_version: 1, pairs }
+}
+
+export async function fetchSampleCampaignQueue(
+  signal?: AbortSignal,
+): Promise<SampleCampaignQueueProjection | null> {
+  const res = await fetch(`${BASE}/api/v1/sample-campaign/queue`, {
+    signal,
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { Accept: 'application/json' },
+  })
+  if (res.status === 403 || res.status === 404) return null
+  if (!res.ok) throw new Error('Sample campaign queue is unavailable')
+  return decodeSampleCampaignQueue(await res.json())
+}
+
 export type QueueWaitReason =
   | 'running'
   | 'held'

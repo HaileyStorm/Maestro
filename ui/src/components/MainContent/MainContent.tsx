@@ -1695,8 +1695,109 @@ function queuePositionLabel(position: number | null, waiting: number): string {
   return `${ahead} ${ahead === 1 ? 'job' : 'jobs'} ahead · ${position} of ${waiting}`
 }
 
+function sampleInterventionLabel(value: string): string {
+  const words = value
+    .replace(/^(?:maestro|comparison|control)[.:_+-]+/i, '')
+    .replace(/[.:_+~-]+/g, ' ')
+    .trim()
+  if (!words) return 'Maestro workflow changes'
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+
+function samplePairStateCopy(state: api.SampleCampaignQueueState): string {
+  if (state === 'held') return 'Waiting for spare GPU time.'
+  if (state === 'running_arm') return 'One side is running or ready to start.'
+  if (state === 'outputs_unbound') {
+    return 'Both runs finished, but their outputs are not yet linked as review evidence.'
+  }
+  return 'This comparison stopped before both sides were ready.'
+}
+
+function sampleArmStatusCopy(arm: api.SampleCampaignQueueArm): string {
+  if (arm.status === 'queued') {
+    return arm.queue_held ? 'Waiting for spare GPU time' : 'Queued to start'
+  }
+  if (arm.status === 'running') return `Generating · ${Math.round(arm.progress)}%`
+  if (arm.status === 'completed') {
+    const noun = arm.output_count === 1 ? 'output' : 'outputs'
+    return `${arm.output_count} ${noun} ready · not linked for review yet`
+  }
+  return 'Stopped before this side was ready'
+}
+
+function sampleInterventionCopy(maestroChanges: string[], controlChanges: string[]): string {
+  if (maestroChanges.length > 0 && controlChanges.length > 0) {
+    return `Maestro adds ${maestroChanges.join(', ')}; the comparison adds ${controlChanges.join(', ')}.`
+  }
+  if (maestroChanges.length > 0) {
+    return `Maestro adds ${maestroChanges.join(', ')}; the comparison runs without those changes.`
+  }
+  return `The comparison adds ${controlChanges.join(', ')}; Maestro runs without those changes.`
+}
+
+function SampleCampaignQueueSection({ pairs }: { pairs: api.SampleCampaignQueuePair[] }) {
+  if (pairs.length === 0) return null
+  return (
+    <section
+      aria-labelledby="sample-campaign-queue-title"
+      className="space-y-2 rounded-lg border border-violet-400/25 bg-violet-400/5 px-3 py-3"
+    >
+      <div>
+        <h2 id="sample-campaign-queue-title" className="text-xs font-medium text-text-primary">
+          Comparative samples
+        </h2>
+        <p className="mt-0.5 text-[10px] leading-relaxed text-text-muted">
+          Matched runs compare two workflow variants using the same generation setup.
+        </p>
+      </div>
+      <div className="space-y-2">
+        {pairs.map((entry, index) => {
+          const maestroChanges = entry.pair.intervention_delta.maestro_only.map(sampleInterventionLabel)
+          const controlChanges = entry.pair.intervention_delta.control_only.map(sampleInterventionLabel)
+          return (
+            <article
+              key={entry.pair.pair_id}
+              className="min-w-0 rounded-md border border-border bg-bg-secondary px-2.5 py-2"
+              aria-label={`Matched sample ${index + 1}`}
+            >
+              <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-medium text-text-primary">Matched sample {index + 1}</p>
+                  <p className="mt-0.5 text-[10px] leading-relaxed text-text-muted">
+                    {samplePairStateCopy(entry.queue_state)}
+                  </p>
+                </div>
+                <span className="rounded-full border border-violet-400/25 bg-violet-400/10 px-2 py-0.5 text-[9px] text-violet-200">
+                  Paired comparison
+                </span>
+              </div>
+              <p className="mt-1.5 break-words text-[10px] leading-relaxed text-text-secondary">
+                {sampleInterventionCopy(maestroChanges, controlChanges)}
+              </p>
+              <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {entry.arms.map(arm => (
+                  <div key={arm.arm} className="min-w-0 rounded border border-border/70 bg-bg-primary/45 px-2 py-1.5">
+                    <p className="text-[10px] font-medium text-text-primary">
+                      {arm.arm === 'maestro' ? 'Maestro workflow' : 'Matched comparison workflow'}
+                    </p>
+                    <p className="mt-0.5 text-[10px] text-text-muted">{sampleArmStatusCopy(arm)}</p>
+                  </div>
+                ))}
+              </div>
+              <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+                No visual-model review or owner review has been recorded yet.
+              </p>
+            </article>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
 function QueuePanel({
   jobs,
+  sampleCampaignPairs,
   onStop,
   onDismiss,
   queue,
@@ -1705,6 +1806,7 @@ function QueuePanel({
   refreshQueue,
 }: {
   jobs: GenerationJob[]
+  sampleCampaignPairs: api.SampleCampaignQueuePair[]
   onStop: (jobId: string) => void
   onDismiss: (jobId: string) => void
   queue: api.QueueState | null
@@ -1867,6 +1969,7 @@ function QueuePanel({
             )}
           </div>}
         </div>
+        <SampleCampaignQueueSection pairs={sampleCampaignPairs} />
         {queueError && (
           <div
             className={`rounded-md border px-3 py-2 text-xs ${queue ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-red-500/30 bg-red-500/10 text-red-300'}`}
@@ -2265,6 +2368,8 @@ export function MainContent() {
   const accessContext = useStore(s => s.accessContext)
   const loadAccessContext = useStore(s => s.loadAccessContext)
   const reconcileQueueState = useStore(s => s.reconcileQueueState)
+  const sampleCampaignPairs = useStore(s => s.sampleCampaignPairs)
+  const refreshSampleCampaignQueue = useStore(s => s.refreshSampleCampaignQueue)
   const [shareCopied, setShareCopied] = useState(false)
   const [mainView, setMainView] = useState<MainView>('gallery')
   const [queueTabSnapshot, setQueueTabSnapshot] = useState<QueueTabSnapshot>({
@@ -2336,8 +2441,18 @@ export function MainContent() {
     const relayAbort = () => controller.abort()
     pollSignal?.addEventListener('abort', relayAbort, { once: true })
     try {
-      const next = await api.fetchQueueState(controller.signal)
+      const [queueState] = await Promise.all([
+        api.fetchQueueState(controller.signal),
+        refreshSampleCampaignQueue(controller.signal),
+      ])
       if (queueRefreshIsStale(sequence, queuePollSequence.current, controller.signal.aborted)) return
+      const sampleJobIds = new Set(
+        useStore.getState().sampleCampaignPairs.flatMap(entry => entry.arms.map(arm => arm.job_id)),
+      )
+      const next = {
+        ...queueState,
+        jobs: queueState.jobs.filter(job => !sampleJobIds.has(job.job_id)),
+      }
       reconcileQueueState(next)
       setQueueTabSnapshot(current => reduceQueueTabSnapshot(current, {
         kind: 'success',
@@ -2356,7 +2471,7 @@ export function MainContent() {
       pollSignal?.removeEventListener('abort', relayAbort)
       if (queuePollAbort.current === controller) queuePollAbort.current = null
     }
-  }, [reconcileQueueState])
+  }, [reconcileQueueState, refreshSampleCampaignQueue])
 
   useEffect(() => {
     const refresh = () => {
@@ -2366,13 +2481,23 @@ export function MainContent() {
     return () => window.removeEventListener(QUEUE_REFRESH_EVENT, refresh)
   }, [refreshQueue])
 
+  const sampleCampaignJobIds = useMemo(
+    () => new Set(sampleCampaignPairs.flatMap(entry => entry.arms.map(arm => arm.job_id))),
+    [sampleCampaignPairs],
+  )
   const queueDisplayJobs = queueTabDisplayJobs(queueTabSnapshot, jobs)
+    .filter(job => !sampleCampaignJobIds.has(job.id))
+  const ordinaryQueueState = useMemo(() => queueTabState ? {
+    ...queueTabState,
+    jobs: queueTabState.jobs.filter(job => !sampleCampaignJobIds.has(job.job_id)),
+  } : null, [queueTabState, sampleCampaignJobIds])
   const logicalQueue = useMemo(
-    () => projectLogicalQueue(queueDisplayJobs, queueTabState?.jobs),
-    [queueDisplayJobs, queueTabState?.jobs],
+    () => projectLogicalQueue(queueDisplayJobs, ordinaryQueueState?.jobs),
+    [queueDisplayJobs, ordinaryQueueState?.jobs],
   )
   const activeQueueJobs = logicalQueue.visibleJobs.filter(isActiveLogicalQueueJob)
   const queueActivity = logicalQueue.activeCount > 0
+    || sampleCampaignPairs.some(entry => entry.queue_state === 'running_arm')
 
   useVisibilityPolling(
     refreshQueue,
@@ -2416,12 +2541,12 @@ export function MainContent() {
   const currentSubtaskEtaSeconds = currentTarget?.queueJob?.subtask_eta_seconds ?? currentJob?.subtaskEtaSeconds
   const queueSummary = logicalQueue.summary
   const queueStateLabel = queueSummary.running > 0
-    ? (queueTabState?.pause_after_current ? 'running · pause next' : 'running')
+    ? (ordinaryQueueState?.pause_after_current ? 'running · pause next' : 'running')
     : queueSummary.approval_waiting > 0
       ? 'review needed'
       : queueSummary.preparing > 0
         ? 'preparing'
-    : queueTabState?.paused
+    : ordinaryQueueState?.paused
       ? 'paused'
       : queueSummary.held > 0
         && queueSummary.waiting === 0
@@ -2439,8 +2564,8 @@ export function MainContent() {
       : logicalQueue.visibleJobs.some(job => job.status === 'failed')
         ? 'bg-red-400'
         : logicalQueue.activeCount > 0 ? 'bg-accent-blue' : 'bg-text-muted'
-  const queueTooltip = queueTabState
-    ? `Queue: ${logicalQueue.activeCount} active · ${queueSummaryLabel(queueSummary)}${queueTabState.paused ? ' · paused' : queueTabState.pause_after_current ? ' · pauses after current output' : ''}`
+  const queueTooltip = ordinaryQueueState
+    ? `Queue: ${logicalQueue.activeCount} active · ${queueSummaryLabel(queueSummary)}${ordinaryQueueState.paused ? ' · paused' : ordinaryQueueState.pause_after_current ? ' · pauses after current output' : ''}`
     : 'Queue status loading'
   const ownedJobEtaTooltip = currentJob
     ? ` · Your job: overall ETA ${compactEta(currentEtaSeconds)}${currentSubtaskEtaSeconds != null ? ` · current task ${compactEta(currentSubtaskEtaSeconds)}` : ''}`
@@ -2867,9 +2992,10 @@ export function MainContent() {
         ) : mainView === 'queue' ? (
           <QueuePanel
             jobs={queueDisplayJobs}
+            sampleCampaignPairs={sampleCampaignPairs}
             onStop={stopGeneration}
             onDismiss={dismissJob}
-            queue={queueTabState}
+            queue={ordinaryQueueState}
             queueError={queueTabError}
             queueLastSuccessAt={queueTabSnapshot.lastSuccessAt}
             refreshQueue={refreshQueue}
