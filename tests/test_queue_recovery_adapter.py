@@ -37,6 +37,106 @@ def _serialize(job):
 
 
 class LogicalReferenceRecoveryTests(unittest.TestCase):
+    def test_atomic_registration_restores_both_held_sample_arms_or_neither(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.json")
+            coordinator = QueueRecoveryCoordinator(journal)
+            jobs = (
+                {
+                    "id": "sample-maestro",
+                    "status": "queued",
+                    "queue_class": "background_sample",
+                    "queue_priority": -1000,
+                    "queue_held": True,
+                    "created_at": 1,
+                },
+                {
+                    "id": "sample-control",
+                    "status": "queued",
+                    "queue_class": "background_sample",
+                    "queue_priority": -1000,
+                    "queue_held": True,
+                    "created_at": 2,
+                },
+            )
+            coordinator.register_jobs_atomic(tuple(
+                (job, OWNER, PROJECT, {"kind": "sample-arm"})
+                for job in jobs
+            ))
+            restored = QueueRecoveryCoordinator(journal).restore().jobs
+
+            self.assertEqual(set(restored), {"sample-maestro", "sample-control"})
+            for snapshot in restored.values():
+                self.assertEqual(snapshot["queue_class"], "background_sample")
+                self.assertEqual(snapshot["queue_priority"], -1000)
+                self.assertTrue(snapshot["queue_held"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.json")
+            coordinator = QueueRecoveryCoordinator(journal)
+            with self.assertRaisesRegex(QueueRecoveryAdapterError, "queue_class"):
+                coordinator.register_jobs_atomic((
+                    (
+                        jobs[0], OWNER, PROJECT, {"kind": "sample-arm"},
+                    ),
+                    (
+                        {**jobs[1], "queue_class": "invalid"},
+                        OWNER,
+                        PROJECT,
+                        {"kind": "sample-arm"},
+                    ),
+                ))
+            self.assertEqual(
+                QueueRecoveryCoordinator(journal).restore().jobs,
+                {},
+            )
+
+            with self.assertRaisesRegex(QueueRecoveryAdapterError, "job is invalid"):
+                coordinator.register_jobs_atomic((
+                    (
+                        jobs[0], OWNER, PROJECT, {"kind": "sample-arm"},
+                    ),
+                    (
+                        "not-a-job",  # type: ignore[arg-type]
+                        OWNER,
+                        PROJECT,
+                        {"kind": "sample-arm"},
+                    ),
+                ))
+            self.assertEqual(coordinator.restore().jobs, {})
+
+    def test_atomic_registration_rejects_duplicate_or_existing_job_without_partial_commit(self):
+        job = {
+            "id": "sample-arm",
+            "status": "queued",
+            "queue_class": "background_sample",
+            "queue_priority": -1000,
+            "queue_held": True,
+        }
+        registration = (job, OWNER, PROJECT, {"kind": "sample-arm"})
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.json")
+            coordinator = QueueRecoveryCoordinator(journal)
+            with self.assertRaisesRegex(QueueRecoveryAdapterError, "duplicate"):
+                coordinator.register_jobs_atomic((registration, registration))
+            self.assertEqual(coordinator.restore().jobs, {})
+
+            coordinator.register_job(
+                job,
+                owner_digest=OWNER,
+                project_digest=PROJECT,
+                request_manifest={"kind": "sample-arm"},
+            )
+            other = (
+                {**job, "id": "other-arm"},
+                OWNER,
+                PROJECT,
+                {"kind": "sample-arm"},
+            )
+            with self.assertRaisesRegex(QueueRecoveryAdapterError, "already registered"):
+                coordinator.register_jobs_atomic((registration, other))
+            self.assertEqual(set(coordinator.restore().jobs), {"sample-arm"})
+
     def test_background_sample_queue_class_is_strict_and_orders_after_users(self):
         background = _serialize({
             "id": "background-local",

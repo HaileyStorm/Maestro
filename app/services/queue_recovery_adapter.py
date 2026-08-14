@@ -8,7 +8,7 @@ and testable.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1455,33 +1455,77 @@ class QueueRecoveryCoordinator:
         global_state: Mapping[str, Any] | None = None,
     ) -> None:
         """Durably register a new/recovered runtime job before scheduling."""
-        job_id = str(job.get("id") or "")
-        snapshot = serialize_job(
-            job,
-            owner_digest=owner_digest,
-            project_digest=project_digest,
-            request_manifest=request_manifest,
+        self.register_jobs_atomic(
+            ((job, owner_digest, project_digest, request_manifest),),
+            global_state=global_state,
         )
+
+    def register_jobs_atomic(
+        self,
+        registrations: Sequence[
+            tuple[Mapping[str, Any], str, str, Mapping[str, Any]]
+        ],
+        *,
+        global_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Durably register an all-or-nothing group before any publication."""
+
+        if (
+            isinstance(registrations, (str, bytes))
+            or not isinstance(registrations, Sequence)
+            or not registrations
+        ):
+            raise QueueRecoveryAdapterError(
+                "Queue recovery registrations are invalid."
+            )
+        snapshots: dict[str, dict[str, Any]] = {}
+        identities: dict[str, tuple[str, str]] = {}
+        manifests: dict[str, dict[str, Any]] = {}
+        for registration in registrations:
+            if not isinstance(registration, tuple) or len(registration) != 4:
+                raise QueueRecoveryAdapterError(
+                    "Queue recovery registration is invalid."
+                )
+            job, owner_digest, project_digest, request_manifest = registration
+            snapshot = serialize_job(
+                job,
+                owner_digest=owner_digest,
+                project_digest=project_digest,
+                request_manifest=request_manifest,
+            )
+            job_id = snapshot["id"]
+            if job_id in snapshots:
+                raise QueueRecoveryAdapterError(
+                    "Queue recovery registration contains a duplicate job."
+                )
+            snapshots[job_id] = snapshot
+            identities[job_id] = (owner_digest, project_digest)
+            manifests[job_id] = deepcopy(snapshot["request_manifest"])
         with self._lock:
-            if job_id in self._identities:
-                raise QueueRecoveryAdapterError("Queue recovery job is already registered.")
+            if set(snapshots).intersection(self._identities):
+                raise QueueRecoveryAdapterError(
+                    "Queue recovery job is already registered."
+                )
             clean_global = (
                 None
                 if global_state is None
                 else self._canonical_global_state(
-                    global_state, job_updates={job_id: snapshot},
+                    global_state, job_updates=snapshots,
                 )
             )
             receipt = self.journal.commit_state(
-                jobs={job_id: snapshot},
+                jobs=snapshots,
                 global_state=clean_global,
-                expected_job_revisions={job_id: self._job_revisions.get(job_id, 0)},
+                expected_job_revisions={
+                    job_id: self._job_revisions.get(job_id, 0)
+                    for job_id in snapshots
+                },
                 expected_global_revision=(self._global_revision if clean_global is not None else None),
                 expected_epoch=self._epoch,
             )
-            self._identities[job_id] = (owner_digest, project_digest)
-            self._manifests[job_id] = deepcopy(snapshot["request_manifest"])
-            self._snapshots[job_id] = deepcopy(snapshot)
+            self._identities.update(identities)
+            self._manifests.update(manifests)
+            self._snapshots.update(deepcopy(snapshots))
             if clean_global is not None:
                 self._global_state = deepcopy(clean_global)
             self._accept_receipt(receipt)
