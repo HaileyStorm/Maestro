@@ -15,6 +15,7 @@ from services.queue_recovery import QueueRecoveryJournal  # noqa: E402
 from services.queue_recovery_adapter import (  # noqa: E402
     QueueRecoveryAdapterError,
     QueueRecoveryCoordinator,
+    _durable_order_key,
     owner_principal_digest,
     project_instance_digest,
     serialize_job,
@@ -36,6 +37,53 @@ def _serialize(job):
 
 
 class LogicalReferenceRecoveryTests(unittest.TestCase):
+    def test_background_sample_queue_class_is_strict_and_orders_after_users(self):
+        background = _serialize({
+            "id": "background-local",
+            "status": "queued",
+            "queue_class": "background_sample",
+            "source_remote": False,
+            "queue_priority": 1_000_000,
+            "_queue_manual_order": 99,
+            "created_at": 0,
+        })
+        remote_user = _serialize({
+            "id": "remote-user",
+            "status": "queued",
+            "queue_class": "user",
+            "source_remote": True,
+            "queue_priority": -1_000_000,
+            "created_at": 1,
+        })
+        legacy_local_user = _serialize({
+            "id": "legacy-local-user",
+            "status": "queued",
+            "source_remote": False,
+            "queue_priority": -1_000_000,
+            "created_at": 2,
+        })
+        ordered = sorted(
+            (background, remote_user, legacy_local_user),
+            key=lambda job: _durable_order_key(job, 0),
+        )
+        self.assertEqual(
+            [job["id"] for job in ordered],
+            ["legacy-local-user", "remote-user", "background-local"],
+        )
+        self.assertEqual(background["queue_class"], "background_sample")
+        self.assertEqual(remote_user["queue_class"], "user")
+        self.assertNotIn("queue_class", legacy_local_user)
+        for invalid in ("background", "sample", "", None, 3):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                QueueRecoveryAdapterError,
+                "queue_class",
+            ):
+                _serialize({
+                    "id": "invalid-queue-class",
+                    "status": "queued",
+                    "queue_class": invalid,
+                })
+
     def test_resource_retry_state_is_complete_bounded_and_round_trips(self):
         retry = _serialize({
             "id": "resource-retry", "status": "queued",

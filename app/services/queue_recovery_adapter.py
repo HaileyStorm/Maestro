@@ -52,7 +52,7 @@ _JOB_FIELDS = frozenset({
     "id", "status", "kind", "tool", "workspace", "model_type",
     "generation_mode", "profile_id", "resolution", "private",
     "explicit", "explicit_output", "source_remote", "created_at",
-    "started_at", "finished_at", "queue_priority", "queue_held",
+    "started_at", "finished_at", "queue_class", "queue_priority", "queue_held",
     "hold_after_output", "pause_queue_after", "requested_outputs",
     "cancel_requested", "message", "phase", "progress", "step",
     "total_steps", "window_current", "window_total", "window_step",
@@ -96,6 +96,7 @@ _MAX_MANUAL_ORDER_SEQUENCE = (1 << 63) - 1
 _RESOURCE_INTENTS = frozenset({"generation", "text"})
 _RESOURCE_EXECUTIONS = frozenset({"standard", "cpu"})
 _PREEMPTION_MODES = frozenset({"none", "discard_restart"})
+_QUEUE_CLASSES = frozenset({"user", "background_sample"})
 _RESOURCE_STATES = frozenset({
     "queued", "admitted", "running", "preemption_requested",
     "resources_releasing", "restarting_on_accelerator", "blocked",
@@ -1014,6 +1015,10 @@ def serialize_job(
                 ) from error
         elif key == "credit_queue":
             result[key] = _safe_credit_queue(value)
+        elif key == "queue_class":
+            if value not in _QUEUE_CLASSES:
+                raise QueueRecoveryAdapterError("job.queue_class is invalid.")
+            result[key] = value
         elif key == "resource_intent":
             if value not in _RESOURCE_INTENTS:
                 raise QueueRecoveryAdapterError(
@@ -1318,7 +1323,7 @@ def _validated_recovered_state(
 
 def _durable_order_key(
     snapshot: Mapping[str, Any], sequence: int,
-) -> tuple[bool, int, int, int, int, float, int]:
+) -> tuple[int, bool, int, int, int, int, float, int]:
     try:
         priority = int(snapshot.get("queue_priority", 0) or 0)
     except (TypeError, ValueError):
@@ -1340,9 +1345,14 @@ def _durable_order_key(
         else 0
     )
     remote = bool(snapshot.get("source_remote", False))
+    queue_class = 1 if snapshot.get("queue_class") == "background_sample" else 0
     if manual:
-        return (remote, 0, 0, -priority, -manual, created, sequence)
-    return (remote, 1, -credit_band, -priority, 0, created, sequence)
+        return (
+            queue_class, remote, 0, 0, -priority, -manual, created, sequence,
+        )
+    return (
+        queue_class, remote, 1, -credit_band, -priority, 0, created, sequence,
+    )
 
 
 class QueueRecoveryCoordinator:

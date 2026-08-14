@@ -1121,6 +1121,43 @@ class TestJobLifecycle(unittest.TestCase):
         remote_thread.join(timeout=1)
         self.assertEqual(order, ["local", "remote"])
 
+    def test_every_user_job_precedes_a_local_background_sample(self):
+        generation_lock = threading.Lock()
+        generation_lock.acquire()
+        jobs = (
+            {
+                **_job(), "id": "background-local", "queue_class": "background_sample",
+                "source_remote": False, "queue_priority": 1_000_000,
+                "created_at": 0,
+            },
+            {
+                **_job(), "id": "user-remote", "queue_class": "user",
+                "source_remote": True, "queue_priority": -1_000_000,
+                "created_at": 2,
+            },
+            {
+                **_job(), "id": "user-local", "source_remote": False,
+                "queue_priority": -1_000_000, "created_at": 3,
+            },
+        )
+        order: list[str] = []
+
+        def run(candidate):
+            if acquire_generation_slot(generation_lock, candidate, poll_interval=0.005):
+                order.append(candidate["id"])
+                generation_lock.release()
+
+        threads = [threading.Thread(target=run, args=(job,)) for job in jobs]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.03)
+        self.assertEqual(order, [])
+        generation_lock.release()
+        for thread in threads:
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(order, ["user-local", "user-remote", "background-local"])
+
     def test_residency_affinity_reorders_only_within_exact_local_priority_tier(self):
         base = make_residency_key("base", "model-a")
         affinity = make_residency_key("affinity", "overlay-a")

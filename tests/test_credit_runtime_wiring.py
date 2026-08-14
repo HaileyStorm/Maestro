@@ -6,6 +6,7 @@ import copy
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -38,6 +39,7 @@ from services.job_lifecycle import (
     _reset_queue_state_for_tests,
     _select_next_waiter,
     _validated_credit_queue_metadata,
+    acquire_generation_slot,
     apply_credit_queue_decision,
     block_resource_admission_failure,
     configure_credit_lifecycle_callback,
@@ -440,6 +442,71 @@ class CreditRuntimeWiringTests(unittest.TestCase):
         self.assertIs(selected[1], depleted_new)
         self.assertEqual(reason, "credit_starvation_guard")
         self.assertEqual(skipped, [])
+
+    def test_background_credit_age_never_jumps_the_user_queue_class(self):
+        background_depleted = _job(
+            "background-depleted",
+            created_at=time.time() - CREDIT_PRIORITY_AGE_CEILING_SECONDS - 1,
+        )
+        background_depleted["queue_class"] = "background_sample"
+        background_depleted["_credit_priority_bypass_count"] = (
+            MAX_CREDIT_PRIORITY_BYPASSES
+        )
+        user_funded = _job("user-funded", created_at=time.time())
+        user_funded_second = _job("user-funded-second", created_at=time.time() + 1)
+        self._stamp(
+            background_depleted,
+            _quote(units=0),
+            "background_depleted",
+        )
+        self._stamp(user_funded, _quote(), "user_funded")
+        self._stamp(user_funded_second, _quote(), "user_funded_second")
+        eligible = [
+            (1, background_depleted),
+            (2, user_funded),
+            (3, user_funded_second),
+        ]
+
+        selected, reason, skipped = _select_next_waiter(eligible)
+        self.assertIs(selected[1], user_funded)
+        self.assertEqual(reason, "queue_order")
+        _record_queue_admission(selected[1], reason, skipped, eligible)
+        self.assertEqual(
+            background_depleted["_credit_priority_bypass_count"],
+            MAX_CREDIT_PRIORITY_BYPASSES,
+        )
+        eligible.remove(selected)
+        selected, reason, _skipped = _select_next_waiter(eligible)
+        self.assertIs(selected[1], user_funded_second)
+        self.assertEqual(reason, "queue_order")
+
+        _reset_queue_state_for_tests()
+        generation_lock = threading.Lock()
+        generation_lock.acquire()
+        jobs = (background_depleted, user_funded, user_funded_second)
+        order: list[str] = []
+
+        def run(job):
+            if acquire_generation_slot(generation_lock, job, poll_interval=0.005):
+                order.append(job["id"])
+                generation_lock.release()
+
+        threads = [threading.Thread(target=run, args=(job,)) for job in jobs]
+        for thread in threads:
+            thread.start()
+        deadline = time.time() + 1
+        positions = [0, 0, 0]
+        while time.time() < deadline:
+            positions = [queue_position(job) for job in jobs]
+            if all(positions):
+                break
+            time.sleep(0.005)
+        self.assertEqual(positions, [3, 1, 2])
+        generation_lock.release()
+        for thread in threads:
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(order, ["user-funded", "user-funded-second", "background-depleted"])
 
     def test_depleted_age_bound_survives_scheduler_restore(self):
         depleted = _job(

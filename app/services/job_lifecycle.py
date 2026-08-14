@@ -1220,6 +1220,15 @@ def _queue_priority(job: Mapping[str, Any]) -> int:
         return 0
 
 
+def _queue_class_rank(job: Mapping[str, Any]) -> int:
+    """Keep background samples behind every ordinary user submission."""
+
+    value = job.get("queue_class")
+    if value is None or value == "user":
+        return 0
+    return 1
+
+
 def _queue_manual_order(job: Mapping[str, Any]) -> int:
     try:
         return max(0, int(job.get("_queue_manual_order", 0) or 0))
@@ -1243,11 +1252,13 @@ def _automatic_remote_credit_band(job: Mapping[str, Any]) -> int | None:
 
 def _queue_tier_key(
     entry: tuple[int, MutableMapping[str, Any]],
-) -> tuple[bool, str, int, int, int]:
+) -> tuple[int, bool, str, int, int, int]:
     _, job = entry
+    queue_class = _queue_class_rank(job)
     manual_order = _queue_manual_order(job)
     if manual_order:
         return (
+            queue_class,
             bool(job.get("source_remote", False)),
             "manual",
             _queue_priority(job),
@@ -1256,6 +1267,7 @@ def _queue_tier_key(
         )
     credit_band = _credit_queue_band(job)
     return (
+        queue_class,
         bool(job.get("source_remote", False)),
         "automatic",
         credit_band,
@@ -1272,14 +1284,18 @@ def _queue_order_key(entry: tuple[int, MutableMapping[str, Any]]) -> tuple:
         created_at = float(job.get("created_at", 0) or 0)
     except (TypeError, ValueError):
         created_at = 0.0
-    # Local submissions always wait ahead of Cloudflare submissions, but this
-    # key is consulted only before admission: an already-running remote job is
-    # never preempted or paused.
+    # Every user submission waits ahead of background samples; within one class,
+    # local submissions wait ahead of Cloudflare submissions. This key is
+    # consulted only before admission: running work is never preempted.
     remote = bool(job.get("source_remote", False))
+    queue_class = _queue_class_rank(job)
     if manual_order:
-        return (remote, 0, 0, -priority, -manual_order, created_at, sequence)
+        return (
+            queue_class, remote, 0, 0, -priority, -manual_order, created_at, sequence,
+        )
     credit_band = _credit_queue_band(job)
     return (
+        queue_class,
         remote,
         1,
         -credit_band,
@@ -1496,6 +1512,11 @@ def _select_next_waiter(
     head = ordered[0]
     credit_guarded = False
     if _automatic_remote_credit_band(head[1]) == 1:
+        head_queue_class = _queue_class_rank(head[1])
+        same_class = [
+            entry for entry in ordered
+            if _queue_class_rank(entry[1]) == head_queue_class
+        ]
         check_wall_time = time.time() if wall_now is None else wall_now
 
         def credit_priority_spent(entry: tuple[int, MutableMapping[str, Any]]) -> bool:
@@ -1529,14 +1550,14 @@ def _select_next_waiter(
             )
 
         depleted_at_limit = any(
-            credit_priority_spent(entry) for entry in ordered
+            credit_priority_spent(entry) for entry in same_class
         )
         if depleted_at_limit:
             # Preserve ordinary band ordering. Once funded priority is spent,
             # the next remote automatic non-funded waiter receives capacity;
             # the oldest depleted FIFO head follows any already-waiting band 0.
             head = next(
-                entry for entry in ordered
+                entry for entry in same_class
                 if (
                     _automatic_remote_credit_band(entry[1]) is not None
                     and _automatic_remote_credit_band(entry[1]) < 1
@@ -1613,6 +1634,7 @@ def _record_queue_admission(
         for _, waiting_job in eligible:
             if (
                 waiting_job is not selected
+                and _queue_class_rank(waiting_job) == _queue_class_rank(selected)
                 and _automatic_remote_credit_band(waiting_job) == -1
             ):
                 waiting_job["_credit_priority_bypass_count"] = min(
@@ -1860,6 +1882,8 @@ def _queue_positions_unlocked() -> dict[int, int]:
             for _, waiting_job in remaining:
                 if (
                     waiting_job is not selected[1]
+                    and _queue_class_rank(waiting_job)
+                    == _queue_class_rank(selected[1])
                     and _automatic_remote_credit_band(waiting_job) == -1
                 ):
                     key = id(waiting_job)
