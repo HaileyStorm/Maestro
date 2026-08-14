@@ -218,10 +218,20 @@ Queue each arm as an ordinary durable generation job with
 `queue_class=background_sample`, at the lowest manual priority, and hold it
 until the GPU-idle gate passes. Release one arm at a time.
 The owner's active work, agent-required verification, and meaningful external
-GPU work take precedence. Require a sustained low-utilization window plus no
-foreign compute/graphics process; missing or ambiguous GPU telemetry fails
-closed and retries later. Every deferral or interruption records a durable
-`not_before` time and uses bounded exponential backoff with jitter; a
+GPU work take precedence. Require five qualifying snapshots over at least 8
+seconds, with positive gaps no greater than 3 seconds. The significant-work
+rule is telemetry-only and never uses process names: foreign compute blocks on
+fresh process activity above the 1 percent incidental floor or aggregate memory
+at least `min(1 GiB, 10 percent of total GPU memory)`. Graphics-only contexts
+may pass only at device utilization no greater than 25 percent and aggregate
+foreign graphics memory no greater than
+`min(4 GiB, 15 percent of total GPU memory)`. WDDM unknown graphics bytes need
+valid total-used residual evidence. Compute/graphics overlap counts as compute;
+missing or ambiguous process APIs, compute activity or bytes, utilization PIDs,
+timestamps, totals, or residuals fail closed and reset the window. The exact
+classification and public PID/name-redaction contract is canonical in
+`docs/operations/SAMPLE_CAMPAIGN_QUEUE.md`. Every deferral or interruption
+records a durable `not_before` time and uses bounded exponential backoff with jitter; a
 low-frequency watcher rechecks telemetry and ordinary work without busy
 polling. The exact 30-second base, 1800-second cap, zero-to-25-percent
 deterministic jitter, durable attempt progression, 15-second minimum poll

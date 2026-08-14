@@ -62,6 +62,41 @@ agent-required GPU work has priority too; prefer the next completed generation
 boundary when its urgency permits, otherwise use the same durable cancel and
 requeue path.
 
+The process-attributed gate distinguishes significant external work from
+incidental desktop contexts without process-name, executable, or command-line
+allowlists. It snapshots GPU 0, treats only the Maestro PID and its recursively
+observed children as owned, and requires the owned tree to be identical before
+and after attribution. Compute and graphics records remain separate; a PID in
+both is deduplicated and classified as compute. No PID, process name, raw memory
+record, or timestamp enters the public snapshot.
+
+Each valid snapshot applies these fail-closed rules:
+
+- Device utilization must be at most 25 percent.
+- `nvmlDeviceGetProcessUtilization` must be available and queried with
+  `lastSeenTimeStamp=0`; a wall-clock-derived NVML cursor is forbidden. Samples
+  must be no more than 3 seconds old, and a utilization PID absent from the
+  compute/graphics snapshot is a race and denies release. A valid
+  empty/`NOT_FOUND` response from that zero cursor is positive evidence of no
+  non-zero retained process sample. Missing, unsupported, malformed, or
+  future-dated evidence denies release; a foreign compute context represented
+  only by stale samples also has unknown activity and denies release.
+- Foreign compute is significant when any fresh SM, framebuffer, encoder, or
+  decoder utilization is above the explicit 1 percent incidental floor, or
+  when aggregate foreign compute memory is at least
+  `min(1 GiB, 10 percent of total GPU memory)`. Unknown compute bytes deny.
+- Graphics-only contexts may be incidental only while their aggregate foreign
+  memory is at most `min(4 GiB, 15 percent of total GPU memory)`. On WDDM,
+  unknown per-process graphics bytes may use only a valid conservative residual:
+  aggregate device-used bytes minus all known unique process bytes. Missing or
+  inconsistent total/used/residual evidence denies release.
+
+Release requires five qualifying snapshots spanning at least 8 seconds, with
+every positive adjacent gap at most 3 seconds. Any utilization spike,
+significant foreign work, telemetry ambiguity, nonpositive timestamp movement,
+or overlong gap resets the sustained window. The allocator/headroom gate remains
+separate and must also pass at both release checks.
+
 If an external action nevertheless interrupts or terminates a sample, record
 the newest durable checkpoint, leave foreign work untouched, and return the
 same job to `held` without duplicating the pair. Retry uses a durable
