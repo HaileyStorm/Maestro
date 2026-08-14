@@ -720,6 +720,8 @@ test("offline browser navigation gets static no-tracking HTML", async () => {
   assert.match(response.headers.get("Content-Security-Policy"), /default-src 'none'/)
   const html = await response.text()
   assert.match(html, /Maestro is offline/)
+  assert.match(html, /We can’t reach the studio right now/)
+  assert.match(html, /open Maestro locally on the studio computer and start it from Pinokio/)
   assert.doesNotMatch(html, /private=value|<script|https?:\/\//)
   assert.equal(probes.length, 1)
   assert.equal(probes[0].url, "https://expired-tunnel.trycloudflare.com/health")
@@ -752,8 +754,11 @@ test("current restart status renders escaped accessible HTML before origin healt
   assert.match(response.headers.get("Content-Security-Policy"), /default-src 'none'/)
   const html = await response.text()
   assert.match(html, /aria-labelledby="status-title"/)
-  assert.match(html, /Waiting for boundary/)
+  assert.match(html, /Finishing current work/)
   assert.match(html, /Please wait &lt;script&gt;alert\(&quot;unsafe&quot;\)&lt;\/script&gt; &amp; retry\./)
+  assert.match(html, /Open Technical details for the expected return window\./)
+  assert.match(html, /<summary>Technical details<\/summary>/)
+  assert.match(html, /<dt>Status<\/dt><dd>Waiting for boundary<\/dd>/)
   assert.match(html, /2030-01-02T03:15:00Z to 2030-01-02T03:30:00Z/)
   assert.doesNotMatch(html, /<script|alert\("unsafe"\)/)
   assert.equal(healthProbes, 1)
@@ -781,8 +786,41 @@ test("proxy disconnect also renders the current restart status for navigation", 
   assert.equal(response.status, 503)
   const html = await response.text()
   assert.match(html, /Maestro service update/)
-  assert.match(html, /Verifying/)
+  assert.match(html, /Checking that Maestro is ready/)
+  assert.match(html, /Open Technical details for the expected return time\./)
+  assert.match(html, /<dt>Status<\/dt><dd>Verifying<\/dd>/)
   assert.match(html, /2030-01-02T03:20:00Z/)
+})
+
+test("restart status uses neutral headings for every valid state and reason", async () => {
+  const headings = {
+    planned: "Service work is planned",
+    waiting_for_boundary: "Finishing current work",
+    restarting: "Maestro is restarting",
+    verifying: "Checking that Maestro is ready",
+    complete: "Service work is complete",
+    postponed: "Service work was postponed",
+    forced_emergency: "Maestro is recovering",
+  }
+  const reasons = ["restart", "maintenance", "shutdown", "incident"]
+
+  for (const [index, [state, heading]] of Object.entries(headings).entries()) {
+    const env = environment()
+    env.__TEST_NOW = now
+    env.__TEST_VALUES.set("restart-status", JSON.stringify(statusRecord({
+      state,
+      reason: reasons[index % reasons.length],
+      eta: null,
+    })))
+    const response = await worker.fetch(new Request(`${stable}/`, {
+      headers: { Accept: "text/html" },
+    }), env)
+    assert.equal(response.status, 503, state)
+    const html = await response.text()
+    assert.match(html, new RegExp(`<h1 id="status-title">${heading}</h1>`), state)
+    assert.match(html, /No estimate is available yet\./, state)
+    assert.match(html, new RegExp(`<dt>Reason</dt><dd>${reasons[index % reasons.length].replace(/^./, (letter) => letter.toUpperCase())}</dd>`), state)
+  }
 })
 
 test("expired, malformed, and unreadable restart status use the unchanged generic HTML", async () => {

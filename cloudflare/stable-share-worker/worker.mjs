@@ -73,8 +73,8 @@ const RESPONSE_HEADERS_TO_DROP = new Set([
 const OFFLINE_HTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Maestro is offline</title><style>
-:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,sans-serif}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1017;color:#edf2ff}main{max-width:36rem;margin:2rem;padding:2.5rem;border:1px solid #2c3445;border-radius:1.25rem;background:#151a24;box-shadow:0 1.5rem 5rem #0008}h1{margin:.2rem 0 1rem;font-size:clamp(2rem,7vw,3.4rem)}p{color:#bdc7da;line-height:1.65}.ember{color:#ff9b62;font-size:1.5rem}small{display:block;margin-top:1.5rem;color:#7f8aa1}
-</style></head><body><main><div class="ember" aria-hidden="true">◆</div><h1>Maestro is offline</h1><p>The studio or its private tunnel is not available right now. This address is stable, so you can bookmark it and try again after Maestro has started.</p><small>No tracking, sign-in, or content is loaded on this page.</small></main></body></html>`
+:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,sans-serif}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1017;color:#edf2ff}main{max-width:36rem;margin:2rem;padding:2.5rem;border:1px solid #2c3445;border-radius:1.25rem;background:#151a24;box-shadow:0 1.5rem 5rem #0008}h1{margin:.2rem 0 1rem;font-size:clamp(2rem,7vw,3.4rem)}p{color:#bdc7da;line-height:1.65}.action{color:#edf2ff}.ember{color:#ff9b62;font-size:1.5rem}small{display:block;margin-top:1.5rem;color:#7f8aa1}
+</style></head><body><main><div class="ember" aria-hidden="true">◆</div><h1>Maestro is offline</h1><p>We can’t reach the studio right now. Maestro may be stopped, restarting, or still bringing its private connection online.</p><p class="action">Try this page again in a moment. If you own this studio, open Maestro locally on the studio computer and start it from Pinokio.</p><small>No tracking, sign-in, or content is loaded on this page.</small></main></body></html>`
 
 const jsonResponse = (body, status = 200) => new Response(JSON.stringify(body), {
   status,
@@ -391,7 +391,23 @@ const escapedHtml = (value) => String(value).replace(/[&<>"']/g, (character) => 
 
 const humanized = (value) => value.replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase())
 
+const STATUS_HEADINGS = {
+  planned: "Service work is planned",
+  waiting_for_boundary: "Finishing current work",
+  restarting: "Maestro is restarting",
+  verifying: "Checking that Maestro is ready",
+  complete: "Service work is complete",
+  postponed: "Service work was postponed",
+  forced_emergency: "Maestro is recovering",
+}
+
 const statusEta = (eta) => {
+  if (eta === null) return "No estimate is available yet."
+  if (eta.kind === "at") return "Open Technical details for the expected return time."
+  return "Open Technical details for the expected return window."
+}
+
+const statusEtaDetails = (eta) => {
   if (eta === null) return "Not available"
   if (eta.kind === "at") return eta.at
   return `${eta.earliest} to ${eta.latest}`
@@ -400,8 +416,8 @@ const statusEta = (eta) => {
 const statusOfflineHtml = (status) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Maestro service update</title><style>
-:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1017;color:#edf2ff}main{width:min(42rem,calc(100% - 2rem));margin:1rem;padding:clamp(1.5rem,6vw,3rem);border:1px solid #2c3445;border-radius:1.25rem;background:#151a24;box-shadow:0 1.5rem 5rem #0008}h1{margin:.35rem 0 1rem;font-size:clamp(2rem,7vw,3.4rem)}p{color:#d4dbea;line-height:1.65}.eyebrow{color:#ff9b62;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.message{font-size:1.15rem;color:#edf2ff}dl{display:grid;grid-template-columns:max-content 1fr;gap:.65rem 1rem;margin:1.75rem 0 0;padding-top:1.25rem;border-top:1px solid #2c3445}dt{color:#8f9ab0}dd{margin:0;overflow-wrap:anywhere}small{display:block;margin-top:1.5rem;color:#8f9ab0}@media(max-width:30rem){dl{grid-template-columns:1fr;gap:.25rem}dd{margin-bottom:.5rem}}
-</style></head><body><main aria-labelledby="status-title"><div class="eyebrow">Maestro service update</div><h1 id="status-title">${escapedHtml(humanized(status.state))}</h1><p class="message">${escapedHtml(status.message)}</p><dl><dt>Reason</dt><dd>${escapedHtml(humanized(status.reason))}</dd><dt>Estimated availability</dt><dd>${escapedHtml(statusEta(status.eta))}</dd><dt>Update issued</dt><dd>${escapedHtml(status.issued_at)}</dd><dt>Status expires</dt><dd>${escapedHtml(status.expires_at)}</dd></dl><small>This page contains no scripts, tracking, sign-in, or remote content.</small></main></body></html>`
+:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1017;color:#edf2ff}main{width:min(42rem,calc(100% - 2rem));margin:1rem;padding:clamp(1.5rem,6vw,3rem);border:1px solid #2c3445;border-radius:1.25rem;background:#151a24;box-shadow:0 1.5rem 5rem #0008}h1{margin:.35rem 0 1rem;font-size:clamp(2rem,7vw,3.4rem)}p{color:#d4dbea;line-height:1.65}.eyebrow{color:#ff9b62;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.message{font-size:1.15rem;color:#edf2ff}.eta{margin-bottom:1.5rem}details{border-top:1px solid #2c3445;padding-top:1rem;color:#8f9ab0}summary{cursor:pointer;color:#bdc7da}dl{display:grid;grid-template-columns:max-content 1fr;gap:.65rem 1rem;margin:1rem 0 0}dt{color:#8f9ab0}dd{margin:0;color:#d4dbea;overflow-wrap:anywhere}small{display:block;margin-top:1.5rem;color:#8f9ab0}@media(max-width:30rem){dl{grid-template-columns:1fr;gap:.25rem}dd{margin-bottom:.5rem}}
+</style></head><body><main aria-labelledby="status-title"><div class="eyebrow">Maestro service update</div><h1 id="status-title">${escapedHtml(STATUS_HEADINGS[status.state])}</h1><p class="message">${escapedHtml(status.message)}</p><p class="eta">${escapedHtml(statusEta(status.eta))}</p><details><summary>Technical details</summary><dl><dt>Status</dt><dd>${escapedHtml(humanized(status.state))}</dd><dt>Reason</dt><dd>${escapedHtml(humanized(status.reason))}</dd><dt>Estimated availability</dt><dd>${escapedHtml(statusEtaDetails(status.eta))}</dd><dt>Update issued</dt><dd>${escapedHtml(status.issued_at)}</dd><dt>Status expires</dt><dd>${escapedHtml(status.expires_at)}</dd></dl></details><small>This page contains no scripts, tracking, sign-in, or remote content.</small></main></body></html>`
 
 const offlineResponse = async (request, env) => {
   if (!isBrowserNavigation(request)) {

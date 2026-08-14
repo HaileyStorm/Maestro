@@ -39,12 +39,15 @@ the Quick Tunnel establish the actual upstream host and forwarding identity.
 
 When the Quick Tunnel or Maestro is unavailable, a normal browser navigation
 receives a self-contained no-tracking offline page. A valid current restart
-status replaces the generic copy with its escaped message, state, reason,
-validity, and ETA; malformed, expired, future, or unreadable status falls back
-to the generic page. API calls and non-navigation requests always receive the
-same small `503` JSON response. Both pages have no scripts, remote assets,
-forms, analytics, or executable user content and are served with a restrictive
-CSP.
+status replaces the generic copy with its escaped message, a plain-language
+heading, and an availability summary. Exact state, reason, and UTC timing stay
+available in a collapsed `Technical details` section instead of dominating the
+ordinary-user copy. Malformed, expired, future, or unreadable status falls back
+to the generic page, which explains the uncertainty and tells the studio owner
+to retry or start Maestro locally from Pinokio. API calls and non-navigation
+requests always receive the same small `503` JSON response. Both pages have no
+scripts, remote assets, forms, analytics, or executable user content and are
+served with a restrictive CSP.
 
 Use only a Cloudflare **Workers Free** account. Do not enable a paid Workers
 plan, paid usage, or a custom domain for this setup. Free-plan limits fail
