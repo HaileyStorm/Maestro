@@ -6365,6 +6365,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         snapshot = {
             "id": "maestro-job",
             "kind": "sample_campaign_generation",
+            "status": "queued",
             "queue_class": "background_sample",
             "queue_priority": -1000,
             "queue_held": True,
@@ -6379,7 +6380,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         inputs = ({"path": "/private/input.png", "sha256": "a" * 64},)
         self.assertEqual(validate(snapshot, params, inputs), {"prompt": "private"})
         for tampered_snapshot, tampered_params in (
-            ({**snapshot, "queue_held": False}, params),
+            ({**snapshot, "queue_class": "user"}, params),
             (snapshot, {**params, "_sample_campaign_private": {
                 **private, "pair_manifest_digest": "c" * 64,
             }}),
@@ -6401,6 +6402,284 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertLess(loaded, linkage_check)
         self.assertLess(linkage_check, stripped)
         self.assertLess(linkage_check, unblocked)
+
+    def test_sample_release_owner_gate_and_post_slot_guard_precede_start(self):
+        release = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "release_sample_campaign_arm"),
+        )
+        self.assertLess(
+            release.index("_require_sample_campaign_owner(request)"),
+            release.index("body = await request.json()"),
+        )
+        self.assertIn("SampleCampaignReleaseCoordinator(", release)
+        self.assertIn("coordinator.release_one(", release)
+        self.assertIn("with _sample_campaign_release_lock:", release)
+
+        runner = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_run_generation"),
+        )
+        slot = runner.index("with generation_slot(")
+        guard = runner.index("admission_guard(job)", slot)
+        start = runner.index("if not try_start(", guard)
+        marker = runner.index("on_started()", start)
+        self.assertLess(slot, guard)
+        self.assertLess(guard, start)
+        self.assertLess(start, marker)
+        dedicated = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_run_sample_campaign_generation"),
+        )
+        self.assertIn(
+            "admission_guard=_sample_campaign_post_slot_guard", dedicated,
+        )
+
+    def test_sample_post_slot_failure_reasserts_hold_without_model_work(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_post_slot_guard",),
+            {
+                "Mapping": dict,
+                "Any": object,
+                "_sample_campaign_validate_live_request": lambda _job: True,
+                "_sample_campaign_release_readiness": (
+                    lambda _job: (False, "ordinary_work_waiting")
+                ),
+                "_sample_campaign_persist_hold": (
+                    lambda job, held, state: job.update({
+                        "queue_held": held, "recovery_state": state,
+                    }) is None
+                ),
+                "_sample_campaign_force_hold": lambda job: job.update(
+                    queue_held=True,
+                ),
+            },
+        )
+        job = {"queue_held": False}
+        self.assertFalse(namespace["_sample_campaign_post_slot_guard"](job))
+        self.assertTrue(job["queue_held"])
+        self.assertEqual(job["recovery_state"], "sample_campaign_held")
+
+    def test_sample_completed_first_arm_restores_without_duplicate_dispatch(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_valid_sample_campaign_recovery_groups",),
+            {
+                "Sequence": list,
+                "Mapping": dict,
+                "Any": object,
+                "_SAMPLE_CAMPAIGN_QUEUE_CLASS": "background_sample",
+                "_SAMPLE_CAMPAIGN_QUEUE_PRIORITY": -1000,
+            },
+        )
+        digest = "d" * 64
+
+        def snapshot(job_id, arm, peer, status, held):
+            return {
+                "id": job_id,
+                "kind": "sample_campaign_generation",
+                "status": status,
+                "workspace": "default",
+                "owner_principal": "owner",
+                "project_instance": "project",
+                "queue_class": "background_sample",
+                "queue_priority": -1000,
+                "queue_held": held,
+                "recovery_cursor": {"sample_campaign": {
+                    "schema": 1,
+                    "pair_id": "pair-1",
+                    "pair_manifest_digest": digest,
+                    "arm": arm,
+                    "peer_job_id": peer,
+                }},
+            }
+
+        maestro = snapshot(
+            "maestro-job", "maestro", "control-job", "completed", False,
+        )
+        control = snapshot(
+            "control-job", "control", "maestro-job", "queued", True,
+        )
+        validate = namespace["_valid_sample_campaign_recovery_groups"]
+        self.assertEqual(validate((maestro, control)), ((maestro, control),))
+        interrupted_maestro = snapshot(
+            "maestro-job", "maestro", "control-job", "running", False,
+        )
+        initial_control = snapshot(
+            "control-job", "control", "maestro-job", "queued", True,
+        )
+        self.assertEqual(
+            validate((interrupted_maestro, initial_control)),
+            ((interrupted_maestro, initial_control),),
+        )
+        released_control = snapshot(
+            "control-job", "control", "maestro-job", "queued", False,
+        )
+        self.assertEqual(
+            validate((maestro, released_control)),
+            ((maestro, released_control),),
+        )
+
+        materialize = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_queue_recovery_materialize_job"),
+        )
+        sample_branch = materialize.index(
+            'if snapshot.get("kind") == "sample_campaign_generation":',
+        )
+        completed = materialize.index('if status == "completed"', sample_branch)
+        held = materialize.index('"status": "queued"', completed)
+        self.assertLess(completed, held)
+        self.assertIn('"recovery_state": "terminal"', materialize[completed:held])
+
+    def test_sample_release_keeps_private_envelope_out_of_engine_params(self):
+        validate = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_sample_campaign_validate_live_request"),
+        )
+        self.assertIn("load_request_manifest(", validate)
+        self.assertIn("validate_manifest_inputs(", validate)
+        self.assertIn("_validate_sample_campaign_recovery_linkage(", validate)
+        self.assertIn("return clean == dict(job.get(\"params\") or {})", validate)
+        worker = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_run_sample_campaign_generation"),
+        )
+        self.assertNotIn("load_request_manifest", worker)
+        self.assertNotIn("_sample_campaign_private", worker)
+
+    def test_sample_pair_id_is_immutable_and_exact_retry_is_idempotent(self):
+        class Conflict(RuntimeError):
+            pass
+
+        class Arm:
+            MAESTRO = "maestro-enum"
+            CONTROL = "control-enum"
+
+        pair = types.SimpleNamespace(pair_id="pair-1")
+        digest = "a" * 64
+
+        def job(arm, job_id, pair_digest=digest):
+            peer = "control-id" if arm == "maestro" else "maestro-id"
+            return {
+                "id": job_id,
+                "kind": "sample_campaign_generation",
+                "status": "queued",
+                "workspace": "default",
+                "recovery_cursor": {"sample_campaign": {
+                    "pair_id": "pair-1",
+                    "pair_manifest_digest": pair_digest,
+                    "arm": arm,
+                    "peer_job_id": peer,
+                }},
+            }
+
+        jobs = {
+            "maestro-id": job("maestro", "maestro-id"),
+            "control-id": job("control", "control-id"),
+        }
+        namespace = _isolated_functions(
+            self.launch,
+            ("_existing_sample_campaign_pair",),
+            {
+                "Mapping": dict,
+                "Any": object,
+                "_jobs": jobs,
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "_SampleCampaignPairConflict": Conflict,
+                "CampaignArm": Arm,
+                "sample_arm_job_id": lambda value, arm: {
+                    (digest, Arm.MAESTRO): "maestro-id",
+                    (digest, Arm.CONTROL): "control-id",
+                }.get((value, arm), "different-id"),
+            },
+        )
+        existing = namespace["_existing_sample_campaign_pair"]
+        result = existing(pair, digest, workspace="default")
+        self.assertEqual(result["status"], "held")
+        self.assertEqual(len(result["arms"]), 2)
+        with self.assertRaises(Conflict):
+            existing(pair, "b" * 64, workspace="default")
+
+        submit = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "submit_sample_campaign_pair"),
+        )
+        lock = submit.index("with _sample_campaign_release_lock:")
+        lookup = submit.index("_existing_sample_campaign_pair(", lock)
+        prepare = submit.index("_prepare_sample_campaign_arm(", lookup)
+        self.assertLess(lock, lookup)
+        self.assertLess(lookup, prepare)
+
+    def test_sample_worker_reholds_only_not_started_queued_exit(self):
+        def run_case(job, runner):
+            persisted = []
+            namespace = _isolated_functions(
+                self.launch,
+                ("_run_sample_campaign_generation",),
+                {
+                    "_jobs": {"sample": job},
+                    "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                    "_SAMPLE_CAMPAIGN_QUEUE_CLASS": "background_sample",
+                    "_sample_campaign_post_slot_guard": lambda _job: True,
+                    "_run_generation": runner,
+                    "_sample_campaign_persist_hold": (
+                        lambda current, held, state: persisted.append(
+                            (current["id"], held, state)
+                        ) or current.update(queue_held=held) is None
+                    ),
+                    "_sample_campaign_force_hold": lambda current: current.update(
+                        queue_held=True,
+                    ),
+                },
+            )
+            try:
+                namespace["_run_sample_campaign_generation"]("sample")
+            except RuntimeError:
+                pass
+            return persisted
+
+        base = {
+            "id": "sample",
+            "kind": "sample_campaign_generation",
+            "queue_class": "background_sample",
+            "status": "queued",
+            "queue_held": False,
+        }
+        pending = {**base, "started_at": 1.0}
+        self.assertEqual(
+            run_case(pending, lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("pre-start failure")
+            )),
+            [("sample", True, "sample_campaign_held")],
+        )
+        self.assertTrue(pending["queue_held"])
+        started = dict(base)
+
+        def reached_start(*_args, on_started, **_kwargs):
+            on_started()
+            return False
+
+        self.assertEqual(run_case(started, reached_start), [])
+        completed = {**base, "status": "completed"}
+        self.assertEqual(run_case(completed, lambda *_args, **_kwargs: True), [])
+
+    def test_sample_release_revalidates_both_arms(self):
+        observed = []
+        namespace = _isolated_functions(
+            self.launch,
+            ("_sample_campaign_validate_live_pair",),
+            {
+                "Mapping": dict,
+                "Any": object,
+                "_sample_campaign_validate_live_request": (
+                    lambda job: observed.append(job["id"]) or job["valid"]
+                ),
+            },
+        )
+        validate = namespace["_sample_campaign_validate_live_pair"]
+        self.assertFalse(validate(
+            {"id": "maestro", "valid": False},
+            {"id": "control", "valid": False},
+        ))
+        self.assertEqual(observed, ["maestro", "control"])
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ import requests
 import socket
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, quote, urlsplit
 
 # --- Bootstrap: CWD must be app/ and sys.argv must be patched before importing wgp ---
@@ -1385,6 +1385,14 @@ from services.sample_campaign_coordinator import (
     parse_private_pair_manifest,
     sample_arm_job_id,
     validate_private_arm_request,
+)
+from services.sample_campaign_release import (
+    SampleCampaignReleaseCoordinator,
+    SampleCampaignReleaseError,
+)
+from services.gpu_idle_gate import (
+    SustainedGpuIdleGate,
+    capture_gpu_idle_snapshot,
 )
 from services.reference_admission import (
     ReferenceAdmissionCapacityError,
@@ -5333,18 +5341,35 @@ def _valid_sample_campaign_recovery_groups(
             continue
         maestro_link = maestro["recovery_cursor"]["sample_campaign"]
         control_link = control["recovery_cursor"]["sample_campaign"]
+        states = (
+            (
+                str(maestro.get("status") or "").casefold(),
+                maestro.get("queue_held") is True,
+            ),
+            (
+                str(control.get("status") or "").casefold(),
+                control.get("queue_held") is True,
+            ),
+        )
         if (
             maestro.get("id") == control.get("id")
             or maestro_link.get("peer_job_id") != control.get("id")
             or control_link.get("peer_job_id") != maestro.get("id")
             or any(
-                candidate.get("status") != "queued"
-                or candidate.get("queue_held") is not True
-                or candidate.get("queue_class") != _SAMPLE_CAMPAIGN_QUEUE_CLASS
+                candidate.get("queue_class") != _SAMPLE_CAMPAIGN_QUEUE_CLASS
                 or candidate.get("queue_priority")
                     != _SAMPLE_CAMPAIGN_QUEUE_PRIORITY
                 for candidate in candidates
             )
+            or states not in {
+                (("queued", True), ("queued", True)),
+                (("queued", False), ("queued", True)),
+                (("running", False), ("queued", True)),
+                (("completed", False), ("queued", True)),
+                (("completed", False), ("queued", False)),
+                (("completed", False), ("running", False)),
+                (("completed", False), ("completed", False)),
+            }
         ):
             continue
         valid.append((maestro, control))
@@ -5385,7 +5410,16 @@ def _validate_sample_campaign_recovery_linkage(
         or snapshot.get("kind") != "sample_campaign_generation"
         or snapshot.get("queue_class") != _SAMPLE_CAMPAIGN_QUEUE_CLASS
         or snapshot.get("queue_priority") != _SAMPLE_CAMPAIGN_QUEUE_PRIORITY
-        or snapshot.get("queue_held") is not True
+        or (
+            str(snapshot.get("status") or "").casefold()
+                not in {"queued", "running", "completed"}
+            or type(snapshot.get("queue_held")) is not bool
+            or (
+                str(snapshot.get("status") or "").casefold()
+                in {"running", "completed"}
+                and snapshot.get("queue_held") is not False
+            )
+        )
     ):
         raise QueueRecoveryRuntimeError(
             "Sample campaign recovery linkage is invalid."
@@ -5520,6 +5554,17 @@ def _queue_recovery_materialize_job(
 
     status = str(snapshot.get("status") or "queued").casefold()
     if snapshot.get("kind") == "sample_campaign_generation":
+        if status == "completed" and not blocked_reason:
+            runtime.update({
+                "status": "completed",
+                "queue_held": False,
+                "recovery_state": "terminal",
+                "message": str(
+                    snapshot.get("message") or "Sample arm completed"
+                ),
+                "error": None,
+            })
+            return runtime, False
         runtime.update({
             "status": "queued",
             "queue_held": True,
@@ -6195,8 +6240,15 @@ def _restore_queue_recovery_on_startup() -> None:
             for snapshot in sample_group
         )
         if any(
-            job.get("recovery_state") != "sample_campaign_held"
-            or not job.get("out_dir")
+            not job.get("out_dir")
+            or (
+                job.get("status") == "completed"
+                and job.get("recovery_state") != "terminal"
+            )
+            or (
+                job.get("status") != "completed"
+                and job.get("recovery_state") != "sample_campaign_held"
+            )
             for job in materialized
         ):
             # Durable held evidence remains available for a later repair; a
@@ -35668,6 +35720,72 @@ def _rollback_sample_campaign_jobs(job_ids: Sequence[str]) -> None:
     )
 
 
+class _SampleCampaignPairConflict(RuntimeError):
+    pass
+
+
+_sample_campaign_release_lock = threading.Lock()
+
+
+def _existing_sample_campaign_pair(
+    pair,
+    manifest_digest: str,
+    *,
+    workspace: str,
+) -> dict[str, Any] | None:
+    """Return one exact idempotent pair or reject a reused public pair id."""
+    candidates = []
+    for job in list(_jobs.values()):
+        if not isinstance(job, Mapping):
+            continue
+        cursor = job.get("recovery_cursor")
+        linkage = cursor.get("sample_campaign") if isinstance(cursor, Mapping) else None
+        if (
+            job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+            and isinstance(linkage, Mapping)
+            and linkage.get("pair_id") == pair.pair_id
+        ):
+            candidates.append(job)
+    if not candidates:
+        return None
+    expected = {
+        "maestro": sample_arm_job_id(manifest_digest, CampaignArm.MAESTRO),
+        "control": sample_arm_job_id(manifest_digest, CampaignArm.CONTROL),
+    }
+    by_arm = {}
+    for job in candidates:
+        cursor = job.get("recovery_cursor")
+        linkage = cursor.get("sample_campaign") if isinstance(cursor, Mapping) else None
+        arm = linkage.get("arm") if isinstance(linkage, Mapping) else None
+        if (
+            arm in by_arm
+            or arm not in expected
+            or linkage.get("pair_manifest_digest") != manifest_digest
+            or job.get("id") != expected[arm]
+            or str(job.get("workspace") or "default") != workspace
+        ):
+            raise _SampleCampaignPairConflict("sample pair id is already bound")
+        by_arm[arm] = job
+    if set(by_arm) != set(expected):
+        raise _SampleCampaignPairConflict("sample pair registration is incomplete")
+    statuses = {
+        str(job.get("status") or "").casefold() for job in by_arm.values()
+    }
+    status = (
+        "complete" if statuses == {"completed"}
+        else "active" if statuses.intersection({"running", "preparing"})
+        else "held"
+    )
+    return {
+        "pair_id": pair.pair_id,
+        "status": status,
+        "arms": [
+            {"arm": arm, "job_id": by_arm[arm]["id"]}
+            for arm in ("maestro", "control")
+        ],
+    }
+
+
 @api.post("/api/v1/sample-campaign/pairs")
 async def submit_sample_campaign_pair(request: Request):
     """Atomically submit two owner-authorized background arms already held."""
@@ -35694,41 +35812,57 @@ async def submit_sample_campaign_pair(request: Request):
     try:
         pair = parse_private_pair_manifest(body.get("pair_manifest"))
         manifest_digest = pair_manifest_digest(pair)
-        submissions = []
-        for arm in (CampaignArm.MAESTRO, CampaignArm.CONTROL):
-            # Membership is intentionally checked for each physical job.  The
-            # later workspace deletion fence revalidates both as one batch.
-            project_dir = _require_project_access(
+        with _sample_campaign_release_lock:
+            _require_project_access(
                 request, workspace, permission="project.generate",
             )
-            submissions.append(_prepare_sample_campaign_arm(
-                request,
-                workspace=workspace,
-                project_dir=project_dir,
-                manifest=(pair.maestro if arm is CampaignArm.MAESTRO else pair.control),
-                manifest_digest=manifest_digest,
-                envelope=requests.get(arm.value),
-            ))
-        coordinator = HeldSamplePairCoordinator(
-            write_manifest=write_sealed_request_manifest,
-            remove_manifest=remove_request_manifest,
-            register_jobs_atomic=(
-                lambda registrations, **kwargs:
-                _queue_recovery_with_bounded_compaction(
-                    lambda: _queue_recovery_coordinator.register_jobs_atomic(
-                        registrations, **kwargs,
-                    )
+            existing = _existing_sample_campaign_pair(
+                pair, manifest_digest, workspace=workspace,
+            )
+            if existing is not None:
+                return existing
+            submissions = []
+            for arm in (CampaignArm.MAESTRO, CampaignArm.CONTROL):
+                # Membership is intentionally checked for each physical job.
+                # The later workspace deletion fence revalidates both as one batch.
+                project_dir = _require_project_access(
+                    request, workspace, permission="project.generate",
                 )
-            ),
-            rollback_jobs_atomic=_rollback_sample_campaign_jobs,
-            publish_jobs_atomic=_jobs.publish_prepared_many,
-            global_state_for_jobs=(
-                lambda jobs: durable_queue_state(additions=tuple(jobs))
-            ),
-        )
-        return coordinator.submit(pair, tuple(submissions))
+                submissions.append(_prepare_sample_campaign_arm(
+                    request,
+                    workspace=workspace,
+                    project_dir=project_dir,
+                    manifest=(
+                        pair.maestro
+                        if arm is CampaignArm.MAESTRO else pair.control
+                    ),
+                    manifest_digest=manifest_digest,
+                    envelope=requests.get(arm.value),
+                ))
+            coordinator = HeldSamplePairCoordinator(
+                write_manifest=write_sealed_request_manifest,
+                remove_manifest=remove_request_manifest,
+                register_jobs_atomic=(
+                    lambda registrations, **kwargs:
+                    _queue_recovery_with_bounded_compaction(
+                        lambda: _queue_recovery_coordinator.register_jobs_atomic(
+                            registrations, **kwargs,
+                        )
+                    )
+                ),
+                rollback_jobs_atomic=_rollback_sample_campaign_jobs,
+                publish_jobs_atomic=_jobs.publish_prepared_many,
+                global_state_for_jobs=(
+                    lambda jobs: durable_queue_state(additions=tuple(jobs))
+                ),
+            )
+            return coordinator.submit(pair, tuple(submissions))
     except HTTPException:
         raise
+    except _SampleCampaignPairConflict:
+        raise HTTPException(
+            status_code=409, detail="Sample campaign pair id is already in use",
+        ) from None
     except SampleCampaignSubmissionError:
         raise HTTPException(
             status_code=400, detail="Sample campaign request is invalid",
@@ -35737,6 +35871,259 @@ async def submit_sample_campaign_pair(request: Request):
         raise HTTPException(
             status_code=409, detail="Sample campaign pair could not be submitted",
         ) from None
+
+
+_sample_campaign_idle_gate = SustainedGpuIdleGate()
+_sample_campaign_idle_gate_lock = threading.Lock()
+
+
+def _sample_campaign_ordinary_work_present() -> bool:
+    """Give every runnable or active ordinary job precedence over samples."""
+    active = {
+        "preparing", "waiting_for_plan_approval", "running", "cancelling",
+    }
+    for candidate in list(_jobs.values()):
+        if (
+            not isinstance(candidate, Mapping)
+            or candidate.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+        ):
+            continue
+        status = str(candidate.get("status") or "").casefold()
+        if status in active or (
+            status == "queued" and candidate.get("queue_held") is not True
+        ):
+            return True
+    return False
+
+
+def _sample_campaign_other_arm_active(pair_id: str) -> bool:
+    """Serialize sample generation globally, including across campaign pairs."""
+    for candidate in list(_jobs.values()):
+        if (
+            not isinstance(candidate, Mapping)
+            or candidate.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND
+        ):
+            continue
+        status = str(candidate.get("status") or "").casefold()
+        if status in {"running", "preparing", "cancelling"} or (
+            status == "queued" and candidate.get("queue_held") is not True
+        ):
+            return True
+    return False
+
+
+def _sample_campaign_validate_live_request(job: Mapping[str, Any]) -> bool:
+    """Revalidate sealed bytes and return no private payload to the worker."""
+    if (
+        not isinstance(job, dict)
+        or job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND
+        or job.get("queue_class") != _SAMPLE_CAMPAIGN_QUEUE_CLASS
+        or _SAMPLE_CAMPAIGN_PRIVATE_MANIFEST_KEY in (job.get("params") or {})
+    ):
+        return False
+    pointer = job.get("_recovery_manifest_pointer")
+    owner_digest = job.get("_recovery_owner_digest")
+    project_dir = job.get("out_dir")
+    workspace = str(job.get("workspace") or "default")
+    if (
+        not isinstance(pointer, Mapping)
+        or not isinstance(owner_digest, str)
+        or not owner_digest
+        or not isinstance(project_dir, str)
+        or not project_dir
+    ):
+        return False
+    try:
+        manifest = load_request_manifest(
+            project_dir,
+            pointer,
+            expected_job_id=str(job.get("id") or ""),
+        )
+        validate_manifest_inputs(
+            manifest,
+            lambda descriptor: _queue_recovery_manifest_validator(
+                dict(descriptor),
+                owner_digest=owner_digest,
+                workspace=workspace,
+                project_dir=project_dir,
+            ),
+        )
+        validation_snapshot = snapshot_job(job)
+        if str(validation_snapshot.get("status") or "").casefold() == "queued":
+            validation_snapshot["queue_held"] = True
+        clean = _validate_sample_campaign_recovery_linkage(
+            validation_snapshot,
+            dict(manifest.get("params") or {}),
+            manifest.get("inputs") or (),
+        )
+    except Exception:
+        return False
+    return clean == dict(job.get("params") or {})
+
+
+def _sample_campaign_validate_live_pair(
+    maestro: Mapping[str, Any],
+    control: Mapping[str, Any],
+) -> bool:
+    maestro_valid = _sample_campaign_validate_live_request(maestro)
+    control_valid = _sample_campaign_validate_live_request(control)
+    return maestro_valid and control_valid
+
+
+def _sample_campaign_release_readiness(
+    job: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Require a sustained attributed idle window and clean allocator facts."""
+    if _sample_campaign_ordinary_work_present():
+        return False, "ordinary_work_waiting"
+    try:
+        snapshot = capture_gpu_idle_snapshot()
+        with _sample_campaign_idle_gate_lock:
+            decision = _sample_campaign_idle_gate.observe(snapshot)
+    except Exception:
+        return False, "gpu_readiness_unknown"
+    if not decision.ready:
+        return False, str(decision.reason or "gpu_readiness_unknown")
+    try:
+        clean, reason = _h3_allocation_outcome_is_clean(
+            job if isinstance(job, dict) else None,
+        )
+    except Exception:
+        return False, "allocator_readiness_unknown"
+    return (True, "ready") if clean else (False, str(reason or "headroom_unknown"))
+
+
+def _sample_campaign_persist_hold(
+    job: Mapping[str, Any],
+    held: bool,
+    recovery_state: str,
+) -> bool:
+    if not isinstance(job, dict) or type(held) is not bool:
+        return False
+    return _queue_recovery_checkpoint(
+        job,
+        status="queued",
+        queue_class=_SAMPLE_CAMPAIGN_QUEUE_CLASS,
+        queue_priority=_SAMPLE_CAMPAIGN_QUEUE_PRIORITY,
+        queue_held=held,
+        recovery_state=recovery_state,
+        reruns_denoise=False,
+        message=(
+            "Waiting for idle sample release"
+            if held else "Waiting for generation admission"
+        ),
+    )
+
+
+def _sample_campaign_force_hold(job: Mapping[str, Any]) -> None:
+    """Keep memory fail-closed when the durable writer is unavailable."""
+    if isinstance(job, dict):
+        job["queue_held"] = True
+        job["recovery_state"] = "sample_campaign_held"
+
+
+def _sample_campaign_post_slot_guard(job: Mapping[str, Any]) -> bool:
+    """Recheck evidence and contention after scheduler slot acquisition."""
+    valid = _sample_campaign_validate_live_request(job)
+    ready, _reason = (
+        _sample_campaign_release_readiness(job)
+        if valid else (False, "private_evidence_invalid")
+    )
+    if valid and ready:
+        return True
+    try:
+        persisted = _sample_campaign_persist_hold(
+            job, True, "sample_campaign_held",
+        )
+    except Exception:
+        persisted = False
+    if not persisted:
+        _sample_campaign_force_hold(job)
+    return False
+
+
+def _run_sample_campaign_generation(job_id: str) -> None:
+    """Run only the dedicated sample path with a post-slot fail-closed guard."""
+    job = _jobs.get(job_id)
+    if (
+        not isinstance(job, dict)
+        or job.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND
+        or job.get("queue_class") != _SAMPLE_CAMPAIGN_QUEUE_CLASS
+    ):
+        return
+    reached_start = False
+
+    def mark_started() -> None:
+        nonlocal reached_start
+        reached_start = True
+
+    try:
+        _run_generation(
+            job_id,
+            admission_guard=_sample_campaign_post_slot_guard,
+            on_started=mark_started,
+        )
+    finally:
+        current = _jobs.get(job_id)
+        if (
+            isinstance(current, dict)
+            and not reached_start
+            and str(current.get("status") or "").casefold() == "queued"
+            and current.get("queue_held") is not True
+        ):
+            try:
+                persisted = _sample_campaign_persist_hold(
+                    current, True, "sample_campaign_held",
+                )
+            except Exception:
+                persisted = False
+            if not persisted:
+                _sample_campaign_force_hold(current)
+
+
+def _start_sample_campaign_worker(job_id: str) -> None:
+    thread = threading.Thread(
+        target=_run_sample_campaign_generation,
+        args=(job_id,),
+        daemon=False,
+        name=f"sample-campaign-{job_id}",
+    )
+    thread.start()
+
+
+@api.post("/api/v1/sample-campaign/release")
+async def release_sample_campaign_arm(request: Request):
+    """Release at most one owner-authorized arm after fresh local checks."""
+    _require_sample_campaign_owner(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="Sample campaign release is invalid",
+        ) from None
+    if not isinstance(body, Mapping) or set(body) != {"pair_id"}:
+        raise HTTPException(
+            status_code=400, detail="Sample campaign release is invalid",
+        )
+    try:
+        with _sample_campaign_release_lock:
+            coordinator = SampleCampaignReleaseCoordinator(
+                ordinary_work_present=_sample_campaign_ordinary_work_present,
+                another_sample_active=_sample_campaign_other_arm_active,
+                validate_pair_requests=_sample_campaign_validate_live_pair,
+                readiness=_sample_campaign_release_readiness,
+                persist_hold=_sample_campaign_persist_hold,
+                force_hold=_sample_campaign_force_hold,
+                start_worker=_start_sample_campaign_worker,
+            )
+            result = coordinator.release_one(
+                body.get("pair_id"), tuple(_jobs.values()),
+            )
+    except SampleCampaignReleaseError:
+        raise HTTPException(
+            status_code=409, detail="Sample campaign release is unavailable",
+        ) from None
+    return result.public_payload()
 
 
 @api.post("/api/v1/generate")
@@ -50397,7 +50784,13 @@ def _generation_tasks_succeeded(
     )
 
 
-def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
+def _run_generation(
+    job_id: str,
+    *,
+    finalize: bool = True,
+    admission_guard: Callable[[Mapping[str, Any]], bool] | None = None,
+    on_started: Callable[[], None] | None = None,
+) -> bool:
     """Build and run a job, optionally deferring success finalization."""
     from shared.utils.thread_utils import AsyncStream, async_run
     import copy
@@ -50427,6 +50820,14 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
             _credit_admission_evaluations.pop(job_id, None)
             return False
         try:
+            if admission_guard is not None:
+                try:
+                    admission_ready = admission_guard(job)
+                except Exception:
+                    admission_ready = False
+                if admission_ready is not True:
+                    _credit_admission_evaluations.pop(job_id, None)
+                    return False
             if not try_start(
                 job,
                 generation_lock=_gen_lock,
@@ -50435,6 +50836,8 @@ def _run_generation(job_id: str, *, finalize: bool = True) -> bool:
             ):
                 _credit_admission_evaluations.pop(job_id, None)
                 return False
+            if on_started is not None:
+                on_started()
 
             try:
                 sealed_h3_offload_plan = _require_h3_offload_plan_parity(job)
