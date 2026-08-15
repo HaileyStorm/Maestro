@@ -10,6 +10,7 @@ import threading
 import time
 import types
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -24,6 +25,11 @@ from services.llm_operations import (
     ChatRequestMismatchError,
     LlmChatOperationManager,
     LlmPreparationManager,
+    LlmOperationCapacityError,
+    LlmRouteAdmissionError,
+    LlmRouteOperationConflictError,
+    LlmRouteOperationManager,
+    ROUTE_OPERATION_TTL_SECONDS,
     run_blocking_shielded,
 )
 
@@ -303,6 +309,716 @@ class ChatRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed["live_tps"], 5.0)
         self.assertEqual(completed["average_tps"], 4.0)
         self.assertNotIn("rejected first attempt", repr(completed))
+
+
+class ScopedRouteOperationTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _id() -> str:
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def _submit(manager, request_id, execute, **overrides):
+        values = {
+            "request_id": request_id,
+            "owner_key": "owner",
+            "project_instance_key": "project-instance",
+            "operation_kind": "enhance",
+            "effective_input_digest": "effective-digest",
+            "execute": execute,
+        }
+        values.update(overrides)
+        return manager.submit(**values)
+
+    async def test_exact_identity_coalesces_and_mismatches_stay_opaque(self):
+        manager = LlmRouteOperationManager()
+        release = asyncio.Event()
+        calls = []
+        payload = {"enhanced": "generated output"}
+
+        async def execute(_progress, _cancellation):
+            calls.append(True)
+            await release.wait()
+            return payload
+
+        request_id = self._id()
+        first = self._submit(manager, request_id, execute)
+        second = self._submit(manager, request_id, execute)
+        self.assertEqual(first, second)
+        self.assertEqual(first["request_id"], uuid.UUID(request_id).hex)
+        self.assertEqual(first["status"], "running")
+        self.assertIsNone(manager.status(
+            request_id,
+            owner_key="other",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ))
+        self.assertIsNone(manager.status(
+            request_id,
+            owner_key="owner",
+            project_instance_key="other-project",
+            operation_kind="enhance",
+        ))
+        self.assertIsNone(manager.status(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="image_review",
+        ))
+        self.assertIsNone(self._submit(
+            manager, request_id, execute, owner_key="other",
+        ))
+        with self.assertRaises(LlmRouteOperationConflictError):
+            self._submit(
+                manager, request_id, execute,
+                effective_input_digest="different",
+            )
+        with self.assertRaises(LlmRouteOperationConflictError):
+            self._submit(
+                manager, request_id, execute,
+                operation_kind="director_preview",
+            )
+        await asyncio.sleep(0)
+        release.set()
+        completed = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(completed["result_available"])
+        self.assertNotIn("result", completed)
+        payload["enhanced"] = "mutated by execute caller"
+        recovered = manager.result(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(recovered, {"enhanced": "generated output"})
+        recovered["enhanced"] = "mutated by result caller"
+        self.assertEqual(manager.result(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ), {"enhanced": "generated output"})
+        self.assertIsNone(
+            manager._operations[uuid.UUID(request_id).hex].worker_task,
+        )
+        self.assertIsNone(manager.result(
+            request_id,
+            owner_key="other",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ))
+        captured_progress = []
+
+        async def capture(progress, _cancellation):
+            captured_progress.append(progress)
+            return "done"
+
+        late_id = self._id()
+        self._submit(manager, late_id, capture)
+        await manager.wait(
+            late_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        terminal_public = manager.status(
+            late_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        captured_progress[0]({"text": "late", "phase": "generating"})
+        self.assertEqual(manager.status(
+            late_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ), terminal_public)
+
+    async def test_concurrent_operations_keep_progress_and_results_isolated(self):
+        manager = LlmRouteOperationManager()
+        release = asyncio.Event()
+        entered_a = asyncio.Event()
+        entered_b = asyncio.Event()
+
+        async def execute_a(progress, _cancellation):
+            progress({"text": "alpha", "generated_tokens_approx": 3})
+            entered_a.set()
+            await release.wait()
+            return {"value": "alpha-result"}
+
+        async def execute_b(progress, _cancellation):
+            progress({"text": "beta", "generated_tokens_approx": 7})
+            entered_b.set()
+            await release.wait()
+            return {"value": "beta-result"}
+
+        first_id, second_id = self._id(), self._id()
+        self._submit(manager, first_id, execute_a)
+        self._submit(
+            manager, second_id, execute_b,
+            operation_kind="image_review",
+            effective_input_digest="image-digest",
+        )
+        await asyncio.gather(
+            asyncio.wait_for(entered_a.wait(), 1),
+            asyncio.wait_for(entered_b.wait(), 1),
+        )
+        first = manager.status(
+            first_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        second = manager.status(
+            second_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="image_review",
+        )
+        self.assertEqual(first["partial_text"], "alpha")
+        self.assertEqual(first["generated_tokens_approx"], 3)
+        self.assertEqual(second["partial_text"], "beta")
+        self.assertEqual(second["generated_tokens_approx"], 7)
+        release.set()
+        await asyncio.gather(
+            manager.wait(
+                first_id,
+                owner_key="owner",
+                project_instance_key="project-instance",
+                operation_kind="enhance",
+            ),
+            manager.wait(
+                second_id,
+                owner_key="owner",
+                project_instance_key="project-instance",
+                operation_kind="image_review",
+            ),
+        )
+        self.assertEqual(manager.result(
+            first_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ), {"value": "alpha-result"})
+        self.assertEqual(manager.result(
+            second_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="image_review",
+        ), {"value": "beta-result"})
+
+    async def test_progress_is_bounded_finite_and_tracks_pass_separately(self):
+        manager = LlmRouteOperationManager()
+        gate = asyncio.Event()
+
+        async def execute(progress, _cancellation):
+            progress({
+                "phase": "generating",
+                "stage": "draft",
+                "pass": 1,
+                "pass_limit": 3,
+                "attempt": 1,
+                "attempt_limit": 4,
+                "text": "x" * (llm_operations.ROUTE_PROGRESS_MAX_CHARS + 7),
+                "generated_tokens_approx": 12,
+                "elapsed_seconds": 2.5,
+                "live_tps": 4.8,
+                "average_tps": 3.2,
+                "provider": "must-not-project",
+                "media_path": "/private/image.png",
+            })
+            progress({
+                "pass": 2,
+                "pass_limit": 2,
+                "attempt_limit": 2,
+                "stage": "review",
+                "elapsed_seconds": float("inf"),
+                "live_tps": 1 << 100_000,
+                "average_tps": float("nan"),
+            })
+            await gate.wait()
+            progress({
+                "attempt": 2,
+                "stage": "repair",
+                "text": "accepted partial",
+                "generated_tokens_approx": 5,
+                "elapsed_seconds": 1.0,
+                "live_tps": 6.0,
+                "average_tps": 5.0,
+            })
+            return "final"
+
+        request_id = self._id()
+        self._submit(manager, request_id, execute)
+        for _ in range(100):
+            current = manager.status(
+                request_id,
+                owner_key="owner",
+                project_instance_key="project-instance",
+                operation_kind="enhance",
+            )
+            if current and current["pass"] == 2:
+                break
+            await asyncio.sleep(0.001)
+        self.assertEqual(current["pass"], 2)
+        self.assertEqual(current["pass_limit"], 3)
+        self.assertEqual(current["attempt"], 1)
+        self.assertEqual(current["attempt_limit"], 4)
+        self.assertEqual(current["stage"], "review")
+        self.assertEqual(current["partial_text"], "")
+        self.assertEqual(current["generated_tokens_approx"], 0)
+        self.assertEqual(current["elapsed_seconds"], 0.0)
+        self.assertIsNone(current["live_tps"])
+        self.assertNotIn("provider", repr(current).casefold())
+        self.assertNotIn("private/image", repr(current))
+        gate.set()
+        completed = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["partial_text"], "accepted partial")
+        self.assertEqual(completed["attempt"], 2)
+        self.assertEqual(completed["pass"], 2)
+        self.assertIsNone(completed["live_tps"])
+        self.assertEqual(completed["average_tps"], 5.0)
+
+    async def test_cancel_closes_blocked_response_and_clears_metrics(self):
+        manager = LlmRouteOperationManager()
+        entered = asyncio.Event()
+        closed = threading.Event()
+
+        class Response:
+            def close(self):
+                closed.set()
+
+        async def execute(progress, cancellation):
+            progress({
+                "phase": "generating",
+                "text": "discard me",
+                "generated_tokens_approx": 20,
+                "elapsed_seconds": 4.0,
+                "live_tps": 5.0,
+                "average_tps": 4.5,
+            })
+            cancellation.register_response(Response())
+            entered.set()
+            await asyncio.to_thread(closed.wait, 2)
+            cancellation.checkpoint()
+
+        request_id = self._id()
+        self._submit(manager, request_id, execute)
+        await asyncio.wait_for(entered.wait(), 1)
+        cancelled = manager.cancel(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertTrue(closed.is_set())
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["partial_text"], "")
+        self.assertEqual(cancelled["generated_tokens_approx"], 0)
+        self.assertEqual(cancelled["elapsed_seconds"], 0.0)
+        self.assertIsNone(cancelled["live_tps"])
+        self.assertIsNone(cancelled["average_tps"])
+        terminal = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(terminal["status"], "cancelled")
+        self.assertFalse(terminal["result_available"])
+
+    async def test_cancel_before_worker_start_never_calls_execute(self):
+        manager = LlmRouteOperationManager()
+        calls = []
+        releases = []
+
+        async def execute(_progress, _cancellation):
+            calls.append(True)
+            return "must not run"
+
+        request_id = self._id()
+        self._submit(
+            manager, request_id, execute,
+            release=lambda: releases.append(True),
+        )
+        cancelled = manager.cancel(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        terminal = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(terminal["status"], "cancelled")
+        self.assertEqual(calls, [])
+        self.assertEqual(releases, [True])
+
+    async def test_cancel_during_result_snapshot_clears_consumed_worker(self):
+        manager = LlmRouteOperationManager()
+        deepcopy_entered = threading.Event()
+        deepcopy_release = threading.Event()
+        request_id = self._id()
+
+        class BlockingResult(dict):
+            def __deepcopy__(self, _memo):
+                deepcopy_entered.set()
+                if not deepcopy_release.wait(timeout=2):
+                    raise AssertionError("deepcopy race was not released")
+                return dict(self)
+
+        async def execute(_progress, _cancellation):
+            return BlockingResult(value="private result")
+
+        def cancel_during_copy():
+            if not deepcopy_entered.wait(timeout=2):
+                raise AssertionError("deepcopy race was not entered")
+            try:
+                manager.cancel(
+                    request_id,
+                    owner_key="owner",
+                    project_instance_key="project-instance",
+                    operation_kind="enhance",
+                )
+            finally:
+                deepcopy_release.set()
+
+        canceller = asyncio.create_task(asyncio.to_thread(cancel_during_copy))
+        await asyncio.sleep(0)
+        self._submit(manager, request_id, execute)
+        terminal = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        await canceller
+        self.assertEqual(terminal["status"], "cancelled")
+        self.assertFalse(terminal["result_available"])
+        self.assertIsNone(
+            manager._operations[uuid.UUID(request_id).hex].worker_task,
+        )
+
+    async def test_stop_before_response_registration_closes_late_response(self):
+        manager = LlmRouteOperationManager()
+        entered = asyncio.Event()
+        register = asyncio.Event()
+        closed = threading.Event()
+
+        class Response:
+            def close(self):
+                closed.set()
+
+        async def execute(_progress, cancellation):
+            entered.set()
+            await register.wait()
+            cancellation.register_response(Response())
+            cancellation.checkpoint()
+
+        request_id = self._id()
+        self._submit(manager, request_id, execute)
+        await asyncio.wait_for(entered.wait(), 1)
+        manager.cancel(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        register.set()
+        terminal = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertTrue(closed.is_set())
+        self.assertEqual(terminal["status"], "cancelled")
+
+    async def test_outer_task_cancel_holds_admission_until_inner_worker_exits(self):
+        manager = LlmRouteOperationManager(max_operations=1)
+        entered = asyncio.Event()
+        inner_release = asyncio.Event()
+        releases = []
+
+        async def execute(_progress, cancellation):
+            entered.set()
+            await inner_release.wait()
+            cancellation.checkpoint()
+            return "must not complete"
+
+        request_id = self._id()
+        self._submit(
+            manager, request_id, execute,
+            release=lambda: releases.append(True),
+        )
+        await asyncio.wait_for(entered.wait(), 1)
+        outer_task = manager._operations[uuid.UUID(request_id).hex].task
+        self.assertIsNotNone(outer_task)
+        outer_task.cancel()
+        await asyncio.sleep(0)
+        self.assertEqual(releases, [])
+        failed = manager.status(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(failed["status"], "failed")
+        with self.assertRaises(LlmOperationCapacityError):
+            self._submit(manager, self._id(), execute)
+
+        inner_release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await outer_task
+        self.assertEqual(releases, [True])
+
+        async def successor(_progress, _cancellation):
+            return "successor"
+
+        successor_id = self._id()
+        self._submit(manager, successor_id, successor)
+        successor_status = await manager.wait(
+            successor_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(successor_status["status"], "completed")
+
+    async def test_waiter_disconnect_does_not_cancel_then_exact_stop_wins(self):
+        manager = LlmRouteOperationManager()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def execute(_progress, cancellation):
+            entered.set()
+            await release.wait()
+            cancellation.checkpoint()
+            return "late"
+
+        request_id = self._id()
+        self._submit(manager, request_id, execute)
+        await asyncio.wait_for(entered.wait(), 1)
+        waiter = asyncio.create_task(manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        running = manager.status(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(running["status"], "running")
+        manager.cancel(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        release.set()
+        terminal = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(terminal["status"], "cancelled")
+        self.assertIsNone(manager.result(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ))
+
+    async def test_stale_progress_cannot_mutate_successor_after_ttl(self):
+        now = [0.0]
+        manager = LlmRouteOperationManager(clock=lambda: now[0])
+        old_callbacks = []
+
+        async def old_execute(progress, _cancellation):
+            old_callbacks.append(progress)
+            progress({"text": "old"})
+            return "old result"
+
+        request_id = self._id()
+        self._submit(manager, request_id, old_execute)
+        await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        now[0] = ROUTE_OPERATION_TTL_SECONDS + 1
+        self.assertIsNone(manager.status(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ))
+
+        successor_entered = asyncio.Event()
+        successor_release = asyncio.Event()
+
+        async def successor(progress, _cancellation):
+            progress({"text": "new"})
+            successor_entered.set()
+            await successor_release.wait()
+            return "new result"
+
+        self._submit(manager, request_id, successor)
+        await asyncio.wait_for(successor_entered.wait(), 1)
+        old_callbacks[0]({
+            "phase": "failed", "text": "stale overwrite", "attempt": 9,
+        })
+        current = manager.status(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(current["partial_text"], "new")
+        self.assertEqual(current["status"], "running")
+        successor_release.set()
+        await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+
+    async def test_running_admission_is_bounded_and_terminal_is_evictable(self):
+        manager = LlmRouteOperationManager(max_operations=1)
+        release = asyncio.Event()
+
+        async def blocked(_progress, _cancellation):
+            await release.wait()
+            return "done"
+
+        first_id = self._id()
+        self._submit(manager, first_id, blocked)
+        with self.assertRaises(LlmOperationCapacityError):
+            self._submit(manager, self._id(), blocked)
+        release.set()
+        await manager.wait(
+            first_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+
+        second_id = self._id()
+        self._submit(manager, second_id, blocked)
+        self.assertIsNone(manager.status(
+            first_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        ))
+        await manager.wait(
+            second_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        with self.assertRaises(LlmRouteAdmissionError):
+            LlmRouteOperationManager().submit(
+                request_id=self._id(),
+                owner_key="owner",
+                project_instance_key="project-instance",
+                operation_kind="image_review",
+                effective_input_digest="digest",
+                execute=blocked,
+                admit=lambda: False,
+            )
+
+        cancelled_manager = LlmRouteOperationManager(max_operations=1)
+        cancelled_entered = asyncio.Event()
+        cancelled_release = asyncio.Event()
+
+        async def stubborn(_progress, _cancellation):
+            cancelled_entered.set()
+            await cancelled_release.wait()
+            return "ignored after cancellation"
+
+        cancelled_id = self._id()
+        self._submit(cancelled_manager, cancelled_id, stubborn)
+        await asyncio.wait_for(cancelled_entered.wait(), 1)
+        cancelled_manager.cancel(
+            cancelled_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        with self.assertRaises(LlmOperationCapacityError):
+            self._submit(cancelled_manager, self._id(), blocked)
+        cancelled_release.set()
+        await cancelled_manager.wait(
+            cancelled_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+
+    async def test_failure_and_public_projection_never_retain_private_input(self):
+        manager = LlmRouteOperationManager()
+        private = "SECRET prompt /media/private.png provider-token"
+
+        async def execute(progress, _cancellation):
+            progress({
+                "phase": "generating",
+                "text": "safe generated partial",
+                "prompt": private,
+                "media": private,
+                "provider": private,
+                "exception": private,
+            })
+            raise RuntimeError(private)
+
+        request_id = self._id()
+        public = self._submit(manager, request_id, execute)
+        self.assertNotIn(private, repr(public))
+        failed = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project-instance",
+            operation_kind="enhance",
+        )
+        self.assertEqual(failed["status"], "failed")
+        self.assertNotIn(private, repr(failed))
+        self.assertEqual(failed["partial_text"], "")
+        self.assertFalse(failed["result_available"])
+
+    def test_uuid_and_resume_ttl_contract(self):
+        manager = LlmRouteOperationManager()
+        self.assertGreaterEqual(
+            manager.retention_seconds, ROUTE_OPERATION_TTL_SECONDS,
+        )
+        with self.assertRaises(ValueError):
+            self._submit(manager, "not-a-uuid", lambda *_args: None)
 
 
 class DirectRouteSourceTests(unittest.TestCase):
