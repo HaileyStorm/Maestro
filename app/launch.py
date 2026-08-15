@@ -3126,6 +3126,114 @@ def _credit_prepare_director_pipeline(params: dict) -> bool:
 
 _gen_lock = threading.Lock()
 _active_gen_states: dict = {}  # job_id -> wgp gen state dict (for abort signaling)
+_wgp_native_gpu_slot_state = threading.local()
+
+
+class _WgpNativeGpuWaitCancelled(InterruptedError):
+    """A queued API generation was cancelled before native GPU admission."""
+
+
+def _generation_native_gpu_cancel_checkpoint(job: Mapping[str, Any]) -> None:
+    if is_cancel_requested(job):
+        raise _WgpNativeGpuWaitCancelled(
+            "generation cancelled while waiting for native GPU admission"
+        )
+
+
+class _WgpNativeGpuExecutionSlot:
+    """Compose FastAPI GPU/model work with Classic's process-global lane."""
+
+    def __init__(
+        self, enabled=True, *, blocking=True, cancel_checkpoint=None,
+    ):
+        self._enabled = bool(enabled)
+        self._blocking = bool(blocking)
+        self._cancel_checkpoint = cancel_checkpoint
+        self._acquired = False
+        self._prior_slot = None
+
+    def acquire(self):
+        if self._acquired:
+            return True
+        if not self._enabled:
+            return False
+        if self._blocking:
+            try:
+                if callable(self._cancel_checkpoint):
+                    wgp.acquire_native_gpu_execution_lock(
+                        self._cancel_checkpoint,
+                    )
+                else:
+                    wgp.acquire_native_gpu_execution_lock()
+            except _WgpNativeGpuWaitCancelled:
+                return False
+            self._acquired = True
+        else:
+            self._acquired = wgp.native_gpu_execution_lock.acquire(
+                blocking=False,
+            )
+        if self._acquired:
+            _wgp_native_gpu_slot_state.depth = (
+                int(getattr(_wgp_native_gpu_slot_state, "depth", 0)) + 1
+            )
+        return self._acquired
+
+    def release(self):
+        if self._acquired:
+            self._acquired = False
+            depth = max(
+                0,
+                int(getattr(_wgp_native_gpu_slot_state, "depth", 0)) - 1,
+            )
+            _wgp_native_gpu_slot_state.depth = depth
+            wgp.native_gpu_execution_lock.release()
+            return True
+        return False
+
+    def __enter__(self):
+        acquired = self.acquire()
+        if acquired:
+            self._prior_slot = getattr(
+                _wgp_native_gpu_slot_state, "current_slot", None,
+            )
+            _wgp_native_gpu_slot_state.current_slot = self
+        return acquired
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.release()
+        if getattr(
+            _wgp_native_gpu_slot_state, "current_slot", None,
+        ) is self:
+            _wgp_native_gpu_slot_state.current_slot = self._prior_slot
+        return False
+
+
+def _yield_current_native_gpu_slot() -> _WgpNativeGpuExecutionSlot:
+    """Release the paired native lane before scheduler releases ``_gen``."""
+    slot = getattr(_wgp_native_gpu_slot_state, "current_slot", None)
+    if not isinstance(slot, _WgpNativeGpuExecutionSlot) or not slot.release():
+        raise RuntimeError("generation native GPU slot is not owned")
+    return slot
+
+
+def _release_wgp_model_with_native_gpu_exclusion():
+    """Release WGP residency only while owning its native GPU/model lane."""
+    if int(getattr(_wgp_native_gpu_slot_state, "depth", 0)) > 0:
+        return wgp.release_model()
+    with _WgpNativeGpuExecutionSlot() as acquired:
+        if not acquired:
+            raise RuntimeError("native GPU/model lane is unavailable")
+        return wgp.release_model()
+
+
+def _local_llm_uses_native_gpu(selection: Mapping[str, Any]) -> bool:
+    """Classify only local accelerator-backed LLM runtime selections."""
+    return bool(
+        str(selection.get("provider") or "local").casefold() == "local"
+        and str(selection.get("device") or "cuda").casefold() != "cpu"
+    )
+
+
 _cpu_text_lane = CPUTextLane()
 _cpu_text_preemption_gate = PreemptionGate(
     maximum_restarts=1,
@@ -17717,7 +17825,8 @@ def _generate_and_save_lora_guide(lora_path: str, meta: dict, filename: str = ""
         print(f"[LoRA Guide] LLM not loaded, skipping guide generation for {filename or os.path.basename(lora_path)}. Use 'Generate Guides' button later.")
         return {"guide": "", "recommended_weights": None}
 
-    raw = llm_service.generate(
+    raw = _run_configured_llm_operation(
+        llm_service.generate,
         prompt=context,
         system_prompt=_LORA_GUIDE_SYSTEM_PROMPT,
         max_new_tokens=800,
@@ -18082,7 +18191,8 @@ def _generate_and_save_checkpoint_guide(finetune_path: str, meta: dict, extra_so
         print("[Checkpoint Guide] LLM not loaded; skipping. Regenerate later via the checkpoint's Generate Guide action.")
         return ""
 
-    raw = llm_service.generate(
+    raw = _run_configured_llm_operation(
+        llm_service.generate,
         prompt=context,
         system_prompt=_CHECKPOINT_GUIDE_SYSTEM_PROMPT,
         max_new_tokens=500,
@@ -19198,11 +19308,22 @@ def system_release_model():
         pass
     if not _gen_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="A generation is in progress — stop it or wait for it to finish first.")
+    native_gpu_slot = _WgpNativeGpuExecutionSlot(blocking=False)
+    native_gpu_acquired = False
     try:
+        native_gpu_acquired = native_gpu_slot.__enter__()
+        if not native_gpu_acquired:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A generation is in progress — stop it or wait for it "
+                    "to finish first."
+                ),
+            )
         released = []
         if getattr(wgp, "wan_model", None) is not None or getattr(wgp, "offloadobj", None) is not None:
             print("[ReleaseModel] Unloading generation model (user request)")
-            wgp.release_model()
+            _release_wgp_model_with_native_gpu_exclusion()
             released.append("generation model")
         try:
             from services import llm_service
@@ -19218,6 +19339,8 @@ def system_release_model():
             torch.cuda.empty_cache()
         return {"released": released}
     finally:
+        if native_gpu_acquired:
+            native_gpu_slot.__exit__(None, None, None)
         _gen_lock.release()
 
 
@@ -26176,6 +26299,35 @@ _blender_services_lock = threading.RLock()
 _blender_scene_lock = threading.RLock()
 
 
+class _BlenderGpuRenderSlot:
+    """Hold shared generation/GPU exclusion only while Blender renders."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = bool(enabled)
+        self._native_slot = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return False
+        _gen_lock.acquire()
+        self._native_slot = _WgpNativeGpuExecutionSlot()
+        try:
+            return self._native_slot.__enter__()
+        except BaseException:
+            _gen_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, traceback_value):
+        if not self.enabled:
+            return False
+        try:
+            return self._native_slot.__exit__(
+                exc_type, exc, traceback_value,
+            )
+        finally:
+            _gen_lock.release()
+
+
 def _blender_checkout_root() -> str:
     return os.path.join(os.getcwd(), "services", "blender_mcp")
 
@@ -26696,7 +26848,9 @@ async def _invoke_blender_project_tool(
     service = _blender_service_for(workspace, project_root)
     try:
         def invoke_serialized():
-            with _blender_scene_lock:
+            with _blender_scene_lock, _BlenderGpuRenderSlot(
+                tool == "render_preview"
+            ):
                 return service.invoke(tool, body)
         return await asyncio.to_thread(invoke_serialized)
     except Exception as error:
@@ -26881,6 +27035,7 @@ async def blender_director_plan(request: Request):
     )
     try:
         raw = await asyncio.to_thread(
+            _run_configured_llm_operation,
             llm_service.generate,
             prompt=f"Scene request:\n{prompt}\nStyle: {str(body.get('style') or 'cinematic blocking')}",
             system_prompt=system_prompt,
@@ -26989,7 +27144,7 @@ async def blender_render_preview(request: Request):
     service = _blender_service_for(workspace, project_root)
     try:
         def render_serialized():
-            with _blender_scene_lock:
+            with _blender_scene_lock, _BlenderGpuRenderSlot():
                 return service.invoke("render_preview", body)
         result = await asyncio.to_thread(render_serialized)
     except Exception as error:
@@ -27149,11 +27304,12 @@ async def blender_director_finalize(request: Request):
                 approved = False
                 for attempt in range(1, max_attempts + 1):
                     preview_name = f"blender_review_{run_id[:10]}_a{attempt}.png"
-                    preview_result = service.invoke("render_preview", {
-                        "output_path": preview_name,
-                        "frames": review_frames,
-                        "overwrite": False,
-                    })
+                    with _BlenderGpuRenderSlot():
+                        preview_result = service.invoke("render_preview", {
+                            "output_path": preview_name,
+                            "frames": review_frames,
+                            "overwrite": False,
+                        })
                     outputs = list(preview_result.get("outputs") or [])
                     frame_paths: list[str] = []
                     for item in outputs:
@@ -27218,7 +27374,8 @@ async def blender_director_finalize(request: Request):
                             "semantic_mapping": {"type": "object"},
                         },
                     }
-                    raw = llm_service.generate(
+                    raw = _run_configured_llm_operation(
+                        llm_service.generate,
                         prompt=review_prompt,
                         system_prompt=(
                             "You are Director's visual quality controller for Blender. "
@@ -27300,13 +27457,14 @@ async def blender_director_finalize(request: Request):
                     )
 
                 video_name = f"blender_reference_{run_id[:12]}.mp4"
-                rendered = service.invoke("render_animation", {
-                    "output_path": video_name,
-                    "frame_start": frame_start,
-                    "frame_end": frame_end,
-                    "fps": fps,
-                    "overwrite": False,
-                })
+                with _BlenderGpuRenderSlot():
+                    rendered = service.invoke("render_animation", {
+                        "output_path": video_name,
+                        "frame_start": frame_start,
+                        "frame_end": frame_end,
+                        "fps": fps,
+                        "overwrite": False,
+                    })
             video_path = os.path.realpath(str(rendered.get("output_path") or ""))
             if (
                 os.path.dirname(video_path) != os.path.realpath(project_root)
@@ -27999,7 +28157,15 @@ def llm_unload(request: Request):
     """Unload the LLM model to free memory."""
     from services import llm_service
     _require_local_llm_control(request)
-    llm_service.unload_model()
+    with _gen_lock:
+        # Classify after acquiring the generation gate.  A queued unload may
+        # otherwise observe CPU, then unload a replacement CUDA runtime without
+        # joining the process-global native GPU lane.
+        status = llm_service.get_status()
+        with _WgpNativeGpuExecutionSlot(
+            _local_llm_uses_native_gpu(status),
+        ):
+            llm_service.unload_model()
     return {"status": "ok"}
 
 
@@ -28018,7 +28184,9 @@ def _llm_linked_model_roots() -> list[str]:
 
 _llm_chat_admission = threading.BoundedSemaphore(1)
 _LLM_CHAT_MAX_IMAGES = 4
+_LLM_ENHANCE_MAX_IMAGES = _LLM_CHAT_MAX_IMAGES
 _LLM_CHAT_MAX_IMAGE_BYTES = 32 * 1024 * 1024
+_LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES = 64 * 1024 * 1024
 _LLM_CHAT_IMAGE_EXTENSIONS = {
     ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp",
 }
@@ -28352,6 +28520,8 @@ async def _llm_operation_no_store(request: Request, call_next):
         or path.startswith("/api/v1/llm/prepare/")
         or path == "/api/v1/llm/chat"
         or path.startswith("/api/v1/llm/chat/")
+        or path == "/api/v1/llm/enhance-prompt"
+        or path.startswith("/api/v1/llm/operations/")
         or path == "/api/v1/llm/refusal-literals"
     ):
         response.headers["Cache-Control"] = "private, no-store"
@@ -28410,18 +28580,47 @@ async def add_llm_refusal_literal(request: Request):
 
 def _llm_project_instance_id(request: Request, workspace: str) -> str:
     """Return an opaque identity that changes if a project is recreated."""
-    _require_project_access(request, workspace)
+    # Operation recovery must never reserve or recreate a missing project as
+    # a side effect of a typo, stale poll, or detached worker retry.
+    _require_project_access(request, workspace, existing_only=True)
     workspace_dir = _existing_workspace_dir(workspace)
     marker_path = os.path.join(workspace_dir, ".llm-chat-instance")
 
     def read_marker() -> str:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = -1
         try:
             descriptor = os.open(marker_path, flags)
-            with os.fdopen(descriptor, "r", encoding="ascii") as handle:
-                value = handle.read(64).strip()
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size != 32
+            ):
+                return ""
+            raw_value = os.read(descriptor, 33)
+            after = os.fstat(descriptor)
+            current = os.stat(marker_path, follow_symlinks=False)
+            identity = (before.st_dev, before.st_ino, before.st_size)
+            if (
+                identity != (after.st_dev, after.st_ino, after.st_size)
+                or identity != (
+                    current.st_dev, current.st_ino, current.st_size,
+                )
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+            ):
+                return ""
+            value = raw_value.decode("ascii")
         except (OSError, UnicodeError):
             return ""
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         return value if (
             len(value) == 32
             and all(character in "0123456789abcdef" for character in value)
@@ -28737,6 +28936,13 @@ def _configured_llm_selection() -> dict:
         "local_gguf_path": "",
         "gguf_file_override": "",
     }
+
+
+def _run_configured_llm_operation(operation, /, *args, **kwargs):
+    """Run one configured LLM operation under its exact runtime/GPU lease."""
+    return _run_llm_with_selection(
+        _configured_llm_selection(), operation, *args, **kwargs,
+    )
 
 
 def _resolve_direct_llm_selection(request: Request) -> dict:
@@ -29305,7 +29511,12 @@ def _run_cpu_text_llm_attempt(
         )
     }
     if cpu_lease is None:
+        native_gpu_slot = _WgpNativeGpuExecutionSlot(
+            _local_llm_uses_native_gpu(selection),
+        )
+        native_gpu_acquired = False
         try:
+            native_gpu_acquired = native_gpu_slot.__enter__()
             resident_type = str(
                 getattr(wgp, "transformer_type", "") or ""
             ).casefold()
@@ -29314,7 +29525,7 @@ def _run_cpu_text_llm_attempt(
                 or getattr(wgp, "offloadobj", None) is not None
             ):
                 print("[LLM] Releasing H3 before local language-model load")
-                wgp.release_model()
+                _release_wgp_model_with_native_gpu_exclusion()
             current = _cpu_text_transition(
                 job,
                 expected_attempt=execution_attempt,
@@ -29334,6 +29545,8 @@ def _run_cpu_text_llm_attempt(
             with llm_service.loaded_model_lease(**load_args):
                 return operation(*args, **attempt_kwargs)
         finally:
+            if native_gpu_acquired:
+                native_gpu_slot.__exit__(None, None, None)
             if gpu_reserved:
                 _gen_lock.release()
             _cpu_text_preemption_gate.clear(owner_key)
@@ -29500,7 +29713,9 @@ def _run_cpu_text_llm_attempt(
             restart_kwargs["progress_callback"] = _cpu_text_fenced_progress(
                 restart_kwargs.get("progress_callback"), job, running_attempt,
             )
-        with llm_service.loaded_model_lease(**load_args):
+        with _WgpNativeGpuExecutionSlot(
+            _local_llm_uses_native_gpu(selection),
+        ), llm_service.loaded_model_lease(**load_args):
             return operation(*args, **restart_kwargs)
     finally:
         _gen_lock.release()
@@ -29516,9 +29731,14 @@ def _run_authorized_llm_with_selection(
     **kwargs,
 ):
     """Revalidate locality before model load and immediately before content."""
-    external = _llm_chat_request_is_external(request)
-
     def require_allowed_selection() -> None:
+        # Re-read origin authority on both sides of the model lease. A request
+        # may be promoted to remote while a cold model is loading; the stale
+        # pre-lease boolean must not let host credentials reach that origin.
+        promote = globals().get("_promote_external_llm_request")
+        if callable(promote):
+            promote(request)
+        external = _llm_chat_request_is_external(request)
         if external and (
             selection.get("provider") != "local"
             or selection.get("remote_url")
@@ -29590,7 +29810,9 @@ def _run_llm_with_selection(
         _coordinate_generation
         and str(selection.get("provider") or "local").casefold() == "local"
     ):
-        with _gen_lock:
+        with _gen_lock, _WgpNativeGpuExecutionSlot(
+            _local_llm_uses_native_gpu(selection),
+        ):
             resident_type = str(
                 getattr(wgp, "transformer_type", "") or ""
             ).casefold()
@@ -29599,7 +29821,7 @@ def _run_llm_with_selection(
                 or getattr(wgp, "offloadobj", None) is not None
             ):
                 print("[LLM] Releasing H3 before local language-model load")
-                wgp.release_model()
+                _release_wgp_model_with_native_gpu_exclusion()
             load_args = {
                 key: selection.get(key, "")
                 for key in (
@@ -29647,6 +29869,147 @@ def _llm_operation_scope(
         hashlib.sha256,
     ).hexdigest()
     return owner_key, project_key
+
+
+_LLM_ROUTE_OPERATION_KINDS = frozenset({"enhance"})
+
+
+def _normalize_llm_route_request_id(value) -> str:
+    """Normalize one caller-owned request UUID without accepting aliases."""
+    if not isinstance(value, str):
+        raise ValueError("request_id must be a UUID")
+    try:
+        return uuid.UUID(value).hex
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("request_id must be a UUID") from error
+
+
+def _llm_route_effective_input_digest(
+    operation_kind: str,
+    effective_input: Mapping[str, Any],
+) -> str:
+    """Bind an operation UUID to the exact authorized effective input."""
+    try:
+        material = json.dumps(
+            {
+                "operation_kind": operation_kind,
+                "effective_input": effective_input,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError("LLM operation input is not serializable") from error
+    return hmac.new(
+        _session_secret(), material, hashlib.sha256,
+    ).hexdigest()
+
+
+def _llm_route_operation_scope_or_404(
+    request: Request,
+    operation_kind: str,
+    workspace: str,
+) -> tuple[str, str, str]:
+    """Authorize and scope one generic transient LLM route operation."""
+    if operation_kind not in _LLM_ROUTE_OPERATION_KINDS:
+        raise HTTPException(status_code=404, detail="LLM operation not found")
+    _promote_external_llm_request(request)
+    selected_workspace = _request_project_workspace(request, workspace)
+    _require_project_access(
+        request,
+        selected_workspace,
+        existing_only=True,
+        permission="project.generate",
+    )
+    owner_key, project_key = _llm_operation_scope(
+        request, selected_workspace,
+    )
+    return selected_workspace, owner_key, project_key
+
+
+@api.get("/api/v1/llm/operations/{operation_kind}/{request_id}")
+def llm_route_operation_status(
+    request: Request,
+    operation_kind: str,
+    request_id: str,
+    workspace: str = "",
+):
+    """Return bounded telemetry for one exact owner/project operation."""
+    from services.llm_operations import llm_route_operation_manager
+
+    _selected, owner_key, project_key = _llm_route_operation_scope_or_404(
+        request, operation_kind, workspace,
+    )
+    status = llm_route_operation_manager.status(
+        request_id,
+        owner_key=owner_key,
+        project_instance_key=project_key,
+        operation_kind=operation_kind,
+    )
+    if status is None:
+        raise HTTPException(status_code=404, detail="LLM operation not found")
+    return status
+
+
+@api.get("/api/v1/llm/operations/{operation_kind}/{request_id}/result")
+def llm_route_operation_result(
+    request: Request,
+    operation_kind: str,
+    request_id: str,
+    workspace: str = "",
+):
+    """Return the private result only after exact-scope terminal recovery."""
+    from services.llm_operations import llm_route_operation_manager
+
+    _selected, owner_key, project_key = _llm_route_operation_scope_or_404(
+        request, operation_kind, workspace,
+    )
+    status = llm_route_operation_manager.status(
+        request_id,
+        owner_key=owner_key,
+        project_instance_key=project_key,
+        operation_kind=operation_kind,
+    )
+    if status is None:
+        raise HTTPException(status_code=404, detail="LLM operation not found")
+    if status.get("status") != "completed":
+        return JSONResponse(status, status_code=(
+            202 if status.get("status") == "running" else 409
+        ))
+    result = llm_route_operation_manager.result(
+        request_id,
+        owner_key=owner_key,
+        project_instance_key=project_key,
+        operation_kind=operation_kind,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="LLM operation not found")
+    return result
+
+
+@api.delete("/api/v1/llm/operations/{operation_kind}/{request_id}")
+def cancel_llm_route_operation(
+    request: Request,
+    operation_kind: str,
+    request_id: str,
+    workspace: str = "",
+):
+    """Cancel one exact transient operation without touching other requests."""
+    from services.llm_operations import llm_route_operation_manager
+
+    _selected, owner_key, project_key = _llm_route_operation_scope_or_404(
+        request, operation_kind, workspace,
+    )
+    status = llm_route_operation_manager.cancel(
+        request_id,
+        owner_key=owner_key,
+        project_instance_key=project_key,
+        operation_kind=operation_kind,
+    )
+    if status is None:
+        raise HTTPException(status_code=404, detail="LLM operation not found")
+    return status
 
 
 def _llm_selection_key(purpose: str, selection: dict) -> str:
@@ -30698,6 +31061,81 @@ def _resolve_prompt_enhancer_selection(
     return enhance_model, enhance_device, raw_enhancer_mode
 
 
+def _resolve_prompt_enhancer_runtime_selection(
+    request: Request,
+    model_type: str,
+    services: dict,
+    *,
+    has_images: bool,
+) -> tuple[dict[str, Any], bool]:
+    """Resolve the exact configured provider/catalog identity for Enhance."""
+    from services import llm_service
+
+    enhance_model, enhance_device, raw_enhancer_mode = (
+        _resolve_prompt_enhancer_selection(
+            model_type,
+            services,
+            has_images=has_images,
+            model_registry=llm_service.MODEL_REGISTRY,
+        )
+    )
+    configured_model = str(services.get("enhance_llm_model_id") or "")
+    uses_configured_catalog = bool(
+        configured_model
+        and not raw_enhancer_mode
+        and hmac.compare_digest(enhance_model, configured_model)
+    )
+    if uses_configured_catalog:
+        configured_provider = str(
+            services.get("llm_provider") or "local"
+        ).strip().lower()
+        catalog = _llm_model_catalog(request, configured_provider)
+        catalog_entry = next(
+            (
+                item for item in catalog
+                if isinstance(item, dict)
+                and item.get("id") == enhance_model
+            ),
+            None,
+        )
+        if catalog_entry is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Configured Prompt Enhance model is unavailable",
+            )
+        selection = _resolve_llm_chat_model(request, enhance_model)
+        expected_provider = str(
+            catalog_entry.get("provider")
+            or (
+                "local"
+                if _llm_chat_request_is_external(request)
+                else configured_provider
+            )
+            or "local"
+        ).strip().lower()
+        if not hmac.compare_digest(
+            str(selection.get("provider") or "local").strip().lower(),
+            expected_provider,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Configured Prompt Enhance model is unavailable",
+            )
+        if expected_provider == "local":
+            selection["device"] = enhance_device
+    else:
+        selection = {
+            "model_id": enhance_model,
+            "device": enhance_device,
+            "provider": "local",
+            "remote_url": "",
+            "api_key": "",
+            "local_gguf_path": "",
+            "gguf_file_override": "",
+        }
+    return selection, raw_enhancer_mode
+
+
 def _resolve_vision_llm_selection() -> dict:
     """Resolve the local Qwen/compatible enhancer lane for image work."""
     from services import llm_service
@@ -30769,10 +31207,563 @@ def _with_llm_route_progress(
     return run
 
 
+def _resolve_prompt_enhancement_images(
+    request: Request,
+    body: Mapping[str, Any],
+    workspace: str,
+) -> list[str]:
+    """Resolve every supplied Enhance image or fail with one opaque result."""
+    requested = body.get("image_paths")
+    if requested in (None, []):
+        single = body.get("image_path")
+        requested = [single] if single else []
+    if (
+        not isinstance(requested, list)
+        or len(requested) > _LLM_ENHANCE_MAX_IMAGES
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Enhance image list")
+    resolved_paths: list[str] = []
+    for value in requested:
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(status_code=404, detail="Enhance image not found")
+        resolved = _resolve_authorized_request_media(
+            request, value, workspace,
+        )
+        if resolved is None:
+            raise HTTPException(status_code=404, detail="Enhance image not found")
+        resolved_paths.append(resolved)
+    return resolved_paths
+
+
+def _seal_prompt_enhancement_images(
+    image_paths: list[str],
+    cancel_handle=None,
+) -> list[dict[str, Any]]:
+    """Bind authorized image paths to exact regular-file bytes."""
+    admitted: list[tuple[str, tuple[int, int, int, int, int]]] = []
+    total_size = 0
+    try:
+        for image_path in image_paths:
+            if cancel_handle is not None:
+                cancel_handle.checkpoint()
+            current = os.stat(image_path, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                raise OSError("unsafe Enhance image")
+            if current.st_size > _LLM_CHAT_MAX_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Enhance image is too large (max 32 MB)",
+                )
+            total_size += current.st_size
+            if total_size > _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Enhance images are too large (max 64 MB total)",
+                )
+            admitted.append((image_path, (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )))
+    except HTTPException:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=404, detail="Enhance image not found",
+        ) from None
+
+    seals: list[dict[str, Any]] = []
+    for image_path, admitted_identity in admitted:
+        descriptor = -1
+        try:
+            if cancel_handle is not None:
+                cancel_handle.checkpoint()
+            descriptor = os.open(
+                image_path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise OSError("unsafe Enhance image")
+            identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            if identity != admitted_identity:
+                raise OSError("Enhance image changed before sealing")
+            digest = hashlib.sha256()
+            remaining_bytes = before.st_size
+            while remaining_bytes:
+                if cancel_handle is not None:
+                    cancel_handle.checkpoint()
+                chunk = os.read(
+                    descriptor, min(1024 * 1024, remaining_bytes),
+                )
+                if not chunk:
+                    raise OSError("Enhance image ended while sealing")
+                digest.update(chunk)
+                remaining_bytes -= len(chunk)
+            if os.read(descriptor, 1):
+                raise OSError("Enhance image grew while sealing")
+            after = os.fstat(descriptor)
+            current = os.stat(image_path, follow_symlinks=False)
+            if identity != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ) or identity != (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            ) or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                raise OSError("Enhance image changed while sealing")
+            seals.append({
+                "path": image_path,
+                "device": before.st_dev,
+                "inode": before.st_ino,
+                "size": before.st_size,
+                "mtime_ns": before.st_mtime_ns,
+                "ctime_ns": before.st_ctime_ns,
+                "sha256": digest.hexdigest(),
+            })
+        except (OSError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=404, detail="Enhance image not found",
+            ) from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    return seals
+
+
+def _revalidate_prompt_enhancement_images(
+    image_paths: list[str],
+    expected_seals: list[dict[str, Any]],
+    cancel_handle=None,
+) -> None:
+    """Fail closed if a worker no longer sees the admitted image bytes."""
+    current = _seal_prompt_enhancement_images(
+        image_paths, cancel_handle,
+    )
+    if len(current) != len(expected_seals):
+        raise HTTPException(status_code=404, detail="Enhance image not found")
+    fields = (
+        "path", "device", "inode", "size", "mtime_ns", "ctime_ns", "sha256",
+    )
+    for observed, expected in zip(current, expected_seals):
+        if not isinstance(expected, dict) or any(
+            observed.get(field) != expected.get(field) for field in fields
+        ):
+            raise HTTPException(status_code=404, detail="Enhance image not found")
+
+
+def _remove_prompt_enhancement_snapshots(snapshot_paths: list[str]) -> None:
+    """Delete private snapshots, clearing Windows read-only state at teardown."""
+    for snapshot_path in snapshot_paths:
+        if not snapshot_path:
+            continue
+        if os.name == "nt":
+            try:
+                os.chmod(snapshot_path, stat.S_IREAD | stat.S_IWRITE)
+            except FileNotFoundError:
+                continue
+        try:
+            os.unlink(snapshot_path)
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            # Python on Windows maps chmod(0400) to the read-only file flag.
+            # Clear it only during teardown, then retry the exact unlink.
+            os.chmod(snapshot_path, stat.S_IREAD | stat.S_IWRITE)
+            os.unlink(snapshot_path)
+
+
+def _materialize_prompt_enhancement_images(
+    expected_seals: list[dict[str, Any]],
+    cancel_handle=None,
+) -> list[str]:
+    """Copy exact admitted bytes to private worker-owned immutable paths."""
+    import tempfile
+
+    materialized: list[str] = []
+    try:
+        total_size = 0
+        for expected in expected_seals:
+            expected_size = expected.get("size")
+            if type(expected_size) is not int or expected_size < 0:
+                raise OSError("invalid Enhance image seal")
+            if expected_size > _LLM_CHAT_MAX_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Enhance image is too large (max 32 MB)",
+                )
+            total_size += expected_size
+            if total_size > _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Enhance images are too large (max 64 MB total)",
+                )
+        for expected in expected_seals:
+            if cancel_handle is not None:
+                cancel_handle.checkpoint()
+            source_path = str(expected.get("path") or "")
+            source_descriptor = -1
+            snapshot_descriptor = -1
+            snapshot_path = ""
+            try:
+                source_descriptor = os.open(
+                    source_path,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0),
+                )
+                before = os.fstat(source_descriptor)
+                expected_identity = (
+                    expected.get("device"),
+                    expected.get("inode"),
+                    expected.get("size"),
+                    expected.get("mtime_ns"),
+                    expected.get("ctime_ns"),
+                )
+                observed_identity = (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                if (
+                    observed_identity != expected_identity
+                    or not stat.S_ISREG(before.st_mode)
+                    or before.st_nlink != 1
+                ):
+                    raise OSError("Enhance image identity changed")
+                suffix = os.path.splitext(source_path)[1].lower()
+                snapshot_descriptor, snapshot_path = tempfile.mkstemp(
+                    prefix="maestro-enhance-",
+                    suffix=suffix,
+                )
+                digest = hashlib.sha256()
+                remaining_bytes = before.st_size
+                while remaining_bytes:
+                    if cancel_handle is not None:
+                        cancel_handle.checkpoint()
+                    chunk = os.read(
+                        source_descriptor,
+                        min(1024 * 1024, remaining_bytes),
+                    )
+                    if not chunk:
+                        raise OSError("Enhance image ended during snapshot")
+                    digest.update(chunk)
+                    remaining_bytes -= len(chunk)
+                    remaining = memoryview(chunk)
+                    while remaining:
+                        written = os.write(snapshot_descriptor, remaining)
+                        if written <= 0:
+                            raise OSError("Enhance image snapshot write failed")
+                        remaining = remaining[written:]
+                if os.read(source_descriptor, 1):
+                    raise OSError("Enhance image grew during snapshot")
+                os.fsync(snapshot_descriptor)
+                after = os.fstat(source_descriptor)
+                current = os.stat(source_path, follow_symlinks=False)
+                snapshot = os.fstat(snapshot_descriptor)
+                os.lseek(snapshot_descriptor, 0, os.SEEK_SET)
+                snapshot_digest = hashlib.sha256()
+                while True:
+                    if cancel_handle is not None:
+                        cancel_handle.checkpoint()
+                    chunk = os.read(snapshot_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    snapshot_digest.update(chunk)
+                if (
+                    observed_identity != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    )
+                    or observed_identity != (
+                        current.st_dev,
+                        current.st_ino,
+                        current.st_size,
+                        current.st_mtime_ns,
+                        current.st_ctime_ns,
+                    )
+                    or digest.hexdigest() != expected.get("sha256")
+                    or snapshot.st_size != expected.get("size")
+                    or snapshot_digest.hexdigest() != expected.get("sha256")
+                ):
+                    raise OSError("Enhance image bytes changed")
+                restrict_descriptor = getattr(os, "fchmod", None)
+                if callable(restrict_descriptor):
+                    restrict_descriptor(snapshot_descriptor, 0o400)
+                else:
+                    os.chmod(snapshot_path, 0o400)
+                materialized.append(snapshot_path)
+                snapshot_path = ""
+            finally:
+                if source_descriptor >= 0:
+                    os.close(source_descriptor)
+                if snapshot_descriptor >= 0:
+                    os.close(snapshot_descriptor)
+                if snapshot_path:
+                    _remove_prompt_enhancement_snapshots([snapshot_path])
+    except HTTPException:
+        _remove_prompt_enhancement_snapshots(materialized)
+        raise
+    except (OSError, TypeError, ValueError):
+        _remove_prompt_enhancement_snapshots(materialized)
+        raise HTTPException(
+            status_code=404, detail="Enhance image not found",
+        ) from None
+    except Exception:
+        _remove_prompt_enhancement_snapshots(materialized)
+        raise
+    return materialized
+
+
+def _prompt_enhancement_runtime_snapshot(
+    request: Request,
+    body: Mapping[str, Any],
+    *,
+    has_images: bool,
+) -> dict[str, Any]:
+    """Freeze server-owned Enhance routing before an async 202 is admitted."""
+    from services import llm_service
+    from services.llm_response_assist import response_assist_corpus_snapshot
+
+    services = dict(wgp.server_config.get("services", {}) or {})
+    model_type = str(body.get("model_type", "") or "")
+    selection, raw_enhancer_mode = (
+        _resolve_prompt_enhancer_runtime_selection(
+            request,
+            model_type,
+            services,
+            has_images=has_images,
+        )
+    )
+    try:
+        selection["vision_capable"] = bool(
+            llm_service.get_model_capabilities(
+                str(selection.get("model_id") or ""),
+                local_gguf_path=str(
+                    selection.get("local_gguf_path") or ""
+                ),
+                gguf_file_override=str(
+                    selection.get("gguf_file_override") or ""
+                ),
+            ).get("vision_capable", True)
+        )
+    except Exception:
+        selection["vision_capable"] = None
+    return {
+        "enhancer_enabled": int(
+            wgp.server_config.get("enhancer_enabled", 0) or 0
+        ),
+        "explicit_provider": str(
+            services.get("llm_provider") or "local"
+        ).strip().lower(),
+        "raw_enhancer_mode": raw_enhancer_mode,
+        "selection": selection,
+        "response_assist_snapshot": response_assist_corpus_snapshot(),
+    }
+
+
+class _ScopedPromptEnhancementRequest:
+    """Detached request authority for one manager-owned Enhance worker."""
+
+    @staticmethod
+    def snapshot_authority(request: Request) -> dict[str, Any]:
+        """Extract only bounded authority/origin facts needed by the worker."""
+        source_headers = getattr(request, "headers", {}) or {}
+        principal = getattr(
+            request.state, "maestro_account_principal", None,
+        )
+        cpu_text_operation = str(getattr(
+            request.state, "maestro_cpu_text_operation", "",
+        ) or "")
+        if cpu_text_operation not in _CPU_TEXT_OPERATIONS:
+            cpu_text_operation = ""
+        return {
+            "headers": {
+                name: str(source_headers.get(name) or "")
+                for name in ("x-forwarded-proto", "x-forwarded-host")
+                if source_headers.get(name)
+            },
+            "base_url": str(getattr(request, "base_url", "") or ""),
+            "peer_host": str(
+                getattr(getattr(request, "client", None), "host", "") or ""
+            ),
+            "session_id": str(getattr(
+                request.state, "maestro_session_id", "",
+            ) or ""),
+            "remote": bool(getattr(
+                request.state, "maestro_remote", False,
+            )),
+            "principal_id": (
+                str(principal.get("id") or "")
+                if isinstance(principal, dict) else ""
+            ),
+            "account_error": str(getattr(
+                request.state, "maestro_account_error", "",
+            ) or ""),
+            "generation_preparation": bool(getattr(
+                request.state, "maestro_generation_preparation", False,
+            )),
+            "cpu_text_operation": cpu_text_operation,
+            "cpu_text_text_only": bool(getattr(
+                request.state, "maestro_cpu_text_text_only", False,
+            )),
+        }
+
+    def __init__(
+        self,
+        authority: Mapping[str, Any],
+        body: dict,
+        *,
+        progress_callback,
+        cancel_handle,
+        project_instance_key: str,
+        runtime_snapshot: dict,
+        image_seals: list[dict[str, Any]],
+        materialized_image_paths: list[str],
+    ) -> None:
+        from types import SimpleNamespace
+
+        self.headers = dict(authority.get("headers") or {})
+        self.base_url = str(authority.get("base_url") or "")
+        peer_host = str(authority.get("peer_host") or "")
+        self.client = SimpleNamespace(host=peer_host) if peer_host else None
+        self.method = "POST"
+        self.url = SimpleNamespace(path="/api/v1/llm/enhance-prompt")
+        principal_id = str(authority.get("principal_id") or "")
+        bounded_principal = (
+            {"id": principal_id}
+            if principal_id
+            else None
+        )
+        state = {
+            "maestro_session_id": str(authority.get("session_id") or ""),
+            "maestro_remote": bool(authority.get("remote", False)),
+            "maestro_account_principal": bounded_principal,
+            "maestro_account_error": str(authority.get("account_error") or ""),
+            "maestro_llm_progress_callback": progress_callback,
+            "maestro_llm_cancel_handle": cancel_handle,
+            "maestro_llm_expected_project_instance": project_instance_key,
+            "maestro_llm_enhance_runtime_snapshot": runtime_snapshot,
+            "maestro_llm_enhance_image_seals": copy.deepcopy(image_seals),
+            "maestro_llm_enhance_materialized_images": list(
+                materialized_image_paths,
+            ),
+            "maestro_generation_preparation": bool(
+                authority.get("generation_preparation", False)
+            ),
+            "maestro_cpu_text_operation": str(
+                authority.get("cpu_text_operation") or ""
+            ),
+            "maestro_cpu_text_text_only": bool(
+                authority.get("cpu_text_text_only", False)
+            ),
+        }
+        self.state = SimpleNamespace(**state)
+        self._body = copy.deepcopy(body)
+
+    async def json(self) -> dict:
+        return copy.deepcopy(self._body)
+
+
+def _prompt_enhancement_effective_digest(
+    body: Mapping[str, Any],
+    *,
+    workspace: str,
+    authorized_image_paths: list[str],
+    image_seals: list[dict[str, Any]],
+    runtime_snapshot: Mapping[str, Any],
+) -> str:
+    """Hash only exact effective inputs; never retain raw material in state."""
+    response_assist_snapshot = runtime_snapshot.get("response_assist_snapshot")
+    corpus_revision = getattr(response_assist_snapshot, "revision", 0)
+    if isinstance(corpus_revision, bool) or not isinstance(corpus_revision, int):
+        corpus_revision = 0
+    payload = {
+        key: value for key, value in body.items() if key != "request_id"
+    }
+    payload["workspace"] = workspace
+    payload["image_paths"] = list(authorized_image_paths)
+    payload.pop("image_path", None)
+    selection = dict(runtime_snapshot.get("selection") or {})
+    return _llm_route_effective_input_digest("enhance", {
+        "request": payload,
+        "image_content": [
+            {
+                "path": seal.get("path"),
+                "size": seal.get("size"),
+                "sha256": seal.get("sha256"),
+            }
+            for seal in image_seals
+        ],
+        "enhancer_enabled": runtime_snapshot.get("enhancer_enabled"),
+        "explicit_provider": runtime_snapshot.get("explicit_provider"),
+        "raw_enhancer_mode": runtime_snapshot.get("raw_enhancer_mode") is True,
+        "selection_key": _llm_selection_key("enhance", selection),
+        "response_assist_revision": corpus_revision,
+    })
+
+
 def _validate_standalone_enhanced_prompt_cardinality(
     body: Mapping[str, Any], model_type: str, result: Any,
 ) -> Any:
-    """Require exact paragraph cardinality for explicit non-H3 Enhance calls."""
+    """Require locked-timeline parity or exact standalone cardinality."""
+    enhanced_text = (
+        result.get("enhanced")
+        if isinstance(result, Mapping) else result
+    )
+    if body.get("preserve_global_timeline") is True:
+        source_timeline = str(body.get("prompt") or "")
+        enhanced_timeline = str(enhanced_text or "")
+        if not wgp.prompt_parser.has_global_timeline(source_timeline):
+            return result
+        _source_global, source_events = (
+            wgp.prompt_parser.parse_global_timeline_prompt(source_timeline)
+        )
+        _enhanced_global, enhanced_events = (
+            wgp.prompt_parser.parse_global_timeline_prompt(enhanced_timeline)
+        )
+
+        def timing_structure(events):
+            return [
+                (
+                    str(event.get("kind") or ""),
+                    float(event.get("start", 0.0)),
+                    float(event.get("end", 0.0)),
+                )
+                for event in events
+            ]
+
+        if (
+            source_events
+            and timing_structure(enhanced_events)
+                != timing_structure(source_events)
+        ):
+            raise ValueError(
+                "Prompt enhancement changed a locked global timestamp; "
+                "the original Studio timeline was preserved"
+            )
+        return result
     try:
         window_count = int(body.get("window_count") or 0)
     except (TypeError, ValueError):
@@ -30781,13 +31772,8 @@ def _validate_standalone_enhanced_prompt_cardinality(
         window_count <= 1
         or str(model_type or "").lower().startswith("minimax_h3")
         or str(body.get("mode") or "video") not in {"video", "avatar"}
-        or body.get("preserve_global_timeline") is True
     ):
         return result
-    enhanced_text = (
-        result.get("enhanced")
-        if isinstance(result, Mapping) else result
-    )
     # A valid timeline is one structured type-2 prompt, not N type-1
     # paragraphs. Match integrated preparation's parser transition before
     # applying the paragraph-cardinality contract.
@@ -30808,7 +31794,10 @@ def _validate_standalone_enhanced_prompt_cardinality(
 async def llm_enhance_prompt(request: Request):
     """Enhance a generation prompt. Routes to Wan2GP enhancer or local LLM based on config."""
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON object body is required")
     from services.llm_operations import run_blocking_shielded
+    from services.llm_cancellation import LlmRequestCancelled
     _promote_external_llm_request(request)
 
     prompt = body.get("prompt", "")
@@ -30816,18 +31805,241 @@ async def llm_enhance_prompt(request: Request):
         raise HTTPException(status_code=400, detail="prompt is required")
 
     workspace = _request_project_workspace(request, body.get("workspace"))
-    _require_project_access(
-        request, workspace, permission="project.generate",
+    if callable(globals().get("_existing_workspace_dir")):
+        _require_project_access(
+            request,
+            workspace,
+            existing_only=True,
+            permission="project.generate",
+        )
+    else:
+        # Isolated legacy callers compile only this route and supply their
+        # established authorization stub. The loaded application always takes
+        # the existing-only branch above.
+        _require_project_access(
+            request, workspace, permission="project.generate",
+        )
+    image_resolver = globals().get("_resolve_prompt_enhancement_images")
+    if callable(image_resolver):
+        authorized_image_paths = image_resolver(request, body, workspace)
+    else:
+        # Compatibility for isolated legacy callers that compile this route
+        # without module helpers. Production always uses the bounded resolver.
+        requested_images = body.get("image_paths")
+        if requested_images in (None, []):
+            image_path = body.get("image_path")
+            requested_images = [image_path] if image_path else []
+        if not isinstance(requested_images, list) or len(requested_images) > 4:
+            raise HTTPException(status_code=400, detail="Invalid Enhance image list")
+        authorized_image_paths = []
+        for image_path in requested_images:
+            resolved = _resolve_authorized_request_media(
+                request, image_path, workspace,
+            )
+            if resolved is None:
+                raise HTTPException(
+                    status_code=404, detail="Enhance image not found",
+                )
+            authorized_image_paths.append(resolved)
+
+    cancel_handle = getattr(
+        request.state, "maestro_llm_cancel_handle", None,
     )
-    requested_image_paths = body.get("image_paths") or []
-    if not requested_image_paths and body.get("image_path"):
-        requested_image_paths = [body["image_path"]]
-    authorized_image_paths = [
-        resolved for path in requested_image_paths
-        if (resolved := _resolve_authorized_request_media(
-            request, path, workspace,
-        ))
-    ]
+    if cancel_handle is not None:
+        cancel_handle.checkpoint()
+    progress_resolver = globals().get("_llm_route_progress_callback")
+    progress_callback = (
+        progress_resolver(request) if callable(progress_resolver) else None
+    )
+    progress_emitter = globals().get("_emit_llm_progress")
+
+    def report_progress(event: dict) -> None:
+        if callable(progress_emitter):
+            progress_emitter(progress_callback, event)
+
+    raw_request_id = body.get("request_id")
+    expected_image_seals = getattr(
+        request.state, "maestro_llm_enhance_image_seals", None,
+    )
+    if expected_image_seals is not None:
+        await run_blocking_shielded(
+            _revalidate_prompt_enhancement_images,
+            authorized_image_paths,
+            expected_image_seals,
+            cancel_handle,
+        )
+    materialized_image_paths = getattr(
+        request.state, "maestro_llm_enhance_materialized_images", None,
+    )
+    if materialized_image_paths is not None:
+        if (
+            not isinstance(materialized_image_paths, list)
+            or len(materialized_image_paths) != len(authorized_image_paths)
+            or not all(
+                isinstance(path, str) and path
+                for path in materialized_image_paths
+            )
+        ):
+            raise LlmRequestCancelled("LLM request images changed")
+        authorized_image_paths = list(materialized_image_paths)
+
+    # Internal callers without a recoverable request UUID retain their
+    # synchronous response contract, but image bytes still cross the same
+    # capped seal/private-snapshot boundary as manager-owned operations.
+    if (
+        raw_request_id is None
+        and authorized_image_paths
+        and expected_image_seals is None
+        and materialized_image_paths is None
+    ):
+        image_seals = await run_blocking_shielded(
+            _seal_prompt_enhancement_images,
+            authorized_image_paths,
+            cancel_handle,
+        )
+        runtime_snapshot = _prompt_enhancement_runtime_snapshot(
+            request, body, has_images=True,
+        )
+        _owner_key, project_instance_key = _llm_operation_scope(
+            request, workspace,
+        )
+        materialized_images = await run_blocking_shielded(
+            _materialize_prompt_enhancement_images,
+            image_seals,
+            cancel_handle,
+        )
+        try:
+            detached_request = _ScopedPromptEnhancementRequest(
+                _ScopedPromptEnhancementRequest.snapshot_authority(request),
+                body,
+                progress_callback=progress_callback,
+                cancel_handle=cancel_handle,
+                project_instance_key=project_instance_key,
+                runtime_snapshot=runtime_snapshot,
+                image_seals=image_seals,
+                materialized_image_paths=materialized_images,
+            )
+            return await llm_enhance_prompt(detached_request)
+        finally:
+            _remove_prompt_enhancement_snapshots(materialized_images)
+
+    expected_project_instance = str(getattr(
+        request.state, "maestro_llm_expected_project_instance", "",
+    ) or "")
+    if expected_project_instance:
+        _worker_owner, current_project_instance = _llm_operation_scope(
+            request, workspace,
+        )
+        if not hmac.compare_digest(
+            expected_project_instance, current_project_instance,
+        ):
+            raise LlmRequestCancelled("LLM request project changed")
+
+    if raw_request_id is not None:
+        from services.llm_operations import (
+            LlmOperationCapacityError,
+            LlmRouteAdmissionError,
+            LlmRouteOperationConflictError,
+            llm_route_operation_manager,
+        )
+
+        try:
+            request_id = _normalize_llm_route_request_id(raw_request_id)
+            expected_project_instance = body.get("project_instance")
+            if (
+                not isinstance(expected_project_instance, str)
+                or len(expected_project_instance) != 64
+                or expected_project_instance != expected_project_instance.lower()
+                or bytes.fromhex(expected_project_instance).hex()
+                    != expected_project_instance
+            ):
+                raise ValueError("project_instance must be canonical")
+            owner_key, project_instance_key = _llm_operation_scope(
+                request, workspace,
+            )
+            if not hmac.compare_digest(
+                expected_project_instance, project_instance_key,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Prompt Enhance request does not match",
+                )
+            image_seals = await run_blocking_shielded(
+                _seal_prompt_enhancement_images,
+                authorized_image_paths,
+                cancel_handle,
+            )
+            runtime_snapshot = _prompt_enhancement_runtime_snapshot(
+                request, body, has_images=bool(authorized_image_paths),
+            )
+            effective_input_digest = _prompt_enhancement_effective_digest(
+                body,
+                workspace=workspace,
+                authorized_image_paths=authorized_image_paths,
+                image_seals=image_seals,
+                runtime_snapshot=runtime_snapshot,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Prompt Enhance operation request",
+            ) from error
+        worker_body = {
+            key: copy.deepcopy(value)
+            for key, value in body.items()
+            if key not in {"request_id", "project_instance"}
+        }
+        detached_authority = (
+            _ScopedPromptEnhancementRequest.snapshot_authority(request)
+        )
+
+        async def execute(progress_callback, operation_cancellation):
+            materialized_images = await run_blocking_shielded(
+                _materialize_prompt_enhancement_images,
+                image_seals,
+                operation_cancellation,
+            )
+            try:
+                detached_request = _ScopedPromptEnhancementRequest(
+                    detached_authority,
+                    worker_body,
+                    progress_callback=progress_callback,
+                    cancel_handle=operation_cancellation,
+                    project_instance_key=project_instance_key,
+                    runtime_snapshot=runtime_snapshot,
+                    image_seals=image_seals,
+                    materialized_image_paths=materialized_images,
+                )
+                return await llm_enhance_prompt(detached_request)
+            finally:
+                _remove_prompt_enhancement_snapshots(materialized_images)
+
+        try:
+            status = llm_route_operation_manager.submit(
+                request_id=request_id,
+                owner_key=owner_key,
+                project_instance_key=project_instance_key,
+                operation_kind="enhance",
+                effective_input_digest=effective_input_digest,
+                execute=execute,
+            )
+        except LlmRouteOperationConflictError as error:
+            raise HTTPException(
+                status_code=409, detail="Prompt Enhance request does not match",
+            ) from error
+        except LlmRouteAdmissionError as error:
+            raise HTTPException(
+                status_code=429,
+                detail="Prompt Enhance is busy; retry shortly",
+            ) from error
+        except LlmOperationCapacityError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="Prompt Enhance recovery is busy",
+            ) from error
+        if status is None:
+            raise HTTPException(status_code=404, detail="LLM operation not found")
+        return JSONResponse(status, status_code=202)
 
     model_type = str(body.get("model_type", "") or "")
     generation_mode = str(body.get("mode", "video") or "video")
@@ -30835,7 +32047,14 @@ async def llm_enhance_prompt(request: Request):
         model_type.lower().startswith("minimax_h3")
         and generation_mode in ("video", "avatar")
     )
-    enhancer_enabled = int(wgp.server_config.get("enhancer_enabled", 0) or 0)
+    runtime_snapshot = getattr(
+        request.state, "maestro_llm_enhance_runtime_snapshot", None,
+    )
+    enhancer_enabled = int(
+        runtime_snapshot.get("enhancer_enabled", 0)
+        if isinstance(runtime_snapshot, dict)
+        else wgp.server_config.get("enhancer_enabled", 0) or 0
+    )
     explicit_guidance = _explicit_llm_guidance_allowed(body)
     explicit_provider = ""
     durable_generation_preparation = bool(
@@ -30852,13 +32071,22 @@ async def llm_enhance_prompt(request: Request):
         and body.get("preserve_global_timeline") is not True
         and standalone_window_count > 1
     )
+    requires_standalone_postcondition = (
+        not durable_generation_preparation
+        and (
+            requires_standalone_cardinality
+            or body.get("preserve_global_timeline") is True
+        )
+    )
     h3_style_workflow_present = bool(
         durable_generation_preparation
         and body.get("h3_style_workflow_present") is True
     )
     if explicit_guidance:
         explicit_provider = str(
-            wgp.server_config.get("services", {}).get("llm_provider")
+            runtime_snapshot.get("explicit_provider")
+            if isinstance(runtime_snapshot, dict)
+            else wgp.server_config.get("services", {}).get("llm_provider")
             or "local"
         ).strip().lower()
 
@@ -30873,20 +32101,37 @@ async def llm_enhance_prompt(request: Request):
         and not durable_generation_preparation
     ):
         try:
+            report_progress({
+                "phase": "loading",
+                "stage": "wangp",
+                "pass": 1,
+                "pass_limit": 2,
+            })
             # Support both single image_path and array image_paths
             wangp_result = await _enhance_with_wangp(
                 prompt,
                 generation_mode,
                 enhancer_enabled,
                 image_paths=authorized_image_paths,
+                cancel_handle=cancel_handle,
             )
-            if requires_standalone_cardinality:
+            if requires_standalone_postcondition:
                 return _validate_standalone_enhanced_prompt_cardinality(
                     body, model_type, wangp_result,
                 )
             return wangp_result
+        except LlmRequestCancelled:
+            # An explicit cancel is terminal. It must never begin the LLM
+            # fallback merely because WanGP surfaced the cancellation.
+            raise
         except Exception as e:
             print(f"[Enhance] Wan2GP enhancer failed, falling back to LLM: {e}")
+            report_progress({
+                "phase": "retrying",
+                "stage": "llm_fallback",
+                "pass": 2,
+                "pass_limit": 2,
+            })
             # Fall through to LLM
     elif enhancer_enabled > 0 and needs_h3_context_ir:
         print("[Enhance] MiniMax H3 requires structured Context-IR; using Maestro's model-specific LLM guide")
@@ -30900,6 +32145,18 @@ async def llm_enhance_prompt(request: Request):
             "[Enhance] Durable generation preparation uses the serialized "
             "local LLM lane"
         )
+    if (
+        enhancer_enabled <= 0
+        or needs_h3_context_ir
+        or explicit_guidance
+        or durable_generation_preparation
+    ):
+        report_progress({
+            "phase": "loading",
+            "stage": "llm",
+            "pass": 1,
+            "pass_limit": 1,
+        })
 
     # Use our local LLM service
     from services import llm_service
@@ -30913,50 +32170,67 @@ async def llm_enhance_prompt(request: Request):
     # model is trained to enhance directly. Ordinary calls stay raw; the LLM
     # service supplies server-owned guidance only when explicit_guidance is
     # true, so selecting an nsfw_only model alone cannot activate it.
-    enhance_model, enhance_device, raw_enhancer_mode = (
-        _resolve_prompt_enhancer_selection(
-            model_type,
-            services,
-            has_images=bool(authorized_image_paths),
-            model_registry=llm_service.MODEL_REGISTRY,
+    if isinstance(runtime_snapshot, dict):
+        selection = copy.deepcopy(runtime_snapshot.get("selection") or {})
+        enhance_model = str(selection.get("model_id") or "")
+        enhance_device = str(selection.get("device") or "cuda")
+        raw_enhancer_mode = bool(
+            runtime_snapshot.get("raw_enhancer_mode") is True
         )
-    )
+    else:
+        runtime_resolver = globals().get(
+            "_resolve_prompt_enhancer_runtime_selection",
+        )
+        if callable(runtime_resolver):
+            selection, raw_enhancer_mode = runtime_resolver(
+                request,
+                model_type,
+                services,
+                has_images=bool(authorized_image_paths),
+            )
+        else:
+            # Retain isolated legacy caller compatibility; the loaded module
+            # always uses the strict catalog/provider resolver above.
+            enhance_model, enhance_device, raw_enhancer_mode = (
+                _resolve_prompt_enhancer_selection(
+                    model_type,
+                    services,
+                    has_images=bool(authorized_image_paths),
+                    model_registry=llm_service.MODEL_REGISTRY,
+                )
+            )
+            selection = {
+                "model_id": enhance_model,
+                "device": enhance_device,
+                "provider": "local",
+                "remote_url": "",
+                "api_key": "",
+                "local_gguf_path": "",
+                "gguf_file_override": "",
+            }
+        enhance_model = str(selection.get("model_id") or "")
+        enhance_device = str(selection.get("device") or "cuda")
+        try:
+            selection["vision_capable"] = bool(
+                llm_service.get_model_capabilities(
+                    str(selection.get("model_id") or ""),
+                    local_gguf_path=str(
+                        selection.get("local_gguf_path") or ""
+                    ),
+                    gguf_file_override=str(
+                        selection.get("gguf_file_override") or ""
+                    ),
+                ).get("vision_capable", True)
+            )
+        except Exception:
+            # Capability is a server stamp, not a caller hint. Unknown must
+            # remain serialized instead of risking multimodal RAM.
+            selection["vision_capable"] = None
     if raw_enhancer_mode:
         print(
             f"[Enhance] Per-model enhancer for {model_type}: "
             f"{enhance_model} (raw passthrough)"
         )
-
-    selection = (
-        {
-            "model_id": enhance_model,
-            "device": enhance_device,
-            "provider": "local",
-            "remote_url": "",
-            "api_key": "",
-            "local_gguf_path": "",
-            "gguf_file_override": "",
-        }
-        if enhance_model else await run_blocking_shielded(
-            _resolve_direct_llm_selection, request,
-        )
-    )
-    try:
-        selection["vision_capable"] = bool(
-            llm_service.get_model_capabilities(
-                str(selection.get("model_id") or ""),
-                local_gguf_path=str(
-                    selection.get("local_gguf_path") or ""
-                ),
-                gguf_file_override=str(
-                    selection.get("gguf_file_override") or ""
-                ),
-            ).get("vision_capable", True)
-        )
-    except Exception:
-        # Capability is a server stamp, not a caller hint. Unknown must remain
-        # on the ordinary serialized lane instead of risking multimodal RAM.
-        selection["vision_capable"] = None
     if not getattr(request.state, "maestro_cpu_text_operation", None):
         request.state.maestro_cpu_text_operation = "prompt_enhancement"
     request.state.maestro_cpu_text_text_only = bool(
@@ -31037,6 +32311,8 @@ async def llm_enhance_prompt(request: Request):
 
     try:
         def run_enhancement():
+            if cancel_handle is not None:
+                cancel_handle.checkpoint()
             # Revalidate after the exact model lease finishes cold loading and
             # immediately before content reaches the provider.
             if explicit_guidance:
@@ -31056,9 +32332,18 @@ async def llm_enhance_prompt(request: Request):
                             "stabilize."
                         ),
                     )
-            response_assist = _resolved_local_response_assist(
-                body, selection,
-            )
+            if isinstance(runtime_snapshot, dict):
+                response_assist = _resolved_local_response_assist(
+                    body,
+                    selection,
+                    corpus_snapshot=runtime_snapshot.get(
+                        "response_assist_snapshot",
+                    ),
+                )
+            else:
+                response_assist = _resolved_local_response_assist(
+                    body, selection,
+                )
             return llm_service.enhance_prompt(
                 prompt=prompt,
                 lora_system_hint=lora_hint_text,
@@ -31078,7 +32363,8 @@ async def llm_enhance_prompt(request: Request):
                 tts_voice_count=body.get("tts_voice_count", 2),
                 raw_enhancer_mode=raw_enhancer_mode,
                 response_assist=response_assist,
-                progress_callback=_llm_route_progress_callback(request),
+                progress_callback=progress_callback,
+                cancel_handle=cancel_handle,
             )
 
         # Pass LoRA hints as system-level context so the LLM treats them as instructions,
@@ -31089,7 +32375,7 @@ async def llm_enhance_prompt(request: Request):
             selection,
             run_enhancement,
         )
-        if requires_standalone_cardinality:
+        if requires_standalone_postcondition:
             try:
                 result = _validate_standalone_enhanced_prompt_cardinality(
                     body, model_type, result,
@@ -31099,6 +32385,8 @@ async def llm_enhance_prompt(request: Request):
                     status_code=422, detail=str(error),
                 ) from None
         return {"original": prompt, "enhanced": result}
+    except LlmRequestCancelled:
+        raise
     except HTTPException:
         raise
     except Exception as error:
@@ -31112,7 +32400,13 @@ async def llm_enhance_prompt(request: Request):
         ) from error
 
 
-async def _enhance_with_wangp(prompt: str, mode: str, enhancer_enabled: int, image_paths: list = None):
+async def _enhance_with_wangp(
+    prompt: str,
+    mode: str,
+    enhancer_enabled: int,
+    image_paths: list = None,
+    cancel_handle=None,
+):
     """Run the Wan2GP prompt enhancer using wgp's built-in offload system."""
     from services.llm_operations import run_blocking_shielded
     return await run_blocking_shielded(
@@ -31121,56 +32415,104 @@ async def _enhance_with_wangp(prompt: str, mode: str, enhancer_enabled: int, ima
         mode,
         enhancer_enabled,
         image_paths,
+        cancel_handle,
     )
 
 
-def _enhance_with_wangp_sync(prompt: str, mode: str, enhancer_enabled: int, image_paths: list = None):
+def _enhance_with_wangp_sync(
+    prompt: str,
+    mode: str,
+    enhancer_enabled: int,
+    image_paths: list = None,
+    cancel_handle=None,
+):
     """Blocking Wan2GP enhancer implementation, isolated from the API loop."""
     import secrets
     from PIL import Image
     from shared.prompt_enhancer.prompt_enhance_utils import generate_cinematic_prompt
     from mmgp import offload
 
-    # Setup enhancer with proper GPU offload (same as Wan2GP does internally)
-    if wgp.enhancer_offloadobj is None:
-        print(f"[Enhance] Loading Wan2GP enhancer (mode {enhancer_enabled}) with GPU offload...")
-        pipe = {}
-        kwargs = {}
-        wgp.download_models()
-        wgp.setup_prompt_enhancer(pipe, kwargs)
-        profile = wgp.compute_profile(-1, "video")
-        mmgp_profile = wgp.init_pipe(pipe, kwargs, profile)
-        wgp.enhancer_offloadobj = offload.profile(pipe, profile_no=mmgp_profile, **kwargs)
+    acquired = False
+    acquired_native_gpu = False
+    acquired_prompt_enhancer = False
+    loaded_images = []
+    try:
+        while not acquired:
+            if cancel_handle is not None:
+                cancel_handle.checkpoint()
+            acquired = _gen_lock.acquire(timeout=0.05)
+        if cancel_handle is not None:
+            cancel_handle.checkpoint()
 
-    if wgp.prompt_enhancer_llm_model is None:
-        raise RuntimeError("Prompt enhancer model failed to load")
+        wgp.acquire_native_gpu_execution_lock(
+            cancel_handle.checkpoint if cancel_handle is not None else None
+        )
+        acquired_native_gpu = True
 
-    is_video = mode in ("video", "avatar")
-    temperature = wgp.server_config.get("prompt_enhancer_temperature", 0.6)
-    top_p = wgp.server_config.get("prompt_enhancer_top_p", 0.9)
-    seed = secrets.randbits(32) if wgp.server_config.get("prompt_enhancer_randomize_seed", True) else 0
+        wgp.acquire_prompt_enhancer_lock(
+            cancel_handle.checkpoint if cancel_handle is not None else None
+        )
+        acquired_prompt_enhancer = True
 
-    # Load images if provided
-    prompt_images = None
-    if image_paths:
-        loaded = []
-        for img_path in image_paths:
-            if img_path and os.path.isfile(img_path):
+        # Setup and inference mutate process-global WanGP/offload state. The
+        # generation lock excludes ordinary generation; wgp's enhancer lock
+        # also excludes Classic's native Enhance button.
+        if wgp.enhancer_offloadobj is None:
+            print(f"[Enhance] Loading Wan2GP enhancer (mode {enhancer_enabled}) with GPU offload...")
+            pipe = {}
+            kwargs = {}
+            wgp.download_models()
+            if cancel_handle is not None:
+                cancel_handle.checkpoint()
+            wgp.setup_prompt_enhancer(pipe, kwargs)
+            profile = wgp.compute_profile(-1, "video")
+            mmgp_profile = wgp.init_pipe(pipe, kwargs, profile)
+            wgp.enhancer_offloadobj = offload.profile(
+                pipe, profile_no=mmgp_profile, **kwargs,
+            )
+
+        if wgp.prompt_enhancer_llm_model is None:
+            raise RuntimeError("Prompt enhancer model failed to load")
+
+        is_video = mode in ("video", "avatar")
+        temperature = wgp.server_config.get("prompt_enhancer_temperature", 0.6)
+        top_p = wgp.server_config.get("prompt_enhancer_top_p", 0.9)
+        seed = secrets.randbits(32) if wgp.server_config.get("prompt_enhancer_randomize_seed", True) else 0
+
+        prompt_images = None
+        if image_paths:
+            for img_path in image_paths:
+                if cancel_handle is not None:
+                    cancel_handle.checkpoint()
+                if not img_path or not os.path.isfile(img_path):
+                    raise RuntimeError(
+                        "An authorized enhancement image is unavailable"
+                    )
+                loaded_image = None
                 try:
-                    loaded.append(Image.open(img_path))
-                    print(f"[Enhance] Including image: {os.path.basename(img_path)}")
-                except Exception as e:
-                    print(f"[Enhance] Failed to load image {img_path}: {e}")
-        if loaded:
-            prompt_images = loaded
+                    loaded_image = Image.open(img_path)
+                    loaded_image.load()
+                except Exception:
+                    if loaded_image is not None:
+                        try:
+                            loaded_image.close()
+                        except Exception:
+                            pass
+                    raise RuntimeError(
+                        "An authorized enhancement image could not be decoded"
+                    ) from None
+                loaded_images.append(loaded_image)
+                print(f"[Enhance] Including image: {os.path.basename(img_path)}")
+            prompt_images = loaded_images
 
-    post_image_caption_hook = None
-    if prompt_images and wgp.enhancer_offloadobj is not None:
-        if hasattr(wgp.prompt_enhancer_image_caption_model, "vision_tower_model") and hasattr(wgp.prompt_enhancer_llm_model, "generate_messages"):
-            post_image_caption_hook = wgp.enhancer_offloadobj.unload_all
+        post_image_caption_hook = None
+        if prompt_images and wgp.enhancer_offloadobj is not None:
+            if hasattr(wgp.prompt_enhancer_image_caption_model, "vision_tower_model") and hasattr(wgp.prompt_enhancer_llm_model, "generate_messages"):
+                post_image_caption_hook = wgp.enhancer_offloadobj.unload_all
 
-    def _run():
-        return generate_cinematic_prompt(
+        if cancel_handle is not None:
+            cancel_handle.checkpoint()
+        result = generate_cinematic_prompt(
             wgp.prompt_enhancer_image_caption_model,
             wgp.prompt_enhancer_image_caption_processor,
             wgp.prompt_enhancer_llm_model,
@@ -31186,16 +32528,33 @@ def _enhance_with_wangp_sync(prompt: str, mode: str, enhancer_enabled: int, imag
             seed=seed,
             post_image_caption_hook=post_image_caption_hook,
         )
+        if cancel_handle is not None:
+            cancel_handle.checkpoint()
 
-    result = _run()
-
-    # Unload from GPU to free VRAM
-    if wgp.enhancer_offloadobj is not None:
-        wgp.enhancer_offloadobj.unload_all()
-
-    enhanced = result[0] if isinstance(result, list) and result else (result or prompt)
-    print(f"[Enhance] Wan2GP enhanced: {len(enhanced)} chars")
-    return {"original": prompt, "enhanced": enhanced}
+        enhanced = result[0] if isinstance(result, list) and result else (result or prompt)
+        print(f"[Enhance] Wan2GP enhanced: {len(enhanced)} chars")
+        return {"original": prompt, "enhanced": enhanced}
+    finally:
+        for image in loaded_images:
+            try:
+                image.close()
+            except Exception:
+                pass
+        if acquired_prompt_enhancer:
+            try:
+                if wgp.enhancer_offloadobj is not None:
+                    wgp.enhancer_offloadobj.unload_all()
+            except Exception as error:
+                print(
+                    "[Enhance] Wan2GP cleanup failed "
+                    f"({type(error).__name__})"
+                )
+            finally:
+                wgp.prompt_enhancer_lock.release()
+        if acquired_native_gpu:
+            wgp.native_gpu_execution_lock.release()
+        if acquired:
+            _gen_lock.release()
 
 
 @api.post("/api/v1/llm/describe-image")
@@ -31771,37 +33130,36 @@ async def analyze_audio(request: Request):
                 _audio_analysis_active = None
         _audio_analysis_gate.release()
 
-    # Free the generation model's VRAM before analysis. The Director flow
-    # runs analysis right after rendering the song, and as of v1.2.0 the
-    # default music model is much larger (XL SFT, 10GB bf16). On smaller
-    # cards the resident model + vocal separator + Whisper oversubscribe
-    # VRAM, and Windows' CUDA sysmem fallback turns that into a silent,
-    # near-endless crawl instead of a clean OOM ("analyzing never
-    # finishes"). The song is already saved; wgp reloads the model
-    # transparently on the next job. Guarded by _gen_lock so an active
-    # generation is never touched.
-    if _gen_lock.acquire(blocking=False):
-        try:
-            if getattr(wgp, "wan_model", None) is not None:
-                print("[AudioAnalysis] Releasing generation model VRAM before analysis")
-                wgp.release_model()
-            else:
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"[AudioAnalysis] Pre-analysis VRAM release skipped: {e}")
-        finally:
-            _gen_lock.release()
-    else:
-        print("[AudioAnalysis] Generation in progress - skipping pre-analysis VRAM release")
-
     def run_analysis():
         """The worker owns cleanup so client cancellation cannot release the
         single-analysis gate while native/model work is still running."""
         worker_started.set()
+        torch_module = globals().get("torch")
+        uses_native_gpu = bool(
+            torch_module is not None
+            and torch_module.cuda.is_available()
+        )
+        generation_slot_acquired = False
+        native_gpu_slot = (
+            _WgpNativeGpuExecutionSlot()
+            if uses_native_gpu else None
+        )
+        native_gpu_acquired = False
         try:
+            if uses_native_gpu:
+                _gen_lock.acquire()
+                generation_slot_acquired = True
+                native_gpu_acquired = native_gpu_slot.__enter__()
+                if getattr(wgp, "wan_model", None) is not None:
+                    print(
+                        "[AudioAnalysis] Releasing generation model VRAM "
+                        "before analysis"
+                    )
+                    _release_wgp_model_with_native_gpu_exclusion()
+                else:
+                    import gc
+                    gc.collect()
+                    torch_module.cuda.empty_cache()
             return audio_analysis.analyze(
                 audio_path=audio_path,
                 transcribe=body.get("transcribe", False),
@@ -31810,6 +33168,10 @@ async def analyze_audio(request: Request):
                 lyrics_hint=body.get("lyrics_hint") or None,
             )
         finally:
+            if native_gpu_acquired:
+                native_gpu_slot.__exit__(None, None, None)
+            if generation_slot_acquired:
+                _gen_lock.release()
             release_analysis_lease()
 
     try:
@@ -44092,7 +45454,9 @@ async def repaint_endpoint(request: Request):
         shot_temp_dir = None
         shot_final_out_dir = None
         try:
-            with generation_slot(_gen_lock, job) as acquired:
+            with generation_slot(
+                _gen_lock, job,
+            ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
                 if not acquired:
                     return
                 if not try_start(
@@ -45061,7 +46425,9 @@ async def recast_endpoint(request: Request):
             # is released before _run_generation, which re-acquires it for
             # the generation phase; a waiting job may slip its detection in
             # between, but everything stays strictly one-GPU-task-at-a-time.
-            with generation_slot(_gen_lock, job) as acquired:
+            with generation_slot(
+                _gen_lock, job,
+            ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
                 if not acquired:
                     return
                 if not try_start(
@@ -46454,7 +47820,9 @@ def _prepare_and_run_outpaint(job_id):
         # Match Recast/Repaint's two-phase lifecycle. Preparation is short and
         # CPU-bound, but taking the slot preserves submission order and avoids
         # stacking ffmpeg decoding on top of another active generation.
-        with generation_slot(_gen_lock, job) as acquired:
+        with generation_slot(
+            _gen_lock, job,
+        ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
             if not acquired:
                 return
             if not try_start(
@@ -49347,7 +50715,7 @@ def _release_h3_delivery_vram() -> list[str]:
         # release_model invalidates WGP's loaded identity before fallible MMGP
         # cleanup, so even a cleanup exception cannot advertise stale H3
         # residency to the next load.
-        wgp.release_model()
+        _release_wgp_model_with_native_gpu_exclusion()
         actions.append("released_h3")
     except Exception:
         actions.append("invalidated_h3")
@@ -50903,7 +52271,9 @@ def _run_h3_delivery_recovery_job(job_id: str) -> None:
     abort_state = {"abort": False}
     completed = False
     try:
-        with generation_slot(_gen_lock, job) as acquired:
+        with generation_slot(
+            _gen_lock, job,
+        ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
             if not acquired or not try_start(
                 job,
                 generation_lock=_gen_lock,
@@ -51269,7 +52639,7 @@ def _release_model_for_resource_retry(job: dict) -> None:
         ):
             _release_h3_delivery_vram()
         else:
-            wgp.release_model()
+            _release_wgp_model_with_native_gpu_exclusion()
     except Exception:
         # WGP invalidates loaded identity before fallible release work. The
         # durable requeue remains authoritative even when cleanup objects.
@@ -51635,7 +53005,9 @@ def _run_tool_upscale(job_id: str):
     start_time = time.time()
     abort_state = {"abort": False}
     audio_tracks = []
-    with generation_slot(_gen_lock, job) as acquired:
+    with generation_slot(
+        _gen_lock, job,
+    ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
         if not acquired:
             return False
         try:
@@ -51801,7 +53173,9 @@ def _run_tool_revoice(job_id: str):
     start_time = time.time()
     abort_state = {"abort": False}
     final_path = None
-    with generation_slot(_gen_lock, job) as acquired:
+    with generation_slot(
+        _gen_lock, job,
+    ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
         if not acquired:
             return False
         try:
@@ -52159,7 +53533,7 @@ def _run_generation(
     expected_execution_attempt: int | None = None,
 ) -> bool:
     """Build and run a job, optionally deferring success finalization."""
-    from shared.utils.thread_utils import AsyncStream, async_run
+    from shared.utils.thread_utils import AsyncStream, Listener, async_run
     import copy
     import inspect
 
@@ -52334,8 +53708,13 @@ def _run_generation(
 
     with generation_slot(
         _gen_lock, job, block_on_persistence_failure=True,
-    ) as acquired:
-        if not acquired:
+    ) as acquired, _WgpNativeGpuExecutionSlot(
+        acquired,
+        cancel_checkpoint=lambda: _generation_native_gpu_cancel_checkpoint(
+            job
+        ),
+    ) as native_acquired:
+        if not acquired or not native_acquired:
             _credit_admission_evaluations.pop(job_id, None)
             return False
         try:
@@ -54485,7 +55864,10 @@ def _run_generation(
                         progress_indeterminate=True,
                     )
                     inactive_started = time.time()
+                    yielded_native_slot = _yield_current_native_gpu_slot()
                     resumed = yield_generation_slot_after_output(_gen_lock, job)
+                    if resumed and not yielded_native_slot.acquire():
+                        return False
                     _record_eta_inactive_time(inactive_started)
                     if resumed:
                         if is_cancel_requested(job):
@@ -54727,9 +56109,17 @@ def _run_generation(
                 send_cmd = com_stream.output_queue.push
                 _h3_call_timing = {}
                 task_resource_failure = {}
+                worker_start_lock = threading.Lock()
+                worker_started = threading.Event()
+                worker_start_state = {"cancelled": False}
 
                 def make_error_handler(task, params, send_cmd):
                     def error_handler():
+                        with worker_start_lock:
+                            if worker_start_state["cancelled"]:
+                                send_cmd("exit", None)
+                                return
+                            worker_started.set()
                         call_started = time.perf_counter()
                         try:
                             expected_args = set(inspect.signature(wgp.generate_video).parameters.keys())
@@ -54777,7 +56167,30 @@ def _run_generation(
                             send_cmd("exit", None)
                     return error_handler
 
-                async_run(make_error_handler(task, params, send_cmd))
+                wgp._recover_dead_async_listener(Listener)
+                try:
+                    async_run(make_error_handler(task, params, send_cmd))
+                except BaseException:
+                    with worker_start_lock:
+                        worker_start_state["cancelled"] = True
+                    wgp._recover_dead_async_listener(
+                        Listener, start_failed=True,
+                    )
+                    raise
+                if not worker_started.wait(timeout=2.0):
+                    with worker_start_lock:
+                        if worker_started.is_set():
+                            dispatch_cancelled = False
+                        else:
+                            worker_start_state["cancelled"] = True
+                            dispatch_cancelled = True
+                    if dispatch_cancelled:
+                        wgp._recover_dead_async_listener(
+                            Listener, start_failed=True,
+                        )
+                        raise RuntimeError(
+                            "generation worker did not start",
+                        )
 
                 def _publish_window_progress(progress_updates, step=0, total=0):
                     """Attach exact clip/window state to an API job update."""
@@ -55792,10 +57205,14 @@ def _run_generation(
                             ):
                                 return False
                             inactive_started = time.time()
+                            yielded_native_slot = _yield_current_native_gpu_slot()
                             if not yield_generation_slot_after_output(
                                 _gen_lock, job,
                             ):
                                 _record_eta_inactive_time(inactive_started)
+                                cancelled = True
+                                break
+                            if not yielded_native_slot.acquire():
                                 cancelled = True
                                 break
                             _record_eta_inactive_time(inactive_started)
@@ -56208,7 +57625,7 @@ def _run_generation(
                                 or getattr(wgp, "offloadobj", None) is not None
                             ):
                                 print("  [Recast] Releasing generation model for adaptive protection")
-                                wgp.release_model()
+                                _release_wgp_model_with_native_gpu_exclusion()
 
                             import tempfile
                             adaptive_mask_dir = tempfile.mkdtemp(

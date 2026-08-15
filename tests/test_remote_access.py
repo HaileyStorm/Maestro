@@ -1494,6 +1494,136 @@ class LaunchSecurityContractTests(unittest.TestCase):
             self.assertIn('permission="project.read"', source, route)
             self.assertNotIn('permission="project.generate"', source, route)
 
+    def test_scoped_enhance_authorizes_before_provider_or_runtime_resolution(self):
+        route = self._function_source("llm_enhance_prompt")
+        self.assertLess(
+            route.index("_promote_external_llm_request(request)"),
+            route.index("_request_project_workspace("),
+        )
+        self.assertLess(
+            route.index("_require_project_access("),
+            route.index("_prompt_enhancement_runtime_snapshot("),
+        )
+        self.assertLess(
+            route.index('globals().get("_resolve_prompt_enhancement_images")'),
+            route.index("_prompt_enhancement_runtime_snapshot("),
+        )
+        self.assertIn("existing_only=True", route)
+        runtime = self._function_source(
+            "_prompt_enhancement_runtime_snapshot",
+        )
+        self.assertIn("_resolve_prompt_enhancer_runtime_selection(", runtime)
+        resolver = self._function_source(
+            "_resolve_prompt_enhancer_runtime_selection",
+        )
+        self.assertIn("_llm_model_catalog(request, configured_provider)", resolver)
+        self.assertIn("_resolve_llm_chat_model(request, enhance_model)", resolver)
+        self.assertIn("Configured Prompt Enhance model is unavailable", resolver)
+
+    def test_llm_operation_identity_never_creates_and_changes_on_recreation(self):
+        from fastapi import HTTPException
+
+        with tempfile.TemporaryDirectory() as root:
+            namespace = self._function_namespace(
+                (
+                    "_existing_workspace_dir",
+                    "_require_project_access",
+                    "_llm_project_instance_id",
+                    "_llm_operation_scope",
+                    "_llm_route_operation_scope_or_404",
+                ),
+                {
+                    "Request": object,
+                    "HTTPException": HTTPException,
+                    "hashlib": hashlib,
+                    "hmac": __import__("hmac"),
+                    "os": os,
+                    "stat": __import__("stat"),
+                    "threading": threading,
+                    "uuid": __import__("uuid"),
+                    "wgp": types.SimpleNamespace(
+                        server_config={"save_path": root},
+                    ),
+                    "_account_project_access_state": lambda: {
+                        "state": "disabled", "enforced": False,
+                    },
+                    "_require_account_project_permission": (
+                        lambda *_args, **_kwargs: None
+                    ),
+                    "_project_access": types.SimpleNamespace(
+                        status=lambda *_args: types.SimpleNamespace(
+                            protected=False, unlocked=True,
+                        ),
+                        authorize=lambda *_args: types.SimpleNamespace(
+                            protected=False, unlocked=True,
+                        ),
+                    ),
+                    "_STATE_CHANGING_METHODS": frozenset({"POST", "DELETE"}),
+                    "_session_secret": lambda: b"project-instance-secret",
+                    "_llm_project_instance_lock": threading.Lock(),
+                    "_LLM_ROUTE_OPERATION_KINDS": frozenset({"enhance"}),
+                    "_promote_external_llm_request": lambda _request: None,
+                    "_request_project_workspace": (
+                        lambda _request, workspace: workspace
+                    ),
+                },
+            )
+            request = types.SimpleNamespace(
+                method="GET",
+                state=types.SimpleNamespace(
+                    maestro_remote=False,
+                    maestro_session_id="owner-session",
+                ),
+            )
+            missing = os.path.join(root, "missing-project")
+            with self.assertRaises(HTTPException) as raised:
+                namespace["_llm_route_operation_scope_or_404"](
+                    request, "enhance", "missing-project",
+                )
+            self.assertEqual(raised.exception.status_code, 404)
+            self.assertFalse(os.path.exists(missing))
+
+            project = os.path.join(root, "project")
+            os.mkdir(project)
+            first = namespace["_llm_operation_scope"](
+                request, "project",
+            )[1]
+            marker = os.path.join(project, ".llm-chat-instance")
+            self.assertTrue(os.path.isfile(marker))
+            os.remove(marker)
+
+            os.mkdir(marker)
+            with self.assertRaises(HTTPException) as nonregular:
+                namespace["_llm_operation_scope"](request, "project")
+            self.assertEqual(nonregular.exception.status_code, 500)
+            os.rmdir(marker)
+
+            shared_marker = os.path.join(root, "shared-marker")
+            with open(shared_marker, "w", encoding="ascii") as handle:
+                handle.write("c" * 32)
+            try:
+                os.link(shared_marker, marker)
+            except OSError:
+                pass
+            else:
+                with self.assertRaises(HTTPException) as hardlinked:
+                    namespace["_llm_operation_scope"](request, "project")
+                self.assertEqual(hardlinked.exception.status_code, 500)
+                os.remove(marker)
+            os.remove(shared_marker)
+
+            os.rmdir(project)
+            with self.assertRaises(HTTPException) as deleted:
+                namespace["_llm_operation_scope"](request, "project")
+            self.assertEqual(deleted.exception.status_code, 404)
+            self.assertFalse(os.path.exists(project))
+
+            os.mkdir(project)
+            second = namespace["_llm_operation_scope"](
+                request, "project",
+            )[1]
+            self.assertNotEqual(first, second)
+
     def test_remote_default_workspace_is_hidden_and_cannot_be_selected(self):
         class FakeHTTPException(Exception):
             def __init__(self, *, status_code, detail):
@@ -2465,6 +2595,121 @@ class LaunchSecurityContractTests(unittest.TestCase):
         finally:
             release.set()
             namespace["_gen_lock"].release()
+
+    def test_cuda_audio_analysis_waits_for_classic_native_gpu_lane(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        analysis_entered = threading.Event()
+        release_analysis = threading.Event()
+        progress = types.ModuleType("services.audio_analysis")
+
+        def analyze(**_kwargs):
+            analysis_entered.set()
+            release_analysis.wait(2)
+            return {"duration": 1.0}
+
+        progress.analyze = analyze
+        services = types.ModuleType("services")
+        services.audio_analysis = progress
+        native_gpu = threading.Lock()
+
+        class NativeSlot:
+            def __init__(self, enabled=True, **_kwargs):
+                self.enabled = enabled
+                self.acquired = False
+
+            def __enter__(self):
+                if self.enabled:
+                    native_gpu.acquire()
+                    self.acquired = True
+                return self.acquired
+
+            def __exit__(self, *_args):
+                if self.acquired:
+                    native_gpu.release()
+                    self.acquired = False
+
+        generation_lock = threading.Lock()
+        namespace = self._function_namespace(
+            (
+                "_audio_analysis_workspace", "_audio_analysis_owner_key",
+                "analyze_audio",
+            ),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "asyncio": asyncio,
+                "threading": threading,
+                "uuid": __import__("uuid"),
+                "hmac": __import__("hmac"),
+                "hashlib": hashlib,
+                "traceback": __import__("traceback"),
+                "torch": types.SimpleNamespace(cuda=types.SimpleNamespace(
+                    is_available=lambda: True,
+                    empty_cache=lambda: None,
+                )),
+                "wgp": types.SimpleNamespace(wan_model=None),
+                "_WgpNativeGpuExecutionSlot": NativeSlot,
+                "_release_wgp_model_with_native_gpu_exclusion": (
+                    lambda: self.fail("unexpected model release")
+                ),
+                "_session_secret": lambda: b"test-session-secret",
+                "_get_active_workspace": lambda: "project-a",
+                "_remote_active_projects": {"owner": "project-a"},
+                "_remote_active_projects_lock": threading.RLock(),
+                "_audio_analysis_gate": threading.Lock(),
+                "_audio_analysis_state_lock": threading.RLock(),
+                "_audio_analysis_active": None,
+                "_resolve_authorized_request_media": (
+                    lambda _request, path, _workspace: path
+                ),
+                "_gen_lock": generation_lock,
+            },
+        )
+
+        class Request:
+            state = types.SimpleNamespace(
+                maestro_remote=True, maestro_session_id="owner",
+            )
+
+            async def json(self):
+                return {"audio_path": "owned.wav", "workspace": "project-a"}
+
+        async def exercise():
+            with patch.dict(sys.modules, {
+                "services": services,
+                "services.audio_analysis": progress,
+            }):
+                native_gpu.acquire()
+                task = asyncio.create_task(
+                    namespace["analyze_audio"](Request())
+                )
+                for _ in range(200):
+                    if generation_lock.locked():
+                        break
+                    await asyncio.sleep(0.005)
+                self.assertTrue(generation_lock.locked())
+                self.assertFalse(analysis_entered.is_set())
+                native_gpu.release()
+                self.assertTrue(
+                    await asyncio.to_thread(analysis_entered.wait, 1)
+                )
+                release_analysis.set()
+                result = await task
+                self.assertEqual(result["duration"], 1.0)
+                self.assertFalse(generation_lock.locked())
+                self.assertFalse(native_gpu.locked())
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            release_analysis.set()
+            if native_gpu.locked():
+                native_gpu.release()
 
     def test_workspace_busy_checks_are_target_scoped_and_admission_is_reserved(self):
         class FakeHTTPException(Exception):

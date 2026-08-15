@@ -138,6 +138,11 @@ if mmgp_version != target_mmgp_version:
     print(f"Incorrect version of mmgp ({mmgp_version}), version {target_mmgp_version} is needed. Please upgrade with the command 'pip install -r requirements.txt'")
     exit()
 lock = threading.Lock()
+prompt_enhancer_lock = threading.RLock()
+prompt_enhancer_classic_entry_lock = threading.Lock()
+native_gpu_execution_lock = threading.Lock()
+_native_gpu_execution_epoch_lock = threading.Lock()
+_native_gpu_execution_epoch = 0
 current_task_id = None
 task_id = 0
 unique_id = 0
@@ -165,6 +170,165 @@ _MODEL_RESIDENCY_RECOVERY_COST_SECONDS = 180.0
 # upsampling_set attribute (LTX-2, etc.) — without this the VAE check at
 # generate_video time would flip reload_needed on every gen.
 _last_vae_upsampling = None
+
+
+def acquire_prompt_enhancer_lock(cancel_checkpoint=None):
+    """Acquire the process-wide enhancer lane with bounded cancel checks."""
+    while True:
+        if callable(cancel_checkpoint):
+            cancel_checkpoint()
+        if prompt_enhancer_lock.acquire(timeout=0.05):
+            try:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+            except BaseException:
+                prompt_enhancer_lock.release()
+                raise
+            return
+
+
+def acquire_native_gpu_execution_lock(cancel_checkpoint=None):
+    """Acquire exclusion shared by Classic generation and API GPU work."""
+    while True:
+        if callable(cancel_checkpoint):
+            cancel_checkpoint()
+        if native_gpu_execution_lock.acquire(timeout=0.05):
+            try:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+            except BaseException:
+                native_gpu_execution_lock.release()
+                raise
+            return
+
+
+def _next_native_gpu_execution_owner_token():
+    global _native_gpu_execution_epoch
+    with _native_gpu_execution_epoch_lock:
+        _native_gpu_execution_epoch += 1
+        return _native_gpu_execution_epoch
+
+
+class _NativeGpuExecutionCancelled(InterruptedError):
+    """A queued Classic request was stopped before GPU execution began."""
+
+
+class _NativeGpuExecutionLease:
+    """Transfer native GPU exclusion safely from UI iterator to worker."""
+
+    def __init__(self, owner_token=None, cancel_checkpoint=None):
+        if callable(cancel_checkpoint):
+            acquire_native_gpu_execution_lock(cancel_checkpoint)
+        else:
+            acquire_native_gpu_execution_lock()
+        self._guard = threading.Lock()
+        self._owner_token = (
+            _next_native_gpu_execution_owner_token()
+            if owner_token is None else owner_token
+        )
+        self._cancel_checkpoint = cancel_checkpoint
+        self._worker_started = threading.Event()
+        self._transferred = False
+        self._released = False
+
+    @property
+    def owner_token(self):
+        return self._owner_token
+
+    def checkpoint(self):
+        if callable(self._cancel_checkpoint):
+            self._cancel_checkpoint()
+
+    def start_worker(self):
+        with self._guard:
+            if self._released:
+                return False
+            self._transferred = True
+            self._worker_started.set()
+            return True
+
+    def wait_for_worker_start(self, timeout):
+        return self._worker_started.wait(timeout=max(0.0, float(timeout)))
+
+    def release(self, before_release=None):
+        with self._guard:
+            if self._released:
+                return False
+            self._released = True
+        try:
+            if callable(before_release):
+                before_release()
+        finally:
+            native_gpu_execution_lock.release()
+        return True
+
+    def release_if_untransferred(self, before_release=None):
+        with self._guard:
+            if self._transferred or self._released:
+                return False
+            self._released = True
+        try:
+            if callable(before_release):
+                before_release()
+        finally:
+            native_gpu_execution_lock.release()
+        return True
+
+
+def _recover_dead_async_listener(listener, *, start_failed=False):
+    """Reset only a confirmed dead shared listener so queued work can resume."""
+    with listener.lock:
+        candidate = listener.thread
+    if candidate is None or candidate.is_alive():
+        return False
+    if not start_failed and getattr(candidate, "ident", None) is None:
+        # add_task publishes the Thread object just before calling start().
+        # An unstarted thread is not evidence of death and must not be reset.
+        return False
+    if not start_failed:
+        # Avoid racing the narrow add_task window between assigning a new
+        # Thread object and calling start(). A genuinely dead stored listener
+        # remains unchanged across this bounded confirmation interval.
+        time.sleep(0.01)
+    with listener.lock:
+        if listener.thread is candidate and not candidate.is_alive():
+            listener.thread = None
+            return True
+    return False
+
+
+def _schedule_native_gpu_worker(
+    async_run,
+    listener,
+    worker,
+    lease,
+    before_release,
+    *,
+    thread_name="Generation",
+    start_timeout=2.0,
+):
+    """Dispatch a lease-owning worker with an exact start receipt."""
+    _recover_dead_async_listener(listener)
+    try:
+        async_run(worker, thread_name=thread_name)
+    except BaseException:
+        lease.release_if_untransferred(before_release)
+        _recover_dead_async_listener(listener, start_failed=True)
+        raise
+    if lease.wait_for_worker_start(start_timeout):
+        return
+    # If the worker wins the timeout race, release_if_untransferred returns
+    # false and its start receipt is authoritative. Otherwise the queued
+    # wrapper later observes a released lease and exits without GPU work.
+    if lease.release_if_untransferred(before_release):
+        _recover_dead_async_listener(listener, start_failed=True)
+        raise RuntimeError("native generation worker did not start")
+
+
+class _PromptEnhancerLaneCancelled(InterruptedError):
+    """Internal signal for a generation cancelled around enhancer work."""
+
+
 _HANDLER_MODULES = [
     "shared.qtypes.scaled_fp8",
     "shared.qtypes.nvfp4",
@@ -5938,7 +6102,14 @@ reset_prompt_enhancer_requested = False
 def unload_prompt_enhancer_runtime():
     from shared.prompt_enhancer import unload_prompt_enhancer_models
 
-    unload_prompt_enhancer_models(prompt_enhancer_image_caption_model, prompt_enhancer_llm_model)
+    acquire_prompt_enhancer_lock()
+    try:
+        unload_prompt_enhancer_models(
+            prompt_enhancer_image_caption_model,
+            prompt_enhancer_llm_model,
+        )
+    finally:
+        prompt_enhancer_lock.release()
 
 
 def reset_prompt_enhancer():
@@ -5946,6 +6117,14 @@ def reset_prompt_enhancer():
     reset_prompt_enhancer_requested = True
 
 def reset_prompt_enhancer_if_requested():
+    acquire_prompt_enhancer_lock()
+    try:
+        return _reset_prompt_enhancer_if_requested_locked()
+    finally:
+        prompt_enhancer_lock.release()
+
+
+def _reset_prompt_enhancer_if_requested_locked():
     global reset_prompt_enhancer_requested, prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer, enhancer_offloadobj
     if not reset_prompt_enhancer_requested:
         return
@@ -5960,6 +6139,14 @@ def reset_prompt_enhancer_if_requested():
         enhancer_offloadobj = None
 
 def setup_prompt_enhancer(pipe, kwargs):
+    acquire_prompt_enhancer_lock()
+    try:
+        return _setup_prompt_enhancer_locked(pipe, kwargs)
+    finally:
+        prompt_enhancer_lock.release()
+
+
+def _setup_prompt_enhancer_locked(pipe, kwargs):
     global prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer
     model_no = server_config.get("enhancer_enabled", 0) 
     if model_no != 0:
@@ -6445,8 +6632,13 @@ def generate_header(model_type, compile, attention_mode):
 def release_RAM():
     if gen_in_progress:
         gr.Info("Unable to release RAM when a Generation is in Progress")
+    elif not native_gpu_execution_lock.acquire(blocking=False):
+        gr.Info("Unable to release RAM when GPU/model work is in progress")
     else:
-        release_model()
+        try:
+            release_model()
+        finally:
+            native_gpu_execution_lock.release()
         gr.Info("Models stored in RAM have been released")
 
 def get_gen_info(state):
@@ -6634,34 +6826,70 @@ def resume_generation(state):
 
 def abort_generation(state):
     gen = get_gen_info(state)
-    gen["resume"] = True
-    if "in_progress" in gen: # and wan_model != None:
-        if wan_model != None:
-            wan_model._interrupt= True
-        gen["abort"] = True            
-        msg = "Processing Request to abort Current Generation"
-        gen["status"] = msg
+    msg = "Processing Request to abort Current Generation"
+    with gen_lock:
+        gen["resume"] = True
+        in_progress = "in_progress" in gen
+        if in_progress: # and wan_model != None:
+            request_owner = gen.get(_NATIVE_GENERATION_REQUEST_KEY)
+            native_owner = gen.get(_NATIVE_GENERATION_OWNER_KEY)
+            if request_owner is not None:
+                gen[_NATIVE_GENERATION_ABORT_REQUEST_KEY] = request_owner
+            # A Stop for a queued successor must not interrupt the detached
+            # predecessor still owning the shared model/GPU lane.
+            gen["abort"] = bool(
+                request_owner is None or request_owner == native_owner
+            )
+            if gen["abort"] and wan_model != None:
+                wan_model._interrupt= True
+            gen["status"] = msg
+    if in_progress:
         gr.Info(msg)
         return gr.Button(interactive=  False)
-    else:
-        return gr.Button(interactive=  True)
+    return gr.Button(interactive=  True)
 
 def early_stop_generation(state):
     gen = get_gen_info(state)
-    gen["resume"] = True
-    if "in_progress" in gen:
+    with gen_lock:
+        gen["resume"] = True
+        if "in_progress" not in gen:
+            return gr.Button(interactive=True)
         queue = gen.get("queue", [])
         model_type = queue[0].get("params", {}).get("model_type") if queue else None
         model_def = get_model_def(model_type) if model_type else None
         if not model_def or not model_def.get("supports_early_stop", False):
-            gr.Info("Early Stop is not supported for this model.")
-            return gr.Button(interactive=True)
-        if gen.get("early_stop", False):
-            return gr.Button(interactive=False)
-        gen["early_stop"] = True
-        gen["early_stop_forwarded"] = False
-        msg = "Early Stop in progress"
-        gen["status"] = msg
+            supported = False
+            already_stopping = False
+        else:
+            supported = True
+            request_owner = gen.get(_NATIVE_GENERATION_REQUEST_KEY)
+            already_stopping = bool(
+                gen.get(_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY)
+                == request_owner
+                or (
+                    request_owner is None
+                    and gen.get("early_stop", False)
+                )
+            )
+            if not already_stopping:
+                if request_owner is not None:
+                    gen[_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY] = (
+                        request_owner
+                    )
+                gen["early_stop"] = bool(
+                    request_owner is None
+                    or request_owner
+                    == gen.get(_NATIVE_GENERATION_OWNER_KEY)
+                )
+                gen["early_stop_forwarded"] = False
+                gen["status"] = "Early Stop in progress"
+    if not supported:
+        gr.Info("Early Stop is not supported for this model.")
+        return gr.Button(interactive=True)
+    if already_stopping:
+        return gr.Button(interactive=False)
+    msg = "Early Stop in progress"
+    if supported:
         gr.Info(msg)
         return gr.Button(interactive=False)
     return gr.Button(interactive=True)
@@ -6779,10 +7007,10 @@ def refresh_gallery(state): #, msg
 
 
 def finalize_generation(state):
+    if not _claim_native_generation_finalizer(state):
+        return tuple(gr.update() for _ in range(12))
     gen = get_gen_info(state)
     choice = gen.get("selected",0)
-    if "in_progress" in gen:
-        del gen["in_progress"]
     if gen.get("last_selected", True):
         file_list = gen.get("file_list", [])
         choice = len(file_list) - 1
@@ -6796,8 +7024,6 @@ def finalize_generation(state):
     last_was_audio = gen.get("last_was_audio", False)
     gallery_tabs = gr.Tabs(selected= "audio" if last_was_audio else "video_images")
     time.sleep(0.2)
-    global gen_in_progress
-    gen_in_progress = False
     gen["early_stop"] = False
     gen["early_stop_forwarded"] = False
     return gallery_tabs, 1 if last_was_audio else 0, gr.update() if last_was_audio else gr.Gallery(selected_index=choice),  *pack_audio_gallery_state(audio_file_list, audio_choice), gr.Button(interactive=  True), gr.Button(interactive=  True, visible= False), gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.HTML(visible= False, value="")
@@ -7333,13 +7559,31 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
     return choice if source=="video" else gr.update(), html_content, gr.update(visible=visible and is_video) , gr.update(visible=visible and is_image), gr.update(visible=visible and is_audio), gr.update(visible=visible and is_deleted and source=="video"), gr.update(visible=visible and is_deleted and source=="audio"), gr.update(visible=visible and is_video) , gr.update(visible=visible and is_video) 
 
 def convert_image(image):
-
     from PIL import ImageOps
     from typing import cast
+    owned_images = []
     if isinstance(image, str):
         image = Image.open(image)
-    image = image.convert('RGB')
-    return cast(Image, ImageOps.exif_transpose(image))
+        owned_images.append(image)
+    result = None
+    try:
+        rgb_image = image.convert('RGB')
+        if rgb_image is not image:
+            owned_images.append(rgb_image)
+        result = cast(Image, ImageOps.exif_transpose(rgb_image))
+        if result is not image and result is not rgb_image:
+            owned_images.append(result)
+        return result
+    finally:
+        closed_ids = set()
+        for owned_image in owned_images:
+            if owned_image is result or id(owned_image) in closed_ids:
+                continue
+            closed_ids.add(id(owned_image))
+            try:
+                owned_image.close()
+            except Exception:
+                pass
 
 def get_resampled_video(video_in, start_frame, max_frames, target_fps, bridge='torch'):
     if isinstance(video_in, str) and has_image_file_extension(video_in):
@@ -8233,7 +8477,25 @@ class DynamicClass:
         """Alias for assign() - more dict-like"""
         return self.assign(**dict)
 
-def process_prompt_enhancer(model_def, prompt_enhancer, original_prompts,  image_start, original_image_refs, is_image, audio_only, seed, prompt_enhancer_instructions = None ):
+def process_prompt_enhancer(model_def, prompt_enhancer, original_prompts, image_start, original_image_refs, is_image, audio_only, seed, prompt_enhancer_instructions=None):
+    acquire_prompt_enhancer_lock()
+    try:
+        return _process_prompt_enhancer_locked(
+            model_def,
+            prompt_enhancer,
+            original_prompts,
+            image_start,
+            original_image_refs,
+            is_image,
+            audio_only,
+            seed,
+            prompt_enhancer_instructions,
+        )
+    finally:
+        prompt_enhancer_lock.release()
+
+
+def _process_prompt_enhancer_locked(model_def, prompt_enhancer, original_prompts, image_start, original_image_refs, is_image, audio_only, seed, prompt_enhancer_instructions=None):
     global enhancer_offloadobj
     prompt_enhancer_mode = str(prompt_enhancer or "")
     prompt_enhancer_instructions = model_def.get("image_prompt_enhancer_instructions" if is_image else "video_prompt_enhancer_instructions", None)
@@ -8256,10 +8518,17 @@ def process_prompt_enhancer(model_def, prompt_enhancer, original_prompts,  image
             prompt_images += image_start[:1]
         if original_image_refs != None:
             prompt_images += original_image_refs[:1]
-    prompt_images = [Image.open(img) if isinstance(img,str) else img for img in prompt_images]
-    if len(original_prompts) == 0 and "T" not in prompt_enhancer_mode:
-        return None
-    else:
+    opened_prompt_images = []
+    resolved_prompt_images = []
+    try:
+        for image in prompt_images:
+            if isinstance(image, str):
+                image = Image.open(image)
+                opened_prompt_images.append(image)
+            resolved_prompt_images.append(image)
+        prompt_images = resolved_prompt_images
+        if len(original_prompts) == 0 and "T" not in prompt_enhancer_mode:
+            return None
         import secrets
         enhancer_temperature = server_config.get("prompt_enhancer_temperature", 0.6)
         enhancer_top_p = server_config.get("prompt_enhancer_top_p", 0.9)
@@ -8272,7 +8541,7 @@ def process_prompt_enhancer(model_def, prompt_enhancer, original_prompts,  image
         if len(prompt_images) > 0 and enhancer_offloadobj is not None:
             if hasattr(prompt_enhancer_image_caption_model, "vision_tower_model") and hasattr(prompt_enhancer_llm_model, "generate_messages"):
                 post_image_caption_hook = enhancer_offloadobj.unload_all
-        prompts = generate_cinematic_prompt(
+        return generate_cinematic_prompt(
             prompt_enhancer_image_caption_model,
             prompt_enhancer_image_caption_processor,
             prompt_enhancer_llm_model,
@@ -8290,9 +8559,249 @@ def process_prompt_enhancer(model_def, prompt_enhancer, original_prompts,  image
             post_image_caption_hook = post_image_caption_hook,
             thinking_enabled = "K" in prompt_enhancer_mode,
         )
-        return prompts
+    finally:
+        for opened_image in opened_prompt_images:
+            try:
+                opened_image.close()
+            except Exception:
+                pass
 
-def enhance_prompt(state, prompt, prompt_enhancer, multi_images_gen_type, multi_prompts_gen_type, override_profile,  progress=gr.Progress()):
+
+def _process_prompt_enhancer_for_generation(
+    model_def,
+    prompt_enhancer,
+    original_prompts,
+    image_start,
+    original_image_refs,
+    is_image,
+    audio_only,
+    seed,
+    cancel_checkpoint=None,
+):
+    """Run generation-time enhancement and unload as one locked transaction."""
+    acquire_prompt_enhancer_lock(cancel_checkpoint)
+    try:
+        if callable(cancel_checkpoint):
+            cancel_checkpoint()
+        enhanced_prompts = process_prompt_enhancer(
+            model_def,
+            prompt_enhancer,
+            original_prompts,
+            image_start,
+            original_image_refs,
+            is_image,
+            audio_only,
+            seed,
+        )
+        if callable(cancel_checkpoint):
+            cancel_checkpoint()
+        return enhanced_prompts
+    finally:
+        try:
+            unload_prompt_enhancer_runtime()
+        finally:
+            prompt_enhancer_lock.release()
+
+
+_NATIVE_GENERATION_OWNER_KEY = "_maestro_native_generation_owner"
+_NATIVE_GENERATION_REQUEST_KEY = "_maestro_native_generation_request"
+_NATIVE_GENERATION_ABORT_REQUEST_KEY = (
+    "_maestro_native_generation_abort_request"
+)
+_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY = (
+    "_maestro_native_generation_early_stop_request"
+)
+_NATIVE_GENERATION_FINALIZER_QUEUE_KEY = (
+    "_maestro_native_generation_finalizer_queue"
+)
+_NATIVE_GENERATION_LAST_SETTLED_KEY = "_maestro_native_generation_last_settled"
+
+
+def _begin_native_generation_request(state, owner_token):
+    global gen_in_progress
+    gen = get_gen_info(state)
+    with gen_lock:
+        gen[_NATIVE_GENERATION_REQUEST_KEY] = owner_token
+        gen.setdefault(_NATIVE_GENERATION_FINALIZER_QUEUE_KEY, []).append(
+            owner_token
+        )
+        gen["in_progress"] = True
+        gen_in_progress = True
+
+
+def _native_generation_request_is_current(state, owner_token):
+    gen = get_gen_info(state)
+    with gen_lock:
+        return gen.get(_NATIVE_GENERATION_REQUEST_KEY) == owner_token
+
+
+def _checkpoint_native_generation_request(state, owner_token):
+    """Cancel an exact Classic request while it waits for the native lane."""
+    gen = get_gen_info(state)
+    with gen_lock:
+        abort_owner = gen.get(_NATIVE_GENERATION_ABORT_REQUEST_KEY)
+        if (
+            gen.get(_NATIVE_GENERATION_REQUEST_KEY) != owner_token
+            or abort_owner == owner_token
+            or (
+                abort_owner is None
+                and gen.get("abort", False)
+            )
+        ):
+            raise _NativeGpuExecutionCancelled(
+                "native generation request was cancelled"
+            )
+
+
+def _release_native_generation_request(state, owner_token):
+    """Retire only the exact UI/request epoch without touching a successor."""
+    global gen_in_progress
+    gen = get_gen_info(state)
+    with gen_lock:
+        if gen.get(_NATIVE_GENERATION_REQUEST_KEY) != owner_token:
+            return False
+        gen.pop(_NATIVE_GENERATION_REQUEST_KEY, None)
+        if gen.get(_NATIVE_GENERATION_ABORT_REQUEST_KEY) == owner_token:
+            gen.pop(_NATIVE_GENERATION_ABORT_REQUEST_KEY, None)
+        if gen.get(_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY) == owner_token:
+            gen.pop(_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY, None)
+        if gen.get(_NATIVE_GENERATION_OWNER_KEY) is None:
+            gen.pop("in_progress", None)
+            gen["abort"] = False
+            gen_in_progress = False
+            gen[_NATIVE_GENERATION_LAST_SETTLED_KEY] = owner_token
+        return True
+
+
+def _settle_native_generation_task_if_current(state, owner_token):
+    """Atomically retire one worker task without touching a successor Stop."""
+    gen = get_gen_info(state)
+    with gen_lock:
+        if gen.get(_NATIVE_GENERATION_REQUEST_KEY) != owner_token:
+            return None
+        abort_owner = gen.get(_NATIVE_GENERATION_ABORT_REQUEST_KEY)
+        aborted = bool(
+            abort_owner == owner_token
+            or (
+                abort_owner is None
+                and gen.get("abort", False)
+            )
+        )
+        if abort_owner in (None, owner_token):
+            gen["abort"] = False
+            gen.pop(_NATIVE_GENERATION_ABORT_REQUEST_KEY, None)
+        early_stop_owner = gen.get(
+            _NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY
+        )
+        if early_stop_owner in (None, owner_token):
+            gen["early_stop"] = False
+            gen["early_stop_forwarded"] = False
+            gen.pop(_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY, None)
+        return aborted
+
+
+def _mutate_native_generation_if_current(
+    state, owner_token, mutation,
+):
+    """Publish one late worker command only into its exact request epoch."""
+    gen = get_gen_info(state)
+    with gen_lock:
+        if gen.get(_NATIVE_GENERATION_REQUEST_KEY) != owner_token:
+            return False
+        mutation(gen)
+        return True
+
+
+def _claim_native_generation_finalizer(state):
+    """Claim one chained UI finalizer only for its settled request epoch."""
+    gen = get_gen_info(state)
+    with gen_lock:
+        queue = gen.get(_NATIVE_GENERATION_FINALIZER_QUEUE_KEY)
+        if not isinstance(queue, list) or not queue:
+            return False
+        owner_token = queue.pop(0)
+        if not queue:
+            gen.pop(_NATIVE_GENERATION_FINALIZER_QUEUE_KEY, None)
+        return bool(
+            gen.get(_NATIVE_GENERATION_LAST_SETTLED_KEY) == owner_token
+            and gen.get(_NATIVE_GENERATION_REQUEST_KEY) is None
+            and gen.get(_NATIVE_GENERATION_OWNER_KEY) is None
+            and "in_progress" not in gen
+        )
+
+
+def _release_native_generation_owner(state, owner_token):
+    """Release only the exact generation epoch that still owns process:main."""
+    global gen_in_progress
+    gen = get_gen_info(state)
+    with gen_lock:
+        if gen.get(_NATIVE_GENERATION_OWNER_KEY) != owner_token:
+            return False
+        # A successor may already be pending while this worker unwinds. Never
+        # clear its busy marker merely because the predecessor released GPU.
+        request_owner = gen.get(_NATIVE_GENERATION_REQUEST_KEY)
+        if request_owner in (None, owner_token):
+            gen.pop("in_progress", None)
+            gen_in_progress = False
+        gen[_NATIVE_GENERATION_OWNER_KEY] = None
+        process_status = gen.get("process_status")
+        if isinstance(process_status, str) and process_status.startswith(
+            "request:"
+        ):
+            gen["process_status"] = (
+                "process:" + process_status[len("request:"):]
+            )
+        elif process_status == "process:main":
+            gen["process_status"] = None
+        return True
+
+
+def _release_prompt_enhancer_gpu_resources(state):
+    """Never restore process:main after its owning generation has exited."""
+    gen = get_gen_info(state)
+    with gen_lock:
+        process_hierarchy = gen.get("process_hierarchy", {})
+        if (
+            process_hierarchy.get("prompt_enhancer") == "process:main"
+            and gen.get(_NATIVE_GENERATION_OWNER_KEY) is None
+        ):
+            process_hierarchy["prompt_enhancer"] = None
+    release_GPU_ressources(state, "prompt_enhancer")
+
+
+def enhance_prompt(state, prompt, prompt_enhancer, multi_images_gen_type, multi_prompts_gen_type, override_profile, progress=gr.Progress()):
+    """Run Classic and API enhancement through one process-global lane."""
+    # Native GPU bookkeeping treats an identical process ID as reentrant, so
+    # serialize manual entrants before claiming that shared ID. Generation
+    # never needs this entry lock: the stable order remains entry -> GPU ->
+    # prompt, while generation is GPU -> prompt.
+    with prompt_enhancer_classic_entry_lock:
+        acquire_native_gpu_execution_lock()
+        try:
+            acquire_GPU_ressources(
+                state, "prompt_enhancer", "Prompt Enhancer",
+            )
+            try:
+                acquire_prompt_enhancer_lock()
+                try:
+                    return _enhance_prompt_locked(
+                        state,
+                        prompt,
+                        prompt_enhancer,
+                        multi_images_gen_type,
+                        multi_prompts_gen_type,
+                        override_profile,
+                        progress,
+                    )
+                finally:
+                    prompt_enhancer_lock.release()
+            finally:
+                _release_prompt_enhancer_gpu_resources(state)
+        finally:
+            native_gpu_execution_lock.release()
+
+
+def _enhance_prompt_locked(state, prompt, prompt_enhancer, multi_images_gen_type, multi_prompts_gen_type, override_profile, progress):
     global enhancer_offloadobj
     prefix = "#!PROMPT!:"
     model_type = get_state_model_type(state)
@@ -8326,80 +8835,98 @@ def enhance_prompt(state, prompt, prompt_enhancer, multi_images_gen_type, multi_
     num_prompts = len(original_prompts) 
     image_prompt_type = inputs["image_prompt_type"]
     video_prompt_type = inputs["video_prompt_type"]
-    image_start = inputs["image_start"] if "S" in image_prompt_type else None
-    if image_start is None:
-        image_start = inputs["image_end"] if "E" in image_prompt_type else None
-    if image_start is None or not "I" in prompt_enhancer:
-        image_start = [None] * num_prompts
-    else:
-        image_start = [convert_image(img[0]) for img in image_start]
-        if len(image_start) == 1:
-            image_start = image_start * num_prompts
+    helper_created_images = []
+
+    def convert_owned(source):
+        converted = convert_image(source)
+        if converted is not source:
+            helper_created_images.append(converted)
+        return converted
+
+    try:
+        image_start = inputs["image_start"] if "S" in image_prompt_type else None
+        if image_start is None:
+            image_start = inputs["image_end"] if "E" in image_prompt_type else None
+        if image_start is None or not "I" in prompt_enhancer:
+            image_start = [None] * num_prompts
         else:
-            if multi_images_gen_type !=1:
-                gr.Info("On Demand Prompt Enhancer with multiple Start Images requires that option 'Match images and text prompts' is set")
-                return gr.update(), gr.update()
-
-            if len(image_start) != num_prompts:
-                gr.Info("On Demand Prompt Enhancer supports only mutiple Start Images if their number matches the number of Text Prompts")
-                return gr.update(), gr.update()
- 
-    reset_prompt_enhancer_if_requested()
-    if enhancer_offloadobj is None:
-        status = "Please Wait While Loading Prompt Enhancer"
-        progress(0, status)
-        kwargs = {}
-        pipe = {}
-        download_models()
-    model_def = get_model_def(get_state_model_type(state))
-    audio_only = model_def.get("audio_only", False)
-
-    acquire_GPU_ressources(state, "prompt_enhancer", "Prompt Enhancer")
-
-    if enhancer_offloadobj is None:
-        setup_prompt_enhancer(pipe, kwargs)
-        profile = compute_profile(override_profile, "video")
-        mmgp_profile = init_pipe(pipe, kwargs, profile)
-        enhancer_offloadobj = offload.profile(pipe, profile_no=  mmgp_profile, **kwargs)  
-
-    original_image_refs = inputs["image_refs"] if "I" in video_prompt_type else None
-    if original_image_refs is not None:
-        original_image_refs = [ convert_image(tup[0]) for tup in original_image_refs ]        
-    is_image = inputs["image_mode"] > 0
-    seed = inputs["seed"]
-    seed = set_seed(seed)
-    enhanced_prompts = []
-    for i, (one_prompt, one_image) in enumerate(zip(original_prompts, image_start)):
-        start_images = [one_image] if one_image is not None else None
-        status = f'Please Wait While Enhancing Prompt' if num_prompts==1 else f'Please Wait While Enhancing Prompt #{i+1}'
-        progress((i , num_prompts), desc=status, total= num_prompts)
-
-        try:
-            enhanced_prompt = process_prompt_enhancer(model_def, prompt_enhancer, [one_prompt],  start_images, original_image_refs, is_image, audio_only, seed)    
-        except Exception as e:
-            unload_prompt_enhancer_runtime()
-            enhancer_offloadobj.unload_all()
-            release_GPU_ressources(state, "prompt_enhancer")
-            raise gr.Error(e)
-        if enhanced_prompt is not None:
-            if multi_prompts_gen_type ==2:
-                enhanced_prompt = enhanced_prompt[0]
+            image_start = [convert_owned(img[0]) for img in image_start]
+            if len(image_start) == 1:
+                image_start = image_start * num_prompts
             else:
-                enhanced_prompt = enhanced_prompt[0].replace("\n", " ").replace("\r", "")
-            enhanced_prompts.append(prefix + " " + one_prompt)
-            enhanced_prompts.append(enhanced_prompt)
+                if multi_images_gen_type !=1:
+                    gr.Info("On Demand Prompt Enhancer with multiple Start Images requires that option 'Match images and text prompts' is set")
+                    return gr.update(), gr.update()
 
-    unload_prompt_enhancer_runtime()
-    enhancer_offloadobj.unload_all()
+                if len(image_start) != num_prompts:
+                    gr.Info("On Demand Prompt Enhancer supports only mutiple Start Images if their number matches the number of Text Prompts")
+                    return gr.update(), gr.update()
 
-    release_GPU_ressources(state, "prompt_enhancer")
+        reset_prompt_enhancer_if_requested()
+        if enhancer_offloadobj is None:
+            status = "Please Wait While Loading Prompt Enhancer"
+            progress(0, status)
+            kwargs = {}
+            pipe = {}
+            download_models()
+        model_def = get_model_def(get_state_model_type(state))
+        audio_only = model_def.get("audio_only", False)
 
-    prompt = '\n'.join(enhanced_prompts)
-    if num_prompts > 1:
-        gr.Info(f'{num_prompts} Prompts have been Enhanced')
-    else:
-        gr.Info(f'Prompt "{original_prompts[0][:100]}" has been enhanced')
-    return prompt, prompt
+        if enhancer_offloadobj is None:
+            setup_prompt_enhancer(pipe, kwargs)
+            profile = compute_profile(override_profile, "video")
+            mmgp_profile = init_pipe(pipe, kwargs, profile)
+            enhancer_offloadobj = offload.profile(pipe, profile_no=mmgp_profile, **kwargs)
+
+        original_image_refs = inputs["image_refs"] if "I" in video_prompt_type else None
+        if original_image_refs is not None:
+            original_image_refs = [
+                convert_owned(tup[0]) for tup in original_image_refs
+            ]
+        is_image = inputs["image_mode"] > 0
+        seed = set_seed(inputs["seed"])
+        enhanced_prompts = []
+        for i, (one_prompt, one_image) in enumerate(zip(original_prompts, image_start)):
+            start_images = [one_image] if one_image is not None else None
+            status = f'Please Wait While Enhancing Prompt' if num_prompts == 1 else f'Please Wait While Enhancing Prompt #{i+1}'
+            progress((i, num_prompts), desc=status, total=num_prompts)
+
+            try:
+                enhanced_prompt = process_prompt_enhancer(
+                    model_def, prompt_enhancer, [one_prompt], start_images,
+                    original_image_refs, is_image, audio_only, seed,
+                )
+            except Exception as e:
+                unload_prompt_enhancer_runtime()
+                enhancer_offloadobj.unload_all()
+                raise gr.Error(e)
+            if enhanced_prompt is not None:
+                if multi_prompts_gen_type == 2:
+                    enhanced_prompt = enhanced_prompt[0]
+                else:
+                    enhanced_prompt = enhanced_prompt[0].replace("\n", " ").replace("\r", "")
+                enhanced_prompts.append(prefix + " " + one_prompt)
+                enhanced_prompts.append(enhanced_prompt)
+
+        unload_prompt_enhancer_runtime()
+        enhancer_offloadobj.unload_all()
+
+        prompt = '\n'.join(enhanced_prompts)
+        if num_prompts > 1:
+            gr.Info(f'{num_prompts} Prompts have been Enhanced')
+        else:
+            gr.Info(f'Prompt "{original_prompts[0][:100]}" has been enhanced')
+        return prompt, prompt
+    finally:
+        closed_ids = set()
+        for image in helper_created_images:
+            if id(image) in closed_ids:
+                continue
+            closed_ids.add(id(image))
+            try:
+                image.close()
+            except Exception:
+                pass
 
 def get_outpainting_dims(video_guide_outpainting):
     if (
@@ -9876,8 +10403,14 @@ def generate_video(
     gen = get_gen_info(state)
     if gen.get("abort", False):
         return False
-    gen["early_stop"] = False
-    gen["early_stop_forwarded"] = False
+    with gen_lock:
+        active_owner = gen.get(_NATIVE_GENERATION_OWNER_KEY)
+        gen["early_stop"] = bool(
+            active_owner is not None
+            and gen.get(_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY)
+            == active_owner
+        )
+        gen["early_stop_forwarded"] = False
     torch.set_grad_enabled(False) 
     if mode.startswith("edit_"):
         edit_video(send_cmd, state, mode, video_source, seed, temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, MMAudio_setting, MMAudio_prompt, MMAudio_neg_prompt, repeat_generation, audio_source)
@@ -11167,8 +11700,30 @@ def generate_video(
             # enhancement contract; do not replace or disclose it here.
             if _maestro_enhanced_prompt_cardinality is None:
                 send_cmd("progress", [0, get_latest_status(state, "Enhancing Prompt")])
-                enhanced_prompts = process_prompt_enhancer(model_def, prompt_enhancer, original_prompts,  image_start if image_start is not None else image_end , original_image_refs, is_image, audio_only, seed )
-                unload_prompt_enhancer_runtime()
+
+                def check_generation_enhancer_cancelled():
+                    if gen.get("abort", False):
+                        raise _PromptEnhancerLaneCancelled(
+                            "Generation prompt enhancement was cancelled"
+                        )
+
+                try:
+                    enhanced_prompts = _process_prompt_enhancer_for_generation(
+                        model_def,
+                        prompt_enhancer,
+                        original_prompts,
+                        image_start if image_start is not None else image_end,
+                        original_image_refs,
+                        is_image,
+                        audio_only,
+                        seed,
+                        cancel_checkpoint=(
+                            check_generation_enhancer_cancelled
+                        ),
+                    )
+                except _PromptEnhancerLaneCancelled:
+                    enhanced_prompts = None
+                    abort = True
                 if enhanced_prompts is not None:
                     print(f"Enhanced prompts: {enhanced_prompts}" )
                     task["prompt"] = "\n".join(["!enhanced!"] + enhanced_prompts)
@@ -13059,7 +13614,34 @@ def generate_preview(model_type, payload):
 
 
 def process_tasks(state):
-    from shared.utils.thread_utils import AsyncStream, async_run
+    """Own the process-wide native GPU lane for the full queue lifetime."""
+    owner_token = _next_native_gpu_execution_owner_token()
+    _begin_native_generation_request(state, owner_token)
+    try:
+        native_gpu_lease = _NativeGpuExecutionLease(
+            owner_token,
+            lambda: _checkpoint_native_generation_request(
+                state, owner_token,
+            ),
+        )
+    except _NativeGpuExecutionCancelled:
+        _release_native_generation_request(state, owner_token)
+        return
+    try:
+        yield from _process_tasks_with_native_gpu(state, native_gpu_lease)
+    finally:
+        try:
+            native_gpu_lease.release_if_untransferred(
+                lambda: _release_native_generation_owner(
+                    state, native_gpu_lease.owner_token,
+                ),
+            )
+        finally:
+            _release_native_generation_request(state, owner_token)
+
+
+def _process_tasks_with_native_gpu(state, native_gpu_lease):
+    from shared.utils.thread_utils import AsyncStream, Listener, async_run
 
     gen = get_gen_info(state)
     queue = gen.get("queue", [])
@@ -13096,20 +13678,46 @@ def process_tasks(state):
         gen["audio_file_list"], gen["audio_file_settings_list"], gen["audio_selected"] = truncate_list(audio_file_list, audio_file_settings_list, audio_choice)         
 
     while True:
+        native_gpu_lease.checkpoint()
         with gen_lock:
+            if (
+                gen.get(_NATIVE_GENERATION_REQUEST_KEY)
+                != native_gpu_lease.owner_token
+                or gen.get("abort", False)
+            ):
+                raise _NativeGpuExecutionCancelled(
+                    "native generation request was cancelled"
+                )
             process_status = gen.get("process_status", None)
             if process_status is None or process_status == "process:main":
                 gen["process_status"] = "process:main"
+                gen[_NATIVE_GENERATION_OWNER_KEY] = (
+                    native_gpu_lease.owner_token
+                )
+                abort_owner = gen.get(
+                    _NATIVE_GENERATION_ABORT_REQUEST_KEY
+                )
+                gen["abort"] = bool(
+                    abort_owner == native_gpu_lease.owner_token
+                    or (
+                        abort_owner is None
+                        and gen.get("abort", False)
+                    )
+                )
+                early_stop_owner = gen.get(
+                    _NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY
+                )
+                gen["early_stop"] = bool(
+                    early_stop_owner == native_gpu_lease.owner_token
+                )
+                gen["early_stop_forwarded"] = False
                 break
         time.sleep(0.1)
 
     def release_gen():
-        with gen_lock:
-            process_status = gen.get("process_status", None)
-            if process_status.startswith("request:"):        
-                gen["process_status"] = "process:" + process_status[len("request:"):]
-            else:
-                gen["process_status"] = None
+        _release_native_generation_owner(
+            state, native_gpu_lease.owner_token,
+        )
 
     start_time = time.time()
 
@@ -13126,6 +13734,9 @@ def process_tasks(state):
     send_cmd = com_stream.output_queue.push
 
     def queue_worker_func():
+        if not native_gpu_lease.start_worker():
+            send_cmd("worker_exit", None)
+            return
         prompt_no = 0
         try:
             while len(queue) > 0:
@@ -13180,14 +13791,14 @@ def process_tasks(state):
                     send_cmd("error", str(e))
                     return
 
-                abort = gen.get("abort", False)
+                abort = _settle_native_generation_task_if_current(
+                    state, native_gpu_lease.owner_token,
+                )
+                if abort is None:
+                    break
                 if abort:
-                    gen["abort"] = False
                     send_cmd("status", "Video Generation Aborted")
                     send_cmd("output", None)
-
-                gen["early_stop"] = False
-                gen["early_stop_forwarded"] = False
                 if not success: break
                 with lock:
                     queue[:] = [item for item in queue if item['id'] != task_id]
@@ -13203,9 +13814,24 @@ def process_tasks(state):
             traceback.print_exc()
             send_cmd("error", f"Queue worker crashed: {e}")
         finally:
-            send_cmd("worker_exit", None)
+            try:
+                native_gpu_lease.release(
+                    lambda: _release_native_generation_owner(
+                        state, native_gpu_lease.owner_token,
+                    ),
+                )
+            finally:
+                send_cmd("worker_exit", None)
 
-    async_run(queue_worker_func, thread_name="Generation")
+    _schedule_native_gpu_worker(
+        async_run,
+        Listener,
+        queue_worker_func,
+        native_gpu_lease,
+        lambda: _release_native_generation_owner(
+            state, native_gpu_lease.owner_token,
+        ),
+    )
 
     while True:
         cmd, data = com_stream.output_queue.next()               
@@ -13214,9 +13840,22 @@ def process_tasks(state):
         elif cmd == "worker_exit":
             break
         elif cmd == "info":
+            if not _native_generation_request_is_current(
+                state, native_gpu_lease.owner_token,
+            ):
+                continue
             gr.Info(data)
         elif cmd == "error": 
-            queue.clear()
+            def publish_error(current_gen):
+                queue.clear()
+                current_gen["prompts_max"] = 0
+                current_gen["prompt"] = ""
+                current_gen["status_display"] = False
+
+            if not _mutate_native_generation_if_current(
+                state, native_gpu_lease.owner_token, publish_error,
+            ):
+                continue
             try:
                 save_queue_if_crash = server_config.get("save_queue_if_crash", 1)
                 if save_queue_if_crash:
@@ -13230,20 +13869,39 @@ def process_tasks(state):
                 print(f"Error during autosave: {e}")
 
             update_global_queue_ref(queue)
-            gen["prompts_max"] = 0
-            gen["prompt"] = ""
-            gen["status_display"] =  False
             release_gen()
             raise gr.Error(data, print_exception= False, duration = 0)
         elif cmd == "status":
-            gen["status"] = data
+            if not _mutate_native_generation_if_current(
+                state,
+                native_gpu_lease.owner_token,
+                lambda current_gen: current_gen.__setitem__("status", data),
+            ):
+                continue
         elif cmd == "output":
-            gen["preview"] = None
-            gen["refresh_tab"] = True
+            def publish_output(current_gen):
+                current_gen["preview"] = None
+                current_gen["refresh_tab"] = True
+
+            if not _mutate_native_generation_if_current(
+                state, native_gpu_lease.owner_token, publish_output,
+            ):
+                continue
             yield time.time(), time.time(), gr.update()
         elif cmd == "progress":
-            gen["progress_args"] = data
+            if not _mutate_native_generation_if_current(
+                state,
+                native_gpu_lease.owner_token,
+                lambda current_gen: current_gen.__setitem__(
+                    "progress_args", data,
+                ),
+            ):
+                continue
         elif cmd == "preview":
+            if not _native_generation_request_is_current(
+                state, native_gpu_lease.owner_token,
+            ):
+                continue
             current_model_type = "unknown"
             with lock:
                 if len(queue) > 0:
@@ -13252,30 +13910,56 @@ def process_tasks(state):
             try:
                 torch.cuda.current_stream().synchronize()
                 preview = None if data is None else generate_preview(current_model_type, data) 
-                gen["preview"] = preview
+                if not _mutate_native_generation_if_current(
+                    state,
+                    native_gpu_lease.owner_token,
+                    lambda current_gen: current_gen.__setitem__(
+                        "preview", preview,
+                    ),
+                ):
+                    continue
                 yield time.time(), gr.Text(), gr.update()
             except Exception:
                 pass
         elif cmd == "refresh_models":
+            if not _native_generation_request_is_current(
+                state, native_gpu_lease.owner_token,
+            ):
+                continue
             yield gr.update(), gr.update(), (data if data is not None else get_unique_id())
         else:
             pass
 
-    gen["prompts_max"] = 0
-    gen["prompt"] = ""
     end_time = time.time()
-    if gen.get("abort", False):
-        status = f"Video generation was aborted. Total Generation Time: {format_time(end_time-start_time)}" 
-    else:
-        status = f"Total Generation Time: {format_time(end_time-start_time)}"
+    with gen_lock:
+        if (
+            gen.get(_NATIVE_GENERATION_REQUEST_KEY)
+            != native_gpu_lease.owner_token
+        ):
+            return
+        gen["prompts_max"] = 0
+        gen["prompt"] = ""
+        abort_owner = gen.get(_NATIVE_GENERATION_ABORT_REQUEST_KEY)
+        aborted = bool(
+            abort_owner == native_gpu_lease.owner_token
+            or (
+                abort_owner is None
+                and gen.get("abort", False)
+            )
+        )
+        if aborted:
+            status = f"Video generation was aborted. Total Generation Time: {format_time(end_time-start_time)}"
+        else:
+            status = f"Total Generation Time: {format_time(end_time-start_time)}"
+        gen["status"] = status
+        gen["status_display"] = False
+    if not aborted:
         try:
             if server_config.get("notification_sound_enabled", 1):
                 volume = server_config.get("notification_sound_volume", 50)
                 notification_sound.notify_video_completion(volume=volume)
         except Exception as e:
             print(f"Error playing notification sound: {e}")
-    gen["status"] = status
-    gen["status_display"] =  False
     release_gen()
 
 
@@ -14896,15 +15580,19 @@ def preload_model_when_switching(state):
     if "S" in preload_model_policy:
         model_type = get_state_model_type(state) 
         if  model_type !=  transformer_type:
-            release_model()            
-            model_filename = get_model_name(model_type)
-            yield f"Loading model {model_filename}..."
-            wan_model, offloadobj = load_models(
-                model_type,
-                output_type=get_output_type_for_model(model_type, 0),
-            )
-            yield f"Model loaded"
-            reload_needed=  False 
+            acquire_native_gpu_execution_lock()
+            try:
+                release_model()
+                model_filename = get_model_name(model_type)
+                yield f"Loading model {model_filename}..."
+                wan_model, offloadobj = load_models(
+                    model_type,
+                    output_type=get_output_type_for_model(model_type, 0),
+                )
+                yield f"Model loaded"
+                reload_needed=  False
+            finally:
+                native_gpu_execution_lock.release()
         return   
     return gr.Text()
 
@@ -14912,7 +15600,11 @@ def unload_model_if_needed(state):
     global wan_model
     if "U" in preload_model_policy:
         if wan_model != None:
-            release_model()
+            acquire_native_gpu_execution_lock()
+            try:
+                release_model()
+            finally:
+                native_gpu_execution_lock.release()
 
 def all_letters(source_str, letters):
     for letter in letters:

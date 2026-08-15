@@ -1045,7 +1045,6 @@ class DirectRouteSourceTests(unittest.TestCase):
 
         for name in (
             "llm_generate", "llm_write_song", "director_generate_music",
-            "llm_enhance_prompt",
             "director_plan_prompts", "director_plan_angle_prompts",
             "director_classify_sections", "director_plan_prompts_and_images",
             "director_plan_short_film_prompts",
@@ -1057,6 +1056,16 @@ class DirectRouteSourceTests(unittest.TestCase):
                     "_run_authorized_llm_with_selection", functions[name],
                 )
                 self.assertIn("_resolve_direct_llm_selection", functions[name])
+
+        enhance_source = functions["llm_enhance_prompt"]
+        self.assertIn("_promote_external_llm_request", enhance_source)
+        self.assertIn(
+            "_run_authorized_llm_with_selection", enhance_source,
+        )
+        self.assertIn(
+            "_resolve_prompt_enhancer_runtime_selection", enhance_source,
+        )
+        self.assertNotIn("_resolve_direct_llm_selection", enhance_source)
 
         describe_source = functions["llm_describe_image"]
         self.assertIn("_promote_external_llm_request", describe_source)
@@ -1127,6 +1136,1250 @@ class DirectRouteSourceTests(unittest.TestCase):
             'detail=f"Music generation failed:',
             functions["director_generate_music"],
         )
+
+
+class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _function_node(name):
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == name
+        )
+        node.decorator_list = []
+        return source, node
+
+    def test_scoped_source_orders_authorization_before_runtime_and_forwards_cancel(self):
+        source, node = self._function_node("llm_enhance_prompt")
+        route = ast.get_source_segment(source, node) or ""
+        self.assertLess(
+            route.index("_require_project_access("),
+            route.index("_prompt_enhancement_runtime_snapshot("),
+        )
+        self.assertLess(
+            route.index('globals().get("_resolve_prompt_enhancement_images")'),
+            route.index("_prompt_enhancement_runtime_snapshot("),
+        )
+        self.assertIn("existing_only=True", route)
+        self.assertLess(
+            route.index("_seal_prompt_enhancement_images,"),
+            route.index("_prompt_enhancement_runtime_snapshot("),
+        )
+        scoped_submit = route[route.index("if raw_request_id is not None:"):]
+        self.assertLess(
+            scoped_submit.index('body.get("project_instance")'),
+            scoped_submit.index("_prompt_enhancement_runtime_snapshot("),
+        )
+        self.assertLess(
+            scoped_submit.index(
+                "expected_project_instance, project_instance_key"
+            ),
+            scoped_submit.index("_prompt_enhancement_runtime_snapshot("),
+        )
+        self.assertLess(
+            route.index("_revalidate_prompt_enhancement_images,"),
+            route.index("expected_project_instance ="),
+        )
+        self.assertIn("llm_route_operation_manager.submit(", route)
+        self.assertIn("return JSONResponse(status, status_code=202)", route)
+        self.assertIn("cancel_handle=cancel_handle", route)
+        self.assertIn(
+            "image_seals = await run_blocking_shielded(", route,
+        )
+        self.assertIn(
+            "materialized_images = await run_blocking_shielded(", route,
+        )
+        self.assertIn(
+            "_remove_prompt_enhancement_snapshots(materialized_images)",
+            route,
+        )
+        self.assertIn(
+            "await run_blocking_shielded(\n"
+            "            _revalidate_prompt_enhancement_images,",
+            route,
+        )
+        self.assertEqual(
+            route.count("_validate_standalone_enhanced_prompt_cardinality("),
+            2,
+        )
+        self.assertIn(
+            "_ScopedPromptEnhancementRequest.snapshot_authority(request)",
+            route,
+        )
+        execute = next(
+            child for child in ast.walk(node)
+            if isinstance(child, ast.AsyncFunctionDef)
+            and child.name == "execute"
+        )
+        execute_source = ast.get_source_segment(source, execute) or ""
+        self.assertIn("detached_authority", execute_source)
+        self.assertNotIn("snapshot_authority(request)", execute_source)
+        self.assertNotIn("get_stream_status", route)
+        self.assertNotIn("_stream_buffer", route)
+        cancelled = route.index("except LlmRequestCancelled:")
+        fallback = route.index("except Exception as e:")
+        self.assertLess(cancelled, fallback)
+
+    def test_effective_digest_normalizes_request_id_and_image_alias(self):
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_llm_route_effective_input_digest",
+            "_prompt_enhancement_effective_digest",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        namespace = {
+            "Any": object,
+            "Mapping": dict,
+            "hashlib": __import__("hashlib"),
+            "hmac": __import__("hmac"),
+            "json": __import__("json"),
+            "_session_secret": lambda: b"digest-secret",
+            "_llm_selection_key": lambda _purpose, selection: (
+                f"selection:{selection.get('model_id')}"
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        runtime = {
+            "enhancer_enabled": 0,
+            "explicit_provider": "local",
+            "raw_enhancer_mode": False,
+            "selection": {"model_id": "local-model"},
+            "response_assist_snapshot": types.SimpleNamespace(revision=7),
+        }
+        first = namespace["_prompt_enhancement_effective_digest"](
+            {
+                "request_id": str(uuid.uuid4()),
+                "workspace": "project",
+                "prompt": "private prompt",
+                "image_path": "upload.png",
+            },
+            workspace="project",
+            authorized_image_paths=["/private/upload.png"],
+            image_seals=[{
+                "path": "/private/upload.png",
+                "size": 7,
+                "sha256": "a" * 64,
+            }],
+            runtime_snapshot=runtime,
+        )
+        second = namespace["_prompt_enhancement_effective_digest"](
+            {
+                "request_id": str(uuid.uuid4()),
+                "workspace": "project",
+                "prompt": "private prompt",
+                "image_paths": ["different public alias"],
+            },
+            workspace="project",
+            authorized_image_paths=["/private/upload.png"],
+            image_seals=[{
+                "path": "/private/upload.png",
+                "size": 7,
+                "sha256": "a" * 64,
+            }],
+            runtime_snapshot=runtime,
+        )
+        changed = namespace["_prompt_enhancement_effective_digest"](
+            {
+                "request_id": str(uuid.uuid4()),
+                "workspace": "project",
+                "prompt": "different prompt",
+            },
+            workspace="project",
+            authorized_image_paths=["/private/upload.png"],
+            image_seals=[{
+                "path": "/private/upload.png",
+                "size": 7,
+                "sha256": "a" * 64,
+            }],
+            runtime_snapshot=runtime,
+        )
+        replaced_image = namespace["_prompt_enhancement_effective_digest"](
+            {
+                "request_id": str(uuid.uuid4()),
+                "workspace": "project",
+                "prompt": "private prompt",
+            },
+            workspace="project",
+            authorized_image_paths=["/private/upload.png"],
+            image_seals=[{
+                "path": "/private/upload.png",
+                "size": 7,
+                "sha256": "b" * 64,
+            }],
+            runtime_snapshot=runtime,
+        )
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
+        self.assertNotEqual(first, replaced_image)
+        self.assertEqual(len(first), 64)
+
+    def test_every_supplied_image_must_resolve_to_owned_media(self):
+        from fastapi import HTTPException
+
+        _source, node = self._function_node(
+            "_resolve_prompt_enhancement_images",
+        )
+        namespace = {
+            "Any": object,
+            "Mapping": dict,
+            "Request": object,
+            "HTTPException": HTTPException,
+            "_LLM_ENHANCE_MAX_IMAGES": 4,
+            "_resolve_authorized_request_media": (
+                lambda _request, value, _workspace:
+                f"/owned/{value}" if value == "owned.png" else None
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        resolve = namespace["_resolve_prompt_enhancement_images"]
+        self.assertEqual(
+            resolve(object(), {"image_path": "owned.png"}, "project"),
+            ["/owned/owned.png"],
+        )
+        for body in (
+            {"image_path": "foreign.png"},
+            {"image_paths": ["owned.png", "foreign.png"]},
+            {"image_paths": "owned.png"},
+            {"image_paths": ["owned.png"] * 5},
+        ):
+            with self.subTest(body=body), self.assertRaises(HTTPException) as raised:
+                resolve(object(), body, "project")
+            self.assertIn(raised.exception.status_code, {400, 404})
+
+    def test_same_name_image_replacement_fails_closed_before_worker_use(self):
+        import hashlib
+        import os
+        import stat
+        import tempfile
+        from fastapi import HTTPException
+
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in {
+                "_seal_prompt_enhancement_images",
+                "_revalidate_prompt_enhancement_images",
+                "_remove_prompt_enhancement_snapshots",
+                "_materialize_prompt_enhancement_images",
+            }
+        ]
+        namespace = {
+            "Any": object,
+            "HTTPException": HTTPException,
+            "hashlib": hashlib,
+            "os": os,
+            "stat": stat,
+            "_LLM_CHAT_MAX_IMAGE_BYTES": 32 * 1024 * 1024,
+            "_LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES": 64 * 1024 * 1024,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        with tempfile.TemporaryDirectory() as root:
+            image_path = os.path.join(root, "owned.png")
+            with open(image_path, "wb") as handle:
+                handle.write(b"admitted-bytes")
+            seals = namespace["_seal_prompt_enhancement_images"]([image_path])
+            namespace["_revalidate_prompt_enhancement_images"](
+                [image_path], seals,
+            )
+            real_write = os.write
+
+            def short_write(descriptor, value):
+                partial = max(1, len(value) // 2)
+                return real_write(descriptor, value[:partial])
+
+            with mock.patch.object(
+                os, "write", side_effect=short_write,
+            ), mock.patch.object(os, "fchmod", new=None, create=True):
+                materialized = namespace[
+                    "_materialize_prompt_enhancement_images"
+                ](seals)
+            self.assertEqual(len(materialized), 1)
+            with open(materialized[0], "rb") as handle:
+                self.assertEqual(handle.read(), b"admitted-bytes")
+            real_unlink = os.unlink
+
+            def windows_unlink(path):
+                if not os.stat(path).st_mode & stat.S_IWRITE:
+                    raise PermissionError("simulated Windows read-only file")
+                return real_unlink(path)
+
+            with mock.patch.object(
+                os, "unlink", side_effect=windows_unlink,
+            ):
+                namespace["_remove_prompt_enhancement_snapshots"](
+                    materialized,
+                )
+            self.assertFalse(os.path.exists(materialized[0]))
+
+            replacement = os.path.join(root, "replacement.png")
+            with open(replacement, "wb") as handle:
+                handle.write(b"changed!-bytes")
+            os.replace(replacement, image_path)
+            with self.assertRaises(HTTPException) as raised:
+                namespace["_revalidate_prompt_enhancement_images"](
+                    [image_path], seals,
+                )
+            self.assertEqual(raised.exception.status_code, 404)
+            with self.assertRaises(HTTPException) as materialize_raised:
+                namespace["_materialize_prompt_enhancement_images"](seals)
+            self.assertEqual(materialize_raised.exception.status_code, 404)
+
+    def test_image_seal_rejects_per_file_and_aggregate_size_before_hashing(self):
+        import hashlib
+        import os
+        import stat
+        import tempfile
+        from fastapi import HTTPException
+
+        _source, node = self._function_node(
+            "_seal_prompt_enhancement_images",
+        )
+        namespace = {
+            "Any": object,
+            "HTTPException": HTTPException,
+            "hashlib": hashlib,
+            "os": os,
+            "stat": stat,
+            "_LLM_CHAT_MAX_IMAGE_BYTES": 8,
+            "_LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES": 12,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        seal = namespace["_seal_prompt_enhancement_images"]
+        with tempfile.TemporaryDirectory() as root:
+            oversized = os.path.join(root, "oversized.png")
+            with open(oversized, "wb") as handle:
+                handle.truncate(9)
+            with mock.patch.object(
+                os, "read", side_effect=AssertionError("must not hash"),
+            ), self.assertRaises(HTTPException) as per_file:
+                seal([oversized])
+            self.assertEqual(per_file.exception.status_code, 413)
+
+            aggregate = []
+            for index in range(2):
+                image_path = os.path.join(root, f"aggregate-{index}.png")
+                with open(image_path, "wb") as handle:
+                    handle.truncate(7)
+                aggregate.append(image_path)
+            with mock.patch.object(
+                os, "read", side_effect=AssertionError("must not hash"),
+            ), self.assertRaises(HTTPException) as total:
+                seal(aggregate)
+            self.assertEqual(total.exception.status_code, 413)
+
+    def test_snapshot_cleanup_removes_windows_read_only_files_for_all_terminals(self):
+        import os
+        import stat
+        import tempfile
+
+        _source, node = self._function_node(
+            "_remove_prompt_enhancement_snapshots",
+        )
+        namespace = {"os": os, "stat": stat}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        cleanup = namespace["_remove_prompt_enhancement_snapshots"]
+        real_unlink = os.unlink
+
+        def windows_unlink(path):
+            if not os.stat(path).st_mode & stat.S_IWRITE:
+                raise PermissionError("simulated Windows read-only file")
+            return real_unlink(path)
+
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+            os, "unlink", side_effect=windows_unlink,
+        ):
+            for terminal in ("success", "cancel", "error"):
+                snapshot = os.path.join(root, f"{terminal}.png")
+                with open(snapshot, "wb") as handle:
+                    handle.write(b"private-image")
+                os.chmod(snapshot, 0o400)
+                try:
+                    if terminal == "cancel":
+                        raise asyncio.CancelledError()
+                    if terminal == "error":
+                        raise RuntimeError("inference failed")
+                except (asyncio.CancelledError, RuntimeError):
+                    pass
+                finally:
+                    cleanup([snapshot])
+                self.assertFalse(os.path.exists(snapshot), terminal)
+
+    def test_image_byte_caps_survive_replace_and_growth_during_read(self):
+        import hashlib
+        import os
+        import stat
+        import tempfile
+        from fastapi import HTTPException
+
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in {
+                "_seal_prompt_enhancement_images",
+                "_remove_prompt_enhancement_snapshots",
+                "_materialize_prompt_enhancement_images",
+            }
+        ]
+        namespace = {
+            "Any": object,
+            "HTTPException": HTTPException,
+            "hashlib": hashlib,
+            "os": os,
+            "stat": stat,
+            "_LLM_CHAT_MAX_IMAGE_BYTES": 32 * 1024 * 1024,
+            "_LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES": 64 * 1024 * 1024,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        seal = namespace["_seal_prompt_enhancement_images"]
+        materialize = namespace["_materialize_prompt_enhancement_images"]
+        with tempfile.TemporaryDirectory() as root:
+            image_path = os.path.join(root, "owned.png")
+            original_bytes = b"admitted"
+            with open(image_path, "wb") as handle:
+                handle.write(original_bytes)
+            replacement = os.path.join(root, "replacement.png")
+            with open(replacement, "wb") as handle:
+                handle.write(b"replacement-is-larger")
+
+            real_read = os.read
+            replaced = False
+            source_read_sizes = []
+
+            def replace_during_read(descriptor, count):
+                nonlocal replaced
+                data = real_read(descriptor, count)
+                if not replaced and count > 1:
+                    replaced = True
+                    source_read_sizes.append(count)
+                    os.replace(replacement, image_path)
+                return data
+
+            with mock.patch.object(
+                os, "read", side_effect=replace_during_read,
+            ), self.assertRaises(HTTPException) as replaced_error:
+                seal([image_path])
+            self.assertEqual(replaced_error.exception.status_code, 404)
+            self.assertEqual(source_read_sizes, [len(original_bytes)])
+
+            with open(image_path, "wb") as handle:
+                handle.write(original_bytes)
+            seals = seal([image_path])
+            admitted_inode = seals[0]["inode"]
+            grown = False
+            source_read_sizes = []
+
+            def grow_during_read(descriptor, count):
+                nonlocal grown
+                data = real_read(descriptor, count)
+                try:
+                    is_source = os.fstat(descriptor).st_ino == admitted_inode
+                except OSError:
+                    is_source = False
+                if is_source:
+                    source_read_sizes.append(count)
+                    if not grown and data:
+                        grown = True
+                        with open(image_path, "ab") as handle:
+                            handle.write(b"growth-beyond-admitted-size")
+                return data
+
+            with mock.patch.object(
+                os, "read", side_effect=grow_during_read,
+            ), self.assertRaises(HTTPException) as grown_error:
+                materialize(seals)
+            self.assertEqual(grown_error.exception.status_code, 404)
+            self.assertEqual(
+                source_read_sizes, [len(original_bytes), 1],
+            )
+
+    async def test_detached_worker_rejects_replaced_image_before_runtime(self):
+        import hashlib
+        import os
+        import stat
+        import tempfile
+        from fastapi import HTTPException
+
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_seal_prompt_enhancement_images",
+            "_revalidate_prompt_enhancement_images",
+            "llm_enhance_prompt",
+        }
+        nodes = []
+        for node in tree.body:
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in wanted
+            ):
+                node.decorator_list = []
+                nodes.append(node)
+        runtime_calls = []
+        namespace = {
+            "Any": object,
+            "Request": object,
+            "HTTPException": HTTPException,
+            "JSONResponse": object,
+            "copy": __import__("copy"),
+            "hashlib": hashlib,
+            "hmac": __import__("hmac"),
+            "os": os,
+            "stat": stat,
+            "_LLM_CHAT_MAX_IMAGE_BYTES": 32 * 1024 * 1024,
+            "_LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES": 64 * 1024 * 1024,
+            "_promote_external_llm_request": lambda _request: None,
+            "_request_project_workspace": lambda _request, value: value,
+            "_require_project_access": lambda *_args, **_kwargs: None,
+            "_prompt_enhancement_runtime_snapshot": (
+                lambda *_args, **_kwargs: runtime_calls.append(True)
+            ),
+        }
+        with tempfile.TemporaryDirectory() as root:
+            image_path = os.path.join(root, "owned.png")
+            with open(image_path, "wb") as handle:
+                handle.write(b"admitted-bytes")
+            exec(compile(ast.fix_missing_locations(ast.Module(
+                body=nodes, type_ignores=[],
+            )), "launch.py", "exec"), namespace)
+            seals = namespace["_seal_prompt_enhancement_images"]([image_path])
+            replacement = os.path.join(root, "replacement.png")
+            with open(replacement, "wb") as handle:
+                handle.write(b"changed!-bytes")
+            os.replace(replacement, image_path)
+            namespace["_resolve_prompt_enhancement_images"] = (
+                lambda *_args: [image_path]
+            )
+
+            class Request:
+                state = types.SimpleNamespace(
+                    maestro_remote=False,
+                    maestro_session_id="owner",
+                    maestro_llm_enhance_image_seals=seals,
+                )
+
+                async def json(self):
+                    return {"workspace": "project", "prompt": "private"}
+
+            with self.assertRaises(HTTPException) as raised:
+                await namespace["llm_enhance_prompt"](Request())
+            self.assertEqual(raised.exception.status_code, 404)
+            self.assertEqual(runtime_calls, [])
+
+    async def test_synchronous_image_enhance_uses_private_snapshot_and_cleans_it(self):
+        import hashlib
+        import os
+        import stat
+        import tempfile
+        from fastapi import HTTPException
+        from starlette.responses import JSONResponse
+
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_seal_prompt_enhancement_images",
+            "_remove_prompt_enhancement_snapshots",
+            "_materialize_prompt_enhancement_images",
+            "_ScopedPromptEnhancementRequest",
+            "llm_enhance_prompt",
+        }
+        nodes = []
+        for node in tree.body:
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in wanted
+            ) or (
+                isinstance(node, ast.ClassDef) and node.name in wanted
+            ):
+                node.decorator_list = []
+                nodes.append(node)
+        namespace = {
+            "Any": object,
+            "Mapping": dict,
+            "Request": object,
+            "HTTPException": HTTPException,
+            "JSONResponse": JSONResponse,
+            "copy": __import__("copy"),
+            "hashlib": hashlib,
+            "hmac": __import__("hmac"),
+            "os": os,
+            "stat": stat,
+            "_LLM_CHAT_MAX_IMAGE_BYTES": 32 * 1024 * 1024,
+            "_LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES": 64 * 1024 * 1024,
+            "_promote_external_llm_request": lambda _request: None,
+            "_request_project_workspace": lambda _request, value: value,
+            "_require_project_access": lambda *_args, **_kwargs: None,
+            "_prompt_enhancement_runtime_snapshot": (
+                lambda *_args, **_kwargs: {"selection": {"model_id": "local"}}
+            ),
+            "_CPU_TEXT_OPERATIONS": frozenset({
+                "prompt_enhancement",
+                "generation_preparation",
+                "reference_planning",
+            }),
+            "_llm_operation_scope": lambda *_args: ("owner", "a" * 64),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        route = namespace["llm_enhance_prompt"]
+        observed_snapshots = []
+
+        async def execute_detached(detached_request):
+            paths = list(
+                detached_request.state.maestro_llm_enhance_materialized_images
+            )
+            observed_snapshots.extend(paths)
+            self.assertEqual(len(paths), 1)
+            self.assertTrue(os.path.isfile(paths[0]))
+            self.assertEqual(Path(paths[0]).read_bytes(), b"admitted-image")
+            self.assertTrue(
+                detached_request.state.maestro_generation_preparation
+            )
+            self.assertEqual(
+                detached_request.state.maestro_cpu_text_operation,
+                "generation_preparation",
+            )
+            self.assertFalse(
+                detached_request.state.maestro_cpu_text_text_only
+            )
+            return {"enhanced": "done"}
+
+        namespace["llm_enhance_prompt"] = execute_detached
+
+        class Request:
+            headers = {}
+            base_url = "http://local/"
+            client = types.SimpleNamespace(host="127.0.0.1")
+            state = types.SimpleNamespace(
+                maestro_session_id="owner",
+                maestro_remote=False,
+                maestro_account_principal={"id": "owner"},
+                maestro_generation_preparation=True,
+                maestro_cpu_text_operation="generation_preparation",
+                maestro_cpu_text_text_only=False,
+            )
+
+            def __init__(self, image_path):
+                self.image_path = image_path
+
+            async def json(self):
+                return {
+                    "workspace": "project",
+                    "prompt": "private prompt",
+                    "image_path": "owned.png",
+                }
+
+        with tempfile.TemporaryDirectory() as root:
+            image_path = os.path.join(root, "owned.png")
+            Path(image_path).write_bytes(b"admitted-image")
+            namespace["_resolve_prompt_enhancement_images"] = (
+                lambda request, *_args: [request.image_path]
+            )
+            result = await route(Request(image_path))
+            self.assertEqual(result, {"enhanced": "done"})
+            self.assertTrue(observed_snapshots)
+            self.assertTrue(all(
+                not os.path.exists(path) for path in observed_snapshots
+            ))
+
+            symlink_path = os.path.join(root, "linked.png")
+            os.symlink(image_path, symlink_path)
+            with self.assertRaises(HTTPException) as raised:
+                await route(Request(symlink_path))
+            self.assertEqual(raised.exception.status_code, 404)
+            self.assertEqual(len(observed_snapshots), 1)
+
+    def test_scoped_request_preserves_remote_provider_denial(self):
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        selected = [
+            node for node in tree.body
+            if (
+                isinstance(node, ast.ClassDef)
+                and node.name == "_ScopedPromptEnhancementRequest"
+            ) or (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "_run_authorized_llm_with_selection"
+            )
+        ]
+        namespace = {
+            "Request": object,
+            "copy": __import__("copy"),
+            "_CPU_TEXT_OPERATIONS": frozenset({
+                "prompt_enhancement",
+                "generation_preparation",
+                "reference_planning",
+            }),
+            "_llm_chat_request_is_external": (
+                lambda request: bool(request.state.maestro_remote)
+            ),
+            "_run_llm_with_selection": lambda *_args, **_kwargs: self.fail(
+                "remote provider reached the model lease"
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        original = types.SimpleNamespace(
+            headers={},
+            base_url="https://maestro.example/",
+            client=None,
+            url=types.SimpleNamespace(path="/api/v1/llm/enhance-prompt"),
+            state=types.SimpleNamespace(
+                maestro_session_id="remote-owner",
+                maestro_remote=True,
+            ),
+        )
+        authority = namespace[
+            "_ScopedPromptEnhancementRequest"
+        ].snapshot_authority(original)
+        detached = namespace["_ScopedPromptEnhancementRequest"](
+            authority,
+            {"workspace": "project", "prompt": "private"},
+            progress_callback=lambda _event: None,
+            cancel_handle=object(),
+            project_instance_key="project-instance",
+            runtime_snapshot={"selection": {"provider": "openai"}},
+            image_seals=[],
+            materialized_image_paths=[],
+        )
+        self.assertTrue(detached.state.maestro_remote)
+        self.assertEqual(detached.headers, {})
+        self.assertFalse(hasattr(detached.state, "private_header"))
+        with self.assertRaises(PermissionError):
+            namespace["_run_authorized_llm_with_selection"](
+                detached,
+                {
+                    "provider": "openai",
+                    "remote_url": "https://provider.invalid",
+                    "api_key": "host-secret",
+                },
+                lambda: self.fail("remote provider received content"),
+            )
+
+    def test_configured_enhancer_uses_exact_provider_catalog_selection(self):
+        from fastapi import HTTPException
+        from services import llm_service as _loaded_llm_service
+
+        _source, node = self._function_node(
+            "_resolve_prompt_enhancer_runtime_selection",
+        )
+        resolved = {
+            "model_id": "provider-model",
+            "device": "cpu",
+            "provider": "openai",
+            "remote_url": "https://provider.invalid",
+            "api_key": "host-secret",
+            "local_gguf_path": "",
+            "gguf_file_override": "",
+        }
+        namespace = {
+            "Any": object,
+            "Request": object,
+            "HTTPException": HTTPException,
+            "hmac": __import__("hmac"),
+            "_resolve_prompt_enhancer_selection": (
+                lambda *_args, **_kwargs: ("provider-model", "cuda", False)
+            ),
+            "_llm_model_catalog": lambda *_args: [{
+                "id": "provider-model", "provider": "openai",
+            }],
+            "_resolve_llm_chat_model": (
+                lambda *_args: dict(resolved)
+            ),
+            "_llm_chat_request_is_external": lambda _request: False,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        fake_service = types.SimpleNamespace(MODEL_REGISTRY={})
+        services = {
+            "enhance_llm_model_id": "provider-model",
+            "llm_provider": "openai",
+        }
+        with mock.patch.object(
+            sys.modules["services"], "llm_service", fake_service,
+        ):
+            selection, raw_mode = namespace[
+                "_resolve_prompt_enhancer_runtime_selection"
+            ](object(), "", services, has_images=False)
+        self.assertEqual(selection, resolved)
+        self.assertFalse(raw_mode)
+
+        namespace["_resolve_llm_chat_model"] = lambda *_args: {
+            **resolved, "provider": "local", "remote_url": "", "api_key": "",
+        }
+        with mock.patch.object(
+            sys.modules["services"], "llm_service", fake_service,
+        ), self.assertRaises(HTTPException) as raised:
+            namespace["_resolve_prompt_enhancer_runtime_selection"](
+                object(), "", services, has_images=False,
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+
+    def test_external_configured_provider_without_local_catalog_fails_closed(self):
+        from fastapi import HTTPException
+        from services import llm_service as _loaded_llm_service
+
+        _source, node = self._function_node(
+            "_resolve_prompt_enhancer_runtime_selection",
+        )
+        provider_calls = []
+        namespace = {
+            "Any": object,
+            "Request": object,
+            "HTTPException": HTTPException,
+            "hmac": __import__("hmac"),
+            "_resolve_prompt_enhancer_selection": (
+                lambda *_args, **_kwargs: ("provider-model", "cuda", False)
+            ),
+            "_llm_model_catalog": lambda *_args: [],
+            "_resolve_llm_chat_model": (
+                lambda *_args: provider_calls.append(True)
+            ),
+            "_llm_chat_request_is_external": lambda _request: True,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        fake_service = types.SimpleNamespace(MODEL_REGISTRY={})
+        with mock.patch.object(
+            sys.modules["services"], "llm_service", fake_service,
+        ), self.assertRaises(HTTPException) as raised:
+            namespace["_resolve_prompt_enhancer_runtime_selection"](
+                object(),
+                "",
+                {
+                    "enhance_llm_model_id": "provider-model",
+                    "llm_provider": "openai",
+                },
+                has_images=False,
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(provider_calls, [])
+
+    async def test_wangp_cancel_is_terminal_and_never_falls_back(self):
+        from fastapi import HTTPException
+        from services.llm_cancellation import (
+            LlmCancellationHandle,
+            LlmRequestCancelled,
+        )
+
+        _source, node = self._function_node("llm_enhance_prompt")
+        fallback_calls = []
+
+        async def cancelled_wangp(*_args, **_kwargs):
+            raise LlmRequestCancelled("cancelled")
+
+        namespace = {
+            "Request": object,
+            "HTTPException": HTTPException,
+            "JSONResponse": object,
+            "copy": __import__("copy"),
+            "hmac": __import__("hmac"),
+            "wgp": types.SimpleNamespace(server_config={
+                "enhancer_enabled": 1,
+                "services": {},
+            }),
+            "_promote_external_llm_request": lambda _request: None,
+            "_request_project_workspace": lambda _request, value: value,
+            "_require_project_access": lambda *_args, **_kwargs: None,
+            "_resolve_prompt_enhancement_images": lambda *_args: [],
+            "_explicit_llm_guidance_allowed": lambda _body: False,
+            "_llm_route_progress_callback": lambda _request: None,
+            "_emit_llm_progress": lambda *_args: None,
+            "_enhance_with_wangp": cancelled_wangp,
+            "_resolve_prompt_enhancer_selection": (
+                lambda *_args, **_kwargs: fallback_calls.append(True)
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+
+        class Request:
+            state = types.SimpleNamespace(
+                maestro_session_id="owner",
+                maestro_remote=False,
+                maestro_llm_cancel_handle=LlmCancellationHandle(),
+            )
+
+            async def json(self):
+                return {"workspace": "project", "prompt": "content"}
+
+        with self.assertRaises(LlmRequestCancelled):
+            await namespace["llm_enhance_prompt"](Request())
+        self.assertEqual(fallback_calls, [])
+
+    def test_wangp_postcondition_preserves_exact_global_timestamps(self):
+        from shared.utils import prompt_parser
+
+        _source, node = self._function_node(
+            "_validate_standalone_enhanced_prompt_cardinality",
+        )
+        namespace = {
+            "Any": object,
+            "Mapping": dict,
+            "wgp": types.SimpleNamespace(
+                prompt_parser=prompt_parser,
+                _validate_enhanced_prompt_cardinality=(
+                    lambda *_args: self.fail("timeline reached cardinality")
+                ),
+            ),
+            "_ENHANCED_PROMPT_CARDINALITY_VERSION": 1,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        validate = namespace[
+            "_validate_standalone_enhanced_prompt_cardinality"
+        ]
+        cases = (
+            (
+                "[00:00] Begin.\n[00:05] End.",
+                "[00:00] Improved.\n[00:05] Finish.",
+                "Opening at [00:00], then finishing at [00:05].",
+            ),
+            (
+                "10s Begin.\n20 seconds End.",
+                "10s Improved.\n20 seconds Finish.",
+                "10s Improved.\n21 seconds Finish.",
+            ),
+            (
+                "[10-18s] Begin.\n[18-25s] End.",
+                "[10-18s] Improved.\n[18-25s] Finish.",
+                "[10-19s] Improved.\n[19-25s] Finish.",
+            ),
+        )
+        for source_prompt, same, changed in cases:
+            body = {
+                "prompt": source_prompt,
+                "mode": "video",
+                "window_count": 2,
+                "preserve_global_timeline": True,
+            }
+            with self.subTest(source=source_prompt):
+                self.assertEqual(validate(body, "ltx_test", same), same)
+                with self.assertRaises(ValueError):
+                    validate(body, "ltx_test", changed)
+
+    async def test_worker_image_copy_keeps_status_responsive_and_honors_cancel(self):
+        manager = LlmRouteOperationManager()
+        entered = threading.Event()
+        release = threading.Event()
+        request_id = str(uuid.uuid4())
+
+        def bounded_copy(cancellation):
+            entered.set()
+            while not release.wait(0.01):
+                cancellation.checkpoint()
+            cancellation.checkpoint()
+
+        async def execute(progress, cancellation):
+            progress({"phase": "loading", "stage": "image_snapshot"})
+            await run_blocking_shielded(bounded_copy, cancellation)
+            return {"enhanced": "must not complete"}
+
+        manager.submit(
+            request_id=request_id,
+            owner_key="owner",
+            project_instance_key="project",
+            operation_kind="enhance",
+            effective_input_digest="digest",
+            execute=execute,
+        )
+        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        started = time.monotonic()
+        status = manager.status(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project",
+            operation_kind="enhance",
+        )
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertEqual(status["stage"], "image_snapshot")
+        manager.cancel(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project",
+            operation_kind="enhance",
+        )
+        release.set()
+        terminal = await manager.wait(
+            request_id,
+            owner_key="owner",
+            project_instance_key="project",
+            operation_kind="enhance",
+        )
+        self.assertEqual(terminal["status"], "cancelled")
+
+    async def test_caller_uuid_submission_returns_202_after_authorized_digest(self):
+        from fastapi import HTTPException
+        from starlette.responses import JSONResponse
+
+        _source, node = self._function_node("llm_enhance_prompt")
+        events = []
+        captured = {}
+        request_id = str(uuid.uuid4())
+
+        class Manager:
+            @staticmethod
+            def submit(**kwargs):
+                events.append("submit")
+                captured.update(kwargs)
+                return {
+                    "request_id": kwargs["request_id"],
+                    "operation_kind": kwargs["operation_kind"],
+                    "status": "running",
+                }
+
+        namespace = {
+            "Request": object,
+            "HTTPException": HTTPException,
+            "JSONResponse": JSONResponse,
+            "copy": __import__("copy"),
+            "hmac": __import__("hmac"),
+            "_promote_external_llm_request": (
+                lambda _request: events.append("promote")
+            ),
+            "_request_project_workspace": (
+                lambda _request, value: events.append("workspace") or value
+            ),
+            "_require_project_access": (
+                lambda *_args, **_kwargs: events.append("authorize")
+            ),
+            "_resolve_prompt_enhancement_images": (
+                lambda *_args: events.append("images") or ["/owned/image.png"]
+            ),
+            "_seal_prompt_enhancement_images": (
+                lambda *_args: events.append("seal") or [{
+                    "path": "/owned/image.png",
+                    "size": 1,
+                    "sha256": "a" * 64,
+                }]
+            ),
+            "_normalize_llm_route_request_id": (
+                lambda value: uuid.UUID(value).hex
+            ),
+            "_prompt_enhancement_runtime_snapshot": (
+                lambda *_args, **_kwargs: events.append("runtime") or {
+                    "selection": {"model_id": "local"},
+                }
+            ),
+            "_prompt_enhancement_effective_digest": (
+                lambda *_args, **_kwargs: events.append("digest")
+                or "effective-digest"
+            ),
+            "_llm_operation_scope": (
+                lambda *_args: ("owner", "b" * 64)
+            ),
+            "_ScopedPromptEnhancementRequest": types.SimpleNamespace(
+                snapshot_authority=lambda _request: {"session_id": "owner"},
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+
+        class Request:
+            state = types.SimpleNamespace(
+                maestro_session_id="owner", maestro_remote=False,
+            )
+
+            async def json(self):
+                return {
+                    "request_id": request_id,
+                    "project_instance": "b" * 64,
+                    "workspace": "project",
+                    "prompt": "private prompt",
+                }
+
+        with mock.patch.object(
+            llm_operations, "llm_route_operation_manager", Manager(),
+        ):
+            response = await namespace["llm_enhance_prompt"](Request())
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(captured["request_id"], uuid.UUID(request_id).hex)
+        self.assertEqual(captured["operation_kind"], "enhance")
+        self.assertEqual(
+            captured["effective_input_digest"], "effective-digest",
+        )
+        self.assertTrue(callable(captured["execute"]))
+        self.assertLess(events.index("authorize"), events.index("runtime"))
+        self.assertLess(events.index("images"), events.index("runtime"))
+        self.assertLess(events.index("seal"), events.index("runtime"))
+        self.assertLess(events.index("digest"), events.index("submit"))
+
+    async def test_scoped_submit_rejects_project_recreation_before_runtime(self):
+        from fastapi import HTTPException
+        from starlette.responses import JSONResponse
+
+        _source, node = self._function_node("llm_enhance_prompt")
+        runtime_calls = []
+        submit_calls = []
+        request_id = str(uuid.uuid4())
+        old_instance = "a" * 64
+        recreated_instance = "b" * 64
+
+        class Manager:
+            @staticmethod
+            def submit(**kwargs):
+                submit_calls.append(kwargs)
+                return {"status": "running"}
+
+        namespace = {
+            "Request": object,
+            "HTTPException": HTTPException,
+            "JSONResponse": JSONResponse,
+            "copy": __import__("copy"),
+            "hmac": __import__("hmac"),
+            "_promote_external_llm_request": lambda _request: None,
+            "_request_project_workspace": lambda _request, value: value,
+            "_require_project_access": lambda *_args, **_kwargs: None,
+            "_resolve_prompt_enhancement_images": lambda *_args: [],
+            "_normalize_llm_route_request_id": (
+                lambda value: uuid.UUID(value).hex
+            ),
+            "_llm_operation_scope": (
+                lambda *_args: ("owner", recreated_instance)
+            ),
+            "_seal_prompt_enhancement_images": lambda *_args: [],
+            "_prompt_enhancement_runtime_snapshot": (
+                lambda *_args, **_kwargs: runtime_calls.append(True)
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+
+        class Request:
+            state = types.SimpleNamespace(
+                maestro_session_id="owner", maestro_remote=False,
+            )
+
+            async def json(self):
+                return {
+                    "request_id": request_id,
+                    "project_instance": old_instance,
+                    "workspace": "project",
+                    "prompt": "private prompt",
+                }
+
+        with mock.patch.object(
+            llm_operations, "llm_route_operation_manager", Manager(),
+        ), self.assertRaises(HTTPException) as raised:
+            await namespace["llm_enhance_prompt"](Request())
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail, "Prompt Enhance request does not match",
+        )
+        self.assertEqual(runtime_calls, [])
+        self.assertEqual(submit_calls, [])
+
+    async def test_generic_routes_are_exact_scope_recoverable_and_cancellable(self):
+        from fastapi import HTTPException
+        from starlette.responses import JSONResponse
+
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_llm_route_operation_scope_or_404",
+            "llm_route_operation_status",
+            "llm_route_operation_result",
+            "cancel_llm_route_operation",
+        }
+        nodes = []
+        for node in tree.body:
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in wanted
+            ):
+                node.decorator_list = []
+                nodes.append(node)
+        manager = LlmRouteOperationManager()
+        request_id = str(uuid.uuid4())
+        gate = asyncio.Event()
+
+        async def execute(progress, cancellation):
+            progress({"phase": "generating", "text": "bounded partial"})
+            await gate.wait()
+            cancellation.checkpoint()
+            return {"enhanced": "private result"}
+
+        manager.submit(
+            request_id=request_id,
+            owner_key="owner",
+            project_instance_key="project-one",
+            operation_kind="enhance",
+            effective_input_digest="digest",
+            execute=execute,
+        )
+        namespace = {
+            "Request": object,
+            "HTTPException": HTTPException,
+            "JSONResponse": JSONResponse,
+            "_LLM_ROUTE_OPERATION_KINDS": frozenset({"enhance"}),
+            "_promote_external_llm_request": lambda _request: None,
+            "_request_project_workspace": lambda _request, value: value,
+            "_require_project_access": lambda *_args, **_kwargs: None,
+            "_llm_operation_scope": (
+                lambda _request, workspace: ("owner", workspace)
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        request = types.SimpleNamespace(state=types.SimpleNamespace())
+        with mock.patch.object(
+            llm_operations, "llm_route_operation_manager", manager,
+        ):
+            for _ in range(100):
+                status = namespace["llm_route_operation_status"](
+                    request, "enhance", request_id, "project-one",
+                )
+                if status["partial_text"]:
+                    break
+                await asyncio.sleep(0.001)
+            self.assertEqual(status["partial_text"], "bounded partial")
+            waiting = namespace["llm_route_operation_result"](
+                request, "enhance", request_id, "project-one",
+            )
+            self.assertEqual(waiting.status_code, 202)
+            with self.assertRaises(HTTPException) as foreign:
+                namespace["llm_route_operation_status"](
+                    request, "enhance", request_id, "recreated-project",
+                )
+            self.assertEqual(foreign.exception.status_code, 404)
+            cancelled = namespace["cancel_llm_route_operation"](
+                request, "enhance", request_id, "project-one",
+            )
+            self.assertEqual(cancelled["status"], "cancelled")
+            terminal = namespace["llm_route_operation_result"](
+                request, "enhance", request_id, "project-one",
+            )
+            self.assertEqual(terminal.status_code, 409)
+        gate.set()
+        await asyncio.sleep(0)
 
 
 class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
@@ -1225,11 +2478,17 @@ class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
                 self.status_code = status_code
                 self.detail = detail
 
+        @contextmanager
+        def native_gpu_slot(*_args, **_kwargs):
+            yield False
+
         namespace = {
             "Request": object,
             "asyncio": asyncio,
             "HTTPException": HTTPException,
             "_gen_lock": threading.RLock(),
+            "_WgpNativeGpuExecutionSlot": native_gpu_slot,
+            "_local_llm_uses_native_gpu": lambda _selection: False,
             "wgp": types.SimpleNamespace(server_config={"services": {
                 "director_prompt_polish": "off",
             }}, transformer_type="", wan_model=None, offloadobj=None),
@@ -1334,6 +2593,44 @@ class DirectRouteSecurityTests(unittest.TestCase):
                 lambda: None,
             )
 
+    def test_external_origin_is_revalidated_after_model_lease(self):
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "_run_authorized_llm_with_selection"
+        )
+        external_reads = iter((False, True))
+        provider_calls = []
+
+        def run_with_selection(_selection, operation, *_args, **_kwargs):
+            return operation()
+
+        namespace = {
+            "Request": object,
+            "_promote_external_llm_request": lambda _request: None,
+            "_llm_chat_request_is_external": (
+                lambda _request: next(external_reads)
+            ),
+            "_run_llm_with_selection": run_with_selection,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "launch.py", "exec"), namespace)
+        request = types.SimpleNamespace(state=types.SimpleNamespace())
+        with self.assertRaises(PermissionError):
+            namespace["_run_authorized_llm_with_selection"](
+                request,
+                {
+                    "provider": "openai",
+                    "remote_url": "https://provider.invalid",
+                    "api_key": "host-secret",
+                },
+                lambda: provider_calls.append(True),
+            )
+        self.assertEqual(provider_calls, [])
+
     def test_lan_unload_and_stream_status_are_local_only(self):
         from fastapi import HTTPException
 
@@ -1416,6 +2713,9 @@ class DirectRouteSecurityTests(unittest.TestCase):
             ("/api/v1/llm/prepare/missing", 404),
             ("/api/v1/llm/chat", 400),
             ("/api/v1/llm/chat/request-id", 200),
+            ("/api/v1/llm/enhance-prompt", 202),
+            ("/api/v1/llm/operations/enhance/request-id", 200),
+            ("/api/v1/llm/operations/enhance/request-id/result", 409),
         ):
             with self.subTest(path=path, code=code):
                 response = asyncio.run(exercise(path, code))

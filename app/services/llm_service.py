@@ -9,6 +9,7 @@ import os
 import gc
 import hashlib
 import functools
+import inspect
 import math
 import re
 import time
@@ -592,15 +593,22 @@ def _with_model_lease(function):
 
 
 def _with_stream_done_finally(function):
-    """Publish terminal legacy stream state even when cancellation escapes."""
+    """Publish terminal state only for callers using the legacy stream."""
+    signature = inspect.signature(function)
+
     @functools.wraps(function)
     def wrapped(*args, **kwargs):
         global _stream_done
+        bound = signature.bind_partial(*args, **kwargs)
+        request_scoped_progress = callable(
+            bound.arguments.get("progress_callback")
+        )
         try:
             return function(*args, **kwargs)
         finally:
-            with _stream_lock:
-                _stream_done = True
+            if not request_scoped_progress:
+                with _stream_lock:
+                    _stream_done = True
     return wrapped
 
 
@@ -4555,6 +4563,7 @@ def generate_chat(
     an idle unload or another request from swapping the process mid-turn.
     """
     global _stream_done
+    request_scoped_progress = callable(progress_callback)
     _cancellation_checkpoint(cancel_handle)
     clean_messages = validate_chat_messages(messages)
     if (
@@ -4785,8 +4794,9 @@ def generate_chat(
                 close_response = getattr(response, "close", None)
                 if close_owned_response and callable(close_response):
                     close_response()
-                with _stream_lock:
-                    _stream_done = True
+                if not request_scoped_progress:
+                    with _stream_lock:
+                        _stream_done = True
             if refused:
                 _cancellation_checkpoint(cancel_handle)
                 print("[LLM] Response-assist retry 1/1")
@@ -5158,7 +5168,7 @@ def generate_streaming(
     if not is_loaded():
         raise RuntimeError("LLM not loaded. Call load_model() first.")
 
-    request_scoped_progress = progress_callback is not None
+    request_scoped_progress = callable(progress_callback)
 
     # Grammar-constrained JSON mode requires thinking OFF — same rationale
     # as the matching block in generate(): the grammar masks sampling from
@@ -5606,7 +5616,7 @@ def _generate_streaming_anthropic(
 ) -> str:
     """Streaming generation via Anthropic Messages API with SSE."""
     global _stream_buffer, _stream_done
-    request_scoped_progress = progress_callback is not None
+    request_scoped_progress = callable(progress_callback)
 
     system_text = ""
     api_messages = []
@@ -5688,8 +5698,9 @@ def _generate_streaming_anthropic(
         close_response = getattr(resp, "close", None)
         if close_owned_response and callable(close_response):
             close_response()
-        with _stream_lock:
-            _stream_done = True
+        if not request_scoped_progress:
+            with _stream_lock:
+                _stream_done = True
 
     _cancellation_checkpoint(cancel_handle)
     content = _strip_thinking_tags(raw_content)

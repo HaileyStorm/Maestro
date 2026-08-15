@@ -290,6 +290,224 @@ try {
     { workspace: 'project-a', purpose: 'configured' },
   ])
 
+  const enhanceRequestId = '00000000-0000-4000-8000-000000000010'
+  const enhanceRequestIdHex = enhanceRequestId.replaceAll('-', '')
+  const enhanceProjectInstance = 'a'.repeat(64)
+  const enhanceScope = {
+    requestId: enhanceRequestId,
+    workspace: 'project-a',
+    projectInstance: enhanceProjectInstance,
+  }
+  const routeStatus = overrides => ({
+    request_id: enhanceRequestIdHex,
+    operation_kind: 'enhance',
+    status: 'running',
+    phase: 'generating',
+    stage: 'llm',
+    pass: 1,
+    pass_limit: 1,
+    attempt: 1,
+    attempt_limit: 1,
+    partial_text: 'bounded partial',
+    generated_tokens_approx: 2,
+    elapsed_seconds: 0.5,
+    live_tps: 4,
+    average_tps: null,
+    result_available: false,
+    retryable: false,
+    ...overrides,
+  })
+
+  // Prompt Enhance persists its caller-created UUID before the async POST,
+  // then hidden tabs suspend exact-operation polling until visible again.
+  visibility = 'hidden'
+  const enhanceEvents = []
+  const enhanceStatuses = []
+  let enhanceStatusChecks = 0
+  globalThis.fetch = async (url, init = {}) => {
+    const requestUrl = String(url)
+    if (requestUrl.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({
+        operation_id: 'prepare-enhance', status: 'ready', phase: 'ready', retryable: false,
+      }, 202)
+    }
+    if (requestUrl.includes('/api/v1/llm/models?')) {
+      assert.equal(init.cache, 'no-store')
+      return jsonResponse({ models: [], guides: [], project_instance: enhanceProjectInstance })
+    }
+    if (requestUrl.endsWith('/api/v1/llm/enhance-prompt')) {
+      enhanceEvents.push('post')
+      const body = JSON.parse(init.body)
+      assert.equal(body.request_id, enhanceRequestId)
+      assert.equal(body.project_instance, enhanceProjectInstance)
+      assert.equal(body.prompt, 'private prompt')
+      assert.equal(init.cache, 'no-store')
+      return jsonResponse(routeStatus({}), 202)
+    }
+    if (requestUrl.includes('/api/v1/llm/operations/enhance/') && requestUrl.endsWith(`/result?workspace=project-a`)) {
+      return jsonResponse({ original: 'private prompt', enhanced: 'enhanced prompt' })
+    }
+    if (requestUrl.includes('/api/v1/llm/operations/enhance/')) {
+      enhanceStatusChecks += 1
+      assert.equal(init.cache, 'no-store')
+      return jsonResponse(routeStatus({
+        status: 'completed', phase: 'completed', stage: 'completed',
+        partial_text: 'enhanced prompt', live_tps: null, average_tps: 4,
+        result_available: true,
+      }))
+    }
+    throw new Error(`Unexpected Enhance URL: ${url}`)
+  }
+  const enhanced = api.llmEnhancePrompt({
+    workspace: 'project-a',
+    request_id: enhanceRequestId,
+    project_instance: enhanceProjectInstance,
+    prompt: 'private prompt',
+    mode: 'video',
+  }, {
+    projectInstance: enhanceProjectInstance,
+    onSubmissionAttempted() { enhanceEvents.push('persist') },
+    onOperationStatus(status) { enhanceStatuses.push(status) },
+  })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.deepEqual(enhanceEvents, ['persist', 'post'])
+  assert.equal(enhanceStatuses[0].partial_text, 'bounded partial')
+  assert.equal(enhanceStatusChecks, 0)
+  visibility = 'visible'
+  visibilityTarget.dispatchEvent(new Event('visibilitychange'))
+  assert.equal((await enhanced).enhanced, 'enhanced prompt')
+  assert.equal(enhanceStatusChecks, 1)
+  assert.equal(enhanceStatuses.at(-1).average_tps, 4)
+
+  // A hidden accepted 202 is recovered by status before any idempotent retry.
+  const ambiguousEvents = []
+  let ambiguousPosts = 0
+  let ambiguousChecks = 0
+  globalThis.fetch = async (url, init = {}) => {
+    const requestUrl = String(url)
+    if (requestUrl.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'prepare-ambiguous', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (requestUrl.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: enhanceProjectInstance })
+    }
+    if (requestUrl.endsWith('/api/v1/llm/enhance-prompt')) {
+      ambiguousPosts += 1
+      ambiguousEvents.push('post')
+      throw new TypeError('proxy disconnected after accepting Enhance')
+    }
+    if (requestUrl.endsWith(`/result?workspace=project-a`)) {
+      return jsonResponse({ original: 'private prompt', enhanced: 'recovered prompt' })
+    }
+    if (requestUrl.includes('/api/v1/llm/operations/enhance/')) {
+      ambiguousChecks += 1
+      ambiguousEvents.push('status')
+      return jsonResponse(routeStatus({
+        status: 'completed', phase: 'completed', stage: 'completed',
+        partial_text: 'recovered prompt', live_tps: null, result_available: true,
+      }))
+    }
+    throw new Error(`Unexpected ambiguous Enhance URL: ${url}`)
+  }
+  const recoveredEnhance = await api.llmEnhancePrompt({
+    workspace: 'project-a', request_id: enhanceRequestId,
+    project_instance: enhanceProjectInstance,
+    prompt: 'private prompt', mode: 'video',
+  }, {
+    projectInstance: enhanceProjectInstance,
+    onSubmissionAttempted() { ambiguousEvents.push('persist') },
+  })
+  assert.equal(recoveredEnhance.enhanced, 'recovered prompt')
+  assert.equal(ambiguousPosts, 1)
+  assert.equal(ambiguousChecks, 1)
+  assert.deepEqual(ambiguousEvents.slice(0, 3), ['persist', 'post', 'status'])
+
+  await assert.rejects(
+    api.llmEnhancePrompt({
+      workspace: 'project-a', request_id: enhanceRequestId,
+      project_instance: 'b'.repeat(64), prompt: 'private prompt', mode: 'video',
+    }, { projectInstance: enhanceProjectInstance }),
+    error => error instanceof api.LlmEnhanceScopeError,
+  )
+
+  // Browser abort is wait-only. Only the explicit cancel helper sends DELETE,
+  // and a recreated same-name project fails before that mutation.
+  visibility = 'hidden'
+  let deleteCalls = 0
+  globalThis.fetch = async (url, init = {}) => {
+    const requestUrl = String(url)
+    if (requestUrl.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: enhanceProjectInstance })
+    }
+    if (init.method === 'DELETE') {
+      deleteCalls += 1
+      return jsonResponse(routeStatus({
+        status: 'cancelled', phase: 'cancelled', stage: 'cancelled',
+        partial_text: '', generated_tokens_approx: 0, elapsed_seconds: 0,
+        live_tps: null, average_tps: null,
+      }))
+    }
+    if (requestUrl.includes('/api/v1/llm/operations/enhance/')) {
+      return jsonResponse(routeStatus({}))
+    }
+    throw new Error(`Unexpected cancel URL: ${url}`)
+  }
+  const disconnectController = new AbortController()
+  const stoppedWait = api.waitForLlmEnhanceOperation(
+    enhanceScope, disconnectController.signal,
+  )
+  await new Promise(resolve => setTimeout(resolve, 20))
+  disconnectController.abort()
+  await assert.rejects(stoppedWait, error => error?.name === 'AbortError')
+  assert.equal(deleteCalls, 0)
+  const cancelledEnhance = await api.cancelLlmEnhancePrompt(enhanceScope)
+  assert.equal(cancelledEnhance.status, 'cancelled')
+  assert.equal(deleteCalls, 1)
+
+  // A DELETE 404 cannot prove cancellation while POST admission may still be
+  // settling. Establish the exact UUID, then retry DELETE to terminal state.
+  let racingDeletes = 0
+  let racingStatusChecks = 0
+  globalThis.fetch = async (url, init = {}) => {
+    const requestUrl = String(url)
+    if (requestUrl.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: enhanceProjectInstance })
+    }
+    if (init.method === 'DELETE') {
+      racingDeletes += 1
+      if (racingDeletes === 1) return jsonResponse({ detail: 'not found' }, 404)
+      return jsonResponse(routeStatus({
+        status: 'cancelled', phase: 'cancelled', stage: 'cancelled',
+        partial_text: '', live_tps: null, average_tps: null,
+      }))
+    }
+    if (requestUrl.includes('/api/v1/llm/operations/enhance/')) {
+      racingStatusChecks += 1
+      return jsonResponse(routeStatus({}))
+    }
+    throw new Error(`Unexpected admission-race URL: ${url}`)
+  }
+  assert.equal((await api.cancelLlmEnhancePrompt(enhanceScope)).status, 'cancelled')
+  assert.equal(racingDeletes, 2)
+  assert.equal(racingStatusChecks, 1)
+
+  const recreatedScope = { ...enhanceScope, projectInstance: 'b'.repeat(64) }
+  await assert.rejects(
+    api.cancelLlmEnhancePrompt(recreatedScope),
+    error => error instanceof api.LlmEnhanceScopeError,
+  )
+  assert.equal(deleteCalls, 1)
+
+  // Request identity is checked even if an intermediary returns another
+  // workspace's operation payload at the exact scoped URL.
+  globalThis.fetch = async () => jsonResponse(routeStatus({
+    request_id: '00000000000040008000000000000011',
+  }))
+  await assert.rejects(
+    api.fetchLlmEnhanceOperation(enhanceScope),
+    error => error instanceof api.LlmEnhanceScopeError,
+  )
+
   // A visible timer is suspended if the tab becomes hidden before it fires.
   visibility = 'visible'
   let transitionChecks = 0

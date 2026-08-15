@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import threading
@@ -78,6 +79,7 @@ def _launch_namespace(names: set[str], **overrides):
         "hashlib": hashlib,
         "json": json,
         "math": math,
+        "stat": stat,
         "time": time,
         "uuid": uuid,
         "can_access_upload": can_access_upload,

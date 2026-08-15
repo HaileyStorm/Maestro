@@ -20,6 +20,7 @@ import math
 import hashlib
 import threading
 import traceback
+from contextlib import nullcontext
 from functools import wraps
 from typing import Optional
 
@@ -60,6 +61,7 @@ _recovery_submit_child = None
 _recovery_verify_child = None
 _recovery_validate_child = None
 _runtime_admission = None
+_director_native_gpu_slot_state = threading.local()
 
 _pipelines: dict = {}
 _pipeline_lock = threading.Lock()
@@ -97,6 +99,108 @@ _DIRECTOR_REPAIR_FAILED_CODE = "director_repair_failed"
 _DIRECTOR_REPAIR_FAILED_MESSAGE = "Director repair stopped after an internal error."
 _DIRECTOR_WORKER_FAILED_CODE = "director_worker_start_failed"
 _DIRECTOR_WORKER_FAILED_MESSAGE = "Director could not start its worker."
+
+
+def _director_llm_uses_native_gpu(selection: dict) -> bool:
+    """Return whether one exact Director selection owns local GPU memory."""
+    return bool(
+        str(selection.get("provider") or "local").casefold() == "local"
+        and str(selection.get("device") or "cuda").casefold() != "cpu"
+    )
+
+
+class _DirectorNativeGpuSlot:
+    """Join Director CUDA work to launch/WanGP's process-global GPU lane."""
+
+    def __init__(self, selection: dict, cancel_checkpoint=None):
+        self.enabled = _director_llm_uses_native_gpu(selection)
+        self.cancel_checkpoint = cancel_checkpoint
+        self._outermost = False
+
+    def __enter__(self):
+        if not self.enabled:
+            return False
+        if callable(self.cancel_checkpoint):
+            self.cancel_checkpoint()
+        depth = int(getattr(_director_native_gpu_slot_state, "depth", 0))
+        if depth > 0:
+            _director_native_gpu_slot_state.depth = depth + 1
+            return True
+        if _gen_lock is None or _wgp is None or not callable(
+            getattr(_wgp, "acquire_native_gpu_execution_lock", None)
+        ):
+            raise RuntimeError("Director native GPU lane is unavailable")
+        while not _gen_lock.acquire(timeout=0.05):
+            if callable(self.cancel_checkpoint):
+                self.cancel_checkpoint()
+        try:
+            if callable(self.cancel_checkpoint):
+                self.cancel_checkpoint()
+            if callable(self.cancel_checkpoint):
+                _wgp.acquire_native_gpu_execution_lock(
+                    self.cancel_checkpoint,
+                )
+            else:
+                _wgp.acquire_native_gpu_execution_lock()
+        except BaseException:
+            _gen_lock.release()
+            raise
+        _director_native_gpu_slot_state.depth = 1
+        self._outermost = True
+        return True
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        if not self.enabled:
+            return False
+        depth = max(
+            0,
+            int(getattr(_director_native_gpu_slot_state, "depth", 0)) - 1,
+        )
+        _director_native_gpu_slot_state.depth = depth
+        if self._outermost:
+            try:
+                _wgp.native_gpu_execution_lock.release()
+            finally:
+                _gen_lock.release()
+        return False
+
+
+class _DirectorLlmSelection(dict):
+    """Exact Director load arguments with one ephemeral resident identity."""
+
+    resident_identity = None
+
+
+def _director_resident_identity_locked(llm_service):
+    """Return the exact singleton residency, including its load epoch."""
+    return (
+        llm_service._loaded_model_key,
+        int(llm_service._runtime_generation or 0),
+    )
+
+
+def _unload_director_resident_if_current(
+    selection: dict,
+    resident_identity,
+) -> bool:
+    """Unload only the exact Director runtime that this pipeline loaded."""
+    # Eager cancellation cleanup exists only to release local VRAM. Remote and
+    # CPU residents have no such pressure and remote providers do not expose a
+    # monotonic reconnect generation, so retaining them also closes same-key
+    # stale-cleanup ABA without altering shared llm_service state.
+    if not resident_identity or not _director_llm_uses_native_gpu(selection):
+        return False
+    from services import llm_service
+
+    with _DirectorNativeGpuSlot(selection):
+        with llm_service._lock:
+            if (
+                _director_resident_identity_locked(llm_service)
+                != resident_identity
+            ):
+                return False
+            llm_service.unload_model()
+            return True
 
 
 class _DirectorLlmCancelled(LlmRequestCancelled, RuntimeError):
@@ -3672,6 +3776,17 @@ def _pipeline_llm_pass_active(pid: str, token: object) -> bool:
         )
 
 
+def _director_pipeline_cancel_checkpoint(pid: str) -> None:
+    """Stop a pending Director model lease before it acquires GPU state."""
+    with _pipeline_lock:
+        pipeline = _pipelines.get(pid)
+        if (
+            not pipeline
+            or pipeline.get("status") in _DIRECTOR_TERMINAL_STATUSES
+        ):
+            raise _DirectorLlmCancelled("Director LLM pass was cancelled")
+
+
 def _pipeline_llm_call(
     pid: str,
     phase: str,
@@ -3687,10 +3802,13 @@ def _pipeline_llm_call(
     with _pipeline_lock:
         pipeline_present = pid in _pipelines
         context = dict(_pipeline_llm_contexts.get(pid) or {})
-    # Keep direct unit/legacy helper calls that do not own a live pipeline
-    # source-compatible. Production Director calls always have a pipeline.
     if not pipeline_present:
-        return function(*args, **kwargs)
+        raise _DirectorLlmCancelled(
+            "Director LLM pass has no live pipeline owner"
+        )
+    selection = context.get("selection")
+    if not isinstance(selection, dict) or not selection:
+        raise RuntimeError("Director LLM context is unavailable")
     response_assist = (
         context.get("response_assist")
         if allow_response_assist and kwargs.get("json_schema") is None
@@ -3713,13 +3831,22 @@ def _pipeline_llm_call(
     if response_assist:
         kwargs["response_assist"] = response_assist
     failed = True
+    resident_identity = context.get("resident_identity")
     try:
-        selection = context.get("selection")
-        if isinstance(selection, dict) and selection:
-            from services import llm_service
-            with llm_service.loaded_model_lease(**selection):
-                result = function(*args, **kwargs)
-        else:
+        from services import llm_service
+        with _DirectorNativeGpuSlot(
+            selection, cancel_handle.checkpoint,
+        ), llm_service.loaded_model_lease(
+            **selection
+        ):
+            with llm_service._lock:
+                resident_identity = _director_resident_identity_locked(
+                    llm_service
+                )
+            with _pipeline_lock:
+                current_context = _pipeline_llm_contexts.get(pid)
+                if isinstance(current_context, dict):
+                    current_context["resident_identity"] = resident_identity
             result = function(*args, **kwargs)
         cancel_handle.checkpoint()
         with _pipeline_lock:
@@ -3732,6 +3859,9 @@ def _pipeline_llm_call(
         failed = False
         return result
     except LlmRequestCancelled as exc:
+        _unload_director_resident_if_current(
+            selection, resident_identity,
+        )
         raise _DirectorLlmCancelled("Director LLM pass was cancelled") from exc
     finally:
         _finish_pipeline_llm_pass(pid, token, failed=failed)
@@ -4795,8 +4925,13 @@ def _run_pipeline(pid: str, resume: bool = False):
 
         # Unload LLM to free VRAM
         try:
-            if llm_service.is_loaded():
-                llm_service.unload_model()
+            llm_context = dict(_pipeline_llm_contexts.get(pid) or {})
+            llm_selection = llm_context.get("selection")
+            if isinstance(llm_selection, dict) and llm_selection:
+                _unload_director_resident_if_current(
+                    llm_selection,
+                    llm_context.get("resident_identity"),
+                )
         except Exception as e:
             print(f"[Pipeline] LLM unload warning (non-fatal): {e}")
 
@@ -5073,6 +5208,7 @@ def _resolve_pipeline_llm_context(
     pid: str,
     params: dict,
     selection: dict,
+    resident_identity=None,
 ) -> dict:
     """Freeze response assistance only after the exact local lease is held."""
     response_assist = None
@@ -5096,6 +5232,7 @@ def _resolve_pipeline_llm_context(
             response_assist = None
     context = {
         "selection": dict(selection),
+        "resident_identity": resident_identity,
         "response_assist": response_assist,
     }
     with _pipeline_lock:
@@ -5109,14 +5246,11 @@ def _resolve_pipeline_llm_context(
     return context
 
 
-def _ensure_llm_loaded(params: dict) -> dict:
+def _ensure_llm_loaded(params: dict, cancel_checkpoint=None) -> dict:
     """Load the exact Director selection and return its reusable lease args."""
     from services import llm_service
 
-    selection = _director_llm_selection(params)
-    desired_provider = selection["provider"]
-    desired_device = selection["device"]
-
+    selection = _DirectorLlmSelection(_director_llm_selection(params))
     # Free GPU memory before running a local CUDA LLM. Director planning
     # fires right after image edits / audio analysis: memory profiles keep
     # the last generation model resident, and torch's caching allocator
@@ -5127,9 +5261,16 @@ def _ensure_llm_loaded(params: dict) -> dict:
     # identical request verified fine on a free GPU. Guarded by _gen_lock
     # so an active generation is never released mid-run; wgp reloads the
     # gen model transparently on its next job (reload_needed).
-    if desired_provider == "local" and desired_device == "cuda" and _wgp is not None:
-        acquired = _gen_lock.acquire(blocking=False) if _gen_lock is not None else True
-        if acquired:
+    # The no-checkpoint form is retained only for the isolated idempotence
+    # helper contract. Every live pipeline supplies a cancellation checkpoint
+    # and therefore must join the process-wide GPU lane.
+    gpu_slot = (
+        _DirectorNativeGpuSlot(selection, cancel_checkpoint)
+        if callable(cancel_checkpoint)
+        else nullcontext(False)
+    )
+    with gpu_slot:
+        if _director_llm_uses_native_gpu(selection):
             try:
                 if getattr(_wgp, "wan_model", None) is not None:
                     print("[Pipeline] Releasing generation model VRAM before LLM planning")
@@ -5142,23 +5283,22 @@ def _ensure_llm_loaded(params: dict) -> dict:
                         torch.cuda.empty_cache()
             except Exception as e:
                 print(f"[Pipeline] Pre-LLM VRAM release skipped: {e}")
-            finally:
-                if _gen_lock is not None:
-                    _gen_lock.release()
-        else:
-            print("[Pipeline] Generation in progress — skipping pre-LLM VRAM release")
 
-    # load_model owns the complete idempotence key: device, runtime profile,
-    # selected GGUF/projector file identity, provider URL, and credentials.
-    # A model/provider-only shortcut here left stale devices and mmproj files
-    # resident after settings or downloaded artifacts changed.
-    llm_service.load_model(
-        model_id=selection["model_id"],
-        device=selection["device"],
-        provider=selection["provider"],
-        remote_url=selection["remote_url"],
-        api_key=selection["api_key"],
-    )
+        # load_model owns the complete idempotence key: device, runtime profile,
+        # selected GGUF/projector file identity, provider URL, and credentials.
+        # A model/provider-only shortcut here left stale devices and mmproj files
+        # resident after settings or downloaded artifacts changed.
+        with llm_service._lock:
+            llm_service.load_model(
+                model_id=selection["model_id"],
+                device=selection["device"],
+                provider=selection["provider"],
+                remote_url=selection["remote_url"],
+                api_key=selection["api_key"],
+            )
+            selection.resident_identity = _director_resident_identity_locked(
+                llm_service
+            )
     return selection
 
 
@@ -5170,7 +5310,8 @@ def _run_planning(pid: str, params: dict, pipeline_type: str):
     """
     from services import llm_service
 
-    selection = _ensure_llm_loaded(params)
+    cancel_checkpoint = lambda: _director_pipeline_cancel_checkpoint(pid)
+    selection = _ensure_llm_loaded(params, cancel_checkpoint)
 
     # Default v2 — see launch.py services-config comment for rationale.
     # The params dict is built from servicesConfig in the frontend, so
@@ -5182,11 +5323,28 @@ def _run_planning(pid: str, params: dict, pipeline_type: str):
     # Hold the exact provider/model identity across every coherent planning
     # call. The lock is re-entrant inside generate(), so concurrent Chat or
     # enhancer requests cannot swap the singleton between Director passes.
-    with llm_service.loaded_model_lease(**selection):
-        _resolve_pipeline_llm_context(pid, params, selection)
-        if use_v2:
-            return _run_planning_v2(pid, params, pipeline_type)
-        return _run_planning_legacy(pid, params, pipeline_type)
+    try:
+        with _DirectorNativeGpuSlot(
+            selection, cancel_checkpoint,
+        ), llm_service.loaded_model_lease(
+            **selection
+        ):
+            with llm_service._lock:
+                resident_identity = _director_resident_identity_locked(
+                    llm_service
+                )
+            selection.resident_identity = resident_identity
+            _resolve_pipeline_llm_context(
+                pid, params, selection, resident_identity,
+            )
+            if use_v2:
+                return _run_planning_v2(pid, params, pipeline_type)
+            return _run_planning_legacy(pid, params, pipeline_type)
+    except BaseException:
+        _unload_director_resident_if_current(
+            selection, selection.resident_identity,
+        )
+        raise
 
 
 def _director_h3_style_workflow_present(params: dict) -> bool:

@@ -89,6 +89,15 @@ const DIRECTOR_REPAIR_POLL_MS = 2000
 const DIRECTOR_REPAIR_ACTIVE = new Set(['queued', 'running', 'cancelling'])
 const DIRECTOR_PREPARATION_STORAGE_KEY = 'maestro:director-preparation-v1'
 const DIRECTOR_IMAGE_ROLES_STORAGE_KEY = 'maestro:director-image-roles-v1'
+const ENHANCE_OPERATION_STORAGE_KEY = 'maestro:prompt-enhance-operations-v2'
+const ENHANCE_FINGERPRINT_CLAIM_STORAGE_KEY = 'maestro:prompt-enhance-fingerprint-claim-v1'
+const ENHANCE_OPERATION_MAX_AGE_MS = 2 * 60 * 60 * 1000
+const ENHANCE_OPERATION_MAX_RECORDS = 8
+const ENHANCE_FINGERPRINT_SALT_BYTES = 32
+const ENHANCE_FINGERPRINT_TOKEN_BYTES = 32
+const ENHANCE_FINGERPRINT_LOCK_TIMEOUT_MS = 1_000
+const ENHANCE_LEDGER_LOCK_NAME = 'maestro-prompt-enhance-ledger-v2'
+const ENHANCE_LEDGER_LOCK_TIMEOUT_MS = 1_000
 
 interface PersistedDirectorImageRoles {
   schema_version: 1
@@ -168,6 +177,16 @@ function _directorCapabilitiesKey(explicitOutput: boolean): DirectorCapabilities
 let _dashboardPipelineLoadToken = 0
 let _dashboardPipelineListLoadToken = 0
 let _enhanceLlmRequestToken: symbol | null = null
+let _enhanceStopWaiting: (() => void) | null = null
+let _enhanceWaitSignal: AbortSignal | null = null
+let _enhanceSubmissionAttemptedRequestId: string | null = null
+let _enhancePromptEditGeneration = 0
+let _volatileEnhanceFingerprintSalt: Uint8Array | null = null
+let _enhanceFingerprintClaimPromise: Promise<Uint8Array> | null = null
+let _enhanceFingerprintClaimRecord: EnhanceFingerprintClaimRecord | null = null
+let _enhanceReloadRecoveryAvailable = false
+let _enhanceFingerprintClaimRotatedStored = false
+const _enhanceFingerprintLockRequests = new Set<Promise<unknown>>()
 let _directorLlmRequestToken: symbol | null = null
 let _directorPipelineLifecycleToken: symbol | null = null
 
@@ -190,18 +209,31 @@ function _beginWorkspaceLlmRequest(
   return {
     signal: controller.signal,
     ownsWorkspace: () => useStore.getState().activeWorkspace === workspace,
+    stopWaiting: loseOwnership,
     dispose: unsubscribe,
   }
 }
 
 function _beginEnhanceLlmRequest(workspace: string) {
+  // A same-project successor owns the UI and stops the predecessor's browser
+  // wait without cancelling its already-admitted server operation.
+  _enhanceStopWaiting?.()
   const token = Symbol('enhance-llm-request')
   _enhanceLlmRequestToken = token
   const lifecycle = _beginWorkspaceLlmRequest(workspace, () => {
     if (_enhanceLlmRequestToken !== token) return
     _enhanceLlmRequestToken = null
-    useStore.setState({ isEnhancing: false })
+    _enhanceStopWaiting = null
+    _enhanceWaitSignal = null
+    _enhanceSubmissionAttemptedRequestId = null
+    useStore.setState({
+      isEnhancing: false,
+      enhanceStatus: null,
+      enhanceRequestScope: null,
+    })
   })
+  _enhanceStopWaiting = lifecycle.stopWaiting
+  _enhanceWaitSignal = lifecycle.signal
   return {
     signal: lifecycle.signal,
     ownsWorkspace: () => (
@@ -209,6 +241,9 @@ function _beginEnhanceLlmRequest(workspace: string) {
     ),
     dispose: () => {
       if (_enhanceLlmRequestToken === token) _enhanceLlmRequestToken = null
+      if (_enhanceStopWaiting === lifecycle.stopWaiting) _enhanceStopWaiting = null
+      if (_enhanceWaitSignal === lifecycle.signal) _enhanceWaitSignal = null
+      if (_enhanceLlmRequestToken === null) _enhanceSubmissionAttemptedRequestId = null
       lifecycle.dispose()
     },
   }
@@ -281,6 +316,224 @@ function _discardStaleGenerationPlaceholder(placeholder: GenerationJob): void {
 }
 
 type StoredDirectorPreparation = { requestId: string; workspace: string }
+
+type StoredEnhanceOperation = api.LlmEnhanceOperationScope & {
+  accountFingerprint: string
+  claimToken: string
+  settingsFingerprint: string
+  storedAt: number
+}
+
+type EnhanceFingerprintClaimRecord = {
+  schemaVersion: 1
+  token: string
+  salt: string
+}
+
+function _boundedEnhanceFingerprint(value: unknown): string {
+  const text = JSON.stringify(value)
+  let left = 0x811c9dc5
+  let right = 0x9e3779b9
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    left = Math.imul(left ^ code, 0x01000193)
+    right = Math.imul(right ^ code, 0x85ebca6b)
+  }
+  return `${(left >>> 0).toString(16).padStart(8, '0')}${(right >>> 0).toString(16).padStart(8, '0')}`
+}
+
+function _validStoredEnhanceOperation(value: unknown): value is StoredEnhanceOperation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const parsed = value as Record<string, unknown>
+  return (
+    Object.keys(parsed).length === 7
+    && Object.keys(parsed).every(key => [
+      'requestId', 'workspace', 'projectInstance', 'accountFingerprint',
+      'claimToken', 'settingsFingerprint', 'storedAt',
+    ].includes(key))
+    && typeof parsed.requestId === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.requestId)
+    && typeof parsed.workspace === 'string'
+    && parsed.workspace.length > 0
+    && parsed.workspace.length <= 255
+    && typeof parsed.projectInstance === 'string'
+    && /^[0-9a-f]{64}$/i.test(parsed.projectInstance)
+    && typeof parsed.accountFingerprint === 'string'
+    && /^[0-9a-f]{16}$/i.test(parsed.accountFingerprint)
+    && typeof parsed.claimToken === 'string'
+    && /^[0-9a-f]{64}$/i.test(parsed.claimToken)
+    && typeof parsed.settingsFingerprint === 'string'
+    && /^[0-9a-f]{64}$/i.test(parsed.settingsFingerprint)
+    && typeof parsed.storedAt === 'number'
+    && Number.isFinite(parsed.storedAt)
+    && parsed.storedAt >= Date.now() - ENHANCE_OPERATION_MAX_AGE_MS
+    && parsed.storedAt <= Date.now() + 60_000
+  )
+}
+
+function _loadStoredEnhanceOperations(): StoredEnhanceOperation[] {
+  try {
+    if (typeof localStorage === 'undefined') return []
+    const parsed = JSON.parse(localStorage.getItem(ENHANCE_OPERATION_STORAGE_KEY) || 'null')
+    if (
+      !parsed
+      || typeof parsed !== 'object'
+      || Array.isArray(parsed)
+      || parsed.schemaVersion !== 2
+      || !Array.isArray(parsed.operations)
+      || parsed.operations.length > ENHANCE_OPERATION_MAX_RECORDS
+      || !parsed.operations.every(_validStoredEnhanceOperation)
+    ) {
+      return []
+    }
+    return [...parsed.operations].sort((left, right) => right.storedAt - left.storedAt)
+  } catch {
+    return []
+  }
+}
+
+function _writeStoredEnhanceOperations(operations: StoredEnhanceOperation[]): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return false
+    if (operations.length === 0) {
+      localStorage.removeItem(ENHANCE_OPERATION_STORAGE_KEY)
+      return localStorage.getItem(ENHANCE_OPERATION_STORAGE_KEY) === null
+    }
+    const encoded = JSON.stringify({
+      schemaVersion: 2,
+      operations: operations
+        .sort((left, right) => right.storedAt - left.storedAt)
+        .slice(0, ENHANCE_OPERATION_MAX_RECORDS),
+    })
+    localStorage.setItem(ENHANCE_OPERATION_STORAGE_KEY, encoded)
+    return localStorage.getItem(ENHANCE_OPERATION_STORAGE_KEY) === encoded
+  } catch {
+    return false
+  }
+}
+
+function _ownedEnhanceFingerprintClaimToken(): string | null {
+  if (!_enhanceReloadRecoveryAvailable) return null
+  return _enhanceFingerprintClaimRecord?.token ?? null
+}
+
+function _realmOwnsStoredEnhanceOperation(operation: StoredEnhanceOperation): boolean {
+  const claimToken = _ownedEnhanceFingerprintClaimToken()
+  return claimToken !== null && operation.claimToken === claimToken
+}
+
+async function _runEnhanceLedgerMutation(
+  mutation: () => boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const locks = globalThis.navigator?.locks
+  if (!locks?.request || signal?.aborted) return false
+  const controller = new AbortController()
+  const onAbort = () => controller.abort()
+  signal?.addEventListener('abort', onAbort, { once: true })
+  const timer = globalThis.setTimeout(
+    () => controller.abort(),
+    ENHANCE_LEDGER_LOCK_TIMEOUT_MS,
+  )
+  try {
+    return await locks.request(
+      ENHANCE_LEDGER_LOCK_NAME,
+      { mode: 'exclusive', signal: controller.signal },
+      lock => Boolean(lock) && mutation(),
+    )
+  } catch {
+    return false
+  } finally {
+    globalThis.clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+  }
+}
+
+async function _storeEnhanceOperation(
+  operation: Omit<StoredEnhanceOperation, 'claimToken'>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  // Persist only bounded recovery fences. Prompt/partial text, images, model
+  // and provider names, credentials, and raw settings remain in memory.
+  const claimToken = _ownedEnhanceFingerprintClaimToken()
+  if (!claimToken) return false
+  return _runEnhanceLedgerMutation(() => {
+    const existing = _loadStoredEnhanceOperations()
+    const sameRequest = existing.find(item => item.requestId === operation.requestId)
+    if (sameRequest && sameRequest.claimToken !== claimToken) return false
+    const remaining = existing.filter(item => item.requestId !== operation.requestId)
+    // No realm may silently evict another bounded recovery fence. The current
+    // browser wait remains valid, but reload recovery is unavailable until this
+    // exact record can be durably represented.
+    if (!sameRequest && remaining.length >= ENHANCE_OPERATION_MAX_RECORDS) return false
+    return _writeStoredEnhanceOperations([{ ...operation, claimToken }, ...remaining])
+  }, signal)
+}
+
+function _hasOwnedStoredEnhanceOperation(scope: api.LlmEnhanceOperationScope): boolean {
+  return _loadStoredEnhanceOperations().some(item => (
+    _sameEnhanceScope(item, scope) && _realmOwnsStoredEnhanceOperation(item)
+  ))
+}
+
+async function _removeStoredEnhanceOperation(
+  scope: api.LlmEnhanceOperationScope,
+): Promise<boolean> {
+  return _runEnhanceLedgerMutation(() => {
+    const stored = _loadStoredEnhanceOperations()
+    const matching = stored.find(item => _sameEnhanceScope(item, scope))
+    if (!matching || !_realmOwnsStoredEnhanceOperation(matching)) return false
+    return _writeStoredEnhanceOperations(stored.filter(item => item !== matching))
+  })
+}
+
+async function _clearStoredEnhanceOperations(): Promise<boolean> {
+  return _runEnhanceLedgerMutation(() => {
+    const stored = _loadStoredEnhanceOperations()
+    const retained = stored.filter(item => !_realmOwnsStoredEnhanceOperation(item))
+    if (retained.length === stored.length) return false
+    return _writeStoredEnhanceOperations(retained)
+  })
+}
+
+function _findStoredEnhanceOperation(
+  workspace: string,
+  accountFingerprint: string,
+): StoredEnhanceOperation | null {
+  const accountOperations = _loadStoredEnhanceOperations().filter(item => (
+    item.accountFingerprint === accountFingerprint
+    && item.workspace === workspace
+  ))
+  return accountOperations.find(_realmOwnsStoredEnhanceOperation)
+    ?? accountOperations[0]
+    ?? null
+}
+
+function _sameEnhanceScope(
+  left: api.LlmEnhanceOperationScope | null,
+  right: api.LlmEnhanceOperationScope,
+): boolean {
+  return Boolean(
+    left
+    && left.requestId === right.requestId
+    && left.workspace === right.workspace
+    && left.projectInstance === right.projectInstance,
+  )
+}
+
+function _terminalEnhanceStatus(
+  status: api.LlmEnhanceOperationStatus,
+): api.LlmEnhanceOperationStatus {
+  if (status.status !== 'cancelled' && status.status !== 'failed') return status
+  return {
+    ...status,
+    partial_text: '',
+    generated_tokens_approx: 0,
+    elapsed_seconds: 0,
+    live_tps: null,
+    average_tps: null,
+  }
+}
 
 function _loadStoredDirectorPreparation(): StoredDirectorPreparation | null {
   try {
@@ -2551,9 +2804,13 @@ interface AppState {
 
   // Prompt enhancement
   isEnhancing: boolean
+  enhanceStatus: api.LlmPreparationStatus | api.LlmEnhanceOperationStatus | null
+  enhanceRequestScope: api.LlmEnhanceOperationScope | null
   studioPromptEnhance: boolean
   setStudioPromptEnhance: (enabled: boolean) => void
   enhancePrompt: (ttsMode?: string) => Promise<boolean>
+  resumeEnhancePrompt: () => Promise<boolean>
+  cancelEnhancePrompt: () => Promise<void>
 
   // Director (Music Video Director)
   sidebarMode: SidebarMode
@@ -3176,6 +3433,208 @@ function _accountIdentity(context: AccountContext | null | undefined): string {
   return context?.authenticated === true && context.account ? context.account.id : ''
 }
 
+function _enhanceAccountFingerprint(
+  state: Pick<AppState, 'accountContext' | 'accessContext'>,
+): string {
+  return _boundedEnhanceFingerprint(
+    _accountIdentity(state.accountContext ?? state.accessContext?.accounts) || 'local-owner',
+  )
+}
+
+function _enhanceBytesToHex(bytes: ArrayBuffer | Uint8Array): string {
+  return Array.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes))
+    .map(value => value.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function _readEnhanceFingerprintClaim(): EnhanceFingerprintClaimRecord | null {
+  try {
+    const parsed = JSON.parse(
+      sessionStorage.getItem(ENHANCE_FINGERPRINT_CLAIM_STORAGE_KEY) || 'null',
+    )
+    if (
+      !parsed
+      || typeof parsed !== 'object'
+      || Array.isArray(parsed)
+      || Object.keys(parsed).length !== 3
+      || parsed.schemaVersion !== 1
+      || typeof parsed.token !== 'string'
+      || !/^[0-9a-f]{64}$/i.test(parsed.token)
+      || typeof parsed.salt !== 'string'
+      || !/^[0-9a-f]{64}$/i.test(parsed.salt)
+    ) return null
+    return { schemaVersion: 1, token: parsed.token, salt: parsed.salt }
+  } catch {
+    return null
+  }
+}
+
+function _writeEnhanceFingerprintClaim(record: EnhanceFingerprintClaimRecord): void {
+  try {
+    sessionStorage.setItem(ENHANCE_FINGERPRINT_CLAIM_STORAGE_KEY, JSON.stringify(record))
+  } catch { /* same-realm identity remains usable; reload recovery fails closed */ }
+}
+
+function _newEnhanceFingerprintClaim(): EnhanceFingerprintClaimRecord {
+  return {
+    schemaVersion: 1,
+    token: _enhanceBytesToHex(globalThis.crypto.getRandomValues(
+      new Uint8Array(ENHANCE_FINGERPRINT_TOKEN_BYTES),
+    )),
+    salt: _enhanceBytesToHex(globalThis.crypto.getRandomValues(
+      new Uint8Array(ENHANCE_FINGERPRINT_SALT_BYTES),
+    )),
+  }
+}
+
+async function _tryClaimEnhanceFingerprintToken(token: string): Promise<boolean> {
+  const locks = globalThis.navigator?.locks
+  if (!locks?.request) return false
+  return new Promise(resolve => {
+    let decided = false
+    const holdForRealmLifetime = new Promise<void>(() => {})
+    const timer = globalThis.setTimeout(() => {
+      if (decided) return
+      decided = true
+      resolve(false)
+    }, ENHANCE_FINGERPRINT_LOCK_TIMEOUT_MS)
+    try {
+      const request = locks.request(
+        `maestro-prompt-enhance-tab-${token}`,
+        { mode: 'exclusive', ifAvailable: true },
+        lock => {
+          if (decided) return undefined
+          decided = true
+          globalThis.clearTimeout(timer)
+          if (!lock) {
+            resolve(false)
+            return undefined
+          }
+          resolve(true)
+          return holdForRealmLifetime
+        },
+      )
+      const tracked = Promise.resolve(request).catch(() => {
+        if (decided) return
+        decided = true
+        globalThis.clearTimeout(timer)
+        resolve(false)
+      })
+      _enhanceFingerprintLockRequests.add(tracked)
+      void tracked.finally(() => _enhanceFingerprintLockRequests.delete(tracked))
+    } catch {
+      if (decided) return
+      decided = true
+      globalThis.clearTimeout(timer)
+      resolve(false)
+    }
+  })
+}
+
+async function _initializeEnhanceFingerprintSalt(): Promise<Uint8Array> {
+  const stored = _readEnhanceFingerprintClaim()
+  if (stored && await _tryClaimEnhanceFingerprintToken(stored.token)) {
+    _enhanceFingerprintClaimRecord = stored
+    _enhanceReloadRecoveryAvailable = true
+    _enhanceFingerprintClaimRotatedStored = false
+    _volatileEnhanceFingerprintSalt = Uint8Array.from(
+      stored.salt.match(/.{2}/g) ?? [], value => Number.parseInt(value, 16),
+    )
+    return _volatileEnhanceFingerprintSalt
+  }
+
+  // A copied/duplicated tab cannot acquire the predecessor's token lock.
+  // Missing, failed, and timed-out Web Locks also rotate rather than trust
+  // copied sessionStorage; reload recovery is unavailable unless this claim wins.
+  const replacement = _newEnhanceFingerprintClaim()
+  const replacementClaimed = await _tryClaimEnhanceFingerprintToken(replacement.token)
+  _enhanceFingerprintClaimRecord = replacement
+  _enhanceReloadRecoveryAvailable = replacementClaimed
+  _enhanceFingerprintClaimRotatedStored = Boolean(stored)
+  _writeEnhanceFingerprintClaim(replacement)
+  _volatileEnhanceFingerprintSalt = Uint8Array.from(
+    replacement.salt.match(/.{2}/g) ?? [], value => Number.parseInt(value, 16),
+  )
+  return _volatileEnhanceFingerprintSalt
+}
+
+async function _enhanceFingerprintSalt(): Promise<Uint8Array> {
+  if (!_enhanceFingerprintClaimPromise) {
+    _enhanceFingerprintClaimPromise = _initializeEnhanceFingerprintSalt()
+  }
+  const salt = await _enhanceFingerprintClaimPromise
+  try {
+    if (_enhanceFingerprintClaimRecord) {
+      _writeEnhanceFingerprintClaim(_enhanceFingerprintClaimRecord)
+    }
+  } catch { /* cached same-realm claim remains authoritative */ }
+  return salt
+}
+
+async function _enhanceSha256(bytes: ArrayBuffer): Promise<string> {
+  if (!globalThis.crypto.subtle) {
+    throw new Error('Prompt Enhance recovery requires browser SHA-256 support')
+  }
+  return _enhanceBytesToHex(await globalThis.crypto.subtle.digest('SHA-256', bytes))
+}
+
+async function _enhanceHmacSha256(value: unknown): Promise<string> {
+  if (!globalThis.crypto.subtle) {
+    throw new Error('Prompt Enhance recovery requires browser SHA-256 support')
+  }
+  const salt = await _enhanceFingerprintSalt()
+  const keyBytes = new Uint8Array(salt.byteLength)
+  keyBytes.set(salt)
+  const key = await globalThis.crypto.subtle.importKey(
+    'raw', keyBytes,
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  )
+  const message = new TextEncoder().encode(JSON.stringify(value))
+  return _enhanceBytesToHex(await globalThis.crypto.subtle.sign('HMAC', key, message))
+}
+
+async function _enhanceFileIdentity(file: File | null): Promise<readonly unknown[] | null> {
+  if (!file) return null
+  return [
+    file.name,
+    file.size,
+    file.type,
+    file.lastModified,
+    file.webkitRelativePath,
+    await _enhanceSha256(await file.arrayBuffer()),
+  ]
+}
+
+async function _enhanceSettingsFingerprint(state: AppState): Promise<string> {
+  const startPath = Array.isArray(state.params.image_start)
+    ? [...state.params.image_start]
+    : state.params.image_start
+  const referencePaths = state.params.image_refs ? [...state.params.image_refs] : undefined
+  const activatedLoras = [...state.params.activated_loras]
+  const startImage = state.startImage
+  const imageRefs = [...state.imageRefs]
+  return _enhanceHmacSha256([
+    state.generationMode,
+    state.params.model_type,
+    state.params.image_mode,
+    state.params.multi_prompts_gen_type,
+    state.durationSeconds,
+    state.slidingWindowSeconds,
+    state.slidingWindowOverlap,
+    state.params.force_fps,
+    state.params.video_guide,
+    state.guideVideoFps,
+    state.guideVideoFrameCount,
+    state.ttsVoiceCount,
+    state.explicitOutput,
+    activatedLoras,
+    startPath,
+    referencePaths,
+    await _enhanceFileIdentity(startImage),
+    await Promise.all(imageRefs.map(file => _enhanceFileIdentity(file))),
+  ])
+}
+
 function _advanceAccountIdentityEpoch(): void {
   _accountIdentityEpoch += 1
   _workspaceLoadSequence += 1
@@ -3209,6 +3668,16 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
   _dashboardPipelineListLoadToken += 1
   _stopDirectorPreparationPoll()
   _storeDirectorPreparation(null, null)
+  _enhancePromptEditGeneration += 1
+  // Initial account hydration may legitimately recover a record for that
+  // same account. A real scrub/logout always has a previous context and must
+  // remove every prior-account recovery fence.
+  if (state.accountContext !== null) void _clearStoredEnhanceOperations()
+  _enhanceStopWaiting?.()
+  _enhanceLlmRequestToken = null
+  _enhanceStopWaiting = null
+  _enhanceWaitSignal = null
+  _enhanceSubmissionAttemptedRequestId = null
   return {
     workspaces: [],
     activeWorkspace: '',
@@ -3224,6 +3693,9 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     gallerySelectionMode: false,
     jobs: [],
     isGenerating: false,
+    isEnhancing: false,
+    enhanceStatus: null,
+    enhanceRequestScope: null,
     sampleCampaignPairs: [],
     params: { ...state.params, ...BLANK_VIDEO_INPUT_PARAMS },
     startImage: null,
@@ -3980,6 +4452,9 @@ export const useStore = create<AppState>((set, get) => ({
 
   params: { ...defaultParams },
   setParam: (key, value) => {
+    if (key === 'prompt' && value !== get().params.prompt) {
+      _enhancePromptEditGeneration += 1
+    }
     // Per-sub-mode isolation: remember the outgoing sub-mode BEFORE the
     // param write flips image_mode (see videoSubModeStash).
     const prevImageMode = key === 'image_mode' ? ((get().params.image_mode as number) ?? 0) : null
@@ -4109,6 +4584,9 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   setParams: (partial) => {
+    if (Object.prototype.hasOwnProperty.call(partial, 'prompt') && partial.prompt !== get().params.prompt) {
+      _enhancePromptEditGeneration += 1
+    }
     const profileSettingChanged = Object.keys(partial).some(key => H3_PROFILE_PARAM_KEYS.has(key as keyof GenerateParams))
     if (profileSettingChanged) {
       ++_h3ProfileApplySeq
@@ -9480,14 +9958,49 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Prompt enhancement
   isEnhancing: false,
+  enhanceStatus: null,
+  enhanceRequestScope: null,
   studioPromptEnhance: false,
   setStudioPromptEnhance: (enabled) => set({ studioPromptEnhance: enabled }),
   enhancePrompt: async (ttsMode?: string) => {
     const { params, generationMode, startImage, imageRefs, activeWorkspace } = get()
     if (!params.prompt.trim()) return false
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const accountFingerprint = _enhanceAccountFingerprint(get())
+    const promptEditGeneration = _enhancePromptEditGeneration
+    const requestState = get()
+    const inputsRemainCurrent = () => {
+      const current = get()
+      return current.startImage === startImage
+        && current.imageRefs.length === imageRefs.length
+        && current.imageRefs.every((reference, index) => reference === imageRefs[index])
+    }
     const lifecycle = _beginEnhanceLlmRequest(activeWorkspace)
-    set({ isEnhancing: true })
+    let scope: api.LlmEnhanceOperationScope | null = null
+    let submissionAttempted = false
+    let durableRecoveryStored = false
+    let settingsFingerprint = ''
+    set({ isEnhancing: true, enhanceStatus: null, enhanceRequestScope: null })
     try {
+      settingsFingerprint = await _enhanceSettingsFingerprint(requestState)
+      if (
+        !lifecycle.ownsWorkspace()
+        || _enhancePromptEditGeneration !== promptEditGeneration
+        || get().params.prompt !== params.prompt
+        || !inputsRemainCurrent()
+      ) return false
+      const catalog = await api.fetchLlmModels(activeWorkspace, lifecycle.signal)
+      if (!lifecycle.ownsWorkspace()) return false
+      if (!catalog.project_instance) {
+        throw new api.LlmEnhanceScopeError('Could not open this project for Prompt Enhance')
+      }
+      scope = {
+        requestId: api.createLlmRequestId(),
+        workspace: activeWorkspace,
+        projectInstance: catalog.project_instance,
+      }
+      set({ enhanceRequestScope: scope })
+
       // Collect images relevant to the CURRENT mode only
       const imagePaths: string[] = []
 
@@ -9496,6 +10009,7 @@ export const useStore = create<AppState>((set, get) => ({
         for (const ref of imageRefs) {
           try {
             const uploaded = await api.uploadImage(ref)
+            if (!lifecycle.ownsWorkspace()) return false
             imagePaths.push(uploaded.path)
           } catch { /* best effort */ }
         }
@@ -9504,6 +10018,7 @@ export const useStore = create<AppState>((set, get) => ({
         if (startImage) {
           try {
             const uploaded = await api.uploadImage(startImage)
+            if (!lifecycle.ownsWorkspace()) return false
             imagePaths.push(uploaded.path)
           } catch { /* best effort */ }
         } else if (params.image_start && typeof params.image_start === 'string') {
@@ -9545,9 +10060,22 @@ export const useStore = create<AppState>((set, get) => ({
 
       // TTS dialogue needs more tokens for longer conversations
       const maxTokens = (generationMode === 'audio' && ttsMode) ? 2048 : undefined
+      if (!lifecycle.ownsWorkspace() || !_sameEnhanceScope(get().enhanceRequestScope, scope)) {
+        return false
+      }
+      if (
+        !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || _enhanceAccountFingerprint(get()) !== accountFingerprint
+        || _enhancePromptEditGeneration !== promptEditGeneration
+        || get().params.prompt !== params.prompt
+        || (await _enhanceSettingsFingerprint(get())) !== settingsFingerprint
+        || !inputsRemainCurrent()
+      ) return false
 
       const result = await api.llmEnhancePrompt({
         workspace: activeWorkspace,
+        request_id: scope.requestId,
+        project_instance: scope.projectInstance,
         prompt: params.prompt,
         mode: generationMode,
         model_type: params.model_type,
@@ -9561,10 +10089,69 @@ export const useStore = create<AppState>((set, get) => ({
         tts_enhance_mode: ttsMode || undefined,
         tts_voice_count: state.ttsVoiceCount || undefined,
         explicit_output: state.explicitOutput,
-      }, { signal: lifecycle.signal })
-      if (!lifecycle.ownsWorkspace()) return false
+      }, {
+        projectInstance: scope.projectInstance,
+        signal: lifecycle.signal,
+        onPreparationStatus: status => {
+          if (
+            lifecycle.ownsWorkspace()
+            && scope
+            && _sameEnhanceScope(get().enhanceRequestScope, scope)
+          ) set({ enhanceStatus: status })
+        },
+        onSubmissionAttempted: async () => {
+          if (
+            lifecycle.ownsWorkspace()
+            && scope
+            && _sameEnhanceScope(get().enhanceRequestScope, scope)
+          ) {
+            const storedRecovery = await _storeEnhanceOperation({
+              ...scope,
+              accountFingerprint,
+              settingsFingerprint,
+              storedAt: Date.now(),
+            }, lifecycle.signal)
+            if (
+              !lifecycle.ownsWorkspace()
+              || !scope
+              || !_sameEnhanceScope(get().enhanceRequestScope, scope)
+            ) {
+              if (storedRecovery) await _removeStoredEnhanceOperation(scope)
+              return
+            }
+            durableRecoveryStored = storedRecovery || durableRecoveryStored
+            submissionAttempted = true
+            _enhanceSubmissionAttemptedRequestId = scope.requestId
+          }
+        },
+        onOperationStatus: status => {
+          if (
+            lifecycle.ownsWorkspace()
+            && scope
+            && _sameEnhanceScope(get().enhanceRequestScope, scope)
+          ) set({ enhanceStatus: _terminalEnhanceStatus(status) })
+        },
+      })
+      if (
+        !lifecycle.ownsWorkspace()
+        || !_sameEnhanceScope(get().enhanceRequestScope, scope)
+      ) return false
+      if (
+        !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || _enhanceAccountFingerprint(get()) !== accountFingerprint
+        || _enhancePromptEditGeneration !== promptEditGeneration
+        || get().params.prompt !== result.original
+        || result.original !== params.prompt
+        || (await _enhanceSettingsFingerprint(get())) !== settingsFingerprint
+        || !inputsRemainCurrent()
+      ) {
+        await _removeStoredEnhanceOperation(scope)
+        return false
+      }
+      await _removeStoredEnhanceOperation(scope)
       set(s => ({
         params: { ...s.params, prompt: result.enhanced },
+        enhanceStatus: null,
       }))
       // Auto-parse speaker names from the enhanced text whenever there are
       // voice slots to fill. Previously gated to dialogue mode only; the user
@@ -9578,13 +10165,171 @@ export const useStore = create<AppState>((set, get) => ({
       return true
     } catch (e) {
       if (_isBrowserAbort(e) || !lifecycle.ownsWorkspace()) return false
+      const reloadRecoveryUnavailable = (
+        e instanceof api.LlmEnhanceWaitError
+        && submissionAttempted
+        && (!scope || !durableRecoveryStored || !_hasOwnedStoredEnhanceOperation(scope))
+      )
+      if (!(e instanceof api.LlmEnhanceWaitError && submissionAttempted && !reloadRecoveryUnavailable)) {
+        if (scope) await _removeStoredEnhanceOperation(scope)
+      }
+      if (e instanceof api.LlmEnhanceScopeError) return false
       console.error('Failed to enhance prompt:', e)
-      window.alert(e instanceof Error ? e.message : 'Prompt enhancement failed')
+      window.alert(reloadRecoveryUnavailable
+        ? 'Prompt Enhance stopped waiting. This browser could not reserve private reload recovery, so reloading will not resume this request. You can try Prompt Enhance again.'
+        : (e instanceof Error ? e.message : 'Prompt enhancement failed'))
       return false
     } finally {
-      if (lifecycle.ownsWorkspace()) set({ isEnhancing: false })
+      if (lifecycle.ownsWorkspace()) {
+        set({
+          isEnhancing: false,
+          enhanceStatus: null,
+          enhanceRequestScope: null,
+        })
+      }
       lifecycle.dispose()
     }
+  },
+  resumeEnhancePrompt: async () => {
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const accountFingerprint = _enhanceAccountFingerprint(get())
+    const initialStored = _findStoredEnhanceOperation(get().activeWorkspace, accountFingerprint)
+    if (
+      !initialStored
+      || _enhanceLlmRequestToken !== null
+      || get().enhanceRequestScope !== null
+    ) return false
+    try {
+      await _enhanceFingerprintSalt()
+    } catch {
+      window.alert(
+        'Prompt Enhance recovery was not applied because this tab could not exclusively reclaim its original private recovery key. The prior result was left unchanged.',
+      )
+      return false
+    }
+    const stored = _findStoredEnhanceOperation(get().activeWorkspace, accountFingerprint)
+    if (_enhanceLlmRequestToken !== null || get().enhanceRequestScope !== null) return false
+    if (!stored || !_realmOwnsStoredEnhanceOperation(stored)) {
+      window.alert(
+        'Prompt Enhance recovery was not applied because this tab could not exclusively reclaim its original private recovery key. The prior result was left unchanged.',
+      )
+      return false
+    }
+    const scope: api.LlmEnhanceOperationScope = {
+      requestId: stored.requestId,
+      workspace: stored.workspace,
+      projectInstance: stored.projectInstance,
+    }
+    const promptEditGeneration = _enhancePromptEditGeneration
+    const lifecycle = _beginEnhanceLlmRequest(scope.workspace)
+    _enhanceSubmissionAttemptedRequestId = scope.requestId
+    set({
+      isEnhancing: true,
+      enhanceStatus: null,
+      enhanceRequestScope: scope,
+    })
+    try {
+      const result = await api.resumeLlmEnhancePrompt(scope, {
+        signal: lifecycle.signal,
+        onOperationStatus: status => {
+          if (
+            lifecycle.ownsWorkspace()
+            && _sameEnhanceScope(get().enhanceRequestScope, scope)
+          ) set({ enhanceStatus: _terminalEnhanceStatus(status) })
+        },
+      })
+      if (
+        !lifecycle.ownsWorkspace()
+        || !_sameEnhanceScope(get().enhanceRequestScope, scope)
+      ) return false
+      if (
+        !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || _enhanceAccountFingerprint(get()) !== stored.accountFingerprint
+        || _enhancePromptEditGeneration !== promptEditGeneration
+        || get().params.prompt !== result.original
+        || (await _enhanceSettingsFingerprint(get())) !== stored.settingsFingerprint
+      ) {
+        await _removeStoredEnhanceOperation(scope)
+        if (_enhanceFingerprintClaimRotatedStored) {
+          window.alert(
+            'Prompt Enhance recovery was not applied because this tab could not exclusively reclaim its original private recovery key. The prior result was left unchanged.',
+          )
+        }
+        return false
+      }
+      await _removeStoredEnhanceOperation(scope)
+      set(state => ({
+        params: { ...state.params, prompt: result.enhanced },
+        enhanceStatus: null,
+      }))
+      if (get().generationMode === 'audio' && get().ttsVoiceCount > 0) {
+        get()._autoParseSpkeakerNames(result.enhanced, true)
+      }
+      return true
+    } catch (error) {
+      if (_isBrowserAbort(error) || !lifecycle.ownsWorkspace()) return false
+      if (!(error instanceof api.LlmEnhanceWaitError) || !_enhanceReloadRecoveryAvailable) {
+        await _removeStoredEnhanceOperation(scope)
+      }
+      if (!(error instanceof api.LlmEnhanceScopeError)) {
+        console.error('Failed to resume prompt enhancement:', error)
+        window.alert(error instanceof Error ? error.message : 'Prompt enhancement failed')
+      }
+      return false
+    } finally {
+      if (lifecycle.ownsWorkspace()) {
+        set({
+          isEnhancing: false,
+          enhanceStatus: null,
+          enhanceRequestScope: null,
+        })
+      }
+      lifecycle.dispose()
+    }
+  },
+  cancelEnhancePrompt: async () => {
+    const accountFingerprint = _enhanceAccountFingerprint(get())
+    const scope = get().enhanceRequestScope
+      ?? (() => {
+        const stored = _findStoredEnhanceOperation(get().activeWorkspace, accountFingerprint)
+        return stored ? {
+          requestId: stored.requestId,
+          workspace: stored.workspace,
+          projectInstance: stored.projectInstance,
+        } : null
+      })()
+    if (!scope) {
+      if (get().isEnhancing) {
+        _enhanceStopWaiting?.()
+        set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null })
+      }
+      return
+    }
+    if (scope.workspace !== get().activeWorkspace) return
+    if (
+      _sameEnhanceScope(get().enhanceRequestScope, scope)
+      && _enhanceSubmissionAttemptedRequestId !== scope.requestId
+    ) {
+      _enhanceStopWaiting?.()
+      set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null })
+      await _removeStoredEnhanceOperation(scope)
+      return
+    }
+    try {
+      const status = await api.cancelLlmEnhancePrompt(scope, _enhanceWaitSignal ?? undefined)
+      if (_sameEnhanceScope(get().enhanceRequestScope, scope)) {
+        set({ enhanceStatus: _terminalEnhanceStatus(status) })
+      }
+    } catch (error) {
+      if (!(error instanceof api.LlmEnhanceScopeError)) {
+        console.error('Failed to cancel prompt enhancement:', error)
+        window.alert(error instanceof Error ? error.message : 'Prompt enhancement could not be cancelled')
+        return
+      }
+    }
+    await _removeStoredEnhanceOperation(scope)
+    _enhanceStopWaiting?.()
+    set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null })
   },
 
   // Director (Music Video Director)
@@ -11669,6 +12414,9 @@ export const useStore = create<AppState>((set, get) => ({
         ...(projectChanged && previousActive ? [previousActive] : []),
         ...(previousAccessRevoked ? [previousActive] : []),
       ])) hidePrivatePreviewsForWorkspace(workspace)
+      // A reload keeps only the opaque Enhance request fence. Resume status
+      // waiting after the authoritative active project has been restored.
+      void get().resumeEnhancePrompt()
       if (get().accessContext?.remote && data.active) {
         void get().loadOutputs()
       }

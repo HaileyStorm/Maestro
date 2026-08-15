@@ -62,10 +62,12 @@ function loadDialogModule() {
   return dialogModulePromise
 }
 
+let storeBundlePromise
 let storeModulePromise
-function loadStoreModule() {
-  if (storeModulePromise) return storeModulePromise
-  storeModulePromise = build({
+let freshStoreModuleSequence = 0
+function storeBundle() {
+  if (storeBundlePromise) return storeBundlePromise
+  storeBundlePromise = build({
     stdin: {
       contents: "export { useStore } from './src/stores/useStore.ts'",
       resolveDir: UI_ROOT,
@@ -77,7 +79,19 @@ function loadStoreModule() {
     platform: 'node',
     treeShaking: true,
     write: false,
-  }).then(result => import(asDataModule(result.outputFiles[0].text)))
+  }).then(result => result.outputFiles[0].text)
+  return storeBundlePromise
+}
+
+function loadStoreModuleFresh() {
+  freshStoreModuleSequence += 1
+  const sequence = freshStoreModuleSequence
+  return storeBundle().then(source => import(`${asDataModule(source)}#store-realm-${sequence}`))
+}
+
+function loadStoreModule() {
+  if (storeModulePromise) return storeModulePromise
+  storeModulePromise = loadStoreModuleFresh()
   return storeModulePromise
 }
 
@@ -191,6 +205,76 @@ function deferred() {
   return { promise, reject, resolve }
 }
 
+async function waitForCondition(predicate, label, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`)
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
+class QueuedEnhanceLocksFake {
+  lifetimeHeld = new Set()
+  ledgerHeld = false
+  ledgerQueue = []
+  blockedLedger = null
+  blockNextLedger = false
+
+  request(name, options, callback) {
+    assert.equal(options.mode, 'exclusive')
+    if (name !== 'maestro-prompt-enhance-ledger-v2') {
+      assert.equal(options.ifAvailable, true)
+      if (this.lifetimeHeld.has(name)) return Promise.resolve(callback(null))
+      this.lifetimeHeld.add(name)
+      return Promise.resolve(callback({ name }))
+    }
+    assert.ok(options.signal instanceof AbortSignal)
+    return new Promise((resolve, reject) => {
+      const entry = { name, callback, resolve, reject, signal: options.signal, onAbort: null }
+      entry.onAbort = () => {
+        const queuedIndex = this.ledgerQueue.indexOf(entry)
+        if (queuedIndex < 0) return
+        this.ledgerQueue.splice(queuedIndex, 1)
+        reject(new DOMException('Ledger lock request aborted', 'AbortError'))
+      }
+      entry.signal.addEventListener('abort', entry.onAbort, { once: true })
+      if (this.ledgerHeld) this.ledgerQueue.push(entry)
+      else this._startLedger(entry)
+    })
+  }
+
+  blockNext() { this.blockNextLedger = true }
+
+  releaseBlocked() {
+    assert.ok(this.blockedLedger)
+    const entry = this.blockedLedger
+    this.blockedLedger = null
+    this._runLedger(entry)
+  }
+
+  _startLedger(entry) {
+    this.ledgerHeld = true
+    if (this.blockNextLedger) {
+      this.blockNextLedger = false
+      this.blockedLedger = entry
+      return
+    }
+    this._runLedger(entry)
+  }
+
+  _runLedger(entry) {
+    entry.signal.removeEventListener('abort', entry.onAbort)
+    Promise.resolve()
+      .then(() => entry.callback({ name: entry.name }))
+      .then(entry.resolve, entry.reject)
+      .finally(() => {
+        this.ledgerHeld = false
+        const next = this.ledgerQueue.shift()
+        if (next) this._startLedger(next)
+      })
+  }
+}
+
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -268,6 +352,7 @@ test('standalone Enhance sends exact count only for type-1 sliding prompts', asy
   const originalDocument = globalThis.document
   const originalLocalStorage = globalThis.localStorage
   const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
   class StorageFake {
     values = new Map()
     getItem(key) { return this.values.get(key) ?? null }
@@ -281,16 +366,50 @@ test('standalone Enhance sends exact count only for type-1 sliding prompts', asy
   globalThis.document = Object.assign(new EventTarget(), { hidden: false })
   globalThis.localStorage = new StorageFake()
   globalThis.sessionStorage = new StorageFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      locks: {
+        request(name, options, callback) {
+          assert.equal(options.mode, 'exclusive')
+          if (name === 'maestro-prompt-enhance-ledger-v2') {
+            assert.ok(options.signal instanceof AbortSignal)
+            return Promise.resolve(callback({ name }))
+          }
+          assert.equal(options.ifAvailable, true)
+          return Promise.resolve(callback({ name }))
+        },
+      },
+    },
+  })
 
   const enhancedRequests = []
+  const projectInstance = 'a'.repeat(64)
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    }
     if (url.endsWith('/api/v1/llm/prepare')) {
-      return jsonResponse({ operation_id: 'enhance-ready', status: 'ready' })
+      return jsonResponse({ operation_id: 'enhance-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
     }
     if (url.endsWith('/api/v1/llm/enhance-prompt')) {
       const body = JSON.parse(String(init.body))
       enhancedRequests.push(body)
+      return jsonResponse({
+        request_id: body.request_id.replaceAll('-', ''),
+        operation_kind: 'enhance',
+        status: 'completed', phase: 'completed', stage: 'completed',
+        pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+        partial_text: `${body.prompt} enhanced`, generated_tokens_approx: 2,
+        elapsed_seconds: 1, live_tps: null, average_tps: 2,
+        result_available: true, retryable: false,
+      }, 202)
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && url.includes('/result?')) {
+      const requestId = decodeURIComponent(url.split('/enhance/')[1].split('/')[0])
+      const body = enhancedRequests.find(item => item.request_id === requestId)
+      assert.ok(body)
       return jsonResponse({ original: body.prompt, enhanced: `${body.prompt} enhanced` })
     }
     throw new Error(`unexpected enhance request ${url}`)
@@ -305,6 +424,11 @@ test('standalone Enhance sends exact count only for type-1 sliding prompts', asy
     globalThis.document = originalDocument
     globalThis.localStorage = originalLocalStorage
     globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
   })
 
   const modelOptions = {
@@ -346,12 +470,1363 @@ test('standalone Enhance sends exact count only for type-1 sliding prompts', asy
   assert.equal(enhancedRequests[1].window_count, 4)
 })
 
+test('Prompt Enhance fences project instances, keeps stale results inert, and cancels explicitly', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  const documentTarget = new EventTarget()
+  Object.defineProperty(documentTarget, 'visibilityState', { value: 'hidden', configurable: true })
+  globalThis.document = documentTarget
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks: { request: (name, options, callback) => Promise.resolve(callback({ name })) } },
+  })
+
+  const projectInstances = {
+    'project one': '1'.repeat(64),
+    'project two': '2'.repeat(64),
+  }
+  const posts = []
+  const deletes = []
+  const statusChecks = []
+  const editResult = deferred()
+  let firstRequestId = ''
+  let editRequestId = ''
+  let editResultRequested = false
+  const operationStatus = (requestId, overrides = {}) => ({
+    request_id: requestId.replaceAll('-', ''),
+    operation_kind: 'enhance',
+    status: 'running', phase: 'generating', stage: 'llm',
+    pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+    partial_text: 'scoped partial', generated_tokens_approx: 2,
+    elapsed_seconds: 0.5, live_tps: 4, average_tps: null,
+    result_available: false, retryable: false,
+    ...overrides,
+  })
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      const workspace = new URL(url, 'http://localhost').searchParams.get('workspace')
+      return jsonResponse({
+        models: [], guides: [], project_instance: projectInstances[workspace],
+      })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'enhance-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      const body = JSON.parse(String(init.body))
+      posts.push(body)
+      assert.equal(body.project_instance, projectInstances[body.workspace])
+      if (body.prompt === 'first prompt') firstRequestId = body.request_id
+      if (body.prompt === 'successor prompt') {
+        return jsonResponse(operationStatus(body.request_id, {
+          status: 'completed', phase: 'completed', stage: 'completed',
+          partial_text: 'successor enhanced', live_tps: null,
+          average_tps: 3, result_available: true,
+        }), 202)
+      }
+      if (body.prompt === 'edit fence') {
+        editRequestId = body.request_id
+        return jsonResponse(operationStatus(body.request_id, {
+          status: 'completed', phase: 'completed', stage: 'completed',
+          partial_text: 'stale enhancement', live_tps: null,
+          average_tps: 3, result_available: true,
+        }), 202)
+      }
+      return jsonResponse(operationStatus(body.request_id), 202)
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && init.method === 'DELETE') {
+      const requestId = decodeURIComponent(url.split('/enhance/')[1].split('?')[0])
+      deletes.push({ requestId, url })
+      return jsonResponse(operationStatus(requestId, {
+        status: 'cancelled', phase: 'cancelled', stage: 'cancelled',
+        partial_text: '', generated_tokens_approx: 0, elapsed_seconds: 0,
+        live_tps: null, average_tps: null,
+      }))
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && url.includes('/result?')) {
+      if (editRequestId && url.includes(editRequestId)) {
+        editResultRequested = true
+        return editResult.promise
+      }
+      if (firstRequestId && url.includes(firstRequestId)) {
+        return jsonResponse({ original: 'first prompt', enhanced: 'reloaded first enhancement' })
+      }
+      return jsonResponse({ original: 'successor prompt', enhanced: 'successor enhanced' })
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/')) {
+      statusChecks.push(url)
+      if (firstRequestId && url.includes(firstRequestId)) {
+        return jsonResponse(operationStatus(firstRequestId, {
+          status: 'completed', phase: 'completed', stage: 'completed',
+          partial_text: 'reloaded first enhancement', live_tps: null,
+          result_available: true,
+        }))
+      }
+      throw new Error('hidden Prompt Enhance must not poll')
+    }
+    throw new Error(`unexpected scoped Enhance request ${url}`)
+  }
+
+  const { useStore } = await loadStoreModule()
+  const baseState = useStore.getState()
+  t.after(() => {
+    useStore.setState(baseState, true)
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+  useStore.setState({
+    activeWorkspace: 'project one', generationMode: 'video',
+    startImage: null, imageRefs: [], modelOptions: null,
+    params: {
+      ...baseState.params,
+      prompt: 'first prompt', model_type: 'test-model', image_mode: 0,
+    },
+  })
+
+  const first = useStore.getState().enhancePrompt()
+  await waitForCondition(() => posts.length >= 1, 'first scoped Enhance POST')
+  assert.equal(posts.length, 1)
+  const persistenceKey = 'maestro:prompt-enhance-operations-v2'
+  const persisted = JSON.parse(globalThis.localStorage.getItem(persistenceKey))
+  assert.deepEqual(Object.keys(persisted).sort(), ['operations', 'schemaVersion'])
+  assert.equal(persisted.schemaVersion, 2)
+  assert.deepEqual(Object.keys(persisted.operations[0]).sort(), [
+    'accountFingerprint', 'claimToken', 'projectInstance', 'requestId',
+    'settingsFingerprint', 'storedAt', 'workspace',
+  ])
+  assert.equal(JSON.stringify(persisted).includes('first prompt'), false)
+  assert.equal(persisted.operations[0].workspace, 'project one')
+  assert.equal(JSON.stringify(persisted).includes('test-model'), false)
+  persisted.operations[0].storedAt = Date.now() - (46 * 60 * 1000)
+  globalThis.localStorage.setItem(persistenceKey, JSON.stringify(persisted))
+
+  // Switching projects aborts only the browser wait. A successor owns all UI
+  // adoption even if the first server operation continues independently.
+  useStore.setState({ activeWorkspace: 'project two' })
+  assert.equal(await first, false)
+  assert.equal(deletes.length, 0)
+  useStore.setState(state => ({
+    params: { ...state.params, prompt: 'successor prompt' },
+  }))
+  assert.equal(await useStore.getState().enhancePrompt(), true)
+  assert.equal(useStore.getState().params.prompt, 'successor enhanced')
+  const afterSuccess = JSON.parse(globalThis.localStorage.getItem(persistenceKey))
+  assert.equal(afterSuccess.operations.length, 1)
+  assert.equal(afterSuccess.operations[0].workspace, 'project one')
+  assert.ok(afterSuccess.operations[0].storedAt <= Date.now() - (45 * 60 * 1000))
+  assert.equal(statusChecks.length, 0)
+
+  useStore.getState().setParam('prompt', 'edit fence')
+  const staleEdit = useStore.getState().enhancePrompt()
+  await waitForCondition(() => editResultRequested, 'edit-fenced Enhance result request')
+  assert.equal(editResultRequested, true)
+  useStore.getState().setParam('prompt', 'newer same-project edit')
+  editResult.resolve(jsonResponse({ original: 'edit fence', enhanced: 'must stay inert' }))
+  assert.equal(await staleEdit, false)
+  assert.equal(useStore.getState().params.prompt, 'newer same-project edit')
+
+  useStore.getState().setParam('prompt', 'cancel me')
+  const cancelWait = useStore.getState().enhancePrompt()
+  await waitForCondition(() => posts.length >= 4, 'cancellable Enhance admission')
+  assert.equal(useStore.getState().enhanceStatus.partial_text, 'scoped partial')
+  assert.equal(useStore.getState().enhanceStatus.live_tps, 4)
+  await useStore.getState().cancelEnhancePrompt()
+  assert.equal(await cancelWait, false)
+  assert.equal(deletes.length, 1)
+  assert.match(deletes[0].url, /workspace=project\+two/)
+  assert.equal(useStore.getState().isEnhancing, false)
+  assert.equal(useStore.getState().enhanceStatus, null)
+  assert.equal(JSON.parse(globalThis.localStorage.getItem(persistenceKey)).operations[0].workspace, 'project one')
+
+  Object.defineProperty(documentTarget, 'visibilityState', { value: 'visible', configurable: true })
+  useStore.setState({ activeWorkspace: 'project one' })
+  useStore.getState().setParam('prompt', 'first prompt')
+  assert.equal(await useStore.getState().resumeEnhancePrompt(), true)
+  assert.equal(useStore.getState().params.prompt, 'reloaded first enhancement')
+  assert.equal(globalThis.localStorage.getItem(persistenceKey), null)
+})
+
+test('Prompt Enhance image identity fences reject path and equal-count reference swaps fresh and after resume', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  let visibility = 'visible'
+  const documentTarget = new EventTarget()
+  Object.defineProperty(documentTarget, 'visibilityState', { get: () => visibility })
+  globalThis.document = documentTarget
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks: { request: (name, options, callback) => Promise.resolve(callback({ name })) } },
+  })
+
+  const instance = 'd'.repeat(64)
+  const requestPrompts = new Map()
+  const resultWaiters = new Map([
+    ['fresh path identity', deferred()],
+    ['fresh reference identity', deferred()],
+  ])
+  const resultRequested = new Set()
+  const postedPrompts = []
+  const operationStatus = (requestId, overrides = {}) => ({
+    request_id: requestId.replaceAll('-', ''), operation_kind: 'enhance',
+    status: 'running', phase: 'generating', stage: 'llm', pass: 1, pass_limit: 1,
+    attempt: 1, attempt_limit: 1, partial_text: '', generated_tokens_approx: 0,
+    elapsed_seconds: 0, live_tps: null, average_tps: null,
+    result_available: false, retryable: false, ...overrides,
+  })
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: instance })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'image-fence-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/upload')) {
+      return jsonResponse({ filename: 'reference.png', path: '/private/uploaded-reference.png', url: '/reference' })
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      const body = JSON.parse(String(init.body))
+      requestPrompts.set(body.request_id, body.prompt)
+      postedPrompts.push(body.prompt)
+      const fresh = body.prompt.startsWith('fresh ')
+      return jsonResponse(operationStatus(body.request_id, fresh ? {
+        status: 'completed', phase: 'completed', stage: 'completed', result_available: true,
+      } : {}), 202)
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && url.includes('/result?')) {
+      const requestId = decodeURIComponent(url.split('/enhance/')[1].split('/result?')[0])
+      const prompt = requestPrompts.get(requestId)
+      const waiter = resultWaiters.get(prompt)
+      if (waiter) {
+        resultRequested.add(prompt)
+        return waiter.promise
+      }
+      return jsonResponse({ original: prompt, enhanced: `${prompt} enhanced` })
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/')) {
+      const requestId = decodeURIComponent(url.split('/enhance/')[1].split('?')[0])
+      return jsonResponse(operationStatus(requestId, {
+        status: 'completed', phase: 'completed', stage: 'completed', result_available: true,
+      }))
+    }
+    throw new Error(`unexpected image-fence request ${url}`)
+  }
+
+  const { useStore } = await loadStoreModule()
+  const baseState = useStore.getState()
+  t.after(() => {
+    useStore.setState(baseState, true)
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+  const file = contents => new File([contents], 'same-reference.png', {
+    type: 'image/png', lastModified: 1234,
+  })
+  const referenceA = file('AAAA')
+  const referenceB = file('BBBB')
+  assert.equal(referenceA.name, referenceB.name)
+  assert.equal(referenceA.size, referenceB.size)
+  assert.equal(referenceA.type, referenceB.type)
+  assert.equal(referenceA.lastModified, referenceB.lastModified)
+
+  useStore.setState({
+    activeWorkspace: 'fresh-path', generationMode: 'video', startImage: null,
+    imageRefs: [], modelOptions: null,
+    params: {
+      ...baseState.params, prompt: 'fresh path identity', model_type: 'test-model',
+      image_mode: 0, image_start: '/private/original-start.png',
+    },
+  })
+  const freshPath = useStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => resultRequested.has('fresh path identity'),
+    'fresh path-fence result request',
+  )
+  useStore.getState().setParam('image_start', '/private/replacement-start.png')
+  resultWaiters.get('fresh path identity').resolve(jsonResponse({
+    original: 'fresh path identity', enhanced: 'stale path result',
+  }))
+  assert.equal(await freshPath, false)
+  assert.equal(useStore.getState().params.prompt, 'fresh path identity')
+
+  useStore.setState(state => ({
+    activeWorkspace: 'fresh-refs', generationMode: 'image', imageRefs: [referenceA],
+    params: {
+      ...state.params, prompt: 'fresh reference identity', image_start: undefined,
+      image_refs: undefined,
+    },
+  }))
+  const freshRefs = useStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => resultRequested.has('fresh reference identity'),
+    'fresh reference-fence result request',
+  )
+  useStore.setState({ imageRefs: [referenceB] })
+  resultWaiters.get('fresh reference identity').resolve(jsonResponse({
+    original: 'fresh reference identity', enhanced: 'stale reference result',
+  }))
+  assert.equal(await freshRefs, false)
+  assert.equal(useStore.getState().params.prompt, 'fresh reference identity')
+
+  visibility = 'hidden'
+  useStore.setState(state => ({
+    activeWorkspace: 'resume-path', generationMode: 'video', imageRefs: [],
+    params: {
+      ...state.params, prompt: 'resume path identity', image_start: '/private/resume-original.png',
+      image_refs: undefined,
+    },
+  }))
+  const waitingPath = useStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => postedPrompts.includes('resume path identity'),
+    'resumable path-fence admission',
+  )
+  const persistedPath = globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2')
+  assert.equal(persistedPath.includes('/private/resume-original.png'), false)
+  assert.match(
+    JSON.parse(persistedPath).operations[0].settingsFingerprint,
+    /^[0-9a-f]{64}$/,
+  )
+  const privacyClaim = globalThis.sessionStorage.getItem('maestro:prompt-enhance-fingerprint-claim-v1')
+  assert.match(JSON.parse(privacyClaim).salt, /^[0-9a-f]{64}$/)
+  assert.match(JSON.parse(privacyClaim).token, /^[0-9a-f]{64}$/)
+  assert.equal(privacyClaim.includes('/private/'), false)
+  useStore.setState({ activeWorkspace: 'parking' })
+  assert.equal(await waitingPath, false)
+  useStore.getState().setParam('image_start', '/private/resume-replacement.png')
+  useStore.setState({ activeWorkspace: 'resume-path' })
+  visibility = 'visible'
+  assert.equal(await useStore.getState().resumeEnhancePrompt(), false)
+  assert.equal(useStore.getState().params.prompt, 'resume path identity')
+
+  visibility = 'hidden'
+  useStore.setState(state => ({
+    activeWorkspace: 'resume-refs', generationMode: 'image', imageRefs: [referenceA],
+    params: {
+      ...state.params, prompt: 'resume reference identity', image_start: undefined,
+      image_refs: ['/private/reference-a.png'],
+    },
+  }))
+  const waitingRefs = useStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => postedPrompts.includes('resume reference identity'),
+    'resumable reference-fence admission',
+  )
+  const persistedRefs = globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2')
+  assert.equal(persistedRefs.includes('same-reference.png'), false)
+  assert.equal(persistedRefs.includes('AAAA'), false)
+  assert.equal(persistedRefs.includes('BBBB'), false)
+  useStore.setState({ activeWorkspace: 'parking' })
+  assert.equal(await waitingRefs, false)
+  useStore.setState({ activeWorkspace: 'resume-refs', imageRefs: [referenceB] })
+  visibility = 'visible'
+  assert.equal(await useStore.getState().resumeEnhancePrompt(), false)
+  assert.equal(useStore.getState().params.prompt, 'resume reference identity')
+})
+
+test('Prompt Enhance Web Lock claim preserves reload and rotates copied or unclaimable salts', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: null })
+    }
+    throw new Error(`unexpected salt-scope request ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+
+  class ExclusiveLocksFake {
+    held = new Set()
+    request(name, options, callback) {
+      assert.equal(options.mode, 'exclusive')
+      if (name === 'maestro-prompt-enhance-ledger-v2') {
+        assert.ok(options.signal instanceof AbortSignal)
+        return Promise.resolve(callback({ name }))
+      }
+      assert.equal(options.ifAvailable, true)
+      if (this.held.has(name)) return Promise.resolve(callback(null))
+      this.held.add(name)
+      return Promise.resolve(callback({ name }))
+    }
+    releaseAll() { this.held.clear() }
+  }
+  const claimKey = 'maestro:prompt-enhance-fingerprint-claim-v1'
+  const runRealm = async label => {
+    const { useStore } = await loadStoreModuleFresh()
+    const baseState = useStore.getState()
+    useStore.setState({
+      activeWorkspace: `salt-${label}`,
+      startImage: null,
+      imageRefs: [],
+      params: { ...baseState.params, prompt: `salt ${label}`, model_type: 'test-model' },
+    })
+    assert.equal(await useStore.getState().enhancePrompt(), false)
+    const claim = JSON.parse(globalThis.sessionStorage.getItem(claimKey))
+    assert.deepEqual(Object.keys(claim).sort(), ['salt', 'schemaVersion', 'token'])
+    assert.equal(claim.schemaVersion, 1)
+    assert.match(claim.token, /^[0-9a-f]{64}$/)
+    assert.match(claim.salt, /^[0-9a-f]{64}$/)
+    assert.equal(JSON.stringify(claim).includes('/private/'), false)
+    return claim
+  }
+
+  const locks = new ExclusiveLocksFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true, value: { locks },
+  })
+  const originalClaim = await runRealm('original')
+
+  // A reload begins after its predecessor realm releases the token lock and
+  // therefore retains the exact token and salt.
+  locks.releaseAll()
+  const reloadClaim = await runRealm('reload')
+  assert.deepEqual(reloadClaim, originalClaim)
+
+  // A duplicated/opener-copied tab sees the predecessor lock held. This is
+  // fail-closed even if Navigation Timing would have called it a reload.
+  const duplicateSession = new StorageFake()
+  duplicateSession.setItem(claimKey, JSON.stringify(reloadClaim))
+  globalThis.sessionStorage = duplicateSession
+  const duplicateClaim = await runRealm('duplicate')
+  assert.notEqual(duplicateClaim.token, reloadClaim.token)
+  assert.notEqual(duplicateClaim.salt, reloadClaim.salt)
+
+  const copiedClaim = JSON.stringify(duplicateClaim)
+  globalThis.sessionStorage = new StorageFake()
+  globalThis.sessionStorage.setItem(claimKey, copiedClaim)
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {} })
+  const missingLocksClaim = await runRealm('missing-locks')
+  assert.notDeepEqual(missingLocksClaim, duplicateClaim)
+
+  globalThis.sessionStorage = new StorageFake()
+  globalThis.sessionStorage.setItem(claimKey, copiedClaim)
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks: { request: async () => { throw new Error('locks unavailable') } } },
+  })
+  const erroredLocksClaim = await runRealm('errored-locks')
+  assert.notDeepEqual(erroredLocksClaim, duplicateClaim)
+})
+
+test('Prompt Enhance duplicate rejection preserves the source-owned recovery record', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  class ExclusiveLocksFake {
+    held = new Set()
+    request(name, options, callback) {
+      assert.equal(options.mode, 'exclusive')
+      if (name === 'maestro-prompt-enhance-ledger-v2') {
+        assert.ok(options.signal instanceof AbortSignal)
+        return Promise.resolve(callback({ name }))
+      }
+      assert.equal(options.ifAvailable, true)
+      if (this.held.has(name)) return Promise.resolve(callback(null))
+      this.held.add(name)
+      return Promise.resolve(callback({ name }))
+    }
+  }
+  const alerts = []
+  let visibility = 'hidden'
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    alert(message) { alerts.push(String(message)) },
+    location: { hostname: 'localhost' },
+  })
+  const documentTarget = new EventTarget()
+  Object.defineProperty(documentTarget, 'visibilityState', { get: () => visibility })
+  globalThis.document = documentTarget
+  globalThis.localStorage = new StorageFake()
+  const sourceSession = new StorageFake()
+  globalThis.sessionStorage = sourceSession
+  const locks = new ExclusiveLocksFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true, value: { locks },
+  })
+  const projectInstance = 'f'.repeat(64)
+  let requestId = ''
+  let statusRequests = 0
+  let resultRequests = 0
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'owner-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      const body = JSON.parse(String(init.body))
+      requestId = body.request_id
+      return jsonResponse({
+        request_id: requestId.replaceAll('-', ''), operation_kind: 'enhance',
+        status: 'running', phase: 'generating', stage: 'llm', pass: 1, pass_limit: 1,
+        attempt: 1, attempt_limit: 1, partial_text: 'source partial',
+        generated_tokens_approx: 1, elapsed_seconds: 1, live_tps: 1,
+        average_tps: null, result_available: false, retryable: false,
+      }, 202)
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && url.includes('/result?')) {
+      resultRequests += 1
+      return jsonResponse({ original: 'source-owned prompt', enhanced: 'source-owned result' })
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/')) {
+      statusRequests += 1
+      return jsonResponse({
+        request_id: requestId.replaceAll('-', ''), operation_kind: 'enhance',
+        status: 'completed', phase: 'completed', stage: 'completed', pass: 1, pass_limit: 1,
+        attempt: 1, attempt_limit: 1, partial_text: 'source-owned result',
+        generated_tokens_approx: 2, elapsed_seconds: 1, live_tps: null,
+        average_tps: 2, result_available: true, retryable: false,
+      })
+    }
+    throw new Error(`unexpected owner-fence request ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+
+  const configureRealm = useStore => {
+    const baseState = useStore.getState()
+    useStore.setState({
+      activeWorkspace: 'source-owned-workspace', generationMode: 'video',
+      startImage: null, imageRefs: [], modelOptions: null,
+      params: {
+        ...baseState.params, prompt: 'source-owned prompt', model_type: 'test-model',
+        image_mode: 0, image_start: undefined, image_refs: undefined,
+      },
+    })
+  }
+  const ledgerKey = 'maestro:prompt-enhance-operations-v2'
+  const claimKey = 'maestro:prompt-enhance-fingerprint-claim-v1'
+  const { useStore: sourceStore } = await loadStoreModuleFresh()
+  configureRealm(sourceStore)
+  const sourceWait = sourceStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => requestId !== '' && globalThis.localStorage.getItem(ledgerKey) !== null,
+    'source-owned recovery admission',
+  )
+  sourceStore.setState({ activeWorkspace: 'source-parking' })
+  assert.equal(await sourceWait, false)
+  const sourceClaim = JSON.parse(sourceSession.getItem(claimKey))
+  const sourceLedger = globalThis.localStorage.getItem(ledgerKey)
+  const sourceRecord = JSON.parse(sourceLedger).operations[0]
+  assert.equal(sourceRecord.claimToken, sourceClaim.token)
+  assert.equal(sourceLedger.includes('source-owned prompt'), false)
+
+  const copiedSession = new StorageFake()
+  copiedSession.setItem(claimKey, JSON.stringify(sourceClaim))
+  globalThis.sessionStorage = copiedSession
+  const { useStore: duplicateStore } = await loadStoreModuleFresh()
+  configureRealm(duplicateStore)
+  assert.equal(await duplicateStore.getState().resumeEnhancePrompt(), false)
+  assert.equal(globalThis.localStorage.getItem(ledgerKey), sourceLedger)
+  assert.equal(statusRequests, 0)
+  assert.equal(resultRequests, 0)
+  assert.match(alerts.at(-1), /could not exclusively reclaim/)
+
+  for (const unavailableLocks of [
+    {},
+    { locks: { request: async () => { throw new Error('locks unavailable') } } },
+  ]) {
+    const unavailableSession = new StorageFake()
+    unavailableSession.setItem(claimKey, JSON.stringify(sourceClaim))
+    globalThis.sessionStorage = unavailableSession
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true, value: unavailableLocks,
+    })
+    const { useStore: unavailableStore } = await loadStoreModuleFresh()
+    configureRealm(unavailableStore)
+    assert.equal(await unavailableStore.getState().resumeEnhancePrompt(), false)
+    assert.equal(globalThis.localStorage.getItem(ledgerKey), sourceLedger)
+    assert.match(alerts.at(-1), /could not exclusively reclaim/)
+  }
+
+  visibility = 'visible'
+  globalThis.sessionStorage = sourceSession
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true, value: { locks },
+  })
+  sourceStore.setState({ activeWorkspace: 'source-owned-workspace' })
+  assert.equal(await sourceStore.getState().resumeEnhancePrompt(), true)
+  assert.equal(sourceStore.getState().params.prompt, 'source-owned result')
+  assert.equal(statusRequests, 1)
+  assert.equal(resultRequests, 1)
+  assert.equal(globalThis.localStorage.getItem(ledgerKey), null)
+})
+
+test('Prompt Enhance delayed reload claim cannot steal a manual successor', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  class DelayedLocksFake {
+    held = new Set()
+    delayed = false
+    waiters = []
+    request(name, options, callback) {
+      assert.equal(options.mode, 'exclusive')
+      if (name === 'maestro-prompt-enhance-ledger-v2') {
+        assert.ok(options.signal instanceof AbortSignal)
+        return Promise.resolve(callback({ name }))
+      }
+      assert.equal(options.ifAvailable, true)
+      if (this.held.has(name)) return Promise.resolve(callback(null))
+      if (!this.delayed) {
+        this.held.add(name)
+        return Promise.resolve(callback({ name }))
+      }
+      return new Promise(resolve => this.waiters.push({ name, callback, resolve }))
+    }
+    releaseAll() { this.held.clear() }
+    delayNext() { this.delayed = true }
+    grantAll() {
+      this.delayed = false
+      for (const waiter of this.waiters.splice(0)) {
+        this.held.add(waiter.name)
+        waiter.resolve(waiter.callback({ name: waiter.name }))
+      }
+    }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  let visibility = 'hidden'
+  const documentTarget = new EventTarget()
+  Object.defineProperty(documentTarget, 'visibilityState', { get: () => visibility })
+  globalThis.document = documentTarget
+  globalThis.localStorage = new StorageFake()
+  const sourceSession = new StorageFake()
+  globalThis.sessionStorage = sourceSession
+  const locks = new DelayedLocksFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true, value: { locks },
+  })
+  const projectInstance = 'e'.repeat(64)
+  const requests = new Map()
+  let oldStatusRequests = 0
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'race-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      const body = JSON.parse(String(init.body))
+      requests.set(body.request_id, body.prompt)
+      const completed = body.prompt === 'manual successor'
+      return jsonResponse({
+        request_id: body.request_id.replaceAll('-', ''), operation_kind: 'enhance',
+        status: completed ? 'completed' : 'running',
+        phase: completed ? 'completed' : 'generating',
+        stage: completed ? 'completed' : 'llm', pass: 1, pass_limit: 1,
+        attempt: 1, attempt_limit: 1, partial_text: completed ? 'manual result' : 'old partial',
+        generated_tokens_approx: 1, elapsed_seconds: 1, live_tps: null,
+        average_tps: 1, result_available: completed, retryable: false,
+      }, 202)
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && url.includes('/result?')) {
+      const id = decodeURIComponent(url.split('/enhance/')[1].split('/')[0])
+      const original = requests.get(id)
+      return jsonResponse({ original, enhanced: original === 'manual successor' ? 'manual result' : 'old result' })
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/')) {
+      oldStatusRequests += 1
+      throw new Error('delayed recovery must not poll after a successor starts')
+    }
+    throw new Error(`unexpected delayed-claim request ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+  const configure = (useStore, prompt) => {
+    const baseState = useStore.getState()
+    useStore.setState({
+      activeWorkspace: 'delayed-claim-workspace', generationMode: 'video',
+      startImage: null, imageRefs: [], modelOptions: null,
+      params: {
+        ...baseState.params, prompt, model_type: 'test-model', image_mode: 0,
+        image_start: undefined, image_refs: undefined,
+      },
+    })
+  }
+  const ledgerKey = 'maestro:prompt-enhance-operations-v2'
+  const claimKey = 'maestro:prompt-enhance-fingerprint-claim-v1'
+  const { useStore: sourceStore } = await loadStoreModuleFresh()
+  configure(sourceStore, 'delayed recovery')
+  const sourceWait = sourceStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => requests.size === 1 && globalThis.localStorage.getItem(ledgerKey) !== null,
+    'delayed-claim source admission',
+  )
+  sourceStore.setState({ activeWorkspace: 'delayed-source-parking' })
+  assert.equal(await sourceWait, false)
+  const sourceClaim = sourceSession.getItem(claimKey)
+  const sourceLedger = globalThis.localStorage.getItem(ledgerKey)
+
+  locks.releaseAll()
+  locks.delayNext()
+  globalThis.sessionStorage = new StorageFake()
+  globalThis.sessionStorage.setItem(claimKey, sourceClaim)
+  visibility = 'visible'
+  const { useStore: reloadStore } = await loadStoreModuleFresh()
+  configure(reloadStore, 'delayed recovery')
+  const delayedResume = reloadStore.getState().resumeEnhancePrompt()
+  await waitForCondition(() => locks.waiters.length === 1, 'delayed recovery lock request')
+  reloadStore.getState().setParam('prompt', 'manual successor')
+  const successor = reloadStore.getState().enhancePrompt()
+  assert.equal(reloadStore.getState().isEnhancing, true)
+  locks.grantAll()
+  assert.equal(await delayedResume, false)
+  assert.equal(await successor, true)
+  assert.equal(reloadStore.getState().params.prompt, 'manual result')
+  assert.equal(oldStatusRequests, 0)
+  const remaining = JSON.parse(globalThis.localStorage.getItem(ledgerKey)).operations
+  assert.equal(remaining.length, 1)
+  assert.equal(remaining[0].requestId, JSON.parse(sourceLedger).operations[0].requestId)
+})
+
+test('Prompt Enhance persistence failures preserve foreign ledgers and disable reload recovery', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalDateNow = Date.now
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  class FailingStorage extends StorageFake {
+    setItem(key, value) {
+      if (key === 'maestro:prompt-enhance-operations-v2') throw new Error('quota full')
+      super.setItem(key, value)
+    }
+  }
+  const alerts = []
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    alert(message) { alerts.push(String(message)) },
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+  const ledgerKey = 'maestro:prompt-enhance-operations-v2'
+  const fullStorage = new StorageFake()
+  const foreignOperations = Array.from({ length: 8 }, (_, index) => ({
+    requestId: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    workspace: `foreign-${index}`,
+    projectInstance: 'a'.repeat(64),
+    accountFingerprint: 'b'.repeat(16),
+    claimToken: String(index + 1).repeat(64).slice(0, 64),
+    settingsFingerprint: 'c'.repeat(64),
+    storedAt: originalDateNow(),
+  }))
+  fullStorage.setItem(ledgerKey, JSON.stringify({ schemaVersion: 2, operations: foreignOperations }))
+  globalThis.localStorage = fullStorage
+  globalThis.sessionStorage = new StorageFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks: { request: (name, options, callback) => Promise.resolve(callback({ name })) } },
+  })
+  const fullLedger = fullStorage.getItem(ledgerKey)
+  const projectInstance = 'd'.repeat(64)
+  const requestPrompts = new Map()
+  let forceTimeout = false
+  let timeoutTick = 0
+  Date.now = () => forceTimeout
+    ? originalDateNow() + (++timeoutTick * 10_000_000)
+    : originalDateNow()
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'persistence-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      const body = JSON.parse(String(init.body))
+      requestPrompts.set(body.request_id, body.prompt)
+      const completed = body.prompt === 'full ledger current wait'
+      if (!completed) forceTimeout = true
+      return jsonResponse({
+        request_id: body.request_id.replaceAll('-', ''), operation_kind: 'enhance',
+        status: completed ? 'completed' : 'running',
+        phase: completed ? 'completed' : 'generating', stage: completed ? 'completed' : 'llm',
+        pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+        partial_text: completed ? 'current wait result' : 'still running',
+        generated_tokens_approx: 1, elapsed_seconds: 1, live_tps: null,
+        average_tps: 1, result_available: completed, retryable: false,
+      }, 202)
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && url.includes('/result?')) {
+      const id = decodeURIComponent(url.split('/enhance/')[1].split('/')[0])
+      const original = requestPrompts.get(id)
+      return jsonResponse({ original, enhanced: 'current wait result' })
+    }
+    throw new Error(`unexpected persistence request ${url}`)
+  }
+  t.after(() => {
+    Date.now = originalDateNow
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+  const { useStore } = await loadStoreModuleFresh()
+  const configure = prompt => {
+    const state = useStore.getState()
+    useStore.setState({
+      activeWorkspace: 'persistence-workspace', generationMode: 'video',
+      startImage: null, imageRefs: [], modelOptions: null,
+      params: {
+        ...state.params, prompt, model_type: 'test-model', image_mode: 0,
+        image_start: undefined, image_refs: undefined,
+      },
+    })
+  }
+  configure('full ledger current wait')
+  assert.equal(await useStore.getState().enhancePrompt(), true)
+  assert.equal(useStore.getState().params.prompt, 'current wait result')
+  assert.equal(fullStorage.getItem(ledgerKey), fullLedger)
+
+  forceTimeout = false
+  timeoutTick = 0
+  globalThis.localStorage = new FailingStorage()
+  configure('write failure timeout')
+  const originalConsoleError = console.error
+  console.error = () => {}
+  try {
+    assert.equal(await useStore.getState().enhancePrompt(), false)
+  } finally {
+    console.error = originalConsoleError
+  }
+  assert.equal(globalThis.localStorage.getItem(ledgerKey), null)
+  assert.match(alerts.at(-1), /reloading will not resume this request/)
+})
+
+test('Prompt Enhance global ledger lock preserves concurrent two-owner appends', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+  globalThis.localStorage = new StorageFake()
+  const ownerASession = new StorageFake()
+  globalThis.sessionStorage = ownerASession
+  const locks = new QueuedEnhanceLocksFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true, value: { locks },
+  })
+  const projectInstance = '9'.repeat(64)
+  const postWaiters = new Map([
+    ['atomic owner a', deferred()],
+    ['atomic owner b', deferred()],
+  ])
+  const posts = []
+  const requestPrompts = new Map()
+  const completedStatus = (requestId, prompt) => ({
+    request_id: requestId.replaceAll('-', ''), operation_kind: 'enhance',
+    status: 'completed', phase: 'completed', stage: 'completed', pass: 1, pass_limit: 1,
+    attempt: 1, attempt_limit: 1, partial_text: `${prompt} result`,
+    generated_tokens_approx: 1, elapsed_seconds: 1, live_tps: null,
+    average_tps: 1, result_available: true, retryable: false,
+  })
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'atomic-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      const body = JSON.parse(String(init.body))
+      posts.push(body.prompt)
+      requestPrompts.set(body.request_id, body.prompt)
+      return postWaiters.get(body.prompt).promise
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && url.includes('/result?')) {
+      const id = decodeURIComponent(url.split('/enhance/')[1].split('/')[0])
+      const prompt = requestPrompts.get(id)
+      return jsonResponse({ original: prompt, enhanced: `${prompt} result` })
+    }
+    throw new Error(`unexpected atomic-append request ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+  const configure = (useStore, workspace, prompt) => {
+    const state = useStore.getState()
+    useStore.setState({
+      activeWorkspace: workspace, generationMode: 'video', startImage: null,
+      imageRefs: [], modelOptions: null,
+      params: {
+        ...state.params, prompt, model_type: 'test-model', image_mode: 0,
+        image_start: undefined, image_refs: undefined,
+      },
+    })
+  }
+  const ledgerKey = 'maestro:prompt-enhance-operations-v2'
+  const { useStore: ownerA } = await loadStoreModuleFresh()
+  configure(ownerA, 'atomic-a', 'atomic owner a')
+  locks.blockNext()
+  const pendingA = ownerA.getState().enhancePrompt()
+  await waitForCondition(() => locks.blockedLedger !== null, 'first owner ledger lock')
+
+  globalThis.sessionStorage = new StorageFake()
+  const { useStore: ownerB } = await loadStoreModuleFresh()
+  configure(ownerB, 'atomic-b', 'atomic owner b')
+  const pendingB = ownerB.getState().enhancePrompt()
+  await waitForCondition(() => locks.ledgerQueue.length === 1, 'second owner queued append')
+  assert.equal(posts.length, 0)
+  locks.releaseBlocked()
+  await waitForCondition(() => posts.length === 2, 'serialized owner POSTs')
+  const stored = JSON.parse(globalThis.localStorage.getItem(ledgerKey)).operations
+  assert.deepEqual(new Set(stored.map(item => item.workspace)), new Set(['atomic-a', 'atomic-b']))
+
+  for (const [prompt, waiter] of postWaiters) {
+    const requestId = [...requestPrompts].find(([, value]) => value === prompt)[0]
+    waiter.resolve(jsonResponse(completedStatus(requestId, prompt), 202))
+  }
+  assert.equal(await pendingA, true)
+  assert.equal(await pendingB, true)
+  assert.equal(globalThis.localStorage.getItem(ledgerKey), null)
+})
+
+test('Prompt Enhance global ledger lock serializes append ahead of another owner removal', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  let visibility = 'hidden'
+  const documentTarget = new EventTarget()
+  Object.defineProperty(documentTarget, 'visibilityState', { get: () => visibility })
+  globalThis.document = documentTarget
+  globalThis.localStorage = new StorageFake()
+  const ownerASession = new StorageFake()
+  globalThis.sessionStorage = ownerASession
+  const locks = new QueuedEnhanceLocksFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true, value: { locks },
+  })
+  const projectInstance = '8'.repeat(64)
+  const requests = new Map()
+  let appendPosts = 0
+  const runningStatus = (requestId, prompt) => ({
+    request_id: requestId.replaceAll('-', ''), operation_kind: 'enhance',
+    status: 'running', phase: 'generating', stage: 'llm', pass: 1, pass_limit: 1,
+    attempt: 1, attempt_limit: 1, partial_text: `${prompt} partial`,
+    generated_tokens_approx: 1, elapsed_seconds: 1, live_tps: 1,
+    average_tps: null, result_available: false, retryable: false,
+  })
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'atomic-remove-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      const body = JSON.parse(String(init.body))
+      requests.set(body.prompt, body.request_id)
+      if (body.prompt === 'append owner') appendPosts += 1
+      return jsonResponse(runningStatus(body.request_id, body.prompt), 202)
+    }
+    if (init.method === 'DELETE' && url.includes('/api/v1/llm/operations/enhance/')) {
+      const id = decodeURIComponent(url.split('/enhance/')[1].split('?')[0])
+      return jsonResponse({
+        ...runningStatus(id, 'remove owner'), status: 'cancelled', phase: 'cancelled',
+        stage: 'cancelled', partial_text: '', generated_tokens_approx: 0,
+        elapsed_seconds: 0, live_tps: null,
+      })
+    }
+    throw new Error(`unexpected append-remove request ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+  const configure = (useStore, workspace, prompt) => {
+    const state = useStore.getState()
+    useStore.setState({
+      activeWorkspace: workspace, generationMode: 'video', startImage: null,
+      imageRefs: [], modelOptions: null,
+      params: {
+        ...state.params, prompt, model_type: 'test-model', image_mode: 0,
+        image_start: undefined, image_refs: undefined,
+      },
+    })
+  }
+  const ledgerKey = 'maestro:prompt-enhance-operations-v2'
+  const { useStore: ownerA } = await loadStoreModuleFresh()
+  configure(ownerA, 'remove-workspace', 'remove owner')
+  const seed = ownerA.getState().enhancePrompt()
+  await waitForCondition(
+    () => requests.has('remove owner') && globalThis.localStorage.getItem(ledgerKey) !== null,
+    'remove-owner seed',
+  )
+  ownerA.setState({ activeWorkspace: 'remove-parking' })
+  assert.equal(await seed, false)
+
+  globalThis.sessionStorage = new StorageFake()
+  const { useStore: ownerB } = await loadStoreModuleFresh()
+  configure(ownerB, 'append-workspace', 'append owner')
+  locks.blockNext()
+  const append = ownerB.getState().enhancePrompt()
+  await waitForCondition(() => locks.blockedLedger !== null, 'blocked append mutation')
+  ownerA.setState({ activeWorkspace: 'remove-workspace' })
+  const remove = ownerA.getState().cancelEnhancePrompt()
+  await waitForCondition(() => locks.ledgerQueue.length === 1, 'queued owner removal')
+  locks.releaseBlocked()
+  await remove
+  await waitForCondition(() => appendPosts === 1, 'append POST after serialized storage')
+  ownerB.setState({ activeWorkspace: 'append-parking' })
+  assert.equal(await append, false)
+  const remaining = JSON.parse(globalThis.localStorage.getItem(ledgerKey)).operations
+  assert.equal(remaining.length, 1)
+  assert.equal(remaining[0].workspace, 'append-workspace')
+})
+
+test('Prompt Enhance cancel during queued pre-POST persistence stays entirely local', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  const locks = new QueuedEnhanceLocksFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true, value: { locks },
+  })
+  const foreignRelease = deferred()
+  const foreignController = new AbortController()
+  const foreignLedger = locks.request(
+    'maestro-prompt-enhance-ledger-v2',
+    { mode: 'exclusive', signal: foreignController.signal },
+    () => foreignRelease.promise,
+  )
+  let posts = 0
+  let deletes = 0
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: '7'.repeat(64) })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'pre-post-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      posts += 1
+      throw new Error('pre-POST cancellation must not submit')
+    }
+    if (init.method === 'DELETE') {
+      deletes += 1
+      throw new Error('pre-POST cancellation must not delete')
+    }
+    throw new Error(`unexpected pre-POST cancellation request ${url}`)
+  }
+  t.after(() => {
+    foreignController.abort()
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+  const { useStore } = await loadStoreModuleFresh()
+  const baseState = useStore.getState()
+  useStore.setState({
+    activeWorkspace: 'pre-post-cancel', generationMode: 'video', startImage: null,
+    imageRefs: [], modelOptions: null,
+    params: {
+      ...baseState.params, prompt: 'cancel queued persistence', model_type: 'test-model',
+      image_mode: 0, image_start: undefined, image_refs: undefined,
+    },
+  })
+  const pending = useStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => locks.ledgerQueue.length === 1 && useStore.getState().enhanceRequestScope !== null,
+    'queued pre-POST persistence',
+  )
+  const cancel = useStore.getState().cancelEnhancePrompt()
+  await waitForCondition(
+    () => !useStore.getState().isEnhancing && locks.ledgerQueue.length === 1,
+    'local pre-POST abort and queued cleanup',
+  )
+  assert.equal(posts, 0)
+  assert.equal(deletes, 0)
+  assert.equal(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
+  foreignRelease.resolve()
+  await foreignLedger
+  await cancel
+  assert.equal(await pending, false)
+  assert.equal(posts, 0)
+  assert.equal(deletes, 0)
+  assert.equal(useStore.getState().enhanceRequestScope, null)
+  assert.equal(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
+})
+
+test('Prompt Enhance cancel before POST stops locally without issuing a server DELETE', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  const upload = deferred()
+  let posts = 0
+  let deletes = 0
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: 'c'.repeat(64) })
+    }
+    if (url.endsWith('/api/v1/upload')) return upload.promise
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      posts += 1
+      throw new Error('cancelled request must not POST')
+    }
+    if (init.method === 'DELETE') {
+      deletes += 1
+      throw new Error('pre-admission cancel must not DELETE')
+    }
+    throw new Error(`unexpected pre-admission request ${url}`)
+  }
+  const { useStore } = await loadStoreModule()
+  const baseState = useStore.getState()
+  t.after(() => {
+    useStore.setState(baseState, true)
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+  })
+  useStore.setState({
+    activeWorkspace: 'cancel-before-post', generationMode: 'video',
+    startImage: new File(['image'], 'start.png', { type: 'image/png' }),
+    imageRefs: [], modelOptions: null,
+    params: { ...baseState.params, prompt: 'cancel before admission', model_type: 'test-model' },
+  })
+  const pending = useStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => Boolean(useStore.getState().enhanceRequestScope),
+    'pre-admission Enhance scope',
+  )
+  assert.notEqual(useStore.getState().enhanceRequestScope, null)
+  await useStore.getState().cancelEnhancePrompt()
+  upload.resolve(jsonResponse({ filename: 'start.png', path: '/private/start.png', url: '/image' }))
+  assert.equal(await pending, false)
+  assert.equal(posts, 0)
+  assert.equal(deletes, 0)
+  assert.equal(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
+})
+
 test('account identity changes fence deferred generation submission and active-job discovery', async t => {
   const originalFetch = globalThis.fetch
   const originalWindow = globalThis.window
   const originalDocument = globalThis.document
   const originalLocalStorage = globalThis.localStorage
   const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
   class StorageFake {
     values = new Map()
     getItem(key) { return this.values.get(key) ?? null }
@@ -368,12 +1843,21 @@ test('account identity changes fence deferred generation submission and active-j
   globalThis.document = Object.assign(new EventTarget(), { hidden: false })
   globalThis.localStorage = new StorageFake()
   globalThis.sessionStorage = new StorageFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks: { request: (name, options, callback) => Promise.resolve(callback({ name })) } },
+  })
   t.after(() => {
     globalThis.fetch = originalFetch
     globalThis.window = originalWindow
     globalThis.document = originalDocument
     globalThis.localStorage = originalLocalStorage
     globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
   })
 
   const account = (id, username) => ({
@@ -395,10 +1879,29 @@ test('account identity changes fence deferred generation submission and active-j
   const submission = deferred()
   const migration = deferred()
   const discovery = deferred()
+  let enhancePosts = 0
   let discoverNext = false
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input)
     if (url.endsWith('/api/v1/generate')) return submission.promise
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: 'a'.repeat(64) })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'account-enhance', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      enhancePosts += 1
+      const body = JSON.parse(String(init.body))
+      assert.equal(body.project_instance, 'a'.repeat(64))
+      return jsonResponse({
+        request_id: body.request_id.replaceAll('-', ''), operation_kind: 'enhance',
+        status: 'running', phase: 'generating', stage: 'llm', pass: 1, pass_limit: 1,
+        attempt: 1, attempt_limit: 1, partial_text: 'old-account partial',
+        generated_tokens_approx: 1, elapsed_seconds: 1, live_tps: 1,
+        average_tps: null, result_available: false, retryable: false,
+      }, 202)
+    }
     if (url.endsWith('/api/v1/account/projects/migration') && init.method === 'POST') {
       return migration.promise
     }
@@ -447,10 +1950,18 @@ test('account identity changes fence deferred generation submission and active-j
     reconnectDirectorPreparation: async () => { directorReconnects += 1 },
   })
 
+  const pendingEnhance = useStore.getState().enhancePrompt()
+  await waitForCondition(() => enhancePosts >= 1, 'account-scoped Enhance admission')
+  assert.equal(enhancePosts, 1)
+  assert.notEqual(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
   const pendingSubmit = useStore.getState().startGeneration()
   await Promise.resolve()
   assert.equal(useStore.getState().jobs.length, 1, 'submission placeholder should be visible before logout')
   await useStore.getState().logoutAccount()
+  assert.equal(await pendingEnhance, false)
+  assert.equal(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
+  assert.equal(useStore.getState().isEnhancing, false)
+  assert.equal(useStore.getState().enhanceRequestScope, null)
   assert.deepEqual(useStore.getState().jobs, [], 'logout synchronously scrubs the old placeholder')
   const newerIdentityJob = {
     id: 'newer-identity-job', status: 'queued', progress: 0, step: 0, totalSteps: 0,
@@ -1167,9 +2678,7 @@ test('same-poller wakes coalesce behind one in-flight request and stop at termin
     ...apiJobStatus('coalesced-job', 'project one', plan(), 21),
     status: 'running',
   })
-  for (let attempt = 0; attempt < 20 && requestCount < 2; attempt++) {
-    await new Promise(resolve => setImmediate(resolve))
-  }
+  await waitForCondition(() => requestCount >= 2, 'coalesced recovery follow-up')
   assert.equal(requestCount, 2)
   assert.equal(inFlight, 1)
   assert.equal(maxInFlight, 1)
@@ -1179,9 +2688,10 @@ test('same-poller wakes coalesce behind one in-flight request and stop at termin
     ...apiJobStatus('coalesced-job', 'project one', plan(), 21),
     status: 'completed',
   })
-  for (let attempt = 0; attempt < 20 && useStore.getState().jobs.length > 0; attempt++) {
-    await new Promise(resolve => setImmediate(resolve))
-  }
+  await waitForCondition(
+    () => useStore.getState().jobs.length === 0,
+    'terminal recovered job cleanup',
+  )
   assert.equal(useStore.getState().jobs.length, 0)
   assert.equal(useStore.getState().isGenerating, false)
   assert.equal(requestCount, 2)

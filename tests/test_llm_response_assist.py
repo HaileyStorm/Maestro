@@ -423,6 +423,55 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
             ),
         )
 
+    def test_stream_done_finalizer_isolated_from_scoped_outcomes(self):
+        previous_buffer = llm_service._stream_buffer
+        previous_done = llm_service._stream_done
+        self.addCleanup(
+            lambda: setattr(llm_service, "_stream_buffer", previous_buffer)
+        )
+        self.addCleanup(
+            lambda: setattr(llm_service, "_stream_done", previous_done)
+        )
+
+        def probe(progress_callback=None, *, outcome="success"):
+            if outcome == "cancel":
+                raise LlmRequestCancelled("synthetic cancellation")
+            if outcome == "error":
+                raise RuntimeError("synthetic failure")
+            return "ok"
+
+        wrapped = llm_service._with_stream_done_finally(probe)
+        callback = lambda _event: None
+        for outcome, expected_error in (
+            ("success", None),
+            ("cancel", LlmRequestCancelled),
+            ("error", RuntimeError),
+        ):
+            with self.subTest(outcome=outcome):
+                llm_service._stream_buffer = "active-legacy-request"
+                llm_service._stream_done = False
+                if expected_error is None:
+                    self.assertEqual(
+                        wrapped(progress_callback=callback, outcome=outcome),
+                        "ok",
+                    )
+                elif outcome == "cancel":
+                    with self.assertRaises(expected_error):
+                        wrapped(callback, outcome=outcome)
+                else:
+                    with self.assertRaises(expected_error):
+                        wrapped(progress_callback=callback, outcome=outcome)
+                self.assertEqual(
+                    llm_service._stream_buffer, "active-legacy-request",
+                )
+                self.assertFalse(llm_service._stream_done)
+
+        llm_service._stream_buffer = "active-legacy-request"
+        llm_service._stream_done = False
+        self.assertEqual(wrapped(), "ok")
+        self.assertEqual(llm_service._stream_buffer, "active-legacy-request")
+        self.assertTrue(llm_service._stream_done)
+
     def test_multimodal_prefill_is_appended_after_user_and_stripped_once(self):
         response = _StreamResponse([
             _chunk("PREFIXPREFIXanswer"),
@@ -689,7 +738,7 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
         self.assertEqual(result, "answer")
         self.assertEqual(post.call_count, 1)
 
-    def test_local_stream_base_exception_closes_and_marks_done(self):
+    def test_local_stream_base_exception_isolates_scoped_chat_state(self):
         class CancelledStream(_StreamResponse):
             def iter_lines(self, decode_unicode=True):
                 raise KeyboardInterrupt("synthetic cancellation")
@@ -705,6 +754,7 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
 
         chat_response = CancelledStream([])
         patches = self._runtime_patches([chat_response])
+        llm_service._stream_buffer = "active-legacy-request"
         llm_service._stream_done = False
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
                 mock.patch.object(llm_service, "load_model"):
@@ -715,7 +765,10 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
                     progress_callback=lambda _event: None,
                 )
         self.assertTrue(chat_response.closed)
-        self.assertTrue(llm_service._stream_done)
+        self.assertEqual(
+            llm_service._stream_buffer, "active-legacy-request",
+        )
+        self.assertFalse(llm_service._stream_done)
 
     def test_local_cancel_closes_blocked_stream_without_final_publication(self):
         response = _BlockingStreamResponse()
@@ -756,6 +809,16 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
         handle = LlmCancellationHandle()
         events = []
         errors = []
+        previous_buffer = llm_service._stream_buffer
+        previous_done = llm_service._stream_done
+        self.addCleanup(
+            lambda: setattr(llm_service, "_stream_buffer", previous_buffer)
+        )
+        self.addCleanup(
+            lambda: setattr(llm_service, "_stream_done", previous_done)
+        )
+        llm_service._stream_buffer = "active-legacy-request"
+        llm_service._stream_done = False
 
         def run():
             try:
@@ -785,6 +848,10 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
         self.assertEqual(response.close_count, 1)
         self.assertEqual(post.call_count, 1)
         self.assertFalse(any(event["phase"] == "complete" for event in events))
+        self.assertEqual(
+            llm_service._stream_buffer, "active-legacy-request",
+        )
+        self.assertFalse(llm_service._stream_done)
 
     def test_cancelled_refusal_suppresses_response_assist_retry(self):
         handle = LlmCancellationHandle()
@@ -1048,24 +1115,44 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
             b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}',
             b"data: [DONE]",
         ])
+        previous_buffer = llm_service._stream_buffer
+        previous_done = llm_service._stream_done
+        self.addCleanup(
+            lambda: setattr(llm_service, "_stream_buffer", previous_buffer)
+        )
+        self.addCleanup(
+            lambda: setattr(llm_service, "_stream_done", previous_done)
+        )
+        llm_service._stream_buffer = "active-legacy-request"
+        llm_service._stream_done = False
         with mock.patch.object(llm_service.requests, "post", return_value=success):
             self.assertEqual(
                 llm_service._generate_streaming_anthropic(
                     [{"role": "user", "content": "request"}], 10, 0.5, 0.9,
+                    progress_callback=lambda _event: None,
                 ),
                 "ok",
             )
         self.assertTrue(success.closed)
+        self.assertEqual(
+            llm_service._stream_buffer, "active-legacy-request",
+        )
+        self.assertFalse(llm_service._stream_done)
 
         failure = AnthropicResponse([], error=RuntimeError("synthetic"))
         with mock.patch.object(llm_service.requests, "post", return_value=failure):
             self.assertEqual(
                 llm_service._generate_streaming_anthropic(
                     [{"role": "user", "content": "request"}], 10, 0.5, 0.9,
+                    progress_callback=lambda _event: None,
                 ),
                 "",
             )
         self.assertTrue(failure.closed)
+        self.assertEqual(
+            llm_service._stream_buffer, "active-legacy-request",
+        )
+        self.assertFalse(llm_service._stream_done)
 
         cancelled = AnthropicResponse([])
 

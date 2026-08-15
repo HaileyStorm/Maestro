@@ -49,6 +49,7 @@ class DirectorLlmStreamingTests(unittest.TestCase):
             "jobs": pipeline._jobs,
             "active": pipeline._active_gen_states,
             "wgp": pipeline._wgp,
+            "gen_lock": pipeline._gen_lock,
             "stream": llm_service._stream_buffer,
             "last_system": llm_service._last_system_prompt,
             "last_user": llm_service._last_user_prompt,
@@ -64,6 +65,14 @@ class DirectorLlmStreamingTests(unittest.TestCase):
             save_path=self.temporary.name,
             server_config={"services": {}},
         )
+        @contextmanager
+        def default_model_lease(**_selection):
+            yield ("test-resident",)
+
+        self._model_lease_patcher = mock.patch.object(
+            llm_service, "loaded_model_lease", default_model_lease,
+        )
+        self._model_lease_patcher.start()
         # Deliberately unrelated legacy singleton state. Director must neither
         # read it nor clear it when request-scoped callbacks are active.
         llm_service._stream_buffer = "UNRELATED_SINGLETON_STREAM"
@@ -72,6 +81,7 @@ class DirectorLlmStreamingTests(unittest.TestCase):
         llm_service._last_thinking_text = "UNRELATED_SINGLETON_THINKING"
 
     def tearDown(self):
+        self._model_lease_patcher.stop()
         pipeline._pipelines = self.originals["pipelines"]
         pipeline._pipeline_llm_contexts = self.originals["contexts"]
         pipeline._pipeline_llm_tokens = self.originals["tokens"]
@@ -81,6 +91,7 @@ class DirectorLlmStreamingTests(unittest.TestCase):
         pipeline._jobs = self.originals["jobs"]
         pipeline._active_gen_states = self.originals["active"]
         pipeline._wgp = self.originals["wgp"]
+        pipeline._gen_lock = self.originals["gen_lock"]
         llm_service._stream_buffer = self.originals["stream"]
         llm_service._last_system_prompt = self.originals["last_system"]
         llm_service._last_user_prompt = self.originals["last_user"]
@@ -105,13 +116,21 @@ class DirectorLlmStreamingTests(unittest.TestCase):
             "out_dir": self.temporary.name,
         }
         pipeline._pipelines[pid] = record
+        pipeline._pipeline_llm_contexts.setdefault(pid, {
+            "selection": {
+                "model_id": "test-model", "device": "cpu",
+                "provider": "local", "remote_url": "", "api_key": "",
+                "local_gguf_path": "", "gguf_file_override": "",
+            },
+            "response_assist": None,
+        })
         return record
 
     def test_progress_is_bounded_retry_scoped_and_ignores_singleton(self):
         record = self._add_pipeline("scoped")
-        pipeline._pipeline_llm_contexts["scoped"] = {
+        pipeline._pipeline_llm_contexts["scoped"].update({
             "response_assist": {"retry_on_refusal": True},
-        }
+        })
 
         def fake_generate(*, progress_callback, response_assist, cancel_handle):
             self.assertIsInstance(cancel_handle, LlmCancellationHandle)
@@ -520,6 +539,344 @@ class DirectorLlmStreamingTests(unittest.TestCase):
             )
         self.assertEqual(observed, [selection])
 
+    def test_cuda_director_model_work_uses_shared_native_gpu_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        native_gpu = threading.Lock()
+        pipeline._gen_lock = threading.Lock()
+        release_calls = []
+
+        def acquire_native(cancel_checkpoint=None):
+            while True:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+                if native_gpu.acquire(timeout=0.01):
+                    try:
+                        if callable(cancel_checkpoint):
+                            cancel_checkpoint()
+                    except BaseException:
+                        native_gpu.release()
+                        raise
+                    return
+
+        pipeline._wgp = SimpleNamespace(
+            save_path=self.temporary.name,
+            server_config={"services": {}},
+            native_gpu_execution_lock=native_gpu,
+            acquire_native_gpu_execution_lock=acquire_native,
+            wan_model=object(),
+            release_model=lambda: release_calls.append("release"),
+        )
+        selection = {
+            "model_id": "synthetic-model", "device": "cuda",
+            "provider": "local", "remote_url": "", "api_key": "",
+            "local_gguf_path": "", "gguf_file_override": "",
+        }
+        self._add_pipeline("cuda")
+        pipeline._pipeline_llm_contexts["cuda"] = {
+            "selection": selection,
+            "response_assist": None,
+        }
+        inference_entered = threading.Event()
+
+        @contextmanager
+        def fake_lease(**_selection):
+            yield
+
+        def fake_generate(*, progress_callback, cancel_handle):
+            inference_entered.set()
+            return "done"
+
+        native_gpu.acquire()
+        with mock.patch.object(
+            llm_service, "loaded_model_lease", fake_lease,
+        ), ThreadPoolExecutor(max_workers=1) as executor:
+            request = executor.submit(
+                pipeline._pipeline_llm_call,
+                "cuda", "planning", "cuda_pass", fake_generate,
+            )
+            for _ in range(100):
+                if pipeline._gen_lock.locked():
+                    break
+                time.sleep(0.005)
+            self.assertTrue(pipeline._gen_lock.locked())
+            self.assertFalse(inference_entered.wait(timeout=0.1))
+            native_gpu.release()
+            self.assertEqual(request.result(timeout=1), "done")
+        self.assertFalse(pipeline._gen_lock.locked())
+
+        self._add_pipeline("cancelled_wait")
+        pipeline._pipeline_llm_contexts["cancelled_wait"] = {
+            "selection": selection,
+            "response_assist": None,
+        }
+        lease_entered = threading.Event()
+
+        @contextmanager
+        def blocked_lease(**_selection):
+            lease_entered.set()
+            yield
+
+        native_gpu.acquire()
+        with mock.patch.object(
+            llm_service, "loaded_model_lease", blocked_lease,
+        ), ThreadPoolExecutor(max_workers=1) as executor:
+            blocked = executor.submit(
+                pipeline._pipeline_llm_call,
+                "cancelled_wait", "planning", "blocked", fake_generate,
+            )
+            for _ in range(100):
+                if pipeline._gen_lock.locked() and (
+                    "cancelled_wait" in pipeline._pipeline_llm_cancel_handles
+                ):
+                    break
+                time.sleep(0.005)
+            self.assertTrue(pipeline._gen_lock.locked())
+            cancel_handle = pipeline._pipeline_llm_cancel_handles[
+                "cancelled_wait"
+            ][1]
+            cancel_handle.cancel()
+            with self.assertRaises(pipeline._DirectorLlmCancelled):
+                blocked.result(timeout=1)
+            self.assertFalse(lease_entered.is_set())
+            self.assertFalse(pipeline._gen_lock.locked())
+            self.assertTrue(native_gpu.locked())
+            native_gpu.release()
+
+        self._add_pipeline("cpu")
+        pipeline._pipeline_llm_contexts["cpu"] = {
+            "selection": {**selection, "device": "cpu"},
+            "response_assist": None,
+        }
+        inference_entered.clear()
+        native_gpu.acquire()
+        try:
+            with mock.patch.object(
+                llm_service, "loaded_model_lease", fake_lease,
+            ):
+                self.assertEqual(
+                    pipeline._pipeline_llm_call(
+                        "cpu", "planning", "cpu_pass", fake_generate,
+                    ),
+                    "done",
+                )
+            self.assertTrue(inference_entered.is_set())
+        finally:
+            native_gpu.release()
+
+        release_entered = threading.Event()
+        load_entered = threading.Event()
+        pipeline._wgp.release_model = lambda: (
+            release_calls.append("release"), release_entered.set()
+        )
+        native_gpu.acquire()
+        with mock.patch.object(
+            llm_service, "load_model", side_effect=lambda **_kwargs:
+            load_entered.set(),
+        ), ThreadPoolExecutor(max_workers=1) as executor:
+            prepare = executor.submit(
+                pipeline._ensure_llm_loaded,
+                {
+                    "llm_model_id": "synthetic-model",
+                    "llm_device": "cuda",
+                    "llm_provider": "local",
+                },
+                lambda: None,
+            )
+            for _ in range(100):
+                if pipeline._gen_lock.locked():
+                    break
+                time.sleep(0.005)
+            self.assertTrue(pipeline._gen_lock.locked())
+            self.assertFalse(release_entered.is_set())
+            self.assertFalse(load_entered.is_set())
+            native_gpu.release()
+            self.assertEqual(prepare.result(timeout=1)["device"], "cuda")
+        self.assertTrue(release_entered.is_set())
+        self.assertTrue(load_entered.is_set())
+        self.assertFalse(native_gpu.locked())
+        self.assertFalse(pipeline._gen_lock.locked())
+
+    def test_stale_director_cleanup_cannot_unload_successor_identity(self):
+        stale_key = ("local", "old-model", "cpu")
+        successor_key = ("local", "successor-model", "cuda")
+        stale_identity = (stale_key, 17)
+        selection = {
+            "model_id": "old-model", "device": "cpu",
+            "provider": "local", "remote_url": "", "api_key": "",
+            "local_gguf_path": "", "gguf_file_override": "",
+        }
+        with mock.patch.object(
+            llm_service, "_lock", threading.RLock(),
+        ), mock.patch.object(
+            llm_service, "_loaded_model_key", successor_key,
+        ), mock.patch.object(
+            llm_service, "_runtime_generation", 18,
+        ), mock.patch.object(
+            llm_service, "unload_model",
+        ) as unload:
+            self.assertFalse(
+                pipeline._unload_director_resident_if_current(
+                    selection, stale_identity,
+                )
+            )
+        unload.assert_not_called()
+
+    def test_stale_director_cleanup_cannot_unload_same_key_successor_epoch(self):
+        load_key = ("local", "same-model", "cuda")
+        selection = {
+            "model_id": "same-model", "device": "cuda",
+            "provider": "local", "remote_url": "", "api_key": "",
+            "local_gguf_path": "", "gguf_file_override": "",
+        }
+        @contextmanager
+        def no_native_slot(*_args, **_kwargs):
+            yield False
+
+        with mock.patch.object(
+            pipeline, "_DirectorNativeGpuSlot", no_native_slot,
+        ), mock.patch.object(
+            llm_service, "_lock", threading.RLock(),
+        ), mock.patch.object(
+            llm_service, "_loaded_model_key", load_key,
+        ), mock.patch.object(
+            llm_service, "_runtime_generation", 18,
+        ), mock.patch.object(
+            llm_service, "unload_model",
+        ) as unload:
+            self.assertFalse(
+                pipeline._unload_director_resident_if_current(
+                    selection, (load_key, 17),
+                )
+            )
+        unload.assert_not_called()
+
+    def test_remote_director_cleanup_never_unloads_same_key_replacement(self):
+        load_key = ("remote", "same-model", "remote", "https://provider", "")
+        selection = {
+            "model_id": "same-model", "device": "remote",
+            "provider": "remote", "remote_url": "https://provider",
+            "api_key": "", "local_gguf_path": "",
+            "gguf_file_override": "",
+        }
+        with mock.patch.object(
+            llm_service, "_loaded_model_key", load_key,
+        ), mock.patch.object(
+            llm_service, "_runtime_generation", 0,
+        ), mock.patch.object(
+            llm_service, "unload_model",
+        ) as unload:
+            self.assertFalse(
+                pipeline._unload_director_resident_if_current(
+                    selection, (load_key, 0),
+                )
+            )
+        unload.assert_not_called()
+
+    def test_unscoped_director_llm_call_fails_before_callable(self):
+        invoked = mock.Mock(return_value="unsafe")
+        with self.assertRaises(pipeline._DirectorLlmCancelled):
+            pipeline._pipeline_llm_call(
+                "missing", "planning", "unscoped", invoked,
+            )
+        invoked.assert_not_called()
+
+    def test_live_pipeline_without_exact_context_fails_before_callable(self):
+        self._add_pipeline("recovery-without-context")
+        pipeline._pipeline_llm_contexts.pop(
+            "recovery-without-context", None,
+        )
+        invoked = mock.Mock(return_value="unsafe singleton result")
+        with self.assertRaisesRegex(
+            RuntimeError, "context is unavailable",
+        ):
+            pipeline._pipeline_llm_call(
+                "recovery-without-context",
+                "reference_style",
+                "reference_style_vlm",
+                invoked,
+            )
+        invoked.assert_not_called()
+
+    def test_cancel_after_director_load_cleans_exact_resident(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        record = self._add_pipeline("cancel_after_load")
+        native_gpu = threading.Lock()
+        pipeline._gen_lock = threading.Lock()
+
+        def acquire_native(cancel_checkpoint=None):
+            while True:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+                if native_gpu.acquire(timeout=0.01):
+                    try:
+                        if callable(cancel_checkpoint):
+                            cancel_checkpoint()
+                    except BaseException:
+                        native_gpu.release()
+                        raise
+                    return
+
+        pipeline._wgp = SimpleNamespace(
+            save_path=self.temporary.name,
+            server_config={"services": {}},
+            native_gpu_execution_lock=native_gpu,
+            acquire_native_gpu_execution_lock=acquire_native,
+        )
+        resident_key = ("local", "director-model", "cuda")
+        resident_identity = (resident_key, 17)
+        selection = pipeline._DirectorLlmSelection({
+            "model_id": "director-model", "device": "cuda",
+            "provider": "local", "remote_url": "", "api_key": "",
+            "local_gguf_path": "", "gguf_file_override": "",
+        })
+        selection.resident_identity = resident_identity
+        lease_entered = threading.Event()
+
+        @contextmanager
+        def unexpected_lease(**_selection):
+            lease_entered.set()
+            yield resident_key
+
+        native_gpu.acquire()
+        with mock.patch.object(
+            pipeline, "_ensure_llm_loaded", return_value=selection,
+        ), mock.patch.object(
+            llm_service, "loaded_model_lease", unexpected_lease,
+        ), mock.patch.object(
+            llm_service, "_lock", threading.RLock(),
+        ), mock.patch.object(
+            llm_service, "_loaded_model_key", resident_key,
+        ), mock.patch.object(
+            llm_service, "_runtime_generation", 17,
+        ), mock.patch.object(
+            llm_service, "unload_model",
+        ) as unload, ThreadPoolExecutor(max_workers=1) as executor:
+            planning = executor.submit(
+                pipeline._run_planning,
+                "cancel_after_load",
+                {"use_director_v2": True},
+                "music_video",
+            )
+            for _ in range(100):
+                if pipeline._gen_lock.locked():
+                    break
+                time.sleep(0.005)
+            self.assertTrue(pipeline._gen_lock.locked())
+            with pipeline._pipeline_lock:
+                record["status"] = "cancelled"
+            # The cancelled outer acquisition unwinds, then exact cleanup
+            # waits for the same native lane before unloading its own model.
+            time.sleep(0.05)
+            self.assertFalse(lease_entered.is_set())
+            native_gpu.release()
+            with self.assertRaises(pipeline._DirectorLlmCancelled):
+                planning.result(timeout=1)
+        unload.assert_called_once_with()
+        self.assertFalse(native_gpu.locked())
+        self.assertFalse(pipeline._gen_lock.locked())
+
     def test_third_pass_forwards_callback_and_response_assist(self):
         calls = []
         callback = mock.Mock()
@@ -552,9 +909,9 @@ class DirectorLlmStreamingTests(unittest.TestCase):
 
     def test_legacy_planner_forwards_progress_but_bypasses_assistance(self):
         record = self._add_pipeline("legacy")
-        pipeline._pipeline_llm_contexts["legacy"] = {
+        pipeline._pipeline_llm_contexts["legacy"].update({
             "response_assist": {"retry_on_refusal": True},
-        }
+        })
         observed = {}
 
         def fake_plan(**kwargs):

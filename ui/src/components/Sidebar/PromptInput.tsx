@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { Sparkles, Loader2, ChevronUp, Brain, PenLine } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
-import * as api from '../../api/client'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry, globalTimelineEndSeconds, hasGlobalTimeline, usesStudioSegments } from '../../lib/timelinePrompt'
 import { h3StyleWorkflowCatalogStateLabel, h3StyleWorkflowSupportsModel } from '../../lib/h3StyleWorkflows'
 
@@ -80,91 +79,6 @@ export function H3StyleWorkflowField({
   )
 }
 
-function useEnhanceStatus(
-  isEnhancing: boolean,
-  expectedModelId: string,
-  expectedModelLabel: string,
-  tracksLlm: boolean,
-) {
-  const [status, setStatus] = useState<{
-    phase: 'loading' | 'thinking' | 'writing' | 'idle'
-    chars: number
-    detail?: string
-  }>({ phase: 'idle', chars: 0 })
-
-  useEffect(() => {
-    if (!isEnhancing) return
-    let active = true
-    const assistantLabel = expectedModelLabel ? 'your writing assistant' : 'the writing assistant'
-    const initialStatusTimer = window.setTimeout(() => {
-      if (active) setStatus({ phase: 'loading', chars: 0, detail: `Preparing ${assistantLabel}…` })
-    }, 0)
-    const poll = async () => {
-      let streamStarted = false
-      while (active) {
-        try {
-          if (tracksLlm && !streamStarted) {
-            const llmData = await api.fetchLlmStatus()
-            const loadingId = String(llmData.loading_model_id || llmData.download?.model_id || '')
-            const matchesExpected = !expectedModelId || loadingId === expectedModelId
-            const expectedLoaded = Boolean(llmData.loaded && (!expectedModelId || llmData.model_id === expectedModelId))
-            if (!expectedLoaded || (llmData.loading && matchesExpected)) {
-              const download = matchesExpected ? llmData.download : null
-              const total = Number(download?.total_bytes || 0)
-              const downloaded = Number(download?.downloaded_bytes || 0)
-              const percent = total > 0 ? Math.min(100, Math.round(downloaded * 100 / total)) : null
-              const percentProgress = percent != null ? ` · ${percent}%` : ''
-              const filename = String(download?.filename || '').toLowerCase()
-              const loadingPhase = String(llmData.loading_phase || download?.phase || '')
-              let activity = `Preparing ${assistantLabel}`
-              if (matchesExpected && (filename.includes('mmproj') || filename.includes('projector'))) {
-                activity = 'Preparing image support'
-              } else if (matchesExpected && loadingPhase === 'downloading_runtime') {
-                activity = 'Preparing writing tools'
-              } else if (matchesExpected && loadingPhase === 'building_runtime') {
-                activity = 'Preparing writing tools'
-              } else if (matchesExpected && loadingPhase === 'downloading') {
-                activity = `Downloading ${assistantLabel}`
-              }
-              setStatus({
-                phase: 'loading',
-                chars: 0,
-                detail: `${activity}${percentProgress}`,
-              })
-              await new Promise(r => setTimeout(r, 800))
-              continue
-            }
-          }
-          const res = await fetch('/api/v1/llm/stream-status')
-          if (res.ok && active) {
-            const data = await res.json()
-            const text = (data.text || '') as string
-            if (text.length > 0) streamStarted = true
-            const hasThinking = text.includes('<think>') || text.includes('<thinking>')
-            const thinkingClosed = text.includes('</think>') || text.includes('</thinking>')
-            if (hasThinking && !thinkingClosed) {
-              setStatus({ phase: 'thinking', chars: text.length, detail: expectedModelLabel })
-            } else if (text.length > 0) {
-              setStatus({ phase: 'writing', chars: text.length, detail: expectedModelLabel })
-            } else if (!streamStarted) {
-              setStatus({ phase: 'loading', chars: 0, detail: `Preparing ${assistantLabel}…` })
-            }
-            if (data.done) break
-          }
-        } catch { /* ignore */ }
-        await new Promise(r => setTimeout(r, 800))
-      }
-    }
-    poll()
-    return () => {
-      active = false
-      window.clearTimeout(initialStatusTimer)
-    }
-  }, [expectedModelId, expectedModelLabel, isEnhancing, tracksLlm])
-
-  return isEnhancing ? status : { phase: 'idle' as const, chars: 0 }
-}
-
 export function PromptInput() {
   const prompt = useStore(s => s.params.prompt)
   const setParam = useStore(s => s.setParam)
@@ -172,6 +86,8 @@ export function PromptInput() {
   const editSubMode = useStore(s => s.editSubMode)
   const enhancePrompt = useStore(s => s.enhancePrompt)
   const isEnhancing = useStore(s => s.isEnhancing)
+  const enhanceStatus = useStore(s => s.enhanceStatus)
+  const cancelEnhancePrompt = useStore(s => s.cancelEnhancePrompt)
   const durationSeconds = useStore(s => s.durationSeconds)
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
   const slidingWindowOverlap = useStore(s => s.slidingWindowOverlap)
@@ -255,13 +171,29 @@ export function PromptInput() {
   const enhancerModelLabel = wangpEnhancerMode > 0 && !needsH3Guide
     ? enhancerModeLabels[wangpEnhancerMode] || `Wan2GP enhancer mode ${wangpEnhancerMode}`
     : configuredEnhancerLabel || 'Writing assistant'
-  const tracksEnhancerLlm = !(wangpEnhancerMode > 0 && !needsH3Guide)
-  const enhanceStatus = useEnhanceStatus(
-    isEnhancing,
-    tracksEnhancerLlm ? configuredEnhancerId : '',
-    enhancerModelLabel,
-    tracksEnhancerLlm,
-  )
+  const routeEnhanceStatus = enhanceStatus && 'request_id' in enhanceStatus
+    ? enhanceStatus
+    : null
+  const enhancePhase = String(enhanceStatus?.phase || 'loading')
+  const enhanceIsThinking = enhancePhase === 'thinking' || enhancePhase === 'detecting'
+  const enhanceIsWriting = Boolean(routeEnhanceStatus?.partial_text)
+    || ['prefill', 'inference', 'generating', 'finalizing', 'retrying'].includes(enhancePhase)
+  const enhanceStageLabels: Record<string, string> = {
+    queued: 'Queued',
+    loading: 'Preparing writing tools',
+    wangp: 'Drafting with the prompt enhancer',
+    llm: 'Drafting with your writing assistant',
+    llm_fallback: 'Continuing with your writing assistant',
+    inference: 'Writing your revision',
+  }
+  const enhanceStage = routeEnhanceStatus
+    ? enhanceStageLabels[routeEnhanceStatus.stage]
+      || enhanceStageLabels[routeEnhanceStatus.phase]
+      || 'Writing your revision'
+    : enhanceStatus?.phase === 'ready'
+      ? 'Writing your revision'
+      : `Preparing ${enhancerModelLabel}`
+  const enhanceTps = routeEnhanceStatus?.live_tps ?? routeEnhanceStatus?.average_tps
   const enhancerFooter = !isAudioOnly
   const modePlaceholder = generationMode === 'avatar' && editSubMode === 'recast'
     ? 'Describe the finished video and replacement characters...'
@@ -308,24 +240,44 @@ export function PromptInput() {
     <div className="relative grow shrink-0 flex flex-col">
       {generationMode === 'video' && <div className="mb-1.5"><H3StyleWorkflowField effectiveVideoModel={effectiveVideoModel} surface="Generate" /></div>}
       {/* Enhance status indicator */}
-      {isEnhancing && enhanceStatus.phase !== 'idle' && (
-        <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-text-muted bg-bg-tertiary/80 rounded-t-lg border border-b-0 border-border">
-          {enhanceStatus.phase === 'loading' ? (
+      {isEnhancing && (
+        <div className="flex min-h-11 items-center gap-2 rounded-t-lg border border-b-0 border-border bg-bg-tertiary/80 px-2 py-1 text-[10px] text-text-muted">
+          {!enhanceIsThinking && !enhanceIsWriting ? (
             <>
               <Loader2 size={10} className="text-text-muted animate-spin" />
-              <span>{enhanceStatus.detail || `Preparing ${enhancerModelLabel}...`}</span>
+              <span>{enhanceStage}…</span>
             </>
-          ) : enhanceStatus.phase === 'thinking' ? (
+          ) : enhanceIsThinking ? (
             <>
               <Brain size={10} className="text-chip-purple animate-pulse" />
-              <span>Working on your prompt…</span>
+              <span>Working on your prompt · {enhanceStage}…</span>
             </>
           ) : (
             <>
               <PenLine size={10} className="text-accent-blue animate-pulse" />
-              <span>Writing your revision…</span>
+              <span>{enhanceStage}…</span>
             </>
           )}
+          {enhanceTps != null && (
+            <span className="whitespace-nowrap tabular-nums">{enhanceTps.toFixed(1)} tok/s</span>
+          )}
+          <button
+            type="button"
+            onClick={() => void cancelEnhancePrompt()}
+            className="mobile-control-target ml-auto inline-flex min-h-11 shrink-0 items-center rounded px-2 text-[10px] text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            aria-label="Cancel prompt enhancement"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+      {isEnhancing && routeEnhanceStatus?.partial_text && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="line-clamp-2 border-x border-border bg-bg-tertiary/60 px-2 py-1 text-[10px] leading-relaxed text-text-secondary"
+        >
+          {routeEnhanceStatus.partial_text}
         </div>
       )}
       <textarea

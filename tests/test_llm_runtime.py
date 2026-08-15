@@ -175,6 +175,2509 @@ class LlmRuntimeTests(unittest.TestCase):
         self.assertIn("_run_authorized_llm_with_selection", endpoint)
         self.assertNotIn("llm_service.load_model(", endpoint)
 
+    def _load_wangp_sync_for_test(self, generate_cinematic_prompt):
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(launch_path))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_enhance_with_wangp_sync"
+        )
+
+        class OffloadState:
+            def __init__(self):
+                self.unloads = 0
+
+            def unload_all(self):
+                self.unloads += 1
+
+        offload_state = OffloadState()
+        prompt_enhancer_lock = threading.RLock()
+        native_gpu_execution_lock = threading.Lock()
+
+        def acquire_prompt_enhancer_lock(cancel_checkpoint=None):
+            while True:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+                if prompt_enhancer_lock.acquire(timeout=0.01):
+                    try:
+                        if callable(cancel_checkpoint):
+                            cancel_checkpoint()
+                    except BaseException:
+                        prompt_enhancer_lock.release()
+                        raise
+                    return
+
+        def acquire_native_gpu_execution_lock(cancel_checkpoint=None):
+            while True:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+                if native_gpu_execution_lock.acquire(timeout=0.01):
+                    try:
+                        if callable(cancel_checkpoint):
+                            cancel_checkpoint()
+                    except BaseException:
+                        native_gpu_execution_lock.release()
+                        raise
+                    return
+
+        fake_wgp = types.SimpleNamespace(
+            enhancer_offloadobj=offload_state,
+            prompt_enhancer_lock=prompt_enhancer_lock,
+            acquire_prompt_enhancer_lock=acquire_prompt_enhancer_lock,
+            native_gpu_execution_lock=native_gpu_execution_lock,
+            acquire_native_gpu_execution_lock=(
+                acquire_native_gpu_execution_lock
+            ),
+            prompt_enhancer_llm_model=object(),
+            prompt_enhancer_llm_tokenizer=object(),
+            prompt_enhancer_image_caption_model=object(),
+            prompt_enhancer_image_caption_processor=object(),
+            server_config={
+                "prompt_enhancer_temperature": 0.6,
+                "prompt_enhancer_top_p": 0.9,
+                "prompt_enhancer_randomize_seed": False,
+            },
+        )
+        fake_pil = types.ModuleType("PIL")
+        fake_pil.Image = types.SimpleNamespace(
+            open=lambda _path: self.fail("unexpected image open"),
+        )
+        fake_prompt = types.ModuleType(
+            "shared.prompt_enhancer.prompt_enhance_utils",
+        )
+        fake_prompt.generate_cinematic_prompt = generate_cinematic_prompt
+        fake_mmgp = types.ModuleType("mmgp")
+        fake_mmgp.offload = types.SimpleNamespace(
+            profile=lambda *_args, **_kwargs: offload_state,
+        )
+        namespace = {
+            "os": os,
+            "wgp": fake_wgp,
+            "_gen_lock": threading.Lock(),
+        }
+        module_patches = {
+            "PIL": fake_pil,
+            "shared.prompt_enhancer.prompt_enhance_utils": fake_prompt,
+            "mmgp": fake_mmgp,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[function], type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+        return (
+            namespace["_enhance_with_wangp_sync"],
+            namespace,
+            offload_state,
+            module_patches,
+        )
+
+    def test_wangp_requests_serialize_global_state_and_cleanup_each_pass(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        state_lock = threading.Lock()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        state = {"active": 0, "maximum": 0, "calls": 0}
+
+        def generate(*_args, **_kwargs):
+            with state_lock:
+                state["calls"] += 1
+                call = state["calls"]
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+            try:
+                if call == 1:
+                    first_entered.set()
+                    release_first.wait(timeout=2)
+                return [f"enhanced-{call}"]
+            finally:
+                with state_lock:
+                    state["active"] -= 1
+
+        enhance, _namespace, offload_state, modules = (
+            self._load_wangp_sync_for_test(generate)
+        )
+        with mock.patch.dict(sys.modules, modules), ThreadPoolExecutor(
+            max_workers=2,
+        ) as executor:
+            first = executor.submit(enhance, "first", "video", 1)
+            self.assertTrue(first_entered.wait(timeout=1))
+            second = executor.submit(enhance, "second", "video", 1)
+            self.assertFalse(second.done())
+            self.assertEqual(state["calls"], 1)
+            release_first.set()
+            self.assertEqual(first.result(timeout=2)["enhanced"], "enhanced-1")
+            self.assertEqual(second.result(timeout=2)["enhanced"], "enhanced-2")
+        self.assertEqual(state["maximum"], 1)
+        self.assertEqual(offload_state.unloads, 2)
+
+    def test_fastapi_and_classic_wangp_enhance_share_one_process_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        classic_entered = threading.Event()
+        release_classic = threading.Event()
+        inference_entered = threading.Event()
+
+        def generate(*_args, **_kwargs):
+            inference_entered.set()
+            return ["api result"]
+
+        enhance, namespace, _offload_state, modules = (
+            self._load_wangp_sync_for_test(generate)
+        )
+        fake_wgp = namespace["wgp"]
+
+        def classic_enhance():
+            fake_wgp.acquire_prompt_enhancer_lock()
+            try:
+                classic_entered.set()
+                release_classic.wait(timeout=2)
+            finally:
+                fake_wgp.prompt_enhancer_lock.release()
+
+        with mock.patch.dict(sys.modules, modules), ThreadPoolExecutor(
+            max_workers=2,
+        ) as executor:
+            classic = executor.submit(classic_enhance)
+            self.assertTrue(classic_entered.wait(timeout=1))
+            api = executor.submit(enhance, "prompt", "video", 1)
+            self.assertFalse(inference_entered.wait(timeout=0.1))
+            release_classic.set()
+            classic.result(timeout=2)
+            self.assertEqual(api.result(timeout=2)["enhanced"], "api result")
+        self.assertTrue(inference_entered.is_set())
+
+        wgp_source = (Path(__file__).resolve().parents[1] / "app" / "wgp.py").read_text(
+            encoding="utf-8",
+        )
+        wgp_tree = ast.parse(wgp_source)
+        classic_wrapper = next(
+            node for node in wgp_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "enhance_prompt"
+        )
+        wrapper_source = ast.get_source_segment(wgp_source, classic_wrapper) or ""
+        self.assertIn("acquire_prompt_enhancer_lock()", wrapper_source)
+        self.assertIn("prompt_enhancer_lock.release()", wrapper_source)
+
+    def test_fastapi_wangp_cancel_while_waiting_for_classic_releases_gen_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from services.llm_cancellation import (
+            LlmCancellationHandle,
+            LlmRequestCancelled,
+        )
+
+        enhance, namespace, offload_state, modules = (
+            self._load_wangp_sync_for_test(
+                lambda *_args, **_kwargs: self.fail("inference must not start")
+            )
+        )
+        fake_wgp = namespace["wgp"]
+        fake_wgp.prompt_enhancer_lock.acquire()
+        cancellation = LlmCancellationHandle()
+        try:
+            with mock.patch.dict(sys.modules, modules), ThreadPoolExecutor(
+                max_workers=1,
+            ) as executor:
+                future = executor.submit(
+                    enhance, "prompt", "video", 1, None, cancellation,
+                )
+                for _ in range(100):
+                    if namespace["_gen_lock"].locked():
+                        break
+                    time.sleep(0.005)
+                self.assertTrue(namespace["_gen_lock"].locked())
+                cancellation.cancel()
+                with self.assertRaises(LlmRequestCancelled):
+                    future.result(timeout=2)
+        finally:
+            fake_wgp.prompt_enhancer_lock.release()
+        self.assertEqual(offload_state.unloads, 0)
+        self.assertTrue(namespace["_gen_lock"].acquire(blocking=False))
+        namespace["_gen_lock"].release()
+
+    def test_api_cancel_while_generation_enhancer_owns_lane_does_not_cleanup_owner(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from services.llm_cancellation import (
+            LlmCancellationHandle,
+            LlmRequestCancelled,
+        )
+
+        enhance, api_namespace, offload_state, modules = (
+            self._load_wangp_sync_for_test(
+                lambda *_args, **_kwargs: self.fail("API inference must not start")
+            )
+        )
+        fake_wgp = api_namespace["wgp"]
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        wgp_source = wgp_path.read_text(encoding="utf-8")
+        wgp_tree = ast.parse(wgp_source)
+        generation_node = next(
+            node for node in wgp_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_process_prompt_enhancer_for_generation"
+        )
+        generation_entered = threading.Event()
+        release_generation = threading.Event()
+        generation_unloads = []
+
+        def generation_process(*_args, **_kwargs):
+            fake_wgp.acquire_prompt_enhancer_lock()
+            try:
+                generation_entered.set()
+                release_generation.wait(timeout=2)
+                return ["generation result"]
+            finally:
+                fake_wgp.prompt_enhancer_lock.release()
+
+        def generation_unload():
+            fake_wgp.acquire_prompt_enhancer_lock()
+            try:
+                generation_unloads.append(True)
+            finally:
+                fake_wgp.prompt_enhancer_lock.release()
+
+        generation_namespace = {
+            "acquire_prompt_enhancer_lock": (
+                fake_wgp.acquire_prompt_enhancer_lock
+            ),
+            "prompt_enhancer_lock": fake_wgp.prompt_enhancer_lock,
+            "process_prompt_enhancer": generation_process,
+            "unload_prompt_enhancer_runtime": generation_unload,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[generation_node], type_ignores=[],
+        )), str(wgp_path), "exec"), generation_namespace)
+        generation_enhance = generation_namespace[
+            "_process_prompt_enhancer_for_generation"
+        ]
+        cancellation = LlmCancellationHandle()
+
+        with mock.patch.dict(sys.modules, modules), ThreadPoolExecutor(
+            max_workers=2,
+        ) as executor:
+            generation = executor.submit(
+                generation_enhance,
+                {}, "T", ["prompt"], None, None, False, False, 0,
+            )
+            self.assertTrue(generation_entered.wait(timeout=1))
+            api = executor.submit(
+                enhance, "api prompt", "video", 1, None, cancellation,
+            )
+            for _ in range(100):
+                if api_namespace["_gen_lock"].locked():
+                    break
+                time.sleep(0.005)
+            self.assertTrue(api_namespace["_gen_lock"].locked())
+            cancellation.cancel()
+            with self.assertRaises(LlmRequestCancelled):
+                api.result(timeout=2)
+            self.assertEqual(offload_state.unloads, 0)
+            self.assertEqual(generation_unloads, [])
+            release_generation.set()
+            self.assertEqual(generation.result(timeout=2), ["generation result"])
+
+        self.assertEqual(generation_unloads, [True])
+        self.assertTrue(api_namespace["_gen_lock"].acquire(blocking=False))
+        api_namespace["_gen_lock"].release()
+
+        for function_name in (
+            "setup_prompt_enhancer",
+            "process_prompt_enhancer",
+            "unload_prompt_enhancer_runtime",
+        ):
+            function_node = next(
+                node for node in wgp_tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == function_name
+            )
+            function_source = (
+                ast.get_source_segment(wgp_source, function_node) or ""
+            )
+            self.assertIn("acquire_prompt_enhancer_lock", function_source)
+            self.assertIn("prompt_enhancer_lock.release()", function_source)
+
+    def test_fastapi_wangp_waits_for_full_classic_native_generation_lifetime(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        inference_entered = threading.Event()
+
+        def generate(*_args, **_kwargs):
+            inference_entered.set()
+            return ["api result"]
+
+        enhance, namespace, _offload_state, modules = (
+            self._load_wangp_sync_for_test(generate)
+        )
+        fake_wgp = namespace["wgp"]
+        fake_wgp.native_gpu_execution_lock.acquire()
+        try:
+            with mock.patch.dict(sys.modules, modules), ThreadPoolExecutor(
+                max_workers=1,
+            ) as executor:
+                api = executor.submit(enhance, "prompt", "video", 1)
+                for _ in range(100):
+                    if namespace["_gen_lock"].locked():
+                        break
+                    time.sleep(0.005)
+                self.assertTrue(namespace["_gen_lock"].locked())
+                self.assertFalse(inference_entered.wait(timeout=0.1))
+                fake_wgp.native_gpu_execution_lock.release()
+                self.assertEqual(
+                    api.result(timeout=2)["enhanced"], "api result",
+                )
+        finally:
+            if not inference_entered.is_set():
+                fake_wgp.native_gpu_execution_lock.release()
+        self.assertTrue(inference_entered.is_set())
+
+    def test_fastapi_generation_and_model_release_share_classic_native_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        slot_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "_WgpNativeGpuExecutionSlot"
+        )
+        release_helper_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_release_wgp_model_with_native_gpu_exclusion"
+        )
+        release_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "system_release_model"
+        )
+        release_node.decorator_list = []
+        generation_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_run_generation"
+        )
+        generation_source = ast.get_source_segment(
+            source, generation_node,
+        ) or ""
+        self.assertIn("generation_slot(", generation_source)
+        self.assertIn("_WgpNativeGpuExecutionSlot(\n        acquired,", generation_source)
+        self.assertIn(
+            "cancel_checkpoint=lambda: "
+            "_generation_native_gpu_cancel_checkpoint(",
+            generation_source,
+        )
+        self.assertIn("_recover_dead_async_listener(Listener)", generation_source)
+        self.assertIn("worker_started.wait(timeout=2.0)", generation_source)
+        wgp_source = (
+            Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        ).read_text(encoding="utf-8")
+        wgp_tree = ast.parse(wgp_source)
+        for function_name in (
+            "release_RAM",
+            "preload_model_when_switching",
+            "unload_model_if_needed",
+        ):
+            function_node = next(
+                node for node in wgp_tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == function_name
+            )
+            function_source = ast.get_source_segment(
+                wgp_source, function_node,
+            ) or ""
+            self.assertIn("native_gpu_execution_lock", function_source)
+
+        native_execution = threading.Lock()
+        release_calls = []
+        fake_wgp = types.SimpleNamespace(
+            native_gpu_execution_lock=native_execution,
+            acquire_native_gpu_execution_lock=native_execution.acquire,
+            wan_model=object(),
+            offloadobj=None,
+            release_model=lambda: release_calls.append("released"),
+        )
+        slot_local = threading.local()
+        namespace = {
+            "wgp": fake_wgp,
+            "_wgp_native_gpu_slot_state": slot_local,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[slot_node, release_helper_node], type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+        slot_class = namespace["_WgpNativeGpuExecutionSlot"]
+        generation_entered = threading.Event()
+        release_generation = threading.Event()
+
+        def run_generation():
+            with slot_class() as acquired:
+                generation_entered.set()
+                release_generation.wait(timeout=1)
+                return acquired
+
+        native_execution.acquire()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            generation = executor.submit(run_generation)
+            self.assertFalse(generation_entered.wait(timeout=0.1))
+            native_execution.release()
+            self.assertTrue(generation_entered.wait(timeout=1))
+            release_generation.set()
+            self.assertTrue(generation.result(timeout=1))
+
+        class HttpError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        release_namespace = {
+            "_jobs": {},
+            "_gen_lock": threading.Lock(),
+            "wgp": fake_wgp,
+            "HTTPException": HttpError,
+            "torch": types.SimpleNamespace(cuda=types.SimpleNamespace(
+                is_available=lambda: False,
+                empty_cache=lambda: None,
+            )),
+            "_WgpNativeGpuExecutionSlot": (
+                namespace["_WgpNativeGpuExecutionSlot"]
+            ),
+            "_release_wgp_model_with_native_gpu_exclusion": (
+                namespace["_release_wgp_model_with_native_gpu_exclusion"]
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[release_node], type_ignores=[],
+        )), str(launch_path), "exec"), release_namespace)
+        director_pipeline = types.ModuleType("services.director_pipeline")
+        director_pipeline._pipelines = {}
+        native_execution.acquire()
+        with mock.patch.dict(
+            sys.modules,
+            {"services.director_pipeline": director_pipeline},
+        ):
+            with self.assertRaises(HttpError) as raised:
+                release_namespace["system_release_model"]()
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertEqual(release_calls, [])
+            self.assertTrue(
+                release_namespace["_gen_lock"].acquire(blocking=False)
+            )
+            release_namespace["_gen_lock"].release()
+            native_execution.release()
+            self.assertEqual(
+                release_namespace["system_release_model"](),
+                {"released": ["generation model"]},
+            )
+        self.assertEqual(release_calls, ["released"])
+
+    def test_safe_output_yield_releases_native_before_generation_slot(self):
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        nodes = [
+            node for node in tree.body
+            if (
+                isinstance(node, ast.ClassDef)
+                and node.name == "_WgpNativeGpuExecutionSlot"
+            ) or (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "_yield_current_native_gpu_slot"
+            )
+        ]
+        native_gpu = threading.Lock()
+        gen_lock = threading.Lock()
+        namespace = {
+            "threading": threading,
+            "wgp": types.SimpleNamespace(
+                native_gpu_execution_lock=native_gpu,
+                acquire_native_gpu_execution_lock=native_gpu.acquire,
+            ),
+            "_wgp_native_gpu_slot_state": threading.local(),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+        slot = namespace["_WgpNativeGpuExecutionSlot"]()
+        gen_lock.acquire()
+        self.assertTrue(slot.__enter__())
+
+        follower_entered = threading.Event()
+        release_follower = threading.Event()
+
+        def follower():
+            gen_lock.acquire()
+            native_gpu.acquire()
+            follower_entered.set()
+            release_follower.wait(timeout=1)
+            native_gpu.release()
+            gen_lock.release()
+
+        thread = threading.Thread(target=follower)
+        thread.start()
+        yielded = namespace["_yield_current_native_gpu_slot"]()
+        self.assertIs(yielded, slot)
+        self.assertFalse(native_gpu.locked())
+        gen_lock.release()
+        self.assertTrue(follower_entered.wait(timeout=1))
+        release_follower.set()
+        gen_lock.acquire()
+        self.assertTrue(yielded.acquire())
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(gen_lock.locked())
+        self.assertTrue(native_gpu.locked())
+        slot.__exit__(None, None, None)
+        gen_lock.release()
+        self.assertFalse(native_gpu.locked())
+
+        generation_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_run_generation"
+        )
+        generation_source = ast.get_source_segment(
+            source, generation_node,
+        ) or ""
+        self.assertEqual(
+            generation_source.count("_yield_current_native_gpu_slot()"), 2,
+        )
+        self.assertEqual(
+            generation_source.count(
+                "yield_generation_slot_after_output(_gen_lock, job)"
+            ),
+            1,
+        )
+        for marker in (
+            "resumed = yield_generation_slot_after_output(_gen_lock, job)",
+            "if not yield_generation_slot_after_output(\n"
+            "                                _gen_lock, job,",
+        ):
+            yield_at = generation_source.index(marker)
+            release_at = generation_source.rfind(
+                "_yield_current_native_gpu_slot()", 0, yield_at,
+            )
+            resume_at = generation_source.index(
+                "yielded_native_slot.acquire()", yield_at,
+            )
+            self.assertGreaterEqual(release_at, 0)
+            self.assertLess(release_at, yield_at)
+            self.assertLess(yield_at, resume_at)
+
+    def test_cancelled_api_waiter_releases_generation_lock_before_native_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_WgpNativeGpuWaitCancelled",
+            "_WgpNativeGpuExecutionSlot",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+            and node.name in wanted
+        ]
+        native_gpu = threading.Lock()
+        gen_lock = threading.Lock()
+        cancelled = threading.Event()
+
+        def checkpoint():
+            if cancelled.is_set():
+                raise namespace["_WgpNativeGpuWaitCancelled"]("cancelled")
+
+        def acquire_native(cancel_checkpoint=None):
+            while True:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+                if native_gpu.acquire(timeout=0.01):
+                    try:
+                        if callable(cancel_checkpoint):
+                            cancel_checkpoint()
+                    except BaseException:
+                        native_gpu.release()
+                        raise
+                    return
+
+        namespace = {
+            "threading": threading,
+            "wgp": types.SimpleNamespace(
+                native_gpu_execution_lock=native_gpu,
+                acquire_native_gpu_execution_lock=acquire_native,
+            ),
+            "_wgp_native_gpu_slot_state": threading.local(),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+
+        native_gpu.acquire()
+
+        def wait_for_native():
+            with gen_lock:
+                with namespace["_WgpNativeGpuExecutionSlot"](
+                    cancel_checkpoint=checkpoint,
+                ) as acquired:
+                    return acquired
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            waiting = executor.submit(wait_for_native)
+            for _ in range(100):
+                if gen_lock.locked():
+                    break
+                time.sleep(0.005)
+            self.assertTrue(gen_lock.locked())
+            cancelled.set()
+            self.assertFalse(waiting.result(timeout=1))
+        self.assertFalse(gen_lock.locked())
+        self.assertTrue(native_gpu.locked())
+        native_gpu.release()
+
+        generation_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_run_generation"
+        )
+        generation_source = ast.get_source_segment(
+            source, generation_node,
+        ) or ""
+        self.assertIn(
+            "cancel_checkpoint=lambda: "
+            "_generation_native_gpu_cancel_checkpoint(",
+            generation_source,
+        )
+        self.assertIn("as native_acquired", generation_source)
+
+    def test_cuda_llm_waits_for_classic_native_lane_but_cpu_does_not(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_WgpNativeGpuExecutionSlot",
+            "_local_llm_uses_native_gpu",
+            "_run_llm_with_selection",
+        }
+        nodes = [
+            node for node in tree.body
+            if (
+                isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                and node.name in wanted
+            )
+        ]
+        native_gpu = threading.Lock()
+        fake_wgp = types.SimpleNamespace(
+            native_gpu_execution_lock=native_gpu,
+            acquire_native_gpu_execution_lock=native_gpu.acquire,
+            transformer_type="",
+            wan_model=None,
+            offloadobj=None,
+        )
+        namespace = {
+            "Any": __import__("typing").Any,
+            "Mapping": __import__("typing").Mapping,
+            "threading": threading,
+            "wgp": fake_wgp,
+            "_wgp_native_gpu_slot_state": threading.local(),
+            "_gen_lock": threading.Lock(),
+            "_release_wgp_model_with_native_gpu_exclusion": (
+                lambda: self.fail("unexpected model release")
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+
+        class LoadedLease:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_llm = types.ModuleType("services.llm_service")
+        fake_llm.loaded_model_lease = lambda **_kwargs: LoadedLease()
+        services = types.ModuleType("services")
+        services.llm_service = fake_llm
+        operation_entered = threading.Event()
+
+        def operation():
+            operation_entered.set()
+            return "done"
+
+        cuda_selection = {
+            "provider": "local", "device": "cuda", "model_id": "m",
+        }
+        native_gpu.acquire()
+        with mock.patch.dict(sys.modules, {
+            "services": services,
+            "services.llm_service": fake_llm,
+        }), ThreadPoolExecutor(max_workers=1) as executor:
+            cuda = executor.submit(
+                namespace["_run_llm_with_selection"],
+                cuda_selection,
+                operation,
+            )
+            for _ in range(100):
+                if namespace["_gen_lock"].locked():
+                    break
+                time.sleep(0.005)
+            self.assertTrue(namespace["_gen_lock"].locked())
+            self.assertFalse(operation_entered.wait(timeout=0.1))
+            native_gpu.release()
+            self.assertEqual(cuda.result(timeout=1), "done")
+
+            operation_entered.clear()
+            native_gpu.acquire()
+            cpu = executor.submit(
+                namespace["_run_llm_with_selection"],
+                {**cuda_selection, "device": "cpu"},
+                operation,
+            )
+            self.assertEqual(cpu.result(timeout=1), "done")
+            self.assertTrue(operation_entered.is_set())
+            native_gpu.release()
+
+        unload_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "llm_unload"
+        )
+        unload_node.decorator_list = []
+        namespace.update({
+            "Request": object,
+            "_require_local_llm_control": lambda _request: None,
+        })
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[unload_node], type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+
+        runtime_device = {"value": "cpu"}
+        status_read = threading.Event()
+        unloaded = threading.Event()
+
+        def get_status():
+            status_read.set()
+            return {
+                "provider": "local",
+                "device": runtime_device["value"],
+            }
+
+        fake_llm.get_status = get_status
+        fake_llm.unload_model = unloaded.set
+        namespace["_gen_lock"].acquire()
+        native_gpu.acquire()
+        with mock.patch.dict(sys.modules, {
+            "services": services,
+            "services.llm_service": fake_llm,
+        }), ThreadPoolExecutor(max_workers=1) as executor:
+            unload = executor.submit(
+                namespace["llm_unload"], object(),
+            )
+            self.assertFalse(status_read.wait(timeout=0.1))
+            runtime_device["value"] = "cuda"
+            namespace["_gen_lock"].release()
+            self.assertTrue(status_read.wait(timeout=1))
+            self.assertFalse(unloaded.wait(timeout=0.1))
+            native_gpu.release()
+            self.assertEqual(unload.result(timeout=1), {"status": "ok"})
+        self.assertTrue(unloaded.is_set())
+
+    def test_direct_local_llm_callers_use_configured_gpu_guard(self):
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for function_name in (
+            "_generate_and_save_lora_guide",
+            "_generate_and_save_checkpoint_guide",
+            "blender_director_plan",
+            "blender_director_finalize",
+        ):
+            function_node = next(
+                node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == function_name
+            )
+            function_source = ast.get_source_segment(
+                source, function_node,
+            ) or ""
+            self.assertIn(
+                "_run_configured_llm_operation", function_source,
+                function_name,
+            )
+            self.assertNotIn(
+                "llm_service.generate(", function_source,
+                function_name,
+            )
+
+        helper_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_run_configured_llm_operation"
+        )
+        calls = []
+        namespace = {
+            "_configured_llm_selection": lambda: {
+                "provider": "local", "device": "cuda", "model_id": "m",
+            },
+            "_run_llm_with_selection": (
+                lambda selection, operation, *args, **kwargs:
+                calls.append((selection, operation, args, kwargs)) or "done"
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[helper_node], type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+        operation = object()
+        self.assertEqual(
+            namespace["_run_configured_llm_operation"](
+                operation, "prompt", temperature=0.2,
+            ),
+            "done",
+        )
+        self.assertEqual(calls[0][0]["device"], "cuda")
+        self.assertIs(calls[0][1], operation)
+        self.assertEqual(calls[0][2], ("prompt",))
+        self.assertEqual(calls[0][3], {"temperature": 0.2})
+
+    def test_blender_render_only_uses_shared_native_gpu_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {"_WgpNativeGpuExecutionSlot", "_BlenderGpuRenderSlot"}
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name in wanted
+        ]
+        native_gpu = threading.Lock()
+        namespace = {
+            "threading": threading,
+            "wgp": types.SimpleNamespace(
+                native_gpu_execution_lock=native_gpu,
+                acquire_native_gpu_execution_lock=native_gpu.acquire,
+            ),
+            "_gen_lock": threading.Lock(),
+            "_wgp_native_gpu_slot_state": threading.local(),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+
+        render_entered = threading.Event()
+
+        def run_render():
+            with namespace["_BlenderGpuRenderSlot"]() as acquired:
+                self.assertTrue(acquired)
+                render_entered.set()
+
+        native_gpu.acquire()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            render = executor.submit(run_render)
+            for _ in range(100):
+                if namespace["_gen_lock"].locked():
+                    break
+                time.sleep(0.005)
+            self.assertTrue(namespace["_gen_lock"].locked())
+            self.assertFalse(render_entered.wait(timeout=0.1))
+            native_gpu.release()
+            render.result(timeout=1)
+        self.assertFalse(native_gpu.locked())
+        self.assertFalse(namespace["_gen_lock"].locked())
+
+        native_gpu.acquire()
+        try:
+            with namespace["_BlenderGpuRenderSlot"](False) as acquired:
+                self.assertFalse(acquired)
+                self.assertFalse(namespace["_gen_lock"].locked())
+        finally:
+            native_gpu.release()
+
+        for function_name in (
+            "_invoke_blender_project_tool",
+            "blender_render_preview",
+            "blender_director_finalize",
+        ):
+            function_node = next(
+                node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == function_name
+            )
+            function_source = ast.get_source_segment(
+                source, function_node,
+            ) or ""
+            self.assertIn("_BlenderGpuRenderSlot", function_source)
+        generic_source = ast.get_source_segment(source, next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_invoke_blender_project_tool"
+        )) or ""
+        self.assertIn('tool == "render_preview"', generic_source)
+        finalize_source = ast.get_source_segment(source, next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "blender_director_finalize"
+        )) or ""
+        self.assertIn(
+            'with _BlenderGpuRenderSlot():\n'
+            '                    rendered = service.invoke("render_animation"',
+            finalize_source,
+        )
+
+    def test_native_gpu_lease_outlives_closed_generation_iterator(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {"_NativeGpuExecutionLease", "process_tasks"}
+        nodes = [
+            node for node in tree.body
+            if (
+                isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                and node.name in wanted
+            )
+        ]
+        inference_entered = threading.Event()
+
+        def generate(*_args, **_kwargs):
+            inference_entered.set()
+            return ["api result"]
+
+        enhance, api_namespace, _offload_state, modules = (
+            self._load_wangp_sync_for_test(generate)
+        )
+        native_execution = (
+            api_namespace["wgp"].native_gpu_execution_lock
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_released = threading.Event()
+        owner_releases = []
+        workers = []
+
+        def fake_inner(state, lease):
+            self.assertTrue(lease.start_worker())
+
+            def worker():
+                worker_started.set()
+                release_worker.wait(timeout=2)
+                lease.release(
+                    lambda: owner_releases.append(state),
+                )
+                worker_released.set()
+
+            thread = threading.Thread(target=worker)
+            workers.append(thread)
+            thread.start()
+            yield "started"
+
+        namespace = {
+            "threading": threading,
+            "native_gpu_execution_lock": native_execution,
+            "acquire_native_gpu_execution_lock": (
+                lambda _checkpoint=None: native_execution.acquire()
+            ),
+            "_next_native_gpu_execution_owner_token": lambda: 17,
+            "_begin_native_generation_request": lambda *_args: None,
+            "_checkpoint_native_generation_request": lambda *_args: None,
+            "_release_native_generation_request": lambda *_args: None,
+            "_NativeGpuExecutionCancelled": InterruptedError,
+            "_process_tasks_with_native_gpu": fake_inner,
+            "_release_native_generation_owner": (
+                lambda state, _owner_token: owner_releases.append(state)
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+
+        state = {"gen": {}}
+        iterator = namespace["process_tasks"](state)
+        self.assertEqual(next(iterator), "started")
+        self.assertTrue(worker_started.wait(timeout=1))
+        iterator.close()
+        self.assertTrue(native_execution.locked())
+        self.assertEqual(owner_releases, [])
+
+        with mock.patch.dict(sys.modules, modules), ThreadPoolExecutor(
+            max_workers=1,
+        ) as executor:
+            api = executor.submit(enhance, "prompt", "video", 1)
+            for _ in range(100):
+                if api_namespace["_gen_lock"].locked():
+                    break
+                time.sleep(0.005)
+            self.assertTrue(api_namespace["_gen_lock"].locked())
+            self.assertFalse(inference_entered.wait(timeout=0.1))
+            release_worker.set()
+            self.assertTrue(worker_released.wait(timeout=1))
+            self.assertEqual(
+                api.result(timeout=2)["enhanced"], "api result",
+            )
+        workers[0].join(timeout=1)
+        self.assertFalse(native_execution.locked())
+        self.assertEqual(owner_releases, [state])
+
+    def test_native_gpu_lease_unlocks_when_owner_cleanup_raises(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        lease_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "_NativeGpuExecutionLease"
+        )
+
+        for method_name, transfer in (
+            ("release", True),
+            ("release_if_untransferred", False),
+        ):
+            with self.subTest(method=method_name):
+                native_execution = threading.Lock()
+                namespace = {
+                    "threading": threading,
+                    "native_gpu_execution_lock": native_execution,
+                    "acquire_native_gpu_execution_lock": (
+                        native_execution.acquire
+                    ),
+                    "_next_native_gpu_execution_owner_token": lambda: 17,
+                }
+                exec(compile(ast.fix_missing_locations(ast.Module(
+                    body=[lease_node], type_ignores=[],
+                )), str(wgp_path), "exec"), namespace)
+                lease = namespace["_NativeGpuExecutionLease"]()
+                if transfer:
+                    self.assertTrue(lease.start_worker())
+
+                def fail_cleanup():
+                    raise RuntimeError("cleanup failed")
+
+                with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                    getattr(lease, method_name)(fail_cleanup)
+                self.assertFalse(native_execution.locked())
+                self.assertFalse(lease.release())
+
+    def test_native_worker_dispatch_failures_never_wedge_gpu_lease(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_NativeGpuExecutionLease",
+            "_recover_dead_async_listener",
+            "_schedule_native_gpu_worker",
+        }
+        nodes = [
+            node for node in tree.body
+            if (
+                isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                and node.name in wanted
+            )
+        ]
+
+        class DeadThread:
+            ident = 123
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        class UnstartedThread:
+            ident = None
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        class Listener:
+            lock = threading.Lock()
+            thread = DeadThread()
+
+        native_execution = threading.Lock()
+        namespace = {
+            "threading": threading,
+            "time": time,
+            "native_gpu_execution_lock": native_execution,
+            "acquire_native_gpu_execution_lock": native_execution.acquire,
+            "_next_native_gpu_execution_owner_token": lambda: 17,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+        lease_class = namespace["_NativeGpuExecutionLease"]
+        schedule = namespace["_schedule_native_gpu_worker"]
+        cleanup = []
+
+        failed_lease = lease_class()
+
+        def fail_start(_worker, **_kwargs):
+            Listener.thread = UnstartedThread()
+            raise RuntimeError("thread start failed")
+
+        with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+            schedule(
+                fail_start,
+                Listener,
+                lambda: None,
+                failed_lease,
+                lambda: cleanup.append("failed"),
+                start_timeout=0.01,
+            )
+        self.assertFalse(native_execution.locked())
+        self.assertIsNone(Listener.thread)
+        self.assertEqual(cleanup, ["failed"])
+
+        unstarted = UnstartedThread()
+        Listener.thread = unstarted
+        self.assertFalse(
+            namespace["_recover_dead_async_listener"](Listener)
+        )
+        self.assertIs(Listener.thread, unstarted)
+
+        timed_out_lease = lease_class()
+        with self.assertRaisesRegex(
+            RuntimeError, "native generation worker did not start",
+        ):
+            schedule(
+                lambda _worker, **_kwargs: None,
+                Listener,
+                lambda: None,
+                timed_out_lease,
+                lambda: cleanup.append("timed_out"),
+                start_timeout=0.01,
+            )
+        self.assertFalse(native_execution.locked())
+        self.assertIsNone(Listener.thread)
+
+        Listener.thread = DeadThread()
+        recovered_lease = lease_class()
+
+        def run_after_recovery(worker, **_kwargs):
+            self.assertIsNone(Listener.thread)
+            worker()
+
+        def worker():
+            self.assertTrue(recovered_lease.start_worker())
+            recovered_lease.release(
+                lambda: cleanup.append("recovered"),
+            )
+
+        schedule(
+            run_after_recovery,
+            Listener,
+            worker,
+            recovered_lease,
+            lambda: cleanup.append("unexpected"),
+            start_timeout=0.01,
+        )
+        self.assertFalse(native_execution.locked())
+        self.assertEqual(
+            cleanup, ["failed", "timed_out", "recovered"],
+        )
+
+    def test_detached_classic_start_failure_and_iterator_close_clear_busy_epoch(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_NativeGpuExecutionLease",
+            "_recover_dead_async_listener",
+            "_schedule_native_gpu_worker",
+            "_release_native_generation_owner",
+            "process_tasks",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+            and node.name in wanted
+        ]
+        native_gpu = threading.Lock()
+        namespace = {
+            "threading": threading,
+            "time": time,
+            "native_gpu_execution_lock": native_gpu,
+            "acquire_native_gpu_execution_lock": (
+                lambda _checkpoint=None: native_gpu.acquire()
+            ),
+            "_next_native_gpu_execution_owner_token": iter((17, 18)).__next__,
+            "get_gen_info": lambda state: state["gen"],
+            "gen_lock": threading.Lock(),
+            "gen_in_progress": False,
+            "_NATIVE_GENERATION_OWNER_KEY": (
+                "_maestro_native_generation_owner"
+            ),
+            "_NATIVE_GENERATION_REQUEST_KEY": (
+                "_maestro_native_generation_request"
+            ),
+            "_begin_native_generation_request": lambda *_args: None,
+            "_checkpoint_native_generation_request": lambda *_args: None,
+            "_release_native_generation_request": lambda *_args: None,
+            "_NativeGpuExecutionCancelled": InterruptedError,
+        }
+
+        def fake_inner(state, lease):
+            state["gen"].update({
+                "_maestro_native_generation_owner": lease.owner_token,
+                "process_status": "process:main",
+                "in_progress": True,
+            })
+            namespace["gen_in_progress"] = True
+            yield "started"
+
+        namespace["_process_tasks_with_native_gpu"] = fake_inner
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+
+        closed_state = {"gen": {}}
+        iterator = namespace["process_tasks"](closed_state)
+        self.assertEqual(next(iterator), "started")
+        self.assertTrue(closed_state["gen"]["in_progress"])
+        self.assertTrue(namespace["gen_in_progress"])
+        iterator.close()
+        self.assertNotIn("in_progress", closed_state["gen"])
+        self.assertFalse(namespace["gen_in_progress"])
+        self.assertIsNone(
+            closed_state["gen"]["_maestro_native_generation_owner"]
+        )
+        self.assertFalse(native_gpu.locked())
+
+        failed_state = {"gen": {
+            "_maestro_native_generation_owner": 18,
+            "process_status": "process:main",
+            "in_progress": True,
+        }}
+        namespace["gen_in_progress"] = True
+        failed_lease = namespace["_NativeGpuExecutionLease"]()
+
+        class Listener:
+            lock = threading.Lock()
+            thread = None
+
+        with self.assertRaisesRegex(RuntimeError, "start failed"):
+            namespace["_schedule_native_gpu_worker"](
+                lambda _worker, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("start failed")
+                ),
+                Listener,
+                lambda: None,
+                failed_lease,
+                lambda: namespace["_release_native_generation_owner"](
+                    failed_state, 18,
+                ),
+                start_timeout=0.01,
+            )
+        self.assertNotIn("in_progress", failed_state["gen"])
+        self.assertFalse(namespace["gen_in_progress"])
+        self.assertIsNone(
+            failed_state["gen"]["_maestro_native_generation_owner"]
+        )
+        self.assertFalse(native_gpu.locked())
+
+    def test_late_classic_finalizer_cannot_clear_successor_busy_epoch(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "finalize_generation"
+        )
+        function_source = ast.get_source_segment(
+            source, function_node,
+        ) or ""
+        self.assertNotIn("gen_in_progress", function_source)
+        self.assertNotIn('del gen["in_progress"]', function_source)
+
+        ui = lambda *args, **kwargs: (args, kwargs)
+        namespace = {
+            "get_gen_info": lambda state: state["gen"],
+            "gr": types.SimpleNamespace(
+                Tabs=ui, Gallery=ui, update=ui, Button=ui,
+                Column=ui, HTML=ui,
+            ),
+            "time": types.SimpleNamespace(sleep=lambda _seconds: None),
+            "pack_audio_gallery_state": lambda *_args: (),
+            "gen_in_progress": True,
+            "_claim_native_generation_finalizer": lambda _state: False,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[function_node], type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+        successor = {"gen": {
+            "_maestro_native_generation_owner": 19,
+            "process_status": "process:main",
+            "in_progress": True,
+            "file_list": [],
+            "audio_file_list": [],
+        }}
+        namespace["finalize_generation"](successor)
+        self.assertTrue(namespace["gen_in_progress"])
+        self.assertTrue(successor["gen"]["in_progress"])
+        self.assertEqual(
+            successor["gen"]["_maestro_native_generation_owner"], 19,
+        )
+
+    def test_manual_cleanup_never_restores_exited_native_generation_owner(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_release_native_generation_owner",
+            "_release_prompt_enhancer_gpu_resources",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        state = {"gen": {
+            "process_status": "request:prompt_enhancer",
+            "process_hierarchy": {"prompt_enhancer": "process:main"},
+            "_maestro_native_generation_owner": 17,
+        }}
+        native_release_observations = []
+        process_lock = threading.Lock()
+
+        def native_release(current_state, process_id):
+            # Exact shared/utils/process_locks.py release semantics.
+            current = current_state["gen"]
+            with process_lock:
+                hierarchy = current.get("process_hierarchy", {})
+                current["process_status"] = hierarchy.get(process_id, None)
+                native_release_observations.append(current["process_status"])
+
+        namespace = {
+            "_NATIVE_GENERATION_OWNER_KEY": (
+                "_maestro_native_generation_owner"
+            ),
+            "_NATIVE_GENERATION_REQUEST_KEY": (
+                "_maestro_native_generation_request"
+            ),
+            "gen_lock": process_lock,
+            "get_gen_info": lambda current_state: current_state["gen"],
+            "release_GPU_ressources": native_release,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+
+        namespace["_release_native_generation_owner"](state, 17)
+        self.assertIsNone(
+            state["gen"]["_maestro_native_generation_owner"]
+        )
+        self.assertEqual(
+            state["gen"]["process_status"], "process:prompt_enhancer",
+        )
+        namespace["_release_prompt_enhancer_gpu_resources"](state)
+        self.assertEqual(native_release_observations, [None])
+        self.assertIsNone(state["gen"]["process_status"])
+        self.assertIsNone(
+            state["gen"]["process_hierarchy"]["prompt_enhancer"]
+        )
+
+    def test_late_predecessor_cleanup_cannot_clear_successor_generation(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_release_native_generation_owner"
+        )
+        state = {"gen": {
+            "process_status": "process:main",
+            "_maestro_native_generation_owner": 18,
+        }}
+        namespace = {
+            "_NATIVE_GENERATION_OWNER_KEY": (
+                "_maestro_native_generation_owner"
+            ),
+            "_NATIVE_GENERATION_REQUEST_KEY": (
+                "_maestro_native_generation_request"
+            ),
+            "gen_lock": threading.Lock(),
+            "get_gen_info": lambda current_state: current_state["gen"],
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+
+        self.assertFalse(
+            namespace["_release_native_generation_owner"](state, 17)
+        )
+        self.assertEqual(state["gen"]["process_status"], "process:main")
+        self.assertEqual(
+            state["gen"]["_maestro_native_generation_owner"], 18,
+        )
+        self.assertTrue(
+            namespace["_release_native_generation_owner"](state, 18)
+        )
+        self.assertIsNone(state["gen"]["process_status"])
+
+    def test_predecessor_post_worker_epoch_cannot_mutate_pending_successor(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_native_generation_request_is_current",
+            "_release_native_generation_owner",
+            "_process_tasks_with_native_gpu",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        state = {"gen": {
+            "process_status": "process:main",
+            "in_progress": True,
+            "_maestro_native_generation_owner": 17,
+            "_maestro_native_generation_request": 18,
+            "status": "successor waiting",
+        }}
+        namespace = {
+            "_NATIVE_GENERATION_OWNER_KEY": (
+                "_maestro_native_generation_owner"
+            ),
+            "_NATIVE_GENERATION_REQUEST_KEY": (
+                "_maestro_native_generation_request"
+            ),
+            "gen_lock": threading.Lock(),
+            "gen_in_progress": True,
+            "get_gen_info": lambda current_state: current_state["gen"],
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes[:2], type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+
+        self.assertFalse(
+            namespace["_native_generation_request_is_current"](state, 17)
+        )
+        self.assertTrue(
+            namespace["_release_native_generation_owner"](state, 17)
+        )
+        self.assertTrue(state["gen"]["in_progress"])
+        self.assertEqual(
+            state["gen"]["_maestro_native_generation_request"], 18,
+        )
+        self.assertEqual(state["gen"]["status"], "successor waiting")
+        worker_source = ast.get_source_segment(
+            source,
+            next(node for node in nodes if node.name == "_process_tasks_with_native_gpu"),
+        ) or ""
+        self.assertIn(
+            "_mutate_native_generation_if_current(", worker_source,
+        )
+        self.assertIn(
+            "if not _native_generation_request_is_current(", worker_source,
+        )
+
+    def test_pending_successor_stop_survives_predecessor_worker_and_finalizer(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_begin_native_generation_request",
+            "_native_generation_request_is_current",
+            "_checkpoint_native_generation_request",
+            "_release_native_generation_request",
+            "_release_native_generation_owner",
+            "_claim_native_generation_finalizer",
+            "_settle_native_generation_task_if_current",
+            "_mutate_native_generation_if_current",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        namespace = {
+            "_NATIVE_GENERATION_OWNER_KEY": (
+                "_maestro_native_generation_owner"
+            ),
+            "_NATIVE_GENERATION_REQUEST_KEY": (
+                "_maestro_native_generation_request"
+            ),
+            "_NATIVE_GENERATION_ABORT_REQUEST_KEY": (
+                "_maestro_native_generation_abort_request"
+            ),
+            "_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY": (
+                "_maestro_native_generation_early_stop_request"
+            ),
+            "_NATIVE_GENERATION_FINALIZER_QUEUE_KEY": (
+                "_maestro_native_generation_finalizer_queue"
+            ),
+            "_NATIVE_GENERATION_LAST_SETTLED_KEY": (
+                "_maestro_native_generation_last_settled"
+            ),
+            "gen_lock": threading.Lock(),
+            "gen_in_progress": False,
+            "get_gen_info": lambda current_state: current_state["gen"],
+            "_NativeGpuExecutionCancelled": InterruptedError,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+        state = {"gen": {"process_status": "process:main"}}
+        namespace["_begin_native_generation_request"](state, 17)
+        state["gen"]["_maestro_native_generation_owner"] = 17
+        settle_result = []
+        settle_started = threading.Event()
+        namespace["gen_lock"].acquire()
+        try:
+            def settle_predecessor():
+                settle_started.set()
+                settle_result.append(
+                    namespace[
+                        "_settle_native_generation_task_if_current"
+                    ](state, 17)
+                )
+
+            settle_thread = threading.Thread(target=settle_predecessor)
+            settle_thread.start()
+            self.assertTrue(settle_started.wait(timeout=1))
+            # Deterministically place successor registration + Stop inside
+            # the same critical section that the predecessor must recheck.
+            state["gen"].update({
+                "_maestro_native_generation_request": 18,
+                "_maestro_native_generation_abort_request": 18,
+                "_maestro_native_generation_early_stop_request": 18,
+                "abort": False,
+                "early_stop": False,
+                "early_stop_forwarded": False,
+                "extra_orders": 3,
+                "in_progress": True,
+            })
+            state["gen"][
+                "_maestro_native_generation_finalizer_queue"
+            ].append(18)
+        finally:
+            namespace["gen_lock"].release()
+        settle_thread.join(timeout=1)
+        self.assertFalse(settle_thread.is_alive())
+        self.assertEqual(settle_result, [None])
+
+        self.assertTrue(
+            namespace["_release_native_generation_owner"](state, 17)
+        )
+        self.assertFalse(
+            namespace["_native_generation_request_is_current"](state, 17)
+        )
+        self.assertFalse(
+            namespace["_claim_native_generation_finalizer"](state)
+        )
+        self.assertEqual(
+            state["gen"]["_maestro_native_generation_abort_request"], 18,
+        )
+        self.assertEqual(
+            state["gen"][
+                "_maestro_native_generation_early_stop_request"
+            ],
+            18,
+        )
+        self.assertEqual(state["gen"]["extra_orders"], 3)
+        with self.assertRaises(InterruptedError):
+            namespace["_checkpoint_native_generation_request"](state, 18)
+
+        state["gen"]["_maestro_native_generation_owner"] = 18
+        state["gen"]["process_status"] = "process:main"
+        self.assertTrue(
+            namespace["_release_native_generation_owner"](state, 18)
+        )
+        self.assertTrue(
+            namespace["_release_native_generation_request"](state, 18)
+        )
+        self.assertTrue(
+            namespace["_claim_native_generation_finalizer"](state)
+        )
+
+        abort_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "abort_generation"
+        )
+
+        class _GrStub:
+            @staticmethod
+            def Info(_message):
+                return None
+
+            @staticmethod
+            def Button(**kwargs):
+                return kwargs
+
+        abort_namespace = {
+            "get_gen_info": lambda current_state: current_state["gen"],
+            "gen_lock": threading.Lock(),
+            "wan_model": None,
+            "gr": _GrStub,
+            "_NATIVE_GENERATION_OWNER_KEY": (
+                "_maestro_native_generation_owner"
+            ),
+            "_NATIVE_GENERATION_REQUEST_KEY": (
+                "_maestro_native_generation_request"
+            ),
+            "_NATIVE_GENERATION_ABORT_REQUEST_KEY": (
+                "_maestro_native_generation_abort_request"
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[abort_node], type_ignores=[],
+        )), str(wgp_path), "exec"), abort_namespace)
+        stopped_state = {"gen": {
+            "in_progress": True,
+            "_maestro_native_generation_owner": 17,
+            "_maestro_native_generation_request": 18,
+        }}
+        abort_namespace["abort_generation"](stopped_state)
+        self.assertEqual(
+            stopped_state["gen"][
+                "_maestro_native_generation_abort_request"
+            ],
+            18,
+        )
+        self.assertFalse(stopped_state["gen"]["abort"])
+
+        command_state = {"gen": {
+            "_maestro_native_generation_request": 17,
+            "status": "predecessor",
+            "queue": [{"id": "successor"}],
+        }}
+        command_results = []
+        command_started = threading.Event()
+        namespace["gen_lock"].acquire()
+        try:
+            def publish_predecessor_error():
+                command_started.set()
+
+                def mutation(current_gen):
+                    current_gen["queue"].clear()
+                    current_gen["status"] = "predecessor error"
+
+                command_results.append(
+                    namespace[
+                        "_mutate_native_generation_if_current"
+                    ](command_state, 17, mutation)
+                )
+
+            command_thread = threading.Thread(
+                target=publish_predecessor_error
+            )
+            command_thread.start()
+            self.assertTrue(command_started.wait(timeout=1))
+            command_state["gen"].update({
+                "_maestro_native_generation_request": 18,
+                "status": "successor running",
+            })
+        finally:
+            namespace["gen_lock"].release()
+        command_thread.join(timeout=1)
+        self.assertFalse(command_thread.is_alive())
+        self.assertEqual(command_results, [False])
+        self.assertEqual(
+            command_state["gen"]["status"], "successor running",
+        )
+        self.assertEqual(
+            command_state["gen"]["queue"], [{"id": "successor"}],
+        )
+
+        worker_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_process_tasks_with_native_gpu"
+        )
+        worker_source = ast.get_source_segment(source, worker_node) or ""
+        self.assertIn(
+            "abort = _settle_native_generation_task_if_current(",
+            worker_source,
+        )
+        self.assertIn(
+            "_mutate_native_generation_if_current(", worker_source,
+        )
+        tail_at = worker_source.rindex("with gen_lock:")
+        self.assertIn("_NATIVE_GENERATION_REQUEST_KEY", worker_source[tail_at:])
+
+    def test_classic_stop_cancels_request_waiting_for_native_lane(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_NativeGpuExecutionCancelled",
+            "_NativeGpuExecutionLease",
+            "_begin_native_generation_request",
+            "_checkpoint_native_generation_request",
+            "_release_native_generation_request",
+            "process_tasks",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+            and node.name in wanted
+        ]
+        native_gpu = threading.Lock()
+
+        def acquire_native(cancel_checkpoint=None):
+            while True:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+                if native_gpu.acquire(timeout=0.01):
+                    return
+
+        namespace = {
+            "threading": threading,
+            "native_gpu_execution_lock": native_gpu,
+            "acquire_native_gpu_execution_lock": acquire_native,
+            "_next_native_gpu_execution_owner_token": lambda: 17,
+            "_NATIVE_GENERATION_OWNER_KEY": (
+                "_maestro_native_generation_owner"
+            ),
+            "_NATIVE_GENERATION_REQUEST_KEY": (
+                "_maestro_native_generation_request"
+            ),
+            "_NATIVE_GENERATION_ABORT_REQUEST_KEY": (
+                "_maestro_native_generation_abort_request"
+            ),
+            "_NATIVE_GENERATION_EARLY_STOP_REQUEST_KEY": (
+                "_maestro_native_generation_early_stop_request"
+            ),
+            "_NATIVE_GENERATION_FINALIZER_QUEUE_KEY": (
+                "_maestro_native_generation_finalizer_queue"
+            ),
+            "_NATIVE_GENERATION_LAST_SETTLED_KEY": (
+                "_maestro_native_generation_last_settled"
+            ),
+            "get_gen_info": lambda current_state: current_state["gen"],
+            "gen_lock": threading.Lock(),
+            "gen_in_progress": False,
+            "_process_tasks_with_native_gpu": lambda *_args: iter(()),
+            "_release_native_generation_owner": lambda *_args: False,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+        state = {"gen": {"queue": [{"id": "waiting"}]}}
+        native_gpu.acquire()
+        iterator = namespace["process_tasks"](state)
+        outcome = []
+
+        def wait_for_request():
+            try:
+                next(iterator)
+            except StopIteration:
+                outcome.append("cancelled")
+
+        worker = threading.Thread(target=wait_for_request)
+        worker.start()
+        for _ in range(100):
+            if state["gen"].get("in_progress"):
+                break
+            time.sleep(0.005)
+        self.assertTrue(state["gen"].get("in_progress"))
+        state["gen"]["abort"] = True
+        worker.join(timeout=1)
+        native_gpu.release()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, ["cancelled"])
+        self.assertNotIn("in_progress", state["gen"])
+        self.assertNotIn(
+            "_maestro_native_generation_request", state["gen"],
+        )
+
+    def test_classic_manual_enhance_waits_for_native_gpu_before_prompt_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {"enhance_prompt", "_process_prompt_enhancer_for_generation"}
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in wanted
+        ]
+        prompt_lane = threading.RLock()
+        native_execution = threading.Lock()
+        process_state_lock = threading.Lock()
+        manual_waiting_for_gpu = threading.Event()
+        manual_entered_prompt = threading.Event()
+        ordering = []
+        state = {"gen": {"process_status": "process:main"}}
+
+        def acquire_prompt(cancel_checkpoint=None):
+            while True:
+                if callable(cancel_checkpoint):
+                    cancel_checkpoint()
+                if prompt_lane.acquire(timeout=0.01):
+                    return
+
+        def acquire_gpu(current_state, process_id, _process_name):
+            with process_state_lock:
+                self.assertEqual(
+                    current_state["gen"]["process_status"], None,
+                )
+                current_state["gen"]["process_status"] = (
+                    f"process:{process_id}"
+                )
+            manual_waiting_for_gpu.set()
+
+        def release_gpu(current_state, _process_id):
+            with process_state_lock:
+                current_state["gen"]["process_status"] = None
+
+        def generation_process(*_args, **_kwargs):
+            ordering.append("generation")
+            return ["generation enhanced"]
+
+        def manual_process(*_args, **_kwargs):
+            ordering.append("manual")
+            manual_entered_prompt.set()
+            return ("manual enhanced", "manual enhanced")
+
+        namespace = {
+            "gr": types.SimpleNamespace(Progress=lambda: object()),
+            "acquire_GPU_ressources": acquire_gpu,
+            "_release_prompt_enhancer_gpu_resources": (
+                lambda current_state: release_gpu(
+                    current_state, "prompt_enhancer",
+                )
+            ),
+            "native_gpu_execution_lock": native_execution,
+            "acquire_native_gpu_execution_lock": native_execution.acquire,
+            "acquire_prompt_enhancer_lock": acquire_prompt,
+            "prompt_enhancer_lock": prompt_lane,
+            "prompt_enhancer_classic_entry_lock": threading.Lock(),
+            "_enhance_prompt_locked": manual_process,
+            "process_prompt_enhancer": generation_process,
+            "unload_prompt_enhancer_runtime": lambda: None,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+
+        native_execution.acquire()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            manual = executor.submit(
+                namespace["enhance_prompt"],
+                state, "prompt", "T", 0, 0, -1,
+            )
+            time.sleep(0.1)
+            self.assertFalse(manual_waiting_for_gpu.is_set())
+            self.assertFalse(manual_entered_prompt.is_set())
+            self.assertTrue(prompt_lane.acquire(blocking=False))
+            prompt_lane.release()
+
+            generation = executor.submit(
+                namespace["_process_prompt_enhancer_for_generation"],
+                {}, "T", ["prompt"], None, None, False, False, 0,
+            )
+            self.assertEqual(
+                generation.result(timeout=1), ["generation enhanced"],
+            )
+            with process_state_lock:
+                state["gen"]["process_status"] = None
+            native_execution.release()
+            self.assertTrue(manual_waiting_for_gpu.wait(timeout=1))
+            self.assertEqual(
+                manual.result(timeout=1),
+                ("manual enhanced", "manual enhanced"),
+            )
+
+        self.assertEqual(ordering, ["generation", "manual"])
+        self.assertIsNone(state["gen"]["process_status"])
+        wrapper = ast.get_source_segment(source, next(
+            node for node in nodes if node.name == "enhance_prompt"
+        )) or ""
+        self.assertLess(
+            wrapper.index("acquire_GPU_ressources("),
+            wrapper.index("acquire_prompt_enhancer_lock("),
+        )
+
+    def test_two_classic_manual_enhancers_do_not_alias_native_process_owner(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wrapper_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "enhance_prompt"
+        )
+        native_lock = threading.Lock()
+        prompt_lane = threading.RLock()
+        native_execution = threading.Lock()
+        first_inside = threading.Event()
+        release_first = threading.Event()
+        native = {
+            "status": None,
+            "active": 0,
+            "maximum": 0,
+            "acquires": 0,
+        }
+        manual_calls = 0
+
+        def acquire_gpu(_state, process_id, _process_name):
+            with native_lock:
+                native["acquires"] += 1
+                if native["status"] is None:
+                    native["status"] = f"process:{process_id}"
+                else:
+                    # Mirror the native helper's process-ID reentrancy rule.
+                    self.assertEqual(
+                        native["status"], f"process:{process_id}",
+                    )
+                native["active"] += 1
+                native["maximum"] = max(
+                    native["maximum"], native["active"],
+                )
+
+        def release_gpu(_state, _process_id):
+            with native_lock:
+                native["active"] -= 1
+                native["status"] = None
+
+        def acquire_prompt(_cancel_checkpoint=None):
+            prompt_lane.acquire()
+
+        def run_manual(*_args, **_kwargs):
+            nonlocal manual_calls
+            manual_calls += 1
+            if manual_calls == 1:
+                first_inside.set()
+                release_first.wait(timeout=2)
+            return (f"manual-{manual_calls}", f"manual-{manual_calls}")
+
+        namespace = {
+            "gr": types.SimpleNamespace(Progress=lambda: object()),
+            "acquire_GPU_ressources": acquire_gpu,
+            "_release_prompt_enhancer_gpu_resources": (
+                lambda current_state: release_gpu(
+                    current_state, "prompt_enhancer",
+                )
+            ),
+            "native_gpu_execution_lock": native_execution,
+            "acquire_native_gpu_execution_lock": native_execution.acquire,
+            "acquire_prompt_enhancer_lock": acquire_prompt,
+            "prompt_enhancer_lock": prompt_lane,
+            "prompt_enhancer_classic_entry_lock": threading.Lock(),
+            "_enhance_prompt_locked": run_manual,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[wrapper_node], type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                namespace["enhance_prompt"],
+                {}, "first", "T", 0, 0, -1,
+            )
+            self.assertTrue(first_inside.wait(timeout=1))
+            second = executor.submit(
+                namespace["enhance_prompt"],
+                {}, "second", "T", 0, 0, -1,
+            )
+            time.sleep(0.1)
+            with native_lock:
+                self.assertEqual(native["acquires"], 1)
+                self.assertEqual(native["maximum"], 1)
+                self.assertEqual(native["status"], "process:prompt_enhancer")
+            release_first.set()
+            first.result(timeout=1)
+            second.result(timeout=1)
+
+        with native_lock:
+            self.assertEqual(native["acquires"], 2)
+            self.assertEqual(native["maximum"], 1)
+            self.assertEqual(native["active"], 0)
+            self.assertIsNone(native["status"])
+
+    def test_successful_wangp_image_enhancement_closes_loaded_pil_image(self):
+        closed = []
+        observed_images = []
+
+        class LoadedImage:
+            def load(self):
+                return None
+
+            def close(self):
+                closed.append(True)
+
+        loaded_image = LoadedImage()
+
+        def generate(*args, **_kwargs):
+            observed_images.extend(args[5] or [])
+            return ["enhanced with image"]
+
+        enhance, _namespace, offload_state, modules = (
+            self._load_wangp_sync_for_test(generate)
+        )
+        modules["PIL"].Image.open = lambda _path: loaded_image
+        with tempfile.TemporaryDirectory() as root:
+            image_path = os.path.join(root, "owned.png")
+            Path(image_path).write_bytes(b"image-bytes")
+            with mock.patch.dict(sys.modules, modules):
+                result = enhance(
+                    "prompt", "video", 1, [image_path], None,
+                )
+        self.assertEqual(result["enhanced"], "enhanced with image")
+        self.assertEqual(observed_images, [loaded_image])
+        self.assertEqual(closed, [True])
+        self.assertEqual(offload_state.unloads, 1)
+
+    def test_wangp_admitted_image_decode_failure_never_runs_inference(self):
+        inference = mock.Mock(return_value=["must not run"])
+        enhance, _namespace, offload_state, modules = (
+            self._load_wangp_sync_for_test(inference)
+        )
+
+        class CorruptImage:
+            def __init__(self):
+                self.closed = False
+
+            def load(self):
+                raise OSError("private decoder detail")
+
+            def close(self):
+                self.closed = True
+
+        corrupt = CorruptImage()
+        modules["PIL"].Image.open = lambda _path: corrupt
+        with tempfile.TemporaryDirectory() as root:
+            image_path = os.path.join(root, "owned.png")
+            Path(image_path).write_bytes(b"not-an-image")
+            with mock.patch.dict(sys.modules, modules):
+                with self.assertRaisesRegex(
+                    RuntimeError, "could not be decoded",
+                ):
+                    enhance("prompt", "video", 1, [image_path], None)
+        inference.assert_not_called()
+        self.assertTrue(corrupt.closed)
+        self.assertEqual(offload_state.unloads, 1)
+
+    def test_classic_prompt_enhancer_closes_only_images_it_opened(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_process_prompt_enhancer_locked"
+        )
+
+        class TrackedImage:
+            def __init__(self):
+                self.closes = 0
+
+            def close(self):
+                self.closes += 1
+
+        caller_image = TrackedImage()
+        opened = []
+        observed = []
+        should_fail = {"value": False}
+
+        def open_image(_path):
+            image = TrackedImage()
+            opened.append(image)
+            return image
+
+        def generate(*args, **_kwargs):
+            observed.append(list(args[5] or []))
+            if should_fail["value"]:
+                raise RuntimeError("synthetic enhancer failure")
+            return ["enhanced"]
+
+        prompt_module = types.ModuleType(
+            "shared.prompt_enhancer.prompt_enhance_utils"
+        )
+        prompt_module.generate_cinematic_prompt = generate
+        namespace = {
+            "re": __import__("re"),
+            "Image": types.SimpleNamespace(open=open_image),
+            "server_config": {
+                "prompt_enhancer_temperature": 0.6,
+                "prompt_enhancer_top_p": 0.9,
+                "prompt_enhancer_randomize_seed": False,
+            },
+            "enhancer_offloadobj": None,
+            "prompt_enhancer_image_caption_model": object(),
+            "prompt_enhancer_image_caption_processor": object(),
+            "prompt_enhancer_llm_model": object(),
+            "prompt_enhancer_llm_tokenizer": object(),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[function_node], type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+
+        with mock.patch.dict(sys.modules, {
+            "shared.prompt_enhancer.prompt_enhance_utils": prompt_module,
+        }):
+            self.assertEqual(
+                namespace["_process_prompt_enhancer_locked"](
+                    {}, "TI", ["prompt"], ["owned-path.png"],
+                    [caller_image], False, False, 1,
+                ),
+                ["enhanced"],
+            )
+            self.assertEqual(opened[-1].closes, 1)
+            self.assertEqual(caller_image.closes, 0)
+            self.assertEqual(observed[-1], [opened[-1], caller_image])
+
+            should_fail["value"] = True
+            with self.assertRaisesRegex(
+                RuntimeError, "synthetic enhancer failure",
+            ):
+                namespace["_process_prompt_enhancer_locked"](
+                    {}, "TI", ["prompt"], ["replacement.png"],
+                    [caller_image], False, False, 1,
+                )
+            self.assertEqual(opened[-1].closes, 1)
+            self.assertEqual(caller_image.closes, 0)
+
+    def test_manual_enhance_closes_only_helper_created_conversions(self):
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_enhance_prompt_locked"
+        )
+
+        class TrackedImage:
+            def __init__(self, label):
+                self.label = label
+                self.closes = 0
+
+            def close(self):
+                self.closes += 1
+
+        class GrError(RuntimeError):
+            pass
+
+        caller_start = TrackedImage("caller-start")
+        caller_ref = TrackedImage("caller-ref")
+        converted = []
+        observed = []
+        should_fail = {"value": False}
+
+        def convert(source):
+            image = TrackedImage("converted-" + source.label)
+            converted.append(image)
+            return image
+
+        def process(*args, **_kwargs):
+            observed.append((list(args[3] or []), list(args[4] or [])))
+            if should_fail["value"]:
+                raise RuntimeError("synthetic failure")
+            return ["enhanced"]
+
+        class Offload:
+            @staticmethod
+            def unload_all():
+                return None
+
+        namespace = {
+            "gr": types.SimpleNamespace(
+                Info=lambda *_args: None,
+                update=lambda: None,
+                Error=GrError,
+            ),
+            "prompt_parser": types.SimpleNamespace(
+                process_template=lambda value, **_kwargs: (value, ""),
+            ),
+            "get_state_model_type": lambda _state: "model",
+            "get_model_settings": lambda *_args: {
+                "prompt": "prompt",
+                "image_prompt_type": "S",
+                "video_prompt_type": "I",
+                "image_start": [(caller_start,)],
+                "image_end": None,
+                "image_refs": [(caller_ref,)],
+                "image_mode": 0,
+                "seed": 1,
+            },
+            "convert_image": convert,
+            "reset_prompt_enhancer_if_requested": lambda: None,
+            "enhancer_offloadobj": Offload(),
+            "get_model_def": lambda _model: {},
+            "set_seed": lambda seed: seed,
+            "process_prompt_enhancer": process,
+            "unload_prompt_enhancer_runtime": lambda: None,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[function_node], type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+        progress = lambda *_args, **_kwargs: None
+
+        result = namespace["_enhance_prompt_locked"](
+            {}, "prompt", "TI", 0, 0, -1, progress,
+        )
+        self.assertEqual(result, ("#!PROMPT!: prompt\nenhanced",) * 2)
+        self.assertEqual([image.closes for image in converted], [1, 1])
+        self.assertEqual(caller_start.closes, 0)
+        self.assertEqual(caller_ref.closes, 0)
+        self.assertEqual(observed[-1], ([converted[0]], [converted[1]]))
+
+        converted.clear()
+        should_fail["value"] = True
+        with self.assertRaises(GrError):
+            namespace["_enhance_prompt_locked"](
+                {}, "prompt", "TI", 0, 0, -1, progress,
+            )
+        self.assertEqual([image.closes for image in converted], [1, 1])
+        self.assertEqual(caller_start.closes, 0)
+        self.assertEqual(caller_ref.closes, 0)
+
+    def test_convert_image_closes_owned_real_pil_sources_and_intermediates(self):
+        from PIL import Image as PilImage
+        from PIL import ImageOps
+
+        wgp_path = Path(__file__).resolve().parents[1] / "app" / "wgp.py"
+        source = wgp_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "convert_image"
+        )
+        namespace = {"Image": PilImage}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[function_node], type_ignores=[],
+        )), str(wgp_path), "exec"), namespace)
+        convert = namespace["convert_image"]
+
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, "source.png")
+            moved_path = os.path.join(root, "moved.png")
+            PilImage.new("RGBA", (2, 2), (1, 2, 3, 255)).save(source_path)
+            caller_image = PilImage.open(source_path)
+            intermediates = []
+            real_transpose = ImageOps.exif_transpose
+
+            def capture_transpose(image):
+                intermediates.append(image)
+                return real_transpose(image)
+
+            with mock.patch.object(
+                ImageOps, "exif_transpose", side_effect=capture_transpose,
+            ):
+                result = convert(caller_image)
+            self.assertEqual(caller_image.getpixel((0, 0)), (1, 2, 3, 255))
+            self.assertEqual(result.getpixel((0, 0)), (1, 2, 3))
+            with self.assertRaises(ValueError):
+                intermediates[-1].getpixel((0, 0))
+            result.close()
+            caller_image.close()
+
+            intermediates.clear()
+            with mock.patch.object(
+                ImageOps, "exif_transpose", side_effect=capture_transpose,
+            ):
+                result = convert(source_path)
+            os.replace(source_path, moved_path)
+            self.assertEqual(result.getpixel((0, 0)), (1, 2, 3))
+            with self.assertRaises(ValueError):
+                intermediates[-1].getpixel((0, 0))
+            result.close()
+
+            caller_image = PilImage.open(moved_path)
+            failed_intermediate = []
+
+            def fail_transpose(image):
+                failed_intermediate.append(image)
+                raise RuntimeError("synthetic transpose failure")
+
+            with mock.patch.object(
+                ImageOps, "exif_transpose", side_effect=fail_transpose,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "synthetic transpose failure",
+                ):
+                    convert(caller_image)
+            self.assertEqual(caller_image.getpixel((0, 0)), (1, 2, 3, 255))
+            with self.assertRaises(ValueError):
+                failed_intermediate[-1].getpixel((0, 0))
+            caller_image.close()
+
+    def test_wangp_cancel_after_blocked_inference_unloads_and_releases_lane(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from services.llm_cancellation import (
+            LlmCancellationHandle,
+            LlmRequestCancelled,
+        )
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def generate(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=2)
+            return ["late result"]
+
+        enhance, namespace, offload_state, modules = (
+            self._load_wangp_sync_for_test(generate)
+        )
+        cancellation = LlmCancellationHandle()
+        with mock.patch.dict(sys.modules, modules), ThreadPoolExecutor(
+            max_workers=1,
+        ) as executor:
+            future = executor.submit(
+                enhance, "prompt", "video", 1, None, cancellation,
+            )
+            self.assertTrue(entered.wait(timeout=1))
+            cancellation.cancel()
+            release.set()
+            with self.assertRaises(LlmRequestCancelled):
+                future.result(timeout=2)
+        self.assertEqual(offload_state.unloads, 1)
+        self.assertTrue(namespace["_gen_lock"].acquire(blocking=False))
+        namespace["_gen_lock"].release()
+
+    def test_second_wangp_request_cancels_while_waiting_without_inference(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from services.llm_cancellation import (
+            LlmCancellationHandle,
+            LlmRequestCancelled,
+        )
+
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        calls = []
+
+        def generate(*_args, **_kwargs):
+            calls.append(True)
+            first_entered.set()
+            release_first.wait(timeout=2)
+            return ["first result"]
+
+        enhance, _namespace, offload_state, modules = (
+            self._load_wangp_sync_for_test(generate)
+        )
+        second_cancel = LlmCancellationHandle()
+        with mock.patch.dict(sys.modules, modules), ThreadPoolExecutor(
+            max_workers=2,
+        ) as executor:
+            first = executor.submit(enhance, "first", "video", 1)
+            self.assertTrue(first_entered.wait(timeout=1))
+            second = executor.submit(
+                enhance, "second", "video", 1, None, second_cancel,
+            )
+            self.assertFalse(second.done())
+            second_cancel.cancel()
+            with self.assertRaises(LlmRequestCancelled):
+                second.result(timeout=1)
+            self.assertEqual(len(calls), 1)
+            release_first.set()
+            self.assertEqual(first.result(timeout=2)["enhanced"], "first result")
+        self.assertEqual(offload_state.unloads, 1)
+
+    def test_scoped_enhance_passes_exact_cancel_handle_and_progress_callback(self):
+        from fastapi import HTTPException
+        from services.llm_cancellation import LlmCancellationHandle
+
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(launch_path))
+        route = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "llm_enhance_prompt"
+        )
+        route.decorator_list = []
+        observed = {}
+        progress_events = []
+        cancel_handle = LlmCancellationHandle()
+
+        def enhance_prompt(**kwargs):
+            observed.update(kwargs)
+            kwargs["cancel_handle"].checkpoint()
+            kwargs["progress_callback"]({
+                "phase": "generating", "text": "scoped partial",
+            })
+            return "enhanced result"
+
+        fake_service = types.SimpleNamespace(
+            MODEL_REGISTRY={},
+            get_model_capabilities=lambda *_args, **_kwargs: {
+                "vision_capable": False,
+            },
+            enhance_prompt=enhance_prompt,
+        )
+        fake_wgp = types.SimpleNamespace(server_config={
+            "enhancer_enabled": 0,
+            "services": {},
+        })
+        namespace = {
+            "Request": object,
+            "HTTPException": HTTPException,
+            "JSONResponse": object,
+            "copy": __import__("copy"),
+            "hmac": __import__("hmac"),
+            "wgp": fake_wgp,
+            "_promote_external_llm_request": lambda _request: None,
+            "_request_project_workspace": lambda _request, value: value,
+            "_require_project_access": lambda *_args, **_kwargs: None,
+            "_resolve_prompt_enhancement_images": lambda *_args: [],
+            "_explicit_llm_guidance_allowed": lambda _body: False,
+            "_llm_route_progress_callback": (
+                lambda request: request.state.maestro_llm_progress_callback
+            ),
+            "_emit_llm_progress": (
+                lambda callback, event: callback(event) if callback else None
+            ),
+            "_resolve_prompt_enhancer_selection": (
+                lambda *_args, **_kwargs: ("local-enhancer", "cpu", False)
+            ),
+            "_resolve_prompt_enhancer_runtime_selection": (
+                lambda *_args, **_kwargs: ({
+                    "model_id": "local-enhancer",
+                    "device": "cpu",
+                    "provider": "local",
+                    "remote_url": "",
+                    "api_key": "",
+                    "local_gguf_path": "",
+                    "gguf_file_override": "",
+                }, False)
+            ),
+            "_run_authorized_llm_with_selection": (
+                lambda _request, _selection, operation: operation()
+            ),
+            "_resolved_local_response_assist": lambda *_args, **_kwargs: None,
+            "_validate_standalone_enhanced_prompt_cardinality": (
+                lambda _body, _model_type, result: result
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[route], type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+
+        class Request:
+            state = types.SimpleNamespace(
+                maestro_session_id="owner",
+                maestro_remote=False,
+                maestro_llm_cancel_handle=cancel_handle,
+                maestro_llm_progress_callback=progress_events.append,
+            )
+
+            async def json(self):
+                return {"workspace": "project", "prompt": "private prompt"}
+
+        with mock.patch.object(
+            sys.modules["services"], "llm_service", fake_service,
+        ):
+            result = asyncio.run(namespace["llm_enhance_prompt"](Request()))
+
+        self.assertEqual(
+            result, {"original": "private prompt", "enhanced": "enhanced result"},
+        )
+        self.assertIs(observed["cancel_handle"], cancel_handle)
+        self.assertIs(
+            observed["progress_callback"],
+            Request.state.maestro_llm_progress_callback,
+        )
+        self.assertIn("scoped partial", repr(progress_events))
+
     def test_gguf_download_is_visible_through_llm_status(self):
         observed = {}
 
@@ -197,18 +2700,20 @@ class LlmRuntimeTests(unittest.TestCase):
         self.assertTrue(result.endswith("nested/enhancer.gguf"))
         self.assertFalse(llm_service.get_status()["loading"])
 
-    def test_prompt_enhancer_progress_matches_the_requested_model_and_names_runtime_phases(self):
+    def test_prompt_enhancer_uses_request_scoped_stage_and_throughput_status(self):
         prompt_input = (
             Path(__file__).resolve().parents[1]
             / "ui" / "src" / "components" / "Sidebar" / "PromptInput.tsx"
         ).read_text(encoding="utf-8")
-        self.assertIn("loadingId === expectedModelId", prompt_input)
-        self.assertIn("llmData.model_id === expectedModelId", prompt_input)
-        self.assertIn("Downloading vision projector", prompt_input)
-        self.assertIn("Downloading writing-assistant tools", prompt_input)
-        self.assertIn("Preparing writing-assistant tools", prompt_input)
-        self.assertIn("compactBytes(downloaded)", prompt_input)
-        self.assertNotIn("if (!llmData.loaded)", prompt_input)
+        self.assertIn("const enhanceStatus = useStore", prompt_input)
+        self.assertIn("'request_id' in enhanceStatus", prompt_input)
+        self.assertIn("routeEnhanceStatus?.partial_text", prompt_input)
+        self.assertIn("routeEnhanceStatus?.live_tps", prompt_input)
+        self.assertIn("routeEnhanceStatus?.average_tps", prompt_input)
+        self.assertIn("llm_fallback: 'Continuing with your writing assistant'", prompt_input)
+        self.assertIn("cancelEnhancePrompt", prompt_input)
+        self.assertNotIn("loadingId === expectedModelId", prompt_input)
+        self.assertNotIn("fetchLlmStatus", prompt_input)
 
     def test_runtime_build_status_ignores_unrelated_safe_download(self):
         from services import safe_download

@@ -5730,12 +5730,28 @@ export class LlmChatWaitError extends Error {
   }
 }
 
+export class LlmEnhanceWaitError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'LlmEnhanceWaitError'
+  }
+}
+
+export class LlmEnhanceScopeError extends Error {
+  constructor(message = 'The Prompt Enhance project changed') {
+    super(message)
+    this.name = 'LlmEnhanceScopeError'
+  }
+}
+
 // A 31B local model can take substantially longer to download/load than an
 // HTTP proxy will keep one inference request open. Preparation uses short
 // requests and permits a bounded 45-minute wait without placing creative
 // content in the prepare payload.
 const LLM_PREPARATION_MAX_WAIT_MS = 45 * 60 * 1000
 const LLM_PREPARATION_VISIBLE_POLL_MS = 1_000
+const LLM_ENHANCE_CANCEL_ADMISSION_WAIT_MS = 15_000
+const LLM_ENHANCE_CANCEL_RETRY_MS = 250
 
 class TransientHttpError extends Error {}
 
@@ -5786,6 +5802,24 @@ function waitForPreparationPoll(signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) {
       onAbort()
     }
+  })
+}
+
+function waitForLlmMutationRetry(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal)
+  return new Promise((resolve, reject) => {
+    const timer = globalThis.setTimeout(finish, LLM_ENHANCE_CANCEL_RETRY_MS)
+    function finish(): void {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }
+    function onAbort(): void {
+      globalThis.clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      reject(new DOMException('The browser stopped waiting', 'AbortError'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
   })
 }
 
@@ -5989,7 +6023,7 @@ export async function unloadLlm(): Promise<void> {
   if (!res.ok) throw new Error('Failed to unload LLM')
 }
 
-export async function fetchLlmModels(workspace?: string): Promise<{
+export async function fetchLlmModels(workspace?: string, signal?: AbortSignal): Promise<{
   models: import('../types').LlmModelOption[]
   guides: import('../types').LlmPromptGuideOption[]
   project_instance?: string
@@ -5997,7 +6031,10 @@ export async function fetchLlmModels(workspace?: string): Promise<{
   const query = workspace
     ? `?${new URLSearchParams({ workspace })}`
     : ''
-  const res = await fetch(`${BASE}/api/v1/llm/models${query}`)
+  const res = await fetch(`${BASE}/api/v1/llm/models${query}`, {
+    cache: 'no-store',
+    signal,
+  })
   if (!res.ok) throw new Error('Failed to fetch LLM models')
   const data = await res.json()
   return {
@@ -6340,8 +6377,297 @@ export async function llmChat(params: {
   )
 }
 
+export interface LlmEnhanceOperationScope {
+  requestId: string
+  workspace: string
+  projectInstance: string
+}
+
+export interface LlmEnhanceOperationStatus {
+  request_id: string
+  operation_kind: 'enhance'
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  phase: string
+  stage: string
+  pass: number
+  pass_limit: number
+  attempt: number
+  attempt_limit: number
+  partial_text: string
+  generated_tokens_approx: number
+  elapsed_seconds: number
+  live_tps: number | null
+  average_tps: number | null
+  result_available: boolean
+  retryable: boolean
+  error?: { code: string; message: string; retryable: boolean } | null
+}
+
+export interface LlmEnhanceResult {
+  original: string
+  enhanced: string
+}
+
+export interface LlmEnhanceRequestOptions extends LlmRequestOptions {
+  projectInstance: string
+  onOperationStatus?: (status: LlmEnhanceOperationStatus) => void
+  onSubmissionAttempted?: () => void | Promise<void>
+}
+
+function canonicalLlmRequestId(requestId: string): string {
+  return requestId.replaceAll('-', '').toLowerCase()
+}
+
+function assertLlmEnhanceStatusScope(
+  status: LlmEnhanceOperationStatus,
+  scope: LlmEnhanceOperationScope,
+): void {
+  if (
+    canonicalLlmRequestId(status.request_id) !== canonicalLlmRequestId(scope.requestId)
+    || status.operation_kind !== 'enhance'
+  ) {
+    throw new LlmEnhanceScopeError()
+  }
+}
+
+async function assertLlmEnhanceProjectScope(
+  scope: LlmEnhanceOperationScope,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal)
+  const current = await fetchLlmModels(scope.workspace, signal)
+  if (
+    !current.project_instance
+    || current.project_instance !== scope.projectInstance
+  ) {
+    throw new LlmEnhanceScopeError()
+  }
+}
+
+async function submitLlmEnhance(
+  request: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<LlmEnhanceOperationStatus> {
+  const res = await fetch(`${BASE}/api/v1/llm/enhance-prompt`, {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+    signal,
+  })
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok || res.status !== 202) {
+    const err = await res.json().catch(() => ({ detail: 'Enhancement failed' }))
+    throw new Error(err.detail || 'Enhancement failed')
+  }
+  return res.json()
+}
+
+export async function fetchLlmEnhanceOperation(
+  scope: LlmEnhanceOperationScope,
+  signal?: AbortSignal,
+): Promise<LlmEnhanceOperationStatus | null> {
+  throwIfAborted(signal)
+  const query = new URLSearchParams({ workspace: scope.workspace })
+  const res = await fetch(
+    `${BASE}/api/v1/llm/operations/enhance/${encodeURIComponent(scope.requestId)}?${query}`,
+    { cache: 'no-store', signal },
+  )
+  if (res.status === 404) return null
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Prompt Enhance status is unavailable' }))
+    throw new Error(err.detail || 'Prompt Enhance status is unavailable')
+  }
+  const status = await res.json() as LlmEnhanceOperationStatus
+  assertLlmEnhanceStatusScope(status, scope)
+  return status
+}
+
+async function fetchLlmEnhanceResult(
+  scope: LlmEnhanceOperationScope,
+  signal?: AbortSignal,
+): Promise<LlmEnhanceResult> {
+  await assertLlmEnhanceProjectScope(scope, signal)
+  const query = new URLSearchParams({ workspace: scope.workspace })
+  const res = await fetch(
+    `${BASE}/api/v1/llm/operations/enhance/${encodeURIComponent(scope.requestId)}/result?${query}`,
+    { cache: 'no-store', signal },
+  )
+  if (res.status === 404) {
+    throw new LlmEnhanceWaitError('This Prompt Enhance result is no longer available.')
+  }
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Prompt Enhance result is unavailable' }))
+    throw new Error(err.detail || 'Prompt Enhance result is unavailable')
+  }
+  const result = await res.json() as Partial<LlmEnhanceResult>
+  await assertLlmEnhanceProjectScope(scope, signal)
+  if (typeof result.original !== 'string' || typeof result.enhanced !== 'string') {
+    throw new LlmEnhanceScopeError('The Prompt Enhance result did not match its request')
+  }
+  return { original: result.original, enhanced: result.enhanced }
+}
+
+async function recoverLlmEnhanceSubmission(
+  request: Record<string, unknown>,
+  scope: LlmEnhanceOperationScope,
+  signal?: AbortSignal,
+): Promise<LlmEnhanceOperationStatus> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < LLM_PREPARATION_MAX_WAIT_MS) {
+    throwIfAborted(signal)
+    try {
+      const existing = await fetchLlmEnhanceOperation(scope, signal)
+      if (existing) return existing
+      // A missing status is safe to re-submit only while the exact browser
+      // project instance still owns this UUID and unchanged request body.
+      await assertLlmEnhanceProjectScope(scope, signal)
+      const submitted = await submitLlmEnhance(request, signal)
+      assertLlmEnhanceStatusScope(submitted, scope)
+      return submitted
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      await waitForPreparationPoll(signal)
+    }
+  }
+  throw new LlmEnhanceWaitError(
+    'Prompt Enhance status is still unavailable. Reload to resume waiting.',
+  )
+}
+
+export async function waitForLlmEnhanceOperation(
+  scope: LlmEnhanceOperationScope,
+  signal?: AbortSignal,
+  initial?: LlmEnhanceOperationStatus,
+  onStatus?: (status: LlmEnhanceOperationStatus) => void,
+): Promise<LlmEnhanceResult> {
+  const startedAt = Date.now()
+  let operation: LlmEnhanceOperationStatus | null | undefined = initial
+  while (!operation) {
+    if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
+      throw new LlmEnhanceWaitError(
+        'Prompt Enhance is still running. Reload to resume waiting.',
+      )
+    }
+    try {
+      operation = await fetchLlmEnhanceOperation(scope, signal)
+      if (!operation) {
+        throw new LlmEnhanceWaitError('This Prompt Enhance request is no longer available.')
+      }
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      await waitForPreparationPoll(signal)
+    }
+  }
+  assertLlmEnhanceStatusScope(operation, scope)
+  onStatus?.(operation)
+  while (operation.status === 'running') {
+    if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
+      throw new LlmEnhanceWaitError(
+        'Prompt Enhance is still running. Reload to resume waiting.',
+      )
+    }
+    await waitForPreparationPoll(signal)
+    try {
+      const next = await fetchLlmEnhanceOperation(scope, signal)
+      if (!next) {
+        throw new LlmEnhanceWaitError('This Prompt Enhance request is no longer available.')
+      }
+      operation = next
+      onStatus?.(operation)
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+    }
+  }
+  if (operation.status !== 'completed' || !operation.result_available) {
+    throw new Error(
+      operation.error?.message
+      || (operation.status === 'cancelled'
+        ? 'Prompt enhancement was cancelled'
+        : 'Prompt enhancement failed'),
+    )
+  }
+  while (Date.now() - startedAt < LLM_PREPARATION_MAX_WAIT_MS) {
+    try {
+      return await fetchLlmEnhanceResult(scope, signal)
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      await waitForPreparationPoll(signal)
+    }
+  }
+  throw new LlmEnhanceWaitError(
+    'Prompt Enhance finished, but its result is still unreachable. Reload to resume waiting.',
+  )
+}
+
+export async function resumeLlmEnhancePrompt(
+  scope: LlmEnhanceOperationScope,
+  options?: Pick<LlmEnhanceRequestOptions, 'signal' | 'onOperationStatus'>,
+): Promise<LlmEnhanceResult> {
+  await assertLlmEnhanceProjectScope(scope, options?.signal)
+  return waitForLlmEnhanceOperation(
+    scope,
+    options?.signal,
+    undefined,
+    options?.onOperationStatus,
+  )
+}
+
+export async function cancelLlmEnhancePrompt(
+  scope: LlmEnhanceOperationScope,
+  signal?: AbortSignal,
+): Promise<LlmEnhanceOperationStatus> {
+  await assertLlmEnhanceProjectScope(scope, signal)
+  const query = new URLSearchParams({ workspace: scope.workspace })
+  const operationUrl = `${BASE}/api/v1/llm/operations/enhance/${encodeURIComponent(scope.requestId)}?${query}`
+  const startedAt = Date.now()
+  while (true) {
+    throwIfAborted(signal)
+    const res = await fetch(operationUrl, {
+      method: 'DELETE', cache: 'no-store', signal,
+    })
+    if (res.status !== 404) {
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Prompt Enhance could not be cancelled' }))
+        throw new Error(err.detail || 'Prompt Enhance could not be cancelled')
+      }
+      const status = await res.json() as LlmEnhanceOperationStatus
+      assertLlmEnhanceStatusScope(status, scope)
+      return status
+    }
+
+    // DELETE may race an ambiguous POST whose 202 response was lost before
+    // the operation became visible. Never treat this 404 as cancellation: an
+    // admitted worker could otherwise appear after the browser forgets it.
+    let admitted: LlmEnhanceOperationStatus | null = null
+    try {
+      admitted = await fetchLlmEnhanceOperation(scope, signal)
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+    }
+    if (admitted && admitted.status !== 'running') {
+      return admitted
+    }
+    if (Date.now() - startedAt >= LLM_ENHANCE_CANCEL_ADMISSION_WAIT_MS) {
+      throw new LlmEnhanceWaitError(
+        'Prompt Enhance cancellation is still confirming. Reload to resume or cancel again.',
+      )
+    }
+    await waitForLlmMutationRetry(signal)
+  }
+}
+
 export async function llmEnhancePrompt(params: {
   workspace: string
+  request_id: string
+  project_instance: string
   prompt: string
   mode?: string
   model_type?: string
@@ -6357,8 +6683,16 @@ export async function llmEnhancePrompt(params: {
   tts_voice_count?: number
   max_new_tokens?: number
   explicit_output?: boolean
-}, options?: LlmRequestOptions): Promise<{ original: string; enhanced: string }> {
-  return withLlmPreparation(
+}, options: LlmEnhanceRequestOptions): Promise<LlmEnhanceResult> {
+  const scope: LlmEnhanceOperationScope = {
+    requestId: params.request_id,
+    workspace: params.workspace,
+    projectInstance: params.project_instance,
+  }
+  if (options.projectInstance !== params.project_instance) {
+    throw new LlmEnhanceScopeError('The Prompt Enhance project fence did not match its request')
+  }
+  await prepareLlmForRequest(
     {
       workspace: params.workspace,
       purpose: 'enhance',
@@ -6366,19 +6700,28 @@ export async function llmEnhancePrompt(params: {
       vision_required: Boolean(params.image_path || params.image_paths?.length),
     },
     options,
-    async () => {
-      const res = await fetch(`${BASE}/api/v1/llm/enhance-prompt`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-        signal: options?.signal,
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Enhancement failed' }))
-        throw new Error(err.detail || 'Enhancement failed')
-      }
-      return res.json()
-    },
+  )
+  await assertLlmEnhanceProjectScope(scope, options.signal)
+  throwIfAborted(options.signal)
+  // Persist the content-free recovery scope immediately before the first POST.
+  await options.onSubmissionAttempted?.()
+  throwIfAborted(options.signal)
+  let operation: LlmEnhanceOperationStatus
+  try {
+    operation = await submitLlmEnhance(params, options.signal)
+    assertLlmEnhanceStatusScope(operation, scope)
+  } catch (error) {
+    throwIfAborted(options.signal)
+    if (!isTransientRequestError(error)) throw error
+    // An accepted 202 may have been hidden by a proxy disconnect. Query this
+    // UUID first and only then re-submit the exact request when still absent.
+    operation = await recoverLlmEnhanceSubmission(params, scope, options.signal)
+  }
+  return waitForLlmEnhanceOperation(
+    scope,
+    options.signal,
+    operation,
+    options.onOperationStatus,
   )
 }
 
