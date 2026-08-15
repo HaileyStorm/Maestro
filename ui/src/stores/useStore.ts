@@ -176,6 +176,11 @@ function _directorCapabilitiesKey(explicitOutput: boolean): DirectorCapabilities
 }
 let _dashboardPipelineLoadToken = 0
 let _dashboardPipelineListLoadToken = 0
+type DashboardPipelineListRead = {
+  workspace: string
+  generation: number
+  status: 'idle' | 'loading' | 'ready' | 'failed'
+}
 let _enhanceLlmRequestToken: symbol | null = null
 let _enhanceStopWaiting: (() => void) | null = null
 let _enhanceWaitSignal: AbortSignal | null = null
@@ -2341,6 +2346,7 @@ interface AppState {
   // Director Pipeline Dashboard
   dashboardOpen: boolean
   dashboardPipelineList: PipelineListItem[]
+  dashboardPipelineListRead: DashboardPipelineListRead
   dashboardSelectedPipeline: SavedPipelineState | null
   dashboardLoading: boolean
   setDashboardOpen: (open: boolean) => void
@@ -3754,6 +3760,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     shortFilmPath: null,
     dashboardOpen: false,
     dashboardPipelineList: [],
+    dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
     dashboardSelectedPipeline: null,
     dashboardLoading: false,
     pendingH3Plan: null,
@@ -4671,6 +4678,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   dashboardOpen: false,
   dashboardPipelineList: [],
+  dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
   dashboardSelectedPipeline: null,
   dashboardLoading: false,
   setDashboardOpen: (open) => {
@@ -4682,11 +4690,18 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   loadPipelineList: async () => {
-    const loadToken = ++_dashboardPipelineListLoadToken
+    const generation = ++_dashboardPipelineListLoadToken
+    const workspace = get().activeWorkspace
+    set({
+      dashboardPipelineListRead: { workspace, generation, status: 'loading' },
+    })
     try {
-      const { pipelines } = await api.fetchPipelineList(get().activeWorkspace)
-      if (loadToken !== _dashboardPipelineListLoadToken) return
-      set({ dashboardPipelineList: pipelines })
+      const { pipelines } = await api.fetchPipelineList(workspace)
+      if (generation !== _dashboardPipelineListLoadToken || get().activeWorkspace !== workspace) return
+      set({
+        dashboardPipelineList: pipelines,
+        dashboardPipelineListRead: { workspace, generation, status: 'ready' },
+      })
 
       // The repair worker belongs to the server, so a browser reload must
       // rediscover active operations and resume UI polling without requiring
@@ -4698,7 +4713,7 @@ export const useStore = create<AppState>((set, get) => ({
 
         const discovery = {}
         _directorRepairDiscoveries.set(item.id, discovery)
-        void api.fetchSavedPipeline(item.id, get().activeWorkspace).then(pipeline => {
+        void api.fetchSavedPipeline(item.id, workspace).then(pipeline => {
           if (_directorRepairDiscoveries.get(item.id) !== discovery) return
           if (_directorRepairPolls.has(item.id)) return
 
@@ -4727,8 +4742,11 @@ export const useStore = create<AppState>((set, get) => ({
         })
       }
     } catch (e) {
-      if (loadToken !== _dashboardPipelineListLoadToken) return
+      if (generation !== _dashboardPipelineListLoadToken || get().activeWorkspace !== workspace) return
       console.error('Failed to load pipeline list:', e)
+      set({
+        dashboardPipelineListRead: { workspace, generation, status: 'failed' },
+      })
     }
   },
   loadSavedPipeline: async (pid) => {
@@ -12365,7 +12383,7 @@ export const useStore = create<AppState>((set, get) => ({
           previousAccessRevoked && before.pendingH3PlanWorkspace === previousActive
         )
       )
-      if (projectChanged) {
+      if (projectChanged || previousAccessRevoked) {
         _directorPipelineLifecycleToken = null
         _dashboardPipelineLoadToken += 1
         _dashboardPipelineListLoadToken += 1
@@ -12392,6 +12410,7 @@ export const useStore = create<AppState>((set, get) => ({
             directorLoading: false,
             dashboardOpen: false,
             dashboardPipelineList: [],
+            dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
             dashboardSelectedPipeline: null,
             dashboardLoading: false,
           } : {}),
@@ -12462,6 +12481,7 @@ export const useStore = create<AppState>((set, get) => ({
         directorLoading: false,
         dashboardOpen: false,
         dashboardPipelineList: [],
+        dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
         dashboardSelectedPipeline: null,
         dashboardLoading: false,
       })
@@ -12503,6 +12523,7 @@ export const useStore = create<AppState>((set, get) => ({
         directorLoading: false,
         dashboardOpen: false,
         dashboardPipelineList: [],
+        dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
         dashboardSelectedPipeline: null,
         dashboardLoading: false,
       })
@@ -12572,6 +12593,7 @@ export const useStore = create<AppState>((set, get) => ({
         directorLoading: false,
         dashboardOpen: false,
         dashboardPipelineList: [],
+        dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
         dashboardSelectedPipeline: null,
         dashboardLoading: false,
       })
@@ -12626,6 +12648,7 @@ export const useStore = create<AppState>((set, get) => ({
           directorLoading: false,
           dashboardOpen: false,
           dashboardPipelineList: [],
+          dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
           dashboardSelectedPipeline: null,
           dashboardLoading: false,
         } : {}),
@@ -12674,6 +12697,7 @@ export const useStore = create<AppState>((set, get) => ({
         directorLoading: false,
         dashboardOpen: false,
         dashboardPipelineList: [],
+        dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
         dashboardSelectedPipeline: null,
         dashboardLoading: false,
       })

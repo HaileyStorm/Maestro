@@ -293,6 +293,11 @@ interface PendingChatRequest {
 }
 
 type ChatRequestPhase = 'idle' | 'uploading' | 'queued' | 'preparing' | 'generating'
+type ChatCatalogRead = {
+  workspace: string
+  status: 'loading' | 'ready' | 'failed'
+}
+type ChatEmptyState = 'project-required' | 'loading' | 'catalog-failed' | 'model-required' | 'ready'
 interface EditingTurn {
   index: number
   requiresFreshImage: boolean
@@ -435,6 +440,7 @@ export function LlmChat() {
   const selectedVideoModel = useStore(state => state.selectedModelPerMode.video || '')
   const [messages, setMessages] = useState<LlmChatMessage[]>([])
   const [projectInstance, setProjectInstance] = useState('')
+  const [projectInstanceWorkspace, setProjectInstanceWorkspace] = useState('')
   const [models, setModels] = useState<LlmModelOption[]>([])
   const [guides, setGuides] = useState<LlmPromptGuideOption[]>([])
   const [modelId, setModelId] = useState('')
@@ -444,6 +450,10 @@ export function LlmChat() {
   const [draft, setDraft] = useState('')
   const [selectedImages, setSelectedImages] = useState<File[]>([])
   const [loadingCatalog, setLoadingCatalog] = useState(true)
+  const [catalogRead, setCatalogRead] = useState<ChatCatalogRead>({
+    workspace: '',
+    status: 'loading',
+  })
   const [sending, setSending] = useState(false)
   const [uploadingImages, setUploadingImages] = useState(false)
   const [requestPhase, setRequestPhase] = useState<ChatRequestPhase>('idle')
@@ -529,6 +539,7 @@ export function LlmChat() {
     }
     projectInstanceRef.current = nextProjectInstance
     setProjectInstance(nextProjectInstance)
+    setProjectInstanceWorkspace(activeWorkspace)
     setMessages(restoreMessages(activeWorkspace, nextProjectInstance))
     setDraft('')
     setEditingTurn(null)
@@ -581,6 +592,7 @@ export function LlmChat() {
     if (fileInputRef.current) fileInputRef.current.value = ''
     projectInstanceRef.current = ''
     setProjectInstance('')
+    setProjectInstanceWorkspace('')
     setMessages([])
     setError(null)
     return () => {
@@ -619,6 +631,7 @@ export function LlmChat() {
   useEffect(() => {
     let cancelled = false
     setLoadingCatalog(true)
+    setCatalogRead({ workspace: activeWorkspace, status: 'loading' })
     const refresh = (initial = false) => {
       api.fetchLlmModels(activeWorkspace)
         .then(data => {
@@ -632,8 +645,13 @@ export function LlmChat() {
           modelSelectionTouched.current,
         ))
         if (data.project_instance) adoptProjectInstance(data.project_instance)
+        if (initial) setCatalogRead({ workspace: activeWorkspace, status: 'ready' })
       })
-      .catch(err => { if (!cancelled) setError(err instanceof Error ? err.message : String(err)) })
+      .catch(err => {
+        if (cancelled) return
+        setError(err instanceof Error ? err.message : String(err))
+        if (initial) setCatalogRead({ workspace: activeWorkspace, status: 'failed' })
+      })
       .finally(() => { if (initial && !cancelled) setLoadingCatalog(false) })
     }
     refresh(true)
@@ -901,6 +919,35 @@ export function LlmChat() {
     && liveChatStatus.projectInstance === projectInstance
     ? liveChatStatus.status
     : null
+  const chatEmptyState: ChatEmptyState = !activeWorkspace
+    ? 'project-required'
+    : catalogRead.workspace !== activeWorkspace || catalogRead.status === 'loading'
+      ? 'loading'
+      : catalogRead.status === 'failed'
+        ? 'catalog-failed'
+        : projectInstanceWorkspace !== activeWorkspace || !projectInstance
+          ? 'loading'
+          : !effectiveModelId
+            ? 'model-required'
+            : 'ready'
+  const chatEmptyHeading = chatEmptyState === 'project-required'
+    ? 'Select a project'
+    : chatEmptyState === 'loading'
+      ? 'Opening this project’s conversation'
+      : chatEmptyState === 'catalog-failed'
+        ? 'Language models unavailable'
+        : chatEmptyState === 'model-required'
+          ? 'Choose a language model'
+          : 'Start a project conversation'
+  const chatEmptyBody = chatEmptyState === 'project-required'
+    ? 'Select or create a project before chatting.'
+    : chatEmptyState === 'loading'
+      ? 'Loading the language model and conversation history…'
+      : chatEmptyState === 'catalog-failed'
+        ? 'Maestro could not load language models for this project. Reopen Chat to try again.'
+        : chatEmptyState === 'model-required'
+          ? 'Choose a language model above before starting a conversation.'
+          : 'Start a conversation for this project with the selected language model.'
 
   const clearConversation = () => {
     if (interactionLocked || refusalLiteralSaveRef.current) return
@@ -1477,8 +1524,16 @@ export function LlmChat() {
       >
         <div className="mx-auto flex max-w-4xl flex-col gap-3">
           {messages.length === 0 && (
-            <div className="rounded-xl border border-dashed border-border bg-bg-secondary/60 p-8 text-center text-sm text-text-muted">
-              Start a conversation for this project with the selected language model.
+            <div className="flex min-h-48 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-8 text-center">
+              <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-accent-blue/30 bg-accent-blue/10 text-accent-blue" aria-hidden="true">
+                <Bot size={22} />
+              </div>
+              <h3 className="text-sm font-medium text-text-primary">
+                {chatEmptyHeading}
+              </h3>
+              <p className="mt-1 max-w-md text-sm leading-relaxed text-text-muted">
+                {chatEmptyBody}
+              </p>
             </div>
           )}
           {messages.map((message, index) => {

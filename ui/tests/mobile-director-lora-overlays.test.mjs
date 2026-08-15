@@ -279,7 +279,9 @@ test('rendered full-screen surfaces portal to body and route backdrop and X thro
   let directorCloseCalls = 0
   resetRenderedHarness(directorDocument, [directorAutoLoadRef, { current: directorDialog }, { current: directorClose }], {
     setDashboardOpen(open) { if (!open) directorCloseCalls += 1 },
-    dashboardPipelineList: [], dashboardSelectedPipeline: null, dashboardLoading: false,
+    dashboardPipelineList: [],
+    dashboardPipelineListRead: { workspace: 'default', generation: 1, status: 'ready' },
+    dashboardSelectedPipeline: null, dashboardLoading: false,
     loadSavedPipeline() {}, tagClip() {}, async startPipelineRepair() {}, async cancelPipelineRepair() {},
     async rerunClipImage() {}, async rerunClipVideo() {}, async rejoinPipelineClips() {},
     async resumePipeline() {}, async deletePipeline() {},

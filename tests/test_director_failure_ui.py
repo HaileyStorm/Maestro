@@ -12,6 +12,9 @@ CLIENT = (ROOT / "ui/src/api/client.ts").read_text(encoding="utf-8")
 CHAT = (ROOT / "ui/src/components/Sidebar/DirectorChat.tsx").read_text(
     encoding="utf-8",
 )
+DASHBOARD = (
+    ROOT / "ui/src/components/DirectorDashboard/DirectorDashboard.tsx"
+).read_text(encoding="utf-8")
 
 
 class TestDirectorFailureUi(unittest.TestCase):
@@ -116,6 +119,50 @@ class TestDirectorFailureUi(unittest.TestCase):
         )
         self.assertIsNotNone(autoscroll)
         self.assertIn("error", autoscroll.group(1))
+
+    def test_dashboard_empty_state_waits_for_authoritative_list_read(self):
+        self.assertNotIn("fetchPipelineList", DASHBOARD)
+        self.assertIn(
+            "const pipelineListRead = useStore(s => s.dashboardPipelineListRead)",
+            DASHBOARD,
+        )
+        self.assertIn("dashboardPipelineListRead: DashboardPipelineListRead", STORE)
+        self.assertIn(
+            "dashboardPipelineListRead: { workspace, generation, status: 'loading' }",
+            STORE,
+        )
+        self.assertIn(
+            "dashboardPipelineListRead: { workspace, generation, status: 'ready' }",
+            STORE,
+        )
+        self.assertIn(
+            "dashboardPipelineListRead: { workspace, generation, status: 'failed' }",
+            STORE,
+        )
+        self.assertEqual(STORE.count("await api.fetchPipelineList(workspace)"), 1)
+        self.assertIn("generation !== _dashboardPipelineListLoadToken", STORE)
+        self.assertIn("get().activeWorkspace !== workspace", STORE)
+        self.assertIn("const pipelineListHydrating =", DASHBOARD)
+        self.assertIn("const pipelineListFailed =", DASHBOARD)
+        self.assertIn("const pipelineListEmpty =", DASHBOARD)
+        self.assertIn("pipelineListRead.status === 'idle'", DASHBOARD)
+        self.assertIn("pipelineListRead.status === 'ready'", DASHBOARD)
+        self.assertNotIn("pipelineListRead.count", DASHBOARD)
+        self.assertIn("{(loading || pipelineListHydrating) && (", DASHBOARD)
+        self.assertIn("{!loading && pipelineListFailed && (", DASHBOARD)
+        self.assertIn("Saved pipelines unavailable", DASHBOARD)
+
+        start = DASHBOARD.index("{!loading && pipelineListEmpty && (")
+        end = DASHBOARD.index("{selectedPipeline && (", start)
+        empty_state = DASHBOARD[start:end]
+
+        self.assertIn("<Film size={24} />", empty_state)
+        self.assertIn("<h2", empty_state)
+        self.assertIn("No saved pipelines yet", empty_state)
+        self.assertIn("Run a Director pipeline and it will appear here", empty_state)
+        self.assertIn("text-text-primary", empty_state)
+        self.assertIn("text-text-muted", empty_state)
+        self.assertNotIn("<button", empty_state)
 
 
 if __name__ == "__main__":

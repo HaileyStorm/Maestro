@@ -460,7 +460,9 @@ export function DirectorDashboard() {
 
 function DirectorDashboardInner() {
   const setOpen = useStore(s => s.setDashboardOpen)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
   const pipelineList = useStore(s => s.dashboardPipelineList)
+  const pipelineListRead = useStore(s => s.dashboardPipelineListRead)
   const selectedPipeline = useStore(s => s.dashboardSelectedPipeline)
   const loading = useStore(s => s.dashboardLoading)
   const loadPipeline = useStore(s => s.loadSavedPipeline)
@@ -499,6 +501,20 @@ function DirectorDashboardInner() {
       return next
     })
   }
+
+  const pipelineListHydrating = !selectedPipeline && (
+    pipelineListRead.workspace !== activeWorkspace
+    || pipelineListRead.status === 'idle'
+    || pipelineListRead.status === 'loading'
+  )
+  const pipelineListFailed = !selectedPipeline
+    && pipelineList.length === 0
+    && pipelineListRead.workspace === activeWorkspace
+    && pipelineListRead.status === 'failed'
+  const pipelineListEmpty = !selectedPipeline
+    && pipelineList.length === 0
+    && pipelineListRead.workspace === activeWorkspace
+    && pipelineListRead.status === 'ready'
 
   // Auto-load first pipeline when list loads
   useEffect(() => {
@@ -815,17 +831,30 @@ function DirectorDashboardInner() {
 
       {/* Content */}
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-3 [-webkit-overflow-scrolling:touch] sm:p-4">
-        {loading && (
+        {(loading || pipelineListHydrating) && (
           <div className="flex items-center justify-center py-12 text-text-muted">
             <Loader2 size={20} className="animate-spin mr-2" />
-            Loading pipeline...
+            {loading ? 'Loading pipeline...' : 'Loading saved pipelines...'}
           </div>
         )}
 
-        {!loading && !selectedPipeline && pipelineList.length === 0 && (
-          <div className="text-center py-12 text-text-muted">
-            <p className="text-sm">No saved pipelines yet</p>
-            <p className="text-xs mt-1">Run a Director pipeline and it will appear here</p>
+        {!loading && pipelineListFailed && (
+          <div className="flex min-h-[360px] flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/40 px-6 py-12 text-center sm:min-h-[440px]">
+            <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-border bg-bg-tertiary text-text-muted" aria-hidden="true">
+              <AlertTriangle size={24} />
+            </div>
+            <h2 className="text-sm font-medium text-text-primary">Saved pipelines unavailable</h2>
+            <p className="mt-1 max-w-sm text-xs leading-relaxed text-text-muted">Maestro could not load saved pipelines. Close and reopen the dashboard to try again.</p>
+          </div>
+        )}
+
+        {!loading && pipelineListEmpty && (
+          <div className="flex min-h-[360px] flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/40 px-6 py-12 text-center sm:min-h-[440px]">
+            <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-accent-blue/30 bg-accent-blue/10 text-accent-blue" aria-hidden="true">
+              <Film size={24} />
+            </div>
+            <h2 className="text-sm font-medium text-text-primary">No saved pipelines yet</h2>
+            <p className="mt-1 max-w-sm text-xs leading-relaxed text-text-muted">Run a Director pipeline and it will appear here</p>
           </div>
         )}
 

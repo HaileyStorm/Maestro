@@ -33,6 +33,18 @@ async function loadTabKeyboardContract(source) {
   return import(asDataModule(result.code))
 }
 
+async function loadEmptyStateContracts(source) {
+  const start = source.indexOf('type GalleryEmptyState')
+  const end = source.indexOf('type ResourcePresentation', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const result = await transform(
+    `${source.slice(start, end)}\nexport { galleryEmptyState, queuePanelEmptyState }\n`,
+    { format: 'esm', loader: 'ts', target: 'es2022' },
+  )
+  return import(asDataModule(result.code))
+}
+
 function flattenElements(value, result = []) {
   if (Array.isArray(value)) {
     for (const child of value) flattenElements(child, result)
@@ -215,6 +227,67 @@ test('MainContent mobile targets remain 44px through 767 and keep narrow layouts
   assert.match(css, /flex-wrap: nowrap/)
   assert.match(css, /grid-template-rows: auto auto/)
   assert.match(css, /@media \(width >= 48rem\)/)
+})
+
+test('Gallery and queue empty states add hierarchy without inventing actions or changing status copy', async () => {
+  const source = await readFile(mainUrl, 'utf8')
+  const { galleryEmptyState, queuePanelEmptyState } = await loadEmptyStateContracts(source)
+  const gallery = sourceRegion(
+    source,
+    '{/* Empty-state quick start.',
+    '{/* Thumbnail sidebar */}',
+  )
+  const queue = sourceRegion(
+    source,
+    "{emptyState === 'pending' ? (",
+    ') : visibleJobs.map((job, index) => {',
+  )
+
+  assert.match(gallery, /<Play size=\{24\} \/>/)
+  assert.match(gallery, /<h2[^>]*>No finished \{noun\} yet<\/h2>/)
+  assert.match(gallery, /Your generated \{noun\} will appear here\./)
+  assert.match(gallery, /Pick a model in the sidebar \(a good default is already selected\)\./)
+  assert.match(gallery, /The shared host cache is[\s\S]*loading into RAM\/VRAM is a separate step\./)
+  assert.match(gallery, /aria-label="Browse recipes"/)
+  assert.match(gallery, /min-h-11 min-w-11[^"]*focus-visible:ring-2/)
+  assert.doesNotMatch(gallery, /Generate your first/)
+  const projectEmpty = {
+    outputsLoading: false,
+    outputCount: 0,
+    outputsTotal: 0,
+    browsingUploads: false,
+    activeWorkspace: 'project-a',
+    hasActiveFilters: false,
+    hasProjectJobs: false,
+  }
+  assert.equal(galleryEmptyState(projectEmpty), 'onboarding')
+  assert.equal(galleryEmptyState({ ...projectEmpty, browsingUploads: true }), 'uploads')
+  assert.equal(galleryEmptyState({ ...projectEmpty, hasActiveFilters: true }), 'filtered')
+  assert.equal(galleryEmptyState({ ...projectEmpty, activeWorkspace: '' }), 'project-required')
+  assert.equal(galleryEmptyState({ ...projectEmpty, hasProjectJobs: true }), 'none')
+  assert.equal(galleryEmptyState({ ...projectEmpty, outputsTotal: 1 }), 'none')
+  // An unrelated project job leaves hasProjectJobs false, so it cannot hide
+  // onboarding for the authoritative empty project.
+  assert.equal(galleryEmptyState({ ...projectEmpty, hasProjectJobs: false }), 'onboarding')
+  assert.match(source, /jobs\.some\(job => job\.workspace === activeWorkspace\)/)
+  assert.match(source, /galleryState === 'onboarding'/)
+
+  assert.match(queue, /<Loader2 size=\{22\} className="animate-spin" \/>/)
+  assert.match(queue, /<h3[^>]*>Loading queue<\/h3>/)
+  assert.match(queue, /<h3[^>]*>Queue unavailable<\/h3>/)
+  assert.match(queue, /The queue is unavailable\. Maestro is retrying automatically\./)
+  assert.match(queue, /<ListChecks size=\{22\} \/>/)
+  assert.match(queue, /<h3[^>]*>Last known queue is clear<\/h3>/)
+  assert.match(queue, /<h3[^>]*>Queue is clear<\/h3>/)
+  assert.match(queue, /No queued, running, or failed generations\./)
+  assert.doesNotMatch(queue, /<button/)
+
+  const queueState = { jobs: [] }
+  assert.equal(queuePanelEmptyState(null, null, null, 0), 'pending')
+  assert.equal(queuePanelEmptyState(null, 'offline', null, 0), 'unavailable')
+  assert.equal(queuePanelEmptyState(queueState, 'offline', 1, 0), 'cached-stale')
+  assert.equal(queuePanelEmptyState(queueState, null, 1, 0), 'empty')
+  assert.equal(queuePanelEmptyState(queueState, null, 1, 1), 'none')
 })
 
 test('responsive queue controls preserve authorization, bounds, snapshots, and exact IDs', async () => {

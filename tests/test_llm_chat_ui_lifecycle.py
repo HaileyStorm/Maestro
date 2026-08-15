@@ -312,6 +312,61 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
         self.assertIn("disabled={!messages.length || interactionLocked}", self.source)
         self.assertIn("disabled={branchControlsLocked || retryUnavailable}", self.source)
 
+    def test_empty_transcript_is_project_catalog_and_history_scoped(self):
+        start = self.source.index("{messages.length === 0 && (")
+        end = self.source.index("{messages.map((message, index) => {", start)
+        empty_state = self.source[start:end]
+
+        self.assertIn("<Bot size={22} />", empty_state)
+        self.assertIn("{chatEmptyHeading}", empty_state)
+        self.assertIn("{chatEmptyBody}", empty_state)
+        self.assertIn("text-text-primary", empty_state)
+        self.assertIn("text-text-muted", empty_state)
+        self.assertNotIn("<button", empty_state)
+
+        self.assertIn(
+            "const [projectInstanceWorkspace, setProjectInstanceWorkspace] = useState('')",
+            self.source,
+        )
+        self.assertIn("setProjectInstanceWorkspace(activeWorkspace)", self.source)
+        self.assertIn("setProjectInstanceWorkspace('')", self.source)
+        self.assertIn(
+            "setCatalogRead({ workspace: activeWorkspace, status: 'loading' })",
+            self.source,
+        )
+        self.assertIn(
+            "setCatalogRead({ workspace: activeWorkspace, status: 'ready' })",
+            self.source,
+        )
+        self.assertIn(
+            "setCatalogRead({ workspace: activeWorkspace, status: 'failed' })",
+            self.source,
+        )
+
+        state_start = self.source.index("const chatEmptyState: ChatEmptyState =")
+        state_end = self.source.index("const clearConversation", state_start)
+        state = self.source[state_start:state_end]
+        for contract in (
+            "catalogRead.workspace !== activeWorkspace",
+            "catalogRead.status === 'loading'",
+            "catalogRead.status === 'failed'",
+            "projectInstanceWorkspace !== activeWorkspace",
+            "!projectInstance",
+            "!effectiveModelId",
+            "Opening this project’s conversation",
+            "Loading the language model and conversation history…",
+            "Language models unavailable",
+            "Choose a language model above before starting a conversation.",
+            "Start a conversation for this project with the selected language model.",
+        ):
+            self.assertIn(contract, state)
+
+        unavailable_start = self.source.index("const unavailableReason =")
+        unavailable_end = self.source.index("const activeLiveStatus", unavailable_start)
+        unavailable = self.source[unavailable_start:unavailable_end]
+        self.assertIn(": !effectiveModelId", unavailable)
+        self.assertIn("'Choose a language model first.'", unavailable)
+
 
 if __name__ == "__main__":
     unittest.main()

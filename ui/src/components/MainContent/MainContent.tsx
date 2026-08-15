@@ -268,6 +268,47 @@ function queueTabDisplayJobs(
   return snapshot.error ? snapshot.jobs : liveJobs
 }
 
+type GalleryEmptyState = 'none' | 'onboarding' | 'uploads' | 'filtered' | 'project-required'
+
+function galleryEmptyState({
+  outputsLoading,
+  outputCount,
+  outputsTotal,
+  browsingUploads,
+  activeWorkspace,
+  hasActiveFilters,
+  hasProjectJobs,
+}: {
+  outputsLoading: boolean
+  outputCount: number
+  outputsTotal: number
+  browsingUploads: boolean
+  activeWorkspace: string
+  hasActiveFilters: boolean
+  hasProjectJobs: boolean
+}): GalleryEmptyState {
+  if (outputsLoading || outputCount > 0) return 'none'
+  if (browsingUploads) return 'uploads'
+  if (!activeWorkspace) return 'project-required'
+  if (hasActiveFilters) return 'filtered'
+  if (outputsTotal > 0 || hasProjectJobs) return 'none'
+  return 'onboarding'
+}
+
+type QueuePanelEmptyState = 'pending' | 'unavailable' | 'cached-stale' | 'empty' | 'none'
+
+function queuePanelEmptyState(
+  queue: api.QueueState | null,
+  queueError: string | null,
+  queueLastSuccessAt: number | null,
+  visibleJobCount: number,
+): QueuePanelEmptyState {
+  if (visibleJobCount > 0) return 'none'
+  if (!queue) return queueError ? 'unavailable' : 'pending'
+  if (queueError && queueLastSuccessAt !== null) return 'cached-stale'
+  return 'empty'
+}
+
 type ResourcePresentation = {
   label: string
   title: string
@@ -1828,6 +1869,12 @@ function QueuePanel({
     [jobs, queue?.jobs],
   )
   const { visibleJobs } = projection
+  const emptyState = queuePanelEmptyState(
+    queue,
+    queueError,
+    queueLastSuccessAt,
+    visibleJobs.length,
+  )
   const referenceQualityTargetKey = JSON.stringify(visibleJobs.flatMap(job => (
     job.logicalJobKind === 'reference_pack_parent'
       && job.status === 'completed'
@@ -1928,7 +1975,9 @@ function QueuePanel({
           <div>
             <p className="text-xs font-medium text-text-primary">Generation queue</p>
             <p className="text-[10px] text-text-muted">
-              {queueError && !queue
+              {emptyState === 'pending'
+                ? 'Loading queue status.'
+                : queueError && !queue
                 ? 'Queue status unavailable.'
                 : queue?.paused
                   ? 'Paused — queued jobs will not start.'
@@ -1978,13 +2027,45 @@ function QueuePanel({
         )}
         {(error || planReviewError) && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error || planReviewError}</div>}
         <PipelinePlaceholder />
-        {queueError && !queue ? (
-          <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-text-muted">
-            The queue is unavailable. Maestro is retrying automatically.
+        {emptyState === 'pending' ? (
+          <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-10 text-center">
+            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-bg-tertiary text-text-muted" aria-hidden="true">
+              <Loader2 size={22} className="animate-spin" />
+            </div>
+            <h3 className="text-sm font-medium text-text-primary">Loading queue</h3>
+            <p className="mt-1 max-w-sm text-xs leading-relaxed text-text-muted">
+              Checking queued and running generations.
+            </p>
           </div>
-        ) : visibleJobs.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-text-muted">
-            No queued, running, or failed generations.
+        ) : emptyState === 'unavailable' ? (
+          <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-10 text-center">
+            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-bg-tertiary text-text-muted" aria-hidden="true">
+              <Loader2 size={22} className="animate-spin" />
+            </div>
+            <h3 className="text-sm font-medium text-text-primary">Queue unavailable</h3>
+            <p className="mt-1 max-w-sm text-xs leading-relaxed text-text-muted">
+              The queue is unavailable. Maestro is retrying automatically.
+            </p>
+          </div>
+        ) : emptyState === 'cached-stale' ? (
+          <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-10 text-center">
+            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-bg-tertiary text-text-muted" aria-hidden="true">
+              <ListChecks size={22} />
+            </div>
+            <h3 className="text-sm font-medium text-text-primary">Last known queue is clear</h3>
+            <p className="mt-1 max-w-sm text-xs leading-relaxed text-text-muted">
+              The latest refresh failed. Maestro is retrying automatically.
+            </p>
+          </div>
+        ) : emptyState === 'empty' ? (
+          <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-10 text-center">
+            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-accent-blue/30 bg-accent-blue/10 text-accent-blue" aria-hidden="true">
+              <ListChecks size={22} />
+            </div>
+            <h3 className="text-sm font-medium text-text-primary">Queue is clear</h3>
+            <p className="mt-1 max-w-sm text-xs leading-relaxed text-text-muted">
+              No queued, running, or failed generations.
+            </p>
           </div>
         ) : visibleJobs.map((job, index) => {
           const target = projection.schedulerTargetByPublicJobId.get(job.id)
@@ -2379,6 +2460,19 @@ export function MainContent() {
   const queuePollSequence = useRef(0)
   const queuePollAbort = useRef<AbortController | null>(null)
   const seenJobIds = useRef(new Set(jobs.map(job => job.id).filter(Boolean)))
+  const hasActiveGalleryFilters = mediaFilter !== 'all'
+    || outputArtifactScope !== 'final'
+    || outputSearchQuery.trim().length > 0
+  const activeWorkspaceHasJobs = !!activeWorkspace && jobs.some(job => job.workspace === activeWorkspace)
+  const galleryState = galleryEmptyState({
+    outputsLoading,
+    outputCount: outputs.length,
+    outputsTotal,
+    browsingUploads,
+    activeWorkspace,
+    hasActiveFilters: hasActiveGalleryFilters,
+    hasProjectJobs: activeWorkspaceHasJobs,
+  })
 
   useEffect(() => subscribePrivatePreviewChanges(() => {
     setPrivatePreviewVersion(version => version + 1)
@@ -3051,7 +3145,7 @@ export function MainContent() {
           {/* Empty-state quick start. Teaches the three steps to a generation
               and explains host-shared model preparation without implying that
               every user's first request triggers a separate download. */}
-          {!outputsLoading && outputs.length === 0 && jobs.length === 0 && (() => {
+          {galleryState === 'onboarding' && (() => {
             const noun = generationMode === 'image' ? 'images'
               : generationMode === 'audio' ? 'audio' : 'videos'
             const example = generationMode === 'image'
@@ -3061,17 +3155,18 @@ export function MainContent() {
               : 'a golden retriever surfing a big wave, slow motion'
             return (
               <div className="flex items-center justify-center min-h-[300px] px-6">
-                <div className="flex flex-col items-center gap-4 text-center max-w-sm">
-                  <div className="w-16 h-16 rounded-2xl bg-bg-active flex items-center justify-center text-text-muted">
+                <div className="flex max-w-md flex-col items-center text-center">
+                  <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-accent-blue/30 bg-accent-blue/10 text-accent-blue" aria-hidden="true">
                     <Play size={24} />
                   </div>
-                  <p className="text-sm text-text-secondary">Your generated {noun} will appear here.</p>
-                  <ol className="text-xs text-text-muted space-y-1.5 text-left">
+                  <h2 className="text-base font-semibold text-text-primary">No finished {noun} yet</h2>
+                  <p className="mt-1 text-sm text-text-secondary">Your generated {noun} will appear here.</p>
+                  <ol className="mt-5 w-full space-y-2 rounded-xl border border-border bg-bg-secondary/60 p-4 text-left text-xs text-text-muted">
                     <li><span className="text-accent-blue font-medium">1.</span> Pick a model in the sidebar (a good default is already selected).</li>
                     <li><span className="text-accent-blue font-medium">2.</span> Type a prompt — e.g. <span className="text-text-secondary italic">“{example}”</span></li>
                     <li><span className="text-accent-blue font-medium">3.</span> Hit Generate.</li>
                   </ol>
-                  <p className="text-[11px] text-text-muted leading-snug">
+                  <p className="mt-4 text-[11px] leading-relaxed text-text-muted">
                     Heads up: if needed, this Maestro host downloads and prepares
                     model files before generation starts. The shared host cache is
                     reused when possible; loading into RAM/VRAM is a separate step.
@@ -3080,7 +3175,7 @@ export function MainContent() {
                   <button
                     type="button"
                     onClick={() => useStore.getState().setRecipesOpen(true)}
-                    className="mt-1 flex items-center gap-1.5 px-3 py-1.5 text-xs bg-accent-blue/10 border border-accent-blue/30 rounded-lg text-accent-blue hover:bg-accent-blue/20 transition-colors"
+                    className="mt-5 flex min-h-11 min-w-11 items-center gap-1.5 rounded-lg border border-accent-blue/30 bg-accent-blue/10 px-3 py-2 text-xs text-accent-blue transition-colors hover:bg-accent-blue/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0"
                     aria-label="Browse recipes"
                   >
                     <BookMarked size={13} /> Browse recipes
@@ -3089,6 +3184,42 @@ export function MainContent() {
               </div>
             )
           })()}
+
+          {galleryState === 'uploads' && (
+            <div className="flex min-h-[300px] items-center justify-center px-6">
+              <div className="flex max-w-sm flex-col items-center text-center">
+                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-border bg-bg-secondary/60 text-text-muted" aria-hidden="true">
+                  <Upload size={24} />
+                </div>
+                <h2 className="text-base font-semibold text-text-primary">No uploads yet</h2>
+                <p className="mt-1 text-sm text-text-muted">Uploaded media will appear in this view.</p>
+              </div>
+            </div>
+          )}
+
+          {galleryState === 'filtered' && (
+            <div className="flex min-h-[300px] items-center justify-center px-6">
+              <div className="flex max-w-sm flex-col items-center text-center">
+                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-border bg-bg-secondary/60 text-text-muted" aria-hidden="true">
+                  <Film size={24} />
+                </div>
+                <h2 className="text-base font-semibold text-text-primary">No matching items</h2>
+                <p className="mt-1 text-sm text-text-muted">Try changing the Gallery filters or search.</p>
+              </div>
+            </div>
+          )}
+
+          {galleryState === 'project-required' && (
+            <div className="flex min-h-[300px] items-center justify-center px-6">
+              <div className="flex max-w-sm flex-col items-center text-center">
+                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-border bg-bg-secondary/60 text-text-muted" aria-hidden="true">
+                  <FolderOpen size={24} />
+                </div>
+                <h2 className="text-base font-semibold text-text-primary">Select a project</h2>
+                <p className="mt-1 text-sm text-text-muted">Choose a project to view its Gallery.</p>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Thumbnail sidebar */}
