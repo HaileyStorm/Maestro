@@ -80,7 +80,7 @@ const apiToken = setting("CLOUDFLARE_API_TOKEN")
 const freePlanConfirmed = setting("CLOUDFLARE_WORKERS_FREE_CONFIRMED").toLowerCase() === "true"
 let updateSecret = setting("PINOKIO_STABLE_SHARE_UPDATE_SECRET")
 const workerName = setting("PINOKIO_STABLE_SHARE_WORKER_NAME", "maestro-stable-share")
-const shareMode = setting("SHARE_MODE", "proxy").trim().toLowerCase()
+const shareMode = (setting("SHARE_MODE") || "proxy").trim().toLowerCase()
 let namespaceId = setting("CLOUDFLARE_KV_NAMESPACE_ID")
 const encodedCandidate = setting("PINOKIO_STABLE_SHARE_CANDIDATE")
 
@@ -121,9 +121,10 @@ let oauthLogoutVerified = false
 
 const replaceEnvironmentValues = (updates) => {
   const currentEnvironment = readEnvironmentFile()
+  const effectiveUpdates = { ...updates, SHARE_MODE: shareMode }
   const next = canonicalizeManagedEnvironment(
     currentEnvironment,
-    updates,
+    effectiveUpdates,
     managedEnvironmentKeys,
   )
   const temporaryEnvironment = join(

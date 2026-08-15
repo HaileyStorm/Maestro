@@ -656,6 +656,26 @@ class StableShareSourceContracts(unittest.TestCase):
                 {{ CLOUDFLARE_API_TOKEN: "", PINOKIO_STABLE_SHARE_CANDIDATE: "new" }},
                 ["CLOUDFLARE_API_TOKEN", "PINOKIO_STABLE_SHARE_CANDIDATE"],
               ),
+              stagedDefaultMode: canonicalizeManagedEnvironment(
+                "KEEP=value\\n",
+                {{ SHARE_MODE: "proxy", PINOKIO_STABLE_SHARE_CANDIDATE: "new" }},
+                ["PINOKIO_STABLE_SHARE_CANDIDATE", "SHARE_MODE"],
+              ),
+              promotedDefaultMode: canonicalizeManagedEnvironment(
+                "KEEP=value\\nPINOKIO_STABLE_SHARE_CANDIDATE=new\\nSHARE_MODE=proxy\\n",
+                {{ SHARE_MODE: "proxy", PINOKIO_STABLE_SHARE_CANDIDATE: "" }},
+                ["PINOKIO_STABLE_SHARE_CANDIDATE", "SHARE_MODE"],
+              ),
+              stagedRedirectMode: canonicalizeManagedEnvironment(
+                "KEEP=value\\nSHARE_MODE=redirect\\n",
+                {{ SHARE_MODE: "redirect", PINOKIO_STABLE_SHARE_CANDIDATE: "new" }},
+                ["PINOKIO_STABLE_SHARE_CANDIDATE", "SHARE_MODE"],
+              ),
+              promotedRedirectMode: canonicalizeManagedEnvironment(
+                "KEEP=value\\nPINOKIO_STABLE_SHARE_CANDIDATE=new\\nSHARE_MODE=redirect\\n",
+                {{ SHARE_MODE: "redirect", PINOKIO_STABLE_SHARE_CANDIDATE: "" }},
+                ["PINOKIO_STABLE_SHARE_CANDIDATE", "SHARE_MODE"],
+              ),
               rejectsBadPreview: extractVersionUpload(
                 `Worker Version ID: ${{versionId}}\nVersion Preview URL: https://other.workers.dev`,
                 "maestro-stable-share",
@@ -695,6 +715,22 @@ class StableShareSourceContracts(unittest.TestCase):
             payload["canonicalEnvironment"],
             "KEEP=value\nCLOUDFLARE_API_TOKEN=\nPINOKIO_STABLE_SHARE_CANDIDATE=new\n",
         )
+        self.assertEqual(
+            payload["stagedDefaultMode"],
+            "KEEP=value\nPINOKIO_STABLE_SHARE_CANDIDATE=new\nSHARE_MODE=proxy\n",
+        )
+        self.assertEqual(
+            payload["promotedDefaultMode"],
+            "KEEP=value\nPINOKIO_STABLE_SHARE_CANDIDATE=\nSHARE_MODE=proxy\n",
+        )
+        self.assertEqual(
+            payload["stagedRedirectMode"],
+            "KEEP=value\nPINOKIO_STABLE_SHARE_CANDIDATE=new\nSHARE_MODE=redirect\n",
+        )
+        self.assertEqual(
+            payload["promotedRedirectMode"],
+            "KEEP=value\nPINOKIO_STABLE_SHARE_CANDIDATE=\nSHARE_MODE=redirect\n",
+        )
         self.assertEqual(payload["invalidArgs"], [True, True, True])
 
     def test_provisioner_keeps_secret_off_argv_and_temporary_wrangler_config(self):
@@ -709,10 +745,22 @@ class StableShareSourceContracts(unittest.TestCase):
         self.assertNotIn("updateSecret]", source)
         self.assertIn("observability: { enabled: false }", source)
         self.assertIn('vars: { SHARE_MODE: shareMode }', source)
+        self.assertIn(
+            'const shareMode = (setting("SHARE_MODE") || "proxy").trim().toLowerCase()',
+            source,
+        )
         self.assertIn("randomBytes(32).toString(\"hex\")", source)
         self.assertIn("CLOUDFLARE_WORKERS_FREE_CONFIRMED=true", source)
         self.assertIn("renameSync(temporaryEnvironment, environmentPath)", source)
         self.assertIn("chmodSync(environmentPath, 0o600)", source)
+        self.assertIn(
+            "const effectiveUpdates = { ...updates, SHARE_MODE: shareMode }",
+            source,
+        )
+        self.assertIn(
+            "currentEnvironment,\n    effectiveUpdates,\n    managedEnvironmentKeys",
+            source,
+        )
         self.assertNotIn("process.stdout.write(updateSecret", source)
         self.assertIn("delete childEnvironment.PINOKIO_STABLE_SHARE_UPDATE_SECRET", source)
         self.assertIn("delete childEnvironment.PINOKIO_STABLE_SHARE_CANDIDATE", source)
