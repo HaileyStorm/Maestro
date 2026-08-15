@@ -1994,11 +1994,110 @@ def rejoin_clips(out_dir: str, pid: str) -> dict:
     return _rejoin_clips_impl(out_dir, pid)
 
 
+def _director_rejoin_model_identity(state: dict) -> dict | None:
+    """Resolve mutually compatible saved Director video-model declarations."""
+    snapshot = state.get("_params_snapshot")
+    declarations = []
+    for value in (
+        state.get("video_model"),
+        snapshot.get("video_model") if isinstance(snapshot, dict) else None,
+    ):
+        model_type = str(value or "").strip()
+        if model_type and model_type not in declarations:
+            declarations.append(model_type)
+    if not declarations:
+        return None
+    resolved = []
+    for model_type in declarations:
+        try:
+            base_model_type = str(
+                _wgp.get_base_model_type(model_type) or ""
+            ).strip()
+        except Exception as exc:
+            raise ValueError(
+                "Saved pipeline video model metadata is ambiguous."
+            ) from exc
+        if not base_model_type:
+            raise ValueError(
+                "Saved pipeline video model metadata is ambiguous."
+            )
+        resolved.append((model_type, base_model_type))
+    base_models = sorted({base for _, base in resolved})
+    if len(base_models) != 1:
+        raise ValueError("Saved pipeline uses mixed video model families.")
+    source_models = sorted({model for model, _ in resolved})
+    base_model_type = base_models[0]
+    return {
+        "model_type": (
+            source_models[0] if len(source_models) == 1 else base_model_type
+        ),
+        "source_model_types": source_models,
+        "base_model_type": base_model_type,
+        "requires_h3_audio_safety": base_model_type in {
+            "minimax_h3", "minimax_h3_ref2va",
+        },
+    }
+
+
+def _director_rejoin_h3_adoption_verified(
+    sidecar: dict, model_identity: dict | None,
+) -> bool:
+    """Require current H3 policy and model provenance before adoption."""
+    if (
+        not isinstance(model_identity, dict)
+        or model_identity.get("requires_h3_audio_safety") is not True
+    ):
+        return True
+    if not isinstance(sidecar, dict):
+        return False
+    from services.h3_audio_safety import DEFAULT_TARGET_DBTP, POLICY_VERSION
+
+    params = sidecar.get("params")
+    stats = sidecar.get("h3_audio_true_peak")
+    return bool(
+        isinstance(params, dict)
+        and isinstance(stats, dict)
+        and sidecar.get("model_type") == model_identity.get("model_type")
+        and params.get("model_type") == model_identity.get("model_type")
+        and params.get("base_model_type")
+            == model_identity.get("base_model_type")
+        and params.get("source_model_types")
+            == model_identity.get("source_model_types")
+        and params.get("h3_audio_true_peak") == stats
+        and stats.get("policy_version") == POLICY_VERSION
+        and stats.get("target_dbtp") == DEFAULT_TARGET_DBTP
+        and stats.get("verified") is True
+    )
+
+
+def _enforce_director_rejoin_h3_final_audio(
+    output_path: str, model_identity: dict | None,
+) -> dict | None:
+    """Verify a staged H3 Director rejoin and clean it on failure."""
+    if (
+        not isinstance(model_identity, dict)
+        or model_identity.get("requires_h3_audio_safety") is not True
+    ):
+        return None
+    try:
+        stats = _wgp.enforce_h3_final_audio_safety(
+            output_path,
+            str(model_identity.get("base_model_type") or ""),
+        )
+        if not isinstance(stats, dict) or stats.get("verified") is not True:
+            raise RuntimeError("H3 true-peak attestation was not verified")
+    except Exception:
+        _wgp.remove_failed_h3_final_output(output_path)
+        raise
+    return dict(stats)
+
+
 def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
     """Re-join all clips from a saved pipeline using current best versions. Returns {filename}."""
     state = load_pipeline_state(out_dir, pid)
     if not state:
         raise ValueError(f"Pipeline {pid} not found")
+    model_identity = _director_rejoin_model_identity(state)
 
     pipeline_file = _find_pipeline_file(out_dir, pid)
     clip_out_dir = os.path.dirname(pipeline_file) if pipeline_file else out_dir
@@ -2140,6 +2239,9 @@ def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
                 existing_sidecar.get("producer_unit_id") == producer_unit_id
                 and existing_sidecar.get("producer_media_size") == size
                 and existing_sidecar.get("producer_media_sha256") == digest.hexdigest()
+                and _director_rejoin_h3_adoption_verified(
+                    existing_sidecar, model_identity,
+                )
             ):
                 return {"filename": output_name, "adopted": True}
         except (OSError, ValueError, TypeError):
@@ -2150,6 +2252,12 @@ def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
             except OSError:
                 pass
 
+    staging_path = os.path.join(
+        clip_out_dir,
+        f".{output_name}.{uuid.uuid4().hex[:8]}.staging.mp4",
+    )
+    temp_sidecar = None
+    promoted = False
     try:
         # concatenate_multi_clip_videos is the join the original pipeline
         # uses (ffmpeg concat FILTER, re-encodes to a uniform format). The
@@ -2158,12 +2266,17 @@ def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
         # AttributeError only surfaced now.
         ok = _wgp.concatenate_multi_clip_videos(
             video_files,
-            output_path,
+            staging_path,
             audio_path,
             audio_start_sec=audio_start_sec,
         )
-        if not ok or not os.path.isfile(output_path):
+        if not ok or not os.path.isfile(staging_path):
             raise RuntimeError("ffmpeg concatenation failed (see server log for the clip that broke it)")
+        audio_safety_stats = _enforce_director_rejoin_h3_final_audio(
+            staging_path, model_identity,
+        )
+        os.replace(staging_path, output_path)
+        promoted = True
         media_size = os.path.getsize(output_path)
         media_digest = hashlib.sha256()
         with open(output_path, "rb") as handle:
@@ -2191,6 +2304,20 @@ def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
             "producer_media_sha256": media_digest.hexdigest(),
             "producer_media_size": media_size,
         }
+        if isinstance(model_identity, dict):
+            sidecar["model_type"] = model_identity["model_type"]
+            sidecar["params"].update({
+                "model_type": model_identity["model_type"],
+                "source_model_types": list(
+                    model_identity["source_model_types"]
+                ),
+                "base_model_type": model_identity["base_model_type"],
+            })
+        if isinstance(audio_safety_stats, dict):
+            sidecar["h3_audio_true_peak"] = dict(audio_safety_stats)
+            sidecar["params"]["h3_audio_true_peak"] = dict(
+                audio_safety_stats
+            )
         from services.output_access import stamp_sidecar_policy
         stamp_sidecar_policy(
             sidecar, policy, workspace=state.get("workspace") or "default",
@@ -2211,6 +2338,18 @@ def _rejoin_clips_impl(out_dir: str, pid: str) -> dict:
 
         return {"filename": output_name}
     except Exception as e:
+        for failed_path in (
+            temp_sidecar,
+            staging_path,
+            sidecar_path if promoted else None,
+            output_path if promoted else None,
+        ):
+            if not failed_path:
+                continue
+            try:
+                os.remove(failed_path)
+            except OSError:
+                pass
         raise RuntimeError(f"Rejoin failed: {e}")
 
 

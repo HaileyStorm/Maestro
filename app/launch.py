@@ -7079,6 +7079,16 @@ def _queue_recovery_units(job: dict) -> list[dict]:
         if isinstance(units, list) else []
 
 
+def _h3_true_peak_policy_identity() -> dict:
+    """Return the stable policy fields bound into an H3 concat unit ID."""
+    from services.h3_audio_safety import DEFAULT_TARGET_DBTP, POLICY_VERSION
+
+    return {
+        "policy_version": POLICY_VERSION,
+        "target_dbtp": DEFAULT_TARGET_DBTP,
+    }
+
+
 def _queue_recovery_unit_matches(
     job: dict,
     *,
@@ -7096,6 +7106,36 @@ def _queue_recovery_unit_matches(
             or unit.get("state") != "completed"
         ):
             continue
+        if unit.get("kind") == "h3_concat":
+            from services.h3_audio_safety import (
+                DEFAULT_TARGET_DBTP,
+                POLICY_VERSION,
+            )
+
+            attestation = unit.get("attestation")
+            settings = unit.get("settings")
+            policy = (
+                settings.get("h3_audio_true_peak_policy")
+                if isinstance(settings, dict) else None
+            )
+            true_peak = (
+                attestation.get("h3_audio_true_peak")
+                if isinstance(attestation, dict) else None
+            )
+            expected_policy = {
+                "policy_version": POLICY_VERSION,
+                "target_dbtp": DEFAULT_TARGET_DBTP,
+            }
+            if (
+                policy != expected_policy
+                or not isinstance(true_peak, dict)
+                or true_peak.get("policy_version") != POLICY_VERSION
+                or true_peak.get("target_dbtp") != DEFAULT_TARGET_DBTP
+                or true_peak.get("verified") is not True
+            ):
+                # Preserve verified segments and replay only concat through
+                # the current final-container audio policy.
+                continue
         unit_id = str(unit.get("unit_id") or "")
         artifacts = unit.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts:
@@ -7202,6 +7242,7 @@ def _queue_recovery_checkpoint_unit(
     dependencies: list[str] | None = None,
     continuation: dict | None = None,
     settings: dict | None = None,
+    attestation: dict | None = None,
     ordinary_repeat_offset: int | None = None,
 ) -> dict:
     """Seal media+sidecars, then persist one completed safe-unit descriptor."""
@@ -7234,6 +7275,8 @@ def _queue_recovery_checkpoint_unit(
         unit["continuation"] = dict(continuation)
     if settings:
         unit["settings"] = dict(settings)
+    if attestation:
+        unit["attestation"] = dict(attestation)
     units = [
         item for item in _queue_recovery_units(job)
         if not (
@@ -53657,6 +53700,9 @@ def _run_generation(
                     "preserve_generated_audio": bool(
                         clip_info.get("preserve_generated_audio")
                     ),
+                    "h3_audio_true_peak_policy": (
+                        _h3_true_peak_policy_identity()
+                    ),
                 }
                 unit_id = recovery_unit_id(
                     job_id,
@@ -53677,8 +53723,10 @@ def _run_generation(
                     )
                 )
 
+                concat_safety_evidence = {}
+
                 def concatenate(component_paths, staging_path):
-                    return wgp.concatenate_multi_clip_videos(
+                    assembled = wgp.concatenate_multi_clip_videos(
                         component_paths,
                         staging_path,
                         concat_audio,
@@ -53686,6 +53734,16 @@ def _run_generation(
                         clip_start_frames=clip_start_frames,
                         abort_callback=lambda: is_cancel_requested(job),
                     )
+                    if assembled is not True:
+                        return assembled
+                    stats = _enforce_deferred_h3_final_audio(
+                        job,
+                        staging_path,
+                        update_job_fn=update_job,
+                    )
+                    if stats is not None:
+                        concat_safety_evidence.update(stats)
+                    return True
 
                 replay_concat_to_stable_output(
                     out_dir,
@@ -53693,6 +53751,14 @@ def _run_generation(
                     output_basename=output_name,
                     concatenate=concatenate,
                 )
+                output_path = os.path.join(out_dir, output_name)
+                concat_safety_stats = dict(concat_safety_evidence)
+                if concat_safety_stats.get("verified") is not True:
+                    raise _GenerationStageFailure(
+                        "The recovered H3 concat has no verified true-peak result",
+                        stage="audio_mux",
+                        code="audio_true_peak_failed",
+                    )
                 with _sample_campaign_transition_lock:
                     if not sample_safe_unit_current(abort_state):
                         raise InterruptedError("H3 concat preempted")
@@ -53712,6 +53778,7 @@ def _run_generation(
                         task_params={
                             **raw_params,
                             "multi_clip_info": dict(clip_info),
+                            "h3_audio_true_peak": concat_safety_stats,
                         },
                     )
                     unit = _queue_recovery_checkpoint_unit(
@@ -53723,11 +53790,19 @@ def _run_generation(
                         artifact_names=[output_name],
                         dependencies=dependencies,
                         settings=settings,
+                        attestation={
+                            "h3_audio_true_peak": dict(concat_safety_stats),
+                        },
                     )
                     if not unit:
                         raise InterruptedError("H3 concat checkpoint rejected")
+                    if not update_job(
+                        job,
+                        h3_audio_true_peak=dict(concat_safety_stats),
+                    ):
+                        raise InterruptedError("H3 concat status was cancelled")
                     producer_artifact_roles[output_name] = "final"
-                    path = os.path.join(out_dir, output_name)
+                    path = output_path
                     if path not in gen["file_list"]:
                         gen["file_list"].append(path)
                     return unit
@@ -55380,6 +55455,28 @@ def _run_generation(
                                 "preserve_generated_audio": bool(
                                     clip_info.get("preserve_generated_audio")
                                 ),
+                                "h3_audio_true_peak_policy": (
+                                    _h3_true_peak_policy_identity()
+                                ),
+                            }
+                            concat_safety_stats = gen.get(
+                                "h3_audio_true_peak"
+                            )
+                            if (
+                                not isinstance(concat_safety_stats, dict)
+                                or concat_safety_stats.get("verified") is not True
+                            ):
+                                raise _GenerationStageFailure(
+                                    "The final H3 audio has no verified true-peak result",
+                                    stage="audio_mux",
+                                    code="audio_true_peak_failed",
+                                )
+                            concat_safety_stats = dict(concat_safety_stats)
+                            concat_sidecar_params = {
+                                **task_sidecar_params,
+                                "h3_audio_true_peak": dict(
+                                    concat_safety_stats
+                                ),
                             }
                             concat_unit_id = recovery_unit_id(
                                 job_id,
@@ -55411,7 +55508,7 @@ def _run_generation(
                                         for name in concat_names
                                         if name in task_staged_media
                                     },
-                                    task_params=task_sidecar_params,
+                                    task_params=concat_sidecar_params,
                                 )
                                 if task_staged_media:
                                     _queue_recovery_promote_staged_outputs(
@@ -55432,6 +55529,18 @@ def _run_generation(
                                     artifact_names=concat_names,
                                     dependencies=concat_dependencies,
                                     settings=concat_settings,
+                                    attestation={
+                                        "h3_audio_true_peak": dict(
+                                            concat_safety_stats
+                                        ),
+                                    },
+                                ):
+                                    return False
+                                if not update_job(
+                                    job,
+                                    h3_audio_true_peak=dict(
+                                        concat_safety_stats
+                                    ),
                                 ):
                                     return False
 
@@ -56421,8 +56530,45 @@ def _recast_video_frame_count(video_path):
         del reader
 
 
+def _enforce_deferred_h3_final_audio(
+    job, output_path, *, update_job_fn=None,
+):
+    """Enforce H3 safety once on a deferred-concat published container."""
+    params = job.get("params") if isinstance(job, dict) else None
+    model_type = params.get("model_type") if isinstance(params, dict) else None
+    base_model_type = wgp.get_base_model_type(model_type)
+    if base_model_type not in {"minimax_h3", "minimax_h3_ref2va"}:
+        return None
+    update = update_job_fn or update_job
+    if not update(
+        job,
+        progress=99,
+        phase="Audio safety",
+        message="Verifying final H3 audio safety...",
+    ):
+        raise InterruptedError("H3 audio safety was cancelled")
+    try:
+        stats = wgp.enforce_h3_final_audio_safety(
+            output_path, base_model_type,
+        )
+    except wgp.PostDecodeStageError as error:
+        raise _GenerationStageFailure(
+            str(error),
+            stage="audio_mux",
+            code="audio_true_peak_failed",
+        ) from error
+    if not isinstance(stats, dict) or stats.get("verified") is not True:
+        raise _GenerationStageFailure(
+            "The final H3 audio did not pass true-peak verification",
+            stage="audio_mux",
+            code="audio_true_peak_failed",
+        )
+    public_stats = dict(stats)
+    return public_stats
+
+
 def _write_recast_shot_aware_sidecar(
-    job, output_path, shot_bundle, generation_time,
+    job, output_path, shot_bundle, generation_time, audio_safety_stats=None,
 ):
     """Persist restorable settings without leaking disposable shot paths."""
     import copy
@@ -56470,6 +56616,9 @@ def _write_recast_shot_aware_sidecar(
         "created_at": time.time(),
         "output_filename": output_name,
     }
+    if isinstance(audio_safety_stats, dict):
+        sidecar["h3_audio_true_peak"] = dict(audio_safety_stats)
+        sidecar["params"]["h3_audio_true_peak"] = dict(audio_safety_stats)
     meta_path = os.path.splitext(output_path)[0] + ".meta.json"
     with open(meta_path, "w", encoding="utf-8") as handle:
         json.dump(sidecar, handle, indent=2)
@@ -56590,11 +56739,15 @@ def _run_recast_shot_generation(job_id):
                 f"({actual_frames}/{expected_frames} frames)."
             )
 
+        audio_safety_stats = _enforce_deferred_h3_final_audio(
+            job, final_path,
+        )
         _write_recast_shot_aware_sidecar(
             job,
             final_path,
             shot_bundle,
             time.time() - started_at,
+            audio_safety_stats=audio_safety_stats,
         )
         final_name = os.path.basename(final_path)
         job["out_dir"] = final_out_dir
@@ -56609,6 +56762,10 @@ def _run_recast_shot_generation(job_id):
             total_steps=0,
             phase="",
             message="Done",
+            **(
+                {"h3_audio_true_peak": audio_safety_stats}
+                if audio_safety_stats is not None else {}
+            ),
         )
         if not published:
             return
@@ -56620,12 +56777,15 @@ def _run_recast_shot_generation(job_id):
     except Exception as error:
         traceback.print_exc()
         if not is_cancel_requested(job):
-            finish_job(
-                job,
-                "failed",
-                error=str(error),
-                message=f"Recast assembly failed: {error}",
-            )
+            if isinstance(error, _GenerationStageFailure):
+                finish_job(job, "failed", **_safe_failure_updates(error, job))
+            else:
+                finish_job(
+                    job,
+                    "failed",
+                    error=str(error),
+                    message=f"Recast assembly failed: {error}",
+                )
     finally:
         if final_path and not published:
             for leftover in (
@@ -56666,7 +56826,7 @@ def _run_recast_shot_generation(job_id):
 
 
 def _write_repaint_shot_aware_sidecar(
-    job, output_path, shot_bundle, generation_time,
+    job, output_path, shot_bundle, generation_time, audio_safety_stats=None,
 ):
     """Persist mapped Repaint settings without disposable shot artifacts."""
     import copy
@@ -56716,6 +56876,9 @@ def _write_repaint_shot_aware_sidecar(
         "created_at": time.time(),
         "output_filename": output_name,
     }
+    if isinstance(audio_safety_stats, dict):
+        sidecar["h3_audio_true_peak"] = dict(audio_safety_stats)
+        sidecar["params"]["h3_audio_true_peak"] = dict(audio_safety_stats)
     meta_path = os.path.splitext(output_path)[0] + ".meta.json"
     with open(meta_path, "w", encoding="utf-8") as handle:
         json.dump(sidecar, handle, indent=2)
@@ -56836,11 +56999,15 @@ def _run_repaint_shot_generation(job_id):
                 f"({actual_frames}/{expected_frames} frames)."
             )
 
+        audio_safety_stats = _enforce_deferred_h3_final_audio(
+            job, final_path,
+        )
         _write_repaint_shot_aware_sidecar(
             job,
             final_path,
             shot_bundle,
             time.time() - started_at,
+            audio_safety_stats=audio_safety_stats,
         )
         final_name = os.path.basename(final_path)
         job["out_dir"] = final_out_dir
@@ -56855,6 +57022,10 @@ def _run_repaint_shot_generation(job_id):
             total_steps=0,
             phase="",
             message="Done",
+            **(
+                {"h3_audio_true_peak": audio_safety_stats}
+                if audio_safety_stats is not None else {}
+            ),
         )
         if not published:
             return
@@ -56866,12 +57037,15 @@ def _run_repaint_shot_generation(job_id):
     except Exception as error:
         traceback.print_exc()
         if not is_cancel_requested(job):
-            finish_job(
-                job,
-                "failed",
-                error=str(error),
-                message=f"Repaint assembly failed: {error}",
-            )
+            if isinstance(error, _GenerationStageFailure):
+                finish_job(job, "failed", **_safe_failure_updates(error, job))
+            else:
+                finish_job(
+                    job,
+                    "failed",
+                    error=str(error),
+                    message=f"Repaint assembly failed: {error}",
+                )
     finally:
         if final_path and not published:
             for leftover in (
@@ -56916,7 +57090,7 @@ def _run_repaint_shot_generation(job_id):
 
 
 def _write_outpaint_shot_aware_sidecar(
-    job, output_path, shot_bundle, generation_time,
+    job, output_path, shot_bundle, generation_time, audio_safety_stats=None,
 ):
     """Persist restorable Outpaint settings without private shot paths."""
     import copy
@@ -56963,6 +57137,9 @@ def _write_outpaint_shot_aware_sidecar(
         "created_at": time.time(),
         "output_filename": output_name,
     }
+    if isinstance(audio_safety_stats, dict):
+        sidecar["h3_audio_true_peak"] = dict(audio_safety_stats)
+        sidecar["params"]["h3_audio_true_peak"] = dict(audio_safety_stats)
     meta_path = os.path.splitext(output_path)[0] + ".meta.json"
     with open(meta_path, "w", encoding="utf-8") as handle:
         json.dump(sidecar, handle, indent=2)
@@ -57091,11 +57268,15 @@ def _run_outpaint_shot_generation(job_id):
                 f"({actual_frames}/{expected_frames} frames)."
             )
 
+        audio_safety_stats = _enforce_deferred_h3_final_audio(
+            job, final_path,
+        )
         _write_outpaint_shot_aware_sidecar(
             job,
             final_path,
             shot_bundle,
             time.time() - started_at,
+            audio_safety_stats=audio_safety_stats,
         )
         final_name = os.path.basename(final_path)
         job["out_dir"] = final_out_dir
@@ -57110,6 +57291,10 @@ def _run_outpaint_shot_generation(job_id):
             total_steps=0,
             phase="",
             message="Done",
+            **(
+                {"h3_audio_true_peak": audio_safety_stats}
+                if audio_safety_stats is not None else {}
+            ),
         )
         if not published:
             return
@@ -57121,12 +57306,15 @@ def _run_outpaint_shot_generation(job_id):
     except Exception as error:
         traceback.print_exc()
         if not is_cancel_requested(job):
-            finish_job(
-                job,
-                "failed",
-                error=str(error),
-                message=f"Outpaint assembly failed: {error}",
-            )
+            if isinstance(error, _GenerationStageFailure):
+                finish_job(job, "failed", **_safe_failure_updates(error, job))
+            else:
+                finish_job(
+                    job,
+                    "failed",
+                    error=str(error),
+                    message=f"Outpaint assembly failed: {error}",
+                )
     finally:
         if final_path and not published:
             for leftover in (
@@ -61113,6 +61301,102 @@ def view_output_share(token: str):
     )
 
 
+def _rejoin_source_model_identity(source_sidecars: list[dict]) -> dict | None:
+    """Resolve one trustworthy model family from rejoin source sidecars."""
+    observed = []
+    missing = False
+    for sidecar in source_sidecars:
+        if not isinstance(sidecar, dict):
+            missing = True
+            continue
+        params = sidecar.get("params")
+        params_model = (
+            str(params.get("model_type") or "").strip()
+            if isinstance(params, dict) else ""
+        )
+        top_model = str(sidecar.get("model_type") or "").strip()
+        declared = {value for value in (params_model, top_model) if value}
+        if len(declared) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Source clip model metadata is inconsistent",
+            )
+        if not declared:
+            missing = True
+            continue
+        model_type = declared.pop()
+        try:
+            base_model_type = str(
+                wgp.get_base_model_type(model_type) or ""
+            ).strip()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Source clip model metadata is ambiguous",
+            ) from exc
+        if not base_model_type:
+            raise HTTPException(
+                status_code=409,
+                detail="Source clip model metadata is ambiguous",
+            )
+        observed.append((model_type, base_model_type))
+
+    # Legacy groups without any model declaration retain their historical
+    # non-H3 rejoin behavior. Once a group declares identity, every selected
+    # source must agree so an H3 output can never bypass safety through a
+    # missing or unrelated sidecar.
+    if not observed:
+        return None
+    if missing or len(observed) != len(source_sidecars):
+        raise HTTPException(
+            status_code=409,
+            detail="Source clip model metadata is incomplete",
+        )
+    base_models = sorted({base for _, base in observed})
+    if len(base_models) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Source clips use mixed model families",
+        )
+    source_models = sorted({model for model, _ in observed})
+    base_model_type = base_models[0]
+    return {
+        "model_type": (
+            source_models[0] if len(source_models) == 1 else base_model_type
+        ),
+        "source_model_types": source_models,
+        "base_model_type": base_model_type,
+        "requires_h3_audio_safety": base_model_type in {
+            "minimax_h3", "minimax_h3_ref2va",
+        },
+    }
+
+
+def _enforce_rejoined_h3_final_audio(
+    output_path: str, model_identity: dict | None,
+) -> dict | None:
+    """Verify one joined H3 container and remove it on any safety failure."""
+    if (
+        not isinstance(model_identity, dict)
+        or model_identity.get("requires_h3_audio_safety") is not True
+    ):
+        return None
+    try:
+        stats = wgp.enforce_h3_final_audio_safety(
+            output_path,
+            str(model_identity.get("base_model_type") or ""),
+        )
+        if not isinstance(stats, dict) or stats.get("verified") is not True:
+            raise RuntimeError("H3 true-peak attestation was not verified")
+    except Exception as exc:
+        wgp.remove_failed_h3_final_output(output_path)
+        raise HTTPException(
+            status_code=500,
+            detail="Joined H3 audio could not be verified safely",
+        ) from exc
+    return dict(stats)
+
+
 @api.post("/api/v1/outputs/rejoin")
 def rejoin_clips(request: Request, body: dict):
     """Re-concatenate clips from a multi-clip group.
@@ -61195,6 +61479,8 @@ def rejoin_clips(request: Request, body: dict):
     if len(clip_paths) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 clips to rejoin")
 
+    model_identity = _rejoin_source_model_identity(source_sidecars)
+
     # Allow override audio from request body
     body_audio = body.get("audio_file")
     if body_audio:
@@ -61220,54 +61506,103 @@ def rejoin_clips(request: Request, body: dict):
         timestamp = time.strftime("%Y-%m-%d_%H%M%S")
         concat_name = f"{timestamp}_rejoin_multiclip.mp4"
         concat_path = os.path.join(out_dir, concat_name)
+        concat_staging_path = os.path.join(
+            out_dir,
+            f".{timestamp}-{uuid.uuid4().hex[:8]}-rejoin-staging.mp4",
+        )
 
         success = concatenate_multi_clip_videos(
             clip_paths,
-            concat_path,
+            concat_staging_path,
             audio_path,
             audio_start_sec=audio_start_sec,
         )
-        if not success or not os.path.isfile(concat_path):
+        if not success or not os.path.isfile(concat_staging_path):
+            try:
+                os.remove(concat_staging_path)
+            except OSError:
+                pass
             raise HTTPException(status_code=500, detail="Concatenation failed")
 
-        inherited_audio = _inherit_media_access_policy(
-            [audio_path] if audio_path else [],
-            selected_workspace,
-            request.state.maestro_session_id,
+        audio_safety_stats = _enforce_rejoined_h3_final_audio(
+            concat_staging_path, model_identity,
         )
-        private = inherited_audio["private"] or any(
-            bool(sidecar.get("private", False)) for sidecar in source_sidecars
-        )
-        explicit = inherited_audio["explicit"] or any(
-            bool(sidecar.get("explicit", False)) for sidecar in source_sidecars
-        )
-        policy = {"private": private, "explicit": explicit}
-        joined_sidecar = {
-            "params": {
-                "multi_clip_info": {"group_id": group_id, "joined": True},
-                "prompt": ((source_sidecar or {}).get("params") or {}).get("prompt", ""),
-            },
-            "artifact_class": "final",
-            "job_id": (source_sidecar or {}).get("job_id"),
-            "generation_mode": "video",
-            "created_at": time.time(),
-            "output_filename": concat_name,
-        }
-        stamp_sidecar_policy(joined_sidecar, policy, workspace=selected_workspace)
+        try:
+            os.replace(concat_staging_path, concat_path)
+        except OSError as exc:
+            try:
+                os.remove(concat_staging_path)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail="Joined output could not be published safely",
+            ) from exc
+
         joined_meta_path = os.path.splitext(concat_path)[0] + ".meta.json"
         joined_meta_temp = f"{joined_meta_path}.{uuid.uuid4().hex[:8]}.tmp"
         try:
+            inherited_audio = _inherit_media_access_policy(
+                [audio_path] if audio_path else [],
+                selected_workspace,
+                request.state.maestro_session_id,
+            )
+            private = inherited_audio["private"] or any(
+                bool(sidecar.get("private", False))
+                for sidecar in source_sidecars
+            )
+            explicit = inherited_audio["explicit"] or any(
+                bool(sidecar.get("explicit", False))
+                for sidecar in source_sidecars
+            )
+            policy = {"private": private, "explicit": explicit}
+            joined_sidecar = {
+                "params": {
+                    "multi_clip_info": {
+                        "group_id": group_id, "joined": True,
+                    },
+                    "prompt": (
+                        (source_sidecar or {}).get("params") or {}
+                    ).get("prompt", ""),
+                },
+                "artifact_class": "final",
+                "job_id": (source_sidecar or {}).get("job_id"),
+                "generation_mode": "video",
+                "created_at": time.time(),
+                "output_filename": concat_name,
+            }
+            if isinstance(model_identity, dict):
+                joined_sidecar["model_type"] = model_identity["model_type"]
+                joined_sidecar["params"].update({
+                    "model_type": model_identity["model_type"],
+                    "source_model_types": list(
+                        model_identity["source_model_types"]
+                    ),
+                    "base_model_type": model_identity["base_model_type"],
+                })
+            if isinstance(audio_safety_stats, dict):
+                joined_sidecar["h3_audio_true_peak"] = dict(
+                    audio_safety_stats
+                )
+                joined_sidecar["params"]["h3_audio_true_peak"] = dict(
+                    audio_safety_stats
+                )
+            stamp_sidecar_policy(
+                joined_sidecar, policy, workspace=selected_workspace,
+            )
             with open(joined_meta_temp, "w", encoding="utf-8") as handle:
                 json.dump(joined_sidecar, handle, indent=2)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(joined_meta_temp, joined_meta_path)
         except Exception as exc:
-            for path in (joined_meta_temp, concat_path):
+            for path in (joined_meta_temp, joined_meta_path, concat_path):
                 try:
                     os.remove(path)
                 except OSError:
                     pass
+            if isinstance(exc, HTTPException):
+                raise
             raise HTTPException(
                 status_code=500,
                 detail="Joined output metadata could not be published safely",

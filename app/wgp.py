@@ -9165,6 +9165,52 @@ def resolve_mux_audio_contract(
     )
 
 
+def enforce_h3_final_audio_safety(
+    media_path, base_model_type, *, send_cmd=None, state=None,
+):
+    """Apply the final-container H3 true-peak policy or fail the audio stage."""
+    if base_model_type not in {"minimax_h3", "minimax_h3_ref2va"}:
+        return None
+    if callable(send_cmd):
+        send_cmd(
+            "progress",
+            [0, get_latest_status(state, "Verifying H3 Audio Safety")],
+        )
+    try:
+        from services.h3_audio_safety import enforce_true_peak_safety
+
+        stats = enforce_true_peak_safety(media_path)
+    except PostDecodeStageError:
+        raise
+    except Exception as error:
+        raise PostDecodeStageError(
+            "The rendered H3 audio could not be verified below the true-peak ceiling",
+            stage="audio_mux",
+            code="audio_true_peak_failed",
+        ) from error
+    if not isinstance(stats, dict) or stats.get("verified") is not True:
+        raise PostDecodeStageError(
+            "The rendered H3 audio did not pass true-peak verification",
+            stage="audio_mux",
+            code="audio_true_peak_failed",
+        )
+    return stats
+
+
+def remove_failed_h3_final_output(media_path):
+    """Remove only an unverified final; recovery inputs remain untouched."""
+    try:
+        os.remove(media_path)
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        gc.collect()
+        try:
+            os.remove(media_path)
+        except OSError:
+            pass
+
+
 def resume_h3_source_audio_premux(
     *,
     premux_video_path,
@@ -9174,6 +9220,8 @@ def resume_h3_source_audio_premux(
     premux_audio_path=None,
     audio_codec_key="aac_128",
     combine_fn=None,
+    safety_fn=None,
+    return_safety_stats=False,
 ):
     """Finish a hash-verified H3 source-audio mux without model inference."""
 
@@ -9229,12 +9277,22 @@ def resume_h3_source_audio_premux(
             "Recovered H3 audio mux produced no final output",
             stage="audio_mux", code="audio_mux_output_invalid",
         )
+    safety_stats = None
+    if safety_fn is not None or combine_fn is None:
+        safety = safety_fn or enforce_h3_final_audio_safety
+        try:
+            safety_stats = safety(output, "minimax_h3")
+        except Exception:
+            remove_failed_h3_final_output(output)
+            raise
     for temporary in (premux_video, recovered_audio):
         if temporary:
             try:
                 os.remove(temporary)
             except FileNotFoundError:
                 pass
+    if return_safety_stats:
+        return output, safety_stats
     return output
 
 
@@ -9894,8 +9952,12 @@ def generate_video(
             durable_output_dir,
             f"{durable_output_prefix}-r{repeat_index}-w1.{container}",
         )
+        recovered_h3_multiclip_component = (
+            isinstance(multi_clip_info, dict)
+            and int(multi_clip_info.get("total", 1) or 1) > 1
+        )
         try:
-            recovered_output = resume_h3_source_audio_premux(
+            recovered_output, recovered_audio_safety = resume_h3_source_audio_premux(
                 premux_video_path=_h3_source_audio_premux_recovery.get(
                     "video_path"
                 ),
@@ -9908,6 +9970,19 @@ def generate_video(
                 audio_codec_key=server_config.get(
                     "audio_output_codec", "aac_128"
                 ),
+                safety_fn=(
+                    (lambda _path, _base_model_type: None)
+                    if recovered_h3_multiclip_component
+                    else lambda path, _base_model_type: (
+                        enforce_h3_final_audio_safety(
+                            path,
+                            base_model_type,
+                            send_cmd=send_cmd,
+                            state=state,
+                        )
+                    )
+                ),
+                return_safety_stats=True,
             )
         except PostDecodeStageError:
             raise
@@ -9921,9 +9996,15 @@ def generate_video(
                 gen["artifact_list"].append(recovered_output)
             gen.setdefault("artifact_roles", {})[recovered_output] = "final"
             file_list.append(recovered_output)
-            file_settings_list.append({
+            recovered_settings = {
                 "custom_settings": dict(custom_settings or {}),
-            })
+            }
+            if recovered_audio_safety is not None:
+                recovered_settings["h3_audio_true_peak"] = (
+                    recovered_audio_safety
+                )
+                gen["h3_audio_true_peak"] = dict(recovered_audio_safety)
+            file_settings_list.append(recovered_settings)
             gen["last_was_audio"] = False
         send_cmd("output")
         return True
@@ -11959,6 +12040,12 @@ def generate_video(
                     any_mmaudio = MMAudio_setting != 0 and mmaudio_enabled and output_frame_count >= fps
                 time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%Hh%Mm%Ss")
                 save_prompt = original_prompts[0]
+                h3_audio_true_peak_stats = None
+                h3_audio_safety_deferred_to_multiclip_final = (
+                    base_model_type in {"minimax_h3", "minimax_h3_ref2va"}
+                    and isinstance(multi_clip_info, dict)
+                    and int(multi_clip_info.get("total", 1) or 1) > 1
+                )
                 if audio_only:
                     audio_codec = server_config.get("audio_stand_alone_output_codec", "wav")
                     extension = get_audio_codec_extension(audio_codec)
@@ -12171,7 +12258,26 @@ def generate_video(
                             output_audio_channels=mux_audio_channels,
                             verbose=verbose_level >= 2,
                         )
-                        h3_mux_succeeded = True
+                        try:
+                            if (
+                                not h3_audio_safety_deferred_to_multiclip_final
+                                and _retake_stitch_info is None
+                            ):
+                                h3_audio_true_peak_stats = (
+                                    enforce_h3_final_audio_safety(
+                                        video_path,
+                                        base_model_type,
+                                        send_cmd=send_cmd,
+                                        state=state,
+                                    )
+                                )
+                        except PostDecodeStageError:
+                            remove_failed_h3_final_output(video_path)
+                            raise
+                        # Retake stitching mutates this container later. Keep
+                        # the H3 pre-mux recovery inputs until that actual
+                        # final container has passed the one safety check.
+                        h3_mux_succeeded = _retake_stitch_info is None
                     except PostDecodeStageError:
                         raise
                     except Exception as error:
@@ -12297,6 +12403,10 @@ def generate_video(
                 configs["generation_time"] = round(end_time-start_time)
                 configs["creation_date"] = datetime.fromtimestamp(end_time).isoformat(timespec="seconds")
                 configs["creation_timestamp"] = int(end_time)
+                if h3_audio_true_peak_stats is not None:
+                    configs["h3_audio_true_peak"] = dict(
+                        h3_audio_true_peak_stats
+                    )
                 # if sample_is_image: configs["is_image"] = True
                 metadata_choice = server_config.get("metadata_type","metadata")
                 video_path = [video_path] if not isinstance(video_path, list) else video_path
@@ -12318,7 +12428,8 @@ def generate_video(
                         print(f"New image saved to Path: "+ path)
                     else:
                         # Retake stitching: combine original[0:start] + retake + original[end:]
-                        if _retake_stitch_info is not None:
+                        retake_was_requested = _retake_stitch_info is not None
+                        if retake_was_requested:
                             try:
                                 import subprocess
                                 si = _retake_stitch_info
@@ -12536,6 +12647,73 @@ def generate_video(
                             except Exception as stitch_err:
                                 print(f"[Retake] Stitch error (non-fatal): {stitch_err}")
 
+                        if (
+                            retake_was_requested
+                            and not h3_audio_safety_deferred_to_multiclip_final
+                        ):
+                            try:
+                                retake_safety_stats = enforce_h3_final_audio_safety(
+                                    path,
+                                    base_model_type,
+                                    send_cmd=send_cmd,
+                                    state=state,
+                                )
+                            except PostDecodeStageError:
+                                remove_failed_h3_final_output(path)
+                                with lock:
+                                    gen["artifact_list"] = [
+                                        artifact
+                                        for artifact in gen.get(
+                                            "artifact_list", []
+                                        )
+                                        if artifact != path
+                                    ]
+                                    gen.setdefault(
+                                        "artifact_roles", {}
+                                    ).pop(path, None)
+                                raise
+                            if retake_safety_stats is not None:
+                                configs["h3_audio_true_peak"] = dict(
+                                    retake_safety_stats
+                                )
+                                # Retake stitching replaces the container after
+                                # the normal metadata write, so persist the
+                                # verified final-container result again.
+                                if metadata_choice == "json":
+                                    json_path = os.path.splitext(path)[0] + ".json"
+                                    with open(json_path, "w") as metadata_file:
+                                        json.dump(configs, metadata_file, indent=4)
+                                elif metadata_choice == "metadata":
+                                    save_video_metadata(path, configs, embedded_images)
+
+                        if retake_was_requested and h3_keep_premux:
+                            for premux_path in h3_premux_paths:
+                                try:
+                                    os.remove(premux_path)
+                                except FileNotFoundError:
+                                    pass
+                                except PermissionError:
+                                    gc.collect()
+                                    try:
+                                        os.remove(premux_path)
+                                    except OSError:
+                                        pass
+                            with lock:
+                                artifact_list = gen.setdefault(
+                                    "artifact_list", []
+                                )
+                                gen["artifact_list"] = [
+                                    artifact
+                                    for artifact in artifact_list
+                                    if artifact not in h3_premux_paths
+                                ]
+                                artifact_roles = gen.setdefault(
+                                    "artifact_roles", {}
+                                )
+                                for premux_path in h3_premux_paths:
+                                    artifact_roles.pop(premux_path, None)
+                            h3_mux_succeeded = True
+
                         print(f"New video saved to Path: "+ path)
                     with lock:
                         if audio_only:
@@ -12544,6 +12722,10 @@ def generate_video(
                         else:
                             file_list.append(path)
                             file_settings_list.append(configs if no > 0 else configs.copy())
+                            if configs.get("h3_audio_true_peak") is not None:
+                                gen["h3_audio_true_peak"] = dict(
+                                    configs["h3_audio_true_peak"]
+                                )
                         gen.setdefault("artifact_roles", {})[path] = (
                             "component"
                             if isinstance(multi_clip_info, dict)
@@ -12631,38 +12813,69 @@ def generate_video(
                         )
                         if concat_succeeded:
                             print(f"[Multi-Clip] Concatenated video saved: {concat_path}")
+                            try:
+                                concat_safety_stats = enforce_h3_final_audio_safety(
+                                    concat_path,
+                                    base_model_type,
+                                    send_cmd=send_cmd,
+                                    state=state,
+                                )
+                            except PostDecodeStageError:
+                                remove_failed_h3_final_output(concat_path)
+                                raise
+                            concat_configs = configs.copy()
+                            concat_configs["prompt"] = (
+                                multi_clip_info.get("global_prompt")
+                                or "\n".join(
+                                    group[i]["prompt"]
+                                    for i in range(multi_clip_info["total"])
+                                )
+                            )
+                            concat_configs["image_start"] = [
+                                group[i]["image_start"]
+                                for i in range(multi_clip_info["total"])
+                            ]
+                            concat_configs["multi_prompts_gen_type"] = 3
+                            concat_configs["video_length"] = sum(
+                                int(group[i].get("published_frames") or 0)
+                                for i in range(multi_clip_info["total"])
+                            )
+                            concat_configs["sliding_window_size"] = (
+                                0
+                                if multi_clip_info.get("automatic_h3_longform")
+                                else video_length
+                            )
+                            if preserve_generated_audio:
+                                concat_configs.pop("audio_guide", None)
+                            elif original_audio_guide:
+                                concat_configs["audio_guide"] = original_audio_guide
+                            if concat_safety_stats is not None:
+                                concat_configs["h3_audio_true_peak"] = dict(
+                                    concat_safety_stats
+                                )
+                                if metadata_choice == "json":
+                                    concat_json_path = os.path.splitext(
+                                        concat_path
+                                    )[0] + ".json"
+                                    with open(concat_json_path, "w") as metadata_file:
+                                        json.dump(
+                                            concat_configs,
+                                            metadata_file,
+                                            indent=4,
+                                        )
+                                elif metadata_choice == "metadata":
+                                    save_video_metadata(
+                                        concat_path, concat_configs, None,
+                                    )
                             with lock:
                                 file_list.append(concat_path)
                                 gen.setdefault("artifact_roles", {})[
                                     concat_path
                                 ] = "final"
-                                concat_configs = configs.copy()
-                                concat_configs["prompt"] = (
-                                    multi_clip_info.get("global_prompt")
-                                    or "\n".join(
-                                        group[i]["prompt"]
-                                        for i in range(
-                                            multi_clip_info["total"]
-                                        )
+                                if concat_safety_stats is not None:
+                                    gen["h3_audio_true_peak"] = dict(
+                                        concat_safety_stats
                                     )
-                                )
-                                concat_configs["image_start"] = [group[i]["image_start"] for i in range(multi_clip_info["total"])]
-                                concat_configs["multi_prompts_gen_type"] = 3
-                                concat_configs["video_length"] = sum(
-                                    int(group[i].get("published_frames") or 0)
-                                    for i in range(multi_clip_info["total"])
-                                )
-                                concat_configs["sliding_window_size"] = (
-                                    0
-                                    if multi_clip_info.get(
-                                        "automatic_h3_longform"
-                                    )
-                                    else video_length
-                                )
-                                if preserve_generated_audio:
-                                    concat_configs.pop("audio_guide", None)
-                                elif original_audio_guide:
-                                    concat_configs["audio_guide"] = original_audio_guide
                                 file_settings_list.append(concat_configs)
                             send_cmd("output")
                             del clip_store[group_id]
