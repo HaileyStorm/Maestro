@@ -244,10 +244,10 @@ class GenerationTelemetryTests(unittest.TestCase):
         self.assertIn("progress_indeterminate?: boolean", client)
         self.assertIn("progressIndeterminate: status.status === 'running'", store)
         self.assertIn("hasExactCurrentSteps\n        ? (currentStep / currentTotalSteps)", main)
-        self.assertIn("Overall ETA ${compactEta(job.etaSeconds)}", main)
-        self.assertIn("Current segment ETA ${compactEta(job.subtaskEtaSeconds)}", main)
-        self.assertIn("Estimated time ${compactEta(queuedH3Runtime)} after start", main)
-        self.assertIn("Planned time ${compactEta(queuedH3Runtime)} after start", main)
+        self.assertIn("Overall ETA ${formatApproximateDuration(job.etaSeconds)}", main)
+        self.assertIn("Current segment ETA ${formatApproximateDuration(job.subtaskEtaSeconds)}", main)
+        self.assertIn("Estimated time ${formatApproximateDuration(queuedH3Runtime)} after start", main)
+        self.assertIn("Planned time ${formatApproximateDuration(queuedH3Runtime)} after start", main)
         self.assertIn("stripTimeSuffix", main)
         pipeline_start = main.index("function PipelinePlaceholder()")
         pipeline = main[pipeline_start:]
@@ -320,15 +320,15 @@ class GenerationTelemetryTests(unittest.TestCase):
             placeholder,
         )
         self.assertIn(
-            "Estimated time ${compactEta(queuedH3Runtime)} after start",
+            "Estimated time ${formatApproximateDuration(queuedH3Runtime)} after start",
             eta_render,
         )
         self.assertIn("job.status !== 'completed'", eta_render)
         self.assertIn(
-            "Planned time ${compactEta(queuedH3Runtime)} after start",
+            "Planned time ${formatApproximateDuration(queuedH3Runtime)} after start",
             eta_render,
         )
-        self.assertIn("Overall ETA ${compactEta(job.etaSeconds)}", eta_render)
+        self.assertIn("Overall ETA ${formatApproximateDuration(job.etaSeconds)}", eta_render)
         self.assertIn("const exactTextEta = resourceDescriptor?.intent === 'text'", status_mapper)
         self.assertIn(
             "exactTextEta ? status.eta_seconds ?? null : previous?.etaSeconds ?? estimatedTotal",

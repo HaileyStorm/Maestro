@@ -1,47 +1,46 @@
 import { useEffect } from 'react'
 import { Clock3, Gauge } from 'lucide-react'
 import { h3ProfileMatches, useStore } from '../../stores/useStore'
+import { formatApproximateDuration } from '../../lib/format'
 import type {
   H3PerformanceEstimate,
   H3PerformanceProfileId,
 } from '../../types'
 
-function formatSeconds(seconds: number): string {
+function formatEstimateTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return 'calibrating'
-  if (seconds < 60) return `~${Math.max(1, Math.round(seconds))}s`
-  const minutes = Math.floor(seconds / 60)
-  const remainder = Math.round(seconds % 60)
-  return remainder ? `~${minutes}m ${remainder}s` : `~${minutes}m`
+  const duration = formatApproximateDuration(seconds, '')
+  return duration ? `~${duration}` : 'calibrating'
 }
 
 function modelLoadSuffix(estimate: H3PerformanceEstimate | null): string {
   if (!estimate || estimate.model_load_state === 'resident') return ''
   const loadSeconds = Number(estimate.model_load_seconds)
   return Number.isFinite(loadSeconds) && loadSeconds > 0
-    ? ` + ${formatSeconds(loadSeconds)} load`
+    ? ` + ${formatEstimateTime(loadSeconds)} load`
     : ' + load TBD'
 }
 
 function estimateLabel(estimate: H3PerformanceEstimate | null): string {
   if (!estimate) return 'calibrating'
-  return `${formatSeconds(estimate.seconds)} run${modelLoadSuffix(estimate)}`
+  return `${formatEstimateTime(estimate.seconds)} run${modelLoadSuffix(estimate)}`
 }
 
 function estimateTitle(estimate: H3PerformanceEstimate | null): string {
   if (!estimate) return 'Collecting enough local timing data to estimate this output.'
-  const range = `${formatSeconds(estimate.range_seconds.low)}–${formatSeconds(estimate.range_seconds.high)}`
+  const range = `${formatEstimateTime(estimate.range_seconds.low)}–${formatEstimateTime(estimate.range_seconds.high)}`
   const samples = `${estimate.sample_count} local sample${estimate.sample_count === 1 ? '' : 's'}`
   const loadSeconds = Number(estimate.model_load_seconds)
   const modelLoad = estimate.model_load_state === 'resident'
     ? ' The model is resident, so no model-load allowance is added.'
     : Number.isFinite(loadSeconds) && loadSeconds > 0
-      ? ` Model load adds about ${formatSeconds(loadSeconds)} separately.`
+      ? ` Model load adds about ${formatEstimateTime(loadSeconds)} separately.`
       : ' Model-load time is not calibrated yet and is shown separately.'
   const uncertainty = estimate.uncertainty_reasons.length
     ? ` Main uncertainty: ${estimate.uncertainty_reasons.join('; ')}.`
     : ''
   const delivery = estimate.postprocess_seconds && estimate.delivery_resolution
-    ? ` Generation is about ${formatSeconds(estimate.generation_seconds || 0)}; ${estimate.postprocess_method || 'post-processing'} adds about ${formatSeconds(estimate.postprocess_seconds)} for ${estimate.delivery_resolution} delivery.`
+    ? ` Generation is about ${formatEstimateTime(estimate.generation_seconds || 0)}; ${estimate.postprocess_method || 'post-processing'} adds about ${formatEstimateTime(estimate.postprocess_seconds)} for ${estimate.delivery_resolution} delivery.`
     : ''
   return `Estimated generation time ${range}.${delivery}${modelLoad} ${samples}; source: ${estimate.source}.${uncertainty}`
 }

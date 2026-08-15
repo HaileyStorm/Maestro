@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Lock, Unlock } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry, hasGlobalTimeline, usesStudioSegments } from '../../lib/timelinePrompt'
+import { formatMediaDuration } from '../../lib/format'
 import * as api from '../../api/client'
 
 export function DurationSlider() {
@@ -121,7 +122,7 @@ export function DurationSlider() {
       <div className="mb-1.5 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
         <label htmlFor="studio-duration-seconds" className="text-[11px] text-text-muted uppercase tracking-wider">Duration</label>
         <span className="text-xs text-text-secondary">
-          {duration >= 60 ? `${Math.floor(duration / 60)}m${duration % 60 ? ` ${duration % 60}s` : ''}` : `${duration}s`}
+          {formatMediaDuration(duration)}
           {(usesSegments || showSlidingWindow) && (
             <span className="text-text-muted ml-1">
               ({usesSegments
@@ -145,11 +146,11 @@ export function DurationSlider() {
           {usesSegments ? (
             <span title={h3SegmentEstimate?.reason}>
               {`Estimated shots ${estimatedSegmentLabel}`}
-              {' '}· maximum {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s each
+              {' '}· maximum {formatMediaDuration(windowSize)} each
               {globalTimeline ? ' · authored timestamps stay exact' : ' · prompt beats can produce shorter, uneven shots'}
             </span>
           ) : <>
-            {windowCount} sections of up to {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s &middot; {globalTimeline ? (
+            {windowCount} sections of up to {formatMediaDuration(windowSize)} &middot; {globalTimeline ? (
               'full-video timing mapped automatically'
             ) : (
               <>{promptLineCount}/{windowCount} descriptions{promptLineCount < windowCount && ' (last reused)'}</>
@@ -178,7 +179,7 @@ export function DurationSlider() {
               </button>
             </div>
             <span className="text-xs text-text-secondary">
-              {windowSize.toFixed(windowSize % 1 ? 2 : 0)}s · {geometry?.windowFrames ?? Math.round(windowSize * fps)}f · {windowCount} {plannedUnitLabel}
+              {formatMediaDuration(windowSize)} · {geometry?.windowFrames ?? Math.round(windowSize * fps)}f · {windowCount} {plannedUnitLabel}
             </span>
           </div>
           <input
@@ -196,8 +197,8 @@ export function DurationSlider() {
           <p className="mt-1 text-[9px] text-text-muted">
             {usesSegments
               ? locked
-                ? `This is a hard maximum: no planned shot exceeds ${windowSize.toFixed(2)}s. Prompt-led shots can be shorter or uneven, and the final export is trimmed to the duration above.`
-                : `Automatic planning can vary shot length up to ${windowMax.toFixed(2)}s to follow your prompt. Authored timestamps remain exact, and the final export is trimmed to the duration above.`
+                ? `This is a hard maximum: no planned shot exceeds ${formatMediaDuration(windowSize)}. Prompt-led shots can be shorter or uneven, and the final export is trimmed to the duration above.`
+                : `Automatic planning can vary shot length up to ${formatMediaDuration(windowMax)} to follow your prompt. Authored timestamps remain exact, and the final export is trimmed to the duration above.`
               : 'Larger sections use more VRAM; smaller sections create more joins.'}
           </p>
           {usesSegments && (

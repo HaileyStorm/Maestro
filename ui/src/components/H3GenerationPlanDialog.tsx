@@ -5,14 +5,13 @@ import { useStore } from '../stores/useStore'
 import type { H3SegmentBoundary, H3SegmentPlan, H3SegmentPlanItem } from '../types'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
 import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
+import { formatApproximateDuration, formatMediaDuration } from '../lib/format'
 import { H3DurationPlanBar } from './H3DurationPlanBar'
 
-function compactTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return 'calculating…'
-  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s`
-  const minutes = Math.floor(seconds / 60)
-  const remainder = Math.round(seconds % 60)
-  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`
+function formatPlanEstimateTime(seconds: number): string {
+  return Number.isFinite(seconds) && seconds > 0
+    ? formatApproximateDuration(seconds, 'calculating…')
+    : 'calculating…'
 }
 
 type H3Model = H3SegmentPlanItem['model_type']
@@ -397,14 +396,14 @@ export function H3GenerationPlanDialog() {
           <div className="min-w-0 flex-1">
             <h2 id="h3-plan-dialog-title" className="text-sm font-semibold text-text-primary">Review long-video plan</h2>
             <p id="h3-plan-dialog-description" className="mt-0.5 text-[11px] text-text-muted">
-              {plan.clip_count} segment{plan.clip_count === 1 ? '' : 's'} · {(planPublishedFrames / planFps).toFixed(2)}s final video
-              {plan.planned_frames !== planPublishedFrames && ` · ${(plan.planned_frames / planFps).toFixed(2)}s generated`}
+              {plan.clip_count} segment{plan.clip_count === 1 ? '' : 's'} · {formatMediaDuration(planPublishedFrames / planFps)} final video
+              {plan.planned_frames !== planPublishedFrames && ` · ${formatMediaDuration(plan.planned_frames / planFps)} generated`}
               {' '}· {switchCount} model change{switchCount === 1 ? '' : 's'}
             </p>
             {planEstimate && (
               <p className="mt-0.5 text-[10px] text-text-muted" title={`Confidence: ${planEstimate.confidence}. ${planEstimate.uncertainty_reasons.join('; ')}`}>
-                Planned time {compactTime(planEstimate.seconds + planLoadSeconds)}
-                {' '}· range {compactTime(planEstimate.range_seconds.low + planLoadSeconds)}–{compactTime(planEstimate.range_seconds.high + planLoadSeconds)}
+                Planned time {formatPlanEstimateTime(planEstimate.seconds + planLoadSeconds)}
+                {' '}· range {formatPlanEstimateTime(planEstimate.range_seconds.low + planLoadSeconds)}–{formatPlanEstimateTime(planEstimate.range_seconds.high + planLoadSeconds)}
               </p>
             )}
           </div>
@@ -588,8 +587,8 @@ export function H3GenerationPlanDialog() {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-xs font-semibold text-text-primary">Segment {segment.index}</span>
                     <span className="text-[10px] text-text-muted">
-                      {publishedSeconds.toFixed(2)}s final video · {publishedFrames}f
-                      {generatedFrames !== publishedFrames && ` · ${generatedSeconds.toFixed(2)}s generated · ${generatedFrames}f`}
+                      {formatMediaDuration(publishedSeconds)} final video · {publishedFrames}f
+                      {generatedFrames !== publishedFrames && ` · ${formatMediaDuration(generatedSeconds)} generated · ${generatedFrames}f`}
                     </span>
                     {index > 0 && (
                       <select disabled={!editsReady || reviewLoading} value={boundaries[index - 1]} onChange={event => changeBoundary(index - 1, event.target.value as BoundaryType)} aria-label={`Boundary before segment ${segment.index}`} className="ml-auto min-h-11 max-w-full rounded border border-border bg-bg-primary px-2 py-1 text-[10px] text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">

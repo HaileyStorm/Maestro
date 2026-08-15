@@ -19,6 +19,7 @@ import { boundedBackoffDelay, POLL_INTERVAL_MS, useVisibilityPolling } from '../
 import { copyTextToClipboard } from '../../lib/clipboard'
 import { subscribeQueueView } from '../../lib/mainViewNavigation'
 import { isActiveLogicalQueueJob, projectLogicalQueue } from '../../lib/queueProjection'
+import { formatApproximateDuration, formatMediaDuration } from '../../lib/format'
 
 const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
@@ -397,13 +398,6 @@ function resourcePresentationClass(tone: ResourcePresentation['tone']): string {
   if (tone === 'transition') return 'border-violet-300/35 bg-violet-300/10 text-violet-200'
   if (tone === 'accelerated') return 'border-accent-green/30 bg-accent-green/10 text-accent-green'
   return 'border-border bg-bg-secondary text-text-secondary'
-}
-
-function compactEta(seconds: number | null | undefined): string {
-  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return 'unknown'
-  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s`
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`
-  return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`
 }
 
 function h3EstimatedRuntime(job: GenerationJob): number | null {
@@ -1435,11 +1429,11 @@ function JobPlaceholder({
               <p className="mt-1 text-[10px] text-text-secondary">
                 {queuedH3Runtime != null
                   ? job.h3SegmentPlan?.segments.length
-                    ? `Planned time ${compactEta(queuedH3Runtime)} after start`
-                    : `Estimated time ${compactEta(queuedH3Runtime)} after start`
-                  : `Overall ETA ${compactEta(job.etaSeconds)}`}
+                    ? `Planned time ${formatApproximateDuration(queuedH3Runtime)} after start`
+                    : `Estimated time ${formatApproximateDuration(queuedH3Runtime)} after start`
+                  : `Overall ETA ${formatApproximateDuration(job.etaSeconds)}`}
                 {job.status === 'running' && hasWindows && job.modelType?.startsWith('minimax_h3')
-                    ? ` · Current segment ETA ${compactEta(job.subtaskEtaSeconds)}`
+                    ? ` · Current segment ETA ${formatApproximateDuration(job.subtaskEtaSeconds)}`
                     : ''}
               </p>
             )}
@@ -1458,7 +1452,7 @@ function JobPlaceholder({
                 )}
                 {estimateRuntime(job.estimateAfterResume) != null && (
                   <p className="mt-1">
-                    Estimated work after resume: {compactEta(estimateRuntime(job.estimateAfterResume))}.
+                    Estimated work after resume: {formatApproximateDuration(estimateRuntime(job.estimateAfterResume))}.
                   </p>
                 )}
                 {!!job.recoveryActions?.length && canManageGeneration && (
@@ -1544,7 +1538,7 @@ function JobPlaceholder({
                     return (
                       <div
                         key={segment.index}
-                        title={`Segment ${segment.index}: ${segmentModelLabel} · ${publishedSeconds.toFixed(2)}s published (${publishedFrames}f)${generatedFrames !== publishedFrames ? ` · ${generatedSeconds.toFixed(2)}s generated (${generatedFrames}f)` : ''} · ${segmentPurpose}${boundary ? ` · ${boundaryLabel}` : ''}`}
+                        title={`Segment ${segment.index}: ${segmentModelLabel} · ${formatMediaDuration(publishedSeconds)} published (${publishedFrames}f)${generatedFrames !== publishedFrames ? ` · ${formatMediaDuration(generatedSeconds)} generated (${generatedFrames}f)` : ''} · ${segmentPurpose}${boundary ? ` · ${boundaryLabel}` : ''}`}
                         className={`min-w-[44px] rounded border px-1.5 py-1 text-center transition-colors ${
                           active ? 'border-white/70 ring-1 ring-white/30' : 'border-transparent'
                         } ${ref2va ? 'bg-violet-500/25 text-violet-200' : 'bg-sky-500/25 text-sky-200'}`}
@@ -2048,8 +2042,8 @@ function QueuePanel({
                     <>
                       <span title={resourceWaitTitle}>{queueRowLabel}{waitDetail ? ` · ${waitDetail}` : ''} · Priority {info.priority} · Outputs {info.produced_outputs}/{info.requested_outputs}</span>
                       <span className="text-[9px] text-text-secondary">
-                        ETA {compactEta(info.eta_seconds)}
-                        {info.subtask_eta_seconds != null ? ` · current task ${compactEta(info.subtask_eta_seconds)}` : ''}
+                        ETA {formatApproximateDuration(info.eta_seconds)}
+                        {info.subtask_eta_seconds != null ? ` · current task ${formatApproximateDuration(info.subtask_eta_seconds)}` : ''}
                       </span>
                       {residencyMessage && (
                         <span
@@ -2568,7 +2562,7 @@ export function MainContent() {
     ? `Queue: ${logicalQueue.activeCount} active · ${queueSummaryLabel(queueSummary)}${ordinaryQueueState.paused ? ' · paused' : ordinaryQueueState.pause_after_current ? ' · pauses after current output' : ''}`
     : 'Queue status loading'
   const ownedJobEtaTooltip = currentJob
-    ? ` · Your job: overall ETA ${compactEta(currentEtaSeconds)}${currentSubtaskEtaSeconds != null ? ` · current task ${compactEta(currentSubtaskEtaSeconds)}` : ''}`
+    ? ` · Your job: overall ETA ${formatApproximateDuration(currentEtaSeconds)}${currentSubtaskEtaSeconds != null ? ` · current task ${formatApproximateDuration(currentSubtaskEtaSeconds)}` : ''}`
     : ''
 
   const feedRef = useRef<HTMLDivElement>(null)
@@ -2931,8 +2925,8 @@ export function MainContent() {
             queueStateLabel={queueStateLabel}
             queueDetails={currentJob ? (
               <span className="hidden text-[9px] xl:inline">
-                · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {compactEta(currentEtaSeconds)}
-                {currentSubtaskEtaSeconds != null ? ` · task ${compactEta(currentSubtaskEtaSeconds)}` : ''}
+                · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {formatApproximateDuration(currentEtaSeconds)}
+                {currentSubtaskEtaSeconds != null ? ` · task ${formatApproximateDuration(currentSubtaskEtaSeconds)}` : ''}
               </span>
             ) : undefined}
           />

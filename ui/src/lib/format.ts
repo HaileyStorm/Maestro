@@ -22,3 +22,43 @@ export function formatAge(iso: string | null | undefined): string {
   if (days < 365) return `${Math.min(11, Math.floor(days / 30))}mo`
   return `${Math.floor(days / 365)}y`
 }
+
+function formatRoundedDuration(totalSeconds: number, fractionDigits: number): string {
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds - hours * 3600) / 60)
+  const seconds = totalSeconds - hours * 3600 - minutes * 60
+  const parts: string[] = []
+  if (hours) parts.push(`${hours}h`)
+  if (minutes) parts.push(`${minutes}m`)
+  if (seconds || parts.length === 0) {
+    const bounded = String(Number(seconds.toFixed(fractionDigits)))
+    parts.push(`${bounded}s`)
+  }
+  return parts.join(' ')
+}
+
+/** Frame-derived media duration for Generate surfaces. This is display-only:
+ * integer frame geometry remains authoritative for requests and recovery. */
+export function formatMediaDuration(
+  seconds: number | null | undefined,
+  maximumFractionDigits = 2,
+  fallback = '—',
+): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return fallback
+  const fractionDigits = Number.isFinite(maximumFractionDigits)
+    ? Math.min(3, Math.max(0, Math.trunc(maximumFractionDigits)))
+    : 2
+  const scale = 10 ** fractionDigits
+  const rounded = Math.round((seconds + Number.EPSILON) * scale) / scale
+  return formatRoundedDuration(rounded, fractionDigits)
+}
+
+/** Whole-second formatter for explicitly approximate runtime and ETA values.
+ * Round before choosing units so rollover edges never render as 60s/1m 60s. */
+export function formatApproximateDuration(
+  seconds: number | null | undefined,
+  fallback = 'unknown',
+): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return fallback
+  return formatRoundedDuration(Math.max(1, Math.round(seconds)), 0)
+}

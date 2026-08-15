@@ -1486,15 +1486,15 @@ test('Reference logical queue folds physical children while controls retain exac
   assert.equal(duplicateSuppressed[0].props.job.id, parent.id)
   assert.equal(duplicateSuppressed[0].props.job.message, 'Public parent label that does not match its child')
   assert.match(elementText(projectedTree), /Generation queued/)
-  assert.match(elementText(projectedTree), /ETA 2m · current task 30s/)
+  assert.match(elementText(projectedTree), /ETA 1m 30s · current task 30s/)
   assert.match(elementText(projectedTree), /0 running · 0 preparing · 0 awaiting review · 1 waiting/)
   assert.doesNotMatch(elementText(projectedTree), /37 waiting|37 active/)
   assert.match(elementText(projectedTree), /Waiting in queue/)
   assert.doesNotMatch(elementText(projectedTree), /2 of 1|1 job ahead/)
   const mainSource = await readFile(mainUrl, 'utf8')
-  assert.match(mainSource, /ETA \{compactEta\(currentEtaSeconds\)\}/)
-  assert.match(mainSource, /currentSubtaskEtaSeconds != null \? ` · task \$\{compactEta\(currentSubtaskEtaSeconds\)\}`/)
-  assert.doesNotMatch(mainSource, /ETA \{compactEta\(currentJob\.etaSeconds\)\}/)
+  assert.match(mainSource, /ETA \{formatApproximateDuration\(currentEtaSeconds\)\}/)
+  assert.match(mainSource, /currentSubtaskEtaSeconds != null \? ` · task \$\{formatApproximateDuration\(currentSubtaskEtaSeconds\)\}`/)
+  assert.doesNotMatch(mainSource, /ETA \{formatApproximateDuration\(currentJob\.etaSeconds\)\}/)
 
   assert.equal(
     renderCards([parent, child], [parentQueue, childQueue]).length,
