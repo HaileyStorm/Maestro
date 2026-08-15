@@ -42,6 +42,9 @@ class TestDirectorCancellation(unittest.TestCase):
             "operations": pipeline._pipeline_operations,
             "deleting": pipeline._pipeline_deleting,
             "repairs": pipeline._pipeline_repairs,
+            "llm_contexts": pipeline._pipeline_llm_contexts,
+            "llm_tokens": pipeline._pipeline_llm_tokens,
+            "llm_cancel_handles": pipeline._pipeline_llm_cancel_handles,
             "run_generation": pipeline._run_generation,
             "wgp": pipeline._wgp,
             "settle_grace": pipeline._GENERATION_SETTLE_GRACE_S,
@@ -56,6 +59,9 @@ class TestDirectorCancellation(unittest.TestCase):
         pipeline._pipeline_operations = set()
         pipeline._pipeline_deleting = set()
         pipeline._pipeline_repairs = {}
+        pipeline._pipeline_llm_contexts = {}
+        pipeline._pipeline_llm_tokens = {}
+        pipeline._pipeline_llm_cancel_handles = {}
         pipeline._run_generation = None
         pipeline._wgp = SimpleNamespace(save_path=self.temp_dir.name)
         pipeline._GENERATION_SETTLE_GRACE_S = 10.0
@@ -70,6 +76,11 @@ class TestDirectorCancellation(unittest.TestCase):
         pipeline._pipeline_operations = self.originals["operations"]
         pipeline._pipeline_deleting = self.originals["deleting"]
         pipeline._pipeline_repairs = self.originals["repairs"]
+        pipeline._pipeline_llm_contexts = self.originals["llm_contexts"]
+        pipeline._pipeline_llm_tokens = self.originals["llm_tokens"]
+        pipeline._pipeline_llm_cancel_handles = self.originals[
+            "llm_cancel_handles"
+        ]
         pipeline._run_generation = self.originals["run_generation"]
         pipeline._wgp = self.originals["wgp"]
         pipeline._GENERATION_SETTLE_GRACE_S = self.originals["settle_grace"]

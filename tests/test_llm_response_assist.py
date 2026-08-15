@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -16,6 +17,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 from services import llm_response_assist as assist  # noqa: E402
 from services import llm_service  # noqa: E402
+from services.llm_cancellation import (  # noqa: E402
+    LlmCancellationHandle,
+    LlmRequestCancelled,
+)
 
 
 class _StreamResponse:
@@ -64,6 +69,73 @@ def _chunk(content="", *, reasoning="", timings=None, usage=None):
     if usage:
         value["usage"] = usage
     return "data: " + json.dumps(value)
+
+
+class _BlockingStreamResponse:
+    def __init__(self):
+        self.started = threading.Event()
+        self.released = threading.Event()
+        self.close_count = 0
+
+    def raise_for_status(self):
+        return None
+
+    def iter_lines(self, decode_unicode=True):
+        self.started.set()
+        if not self.released.wait(2):
+            raise AssertionError("response was not closed promptly")
+        raise llm_service.requests.exceptions.ConnectionError("response closed")
+
+    def close(self):
+        self.close_count += 1
+        self.released.set()
+
+
+class LlmCancellationHandleTests(unittest.TestCase):
+    class _Response:
+        def __init__(self):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+    def test_scope_identity_and_stop_before_register(self):
+        handle = LlmCancellationHandle()
+        stale = self._Response()
+        current = self._Response()
+        handle.register_response(stale)
+        handle.unregister_response(stale)
+        handle.register_response(current)
+        handle.unregister_response(stale)
+        handle.cancel()
+        handle.cancel()
+
+        self.assertEqual(stale.close_count, 0)
+        self.assertEqual(current.close_count, 1)
+        self.assertTrue(handle.cancelled)
+        with self.assertRaises(LlmRequestCancelled):
+            handle.checkpoint()
+
+        cancelled_first = LlmCancellationHandle()
+        late = self._Response()
+        cancelled_first.cancel()
+        cancelled_first.register_response(late)
+        self.assertEqual(late.close_count, 1)
+
+        reentrant = LlmCancellationHandle()
+        closed = threading.Event()
+
+        class ReentrantResponse:
+            def close(self):
+                reentrant.cancel()
+                closed.set()
+
+        reentrant.register_response(ReentrantResponse())
+        worker = threading.Thread(target=reentrant.cancel)
+        worker.start()
+        worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(closed.is_set())
 
 
 class ResponseAssistHelperTests(unittest.TestCase):
@@ -645,6 +717,155 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
         self.assertTrue(chat_response.closed)
         self.assertTrue(llm_service._stream_done)
 
+    def test_local_cancel_closes_blocked_stream_without_final_publication(self):
+        response = _BlockingStreamResponse()
+        handle = LlmCancellationHandle()
+        events = []
+        errors = []
+        patches = self._runtime_patches([response])
+
+        def run():
+            try:
+                llm_service.generate_streaming(
+                    "request",
+                    progress_callback=events.append,
+                    cancel_handle=handle,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patches[0], patches[1], patches[2] as finish, \
+                patches[3] as record_metrics, patches[4] as post:
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(response.started.wait(1))
+            handle.cancel()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], LlmRequestCancelled)
+        self.assertEqual(response.close_count, 1)
+        self.assertEqual(post.call_count, 1)
+        self.assertFalse(any(event["phase"] == "complete" for event in events))
+        record_metrics.assert_not_called()
+        finish.assert_called_once()
+
+    def test_anthropic_cancel_closes_blocked_stream_and_escapes(self):
+        response = _BlockingStreamResponse()
+        handle = LlmCancellationHandle()
+        events = []
+        errors = []
+
+        def run():
+            try:
+                llm_service._generate_streaming_anthropic(
+                    [{"role": "user", "content": "request"}],
+                    10,
+                    0.5,
+                    0.9,
+                    progress_callback=events.append,
+                    cancel_handle=handle,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(
+            llm_service.requests, "post", return_value=response,
+        ) as post:
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(response.started.wait(1))
+            handle.cancel()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], LlmRequestCancelled)
+        self.assertEqual(response.close_count, 1)
+        self.assertEqual(post.call_count, 1)
+        self.assertFalse(any(event["phase"] == "complete" for event in events))
+
+    def test_cancelled_refusal_suppresses_response_assist_retry(self):
+        handle = LlmCancellationHandle()
+        response = _StreamResponse([
+            _chunk("I cannot generate this"),
+            "data: [DONE]",
+        ])
+        events = []
+
+        def progress(event):
+            events.append(event)
+            if event["phase"] == "generating" and event["text"]:
+                handle.cancel()
+
+        patches = self._runtime_patches([response])
+        with patches[0], patches[1], patches[2], patches[3], \
+                patches[4] as post:
+            with self.assertRaises(LlmRequestCancelled):
+                llm_service.generate_streaming(
+                    "request",
+                    response_assist={
+                        "refusal_profile": "high_confidence",
+                        "retry_on_refusal": True,
+                    },
+                    progress_callback=progress,
+                    cancel_handle=handle,
+                )
+
+        self.assertEqual(post.call_count, 1)
+        self.assertFalse(any(event["phase"] == "retrying" for event in events))
+        self.assertFalse(any(event["phase"] == "complete" for event in events))
+
+    def test_cancelled_story_plan_never_starts_dialogue_rewrite(self):
+        handle = LlmCancellationHandle()
+        raw = json.dumps([{
+            "title": "Long dialogue",
+            "duration": 10,
+            "dialogue": [],
+            "scene_type": "dialogue",
+            "video_prompt": (
+                'A speaker says "one two three four five six seven eight nine '
+                'ten eleven twelve thirteen fourteen fifteen sixteen seventeen '
+                'eighteen nineteen twenty twenty-one twenty-two twenty-three '
+                'twenty-four twenty-five twenty-six twenty-seven" in frame.'
+            ),
+            "image_prompt": "A still frame",
+        }])
+
+        def initial_plan(**_kwargs):
+            handle.cancel()
+            return raw
+
+        with mock.patch.object(
+            llm_service, "generate_streaming", side_effect=initial_plan,
+        ), mock.patch.object(llm_service, "generate") as rewrite:
+            with self.assertRaises(LlmRequestCancelled):
+                llm_service.plan_short_film_from_story(
+                    "story",
+                    target_duration=10,
+                    target_scenes=1,
+                    cancel_handle=handle,
+                )
+        rewrite.assert_not_called()
+
+    def test_cancelled_h3_result_never_starts_format_repair(self):
+        handle = LlmCancellationHandle()
+        handle.cancel()
+        with mock.patch.object(llm_service, "generate") as repair:
+            with self.assertRaises(LlmRequestCancelled):
+                llm_service._finalize_h3_enhance_output(
+                    "malformed",
+                    "source",
+                    ref2va=False,
+                    duration_seconds=10,
+                    max_new_tokens=128,
+                    response_assist=None,
+                    progress_callback=None,
+                    cancel_handle=handle,
+                )
+        repair.assert_not_called()
+
     def test_live_refusal_closes_first_stream_and_retries_once(self):
         first = _StreamResponse([
             _chunk("I cannot "),
@@ -892,6 +1113,10 @@ class LlmResponseAssistRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(
                 parameters["progress_callback"].kind,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            self.assertEqual(
+                parameters["cancel_handle"].kind,
                 inspect.Parameter.KEYWORD_ONLY,
             )
 

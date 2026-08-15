@@ -22,6 +22,20 @@ if str(APP) not in sys.path:
 from services import director_pipeline as pipeline  # noqa: E402
 from services import llm_service  # noqa: E402
 from services.director import prompt_polish  # noqa: E402
+from services.director.planners.base import BasePlanner  # noqa: E402
+from services.director.planners.short_film import ShortFilmPlanner  # noqa: E402
+from services.director.schema import CharacterProfile  # noqa: E402
+from services.llm_cancellation import (  # noqa: E402
+    LlmCancellationHandle,
+    LlmRequestCancelled,
+)
+
+
+class _CancellationPlanner(BasePlanner):
+    skill_type = "test"
+
+    def plan(self, **kwargs):
+        raise NotImplementedError
 
 
 class DirectorLlmStreamingTests(unittest.TestCase):
@@ -31,6 +45,7 @@ class DirectorLlmStreamingTests(unittest.TestCase):
             "pipelines": pipeline._pipelines,
             "contexts": pipeline._pipeline_llm_contexts,
             "tokens": pipeline._pipeline_llm_tokens,
+            "cancel_handles": pipeline._pipeline_llm_cancel_handles,
             "jobs": pipeline._jobs,
             "active": pipeline._active_gen_states,
             "wgp": pipeline._wgp,
@@ -42,6 +57,7 @@ class DirectorLlmStreamingTests(unittest.TestCase):
         pipeline._pipelines = {}
         pipeline._pipeline_llm_contexts = {}
         pipeline._pipeline_llm_tokens = {}
+        pipeline._pipeline_llm_cancel_handles = {}
         pipeline._jobs = {}
         pipeline._active_gen_states = {}
         pipeline._wgp = SimpleNamespace(
@@ -59,6 +75,9 @@ class DirectorLlmStreamingTests(unittest.TestCase):
         pipeline._pipelines = self.originals["pipelines"]
         pipeline._pipeline_llm_contexts = self.originals["contexts"]
         pipeline._pipeline_llm_tokens = self.originals["tokens"]
+        pipeline._pipeline_llm_cancel_handles = self.originals[
+            "cancel_handles"
+        ]
         pipeline._jobs = self.originals["jobs"]
         pipeline._active_gen_states = self.originals["active"]
         pipeline._wgp = self.originals["wgp"]
@@ -94,7 +113,8 @@ class DirectorLlmStreamingTests(unittest.TestCase):
             "response_assist": {"retry_on_refusal": True},
         }
 
-        def fake_generate(*, progress_callback, response_assist):
+        def fake_generate(*, progress_callback, response_assist, cancel_handle):
+            self.assertIsInstance(cancel_handle, LlmCancellationHandle)
             self.assertTrue(response_assist["retry_on_refusal"])
             progress_callback({
                 "phase": "generating", "text": "a" * 9000,
@@ -148,7 +168,8 @@ class DirectorLlmStreamingTests(unittest.TestCase):
         barrier = threading.Barrier(2)
 
         def run(pid: str, marker: str):
-            def fake(*, progress_callback):
+            def fake(*, progress_callback, cancel_handle):
+                self.assertIsInstance(cancel_handle, LlmCancellationHandle)
                 barrier.wait(timeout=2)
                 progress_callback({
                     "phase": "generating", "text": marker,
@@ -178,10 +199,11 @@ class DirectorLlmStreamingTests(unittest.TestCase):
 
     def test_stale_callback_and_terminal_pipeline_updates_are_rejected(self):
         record = self._add_pipeline("stale")
-        _old_token, old_callback = pipeline._begin_pipeline_llm_pass(
+        _old_token, _old_handle, old_callback = pipeline._begin_pipeline_llm_pass(
             "stale", phase="planning", pass_name="old", attempt_limit=1,
         )
-        _new_token, new_callback = pipeline._begin_pipeline_llm_pass(
+        pipeline._finish_pipeline_llm_pass("stale", _old_token)
+        _new_token, _new_handle, new_callback = pipeline._begin_pipeline_llm_pass(
             "stale", phase="planning", pass_name="new", attempt_limit=1,
         )
         old_callback({
@@ -201,7 +223,7 @@ class DirectorLlmStreamingTests(unittest.TestCase):
 
     def test_stop_clears_partial_and_makes_callback_inert(self):
         record = self._add_pipeline("stop")
-        _token, callback = pipeline._begin_pipeline_llm_pass(
+        _token, _cancel_handle, callback = pipeline._begin_pipeline_llm_pass(
             "stop", phase="planning", pass_name="active", attempt_limit=1,
         )
         callback({
@@ -251,6 +273,167 @@ class DirectorLlmStreamingTests(unittest.TestCase):
                     liveness_kwarg="is_active",
                 )
 
+        self.assertEqual(calls, ["video"])
+
+    def test_stop_closes_blocked_response_and_rejects_late_chunk(self):
+        record = self._add_pipeline("blocked")
+        entered = threading.Event()
+        closed = threading.Event()
+        result = []
+        close_lock_free = []
+
+        class BlockingResponse:
+            def close(self):
+                acquired = pipeline._pipeline_lock.acquire(timeout=0.2)
+                close_lock_free.append(acquired)
+                if acquired:
+                    pipeline._pipeline_lock.release()
+                closed.set()
+
+        response = BlockingResponse()
+
+        def fake_generate(*, progress_callback, cancel_handle):
+            cancel_handle.register_response(response)
+            entered.set()
+            self.assertTrue(closed.wait(timeout=2))
+            cancel_handle.unregister_response(response)
+            progress_callback({
+                "phase": "generating", "text": "LATE_CHUNK",
+                "attempt": 1, "generated_tokens_approx": 2,
+                "elapsed_seconds": 1.0, "live_tps": 2.0,
+                "done": False,
+            })
+            cancel_handle.checkpoint()
+            return "late"
+
+        def run():
+            try:
+                pipeline._pipeline_llm_call(
+                    "blocked", "planning", "blocked_response", fake_generate,
+                )
+            except BaseException as exc:
+                result.append(exc)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=2))
+        self.assertTrue(pipeline.stop_pipeline("blocked"))
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(closed.is_set())
+        self.assertEqual(close_lock_free, [True])
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], pipeline._DirectorLlmCancelled)
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["llm_progress"]["activity"], "cancelled")
+        self.assertNotIn("LATE_CHUNK", json.dumps(record))
+        self.assertNotIn("blocked", pipeline._pipeline_llm_cancel_handles)
+
+    def test_stale_handle_cannot_cancel_successor_or_other_pipeline(self):
+        self._add_pipeline("same")
+        self._add_pipeline("other")
+        old_token, old_handle, _old_callback = (
+            pipeline._begin_pipeline_llm_pass(
+                "same", phase="planning", pass_name="old", attempt_limit=1,
+            )
+        )
+        pipeline._finish_pipeline_llm_pass("same", old_token)
+        new_token, new_handle, _new_callback = (
+            pipeline._begin_pipeline_llm_pass(
+                "same", phase="planning", pass_name="new", attempt_limit=1,
+            )
+        )
+        other_token, other_handle, _other_callback = (
+            pipeline._begin_pipeline_llm_pass(
+                "other", phase="planning", pass_name="other", attempt_limit=1,
+            )
+        )
+
+        old_handle.cancel()
+
+        self.assertTrue(old_handle.cancelled)
+        self.assertFalse(new_handle.cancelled)
+        self.assertFalse(other_handle.cancelled)
+        self.assertIs(
+            pipeline._pipeline_llm_cancel_handles["same"][0], new_token,
+        )
+        self.assertIs(
+            pipeline._pipeline_llm_cancel_handles["other"][0], other_token,
+        )
+        pipeline._finish_pipeline_llm_pass("same", new_token)
+        pipeline._finish_pipeline_llm_pass("other", other_token)
+
+    def test_json_grammar_fallback_does_not_swallow_cancellation(self):
+        calls = []
+
+        def cancelled_generate(**kwargs):
+            calls.append(dict(kwargs))
+            raise LlmRequestCancelled("cancelled")
+
+        planner = _CancellationPlanner(llm_generate=cancelled_generate)
+        with self.assertRaises(LlmRequestCancelled):
+            planner._call_llm_json(
+                "request", "system", thinking_budget=0,
+                streaming=False, json_schema={"type": "array"},
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_h3_optional_llm_passes_do_not_swallow_cancellation(self):
+        calls = []
+
+        def cancelled_generate(**kwargs):
+            calls.append(dict(kwargs))
+            raise LlmRequestCancelled("cancelled")
+
+        planner = ShortFilmPlanner(llm_generate=cancelled_generate)
+        character = CharacterProfile(
+            id="char_0", display_name="Ari",
+            physical_description="a synthetic performer",
+        )
+        with self.assertRaises(LlmRequestCancelled):
+            planner._build_h3_character_voice_bible(
+                story_description="A synthetic scene.",
+                char_profiles=[character],
+            )
+        self.assertEqual(len(calls), 1)
+
+        calls.clear()
+        with self.assertRaises(LlmRequestCancelled):
+            planner._run_h3_character_table_read(
+                story_description="A synthetic scene.",
+                screenplay='ARI: "Hello."',
+                manifest=[{
+                    "speaker_name": "Ari", "spoken_text": "Hello.",
+                }],
+                voice_bible=[],
+                max_spoken_words=20,
+                maximum_line_words=10,
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_polish_exception_does_not_start_later_request(self):
+        calls = []
+
+        def cancelled_enhance(**kwargs):
+            calls.append(kwargs["mode"])
+            raise LlmRequestCancelled("cancelled")
+
+        plans = [{
+            "video_prompt": "Synthetic motion.",
+            "image_prompt": "Synthetic still.",
+        }]
+        with mock.patch.object(
+            llm_service, "enhance_prompt", side_effect=cancelled_enhance,
+        ):
+            with self.assertRaises(LlmRequestCancelled):
+                prompt_polish.polish_prompts_third_pass(
+                    plans,
+                    "ltx2_22B_distilled_1_1",
+                    "flux2_klein_9b",
+                    polish_video_prompts=True,
+                    polish_image_prompts=True,
+                    cancel_handle=LlmCancellationHandle(),
+                )
         self.assertEqual(calls, ["video"])
 
     def test_checkpoint_omits_transient_and_raw_llm_content(self):
@@ -319,7 +502,8 @@ class DirectorLlmStreamingTests(unittest.TestCase):
             observed.append(dict(kwargs))
             yield ("synthetic",)
 
-        def fake_generate(*, progress_callback):
+        def fake_generate(*, progress_callback, cancel_handle):
+            self.assertIsInstance(cancel_handle, LlmCancellationHandle)
             progress_callback({
                 "phase": "complete", "text": "done", "attempt": 1,
                 "generated_tokens_approx": 1, "elapsed_seconds": 0.1,

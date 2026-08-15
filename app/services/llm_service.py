@@ -20,6 +20,10 @@ from contextlib import contextmanager
 from urllib.parse import unquote, urlsplit
 from typing import Callable, Optional, Sequence
 
+from services.llm_cancellation import (
+    LlmCancellationHandle,
+    LlmRequestCancelled,
+)
 from services.llm_response_assist import (
     PrefixEchoStripper,
     RequestProgress,
@@ -31,6 +35,31 @@ from services.llm_response_assist import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _cancellation_checkpoint(
+    cancel_handle: Optional[LlmCancellationHandle],
+) -> None:
+    if cancel_handle is not None:
+        cancel_handle.checkpoint()
+
+
+def _register_cancellable_response(
+    cancel_handle: Optional[LlmCancellationHandle],
+    response,
+) -> None:
+    if cancel_handle is not None:
+        cancel_handle.register_response(response)
+        cancel_handle.checkpoint()
+
+
+def _unregister_cancellable_response(
+    cancel_handle: Optional[LlmCancellationHandle],
+    response,
+) -> bool:
+    if cancel_handle is None:
+        return True
+    return cancel_handle.unregister_response(response)
 
 # Singleton state
 _process: Optional[subprocess.Popen] = None
@@ -4517,6 +4546,7 @@ def generate_chat(
     enable_thinking: Optional[bool] = None,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> str:
     """Atomically load the selected model and run a role-preserving chat.
 
@@ -4525,6 +4555,7 @@ def generate_chat(
     an idle unload or another request from swapping the process mid-turn.
     """
     global _stream_done
+    _cancellation_checkpoint(cancel_handle)
     clean_messages = validate_chat_messages(messages)
     if (
         isinstance(max_new_tokens, bool)
@@ -4560,6 +4591,7 @@ def generate_chat(
         raise RuntimeError("LLM did not finish loading")
     if image_paths and not _vision_available:
         raise ValueError("The selected LLM has no available vision projector")
+    _cancellation_checkpoint(cancel_handle)
 
     _cancel_idle_timer()
     prepared_system, enable_thinking, thinking_budget = _prepare_thinking(
@@ -4627,6 +4659,7 @@ def generate_chat(
                 max(temperature, 0.01),
                 top_p,
                 progress_callback=progress_callback,
+                cancel_handle=cancel_handle,
             )
         else:
             content = _generate_anthropic(
@@ -4634,6 +4667,7 @@ def generate_chat(
                 max_new_tokens + thinking_budget,
                 max(temperature, 0.01),
                 top_p,
+                cancel_handle=cancel_handle,
             )
     elif use_stream:
         progress = RequestProgress(progress_callback)
@@ -4661,6 +4695,7 @@ def generate_chat(
                 request_pass=attempt,
             )
             try:
+                _cancellation_checkpoint(cancel_handle)
                 response = requests.post(
                     f"{_server_url()}/v1/chat/completions",
                     json=attempt_payload,
@@ -4668,9 +4703,11 @@ def generate_chat(
                     timeout=(10, 600),
                     stream=True,
                 )
+                _register_cancellable_response(cancel_handle, response)
                 response.raise_for_status()
                 import json as _json_mod
                 for line in response.iter_lines(decode_unicode=True):
+                    _cancellation_checkpoint(cancel_handle)
                     if not line or not line.startswith("data: "):
                         continue
                     encoded = line[6:]
@@ -4729,17 +4766,29 @@ def generate_chat(
                         ):
                             refused = True
                             break
+                    except LlmRequestCancelled:
+                        raise
                     except Exception:
                         continue
             except requests.exceptions.RequestException as error:
+                _cancellation_checkpoint(cancel_handle)
                 raise _diagnose_llm_request_failure(error) from error
+            except LlmRequestCancelled:
+                raise
+            except Exception:
+                _cancellation_checkpoint(cancel_handle)
+                raise
             finally:
+                close_owned_response = _unregister_cancellable_response(
+                    cancel_handle, response,
+                )
                 close_response = getattr(response, "close", None)
-                if callable(close_response):
+                if close_owned_response and callable(close_response):
                     close_response()
                 with _stream_lock:
                     _stream_done = True
             if refused:
+                _cancellation_checkpoint(cancel_handle)
                 print("[LLM] Response-assist retry 1/1")
                 continue
             content = _strip_thinking_tags(prefix_stripper.finish()).strip()
@@ -4755,6 +4804,7 @@ def generate_chat(
             or isinstance(average_tps, bool)
         ):
             average_tps = None
+        _cancellation_checkpoint(cancel_handle)
         progress.emit(
             "complete",
             content,
@@ -4769,22 +4819,35 @@ def generate_chat(
             multimodal=bool(image_paths),
             request_pass=1,
         )
+        response = None
         try:
+            _cancellation_checkpoint(cancel_handle)
             response = requests.post(
                 f"{_server_url()}/v1/chat/completions",
                 json=payload,
                 headers=_api_headers(),
                 timeout=(10, 600),
+                stream=True,
             )
+            _register_cancellable_response(cancel_handle, response)
             response.raise_for_status()
-        except requests.exceptions.RequestException as error:
-            raise _diagnose_llm_request_failure(error) from error
-        try:
             response_data = response.json()
+            _cancellation_checkpoint(cancel_handle)
             _observe_runtime_output_metrics(response_data, request_pass=1)
             message = response_data["choices"][0]["message"]
+        except requests.exceptions.RequestException as error:
+            _cancellation_checkpoint(cancel_handle)
+            raise _diagnose_llm_request_failure(error) from error
         except (KeyError, IndexError, TypeError, ValueError) as error:
+            _cancellation_checkpoint(cancel_handle)
             raise RuntimeError("LLM returned an invalid chat response") from error
+        finally:
+            close_owned_response = _unregister_cancellable_response(
+                cancel_handle, response,
+            )
+            close_response = getattr(response, "close", None)
+            if close_owned_response and callable(close_response):
+                close_response()
         raw_content = message.get("content") or ""
         content = _public_response_text(
             raw_content,
@@ -4793,6 +4856,7 @@ def generate_chat(
         ).strip()
     if not content:
         raise RuntimeError("LLM returned an empty chat response")
+    _cancellation_checkpoint(cancel_handle)
     if _provider != "anthropic":
         _record_response_metrics(
             response_data, multimodal=bool(image_paths),
@@ -4817,6 +4881,7 @@ def generate(
     json_schema: Optional[dict] = None,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> str:
     """Generate text via llama-server's OpenAI-compatible chat endpoint.
 
@@ -4834,6 +4899,7 @@ def generate(
             the model physically cannot emit prose, markdown fences, or the
             repeat-loop garbage that breaks structured planning passes.
     """
+    _cancellation_checkpoint(cancel_handle)
     if not is_loaded():
         raise RuntimeError("LLM not loaded. Call load_model() first.")
 
@@ -4857,6 +4923,7 @@ def generate(
             json_schema=json_schema,
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
 
     # Cancel idle timer during active request — prevents auto-unload mid-generation.
@@ -4945,7 +5012,13 @@ def generate(
             print(f"[LLM] json_schema requested but provider={_provider} — sending unconstrained (grammar is local llama-server only)")
 
     if _provider == "anthropic":
-        return _generate_anthropic(messages, total_tokens, max(temperature, 0.01), top_p)
+        return _generate_anthropic(
+            messages,
+            total_tokens,
+            max(temperature, 0.01),
+            top_p,
+            cancel_handle=cancel_handle,
+        )
 
     retry_enabled = (
         _provider == "local"
@@ -4954,6 +5027,7 @@ def generate(
     data = {}
     raw_content = ""
     for attempt in range(1, 3 if retry_enabled else 2):
+        _cancellation_checkpoint(cancel_handle)
         attempt_payload = dict(payload)
         if attempt > 1 and isinstance(payload.get("seed"), int):
             attempt_payload["seed"] = payload["seed"] + attempt - 1
@@ -4962,7 +5036,9 @@ def generate(
             multimodal=multimodal,
             request_pass=attempt,
         )
+        resp = None
         try:
+            _cancellation_checkpoint(cancel_handle)
             resp = requests.post(
                 f"{_server_url()}/v1/chat/completions",
                 json=attempt_payload,
@@ -4970,28 +5046,46 @@ def generate(
                 # (connect, read): fail fast if the server socket is gone;
                 # allow a long read for actual generation.
                 timeout=(10, 600),
+                stream=True,
             )
+            _register_cancellable_response(cancel_handle, resp)
             resp.raise_for_status()
+            data = resp.json()
+            _cancellation_checkpoint(cancel_handle)
+            _observe_runtime_output_metrics(data, request_pass=attempt)
+            raw_content = data["choices"][0]["message"]["content"] or ""
+            public_content = _public_response_text(
+                raw_content,
+                assistant_prefix,
+                strip_prefix=normalize_response_assist(
+                    response_assist,
+                ).strip_assistant_prefill,
+            )
         except requests.exceptions.RequestException as e:
             # A dead subprocess surfaces here as a ConnectionError; translate it
             # into an actionable error naming the real cause (see the helper).
+            _cancellation_checkpoint(cancel_handle)
             raise _diagnose_llm_request_failure(e) from e
-        data = resp.json()
-        _observe_runtime_output_metrics(data, request_pass=attempt)
-        raw_content = data["choices"][0]["message"]["content"] or ""
-        public_content = _public_response_text(
-            raw_content,
-            assistant_prefix,
-            strip_prefix=normalize_response_assist(
-                response_assist,
-            ).strip_assistant_prefill,
-        )
+        except LlmRequestCancelled:
+            raise
+        except Exception:
+            _cancellation_checkpoint(cancel_handle)
+            raise
+        finally:
+            close_owned_response = _unregister_cancellable_response(
+                cancel_handle, resp,
+            )
+            close_response = getattr(resp, "close", None)
+            if close_owned_response and callable(close_response):
+                close_response()
         if attempt == 1 and retry_enabled and response_assist_refused(
             public_content, response_assist,
         ):
+            _cancellation_checkpoint(cancel_handle)
             print("[LLM] Response-assist retry 1/1")
             continue
         break
+    _cancellation_checkpoint(cancel_handle)
     finish_reason = data["choices"][0].get("finish_reason", "unknown")
     usage = data.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens", "?")
@@ -5012,6 +5106,7 @@ def generate(
             f"reasoning with no answer content ({len(raw_content)} raw chars)"
         )
 
+    _cancellation_checkpoint(cancel_handle)
     _record_response_metrics(
         data, multimodal=multimodal,
     )
@@ -5042,6 +5137,7 @@ def generate_streaming(
     json_schema: Optional[dict] = None,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> str:
     """Generate text using SSE streaming, populating the stream buffer in real-time.
 
@@ -5058,6 +5154,7 @@ def generate_streaming(
     """
     global _stream_buffer, _stream_done, _last_system_prompt, _last_user_prompt, _last_thinking_text
 
+    _cancellation_checkpoint(cancel_handle)
     if not is_loaded():
         raise RuntimeError("LLM not loaded. Call load_model() first.")
 
@@ -5189,6 +5286,7 @@ def generate_streaming(
         return _generate_streaming_anthropic(
             messages, total_tokens, max(temperature, 0.01), top_p,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
 
     normalized_assist = normalize_response_assist(response_assist)
@@ -5202,6 +5300,7 @@ def generate_streaming(
     completed_stream_metrics = {}
     stream_completed = False
     for attempt in range(1, 3 if retry_enabled else 2):
+        _cancellation_checkpoint(cancel_handle)
         if attempt > 1:
             progress.retrying(attempt=attempt)
             if not request_scoped_progress:
@@ -5229,6 +5328,7 @@ def generate_streaming(
             request_pass=attempt,
         )
         try:
+            _cancellation_checkpoint(cancel_handle)
             resp = requests.post(
                 f"{_server_url()}/v1/chat/completions",
                 json=attempt_payload,
@@ -5236,10 +5336,12 @@ def generate_streaming(
                 timeout=(10, 600),
                 stream=True,
             )
+            _register_cancellable_response(cancel_handle, resp)
             resp.raise_for_status()
 
             import json as _json_mod
             for line in resp.iter_lines(decode_unicode=True):
+                _cancellation_checkpoint(cancel_handle)
                 if not line or not line.startswith("data: "):
                     continue
                 data_str = line[6:]  # strip "data: "
@@ -5323,6 +5425,8 @@ def generate_streaming(
                     ):
                         refused = True
                         break
+                except LlmRequestCancelled:
+                    raise
                 except Exception:
                     continue
 
@@ -5332,18 +5436,24 @@ def generate_streaming(
             if not request_scoped_progress:
                 with _stream_lock:
                     _stream_done = True
+            _cancellation_checkpoint(cancel_handle)
             raise _diagnose_llm_request_failure(e) from e
         except Exception:
             if not request_scoped_progress:
                 with _stream_lock:
                     _stream_done = True
+            _cancellation_checkpoint(cancel_handle)
             raise
         finally:
+            close_owned_response = _unregister_cancellable_response(
+                cancel_handle, resp,
+            )
             close_response = getattr(resp, "close", None)
-            if callable(close_response):
+            if close_owned_response and callable(close_response):
                 close_response()
 
         if refused:
+            _cancellation_checkpoint(cancel_handle)
             print("[LLM] Response-assist retry 1/1")
             continue
         break
@@ -5356,6 +5466,7 @@ def generate_streaming(
     #      — emitted by Gemma 4 Heretic and similar fine-tunes whose
     #      chat templates don't extract thinking into reasoning_content.
     # Prefer (1) when present, fall back to (2).
+    _cancellation_checkpoint(cancel_handle)
     inline_gemma_match = _GEMMA_THINKING_INNER_RE.search(raw_content)
     inline_gemma_thinking = inline_gemma_match.group(1) if inline_gemma_match else ""
     if not request_scoped_progress:
@@ -5385,6 +5496,7 @@ def generate_streaming(
             _stream_buffer = full_raw  # keep full raw for the UI to show thinking
             _stream_done = True
 
+    _cancellation_checkpoint(cancel_handle)
     if stream_completed and completed_stream_metrics:
         _record_response_metrics(
             completed_stream_metrics,
@@ -5399,6 +5511,7 @@ def generate_streaming(
     if not isinstance(average_tps, (int, float)) or isinstance(average_tps, bool):
         average_tps = None
     final_content = content.strip()
+    _cancellation_checkpoint(cancel_handle)
     progress.emit(
         "complete",
         final_content,
@@ -5410,7 +5523,14 @@ def generate_streaming(
     return final_content
 
 
-def _generate_anthropic(messages: list, max_tokens: int, temperature: float, top_p: float) -> str:
+def _generate_anthropic(
+    messages: list,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    *,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
+) -> str:
     """Non-streaming generation via Anthropic Messages API."""
     # Anthropic uses system as a top-level param, not in messages
     system_text = ""
@@ -5431,14 +5551,35 @@ def _generate_anthropic(messages: list, max_tokens: int, temperature: float, top
     if system_text:
         payload["system"] = system_text
 
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        json=payload,
-        headers=_api_headers(),
-        timeout=600,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    resp = None
+    try:
+        _cancellation_checkpoint(cancel_handle)
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            json=payload,
+            headers=_api_headers(),
+            timeout=600,
+            stream=True,
+        )
+        _register_cancellable_response(cancel_handle, resp)
+        resp.raise_for_status()
+        data = resp.json()
+        _cancellation_checkpoint(cancel_handle)
+    except requests.exceptions.RequestException:
+        _cancellation_checkpoint(cancel_handle)
+        raise
+    except LlmRequestCancelled:
+        raise
+    except Exception:
+        _cancellation_checkpoint(cancel_handle)
+        raise
+    finally:
+        close_owned_response = _unregister_cancellable_response(
+            cancel_handle, resp,
+        )
+        close_response = getattr(resp, "close", None)
+        if close_owned_response and callable(close_response):
+            close_response()
 
     # Anthropic response: {"content": [{"type": "text", "text": "..."}], ...}
     raw_content = ""
@@ -5447,6 +5588,7 @@ def _generate_anthropic(messages: list, max_tokens: int, temperature: float, top
             raw_content += block.get("text", "")
 
     usage = data.get("usage", {})
+    _cancellation_checkpoint(cancel_handle)
     print(f"[LLM/Anthropic] Response: {usage.get('output_tokens', '?')} tokens (prompt={usage.get('input_tokens', '?')})")
 
     content = _strip_thinking_tags(raw_content)
@@ -5460,6 +5602,7 @@ def _generate_streaming_anthropic(
     top_p: float,
     *,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> str:
     """Streaming generation via Anthropic Messages API with SSE."""
     global _stream_buffer, _stream_done
@@ -5484,11 +5627,13 @@ def _generate_streaming_anthropic(
     if system_text:
         payload["system"] = system_text
 
+    _cancellation_checkpoint(cancel_handle)
     progress = RequestProgress(progress_callback)
     progress.emit("generating", "", attempt=1)
     raw_content = ""
     resp = None
     try:
+        _cancellation_checkpoint(cancel_handle)
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             json=payload,
@@ -5496,10 +5641,12 @@ def _generate_streaming_anthropic(
             timeout=600,
             stream=True,
         )
+        _register_cancellable_response(cancel_handle, resp)
         resp.raise_for_status()
 
         import json
         for line in resp.iter_lines():
+            _cancellation_checkpoint(cancel_handle)
             if not line:
                 continue
             line_str = line.decode("utf-8", errors="replace")
@@ -5524,7 +5671,10 @@ def _generate_streaming_anthropic(
                             _stream_buffer = raw_content
                     progress.emit("generating", raw_content, attempt=1)
 
+    except LlmRequestCancelled:
+        raise
     except Exception as e:
+        _cancellation_checkpoint(cancel_handle)
         print(f"[LLM/Anthropic] Streaming error: {e}")
         if not request_scoped_progress:
             with _stream_lock:
@@ -5532,12 +5682,16 @@ def _generate_streaming_anthropic(
                 _stream_done = True
         return ""
     finally:
+        close_owned_response = _unregister_cancellable_response(
+            cancel_handle, resp,
+        )
         close_response = getattr(resp, "close", None)
-        if callable(close_response):
+        if close_owned_response and callable(close_response):
             close_response()
         with _stream_lock:
             _stream_done = True
 
+    _cancellation_checkpoint(cancel_handle)
     content = _strip_thinking_tags(raw_content)
 
     if not request_scoped_progress:
@@ -5546,6 +5700,7 @@ def _generate_streaming_anthropic(
             _stream_done = True
 
     final_content = content.strip()
+    _cancellation_checkpoint(cancel_handle)
     progress.emit("complete", final_content, attempt=1, done=True)
     return final_content
 
@@ -6240,9 +6395,11 @@ def _finalize_h3_enhance_output(
     max_new_tokens: int,
     response_assist: Optional[dict],
     progress_callback: Optional[Callable[[dict], None]],
+    cancel_handle: Optional[LlmCancellationHandle],
 ) -> str:
     """Validate H3 output, make one local format-only repair, then fail closed."""
 
+    _cancellation_checkpoint(cancel_handle)
     candidate = _clean_h3_context_ir_output(result)
     errors = _h3_enhance_contract_errors(
         candidate,
@@ -6276,6 +6433,7 @@ def _finalize_h3_enhance_output(
     # across the locality check and repair call so another request cannot swap
     # in a remote provider between those two operations.
     with _lock:
+        _cancellation_checkpoint(cancel_handle)
         if _provider != "local":
             raise ValueError(
                 "MiniMax H3 output violated its Context-IR contract and local "
@@ -6290,7 +6448,9 @@ def _finalize_h3_enhance_output(
             thinking_budget=0,
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
+    _cancellation_checkpoint(cancel_handle)
     repaired = _clean_h3_context_ir_output(repaired)
     final_errors = _h3_enhance_contract_errors(
         repaired,
@@ -6329,7 +6489,9 @@ def enhance_prompt(
     h3_style_workflow_present: bool = False,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> str:
+    _cancellation_checkpoint(cancel_handle)
     is_h3_context_ir = (
         mode in ("video", "avatar")
         and (model_type or "").lower().startswith("minimax_h3")
@@ -6416,6 +6578,7 @@ def enhance_prompt(
             stop=["<think>", "<thinking>"],
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
         if is_h3_context_ir and result:
             # Director has already authored the complete Context-IR. Semantic
@@ -6439,6 +6602,7 @@ def enhance_prompt(
                 max_new_tokens=override_max_tokens,
                 response_assist=response_assist,
                 progress_callback=progress_callback,
+                cancel_handle=cancel_handle,
             )
         return result.strip() if result else prompt
 
@@ -6492,6 +6656,7 @@ def enhance_prompt(
             temperature=temperature, enable_thinking=False,
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
         lines = [ln.strip() for ln in (prompt or "").split("\n") if ln.strip()]
         if (
@@ -6502,6 +6667,7 @@ def enhance_prompt(
             print(f"[Enhance] Raw enhancer: per-window x{window_count} ({model_type})")
             outs = []
             for i, ln in enumerate(lines):
+                _cancellation_checkpoint(cancel_handle)
                 # Image only informs window 1; later windows continue from it.
                 w_prompt = _build_enhance_user_prompt(ln, mode, window_size_seconds, 1, window_size_seconds)
                 r = generate(prompt=w_prompt, image_paths=(image_paths if i == 0 else None), **gen_kw)
@@ -6527,6 +6693,7 @@ def enhance_prompt(
                 max_new_tokens=raw_max_tokens,
                 response_assist=response_assist,
                 progress_callback=progress_callback,
+                cancel_handle=cancel_handle,
             )
         return _clean_enhancer_output(result) or prompt
 
@@ -6819,6 +6986,7 @@ def enhance_prompt(
         presence_penalty=0.1,   # encourage variety
         response_assist=response_assist,
         progress_callback=progress_callback,
+        cancel_handle=cancel_handle,
     )
 
     # Post-process. H3's repeated record labels are required syntax, so its
@@ -6833,6 +7001,7 @@ def enhance_prompt(
                 max_new_tokens=effective_max_tokens,
                 response_assist=response_assist,
                 progress_callback=progress_callback,
+                cancel_handle=cancel_handle,
             )
         else:
             result = _clean_enhance_output(result)
@@ -6844,6 +7013,7 @@ def enhance_prompt(
                 "Prompt enhancement changed a locked global timestamp; "
                 "the original Studio timeline was preserved"
             )
+    _cancellation_checkpoint(cancel_handle)
     return result
 
 
@@ -6889,8 +7059,10 @@ def describe_image(
     image_paths: Optional[Sequence[str]] = None,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> str:
     """Describe one or more caller-authorized images with a vision model."""
+    _cancellation_checkpoint(cancel_handle)
     if image_paths is None:
         authorized_paths = [image_path] if image_path else []
     else:
@@ -6928,6 +7100,7 @@ def describe_image(
         ),
         response_assist=response_assist,
         progress_callback=progress_callback,
+        cancel_handle=cancel_handle,
     )
 
 
@@ -7021,6 +7194,7 @@ def plan_clip_prompts(
     *,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> list:
     """Generate per-clip video prompts based on audio analysis and style.
 
@@ -7036,6 +7210,7 @@ def plan_clip_prompts(
     Returns:
         List of prompt strings, one per clip
     """
+    _cancellation_checkpoint(cancel_handle)
     if not clips:
         return []
 
@@ -7065,6 +7240,7 @@ def plan_clip_prompts(
     )
 
     for batch_start in range(0, len(clips), BATCH_SIZE):
+        _cancellation_checkpoint(cancel_handle)
         batch = clips[batch_start:batch_start + BATCH_SIZE]
         batch_size = len(batch)
 
@@ -7099,6 +7275,7 @@ def plan_clip_prompts(
             ),
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
 
         # Parse numbered lines
@@ -7144,6 +7321,7 @@ def plan_angle_prompts(
     *,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> list:
     """Generate image-edit prompts for camera angle variations of a reference photo.
 
@@ -7157,6 +7335,7 @@ def plan_angle_prompts(
     Returns:
         List of image-edit prompt strings, one per angle
     """
+    _cancellation_checkpoint(cancel_handle)
     angles = ANGLE_CATEGORIES[:num_angles]
 
     angle_list = "\n".join(
@@ -7192,6 +7371,7 @@ def plan_angle_prompts(
         ),
         response_assist=response_assist,
         progress_callback=progress_callback,
+        cancel_handle=cancel_handle,
     )
 
     import re
@@ -7722,6 +7902,7 @@ def classify_song_sections(
     *,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> dict:
     """Classify song sections using repetition detection, with LLM fallback.
 
@@ -7733,6 +7914,7 @@ def classify_song_sections(
           labels: List of label strings, one per audio section
           song_structure: List of dicts [{label, display_label, start}, ...]
     """
+    _cancellation_checkpoint(cancel_handle)
     empty_result = {"labels": [], "song_structure": []}
     if not sections:
         return empty_result
@@ -7806,6 +7988,7 @@ def classify_song_sections(
         ),
         response_assist=response_assist,
         progress_callback=progress_callback,
+        cancel_handle=cancel_handle,
     )
 
     print(f"[LLM] Raw classification output:\n{raw}")
@@ -8039,6 +8222,7 @@ def plan_clip_prompts_and_images(
     h3_style_workflow_present: bool = False,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> list:
     """Generate per-clip prompts.  Supports three modes via *prompt_type*:
 
@@ -8051,6 +8235,7 @@ def plan_clip_prompts_and_images(
         ``prompt_type="video"``  → ``[{"video_prompt": str}, ...]``
         ``prompt_type="both"``   → ``[{"video_prompt": str, "image_prompt": str}, ...]``
     """
+    _cancellation_checkpoint(cancel_handle)
     if not clips:
         return []
 
@@ -8354,6 +8539,7 @@ def plan_clip_prompts_and_images(
     print(f"[LLM] Planning prompts: prompt_type={prompt_type}, {len(clips)} clips")
 
     for batch_start in range(0, len(clips), BATCH_SIZE):
+        _cancellation_checkpoint(cancel_handle)
         batch = clips[batch_start:batch_start + BATCH_SIZE]
         batch_size = len(batch)
 
@@ -8427,6 +8613,7 @@ def plan_clip_prompts_and_images(
             ),
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
 
         print(f"[LLM] Output:\n{raw}")
@@ -8490,6 +8677,7 @@ def plan_clip_prompts_and_images(
 
         print(f"[LLM] Planned {prompt_type} prompts for clips {batch_start + 1}-{batch_start + batch_size}")
 
+    _cancellation_checkpoint(cancel_handle)
     return all_plans[:len(clips)]
 
 
@@ -8578,6 +8766,7 @@ def plan_short_film_prompts(
     h3_style_workflow_present: bool = False,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> list:
     """Generate per-clip prompts for short film mode.
 
@@ -8587,6 +8776,7 @@ def plan_short_film_prompts(
 
     Returns same format as plan_clip_prompts_and_images.
     """
+    _cancellation_checkpoint(cancel_handle)
     if not clips:
         return []
 
@@ -8870,6 +9060,7 @@ def plan_short_film_prompts(
         ),
         response_assist=response_assist,
         progress_callback=progress_callback,
+        cancel_handle=cancel_handle,
     )
 
     print(f"[LLM] Output:\n{raw}")
@@ -8914,6 +9105,7 @@ def plan_short_film_prompts(
             ip = image_prompts[k] if k < len(image_prompts) else f"Scene {k + 1} establishing frame"
             all_plans.append({"video_prompt": vp, "image_prompt": ip})
 
+    _cancellation_checkpoint(cancel_handle)
     return all_plans[:len(clips)]
 
 
@@ -8943,6 +9135,7 @@ def plan_short_film_from_story(
     h3_style_workflow_present: bool = False,
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> dict:
     """Plan a short film scene structure from a story description.
 
@@ -8954,6 +9147,7 @@ def plan_short_film_from_story(
     - clips: same format as ``plan_dialogue_scenes`` output
     - clip_plans: same format as ``plan_short_film_prompts`` output
     """
+    _cancellation_checkpoint(cancel_handle)
     import json as _json
     import re
 
@@ -9218,8 +9412,10 @@ def plan_short_film_from_story(
         ),
         response_assist=response_assist,
         progress_callback=progress_callback,
+        cancel_handle=cancel_handle,
     )
 
+    _cancellation_checkpoint(cancel_handle)
     print(f"[LLM] Story plan output:\n{raw}")
 
     # ── Parse JSON response ───────────────────────────────────────
@@ -9321,6 +9517,7 @@ def plan_short_film_from_story(
             over_budget.append((i, scene, total_words, max_words))
 
     if over_budget:
+        _cancellation_checkpoint(cancel_handle)
         print(f"[LLM] {len(over_budget)} scene(s) have dialogue over budget, requesting rewrite")
         rewrite_lines = []
         for idx, scene, actual, budget in over_budget:
@@ -9353,6 +9550,7 @@ def plan_short_film_from_story(
             ),
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
         print(f"[LLM] Rewrite output:\n{rewrite_raw}")
 
@@ -9414,4 +9612,5 @@ def plan_short_film_from_story(
 
         current_time += scene_dur
 
+    _cancellation_checkpoint(cancel_handle)
     return {"clips": clips, "clip_plans": clip_plans}

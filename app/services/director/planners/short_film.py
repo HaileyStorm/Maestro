@@ -16,6 +16,8 @@ import os
 import re
 from typing import Optional, Any
 
+from services.llm_cancellation import LlmRequestCancelled
+
 from ..schema import (
     ProductionPlan, ShotPlan, CharacterProfile, ReferenceAssets,
     AssetRef, SubjectRef, DialogueBeat, CameraPlan, AudioPlan,
@@ -2668,6 +2670,8 @@ SUPPLIED CHARACTER CARDS:
                     "validated supplied characters; using the screenplay rules."
                 )
             return bible
+        except LlmRequestCancelled:
+            raise
         except Exception as exc:
             print(
                 "[ShortFilmPlanner] H3 voice-bible pass was unavailable; "
@@ -2754,6 +2758,8 @@ FULL SCREENPLAY FOR ACTION AND RELATIONSHIP CONTEXT:
                 f"{len(revised)} turn(s) and revised {changed}; dialogue is now locked."
             )
             return revised
+        except LlmRequestCancelled:
+            raise
         except Exception as exc:
             print(
                 "[ShortFilmPlanner] H3 character table read failed validation; "

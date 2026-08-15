@@ -14,6 +14,11 @@ import re
 from functools import lru_cache
 from typing import Callable, Optional
 
+from services.llm_cancellation import (
+    LlmCancellationHandle,
+    LlmRequestCancelled,
+)
+
 _ENHANCE_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_guides", "enhance")
 _DIALECT_DIR = os.path.join(os.path.dirname(__file__), "..", "llm_guides", "dialect")
 
@@ -1079,6 +1084,7 @@ def polish_prompts_third_pass(
     response_assist: Optional[dict] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
     is_active: Optional[Callable[[], bool]] = None,
+    cancel_handle: Optional[LlmCancellationHandle] = None,
 ) -> list[dict]:
     """Post-process clip plans through the enhance LLM pipeline (third pass).
 
@@ -1782,6 +1788,7 @@ def polish_prompts_third_pass(
             preserve_global_timeline=_is_h3_video,
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
         if out:
             cleaned = _strip_markdown(out)
@@ -1854,6 +1861,7 @@ def polish_prompts_third_pass(
             lora_system_hint=image_lora_hints,
             response_assist=response_assist,
             progress_callback=progress_callback,
+            cancel_handle=cancel_handle,
         )
         if out:
             cleaned = _strip_markdown(out)
@@ -1958,7 +1966,10 @@ def polish_prompts_third_pass(
             "in narrative prose will not fire."
         )
 
-    may_start_request = is_active or (lambda: True)
+    def may_start_request() -> bool:
+        if cancel_handle is not None:
+            cancel_handle.checkpoint()
+        return is_active() if is_active is not None else True
 
     for plan_idx, plan in enumerate(clip_plans):
         # Build per-shot character context. The descriptors here reflect
@@ -2009,6 +2020,8 @@ def polish_prompts_third_pass(
                     if enhanced and enhanced.strip() and enhanced.strip() != vp.strip():
                         plan["video_prompt"] = enhanced.strip()
                         polished += 1
+                except LlmRequestCancelled:
+                    raise
                 except Exception as e:
                     failed += 1
                     print(f"[PromptPolish] Video polish failed: {e}")
@@ -2076,6 +2089,8 @@ def polish_prompts_third_pass(
                             polished += 1
                         else:
                             polished_wps.append(wp)
+                    except LlmRequestCancelled:
+                        raise
                     except Exception:
                         failed += 1
                         polished_wps.append(wp)
@@ -2095,6 +2110,8 @@ def polish_prompts_third_pass(
                     if enhanced and enhanced.strip() and enhanced.strip() != ip.strip():
                         plan["image_prompt"] = enhanced.strip()
                         polished += 1
+                except LlmRequestCancelled:
+                    raise
                 except Exception as e:
                     failed += 1
                     print(f"[PromptPolish] Image polish failed: {e}")
@@ -2124,6 +2141,8 @@ def polish_prompts_third_pass(
                                 polished += 1
                             else:
                                 polished_kfs.append(kf)
+                        except LlmRequestCancelled:
+                            raise
                         except Exception as e:
                             failed += 1
                             polished_kfs.append(kf)

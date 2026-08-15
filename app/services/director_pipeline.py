@@ -28,6 +28,10 @@ from services.job_lifecycle import (
     request_cancel,
     snapshot_job,
 )
+from services.llm_cancellation import (
+    LlmCancellationHandle,
+    LlmRequestCancelled,
+)
 from services.director_model_compat import (
     DIRECTOR_PIPELINE_TYPES,
     assess_director_model,
@@ -73,6 +77,9 @@ _pipeline_repairs: dict[str, dict] = {}
 # short id.
 _pipeline_llm_contexts: dict[str, dict] = {}
 _pipeline_llm_tokens: dict[str, object] = {}
+_pipeline_llm_cancel_handles: dict[
+    str, tuple[object, LlmCancellationHandle]
+] = {}
 _REPAIR_ACTIVE_STATUSES = {"queued", "running", "cancelling"}
 _GENERATION_SETTLE_GRACE_S = 10.0
 _DIRECTOR_LLM_PARTIAL_LIMIT = 8192
@@ -92,7 +99,7 @@ _DIRECTOR_WORKER_FAILED_CODE = "director_worker_start_failed"
 _DIRECTOR_WORKER_FAILED_MESSAGE = "Director could not start its worker."
 
 
-class _DirectorLlmCancelled(RuntimeError):
+class _DirectorLlmCancelled(LlmRequestCancelled, RuntimeError):
     """Internal content-free signal for Stop winning an LLM pass."""
 
 
@@ -3540,6 +3547,7 @@ def _begin_pipeline_llm_pass(
 ):
     """Publish one pipeline-bound, process-memory-only LLM progress stream."""
     token = object()
+    cancel_handle = LlmCancellationHandle()
     with _pipeline_lock:
         pipeline = _pipelines.get(pid)
         if (
@@ -3547,7 +3555,10 @@ def _begin_pipeline_llm_pass(
             or pipeline.get("status") in _DIRECTOR_TERMINAL_STATUSES
         ):
             raise _DirectorLlmCancelled("Director LLM pass is no longer active")
+        if pid in _pipeline_llm_tokens:
+            raise RuntimeError("Director pipeline already has an active LLM pass")
         _pipeline_llm_tokens[pid] = token
+        _pipeline_llm_cancel_handles[pid] = (token, cancel_handle)
         pipeline["llm_progress"] = {
             "phase": str(phase or "planning")[:64],
             "pass": str(pass_name or "llm")[:96],
@@ -3616,7 +3627,7 @@ def _begin_pipeline_llm_pass(
             if average_tps is not None:
                 current["average_tps"] = average_tps
 
-    return token, publish
+    return token, cancel_handle, publish
 
 
 def _finish_pipeline_llm_pass(
@@ -3630,6 +3641,9 @@ def _finish_pipeline_llm_pass(
         if _pipeline_llm_tokens.get(pid) is not token:
             return
         _pipeline_llm_tokens.pop(pid, None)
+        active_cancel = _pipeline_llm_cancel_handles.get(pid)
+        if active_cancel is not None and active_cancel[0] is token:
+            _pipeline_llm_cancel_handles.pop(pid, None)
         pipeline = _pipelines.get(pid)
         if (
             not pipeline
@@ -3686,13 +3700,14 @@ def _pipeline_llm_call(
         isinstance(response_assist, dict)
         and response_assist.get("retry_on_refusal") is True
     ) else 1
-    token, callback = _begin_pipeline_llm_pass(
+    token, cancel_handle, callback = _begin_pipeline_llm_pass(
         pid,
         phase=phase,
         pass_name=pass_name,
         attempt_limit=attempt_limit,
     )
     kwargs["progress_callback"] = callback
+    kwargs["cancel_handle"] = cancel_handle
     if liveness_kwarg:
         kwargs[liveness_kwarg] = lambda: _pipeline_llm_pass_active(pid, token)
     if response_assist:
@@ -3706,6 +3721,7 @@ def _pipeline_llm_call(
                 result = function(*args, **kwargs)
         else:
             result = function(*args, **kwargs)
+        cancel_handle.checkpoint()
         with _pipeline_lock:
             pipeline = _pipelines.get(pid)
             cancelled = (
@@ -3715,13 +3731,26 @@ def _pipeline_llm_call(
             raise _DirectorLlmCancelled("Director LLM pass was cancelled")
         failed = False
         return result
+    except LlmRequestCancelled as exc:
+        raise _DirectorLlmCancelled("Director LLM pass was cancelled") from exc
     finally:
         _finish_pipeline_llm_pass(pid, token, failed=failed)
 
 
-def _cancel_pipeline_llm_progress(pid: str) -> None:
-    """Make the active callback inert at the same lock boundary as Stop."""
-    _pipeline_llm_tokens.pop(pid, None)
+def _cancel_pipeline_llm_progress(
+    pid: str,
+) -> Optional[LlmCancellationHandle]:
+    """Detach the exact active pass and return its transport handle."""
+    token = _pipeline_llm_tokens.pop(pid, None)
+    active_cancel = _pipeline_llm_cancel_handles.get(pid)
+    cancel_handle = None
+    if (
+        token is not None
+        and active_cancel is not None
+        and active_cancel[0] is token
+    ):
+        _pipeline_llm_cancel_handles.pop(pid, None)
+        cancel_handle = active_cancel[1]
     progress = (_pipelines.get(pid) or {}).get("llm_progress")
     if isinstance(progress, dict):
         progress.update({
@@ -3730,6 +3759,7 @@ def _cancel_pipeline_llm_progress(pid: str) -> None:
             "live_tps": None,
             "done": True,
         })
+    return cancel_handle
 
 
 def _update_pipeline(pid: str, **kwargs):
@@ -4456,6 +4486,7 @@ def _abort_pipeline_jobs(pid: str):
 
 
 def stop_pipeline(pid: str) -> bool:
+    cancel_handle = None
     with _pipeline_lock:
         p = _pipelines.get(pid)
         if not p or p.get("status") in ("completed", "failed", "cancelled"):
@@ -4471,8 +4502,13 @@ def stop_pipeline(pid: str) -> bool:
             "step": 0,
             "total_steps": 0,
         }
-        _cancel_pipeline_llm_progress(pid)
+        cancel_handle = _cancel_pipeline_llm_progress(pid)
         _pipeline_llm_contexts.pop(pid, None)
+    # Closing a provider response may briefly block while its socket tears
+    # down. Keep that work outside the pipeline registry lock so unrelated
+    # pipelines and status reads remain available.
+    if cancel_handle is not None:
+        cancel_handle.cancel()
     _abort_pipeline_jobs(pid)
     persisted = _save_pipeline_state(pid)
     with _pipeline_lock:
@@ -4964,6 +5000,7 @@ def _run_pipeline(pid: str, resume: bool = False):
     finally:
         with _pipeline_lock:
             _pipeline_llm_tokens.pop(pid, None)
+            _pipeline_llm_cancel_handles.pop(pid, None)
             _pipeline_llm_contexts.pop(pid, None)
             current = _pipeline_threads.get(pid)
             if current is threading.current_thread():

@@ -13,6 +13,8 @@ import os
 from abc import ABC, abstractmethod
 from typing import Optional, Any
 
+from services.llm_cancellation import LlmRequestCancelled
+
 # Optional dependency: json_repair handles common LLM JSON mistakes
 # (missing commas between properties, trailing commas, single quotes,
 # unclosed brackets, etc.). Used as a third fallback after strict
@@ -155,6 +157,8 @@ class BasePlanner(ABC):
                 kwargs["json_schema"] = json_schema
         try:
             response = gen_fn(**kwargs)
+        except LlmRequestCancelled:
+            raise
         except Exception:
             if "json_schema" not in kwargs:
                 raise
@@ -199,6 +203,8 @@ class BasePlanner(ABC):
         )
         try:
             response2 = gen_fn(**retry_kwargs)
+        except LlmRequestCancelled:
+            raise
         except Exception:
             # Same degradation contract as attempt 1: fall back to the
             # historical unconstrained retry (thinking budget restored).
