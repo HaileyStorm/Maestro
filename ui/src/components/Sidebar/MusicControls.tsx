@@ -158,7 +158,7 @@ export function MusicControls() {
           className={`w-full px-4 py-2 rounded-lg flex items-center justify-center gap-1.5 font-medium text-xs transition-all ${
             !description.trim() || writing
               ? 'bg-bg-tertiary text-text-muted cursor-not-allowed border border-border'
-              : 'bg-cta hover:brightness-110 shadow-accent-glow text-white'
+              : 'bg-cta shadow-accent-glow text-cta-foreground hover:ring-2 hover:ring-accent-blue/40'
           }`}
         >
           {writing ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}

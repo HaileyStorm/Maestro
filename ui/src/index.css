@@ -12,9 +12,9 @@
  * block below — no code changes elsewhere are required for elements
  * that use semantic tokens.
  *
- * Special tokens (cta-gradient, accent-cool, shadow vars) exist so
- * components can opt into theme-aware gradients and glow effects with
- * a single utility class.
+ * Special tokens (cta-gradient, matching foregrounds, accent-cool,
+ * shadow vars) exist so components can opt into theme-aware gradients,
+ * readable labels, and glow effects with semantic utility classes.
  */
 @theme {
   /* Backgrounds */
@@ -102,6 +102,7 @@
      gradient. Components using `bg-cta` adapt automatically. */
   --color-gradient-cta-from: #22c55e;
   --color-gradient-cta-to: #22c55e;
+  --color-cta-foreground: #0a0a0f;
 
   /* Toggle-active gradient — used for active states on mode toggles
      (Director/Studio pill, similar). Default theme: both stops equal
@@ -111,6 +112,7 @@
      different colors for primary actions vs active toggles. */
   --color-gradient-toggle-from: #3b82f6;
   --color-gradient-toggle-to: #3b82f6;
+  --color-toggle-active-foreground: #0a0a0f;
 
   /* Active-frame gradient — used as a 2px diagonal-gradient ring
      around the currently-selected media asset in the gallery.
@@ -197,14 +199,18 @@
   --color-accent-cool-from: #a855f7;
   --color-accent-cool-to: #c084fc;
 
-  /* Sunset gradient for primary actions — punchy red→orange */
-  --color-gradient-cta-from: #dc2626;
+  /* Sunset gradient for primary actions — punchy red→orange. The red
+     stop is lifted just enough for the near-black semantic foreground
+     to remain AA-readable across the full gradient. */
+  --color-gradient-cta-from: #e13b2f;
   --color-gradient-cta-to: #f97316;
+  --color-cta-foreground: #0a0a0f;
 
   /* Toggle-active gradient — same red→orange so the active mode
      pill matches the reference render's vibrant CTA energy. */
-  --color-gradient-toggle-from: #dc2626;
+  --color-gradient-toggle-from: #e13b2f;
   --color-gradient-toggle-to: #f97316;
+  --color-toggle-active-foreground: #0a0a0f;
 
   /* Active-frame gradient — diagonal deep-red→bright-gold around the
      currently-selected asset. Wide hue gap (red-800 → amber-300) so
@@ -290,7 +296,7 @@
  *   text-muted #746b5b        4.9:1  (issue #7 rule: muted stays legible)
  *   text-secondary #675e4e    6.0:1
  *   accent-blue #c2410c       4.8:1 as text; white text on it 5.2:1
- *   CTA stops #c2410c→#b45309 white text 5.2:1 / 5.0:1
+ *   CTA stops #c2410c→#b45309 light foreground 5.1:1 / 5.0:1
  */
 [data-theme="ivory"] {
   /* Native form controls (selects, checkboxes, scrollbars the UA
@@ -313,9 +319,9 @@
   --color-text-secondary: #675e4e;
   --color-text-muted: #746b5b;
 
-  /* Repointed accents — burnt orange for actions (dark enough that
-     the app-wide hardcoded white button text passes AA), deep amber
-     for success/progress. Hover DARKENS (light-theme convention). */
+  /* Repointed accents — burnt orange for actions (dark enough for
+     light button foregrounds), deep amber for success/progress.
+     Hover DARKENS (light-theme convention). */
   --color-accent-blue: #c2410c;
   --color-accent-blue-hover: #9a3412;
   --color-accent-green: #b45309;
@@ -353,11 +359,13 @@
   --color-media-canvas: #1c1712;
 
   /* Daylight sunset gradient — burnt orange → deep amber. Kept dark
-     enough for the white CTA label at both stops. */
+     enough for the semantic light foreground at both stops. */
   --color-gradient-cta-from: #c2410c;
   --color-gradient-cta-to: #b45309;
+  --color-cta-foreground: #fffdf7;
   --color-gradient-toggle-from: #c2410c;
   --color-gradient-toggle-to: #b45309;
+  --color-toggle-active-foreground: #fffdf7;
   --color-gradient-active-frame-from: #c2410c;
   --color-gradient-active-frame-to: #f59e0b;
 
@@ -387,8 +395,8 @@
   --color-text-secondary: #57606e;
   --color-text-muted: #68707f;
 
-  /* blue-600 action accent — dark enough for the app-wide hardcoded
-     white button text; hover darkens (light-theme convention). */
+  /* blue-600 action accent — dark enough for the semantic light
+     button foreground; hover darkens (light-theme convention). */
   --color-accent-blue: #2563eb;
   --color-accent-blue-hover: #1d4ed8;
   /* green-700 success/progress — white text passes AA on it. */
@@ -420,8 +428,10 @@
   /* Flat green CTA (Classic's identity) and flat blue toggles/frames */
   --color-gradient-cta-from: #15803d;
   --color-gradient-cta-to: #15803d;
+  --color-cta-foreground: #ffffff;
   --color-gradient-toggle-from: #2563eb;
   --color-gradient-toggle-to: #2563eb;
+  --color-toggle-active-foreground: #ffffff;
   --color-gradient-active-frame-from: #2563eb;
   --color-gradient-active-frame-to: #2563eb;
 
@@ -484,11 +494,13 @@
   --color-chip-red: #b91c1c;
 
   /* Dark charcoal gradient for the CTA — Onyx's light-grey gradient
-     inverted; white label reads at 10:1+. */
+     inverted; the semantic light label reads at 10:1+. */
   --color-gradient-cta-from: #404040;
   --color-gradient-cta-to: #171717;
+  --color-cta-foreground: #ffffff;
   --color-gradient-toggle-from: #404040;
   --color-gradient-toggle-to: #6b6b6b;
+  --color-toggle-active-foreground: #ffffff;
   --color-gradient-active-frame-from: #737373;
   --color-gradient-active-frame-to: #737373;
 
@@ -566,16 +578,18 @@
      the monochrome lane. */
   --color-gradient-cta-from: #888888;
   --color-gradient-cta-to: #b8b8b8;
+  --color-cta-foreground: #0a0a0f;
 
   /* Toggle-active gradient — mid-grey range. The toggle button
-     uses hardcoded white text + shadow-accent-glow halo, so the
-     background needs to be dark enough that white text reads
-     cleanly without competing with the glow. Range chosen to
-     roughly match Golden Hour's #dc2626→#f97316 luminance band
+     uses a semantic white foreground + shadow-accent-glow halo, so
+     the background stays dark enough for AA-readable text without
+     competing with the glow. Range chosen to
+     roughly match Golden Hour's #e13b2f→#f97316 luminance band
      (~0.08→0.27) so both themes feel similarly "lit" against
      their dark chrome without blowing out the foreground text. */
   --color-gradient-toggle-from: #4d4d4d;
-  --color-gradient-toggle-to: #8c8c8c;
+  --color-gradient-toggle-to: #757575;
+  --color-toggle-active-foreground: #ffffff;
 
   /* Media canvas follows this theme's bg-tertiary (unchanged look) */
   --color-media-canvas: #1a1a1a;

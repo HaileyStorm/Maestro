@@ -232,11 +232,11 @@ export function ToolsPanel() {
         disabled={!canRun}
         className={`w-full px-4 py-2.5 rounded-lg flex items-center justify-center gap-1.5 font-medium text-xs transition-all ${
           canRun
-            ? 'bg-cta hover:brightness-110 shadow-accent-glow text-white'
+            ? 'bg-cta shadow-accent-glow text-cta-foreground hover:ring-2 hover:ring-accent-blue/40'
             : 'bg-bg-tertiary text-text-muted cursor-not-allowed border border-border'
         }`}
       >
-        <Play size={13} fill={canRun ? 'white' : 'currentColor'} />
+        <Play size={13} fill="currentColor" />
         {tool === 'upscale' ? 'Upscale Clip' : 'Replace Voice'}
       </button>
       </>}

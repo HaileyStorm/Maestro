@@ -131,14 +131,13 @@ export function GenerateButton() {
         className={`px-4 py-2 rounded-lg flex items-center gap-1.5 font-medium text-xs transition-all whitespace-nowrap ${
           cooldown
             ? 'bg-bg-active text-text-muted cursor-not-allowed'
-            // Default theme: bg-cta resolves to a flat accent-blue (both
-            // gradient stops point at --color-accent-blue). Golden Hour:
-            // resolves to a red→orange sunset gradient. shadow-accent-glow
-            // is empty in default and a warm bloom in Golden Hour.
-            : 'bg-cta hover:brightness-110 shadow-accent-glow text-white'
+            // The CTA gradient, foreground, and glow all resolve through
+            // theme tokens so the label stays readable without changing
+            // the current theme's action identity.
+            : 'bg-cta shadow-accent-glow text-cta-foreground hover:ring-2 hover:ring-accent-blue/40'
         }`}
       >
-        <Play size={13} fill={cooldown ? 'currentColor' : 'white'} />
+        <Play size={13} fill="currentColor" />
         {cooldown ? 'Queued' : queueCount > 0 ? `Go (${queueCount})` : 'Generate'}
       </button>
       {isH3 && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}

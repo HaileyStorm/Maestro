@@ -140,7 +140,7 @@ export function Sidebar() {
         aria-label="Open Generate"
         aria-pressed={sidebarMode === 'studio'}
         className={`mobile-control-target min-w-0 px-1.5 py-1 text-[10px] md:px-2.5 md:text-[11px] rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
-          sidebarMode === 'studio' ? 'bg-toggle-active shadow-accent-glow text-white' : 'text-text-secondary hover:text-text-primary'
+          sidebarMode === 'studio' ? 'bg-toggle-active shadow-accent-glow text-toggle-active-foreground' : 'text-text-secondary hover:text-text-primary'
         }`}
       >
         Generate
@@ -151,11 +151,10 @@ export function Sidebar() {
         aria-label="Open Director"
         aria-pressed={isDirector}
         className={`mobile-control-target min-w-0 px-1.5 py-1 text-[10px] md:px-2.5 md:text-[11px] rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
-          // bg-toggle-active is flat accent-blue in the default theme
-          // (preserves the original blue pill) and a red→orange sunset
-          // gradient in Golden Hour. shadow-accent-glow is empty in
-          // default and a warm bloom in Golden Hour.
-          isDirector ? 'bg-toggle-active shadow-accent-glow text-white' : 'text-text-secondary hover:text-text-primary'
+          // bg-toggle-active preserves each theme's active-pill identity;
+          // text-toggle-active-foreground keeps its label readable across
+          // every gradient stop. The glow remains theme-aware as before.
+          isDirector ? 'bg-toggle-active shadow-accent-glow text-toggle-active-foreground' : 'text-text-secondary hover:text-text-primary'
         }`}
       >
         Director
@@ -167,7 +166,7 @@ export function Sidebar() {
         aria-label={referenceLocked ? 'Unlock project to open Reference' : 'Open Reference'}
         aria-pressed={isReference}
         className={`mobile-control-target min-w-0 px-1.5 py-1 text-[10px] md:px-2.5 md:text-[11px] rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-40 ${
-          isReference ? 'bg-toggle-active shadow-accent-glow text-white' : 'text-text-secondary hover:text-text-primary'
+          isReference ? 'bg-toggle-active shadow-accent-glow text-toggle-active-foreground' : 'text-text-secondary hover:text-text-primary'
         }`}
       >
         Reference

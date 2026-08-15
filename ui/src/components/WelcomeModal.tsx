@@ -108,7 +108,7 @@ export function WelcomeModal() {
         <div className="relative overflow-hidden border-b border-border px-5 pb-5 pt-6 sm:px-7 sm:pb-6 sm:pt-7">
           <div className="pointer-events-none absolute -right-16 -top-24 h-64 w-64 rounded-full bg-accent-blue/15 blur-3xl" />
           <div className="relative flex items-start gap-3 sm:gap-4">
-            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-gradient-toggle-from to-gradient-toggle-to text-xl font-bold text-white shadow-lg sm:h-14 sm:w-14">
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-gradient-toggle-from to-gradient-toggle-to text-xl font-bold text-toggle-active-foreground shadow-lg sm:h-14 sm:w-14">
               M
             </div>
             <div className="min-w-0 flex-1">
@@ -222,7 +222,7 @@ export function WelcomeModal() {
             ref={startButtonRef}
             type="button"
             onClick={enterStudio}
-            className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-gradient-cta-from to-gradient-cta-to px-5 py-2.5 text-xs font-semibold text-white transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue sm:mt-0 sm:w-auto"
+            className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-gradient-cta-from to-gradient-cta-to px-5 py-2.5 text-xs font-semibold text-cta-foreground transition-shadow hover:ring-2 hover:ring-accent-blue/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue sm:mt-0 sm:w-auto"
           >
             Enter the studio <ArrowRight size={14} />
           </button>
