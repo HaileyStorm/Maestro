@@ -1967,9 +1967,866 @@ class QueueLaunchWiringTests(unittest.TestCase):
         worker = source.index("threading.Thread(", scheduler)
         self.assertLess(scheduler, worker)
         cleanup = source.index("cleanup_orphan_request_manifests(")
+        listener_barrier = source.index("before_recovered_workers()")
+        launch_sequence = source.index("begin_startup_execution()")
         timer = source.index("_schedule_plan_review_auto_approval(")
+        launch_sequence_end = source.rindex("end_startup_execution()")
+        self.assertLess(cleanup, listener_barrier)
+        self.assertLess(listener_barrier, launch_sequence)
+        self.assertLess(launch_sequence, timer)
+        self.assertLess(timer, launch_sequence_end)
         self.assertLess(cleanup, timer)
         self.assertIn('"waiting_for_plan_approval"', source)
+
+        startup = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_start_queue_recovery_before_background_workers"),
+        )
+        self.assertIn("target=_run_startup_recovery_background", startup)
+        self.assertNotIn("_restore_queue_recovery_on_startup()", startup)
+        background = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_run_startup_recovery_background"),
+        )
+        self.assertLess(
+            background.index("_restore_queue_recovery_on_startup("),
+            background.index("_start_sample_campaign_preemption_after_recovery,"),
+        )
+        finish = ast.get_source_segment(
+            self.launch_source,
+            _function(
+                self.launch,
+                "_finish_startup_recovery_index_and_wait_for_listener",
+            ),
+        )
+        self.assertLess(
+            finish.index("_reindex_h3_delivery_recoveries()"),
+            finish.index("_wait_for_listener_before_recovered_execution()"),
+        )
+        listener_wait = ast.get_source_segment(
+            self.launch_source,
+            _function(
+                self.launch, "_wait_for_listener_before_recovered_execution",
+            ),
+        )
+        self.assertIn("_startup_recovery_listener_ready.wait(", listener_wait)
+        self.assertIn("_startup_recovery_stop.is_set()", listener_wait)
+
+    def test_background_startup_returns_promptly_then_honors_listener_barrier(self):
+        calls = []
+        restore_entered = threading.Event()
+        state_lock = threading.Lock()
+        listener = threading.Event()
+        finished = threading.Event()
+        stop = threading.Event()
+
+        def restore(
+            *, before_recovered_workers, run_recovered_operation, **_kwargs,
+        ):
+            calls.append("restore")
+            restore_entered.set()
+            before_recovered_workers()
+            self.assertTrue(run_recovered_operation(lambda: None))
+            calls.append("restore-returned")
+            return True
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_set_startup_recovery_state",
+                "_startup_recovery_state_value",
+                "_note_listener_request",
+                "_wait_for_listener_before_recovered_execution",
+                "_finish_startup_recovery_index_and_wait_for_listener",
+                "_run_startup_recovery_background",
+                "_start_queue_recovery_before_background_workers",
+            ),
+            {
+                "threading": threading,
+                "api": types.SimpleNamespace(
+                    on_event=lambda *_args, **_kwargs: (lambda function: function),
+                ),
+                "_startup_recovery_state_lock": state_lock,
+                "_startup_recovery_thread_lock": threading.Lock(),
+                "_startup_recovery_listener_ready": listener,
+                "_startup_recovery_finished": finished,
+                "_startup_recovery_stop": stop,
+                "_startup_recovery_thread": None,
+                "_startup_recovery_state": "pending",
+                "_startup_recovery_once_complete": False,
+                "_startup_recovery_restart_requested": False,
+                "_startup_recovery_restart_generation": 0,
+                "_startup_recovery_cancelled_restart_generation": 0,
+                "_restore_queue_recovery_on_startup": restore,
+                "_startup_recovery_launch_operation": (
+                    lambda operation: operation() is None or True
+                ),
+                "_startup_recovery_begin_launch_sequence": lambda: True,
+                "_startup_recovery_end_launch_sequence": lambda: None,
+                "_startup_recovery_launch_sequence_started": lambda: False,
+                "_reset_startup_recovery_lifecycle_after_stop": (
+                    lambda: True
+                ),
+                "_reindex_h3_delivery_recoveries": (
+                    lambda: calls.append("reindex")
+                ),
+                "_start_sample_campaign_preemption_after_recovery": (
+                    lambda: calls.append("watcher")
+                ),
+            },
+        )
+        start = time.monotonic()
+        namespace["_start_queue_recovery_before_background_workers"]()
+        self.assertLess(time.monotonic() - start, 0.25)
+        self.assertTrue(restore_entered.wait(1.0))
+        self.assertEqual(calls, ["restore", "reindex"])
+        self.assertEqual(
+            namespace["_startup_recovery_state_value"](), "restoring",
+        )
+
+        namespace["_note_listener_request"]()
+        self.assertTrue(finished.wait(1.0))
+        self.assertEqual(
+            calls, ["restore", "reindex", "restore-returned", "watcher"],
+        )
+        self.assertEqual(namespace["_startup_recovery_state_value"](), "ready")
+
+    def test_background_startup_contains_system_exit_and_fails_closed(self):
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_set_startup_recovery_state",
+                "_startup_recovery_state_value",
+                "_run_startup_recovery_background",
+            ),
+            {
+                "threading": threading,
+                "_startup_recovery_state_lock": threading.Lock(),
+                "_startup_recovery_finished": threading.Event(),
+                "_startup_recovery_stop": threading.Event(),
+                "_startup_recovery_state": "restoring",
+                "_startup_recovery_once_complete": False,
+                "_startup_recovery_restart_requested": False,
+                "_startup_recovery_restart_generation": 0,
+                "_startup_recovery_cancelled_restart_generation": 0,
+                "_restore_queue_recovery_on_startup": (
+                    lambda **_kwargs: (_ for _ in ()).throw(SystemExit(9))
+                ),
+                "_finish_startup_recovery_index_and_wait_for_listener": (
+                    lambda: None
+                ),
+                "_startup_recovery_launch_operation": (
+                    lambda operation: operation() is None or True
+                ),
+                "_startup_recovery_begin_launch_sequence": lambda: True,
+                "_startup_recovery_end_launch_sequence": lambda: None,
+                "_startup_recovery_launch_sequence_started": lambda: False,
+                "_reset_startup_recovery_lifecycle_after_stop": (
+                    lambda: True
+                ),
+                "_start_sample_campaign_preemption_after_recovery": (
+                    lambda: self.fail("watcher started after failed restore")
+                ),
+            },
+        )
+        namespace["_run_startup_recovery_background"]()
+        self.assertEqual(namespace["_startup_recovery_state_value"](), "failed")
+        self.assertTrue(namespace["_startup_recovery_finished"].is_set())
+
+    def test_sample_watcher_terminalization_does_not_revoke_recovery_readiness(self):
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_set_startup_recovery_state",
+                "_startup_recovery_state_value",
+                "_run_startup_recovery_background",
+            ),
+            {
+                "threading": threading,
+                "_startup_recovery_state_lock": threading.Lock(),
+                "_startup_recovery_finished": threading.Event(),
+                "_startup_recovery_stop": threading.Event(),
+                "_startup_recovery_state": "restoring",
+                "_startup_recovery_once_complete": False,
+                "_startup_recovery_restart_requested": False,
+                "_startup_recovery_restart_generation": 0,
+                "_startup_recovery_cancelled_restart_generation": 0,
+                "_restore_queue_recovery_on_startup": (
+                    lambda **_kwargs: None
+                ),
+                "_finish_startup_recovery_index_and_wait_for_listener": (
+                    lambda: None
+                ),
+                "_startup_recovery_launch_operation": (
+                    lambda operation: operation() is None or True
+                ),
+                "_startup_recovery_begin_launch_sequence": lambda: True,
+                "_startup_recovery_end_launch_sequence": lambda: None,
+                "_startup_recovery_launch_sequence_started": lambda: False,
+                "_reset_startup_recovery_lifecycle_after_stop": (
+                    lambda: True
+                ),
+                "_start_sample_campaign_preemption_after_recovery": (
+                    lambda: (_ for _ in ()).throw(SystemExit(7))
+                ),
+            },
+        )
+        namespace["_run_startup_recovery_background"]()
+        self.assertEqual(namespace["_startup_recovery_state_value"](), "ready")
+        self.assertTrue(namespace["_startup_recovery_finished"].is_set())
+
+    def test_shutdown_linearizes_before_next_launch_and_partial_set_is_not_replayed(self):
+        calls = []
+        first_worker_entered = threading.Event()
+        release_first_worker = threading.Event()
+        listener = threading.Event()
+        stop = threading.Event()
+
+        def restore(
+            *,
+            before_recovered_workers,
+            run_recovered_operation,
+            begin_recovered_execution,
+            end_recovered_execution,
+            recovered_execution_started,
+        ):
+            calls.append("restore")
+            before_recovered_workers()
+            self.assertTrue(begin_recovered_execution())
+
+            def first_worker():
+                first_worker_entered.set()
+                self.assertTrue(release_first_worker.wait(1.0))
+                calls.append("recovered-worker")
+
+            self.assertTrue(run_recovered_operation(first_worker))
+            self.assertTrue(recovered_execution_started())
+            self.assertFalse(run_recovered_operation(
+                lambda: calls.append("second-worker"),
+            ))
+            # Production treats a launch set interrupted after its first
+            # start as consumed so a later lifespan cannot duplicate it.
+            end_recovered_execution()
+            return True
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_set_startup_recovery_state",
+                "_startup_recovery_state_value",
+                "_note_listener_request",
+                "_startup_recovery_launch_operation",
+                "_startup_recovery_begin_launch_sequence",
+                "_startup_recovery_end_launch_sequence",
+                "_startup_recovery_launch_sequence_started",
+                "_wait_for_listener_before_recovered_execution",
+                "_finish_startup_recovery_index_and_wait_for_listener",
+                "_reset_startup_recovery_lifecycle_after_stop",
+                "_run_startup_recovery_background",
+                "_start_queue_recovery_before_background_workers",
+                "_stop_versioned_model_updates",
+            ),
+            {
+                "threading": threading,
+                "api": types.SimpleNamespace(
+                    on_event=lambda *_args, **_kwargs: (lambda function: function),
+                ),
+                "_model_update_stop": threading.Event(),
+                "_startup_recovery_state_lock": threading.Lock(),
+                "_startup_recovery_thread_lock": threading.Lock(),
+                "_startup_recovery_launch_lock": threading.RLock(),
+                "_startup_recovery_launch_sequence": threading.local(),
+                "_startup_recovery_listener_ready": listener,
+                "_startup_recovery_finished": threading.Event(),
+                "_startup_recovery_stop": stop,
+                "_startup_recovery_thread": None,
+                "_startup_recovery_state": "pending",
+                "_startup_recovery_once_complete": False,
+                "_startup_recovery_restart_requested": False,
+                "_startup_recovery_restart_generation": 0,
+                "_startup_recovery_cancelled_restart_generation": 0,
+                "_restore_queue_recovery_on_startup": restore,
+                "_reindex_h3_delivery_recoveries": (
+                    lambda: calls.append("reindex")
+                ),
+                "_start_sample_campaign_preemption_after_recovery": (
+                    lambda: calls.append("watcher")
+                ),
+            },
+        )
+        namespace["_start_queue_recovery_before_background_workers"]()
+        namespace["_note_listener_request"]()
+        self.assertTrue(first_worker_entered.wait(1.0))
+
+        shutdown = threading.Thread(
+            target=namespace["_stop_versioned_model_updates"],
+        )
+        shutdown.start()
+        # Shutdown publishes stop before waiting for the launch-sequence lock.
+        self.assertTrue(stop.wait(1.0))
+        release_first_worker.set()
+        shutdown.join(timeout=1.0)
+        self.assertFalse(shutdown.is_alive())
+        self.assertEqual(calls, ["restore", "reindex", "recovered-worker"])
+        self.assertEqual(namespace["_startup_recovery_state_value"](), "pending")
+        self.assertIsNone(namespace["_startup_recovery_thread"])
+
+        namespace["_start_queue_recovery_before_background_workers"]()
+        namespace["_note_listener_request"]()
+        self.assertTrue(namespace["_startup_recovery_finished"].wait(1.0))
+        self.assertEqual(namespace["_startup_recovery_state_value"](), "ready")
+        self.assertEqual(calls.count("restore"), 1)
+        self.assertEqual(calls.count("recovered-worker"), 1)
+        self.assertNotIn("second-worker", calls)
+        self.assertEqual(calls.count("watcher"), 1)
+        namespace["_stop_versioned_model_updates"]()
+
+    def test_launch_sequence_does_not_hold_shutdown_lock_between_operations(self):
+        launch_lock = threading.RLock()
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_startup_recovery_begin_launch_sequence",
+                "_startup_recovery_end_launch_sequence",
+            ),
+            {
+                "threading": threading,
+                "_startup_recovery_launch_lock": launch_lock,
+                "_startup_recovery_launch_sequence": threading.local(),
+                "_startup_recovery_stop": threading.Event(),
+            },
+        )
+        self.assertTrue(namespace["_startup_recovery_begin_launch_sequence"]())
+        acquired = threading.Event()
+
+        def cross_thread_shutdown_boundary():
+            with launch_lock:
+                acquired.set()
+
+        probe = threading.Thread(target=cross_thread_shutdown_boundary)
+        probe.start()
+        probe.join(timeout=0.25)
+        self.assertFalse(probe.is_alive())
+        self.assertTrue(acquired.is_set())
+        namespace["_startup_recovery_end_launch_sequence"]()
+
+    def test_repeated_lifespan_restarts_watcher_without_replaying_restore(self):
+        calls = []
+        listener = threading.Event()
+
+        def restore(
+            *, before_recovered_workers, run_recovered_operation, **_kwargs,
+        ):
+            calls.append("restore")
+            before_recovered_workers()
+            self.assertTrue(run_recovered_operation(lambda: None))
+            return True
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_set_startup_recovery_state",
+                "_startup_recovery_state_value",
+                "_note_listener_request",
+                "_startup_recovery_launch_operation",
+                "_startup_recovery_begin_launch_sequence",
+                "_startup_recovery_end_launch_sequence",
+                "_startup_recovery_launch_sequence_started",
+                "_wait_for_listener_before_recovered_execution",
+                "_finish_startup_recovery_index_and_wait_for_listener",
+                "_reset_startup_recovery_lifecycle_after_stop",
+                "_run_startup_recovery_background",
+                "_start_queue_recovery_before_background_workers",
+                "_stop_versioned_model_updates",
+            ),
+            {
+                "threading": threading,
+                "api": types.SimpleNamespace(
+                    on_event=lambda *_args, **_kwargs: (lambda function: function),
+                ),
+                "_model_update_stop": threading.Event(),
+                "_startup_recovery_state_lock": threading.Lock(),
+                "_startup_recovery_thread_lock": threading.Lock(),
+                "_startup_recovery_launch_lock": threading.RLock(),
+                "_startup_recovery_launch_sequence": threading.local(),
+                "_startup_recovery_listener_ready": listener,
+                "_startup_recovery_finished": threading.Event(),
+                "_startup_recovery_stop": threading.Event(),
+                "_startup_recovery_thread": None,
+                "_startup_recovery_state": "pending",
+                "_startup_recovery_once_complete": False,
+                "_startup_recovery_restart_requested": False,
+                "_startup_recovery_restart_generation": 0,
+                "_startup_recovery_cancelled_restart_generation": 0,
+                "_restore_queue_recovery_on_startup": restore,
+                "_reindex_h3_delivery_recoveries": (
+                    lambda: calls.append("reindex")
+                ),
+                "_start_sample_campaign_preemption_after_recovery": (
+                    lambda: calls.append("watcher")
+                ),
+            },
+        )
+        for generation in range(2):
+            namespace["_start_queue_recovery_before_background_workers"]()
+            namespace["_note_listener_request"]()
+            self.assertTrue(namespace["_startup_recovery_finished"].wait(1.0))
+            self.assertEqual(
+                namespace["_startup_recovery_state_value"](), "ready",
+            )
+            namespace["_stop_versioned_model_updates"]()
+            self.assertEqual(
+                namespace["_startup_recovery_state_value"](), "pending",
+            )
+            self.assertIsNone(namespace["_startup_recovery_thread"])
+            if generation == 0:
+                self.assertTrue(namespace["_startup_recovery_once_complete"])
+        self.assertEqual(calls.count("restore"), 1)
+        self.assertEqual(calls.count("reindex"), 1)
+        self.assertEqual(calls.count("watcher"), 2)
+
+    def test_deferred_lifespan_rearms_after_old_restore_outlives_shutdown_join(self):
+        calls = []
+        first_restore_entered = threading.Event()
+        release_first_restore = threading.Event()
+
+        def restore(
+            *,
+            before_recovered_workers,
+            run_recovered_operation,
+            begin_recovered_execution,
+            end_recovered_execution,
+            **_kwargs,
+        ):
+            attempt = calls.count("restore-attempt") + 1
+            calls.append("restore-attempt")
+            if attempt == 1:
+                first_restore_entered.set()
+                self.assertTrue(release_first_restore.wait(4.0))
+                # The retiring attempt reaches its pre-launch callback only
+                # after stop. It must abort before reindex or execution.
+                before_recovered_workers()
+                raise AssertionError("stopped restore crossed pre-launch gate")
+            before_recovered_workers()
+            self.assertTrue(begin_recovered_execution())
+            self.assertTrue(run_recovered_operation(
+                lambda: calls.append("recovered-worker"),
+            ))
+            end_recovered_execution()
+            calls.append("restore-complete")
+            return True
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_set_startup_recovery_state",
+                "_startup_recovery_state_value",
+                "_note_listener_request",
+                "_startup_recovery_launch_operation",
+                "_startup_recovery_begin_launch_sequence",
+                "_startup_recovery_end_launch_sequence",
+                "_startup_recovery_launch_sequence_started",
+                "_wait_for_listener_before_recovered_execution",
+                "_finish_startup_recovery_index_and_wait_for_listener",
+                "_reset_startup_recovery_lifecycle_after_stop",
+                "_run_startup_recovery_background",
+                "_start_queue_recovery_before_background_workers",
+                "_stop_versioned_model_updates",
+            ),
+            {
+                "threading": threading,
+                "api": types.SimpleNamespace(
+                    on_event=lambda *_args, **_kwargs: (
+                        lambda function: function
+                    ),
+                ),
+                "_model_update_stop": threading.Event(),
+                "_startup_recovery_state_lock": threading.Lock(),
+                "_startup_recovery_thread_lock": threading.Lock(),
+                "_startup_recovery_launch_lock": threading.RLock(),
+                "_startup_recovery_launch_sequence": threading.local(),
+                "_startup_recovery_listener_ready": threading.Event(),
+                "_startup_recovery_finished": threading.Event(),
+                "_startup_recovery_stop": threading.Event(),
+                "_startup_recovery_thread": None,
+                "_startup_recovery_state": "pending",
+                "_startup_recovery_once_complete": False,
+                "_startup_recovery_restart_requested": False,
+                "_startup_recovery_restart_generation": 0,
+                "_startup_recovery_cancelled_restart_generation": 0,
+                "_restore_queue_recovery_on_startup": restore,
+                "_reindex_h3_delivery_recoveries": (
+                    lambda: calls.append("reindex")
+                ),
+                "_start_sample_campaign_preemption_after_recovery": (
+                    lambda: calls.append("watcher")
+                ),
+            },
+        )
+        namespace["_start_queue_recovery_before_background_workers"]()
+        self.assertTrue(first_restore_entered.wait(1.0))
+
+        namespace["_stop_versioned_model_updates"]()
+        old_thread = namespace["_startup_recovery_thread"]
+        self.assertIsNotNone(old_thread)
+        self.assertTrue(old_thread.is_alive())
+
+        start = time.monotonic()
+        namespace["_start_queue_recovery_before_background_workers"]()
+        self.assertLess(time.monotonic() - start, 0.25)
+        self.assertTrue(namespace["_startup_recovery_restart_requested"])
+        namespace["_note_listener_request"]()
+        release_first_restore.set()
+
+        self.assertTrue(namespace["_startup_recovery_finished"].wait(3.0))
+        self.assertEqual(namespace["_startup_recovery_state_value"](), "ready")
+        self.assertEqual(calls.count("restore-attempt"), 2)
+        self.assertEqual(calls.count("restore-complete"), 1)
+        self.assertEqual(calls.count("reindex"), 1)
+        self.assertEqual(calls.count("recovered-worker"), 1)
+        self.assertEqual(calls.count("watcher"), 1)
+        self.assertTrue(namespace["_startup_recovery_once_complete"])
+        self.assertFalse(namespace["_startup_recovery_restart_requested"])
+        namespace["_stop_versioned_model_updates"]()
+
+    def test_thread_release_and_pending_state_are_atomic_to_new_startup(self):
+        thread_none_state_restoring = threading.Event()
+        release_pending_transition = threading.Event()
+        startup_returned = threading.Event()
+        successor_started = threading.Event()
+        successor_count = {"value": 0}
+
+        class BarrierStateLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.retiring_thread = None
+                self.paused = False
+
+            def __enter__(self):
+                if (
+                    threading.current_thread() is self.retiring_thread
+                    and not self.paused
+                ):
+                    self.paused = True
+                    thread_none_state_restoring.set()
+                    self.assert_released()
+                self._lock.acquire()
+                return self
+
+            def assert_released(self):
+                if not release_pending_transition.wait(2.0):
+                    raise AssertionError("pending transition barrier timed out")
+
+            def __exit__(self, *_args):
+                self._lock.release()
+
+        state_lock = BarrierStateLock()
+        namespace = None
+
+        def successor_runner():
+            successor_count["value"] += 1
+            successor_started.set()
+            namespace["_set_startup_recovery_state"]("ready")
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_set_startup_recovery_state",
+                "_startup_recovery_state_value",
+                "_reset_startup_recovery_lifecycle_after_stop",
+                "_start_queue_recovery_before_background_workers",
+            ),
+            {
+                "threading": threading,
+                "api": types.SimpleNamespace(
+                    on_event=lambda *_args, **_kwargs: (
+                        lambda function: function
+                    ),
+                ),
+                "_startup_recovery_state_lock": state_lock,
+                "_startup_recovery_thread_lock": threading.Lock(),
+                "_startup_recovery_listener_ready": threading.Event(),
+                "_startup_recovery_finished": threading.Event(),
+                "_startup_recovery_stop": threading.Event(),
+                "_startup_recovery_thread": None,
+                "_startup_recovery_state": "restoring",
+                "_startup_recovery_restart_requested": False,
+                "_startup_recovery_restart_generation": 0,
+                "_startup_recovery_cancelled_restart_generation": 0,
+                "_run_startup_recovery_background": successor_runner,
+            },
+        )
+        namespace["_startup_recovery_stop"].set()
+        retiring = threading.Thread(
+            target=namespace["_reset_startup_recovery_lifecycle_after_stop"],
+        )
+        state_lock.retiring_thread = retiring
+        namespace["_startup_recovery_thread"] = retiring
+        retiring.start()
+        self.assertTrue(thread_none_state_restoring.wait(1.0))
+        self.assertIsNone(namespace["_startup_recovery_thread"])
+        self.assertEqual(namespace["_startup_recovery_state"], "restoring")
+
+        def new_startup():
+            namespace["_start_queue_recovery_before_background_workers"]()
+            startup_returned.set()
+
+        startup = threading.Thread(target=new_startup)
+        startup.start()
+        self.assertFalse(startup_returned.wait(0.1))
+        self.assertFalse(successor_started.is_set())
+
+        release_pending_transition.set()
+        retiring.join(timeout=1.0)
+        startup.join(timeout=1.0)
+        self.assertFalse(retiring.is_alive())
+        self.assertFalse(startup.is_alive())
+        self.assertTrue(startup_returned.is_set())
+        self.assertTrue(successor_started.wait(1.0))
+        self.assertTrue(namespace["_startup_recovery_finished"].wait(1.0))
+        self.assertEqual(namespace["_startup_recovery_state_value"](), "ready")
+        self.assertEqual(successor_count["value"], 1)
+
+    def test_shutdown_cancels_captured_restart_generation_before_successor_claim(self):
+        handoff_captured = threading.Event()
+        release_successor_claim = threading.Event()
+        successor_started = threading.Event()
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_set_startup_recovery_state",
+                "_startup_recovery_state_value",
+                "_reset_startup_recovery_lifecycle_after_stop",
+                "_start_queue_recovery_before_background_workers",
+                "_stop_versioned_model_updates",
+            ),
+            {
+                "threading": threading,
+                "api": types.SimpleNamespace(
+                    on_event=lambda *_args, **_kwargs: (
+                        lambda function: function
+                    ),
+                ),
+                "_model_update_stop": threading.Event(),
+                "_startup_recovery_state_lock": threading.Lock(),
+                "_startup_recovery_thread_lock": threading.Lock(),
+                "_startup_recovery_launch_lock": threading.RLock(),
+                "_startup_recovery_listener_ready": threading.Event(),
+                "_startup_recovery_finished": threading.Event(),
+                "_startup_recovery_stop": threading.Event(),
+                "_startup_recovery_thread": None,
+                "_startup_recovery_state": "restoring",
+                "_startup_recovery_restart_requested": True,
+                "_startup_recovery_restart_generation": 1,
+                "_startup_recovery_cancelled_restart_generation": 0,
+                "_run_startup_recovery_background": successor_started.set,
+            },
+        )
+        namespace["_startup_recovery_stop"].set()
+        original_start = namespace[
+            "_start_queue_recovery_before_background_workers"
+        ]
+
+        def paused_successor_claim(**kwargs):
+            handoff_captured.set()
+            self.assertTrue(release_successor_claim.wait(2.0))
+            return original_start(**kwargs)
+
+        namespace[
+            "_start_queue_recovery_before_background_workers"
+        ] = paused_successor_claim
+        retiring = threading.Thread(
+            target=namespace["_reset_startup_recovery_lifecycle_after_stop"],
+        )
+        namespace["_startup_recovery_thread"] = retiring
+        retiring.start()
+        self.assertTrue(handoff_captured.wait(1.0))
+        self.assertIsNone(namespace["_startup_recovery_thread"])
+
+        namespace["_stop_versioned_model_updates"]()
+        self.assertFalse(namespace["_startup_recovery_restart_requested"])
+        self.assertEqual(
+            namespace["_startup_recovery_cancelled_restart_generation"], 1,
+        )
+        release_successor_claim.set()
+        retiring.join(timeout=1.0)
+        self.assertFalse(retiring.is_alive())
+        self.assertFalse(successor_started.wait(0.1))
+        self.assertIsNone(namespace["_startup_recovery_thread"])
+        self.assertEqual(namespace["_startup_recovery_state_value"](), "pending")
+        self.assertFalse(namespace["_startup_recovery_finished"].is_set())
+        self.assertTrue(namespace["_startup_recovery_stop"].is_set())
+
+    def test_public_readiness_transitions_without_content(self):
+        class FakeResponse:
+            def __init__(self, *, status_code, headers):
+                self.status_code = status_code
+                self.headers = headers
+                self.body = b""
+
+        state = {"value": "restoring"}
+        namespace = _isolated_functions(
+            self.launch,
+            ("public_ready",),
+            {
+                "api": types.SimpleNamespace(
+                    get=lambda *_args, **_kwargs: (lambda function: function),
+                ),
+                "Response": FakeResponse,
+                "_startup_recovery_state_value": lambda: state["value"],
+            },
+        )
+        for recovery_state in ("pending", "restoring", "failed"):
+            state["value"] = recovery_state
+            response = namespace["public_ready"]()
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.body, b"")
+            self.assertEqual(response.headers, {"Cache-Control": "no-store"})
+        state["value"] = "ready"
+        response = namespace["public_ready"]()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b"")
+
+    def test_recovery_controls_fail_closed_without_partial_state_or_caching(self):
+        class FakeJSONResponse:
+            def __init__(self, content, status_code):
+                self.content = content
+                self.status_code = status_code
+                self.headers = {}
+
+        state = {"value": "restoring"}
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_startup_recovery_sensitive_path",
+                "_startup_recovery_gate_response",
+            ),
+            {
+                "Request": object,
+                "JSONResponse": FakeJSONResponse,
+                "_startup_recovery_state_value": lambda: state["value"],
+            },
+        )
+        gate = namespace["_startup_recovery_gate_response"]
+        for recovery_state in ("restoring", "failed"):
+            state["value"] = recovery_state
+            for path in (
+                "/api/v1/status/job-a",
+                "/api/v1/cancel/job-a",
+                "/api/v1/queue",
+                "/api/v1/sample-campaign/queue",
+                "/api/v1/generate",
+                "/api/v1/generate/job-a/plan/approve",
+                "/api/v1/retake",
+                "/api/v1/edit-anything",
+                "/api/v1/repaint",
+                "/api/v1/recast",
+                "/api/v1/outpaint",
+                "/api/v1/blend",
+                "/api/v1/inpaint",
+                "/api/v1/tools/upscale",
+                "/api/v1/tools/revoice",
+                "/api/v1/system/release-model",
+                "/api/v1/projects/project-a/assets/generate",
+                "/api/v1/director/preparation",
+                "/api/v1/director/preparation/request-a",
+                "/api/v1/director/generate-music",
+                "/api/v1/director/classify-sections",
+                "/api/v1/director/pipeline/start",
+                "/api/v1/director/pipelines/pipeline-a/repair",
+                "/api/v1/audio/analyze",
+                "/api/v1/audio/plan-structure",
+                "/api/v1/local-recovery/h3/discovery",
+                "/api/v1/local-recovery/h3/job-a/prepare",
+                "/api/v1/local-recovery/h3/job-a/start",
+            ):
+                with self.subTest(state=recovery_state, path=path):
+                    response = gate(types.SimpleNamespace(
+                        url=types.SimpleNamespace(path=path),
+                    ))
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(
+                        response.content,
+                        {"detail": "Service recovery is not ready"},
+                    )
+                    self.assertEqual(
+                        response.headers["Cache-Control"], "private, no-store",
+                    )
+                    self.assertEqual(response.headers["Pragma"], "no-cache")
+        state["value"] = "ready"
+        self.assertIsNone(gate(types.SimpleNamespace(
+            url=types.SimpleNamespace(path="/api/v1/queue"),
+        )))
+        state["value"] = "restoring"
+        for path in (
+            "/api/v1/outputs",
+            "/api/v1/repaint/preview",
+            "/api/v1/recast/preview",
+            "/api/v1/projects/project-a/assets",
+            "/api/v1/director/plan-prompts",
+            "/api/v1/tools/status",
+        ):
+            with self.subTest(allowed_path=path):
+                self.assertIsNone(gate(types.SimpleNamespace(
+                    url=types.SimpleNamespace(path=path),
+                )))
+
+    def test_decorated_destructive_controls_are_recovery_gated(self):
+        matcher = _isolated_functions(
+            self.launch,
+            ("_startup_recovery_sensitive_path",),
+            {"re": re},
+        )["_startup_recovery_sensitive_path"]
+
+        for function_name, expected_method, expected_route, concrete_path in (
+            (
+                "system_release_model",
+                "POST",
+                "/api/v1/system/release-model",
+                "/api/v1/system/release-model",
+            ),
+            (
+                "delete_workspace",
+                "DELETE",
+                "/api/v1/workspaces/{name}",
+                "/api/v1/workspaces/project-a",
+            ),
+        ):
+            with self.subTest(function=function_name):
+                function = _function(self.launch, function_name)
+                routes = []
+                for decorator in function.decorator_list:
+                    if not isinstance(decorator, ast.Call):
+                        continue
+                    target = decorator.func
+                    if not isinstance(target, ast.Attribute):
+                        continue
+                    if not decorator.args:
+                        continue
+                    route = decorator.args[0]
+                    if isinstance(route, ast.Constant):
+                        routes.append((target.attr.upper(), route.value))
+                self.assertIn((expected_method, expected_route), routes)
+                self.assertTrue(matcher(concrete_path, expected_method))
+
+        self.assertFalse(matcher("/api/v1/workspaces/project-a", "GET"))
+
+    def test_session_middleware_signals_listener_but_gates_after_authority(self):
+        source = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_maestro_session_middleware"),
+        )
+        listener = source.index("_note_listener_request()")
+        local_only = source.index("_sample_campaign_control_denial(request)")
+        attach = source.index("_attach_account_request_state(")
+        recovery_gate = source.index("_startup_recovery_gate_response(request)")
+        endpoint = source.index(
+            "_call_next_with_recovery_no_store(", recovery_gate,
+        )
+        self.assertLess(listener, local_only)
+        self.assertLess(local_only, attach)
+        self.assertLess(attach, recovery_gate)
+        self.assertLess(recovery_gate, endpoint)
 
     def test_expired_plan_timer_accepts_exact_frozen_plan_without_browser(self):
         jobs = {

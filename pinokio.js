@@ -1,8 +1,65 @@
 const path = require('path')
 const fs = require('fs')
+const http = require('http')
 
 const continuumVersion = fs.readFileSync(path.join(__dirname, 'CONTINUUM_VERSION'), 'utf8').trim()
 const maestroBaseVersion = fs.readFileSync(path.join(__dirname, 'VERSION'), 'utf8').trim()
+const DIRECT_HEALTH_TIMEOUT_MS = 500
+
+const directLoopbackOrigin = (rawUrl) => {
+  if (typeof rawUrl !== 'string' || !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/?$/.test(rawUrl)) {
+    return undefined
+  }
+  try {
+    const parsed = new URL(rawUrl)
+    if (
+      parsed.protocol !== 'http:' ||
+      parsed.hostname !== '127.0.0.1' ||
+      !parsed.port ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== '/' ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      return undefined
+    }
+    return parsed.origin
+  } catch (_error) {
+    return undefined
+  }
+}
+
+const probeDirectHealth = (rawUrl) => new Promise((resolve) => {
+  const origin = directLoopbackOrigin(rawUrl)
+  if (!origin) {
+    resolve(false)
+    return
+  }
+
+  let settled = false
+  const finish = (result) => {
+    if (settled) return
+    settled = true
+    resolve(result)
+  }
+  try {
+    const request = http.get(`${origin}/health`, {
+      agent: false,
+      headers: { Accept: 'application/json' },
+    }, (response) => {
+      response.resume()
+      finish(response.statusCode === 200)
+    })
+    request.setTimeout(DIRECT_HEALTH_TIMEOUT_MS, () => {
+      request.destroy()
+      finish(false)
+    })
+    request.once('error', () => finish(false))
+  } catch (_error) {
+    finish(false)
+  }
+})
 
 module.exports = {
   version: "8.0",
@@ -40,25 +97,12 @@ module.exports = {
       } else if (running.start) {
         let local = info.local("start.js")
         if (local && local.url) {
+          const backendAlive = local.backend_ready === true && await probeDirectHealth(local.url)
           const stable = local.share_kind === "stable" ? local.share_url : undefined
           const capturedQuick = local.$share && local.$share.cloudflare
             ? local.$share.cloudflare[local.url]
             : undefined
           const quick = capturedQuick || (local.share_kind === "quick" ? local.share_url : undefined)
-          let menu = [{
-            default: true,
-            icon: "fa-solid fa-rocket",
-            text: "Open Web UI",
-            href: local.url,
-          }, {
-            icon: "fa-solid fa-rocket",
-            text: "Open Classic UI",
-            href: local.url + "/classic",
-          }, {
-            icon: 'fa-solid fa-terminal',
-            text: `Terminal · ${local.sharing || "Localhost only"}`,
-            href: "start.js",
-          }]
           const remoteMenu = []
           if (stable) {
             remoteMenu.push({
@@ -74,6 +118,31 @@ module.exports = {
               href: quick,
             })
           }
+          if (!backendAlive) {
+            return [...remoteMenu, {
+              icon: 'fa-solid fa-triangle-exclamation',
+              text: "Backend unavailable or still recovering · Open terminal",
+              href: "start.js",
+            }, {
+              icon: "fa-solid fa-rotate",
+              text: "Restart Maestro",
+              href: "restart.js",
+            }]
+          }
+          let menu = [{
+            default: true,
+            icon: "fa-solid fa-rocket",
+            text: "Open Web UI",
+            href: local.url,
+          }, {
+            icon: "fa-solid fa-rocket",
+            text: "Open Classic UI",
+            href: local.url + "/classic",
+          }, {
+            icon: 'fa-solid fa-terminal',
+            text: `Terminal · ${local.sharing || "Localhost only"}`,
+            href: "start.js",
+          }]
           if (remoteMenu.length) {
             menu.splice(1, 0, ...remoteMenu)
           } else if (local.sharing && local.sharing.includes("Cloudflare")) {
@@ -83,7 +152,7 @@ module.exports = {
               href: "start.js",
             })
           }
-          if (info.ready("start.js") && local.share_kind === "stable") {
+          if (local.share_kind === "stable") {
             menu.push({
               icon: "fa-solid fa-rotate",
               text: "Restart Maestro",

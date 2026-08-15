@@ -1170,6 +1170,7 @@ api.add_middleware(
 @api.middleware("http")
 async def _maestro_session_middleware(request: Request, call_next):
     """Enforce origin checks and attach identity for session-owned resources."""
+    _note_listener_request()
     # Research is a machine-owner control surface. Reject remote requests
     # before CSRF handling or endpoint body parsing so a remote body is never
     # decoded, validated, or reflected by this surface.
@@ -1209,6 +1210,7 @@ async def _maestro_session_middleware(request: Request, call_next):
     # project, or gain any other API authority.
     capability_read = request.method.upper() == "GET" and (
         request.url.path == "/health"
+        or request.url.path == "/ready"
         or request.url.path == "/api/v1/support/catalog"
         or request.url.path.startswith("/share/")
         or request.url.path.startswith("/api/v1/output-shares/")
@@ -1256,8 +1258,11 @@ async def _maestro_session_middleware(request: Request, call_next):
         str(principal.get("id") or "") if isinstance(principal, dict) else None
     )
     try:
-        response = await _call_next_with_recovery_no_store(
-            request, call_next,
+        recovery_gate = _startup_recovery_gate_response(request)
+        response = (
+            recovery_gate
+            if recovery_gate is not None
+            else await _call_next_with_recovery_no_store(request, call_next)
         )
     finally:
         _request_account_id.reset(account_token)
@@ -1500,6 +1505,129 @@ def _queue_recovery_durable_transition(proposal) -> None:
 configure_durability_hook(_queue_recovery_durable_transition)
 _queue_recovery_checkpoint_lock = threading.RLock()
 _queue_recovery_workers_started = False
+_startup_recovery_state_lock = threading.Lock()
+_startup_recovery_thread_lock = threading.Lock()
+_startup_recovery_launch_lock = threading.RLock()
+_startup_recovery_launch_sequence = threading.local()
+_startup_recovery_listener_ready = threading.Event()
+_startup_recovery_finished = threading.Event()
+_startup_recovery_stop = threading.Event()
+_startup_recovery_thread: threading.Thread | None = None
+_startup_recovery_state = "pending"
+_startup_recovery_once_complete = False
+_startup_recovery_restart_requested = False
+_startup_recovery_restart_generation = 0
+_startup_recovery_cancelled_restart_generation = 0
+
+
+def _set_startup_recovery_state(state: str) -> None:
+    """Publish only the bounded readiness state, never recovery details."""
+    global _startup_recovery_state
+    with _startup_recovery_state_lock:
+        _startup_recovery_state = state
+    if state in {"ready", "failed"}:
+        _startup_recovery_finished.set()
+
+
+def _startup_recovery_state_value() -> str:
+    with _startup_recovery_state_lock:
+        return _startup_recovery_state
+
+
+def _note_listener_request() -> None:
+    """A request proves every ASGI startup hook has returned to the server."""
+    _startup_recovery_listener_ready.set()
+
+
+def _startup_recovery_launch_operation(operation) -> bool:
+    """Serialize execution launch against the shutdown stop boundary."""
+    with _startup_recovery_launch_lock:
+        if _startup_recovery_stop.is_set():
+            return False
+        operation()
+        if bool(getattr(_startup_recovery_launch_sequence, "held", False)):
+            _startup_recovery_launch_sequence.started = True
+        return True
+
+
+def _startup_recovery_begin_launch_sequence() -> bool:
+    """Begin launch accounting without locking non-launch recovery work."""
+    with _startup_recovery_launch_lock:
+        if _startup_recovery_stop.is_set():
+            return False
+        _startup_recovery_launch_sequence.held = True
+        _startup_recovery_launch_sequence.started = False
+        return True
+
+
+def _startup_recovery_end_launch_sequence() -> None:
+    _startup_recovery_launch_sequence.held = False
+    _startup_recovery_launch_sequence.started = False
+
+
+def _startup_recovery_launch_sequence_started() -> bool:
+    return bool(getattr(_startup_recovery_launch_sequence, "started", False))
+
+
+def _startup_recovery_sensitive_path(path: str, method: str = "") -> bool:
+    """Identify queue surfaces that cannot safely observe a partial restore."""
+    return (
+        path == "/api/v1/generate"
+        or path.startswith("/api/v1/generate/")
+        or path in {
+            "/api/v1/retake",
+            "/api/v1/edit-anything",
+            "/api/v1/repaint",
+            "/api/v1/recast",
+            "/api/v1/outpaint",
+            "/api/v1/blend",
+            "/api/v1/inpaint",
+            "/api/v1/tools/upscale",
+            "/api/v1/tools/revoice",
+            "/api/v1/system/release-model",
+            "/api/v1/director/generate-music",
+            "/api/v1/director/classify-sections",
+            "/api/v1/audio/analyze",
+            "/api/v1/audio/plan-structure",
+        }
+        or (
+            path.startswith("/api/v1/projects/")
+            and path.endswith("/assets/generate")
+        )
+        or path == "/api/v1/director/preparation"
+        or path.startswith("/api/v1/director/preparation/")
+        or path == "/api/v1/sample-campaign"
+        or path.startswith("/api/v1/sample-campaign/")
+        or path in {"/api/v1/jobs", "/api/v1/queue"}
+        or path.startswith("/api/v1/status/")
+        or path.startswith("/api/v1/cancel/")
+        or path.startswith("/api/v1/jobs/")
+        or path.startswith("/api/v1/queue/")
+        or path.startswith("/api/v1/local-recovery/")
+        or path.startswith("/api/v1/director/pipeline/")
+        or path.startswith("/api/v1/director/pipelines")
+        or (
+            str(method).upper() == "DELETE"
+            and re.fullmatch(r"/api/v1/workspaces/[^/]+", path) is not None
+        )
+    )
+
+
+def _startup_recovery_gate_response(request: Request) -> JSONResponse | None:
+    """Fail closed without exposing partially restored queue state."""
+    if (
+        _startup_recovery_state_value() == "ready"
+        or not _startup_recovery_sensitive_path(
+            str(request.url.path), str(getattr(request, "method", "")),
+        )
+    ):
+        return None
+    response = JSONResponse(
+        {"detail": "Service recovery is not ready"}, status_code=503,
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 _RECOVERY_UNIT_FIXED_ARTIFACT_ROLES = {
     "h3_segment": "component",
     "h3_concat": "final",
@@ -3048,7 +3176,13 @@ _model_update_stop = threading.Event()
 
 
 def _versioned_model_update_loop() -> None:
-    # Let startup and queued-job restoration settle before probing metadata.
+    # Never let metadata work contend with or overtake durable restoration.
+    while not _startup_recovery_finished.wait(0.1):
+        if _model_update_stop.is_set():
+            return
+    if _startup_recovery_state_value() != "ready":
+        return
+    # Let the restored queue settle before probing metadata.
     if _model_update_stop.wait(30):
         return
     while not _model_update_stop.is_set():
@@ -3083,18 +3217,178 @@ def _versioned_model_update_loop() -> None:
 
 
 @api.on_event("startup")
-def _start_queue_recovery_before_background_workers() -> None:
-    # Defined below the workspace helpers; Python resolves it when FastAPI
-    # runs startup, after module initialization is complete.
-    _restore_queue_recovery_on_startup()
+def _start_queue_recovery_before_background_workers(
+    *, _preserve_listener_generation: bool = False,
+    _restart_generation: int | None = None,
+) -> None:
+    """Start durable restoration without holding FastAPI's startup loop."""
+    global _startup_recovery_cancelled_restart_generation
+    global _startup_recovery_restart_generation
+    global _startup_recovery_restart_requested
+    global _startup_recovery_thread
+    with _startup_recovery_thread_lock:
+        if _restart_generation is not None:
+            if (
+                not _startup_recovery_restart_requested
+                or _restart_generation != _startup_recovery_restart_generation
+                or _restart_generation
+                    <= _startup_recovery_cancelled_restart_generation
+            ):
+                return
+            _startup_recovery_restart_requested = False
+        if _startup_recovery_thread is not None:
+            if _startup_recovery_stop.is_set():
+                if not _startup_recovery_restart_requested:
+                    # Begin a fresh listener generation exactly once. A request
+                    # may arrive before the retiring runner releases ownership.
+                    _startup_recovery_listener_ready.clear()
+                    _startup_recovery_finished.clear()
+                    _startup_recovery_restart_generation += 1
+                _startup_recovery_restart_requested = True
+            return
+        if _startup_recovery_state_value() != "pending":
+            return
+        if _restart_generation is None:
+            _startup_recovery_restart_requested = False
+        if not _preserve_listener_generation:
+            _startup_recovery_listener_ready.clear()
+        _startup_recovery_finished.clear()
+        _startup_recovery_stop.clear()
+        _set_startup_recovery_state("restoring")
+        thread = threading.Thread(
+            target=_run_startup_recovery_background,
+            daemon=True,
+            name="startup-recovery",
+        )
+        _startup_recovery_thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            _startup_recovery_thread = None
+            _set_startup_recovery_state("failed")
 
 
-@api.on_event("startup")
 def _start_sample_campaign_preemption_after_recovery() -> None:
     """Start the low-frequency watcher only after durable jobs are restored."""
     starter = globals().get("_start_sample_campaign_preemption_watcher")
     if callable(starter):
         starter()
+
+
+def _finish_startup_recovery_index_and_wait_for_listener() -> None:
+    """Finish offline indexing, then hold all recovered execution for HTTP."""
+    if _startup_recovery_stop.is_set():
+        raise RuntimeError("Startup recovery stopped")
+    _reindex_h3_delivery_recoveries()
+    _wait_for_listener_before_recovered_execution()
+
+
+def _wait_for_listener_before_recovered_execution() -> None:
+    """Release recovered execution only after the listener serves requests."""
+    while not _startup_recovery_listener_ready.wait(0.1):
+        if _startup_recovery_stop.is_set():
+            raise RuntimeError("Startup recovery stopped")
+    if _startup_recovery_stop.is_set():
+        raise RuntimeError("Startup recovery stopped")
+
+
+def _run_startup_recovery_background() -> None:
+    """Isolate every restore failure, including process-style termination."""
+    global _startup_recovery_once_complete
+    try:
+        if _startup_recovery_once_complete:
+            _wait_for_listener_before_recovered_execution()
+        else:
+            restored = _restore_queue_recovery_on_startup(
+                before_recovered_workers=(
+                    _finish_startup_recovery_index_and_wait_for_listener
+                ),
+                run_recovered_operation=(
+                    _startup_recovery_launch_operation
+                ),
+                begin_recovered_execution=(
+                    _startup_recovery_begin_launch_sequence
+                ),
+                end_recovered_execution=(
+                    _startup_recovery_end_launch_sequence
+                ),
+                recovered_execution_started=(
+                    _startup_recovery_launch_sequence_started
+                ),
+            )
+            if restored is False:
+                _reset_startup_recovery_lifecycle_after_stop()
+                return
+            _startup_recovery_once_complete = True
+    except BaseException:
+        if _startup_recovery_launch_sequence_started():
+            _startup_recovery_once_complete = True
+        _startup_recovery_end_launch_sequence()
+        if _startup_recovery_stop.is_set():
+            _reset_startup_recovery_lifecycle_after_stop()
+            return
+        _set_startup_recovery_state("failed")
+        print(
+            "[Maestro] Startup recovery failed; queue controls remain unavailable.",
+            flush=True,
+        )
+        return
+    try:
+        watcher_started = _startup_recovery_launch_operation(
+            _start_sample_campaign_preemption_after_recovery,
+        )
+    except BaseException:
+        if _startup_recovery_stop.is_set():
+            _reset_startup_recovery_lifecycle_after_stop()
+            return
+        watcher_started = True
+        # Recovery and H3 indexing are complete. Keep the server ready while
+        # leaving held sample jobs inert instead of letting watcher startup
+        # terminate this background boundary.
+        print(
+            "[Maestro] Sample-campaign watcher did not start; held samples "
+            "remain paused.",
+            flush=True,
+        )
+    if not watcher_started:
+        _reset_startup_recovery_lifecycle_after_stop()
+        return
+    ready_published = _startup_recovery_launch_operation(
+        lambda: _set_startup_recovery_state("ready"),
+    )
+    if not ready_published:
+        _reset_startup_recovery_lifecycle_after_stop()
+
+
+def _reset_startup_recovery_lifecycle_after_stop() -> bool:
+    """Reset restartable lifespan state only after the old runner is gone."""
+    global _startup_recovery_restart_requested
+    global _startup_recovery_state
+    global _startup_recovery_thread
+    current = threading.current_thread()
+    restart_generation = None
+    with _startup_recovery_thread_lock:
+        thread = _startup_recovery_thread
+        if (
+            thread is not None
+            and thread is not current
+            and thread.is_alive()
+        ):
+            return False
+        _startup_recovery_thread = None
+        if _startup_recovery_restart_requested:
+            restart_generation = _startup_recovery_restart_generation
+        # Startup reads thread ownership before state under this same lock
+        # order. Publish release + pending as one observable transition.
+        with _startup_recovery_state_lock:
+            _startup_recovery_state = "pending"
+        _startup_recovery_finished.clear()
+    if restart_generation is not None:
+        _start_queue_recovery_before_background_workers(
+            _preserve_listener_generation=True,
+            _restart_generation=restart_generation,
+        )
+    return True
 
 
 @api.on_event("startup")
@@ -3109,7 +3403,36 @@ def _start_versioned_model_updates() -> None:
 
 @api.on_event("shutdown")
 def _stop_versioned_model_updates() -> None:
+    global _startup_recovery_cancelled_restart_generation
+    global _startup_recovery_restart_requested
     _model_update_stop.set()
+    _startup_recovery_stop.set()
+    _startup_recovery_listener_ready.set()
+    # The stop signal is visible immediately. Synchronize only after
+    # publishing it so a long recovered launch set cannot starve shutdown;
+    # the runner observes the event before each subsequent start.
+    with _startup_recovery_launch_lock:
+        pass
+    with _startup_recovery_thread_lock:
+        # A later shutdown cancels any deferred startup generation that did
+        # not yet acquire its successor thread.
+        if _startup_recovery_restart_requested:
+            _startup_recovery_cancelled_restart_generation = max(
+                _startup_recovery_cancelled_restart_generation,
+                _startup_recovery_restart_generation,
+            )
+        _startup_recovery_restart_requested = False
+        # Reassert stop after serializing with any startup that could have
+        # cleared the first signal while claiming lifecycle ownership.
+        _startup_recovery_stop.set()
+        _startup_recovery_listener_ready.set()
+        recovery_thread = _startup_recovery_thread
+    if (
+        recovery_thread is not None
+        and recovery_thread is not threading.current_thread()
+    ):
+        recovery_thread.join(timeout=2.0)
+    _reset_startup_recovery_lifecycle_after_stop()
 
 
 @api.on_event("shutdown")
@@ -6296,11 +6619,46 @@ def _safe_sample_campaign_restart_snapshot(snapshot: Mapping[str, Any]) -> bool:
     )
 
 
-def _restore_queue_recovery_on_startup() -> None:
+def _restore_queue_recovery_on_startup(
+    *, before_recovered_workers=None,
+    run_recovered_operation=None,
+    begin_recovered_execution=None,
+    end_recovered_execution=None,
+    recovered_execution_started=None,
+) -> bool:
     """Restore scheduler membership before starting any recovered workers."""
     global _queue_recovery_workers_started
     if _queue_recovery_workers_started:
-        return
+        return True
+    if callable(run_recovered_operation):
+        run_startup_operation = run_recovered_operation
+    else:
+        def run_startup_operation(operation):
+            operation()
+            return True
+    begin_startup_execution = (
+        begin_recovered_execution
+        if callable(begin_recovered_execution)
+        else lambda: True
+    )
+    end_startup_execution = (
+        end_recovered_execution
+        if callable(end_recovered_execution)
+        else lambda: None
+    )
+
+    def finish_interrupted_startup_execution() -> bool:
+        global _queue_recovery_workers_started
+        partially_started = bool(
+            callable(recovered_execution_started)
+            and recovered_execution_started()
+        )
+        if partially_started:
+            # Never replay a launch set that may already own live workers.
+            # Jobs not yet started remain visible and owner-controllable.
+            _queue_recovery_workers_started = True
+        end_startup_execution()
+        return partially_started
     credit_journal = globals().get("_credit_accounting_journal")
     if callable(credit_journal):
         credit_journal()
@@ -6560,7 +6918,10 @@ def _restore_queue_recovery_on_startup() -> None:
             # Uncertain manifests fail closed: preserve media and allow a later
             # startup to retry without exposing paths in recovery/public state.
             pass
-    _queue_recovery_workers_started = True
+    if before_recovered_workers is not None:
+        before_recovered_workers()
+    if not begin_startup_execution():
+        return False
     # Host terms are global. Reconcile all restored, project-fenced frozen
     # plans before installing timers so a browser need not revisit each
     # workspace after restart. The common timer loop below installs exactly
@@ -6583,7 +6944,10 @@ def _restore_queue_recovery_on_startup() -> None:
             and not job.get("plan_review_terms_required", False)
         ):
             try:
-                _schedule_plan_review_auto_approval(job)
+                if not run_startup_operation(
+                    lambda: _schedule_plan_review_auto_approval(job)
+                ):
+                    return finish_interrupted_startup_execution()
             except Exception:
                 fail_preparation(
                     job,
@@ -6593,7 +6957,10 @@ def _restore_queue_recovery_on_startup() -> None:
                 )
     from services.director_pipeline import start_restored_pipeline
     for pid in director_resumable:
-        start_restored_pipeline(pid)
+        if not run_startup_operation(
+            lambda: start_restored_pipeline(pid)
+        ):
+            return finish_interrupted_startup_execution()
     for job in resumable:
         if (
             job.get("_recovery_reason_code")
@@ -6649,8 +7016,9 @@ def _restore_queue_recovery_on_startup() -> None:
             name=f"studio-recovery-{job['id']}",
         )
         try:
-            thread.start()
-        except Exception:
+            if not run_startup_operation(thread.start):
+                return finish_interrupted_startup_execution()
+        except BaseException:
             job["_recovery_reason_code"] = "worker_start_failed"
             _queue_recovery_checkpoint(
                 job,
@@ -6659,6 +7027,9 @@ def _restore_queue_recovery_on_startup() -> None:
                 reruns_denoise=bool(job.get("reruns_denoise", True)),
                 message="Recovery worker could not be started",
             )
+    _queue_recovery_workers_started = True
+    end_startup_execution()
+    return True
 
 
 def _queue_recovery_revalidate_job(job: dict) -> bool:
@@ -20202,6 +20573,17 @@ def get_access_context(request: Request):
 def public_health():
     """Minimal cookie-free liveness probe for the stable redirect Worker."""
     return {"status": "ok"}
+
+
+@api.get("/ready")
+def public_ready():
+    """Content-free readiness probe for background durable restoration."""
+    return Response(
+        status_code=(
+            200 if _startup_recovery_state_value() == "ready" else 503
+        ),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @api.put("/api/v1/access-context/share-url")
@@ -50113,12 +50495,6 @@ def _reindex_h3_delivery_recoveries() -> int:
         _jobs[source_id] = restored_job
         restored += 1
     return restored
-
-
-@api.on_event("startup")
-def _start_h3_delivery_recovery_index() -> None:
-    _reindex_h3_delivery_recoveries()
-
 
 def _h3_delivery_recovery_token(job: dict, action: str) -> str:
     recovery = job.get("_h3_delivery_recovery") or {}

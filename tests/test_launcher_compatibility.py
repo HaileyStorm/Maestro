@@ -14,10 +14,52 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestPinokioGpuCompatibility(unittest.TestCase):
-    def _render_launcher_menu(self, *, running, locals_by_script, ready=None):
+    def _render_launcher_menu(
+        self,
+        *,
+        running,
+        locals_by_script,
+        ready=None,
+        backend_ready=True,
+        health_status=200,
+        health_mode="status",
+        include_probe=False,
+    ):
         loader = r"""
-const launcher = require('./pinokio.js');
+const {EventEmitter} = require('events');
+const http = require('http');
 const state = JSON.parse(process.argv[1]);
+const requests = [];
+http.get = (url, options, callback) => {
+  const record = {
+    url: String(url),
+    agent: options.agent,
+    headers: options.headers,
+  };
+  requests.push(record);
+  if (state.healthMode === 'throw') throw new Error('probe construction failed');
+  const request = new EventEmitter();
+  request.setTimeout = (timeout, onTimeout) => {
+    record.timeout = timeout;
+    if (state.healthMode === 'timeout') process.nextTick(onTimeout);
+    return request;
+  };
+  request.destroy = () => {
+    if (state.healthMode === 'timeout') {
+      process.nextTick(() => request.emit('error', new Error('timed out')));
+    }
+  };
+  if (state.healthMode === 'error') {
+    process.nextTick(() => request.emit('error', new Error('connection refused')));
+  } else if (state.healthMode === 'status') {
+    process.nextTick(() => callback({
+      statusCode: state.healthStatus,
+      resume: () => {},
+    }));
+  }
+  return request;
+};
+const launcher = require('./pinokio.js');
 const info = {
   exists: (filepath) => filepath === 'app/env',
   running: (filepath) => Boolean(state.running[filepath]),
@@ -25,16 +67,22 @@ const info = {
   local: (filepath) => state.locals[filepath] || {},
 };
 Promise.resolve(launcher.menu({}, info))
-  .then((menu) => process.stdout.write(JSON.stringify(menu)))
+  .then((menu) => process.stdout.write(JSON.stringify({menu, requests})))
   .catch((error) => { console.error(error); process.exit(1); });
 """
+        launcher_locals = json.loads(json.dumps(locals_by_script))
+        start_local = launcher_locals.get("start.js")
+        if backend_ready is not None and isinstance(start_local, dict):
+            start_local.setdefault("backend_ready", backend_ready)
         completed = subprocess.run(
             [
                 "node", "-e", loader,
                 json.dumps({
                     "running": running,
                     "ready": running if ready is None else ready,
-                    "locals": locals_by_script,
+                    "locals": launcher_locals,
+                    "healthStatus": health_status,
+                    "healthMode": health_mode,
                 }),
             ],
             cwd=_ROOT,
@@ -43,7 +91,10 @@ Promise.resolve(launcher.menu({}, info))
             text=True,
             timeout=10,
         )
-        return json.loads(completed.stdout)
+        rendered = json.loads(completed.stdout)
+        if include_probe:
+            return rendered["menu"], rendered["requests"]
+        return rendered["menu"]
 
     def test_installed_app_menu_is_not_hidden_by_early_gpu_detection(self):
         launcher = (_ROOT / "pinokio.js").read_text(encoding="utf-8")
@@ -183,7 +234,7 @@ Promise.resolve(launcher.menu({}, info))
         self.assertEqual(classic_menu[0]["text"], "Open Classic UI")
         self.assertTrue(classic_menu[0]["default"])
 
-    def test_restart_action_requires_ready_stable_share_state(self):
+    def test_restart_action_is_available_for_stable_ready_or_backend_recovery(self):
         local_url = "http://127.0.0.1:7860"
         cases = (
             (
@@ -204,7 +255,7 @@ Promise.resolve(launcher.menu({}, info))
                     "share_kind": "stable",
                     "share_url": "https://maestro.example.workers.dev",
                 },
-                False,
+                True,
             ),
             (
                 "quick_ready",
@@ -245,6 +296,102 @@ Promise.resolve(launcher.menu({}, info))
                     self.assertEqual(actions[0]["text"], "Restart Maestro")
                     self.assertNotIn("default", actions[0])
                 self.assertIn("start.js", [item.get("href") for item in menu])
+
+    def test_menu_requires_backend_marker_and_fresh_direct_health(self):
+        local_url = "http://127.0.0.1:7860"
+        local = {
+            "url": local_url,
+            "share_kind": "stable",
+            "share_url": "https://maestro.example.workers.dev",
+            "$share": {"cloudflare": {
+                local_url: "https://current-session.trycloudflare.com",
+            }},
+        }
+        cases = (
+            ("alive", True, True, 200, "status", True),
+            ("cloudflare_polling", False, True, 200, "status", True),
+            ("dead", True, True, 503, "status", False),
+            ("connection_refused", True, True, 200, "error", False),
+            ("probe_throws", True, True, 200, "throw", False),
+            ("stale_marker", True, True, 200, "timeout", False),
+            ("missing_backend_marker", True, None, 200, "status", False),
+            ("false_backend_marker", True, False, 200, "status", False),
+        )
+        for name, ready, backend_ready, status, mode, expected_alive in cases:
+            with self.subTest(name=name):
+                menu, requests = self._render_launcher_menu(
+                    running={"start.js": True},
+                    ready={"start.js": ready},
+                    locals_by_script={"start.js": local},
+                    backend_ready=backend_ready,
+                    health_status=status,
+                    health_mode=mode,
+                    include_probe=True,
+                )
+                hrefs = [item.get("href") for item in menu]
+                self.assertEqual(local_url in hrefs, expected_alive)
+                self.assertEqual(local_url + "/classic" in hrefs, expected_alive)
+                self.assertEqual(len(requests), 1 if backend_ready is True else 0)
+                if expected_alive:
+                    self.assertEqual(menu[0]["text"], "Open Web UI")
+                    self.assertTrue(menu[0]["default"])
+                else:
+                    self.assertIn("start.js", hrefs)
+                    self.assertIn("restart.js", hrefs)
+                    recovery = next(item for item in menu if item.get("href") == "start.js")
+                    self.assertIn("unavailable or still recovering", recovery["text"])
+
+                # Last-known remote fallbacks remain visible even while the
+                # direct backend is unavailable; neither is used as a probe.
+                self.assertIn(local["share_url"], hrefs)
+                self.assertIn(local["$share"]["cloudflare"][local_url], hrefs)
+                self.assertNotIn(local["share_url"] + "/health", [
+                    request["url"] for request in requests
+                ])
+
+    def test_menu_health_probe_is_bounded_content_free_and_loopback_only(self):
+        local_url = "http://127.0.0.1:7860"
+        menu, requests = self._render_launcher_menu(
+            running={"start.js": True},
+            ready={"start.js": True},
+            locals_by_script={"start.js": {"url": local_url}},
+            backend_ready=True,
+            include_probe=True,
+        )
+        self.assertEqual(menu[0]["href"], local_url)
+        self.assertEqual(requests, [{
+            "url": local_url + "/health",
+            "agent": False,
+            "headers": {"Accept": "application/json"},
+            "timeout": 500,
+        }])
+        request_text = json.dumps(requests)
+        for forbidden in ("Cookie", "Authorization", "token", "secret"):
+            self.assertNotIn(forbidden, request_text)
+
+        for invalid_url in (
+            "https://127.0.0.1:7860",
+            "http://0.0.0.0:7860",
+            "http://192.168.1.5:7860",
+            "http://maestro.example.workers.dev",
+            "http://127.0.0.1:7860@evil.example:8080",
+            "http://127.0.0.1:7860/path",
+            "http://127.0.0.1:7860?token=secret",
+        ):
+            with self.subTest(invalid_url=invalid_url):
+                invalid_menu, invalid_requests = self._render_launcher_menu(
+                    running={"start.js": True},
+                    ready={"start.js": True},
+                    locals_by_script={"start.js": {"url": invalid_url}},
+                    backend_ready=True,
+                    include_probe=True,
+                )
+                self.assertEqual(invalid_requests, [])
+                self.assertNotIn(invalid_url, [
+                    item.get("href") for item in invalid_menu
+                    if item.get("href") != "start.js"
+                ])
+                self.assertIn("restart.js", [item.get("href") for item in invalid_menu])
 
     def test_running_restart_status_is_visible_without_auto_restarting(self):
         menu = self._render_launcher_menu(
@@ -302,7 +449,7 @@ Promise.resolve(build())
         self.assertEqual(restart["params"]["params"], {"restart_generation": generation})
         self.assertNotIn("script.stop", [step["method"] for step in definition["run"]])
 
-    def test_restart_startup_health_and_generation_clear_ordering(self):
+    def test_restart_startup_health_readiness_and_generation_clear_ordering(self):
         definition = self._load_start_with_environment(
             "PINOKIO_SHARE_CLOUDFLARE=true\n"
             "PINOKIO_STABLE_SHARE_URL=https://maestro.example.workers.dev\n",
@@ -320,10 +467,20 @@ Promise.resolve(build())
             if step.get("method") == "local.set"
             and step.get("params", {}).get("url") == "{{input.event[1]}}"
         )
+        backend_ready_index = next(
+            index for index, step in enumerate(steps)
+            if step.get("method") == "local.set"
+            and step.get("params") == {"backend_ready": True}
+        )
         health_indexes = [
             index for index, step in enumerate(steps)
             if step.get("method") == "process.wait"
             and step.get("params", {}).get("url") == "{{local.url}}/health"
+        ]
+        ready_indexes = [
+            index for index, step in enumerate(steps)
+            if step.get("method") == "process.wait"
+            and step.get("params", {}).get("url") == "{{local.url}}/ready"
         ]
         register_index = next(
             index for index, step in enumerate(steps)
@@ -339,10 +496,14 @@ Promise.resolve(build())
         )
 
         self.assertEqual(local_url_index, capture_index + 1)
+        self.assertFalse(steps[local_url_index]["params"]["backend_ready"])
         self.assertEqual(health_indexes[0], local_url_index + 1)
-        self.assertLess(health_indexes[0], register_index)
+        self.assertEqual(ready_indexes[0], health_indexes[0] + 1)
+        self.assertEqual(backend_ready_index, ready_indexes[0] + 1)
+        self.assertLess(backend_ready_index, register_index)
         self.assertLess(register_index, health_indexes[1])
-        self.assertEqual(clear_index, health_indexes[1] + 1)
+        self.assertEqual(ready_indexes[1], health_indexes[1] + 1)
+        self.assertEqual(clear_index, ready_indexes[1] + 1)
         clear = steps[clear_index]
         self.assertIn("args.restart_generation", clear["when"])
         self.assertIn("[A-Za-z0-9_-]{16,64}", clear["when"])
@@ -366,6 +527,7 @@ Promise.resolve(build())
         self.assertIn("expire automatically", status_log["params"]["text"])
         self.assertIn("no matching generation", status_log["params"]["text"])
         self.assertIn("MAESTRO_RESTART_STATUS_CLEAR_FAILED", status_log["params"]["text"])
+        self.assertIn("recovery-readiness verification", status_log["params"]["text"])
 
     def test_install_materializes_safe_defaults_without_overriding_choices(self):
         installer = (_ROOT / "install.js").read_text(encoding="utf-8")

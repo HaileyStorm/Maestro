@@ -904,6 +904,19 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn('return {"status": "ok"}', health)
         self.assertIn('request.url.path == "/health"', self.source)
 
+    def test_public_readiness_is_content_free_cookie_free_and_opaque(self):
+        ready = self._function_source("public_ready")
+        self.assertIn("_startup_recovery_state_value()", ready)
+        self.assertIn('200 if', ready)
+        self.assertIn('else 503', ready)
+        self.assertIn('headers={"Cache-Control": "no-store"}', ready)
+        self.assertIn('request.url.path == "/ready"', self.source)
+        self.assertNotIn("JSONResponse", ready)
+        for private_name in (
+            "exception", "error", "path", "job", "prompt", "traceback",
+        ):
+            self.assertNotIn(private_name, ready.casefold())
+
     def test_remote_projects_are_password_gated_and_do_not_change_global_active_project(self):
         require = self._function_source("_require_project_access")
         listing = self._function_source("list_workspaces_endpoint")

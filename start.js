@@ -139,6 +139,7 @@ module.exports = async (kernel) => {
         method: "local.set",
         params: {
           url: "{{input.event[1]}}",
+          backend_ready: false,
           stable_share_configured: stableShareConfigured,
           share_poll_attempt: 0,
           share_url: "",
@@ -153,6 +154,18 @@ module.exports = async (kernel) => {
         method: "process.wait",
         params: {
           url: "{{local.url}}/health"
+        }
+      },
+      {
+        method: "process.wait",
+        params: {
+          url: "{{local.url}}/ready"
+        }
+      },
+      {
+        method: "local.set",
+        params: {
+          backend_ready: true
         }
       },
       {
@@ -231,6 +244,13 @@ module.exports = async (kernel) => {
       },
       {
         when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind === 'stable'}}",
+        method: "process.wait",
+        params: {
+          url: "{{local.url}}/ready"
+        }
+      },
+      {
+        when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind === 'stable'}}",
         method: "shell.run",
         params: {
           venv: "env",
@@ -256,7 +276,7 @@ module.exports = async (kernel) => {
         when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind === 'stable'}}",
         method: "log",
         params: {
-          text: "{{local.restart_status_clear_result === 'MAESTRO_RESTART_STATUS_CLEARED' ? 'MAESTRO_RESTART_STATUS_CLEARED after direct local health verification.' : (local.restart_status_clear_result === 'MAESTRO_RESTART_STATUS_NOT_CLEARED' ? 'MAESTRO_RESTART_STATUS_RETAINED because no matching generation was active; any existing status remains unchanged.' : 'MAESTRO_RESTART_STATUS_CLEAR_FAILED; the published status remains truthful and will expire automatically.')}}"
+          text: "{{local.restart_status_clear_result === 'MAESTRO_RESTART_STATUS_CLEARED' ? 'MAESTRO_RESTART_STATUS_CLEARED after direct local health and recovery-readiness verification.' : (local.restart_status_clear_result === 'MAESTRO_RESTART_STATUS_NOT_CLEARED' ? 'MAESTRO_RESTART_STATUS_RETAINED because no matching generation was active; any existing status remains unchanged.' : 'MAESTRO_RESTART_STATUS_CLEAR_FAILED; the published status remains truthful and will expire automatically.')}}"
         }
       },
       {

@@ -297,8 +297,9 @@ python app/scripts/restart_status.py set --state planned --reason restart \
 python app/scripts/restart_status.py show
 ```
 
-After the intended surfaces are healthy, clear only that exact generation and
-show the result:
+After the intended surfaces are healthy, require both direct-loopback `/health`
+liveness and `/ready` recovery completion before clearing that exact generation,
+then show the result:
 
 ```bash
 python app/scripts/restart_status.py clear --generation "$RESTART_GENERATION"
@@ -315,10 +316,17 @@ canonical reference, and use:
 ```bash
 pterm status "$MAESTRO_REF" --probe --timeout=5000
 curl -fsS "${MAESTRO_URL%/}/health"
+curl -fsS "${MAESTRO_URL%/}/ready"
 ```
 
 Set `MAESTRO_URL` from the current `ready_url` or the specific external surface
-being tested; never copy an old port from a handoff.
+being tested; never copy an old port from a handoff. After the direct-loopback
+`/health` probe succeeds and `/ready` reports that startup recovery and reindexing
+are complete, `start.js` records its backend-ready marker even if Cloudflare is
+still starting. The dynamic menu requires that marker plus a fresh, bounded
+direct-loopback `/health` probe before advertising the local Web UI. `/health`
+remains the minimal process-liveness check for stable and other access-surface
+verification.
 
 ## Verification matrix
 
@@ -326,7 +334,7 @@ Verify only configured surfaces and label each evidence level accurately.
 
 | Surface | Required checks |
 | --- | --- |
-| Direct local | `pterm status --probe`, then `/health`, `/api/v1/account/context`, and `/api/v1/workspaces` against the current `ready_url`. |
+| Direct local | `pterm status --probe`, then `/health`, `/ready`, `/api/v1/account/context`, and `/api/v1/workspaces` against the current `ready_url`. |
 | LAN | Use the currently advertised LAN URL; repeat the relevant health, account-context, and workspace checks from a LAN client. |
 | Stable/Cloudflare | Use the currently advertised stable URL, confirm `/health`, then exercise account context and workspaces with a cookie-aware browser/client. Keep the direct Quick Tunnel as a separately tested fallback when claimed. |
 
