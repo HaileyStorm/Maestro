@@ -18,6 +18,11 @@ DASHBOARD = (
 
 
 class TestDirectorFailureUi(unittest.TestCase):
+    def test_director_auto_mode_is_opt_in_and_reset_stays_off(self):
+        self.assertEqual(STORE.count("directorAutoMode: false"), 2)
+        self.assertNotIn("directorAutoMode: true", STORE)
+        self.assertIn("setDirectorAutoMode: (v) => set({ directorAutoMode: v })", STORE)
+
     def test_status_type_and_submission_use_current_director_transients(self):
         status = re.search(
             r"export interface PipelineStatus[\s\S]+?\n}\n",

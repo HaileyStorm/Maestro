@@ -11651,10 +11651,9 @@ export const useStore = create<AppState>((set, get) => ({
   directorImageGenProgress: null,
   directorSpeakers: [],
   directorSpeakerMappings: [],
-  // Defaults per user preference (2026-06): Auto ON (hands-off pipeline is
-  // the common flow), Seamless OFF (separate per-clip generations are easier
-  // to retake/review than one rolling-window render).
-  directorAutoMode: true,
+  // Keep review-skipping Auto mode opt-in. Resetting Director or changing
+  // projects must never enable it behind the user's back.
+  directorAutoMode: false,
   directorSeamless: false,
   directorShotImageGuidance: 'auto' as DirectorShotImageGuidance,
   directorSkill: null,
@@ -13092,7 +13091,7 @@ export const useStore = create<AppState>((set, get) => ({
       directorImageGenProgress: null,
       directorSpeakers: [],
       directorSpeakerMappings: [],
-      directorAutoMode: true,
+      directorAutoMode: false,
       directorSeamless: false,
       directorShotImageGuidance: 'auto' as DirectorShotImageGuidance,
       directorSkill: null,
