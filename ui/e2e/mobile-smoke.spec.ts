@@ -45,6 +45,17 @@ const VIEWPORTS = [
   { name: '768 landscape', width: 1024, height: 768 },
 ] as const
 
+const TOOLBAR_VIEWPORTS = [
+  { name: '320 portrait', width: 320, height: 568 },
+  { name: '390 portrait', width: 390, height: 844 },
+  { name: '568 landscape', width: 568, height: 320 },
+  { name: '767 boundary', width: 767, height: 1024 },
+  { name: '768 boundary', width: 768, height: 1024 },
+  { name: '1024 landscape', width: 1024, height: 768 },
+  { name: '1080p desktop', width: 1920, height: 1080 },
+  { name: '4K desktop', width: 3840, height: 2160 },
+] as const
+
 async function skipWelcome(page: Page) {
   await page.addInitScript(() => localStorage.setItem('maestro_welcome_seen_v1', '1'))
 }
@@ -437,6 +448,203 @@ for (const viewport of VIEWPORTS) {
     }
   })
 }
+
+test('shared toolbar keeps view hierarchy and panel baseline stable across simulated viewports', async ({ page }) => {
+  test.setTimeout(120_000)
+  await page.route('**/api/v1/sample-campaign/queue', route => route.fulfill({
+    status: 404,
+    contentType: 'application/json',
+    body: JSON.stringify({ detail: 'No sample campaign queue in this fixture' }),
+  }))
+  await page.setViewportSize(TOOLBAR_VIEWPORTS[0])
+  await skipWelcome(page)
+  await gotoSyntheticApp(page)
+
+  const toolbar = page.locator('[data-main-toolbar]')
+  const primaryRow = page.locator('[data-main-toolbar-primary]')
+  const viewRow = page.locator('[data-main-toolbar-view]')
+  await expect(toolbar).toBeVisible()
+  await expect(primaryRow).toBeVisible()
+  await expect(viewRow).toBeVisible()
+
+  for (const viewport of TOOLBAR_VIEWPORTS) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await expect.poll(() => page.evaluate(() => ({ width: innerWidth, height: innerHeight })))
+      .toEqual({ width: viewport.width, height: viewport.height })
+
+    const viewGeometry: Array<{
+      view: string
+      toolbarHeight: number
+      panelTop: number
+      primaryTop: number
+      primaryBottom: number
+      viewTop: number
+      viewBottom: number
+      toolbarBottom: number
+    }> = []
+
+    for (const view of ['Gallery', 'Queue', 'Chat'] as const) {
+      const tab = page.getByRole('tab', { name: view === 'Queue' ? /^Queue/ : view, exact: view !== 'Queue' })
+      await tab.click()
+      await expect(tab).toHaveAttribute('aria-selected', 'true')
+      await expect(page.locator(`[role="tabpanel"][aria-labelledby="main-${view.toLowerCase()}-tab"]`)).toBeVisible()
+
+      if (view === 'Gallery') {
+        await expect(viewRow.getByRole('button', { name: 'Search Gallery' })).toBeVisible()
+        await expect(viewRow.locator('button[aria-controls="gallery-filter-popover"]')).toBeVisible()
+        if (viewport.width === 768 || viewport.width === 1024) {
+          const workspaceTrigger = primaryRow.getByRole('button', { name: /Current project: .*Open project selector/ })
+          const supportTrigger = page.getByRole('button', { name: 'Open Support', exact: true })
+          await expect(workspaceTrigger).toBeVisible()
+          await expect(supportTrigger).toBeVisible()
+          const [workspaceBox, supportBox] = await Promise.all([
+            workspaceTrigger.boundingBox(),
+            supportTrigger.boundingBox(),
+          ])
+          expect(workspaceBox).not.toBeNull()
+          expect(supportBox).not.toBeNull()
+          const overlapWidth = Math.min(workspaceBox!.x + workspaceBox!.width, supportBox!.x + supportBox!.width)
+            - Math.max(workspaceBox!.x, supportBox!.x)
+          const overlapHeight = Math.min(workspaceBox!.y + workspaceBox!.height, supportBox!.y + supportBox!.height)
+            - Math.max(workspaceBox!.y, supportBox!.y)
+          expect(overlapWidth <= 0 || overlapHeight <= 0, `${viewport.name} Workspace and Support do not overlap`).toBe(true)
+        }
+        if (viewport.width === 1024) {
+          const actionBounds = await viewRow.locator('button:visible').evaluateAll(buttons => {
+            const row = document.querySelector<HTMLElement>('[data-main-toolbar-view]')!
+            const rowBox = row.getBoundingClientRect()
+            return {
+              clientWidth: row.clientWidth,
+              scrollWidth: row.scrollWidth,
+              violations: buttons.flatMap(button => {
+                const box = button.getBoundingClientRect()
+                if (box.left >= rowBox.left - 1 && box.right <= rowBox.right + 1) return []
+                return [{
+                  name: button.getAttribute('aria-label') || button.textContent?.trim() || 'button',
+                  left: box.left,
+                  right: box.right,
+                  rowLeft: rowBox.left,
+                  rowRight: rowBox.right,
+                }]
+              }),
+            }
+          })
+          expect(actionBounds.scrollWidth, '1024px Gallery tools fit without a clipped overflow lane')
+            .toBeLessThanOrEqual(actionBounds.clientWidth + 1)
+          expect(actionBounds.violations, 'Every 1024px Gallery action stays inside the main pane').toEqual([])
+
+          await viewRow.locator('button[aria-controls="gallery-filter-popover"]').click()
+          const filterPopover = page.getByRole('dialog', { name: 'Gallery filters' })
+          await expect(filterPopover).toBeVisible()
+          const filterBounds = await filterPopover.evaluate(element => {
+            const box = element.getBoundingClientRect()
+            return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: innerWidth, height: innerHeight }
+          })
+          expect(filterBounds.left).toBeGreaterThanOrEqual(-1)
+          expect(filterBounds.right).toBeLessThanOrEqual(filterBounds.width + 1)
+          expect(filterBounds.top).toBeGreaterThanOrEqual(-1)
+          expect(filterBounds.bottom).toBeLessThanOrEqual(filterBounds.height + 1)
+          await filterPopover.getByRole('button', { name: 'Close Gallery filters' }).click()
+
+          const workspaceTrigger = primaryRow.getByRole('button', { name: /Current project: .*Open project selector/ })
+          await workspaceTrigger.click()
+          const workspaceDialog = page.getByRole('dialog', { name: 'Workspaces' })
+          await expect(workspaceDialog).toBeVisible()
+          const workspaceBounds = await workspaceDialog.evaluate(element => {
+            const box = element.getBoundingClientRect()
+            return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: innerWidth, height: innerHeight }
+          })
+          expect(workspaceBounds.left).toBeGreaterThanOrEqual(-1)
+          expect(workspaceBounds.right).toBeLessThanOrEqual(workspaceBounds.width + 1)
+          expect(workspaceBounds.top).toBeGreaterThanOrEqual(-1)
+          expect(workspaceBounds.bottom).toBeLessThanOrEqual(workspaceBounds.height + 1)
+          await page.locator('body').dispatchEvent('mousedown')
+          await expect(workspaceDialog).toHaveCount(0)
+        }
+      } else {
+        await expect(viewRow).toContainText(view === 'Queue' ? 'Queue' : 'LLM Chat')
+        if (view === 'Chat') {
+          const chatShell = page.locator('[data-chat-shell]')
+          await expect(chatShell).toBeVisible()
+          const chatBounds = await chatShell.evaluate(element => {
+            const shell = element.getBoundingClientRect()
+            const panel = element.closest<HTMLElement>('[role="tabpanel"]')!.getBoundingClientRect()
+            return {
+              shellTop: shell.top,
+              shellBottom: shell.bottom,
+              shellHeight: shell.height,
+              panelTop: panel.top,
+              panelBottom: panel.bottom,
+            }
+          })
+          expect(chatBounds.shellTop).toBeGreaterThanOrEqual(chatBounds.panelTop - 1)
+          expect(chatBounds.shellBottom).toBeLessThanOrEqual(chatBounds.panelBottom + 1)
+          expect(chatBounds.shellHeight).toBeGreaterThan(0)
+        }
+      }
+
+      const geometry = await page.evaluate(currentView => {
+        const toolbarElement = document.querySelector<HTMLElement>('[data-main-toolbar]')!
+        const primaryElement = document.querySelector<HTMLElement>('[data-main-toolbar-primary]')!
+        const viewElement = document.querySelector<HTMLElement>('[data-main-toolbar-view]')!
+        const panelElement = document.querySelector<HTMLElement>(
+          `[role="tabpanel"][aria-labelledby="main-${currentView.toLowerCase()}-tab"]`,
+        )!
+        const toolbarBox = toolbarElement.getBoundingClientRect()
+        const primaryBox = primaryElement.getBoundingClientRect()
+        const viewBox = viewElement.getBoundingClientRect()
+        const panelBox = panelElement.getBoundingClientRect()
+        return {
+          toolbarHeight: toolbarBox.height,
+          panelTop: panelBox.top,
+          primaryTop: primaryBox.top,
+          primaryBottom: primaryBox.bottom,
+          viewTop: viewBox.top,
+          viewBottom: viewBox.bottom,
+          toolbarBottom: toolbarBox.bottom,
+        }
+      }, view)
+      viewGeometry.push({ view, ...geometry })
+    }
+
+    const baseline = viewGeometry[0]
+    for (const geometry of viewGeometry) {
+      expect(Math.abs(geometry.toolbarHeight - baseline.toolbarHeight), `${viewport.name} ${geometry.view} toolbar height`).toBeLessThanOrEqual(1)
+      expect(Math.abs(geometry.panelTop - baseline.panelTop), `${viewport.name} ${geometry.view} panel top`).toBeLessThanOrEqual(1)
+      expect(Math.abs(geometry.panelTop - geometry.toolbarBottom), `${viewport.name} ${geometry.view} panel follows toolbar`).toBeLessThanOrEqual(1)
+      expect(geometry.primaryTop, `${viewport.name} ${geometry.view} primary row begins first`).toBeLessThanOrEqual(geometry.viewTop)
+      expect(geometry.primaryBottom, `${viewport.name} ${geometry.view} rows do not overlap`).toBeLessThanOrEqual(geometry.viewTop + 1)
+      expect(geometry.viewBottom, `${viewport.name} ${geometry.view} view row stays inside toolbar`).toBeLessThanOrEqual(geometry.toolbarBottom + 1)
+    }
+    await expectNoHorizontalOverflow(page)
+  }
+
+  await page.setViewportSize({ width: 768, height: 1024 })
+  await page.getByRole('tab', { name: 'Chat', exact: true }).click()
+  const chatShell = page.locator('[data-chat-shell]')
+  await expect(chatShell).toBeVisible()
+  await page.setViewportSize({ width: 767, height: 1024 })
+  await expect(chatShell).toBeVisible()
+  const resizedChatBounds = await chatShell.evaluate(element => {
+    const shell = element.getBoundingClientRect()
+    const panel = element.closest<HTMLElement>('[role="tabpanel"]')!.getBoundingClientRect()
+    return { shellTop: shell.top, shellBottom: shell.bottom, panelTop: panel.top, panelBottom: panel.bottom }
+  })
+  expect(resizedChatBounds.shellTop).toBeGreaterThanOrEqual(resizedChatBounds.panelTop - 1)
+  expect(resizedChatBounds.shellBottom).toBeLessThanOrEqual(resizedChatBounds.panelBottom + 1)
+
+  await page.setViewportSize({ width: 768, height: 1024 })
+  await page.getByRole('tab', { name: 'Gallery', exact: true }).click()
+  await viewRow.getByRole('button', { name: 'Search Gallery' }).click()
+  const searchInput = viewRow.getByRole('textbox', { name: 'Search Gallery' })
+  await searchInput.fill('focus survives resize')
+  await expect(searchInput).toBeFocused()
+  await page.setViewportSize({ width: 767, height: 1024 })
+  await expect(searchInput).toBeFocused()
+  await expect(searchInput).toHaveValue('focus survives resize')
+  await viewRow.getByRole('button', { name: 'Clear search text and close search' }).click()
+  await expect(viewRow.getByRole('button', { name: 'Search Gallery' })).toBeFocused()
+})
 
 test('200% layout zoom keeps the narrow synthetic shell usable', async ({ page }) => {
   await page.setViewportSize({ width: 640, height: 900 })

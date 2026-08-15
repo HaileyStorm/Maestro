@@ -142,6 +142,8 @@ function createSearchRuntime() {
 test('Gallery search and filter controls keep mobile targets and compact at 768px', async () => {
   const source = await readFile(tabFilterUrl, 'utf8')
 
+  assert.match(source, /relative flex min-w-0 max-w-full flex-1 shrink-0 basis-\[24rem\][^"\n]*lg:min-w-\[18rem\] lg:shrink/)
+
   const facetButton = source.slice(
     source.indexOf('function facetButton'),
     source.indexOf('export function TabFilter'),
@@ -177,11 +179,17 @@ test('Gallery search and filter controls keep mobile targets and compact at 768p
   assert.equal((metadataControls.match(/className="min-h-11 w-full/g) || []).length, 6)
   assert.equal((metadataControls.match(/md:min-h-0/g) || []).length, 6)
 
-  const compiler = await compile('@theme { --spacing: 0.25rem; --breakpoint-md: 48rem; } @tailwind utilities;')
-  const css = compiler.build(['min-h-11', 'min-w-11', 'md:min-h-0', 'md:min-w-0'])
+  const compiler = await compile('@theme { --spacing: 0.25rem; --breakpoint-md: 48rem; --breakpoint-lg: 64rem; } @tailwind utilities;')
+  const css = compiler.build([
+    'min-h-11', 'min-w-11', 'shrink-0',
+    'md:min-h-0', 'md:min-w-0', 'lg:min-w-[18rem]', 'lg:shrink',
+  ])
   assert.match(css, /min-height: calc\(var\(--spacing\) \* 11\)/)
   assert.match(css, /min-width: calc\(var\(--spacing\) \* 11\)/)
   assert.match(css, /@media \(width >= 48rem\)/)
+  assert.match(css, /@media \(width >= 64rem\)/)
+  assert.match(css, /min-width: 18rem/)
+  assert.match(css, /flex-shrink: 1/)
 })
 
 test('Gallery disclosures and focus exits retain accessible state and exact filter semantics', async () => {
@@ -196,6 +204,8 @@ test('Gallery disclosures and focus exits retain accessible state and exact filt
 
   assert.match(source, /if \(event\.key !== 'Escape'\) return[\s\S]{0,180}closeSearch\(\)/)
   assert.match(source, /closeSearch[\s\S]*requestAnimationFrame\(\(\) => searchTriggerRef\.current\?\.focus\(\)\)/)
+  assert.match(source, /input\.focus\(\)[\s\S]{0,180}input\.scrollIntoView\(\{ block: 'nearest', inline: 'nearest' \}\)/)
+  assert.match(source, /cancelAnimationFrame\(revealFrame\)/)
   assert.match(source, /if \(event\.key !== 'Escape'\) return[\s\S]{0,220}setFiltersOpen\(false\)[\s\S]{0,140}trigger\?\.focus\(\)/)
   assert.match(source, /dialog\?\.contains\(target\) \|\| trigger\?\.contains\(target\)[\s\S]{0,100}setFiltersOpen\(false\)/)
 

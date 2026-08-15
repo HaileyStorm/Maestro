@@ -55,7 +55,13 @@ export function TabFilter() {
   const filterDialogRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    if (searchOpen && searchRef.current) searchRef.current.focus()
+    if (!searchOpen || !searchRef.current) return
+    const input = searchRef.current
+    input.focus()
+    const revealFrame = window.requestAnimationFrame(() => {
+      input.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    })
+    return () => window.cancelAnimationFrame(revealFrame)
   }, [searchOpen])
 
   useEffect(() => () => {
@@ -162,7 +168,7 @@ export function TabFilter() {
   const artifactLabel = artifactScopes.find(option => option.value === artifactScope)?.label || 'Finished'
 
   return (
-    <div className="relative flex min-w-0 max-w-full flex-1 basis-[24rem] items-center gap-1">
+    <div className="relative flex min-w-0 max-w-full flex-1 shrink-0 basis-[24rem] items-center gap-1 lg:min-w-[18rem] lg:shrink">
       {searchOpen ? (
         <div id="gallery-search-controls" role="search" aria-label="Search Gallery" className="flex min-w-0 flex-1 items-center gap-1 rounded-lg border border-border bg-bg-tertiary px-2 py-0.5">
           <Search size={12} className="shrink-0 text-text-muted" />

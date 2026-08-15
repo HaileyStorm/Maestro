@@ -824,7 +824,7 @@ function WorkspaceSelector() {
         aria-expanded={open}
       >
         <FolderOpen size={12} />
-        <span className="max-w-[120px] truncate">{projectTriggerLabel}</span>
+        <span className="max-w-[120px] truncate md:hidden lg:inline">{projectTriggerLabel}</span>
       </button>
 
       {open && (
@@ -2913,69 +2913,93 @@ export function MainContent() {
   return (
     <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden">
       {/* Top bar */}
-      <div className="relative z-40 flex flex-wrap items-start justify-between gap-2 border-b border-border px-2 py-2 [&_button]:min-h-11 [&_button]:min-w-11 [&_input:not([type=checkbox])]:min-h-11 [&_label]:min-h-11 [&_select]:min-h-11 md:px-6 md:py-3 md:[&_button]:min-h-0 md:[&_button]:min-w-0 md:[&_input:not([type=checkbox])]:min-h-0 md:[&_label]:min-h-0 md:[&_select]:min-h-0">
-        {mainView === 'gallery' ? <TabFilter /> : <div className="text-xs font-medium text-text-primary">{mainView === 'queue' ? 'Queue' : 'LLM Chat'}</div>}
-        <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 sm:gap-2">
-          <MainViewTabs
-            activeView={mainView}
-            onSelect={setMainView}
-            queueTitle={`${queueTooltip}${ownedJobEtaTooltip}`}
-            queueStateColor={queueStateColor}
-            activeQueueCount={logicalQueue.activeCount}
-            queueStateLabel={queueStateLabel}
-            queueDetails={currentJob ? (
-              <span className="hidden text-[9px] xl:inline">
-                · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {formatApproximateDuration(currentEtaSeconds)}
-                {currentSubtaskEtaSeconds != null ? ` · task ${formatApproximateDuration(currentSubtaskEtaSeconds)}` : ''}
-              </span>
-            ) : undefined}
-          />
-          <div className="text-[10px] md:text-xs text-text-muted hidden md:block">
-            {outputsTotal > outputs.length
-              ? `${outputs.length} / ${outputsTotal} items`
-              : `${outputs.length} ${outputs.length === 1 ? 'item' : 'items'}`}
-          </div>
-          {!accessContext?.remote && accessContext?.cloudflare_enabled && (
-            <button
-              type="button"
-              disabled={!accessContext.share_url}
-              title={accessContext.share_url || 'Pinokio is establishing the Cloudflare tunnel'}
-              onClick={async () => {
-                if (!accessContext.share_url) return
-                await navigator.clipboard?.writeText(accessContext.share_url)
-                setShareCopied(true)
-                window.setTimeout(() => setShareCopied(false), 1800)
-              }}
-              className="max-w-[180px] truncate rounded-md border border-accent-blue/40 bg-accent-blue/10 px-2 py-1 text-[10px] text-accent-blue disabled:cursor-wait disabled:opacity-70"
-            >
-              {accessContext.share_url ? (shareCopied ? '✓ Cloudflare link copied' : 'Cloudflare · Copy link') : 'Cloudflare · starting…'}
-            </button>
-          )}
-          {mainView === 'gallery' && activeWorkspace && !browsingUploads && <>
-            <span id="private-preview-session-note" className="hidden text-[9px] text-text-muted xl:inline">
-              This only changes previews in this browser. Project access does not change.
-            </span>
-            <button
-              type="button"
-              aria-pressed={privatePreviewActionPressed}
-              aria-describedby="private-preview-session-note"
-              aria-label={`${privatePreviewActionLabel} blurred previews for project ${activeWorkspace}`}
-              onClick={togglePrivatePreviews}
-              title={`${privatePreviewActionLabel} blurred previews in this browser. This does not change who can open the project.`}
-              className="flex min-h-11 items-center gap-1 rounded-md border border-violet-500/40 px-3 text-[10px] text-violet-200 transition-colors hover:bg-violet-500/10 md:min-h-0 md:px-2 md:py-1"
-            >
-              {privatePreviewRevealState === 'all' ? <EyeOff size={12} /> : <Eye size={12} />}
-              {privatePreviewActionLabel}
-            </button>
-          </>}
-          {mainView === 'gallery' && canMutateActiveProject && <button
-            type="button"
-            onClick={() => setGallerySelectionMode(!gallerySelectionMode)}
-            className={`flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] transition-colors ${gallerySelectionMode ? 'border-accent-blue bg-accent-blue/15 text-accent-blue' : 'border-border text-text-secondary hover:text-text-primary'}`}
+      <div
+        data-main-toolbar
+        className="relative z-40 grid min-w-0 grid-rows-[auto_auto] gap-2 border-b border-border px-2 py-2 [&_button]:min-h-11 [&_button]:min-w-11 [&_input:not([type=checkbox])]:min-h-11 [&_label]:min-h-11 [&_select]:min-h-11 md:px-6 md:py-3 md:[&_button]:min-h-0 md:[&_button]:min-w-0 md:[&_input:not([type=checkbox])]:min-h-0 md:[&_label]:min-h-0 md:[&_select]:min-h-0"
+      >
+        <div
+          data-main-toolbar-primary
+          className="flex min-w-0 flex-nowrap items-center gap-1.5 sm:gap-2"
+        >
+          <div
+            data-main-toolbar-navigation
+            className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto sm:gap-2"
           >
-            <ListChecks size={12} /> Select
-          </button>}
-          <WorkspaceSelector />
+            <MainViewTabs
+              activeView={mainView}
+              onSelect={setMainView}
+              queueTitle={`${queueTooltip}${ownedJobEtaTooltip}`}
+              queueStateColor={queueStateColor}
+              activeQueueCount={logicalQueue.activeCount}
+              queueStateLabel={queueStateLabel}
+              queueDetails={currentJob ? (
+                <span className="hidden text-[9px] xl:inline">
+                  · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {formatApproximateDuration(currentEtaSeconds)}
+                  {currentSubtaskEtaSeconds != null ? ` · task ${formatApproximateDuration(currentSubtaskEtaSeconds)}` : ''}
+                </span>
+              ) : undefined}
+            />
+            <div className="hidden text-[10px] text-text-muted md:block md:text-xs">
+              {outputsTotal > outputs.length
+                ? `${outputs.length} / ${outputsTotal} items`
+                : `${outputs.length} ${outputs.length === 1 ? 'item' : 'items'}`}
+            </div>
+            {!accessContext?.remote && accessContext?.cloudflare_enabled && (
+              <button
+                type="button"
+                disabled={!accessContext.share_url}
+                title={accessContext.share_url || 'Pinokio is establishing the Cloudflare tunnel'}
+                onClick={async () => {
+                  if (!accessContext.share_url) return
+                  await navigator.clipboard?.writeText(accessContext.share_url)
+                  setShareCopied(true)
+                  window.setTimeout(() => setShareCopied(false), 1800)
+                }}
+                className="max-w-[180px] truncate rounded-md border border-accent-blue/40 bg-accent-blue/10 px-2 py-1 text-[10px] text-accent-blue disabled:cursor-wait disabled:opacity-70"
+              >
+                {accessContext.share_url ? (shareCopied ? '✓ Cloudflare link copied' : 'Cloudflare · Copy link') : 'Cloudflare · starting…'}
+              </button>
+            )}
+          </div>
+          <div className="shrink-0 md:mr-28"><WorkspaceSelector /></div>
+        </div>
+        <div
+          data-main-toolbar-view
+          className="flex min-h-11 min-w-0 flex-nowrap items-center gap-1.5 overflow-x-auto sm:gap-2 md:min-h-8 lg:overflow-visible"
+        >
+          {mainView === 'gallery' ? <>
+            <TabFilter />
+            <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-2">
+              {activeWorkspace && !browsingUploads && <>
+                <span id="private-preview-session-note" className="hidden text-[9px] text-text-muted xl:inline">
+                  This only changes previews in this browser. Project access does not change.
+                </span>
+                <button
+                  type="button"
+                  aria-pressed={privatePreviewActionPressed}
+                  aria-describedby="private-preview-session-note"
+                  aria-label={`${privatePreviewActionLabel} blurred previews for project ${activeWorkspace}`}
+                  onClick={togglePrivatePreviews}
+                  title={`${privatePreviewActionLabel} blurred previews in this browser. This does not change who can open the project.`}
+                  className="flex min-h-11 items-center gap-1 rounded-md border border-violet-500/40 px-3 text-[10px] text-violet-200 transition-colors hover:bg-violet-500/10 md:min-h-0 md:px-2 md:py-1"
+                >
+                  {privatePreviewRevealState === 'all' ? <EyeOff size={12} /> : <Eye size={12} />}
+                  {privatePreviewActionLabel}
+                </button>
+              </>}
+              {canMutateActiveProject && <button
+                type="button"
+                onClick={() => setGallerySelectionMode(!gallerySelectionMode)}
+                className={`flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] transition-colors ${gallerySelectionMode ? 'border-accent-blue bg-accent-blue/15 text-accent-blue' : 'border-border text-text-secondary hover:text-text-primary'}`}
+              >
+                <ListChecks size={12} /> Select
+              </button>}
+            </div>
+          </> : (
+            <h2 className="shrink-0 whitespace-nowrap text-xs font-medium text-text-primary">
+              {mainView === 'queue' ? 'Queue' : 'LLM Chat'}
+            </h2>
+          )}
         </div>
       </div>
       {/* Content area: feed + thumbnails */}

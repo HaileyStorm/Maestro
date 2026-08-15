@@ -132,6 +132,38 @@ function jsxSentinel(label) {
   return { type: 'sentinel', props: { label } }
 }
 
+test('MainContent toolbar keeps a stable two-row hierarchy across views', async () => {
+  const source = await readFile(mainUrl, 'utf8')
+  const topBar = sourceRegion(source, '{/* Top bar */}', '{/* Content area: feed + thumbnails */}')
+  const primaryStart = topBar.indexOf('data-main-toolbar-primary')
+  const navigationStart = topBar.indexOf('data-main-toolbar-navigation')
+  const viewStart = topBar.indexOf('data-main-toolbar-view')
+  assert.ok(primaryStart >= 0 && navigationStart > primaryStart && viewStart > navigationStart)
+  const primaryRow = topBar.slice(primaryStart, viewStart)
+  const navigationLane = topBar.slice(navigationStart, viewStart)
+  const viewRow = topBar.slice(viewStart)
+
+  for (const hook of ['data-main-toolbar', 'data-main-toolbar-primary', 'data-main-toolbar-view']) {
+    assert.equal((topBar.match(new RegExp(`${hook}(?!-)`, 'g')) ?? []).length, 1)
+  }
+  assert.match(topBar, /grid min-w-0 grid-rows-\[auto_auto\]/)
+  assert.doesNotMatch(topBar, /flex flex-wrap items-start justify-between/)
+  assert.match(primaryRow, /flex min-w-0 flex-nowrap items-center/)
+  assert.doesNotMatch(primaryRow.match(/className="[^"]+"/)?.[0] ?? '', /overflow/)
+  assert.match(navigationLane, /flex min-w-0 flex-1 items-center[^"\n]*overflow-x-auto/)
+  assert.match(viewRow, /flex min-h-11 min-w-0 flex-nowrap items-center[^"\n]*overflow-x-auto[^"\n]*md:min-h-8[^"\n]*lg:overflow-visible/)
+  assert.match(source, /<\/div>\n      \{\/\* Content area: feed \+ thumbnails \*\/\}\n      <MainViewPanels/)
+
+  assert.equal((topBar.match(/<MainViewTabs/g) ?? []).length, 1)
+  assert.equal((topBar.match(/<TabFilter/g) ?? []).length, 1)
+  assert.equal((topBar.match(/<WorkspaceSelector/g) ?? []).length, 1)
+  assert.match(navigationLane, /<MainViewTabs[\s\S]*outputsTotal[\s\S]*cloudflare_enabled/)
+  assert.match(primaryRow, /data-main-toolbar-navigation[\s\S]*shrink-0 md:mr-28[^>]*><WorkspaceSelector/)
+  assert.doesNotMatch(primaryRow, /<TabFilter/)
+  assert.match(viewRow, /mainView === 'gallery' \? <>[\s\S]*<TabFilter[\s\S]*private-preview-session-note[\s\S]*setGallerySelectionMode/)
+  assert.match(viewRow, /<h2[^>]*>[\s\S]*mainView === 'queue' \? 'Queue' : 'LLM Chat'[\s\S]*<\/h2>/)
+})
+
 test('MainContent mobile targets remain 44px through 767 and keep narrow layouts local', async () => {
   const source = await readFile(mainUrl, 'utf8')
   const topBar = sourceRegion(source, '{/* Top bar */}', '{/* Content area: feed + thumbnails */}')
@@ -151,6 +183,7 @@ test('MainContent mobile targets remain 44px through 767 and keep narrow layouts
   assert.match(topBar, /md:\[&_label\]:min-h-0/)
   assert.match(topBar, /md:\[&_select\]:min-h-0/)
   assert.match(workspace, /opacity-100 hover:text-red-400 md:opacity-0/)
+  assert.match(workspace, /max-w-\[120px\] truncate md:hidden lg:inline/)
   assert.match(workspace, /flex min-h-11 cursor-pointer items-start[^"\n]*md:min-h-0/)
   assert.match(workspace, /fixed left-2 right-2 top-14 z-\[70\] max-h-\[calc\(100vh-4rem\)\] overflow-y-auto/)
   assert.match(workspace, /sm:absolute sm:left-auto sm:right-0 sm:top-full/)
@@ -171,15 +204,16 @@ test('MainContent mobile targets remain 44px through 767 and keep narrow layouts
 
   const compiler = await compile('@theme { --spacing: 0.25rem; --breakpoint-md: 48rem; } @tailwind utilities;')
   const css = compiler.build([
-    'min-h-11', 'min-w-11', 'md:min-h-0', 'md:min-w-0',
+    'min-h-8', 'min-h-11', 'min-w-11', 'md:min-h-0', 'md:min-h-8', 'md:min-w-0',
     '[&_button]:min-h-11', '[&_button]:min-w-11',
     'md:[&_button]:min-h-0', 'md:[&_button]:min-w-0',
-    'overflow-x-auto', 'flex-wrap', 'min-w-0',
+    'grid', 'grid-rows-[auto_auto]', 'overflow-x-auto', 'flex-nowrap', 'min-w-0',
   ])
   assert.match(css, /min-height: calc\(var\(--spacing\) \* 11\)/)
   assert.match(css, /min-width: calc\(var\(--spacing\) \* 11\)/)
   assert.match(css, /overflow-x: auto/)
-  assert.match(css, /flex-wrap: wrap/)
+  assert.match(css, /flex-wrap: nowrap/)
+  assert.match(css, /grid-template-rows: auto auto/)
   assert.match(css, /@media \(width >= 48rem\)/)
 })
 
