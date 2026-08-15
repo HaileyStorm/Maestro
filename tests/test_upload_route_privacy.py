@@ -343,6 +343,49 @@ class AuthorizedMediaResolverTests(unittest.TestCase):
 
 
 class UploadRouteSourceContractTests(unittest.TestCase):
+    def test_malformed_managed_output_is_hidden_after_project_authorization(self):
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_require_authorized_output", "list_favorites"}
+        ]
+        for node in nodes:
+            node.decorator_list = []
+        namespace = {
+            "Request": object,
+            "HTTPException": _HTTPException,
+            "os": os,
+        }
+        exec(
+            compile(ast.Module(body=nodes, type_ignores=[]), str(LAUNCH_PATH), "exec"),
+            namespace,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "managed.mp4").write_bytes(b"media")
+            Path(directory, "managed.meta.json").write_text("{broken", encoding="utf-8")
+            namespace.update({
+                "_request_project_workspace": lambda _request, workspace: workspace,
+                "_require_project_access": lambda *_args, **_kwargs: directory,
+                "load_media_sidecars": lambda *_args, **_kwargs: {},
+                "_load_favorites": lambda _workspace: {"managed.mp4"},
+            })
+            request = types.SimpleNamespace(
+                state=types.SimpleNamespace(maestro_session_id="a" * 32),
+            )
+
+            with self.assertRaises(_HTTPException) as raised:
+                namespace["_require_authorized_output"](
+                    request, "project", "managed.mp4",
+                )
+            self.assertEqual(raised.exception.status_code, 404)
+            self.assertEqual(
+                namespace["list_favorites"](request, "project"),
+                {"favorites": []},
+            )
+
     def test_uploads_stamp_final_path_and_expose_only_public_policy(self):
         transcode_markers = {
             "upload_audio": "if needs_transcode",
@@ -374,9 +417,12 @@ class UploadRouteSourceContractTests(unittest.TestCase):
     def test_output_file_and_metadata_routes_share_fail_closed_authorizer(self):
         authorizer = _function_source("_require_authorized_output")
         self.assertIn("is_safe_direct_basename(name)", authorizer)
+        self.assertIn("_require_project_access(request, workspace)", authorizer)
         self.assertIn("expected_sidecar", authorizer)
         self.assertIn("os.path.isfile(expected_sidecar) and sidecar is None", authorizer)
-        self.assertIn("can_access_output(sidecar", authorizer)
+        self.assertNotIn("can_access_output", authorizer)
+        listing = _function_source("list_outputs")
+        self.assertIn("sidecar_cache.get(entry[0]) is None", listing)
         for name in ("serve_file", "get_output_metadata"):
             with self.subTest(name=name):
                 self.assertIn(

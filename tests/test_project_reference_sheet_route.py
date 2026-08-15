@@ -26,7 +26,6 @@ from fastapi import HTTPException
 from PIL import Image
 from services import job_lifecycle as lifecycle
 from services.output_access import (
-    can_access_output,
     public_output_policy,
     stamp_sidecar_policy,
 )
@@ -366,7 +365,6 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "ReferenceAdmissionValidationError": ReferenceAdmissionValidationError,
             "wgp": _ModelRegistry,
             "public_output_policy": public_output_policy,
-            "can_access_output": can_access_output,
             "stamp_sidecar_policy": stamp_sidecar_policy,
             "ArtifactScope": ArtifactScope,
             "artifact_matches_scope": artifact_matches_scope,

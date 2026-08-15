@@ -280,7 +280,7 @@ class BlenderLaunchIntegrationTests(unittest.TestCase):
         self.assertIn("_can_access_project_asset_variant", public_assets)
         self.assertIn("_can_access_project_asset_variant", serve_asset)
         self.assertIn("_can_access_project_asset_variant", resolve_asset)
-        self.assertIn("can_access_output", resolve_asset)
+        self.assertNotIn("can_access_output", resolve_asset)
 
     def test_semantic_mapping_is_normalized_preserved_and_handed_to_studio(self):
         normalize = _load_functions("_normalize_blender_semantic_mapping")[

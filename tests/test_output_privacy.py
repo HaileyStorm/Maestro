@@ -24,7 +24,6 @@ from services.output_access import (  # noqa: E402
     MIN_PROJECT_PASSWORD_LENGTH,
     ProjectAccessManager,
     ProjectUnlockRateLimiter,
-    can_access_output,
     can_access_upload,
     decode_session_cookie,
     encode_session_cookie,
@@ -61,7 +60,6 @@ def _load_launch_functions(*names):
         "threading": threading,
         "time": time,
         "uuid": uuid,
-        "can_access_output": can_access_output,
         "artifact_lineage": artifact_lineage,
         "classify_gallery_artifacts": classify_gallery_artifacts,
         "linked_component_names": linked_component_names,
@@ -187,17 +185,20 @@ class OutputPolicyTests(unittest.TestCase):
             {"private": True, "explicit": True, "owner_session_id": "a" * 32},
             workspace="project-a",
         )
-        self.assertTrue(can_access_output(sidecar, "a" * 32))
-        self.assertTrue(can_access_output(sidecar, "b" * 32))
         self.assertNotIn("owner_session_id", sidecar)
         self.assertEqual(
             public_output_policy(sidecar), {"private": True, "explicit": True},
         )
         self.assertEqual(sidecar["workspace"], "project-a")
 
-    def test_generated_output_missing_metadata_keeps_legacy_open_semantics(self):
-        self.assertTrue(can_access_output(None, "b" * 32))
-        self.assertTrue(can_access_output({"params": {}}, "b" * 32))
+    def test_generated_output_missing_metadata_has_public_presentation_defaults(self):
+        self.assertEqual(
+            public_output_policy(None), {"private": False, "explicit": False},
+        )
+        self.assertEqual(
+            public_output_policy({"params": {}}),
+            {"private": False, "explicit": False},
+        )
 
 
 class UploadAccessTests(unittest.TestCase):
@@ -400,7 +401,10 @@ class ProjectPasswordTests(unittest.TestCase):
             }
             for session in (session_a, session_b):
                 self.assertTrue(manager.require("first", first, session))
-                self.assertTrue(can_access_output(legacy_private, session))
+            self.assertEqual(
+                public_output_policy(legacy_private),
+                {"private": True, "explicit": True},
+            )
             self.assertFalse(manager.require("second", second, session_b))
 
     def test_clearing_password_removes_access_metadata(self):
@@ -803,7 +807,7 @@ class LineagePrivacyTransactionTests(unittest.TestCase):
                 ) as raised:
                     self.set_privacy(
                         directory, names, workspace="project",
-                        private=True, session_id="a" * 32,
+                        private=True,
                     )
             self.assertEqual(raised.exception.status_code, 500)
             for path, original in originals.items():
@@ -830,7 +834,7 @@ class LineagePrivacyTransactionTests(unittest.TestCase):
                 ):
                     self.set_privacy(
                         directory, names, workspace="project",
-                        private=True, session_id="a" * 32,
+                        private=True,
                     )
             for path, original in originals.items():
                 self.assertEqual(path.read_bytes(), original)
@@ -851,7 +855,7 @@ class LineagePrivacyTransactionTests(unittest.TestCase):
                 ):
                     self.set_privacy(
                         directory, names, workspace="project",
-                        private=True, session_id="a" * 32,
+                        private=True,
                     )
             finally:
                 self.namespace["_revoke_output_shares"] = previous
@@ -864,7 +868,7 @@ class LineagePrivacyTransactionTests(unittest.TestCase):
             names, _ = self._lineage(directory)
             changed = self.set_privacy(
                 directory, names, workspace="project",
-                private=True, session_id="b" * 32,
+                private=True,
             )
             self.assertEqual(changed, names)
             for name in names:
@@ -883,7 +887,7 @@ class LineagePrivacyTransactionTests(unittest.TestCase):
             first.write_text(json.dumps(foreign), encoding="utf-8")
             self.set_privacy(
                 directory, names, workspace="project",
-                private=False, session_id="a" * 32,
+                private=False,
             )
             for path in originals:
                 metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -952,14 +956,14 @@ class LineageMutationSafetyTests(unittest.TestCase):
     def test_plan_never_sweeps_a_second_final_from_a_shared_job_seed(self):
         with tempfile.TemporaryDirectory() as directory:
             self._two_finals(directory)
-            plan, _, classes = self.plan(directory, "final-a.mp4", "a" * 32)
+            plan, _, classes = self.plan(directory, "final-a.mp4")
             self.assertEqual(classes["final-b.mp4"], "final")
             self.assertEqual(plan, ["final-a.mp4", "temporary.png", "window.mp4"])
 
     def test_move_carries_nonfinals_but_leaves_the_other_final(self):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
             self._two_finals(source)
-            plan, _, _ = self.plan(source, "final-a.mp4", "a" * 32)
+            plan, _, _ = self.plan(source, "final-a.mp4")
             revisions = self.freeze(source, plan)
             moved = self.move(
                 source, target, plan, source_workspace="source",
@@ -980,11 +984,11 @@ class LineageMutationSafetyTests(unittest.TestCase):
     def test_privacy_changes_selected_lineage_without_touching_other_final(self):
         with tempfile.TemporaryDirectory() as directory:
             self._two_finals(directory)
-            plan, _, _ = self.plan(directory, "final-a.mp4", "a" * 32)
+            plan, _, _ = self.plan(directory, "final-a.mp4")
             revisions = self.freeze(directory, plan)
             changed = self.set_privacy(
                 directory, plan, workspace="workspace",
-                private=True, session_id="a" * 32,
+                private=True,
                 expected_revisions=revisions,
             )
             self.assertEqual(changed, plan)
@@ -1001,12 +1005,12 @@ class LineageMutationSafetyTests(unittest.TestCase):
     def test_legacy_single_output_can_gain_privacy_metadata_and_move(self):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
             Path(source, "legacy.mp4").write_bytes(b"legacy")
-            plan, _, _ = self.plan(source, "legacy.mp4", "a" * 32)
+            plan, _, _ = self.plan(source, "legacy.mp4")
             self.assertEqual(plan, ["legacy.mp4"])
             revisions = self.freeze(source, plan)
             self.set_privacy(
                 source, plan, workspace="source",
-                private=True, session_id="a" * 32,
+                private=True,
                 expected_revisions=revisions,
             )
             metadata = json.loads(
@@ -1044,7 +1048,7 @@ class LineageMutationSafetyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
             self._two_finals(source)
-            plan, _, _ = self.plan(source, "final-a.mp4", "a" * 32)
+            plan, _, _ = self.plan(source, "final-a.mp4")
             revisions = self.freeze(source, plan)
             Path(target, "final-a.mp4").write_bytes(b"collision")
             with self.assertRaisesRegex(HTTPException, "Target already contains"):
@@ -1058,7 +1062,7 @@ class LineageMutationSafetyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
             self._two_finals(source)
-            plan, _, _ = self.plan(source, "final-a.mp4", "a" * 32)
+            plan, _, _ = self.plan(source, "final-a.mp4")
             revisions = self.freeze(source, plan)
             real_move = shutil.move
             calls = 0
@@ -1085,7 +1089,7 @@ class LineageMutationSafetyTests(unittest.TestCase):
     def test_delete_fault_rolls_back_every_member_after_revoking_shares(self):
         with tempfile.TemporaryDirectory() as directory:
             self._two_finals(directory)
-            plan, _, classes = self.plan(directory, "final-a.mp4", "a" * 32)
+            plan, _, classes = self.plan(directory, "final-a.mp4")
             plan.sort(key=lambda candidate: classes.get(candidate) == "final")
             revisions = self.freeze(directory, plan)
             real_replace = os.replace
@@ -1117,7 +1121,7 @@ class LineageMutationSafetyTests(unittest.TestCase):
         self.namespace["_revoke_output_shares"] = fail_revoke
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
             self._two_finals(source)
-            plan, _, _ = self.plan(source, "final-a.mp4", "a" * 32)
+            plan, _, _ = self.plan(source, "final-a.mp4")
             revisions = self.freeze(source, plan)
             before = {
                 path.name: path.read_bytes() for path in Path(source).iterdir()
@@ -1135,7 +1139,7 @@ class LineageMutationSafetyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             self._two_finals(directory)
-            plan, _, classes = self.plan(directory, "final-a.mp4", "a" * 32)
+            plan, _, classes = self.plan(directory, "final-a.mp4")
             plan.sort(key=lambda candidate: classes.get(candidate) == "final")
             revisions = self.freeze(directory, plan)
             before = {
@@ -1154,7 +1158,7 @@ class LineageMutationSafetyTests(unittest.TestCase):
     def test_delete_commits_whole_selected_lineage_then_revokes_once(self):
         with tempfile.TemporaryDirectory() as directory:
             self._two_finals(directory)
-            plan, _, classes = self.plan(directory, "final-a.mp4", "a" * 32)
+            plan, _, classes = self.plan(directory, "final-a.mp4")
             plan.sort(key=lambda candidate: classes.get(candidate) == "final")
             revisions = self.freeze(directory, plan)
             deleted, failed = self.delete(
@@ -1171,7 +1175,7 @@ class LineageMutationSafetyTests(unittest.TestCase):
     def test_move_rechecks_every_frozen_member_revision(self):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as target:
             self._two_finals(source)
-            plan, _, _ = self.plan(source, "final-a.mp4", "a" * 32)
+            plan, _, _ = self.plan(source, "final-a.mp4")
             revisions = self.freeze(source, plan)
             Path(source, "window.mp4").write_bytes(b"changed after snapshot")
             with self.assertRaisesRegex(HTTPException, "window.mp4") as raised:
@@ -1234,7 +1238,8 @@ class LaunchPrivacyContractTests(unittest.TestCase):
         source = (APP_ROOT / "launch.py").read_text(encoding="utf-8")
         self.assertIn("def serve_file(request: Request, filename: str, workspace: str = \"\")", source)
         self.assertNotIn("Search all workspace subdirectories", source)
-        self.assertIn("can_access_output(sidecar_cache.get(entry[0]), session_id)", source)
+        self.assertNotIn("can_access_output", source)
+        self.assertIn("_require_project_access(", source)
         self.assertIn('@api.post("/api/v1/outputs/bulk/move")', source)
         self.assertIn('@api.post("/api/v1/outputs/bulk/privacy")', source)
         self.assertIn('@api.post("/api/v1/outputs/bulk/delete")', source)

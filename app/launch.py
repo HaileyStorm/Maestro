@@ -259,7 +259,6 @@ from services.output_access import (
     ProjectAccessManager,
     ProjectUnlockRateLimiter,
     OutputShareManager,
-    can_access_output,
     can_access_upload,
     decode_session_cookie,
     encode_session_cookie,
@@ -9432,8 +9431,6 @@ def _require_authorized_output(
     if expected_sidecar and os.path.isfile(expected_sidecar) and sidecar is None:
         # A present-but-malformed or ambiguous sidecar is evidence that this
         # is managed output, not a legacy sidecarless file. Fail closed.
-        raise HTTPException(status_code=404, detail="Output file not found")
-    if not can_access_output(sidecar, request.state.maestro_session_id):
         raise HTTPException(status_code=404, detail="Output file not found")
     return out_dir, filepath, sidecar
 
@@ -21156,8 +21153,6 @@ def _public_authorized_project_assets(assets: list[dict], session_id: str) -> li
             outputs = []
             for output in variant.get("outputs") or []:
                 policy = output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
-                if not can_access_output(policy, session_id):
-                    continue
                 output["metadata"] = {
                     **{
                         key: value for key, value in policy.items()
@@ -21199,10 +21194,6 @@ def _require_project_asset_media_access(
     for variant in variants:
         if not _can_access_project_asset_variant(variant, session_id):
             raise HTTPException(status_code=404, detail="Reference asset not found")
-        for output in variant.get("outputs") or []:
-            policy = output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
-            if not can_access_output(policy, session_id):
-                raise HTTPException(status_code=404, detail="Reference asset not found")
     return asset
 
 
@@ -21696,10 +21687,7 @@ def serve_project_asset_media(project: str, relative_path: str, request: Request
             for output in variant.get("outputs") or []:
                 if output.get("relative_path") != relative_path:
                     continue
-                policy = output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
-                authorized = can_access_output(
-                    policy, request.state.maestro_session_id,
-                )
+                authorized = True
                 break
     if not authorized:
         raise HTTPException(status_code=404, detail="Reference media not found")
@@ -50815,15 +50803,6 @@ def _resolve_authorized_project_asset_media(
                 ):
                     continue
                 for output in variant.get("outputs") or []:
-                    policy = (
-                        output.get("metadata")
-                        if isinstance(output.get("metadata"), dict)
-                        else {}
-                    )
-                    if not can_access_output(
-                        policy, request.state.maestro_session_id,
-                    ):
-                        continue
                     relative = output.get("relative_path")
                     if not isinstance(relative, str):
                         continue
@@ -59997,7 +59976,6 @@ def list_favorites(request: Request, workspace: str = ""):
             ))
             and sidecars.get(name) is None
         )
-        and can_access_output(sidecars.get(name), request.state.maestro_session_id)
     ]
     return {"favorites": sorted(visible)}
 
@@ -60219,7 +60197,6 @@ def list_outputs(
             )) is not None
         }
     else:
-        session_id = request.state.maestro_session_id
         raw_entries = [
             entry for entry in raw_entries
             if not (
@@ -60228,7 +60205,6 @@ def list_outputs(
                 ))
                 and sidecar_cache.get(entry[0]) is None
             )
-            and can_access_output(sidecar_cache.get(entry[0]), session_id)
         ]
         media_names = {entry[0] for entry in raw_entries}
         sidecar_cache = {
@@ -60444,10 +60420,6 @@ def get_output_metadata(request: Request, name: str, workspace: str = ""):
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 sidecar = json.load(f)
-            if not can_access_output(
-                sidecar, request.state.maestro_session_id,
-            ):
-                raise HTTPException(status_code=404, detail="Output file not found")
             # Merge actual seed from embedded metadata if sidecar has seed=-1
             params = sidecar.get("params", {})
             if params.get("seed", -1) == -1:
@@ -60794,8 +60766,6 @@ def rejoin_clips(request: Request, body: dict):
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            if not can_access_output(meta, request.state.maestro_session_id):
-                continue
             params = meta.get("params", {})
             mci = params.get("multi_clip_info")
             if not mci or mci.get("group_id") != group_id:
@@ -60943,8 +60913,6 @@ def get_group_clips(request: Request, group_id: str, workspace: str = ""):
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            if not can_access_output(meta, request.state.maestro_session_id):
-                continue
             params = meta.get("params", {})
             mci = params.get("multi_clip_info")
             if not mci or mci.get("group_id") != group_id:
@@ -61021,9 +60989,8 @@ def _workspace_artifact_snapshot(out_dir: str):
 def _authorized_lineage_plan(
     out_dir: str,
     name: str,
-    session_id: str,
 ) -> tuple[list[str], dict[str, dict], dict[str, str]]:
-    """Freeze the selected output plus its sidecar-authorized non-finals.
+    """Freeze the selected output plus its metadata-backed non-finals.
 
     A job/seed lineage is deliberately not an ownership boundary: repeat jobs
     and separately published finals can share it.  Destructive operations may
@@ -61042,17 +61009,13 @@ def _authorized_lineage_plan(
         # by the gallery and must fail closed for mutations too.
         raise HTTPException(status_code=404, detail=f"Output not found: {name}")
     target_meta = sidecars.get(name) or {}
-    if not can_access_output(target_meta, session_id):
-        raise HTTPException(status_code=404, detail=f"Output not found: {name}")
     lineage = artifact_lineage(target_meta)
     if lineage is None:
         return [name], sidecars, classes
     planned = [name]
     if classes.get(name) == "final":
         for candidate in linked_component_names(name, sidecars, classes):
-            meta = sidecars.get(candidate) or {}
-            if can_access_output(meta, session_id):
-                planned.append(candidate)
+            planned.append(candidate)
     return list(dict.fromkeys(planned)) or [name], sidecars, classes
 
 
@@ -61130,7 +61093,6 @@ def _set_lineage_privacy(
     *,
     workspace: str,
     private: bool,
-    session_id: str,
     expected_revisions: dict[str, str] | None = None,
 ) -> list[str]:
     """Rewrite every frozen lineage sidecar or restore all original bytes."""
@@ -61177,11 +61139,6 @@ def _set_lineage_privacy(
                     raise HTTPException(
                         status_code=409,
                         detail=f"Invalid lineage sidecar: {name}",
-                    )
-                if not can_access_output(meta, session_id):
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Output not found: {name}",
                     )
                 originals.append((path, original))
                 updated = dict(meta)
@@ -61384,14 +61341,11 @@ async def bulk_output_privacy(request: Request):
                 out_dir = _require_project_access(request, workspace)
                 with _output_lineage_mutation_guard(out_dir):
                     _validate_bulk_item_revision(out_dir, item)
-                    names, _, _ = _authorized_lineage_plan(
-                        out_dir, name, request.state.maestro_session_id,
-                    )
+                    names, _, _ = _authorized_lineage_plan(out_dir, name)
                     names = [n for n in names if (workspace, n) not in processed]
                     revisions = _freeze_lineage_revisions(out_dir, names) if names else {}
                     changed = _set_lineage_privacy(
                         out_dir, names, workspace=workspace, private=private,
-                        session_id=request.state.maestro_session_id,
                         expected_revisions=revisions,
                     ) if names else []
                     processed.update((workspace, n) for n in changed)
@@ -61427,9 +61381,7 @@ async def bulk_move_outputs(request: Request):
                 target_dir = _require_project_access(request, target_workspace)
                 with _output_lineage_mutation_guard(source_dir, target_dir):
                     _validate_bulk_item_revision(source_dir, item)
-                    names, _, _ = _authorized_lineage_plan(
-                        source_dir, name, request.state.maestro_session_id,
-                    )
+                    names, _, _ = _authorized_lineage_plan(source_dir, name)
                     names = [n for n in names if (workspace, n) not in processed]
                     revisions = _freeze_lineage_revisions(source_dir, names) if names else {}
                     moved = _move_lineage_files(
@@ -61543,9 +61495,7 @@ async def bulk_delete_outputs(request: Request):
                 out_dir = _require_project_access(request, workspace)
                 with _output_lineage_mutation_guard(out_dir):
                     _validate_bulk_item_revision(out_dir, item)
-                    plan, _, classes = _authorized_lineage_plan(
-                        out_dir, name, request.state.maestro_session_id,
-                    )
+                    plan, _, classes = _authorized_lineage_plan(out_dir, name)
                     if not cascade or classes.get(name) != "final":
                         plan = [name]
                     plan = [candidate for candidate in plan if (workspace, candidate) not in processed]
@@ -61605,9 +61555,7 @@ async def move_output(name: str, request: Request):
         print(f"[Move] {name} -> {target_ws}")
         with _output_lineage_mutation_guard(src_dir, dst_dir):
             _validate_bulk_item_revision(src_dir, {"name": name, "revision": body.get("revision")})
-            names, _, _ = _authorized_lineage_plan(
-                src_dir, name, request.state.maestro_session_id,
-            )
+            names, _, _ = _authorized_lineage_plan(src_dir, name)
             revisions = _freeze_lineage_revisions(src_dir, names)
             moved = _move_lineage_files(
                 src_dir, dst_dir, names, source_workspace=source_ws,
@@ -61682,25 +61630,21 @@ def _delete_output_component_candidates(
     out_dir: str,
     candidates,
     workspace: str | None = None,
-    session_id: str | None = None,
 ):
     """Execute a validated all-or-nothing component cleanup plan."""
     selected_workspace = workspace or _get_active_workspace()
     unique_candidates = list(dict.fromkeys(candidates))
     with _output_lineage_mutation_guard(out_dir):
-        if session_id:
-            current_plan, _, classes = _authorized_lineage_plan(
-                out_dir, name, session_id,
+        current_plan, _, classes = _authorized_lineage_plan(out_dir, name)
+        allowed = {
+            candidate for candidate in current_plan
+            if candidate != name and classes.get(candidate) != "final"
+        }
+        if any(candidate not in allowed for candidate in unique_candidates):
+            raise HTTPException(
+                status_code=409,
+                detail="Output lineage changed before component cleanup",
             )
-            allowed = {
-                candidate for candidate in current_plan
-                if candidate != name and classes.get(candidate) != "final"
-            }
-            if any(candidate not in allowed for candidate in unique_candidates):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Output lineage changed before component cleanup",
-                )
         revisions = _freeze_lineage_revisions(out_dir, unique_candidates)
         deleted, failed = _delete_frozen_output_names(
             out_dir, selected_workspace, unique_candidates,
@@ -61733,7 +61677,6 @@ def delete_output_components(
         out_dir, candidates = _plan_output_component_cleanup(name, out_dir)
         return _delete_output_component_candidates(
             name, out_dir, candidates, selected_workspace,
-            request.state.maestro_session_id,
         )
 
 
@@ -61774,9 +61717,7 @@ def delete_output(
                 return {"deleted": name}
             _require_authorized_output(request, selected_workspace, name)
             _validate_bulk_item_revision(out_dir, {"name": name, "revision": revision})
-            plan, _, classes = _authorized_lineage_plan(
-                out_dir, name, request.state.maestro_session_id,
-            )
+            plan, _, classes = _authorized_lineage_plan(out_dir, name)
             if not delete_components or classes.get(name) != "final":
                 plan = [name]
             plan.sort(key=lambda candidate: classes.get(candidate) == "final")

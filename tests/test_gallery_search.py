@@ -712,7 +712,7 @@ class GalleryApiUiContractTests(unittest.TestCase):
             launch.index('@api.get("/api/v1/outputs")'):
             launch.index('@api.get("/api/v1/file/{filename:path}")')
         ]
-        authorization = route.index("can_access_output")
+        authorization = route.index("_require_project_access(")
         artifact_filter = route.index("artifact_matches_scope")
         media_filter = route.index("normalized_media_type")
         total = route.index("total = len(files)")

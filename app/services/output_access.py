@@ -422,17 +422,6 @@ def stamp_sidecar_policy(
     return sidecar
 
 
-def can_access_output(sidecar: Mapping[str, Any] | None, session_id: str) -> bool:
-    """Return whether project authorization may expose a gallery output.
-
-    Project membership is enforced by the route before this policy helper is
-    called.  ``private`` is only a preview-blur flag, and legacy
-    ``owner_session_id`` values are intentionally ignored.  The arguments are
-    retained for source compatibility while callers are migrated naturally.
-    """
-    return True
-
-
 def public_output_policy(sidecar: Mapping[str, Any] | None) -> dict[str, bool]:
     data = sidecar if isinstance(sidecar, Mapping) else {}
     return {
