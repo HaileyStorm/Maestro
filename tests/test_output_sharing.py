@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import hmac
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 from fastapi import HTTPException
 from fastapi.responses import Response
@@ -166,14 +168,184 @@ class OutputShareRouteContractTests(unittest.TestCase):
         self.assertIn("hashlib.sha256()", self.source)
         self.assertIn('detail="Shared output not found"', self.source)
 
-    def test_capability_stream_pins_verified_inode_before_releasing_locks(self):
+    @staticmethod
+    def _share_revision(media: Path, sidecar: Path | None = None) -> str:
+        digest = hashlib.sha256()
+        for label, path in ((b"media\0", media), (b"sidecar\0", sidecar)):
+            digest.update(label)
+            if path is None or not path.exists():
+                digest.update(b"missing\0")
+                continue
+            payload = path.read_bytes()
+            digest.update(len(payload).to_bytes(16, "big", signed=False))
+            digest.update(payload)
+        return f"sha256:{digest.hexdigest()}"
+
+    def _snapshot_helper(self, record: dict, directory: str, resolve):
+        tree = ast.parse(self.source)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "_materialize_output_share_snapshot"
+        )
+
+        @contextmanager
+        def reservation(*_args):
+            yield
+
+        manager = type(
+            "Manager", (), {"resolve": lambda self, token: dict(record)},
+        )()
+        namespace = {
+            "HTTPException": HTTPException,
+            "hashlib": hashlib,
+            "hmac": hmac,
+            "os": os,
+            "stat": stat,
+            "_output_share_manager": lambda: manager,
+            "_reserve_workspace_operations": reservation,
+            "_existing_workspace_dir": lambda _workspace: directory,
+            "_output_lineage_mutation_guard": reservation,
+            "_resolve_shared_output": resolve,
+            "_share_not_found": lambda: HTTPException(
+                status_code=404, detail="Shared output not found",
+            ),
+        }
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, str(ROOT / "app" / "launch.py"), "exec"), namespace)
+        return namespace["_materialize_output_share_snapshot"]
+
+    def test_capability_stream_uses_verified_snapshot_for_exact_ranges(self):
         tree = ast.parse(self.source)
         node = next(
             item for item in tree.body
             if isinstance(item, ast.ClassDef)
             and item.name == "_PinnedOutputShareResponse"
         )
+        payload = b"verified-old-bytes"
+        snapshot_handles = []
 
+        def materialize(_token):
+            snapshot = tempfile.TemporaryFile(mode="w+b")
+            snapshot.write(payload)
+            snapshot.seek(0)
+            snapshot_handles.append(snapshot)
+            return snapshot, len(payload)
+
+        namespace = {
+            "Response": Response,
+            "HTTPException": HTTPException,
+            "asyncio": asyncio,
+            "_materialize_output_share_snapshot": materialize,
+            "_share_not_found": lambda: HTTPException(
+                status_code=404, detail="Shared output not found",
+            ),
+        }
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, str(ROOT / "app" / "launch.py"), "exec"), namespace)
+        response = namespace["_PinnedOutputShareResponse"](
+            "token", "video/mp4",
+        )
+        messages = []
+
+        async def send(message):
+            messages.append(message)
+
+        asyncio.run(response(
+            {"headers": [(b"range", b"bytes=9-11")]}, None, send,
+        ))
+        start = next(
+            message for message in messages
+            if message["type"] == "http.response.start"
+        )
+        headers = dict(start["headers"])
+        body = b"".join(
+            message.get("body", b"") for message in messages
+            if message["type"] == "http.response.body"
+        )
+        self.assertEqual(start["status"], 206)
+        self.assertEqual(headers[b"content-range"], b"bytes 9-11/18")
+        self.assertEqual(headers[b"content-length"], b"3")
+        self.assertEqual(body, b"old")
+        self.assertTrue(snapshot_handles[0].closed)
+        self.assertNotIn("b'\\x00' *", ast.unparse(node))
+
+    def test_cancelled_snapshot_copy_closes_late_temporary_file(self):
+        tree = ast.parse(self.source)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.ClassDef)
+            and item.name == "_PinnedOutputShareResponse"
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+
+        class Snapshot:
+            def close(self):
+                closed.set()
+
+        def materialize(_token):
+            entered.set()
+            release.wait(2)
+            return Snapshot(), 0
+
+        namespace = {
+            "Response": Response,
+            "HTTPException": HTTPException,
+            "asyncio": asyncio,
+            "_materialize_output_share_snapshot": materialize,
+            "_share_not_found": lambda: HTTPException(
+                status_code=404, detail="Shared output not found",
+            ),
+        }
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, str(ROOT / "app" / "launch.py"), "exec"), namespace)
+        response = namespace["_PinnedOutputShareResponse"](
+            "token", "video/mp4",
+        )
+
+        async def scenario():
+            task = asyncio.create_task(response(
+                {"headers": []}, None, lambda _message: None,
+            ))
+            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            release.set()
+            self.assertTrue(await asyncio.to_thread(closed.wait, 1))
+
+        asyncio.run(scenario())
+
+    def test_snapshot_materializes_stable_media_and_sidecar_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory, "final.mp4")
+            sidecar = Path(directory, "final.meta.json")
+            media.write_bytes(b"authorized-media-bytes")
+            sidecar.write_text('{"explicit": false}', encoding="utf-8")
+            record = {
+                "workspace": "project", "filename": media.name,
+                "revision": self._share_revision(media, sidecar),
+                "media_type": "video/mp4",
+            }
+
+            def resolve(_token, *, verify_revision=True):
+                self.assertFalse(verify_revision)
+                return dict(record), str(media)
+
+            helper = self._snapshot_helper(record, directory, resolve)
+            snapshot, size = helper("token")
+            try:
+                self.assertEqual(size, len(b"authorized-media-bytes"))
+                self.assertEqual(snapshot.read(), b"authorized-media-bytes")
+            finally:
+                snapshot.close()
+
+    def test_unguarded_replacement_before_snapshot_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             media = Path(directory, "final.mp4")
             replacement = Path(directory, "replacement.mp4")
@@ -181,73 +353,76 @@ class OutputShareRouteContractTests(unittest.TestCase):
             replacement.write_bytes(b"replacement-bytes")
             record = {
                 "workspace": "project", "filename": media.name,
-                "revision": "revision", "media_type": "video/mp4",
+                "revision": self._share_revision(media),
+                "media_type": "video/mp4",
             }
-            lineage_lock = threading.RLock()
-            resolved = threading.Event()
-            mutation_done = threading.Event()
 
-            @contextmanager
-            def reservation(*_args):
-                yield
-
-            @contextmanager
-            def lineage_guard(*_args):
-                with lineage_lock:
-                    yield
-
-            def resolve(_token):
-                resolved.set()
-                # Give the replacement thread time to block on the same lock.
-                time.sleep(0.05)
+            def resolve(_token, *, verify_revision=True):
+                self.assertFalse(verify_revision)
+                os.replace(replacement, media)
                 return dict(record), str(media)
 
-            manager = type("Manager", (), {"resolve": lambda self, token: dict(record)})()
-            namespace = {
-                "Response": Response,
-                "HTTPException": HTTPException,
-                "hmac": hmac,
-                "os": os,
-                "_output_share_manager": lambda: manager,
-                "_reserve_workspace_operations": reservation,
-                "_existing_workspace_dir": lambda _workspace: directory,
-                "_output_lineage_mutation_guard": lineage_guard,
-                "_resolve_shared_output": resolve,
-                "_share_not_found": lambda: HTTPException(
-                    status_code=404, detail="Shared output not found",
-                ),
-            }
-            module = ast.Module(body=[node], type_ignores=[])
-            ast.fix_missing_locations(module)
-            exec(compile(module, str(ROOT / "app" / "launch.py"), "exec"), namespace)
-            response = namespace["_PinnedOutputShareResponse"](
-                "token", "video/mp4",
-            )
-
-            def mutate():
-                self.assertTrue(resolved.wait(1))
-                with lineage_lock:
-                    os.replace(replacement, media)
-                mutation_done.set()
-
-            mutation = threading.Thread(target=mutate)
-            mutation.start()
-            messages = []
-
-            async def send(message):
-                if message["type"] == "http.response.start":
-                    await asyncio.to_thread(mutation_done.wait, 1)
-                messages.append(message)
-
-            asyncio.run(response({"headers": []}, None, send))
-            mutation.join(1)
-            self.assertTrue(mutation_done.is_set())
-            body = b"".join(
-                message.get("body", b"") for message in messages
-                if message["type"] == "http.response.body"
-            )
-            self.assertEqual(body, b"verified-old-bytes")
+            helper = self._snapshot_helper(record, directory, resolve)
+            with self.assertRaises(HTTPException) as raised:
+                helper("token")
+            self.assertEqual(raised.exception.status_code, 404)
             self.assertEqual(media.read_bytes(), b"replacement-bytes")
+
+    def test_in_place_mutation_during_snapshot_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory, "final.mp4")
+            media.write_bytes(b"a" * (1024 * 1024) + b"b" * 128)
+            record = {
+                "workspace": "project", "filename": media.name,
+                "revision": self._share_revision(media),
+                "media_type": "video/mp4",
+            }
+
+            def resolve(_token, *, verify_revision=True):
+                self.assertFalse(verify_revision)
+                return dict(record), str(media)
+
+            helper = self._snapshot_helper(record, directory, resolve)
+            from services import win_safe_files
+
+            real_open = win_safe_files._open_share_delete
+            mutated = False
+
+            class MutatingHandle:
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def fileno(self):
+                    return self.handle.fileno()
+
+                def read(self, size=-1):
+                    nonlocal mutated
+                    chunk = self.handle.read(size)
+                    if not mutated and chunk:
+                        mutated = True
+                        with open(media, "r+b", buffering=0) as writer:
+                            writer.seek(1024 * 1024)
+                            writer.write(b"c" * 128)
+                            os.fsync(writer.fileno())
+                    return chunk
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    self.handle.close()
+
+            def mutating_open(path):
+                opened = real_open(path)
+                return MutatingHandle(opened) if path == str(media) else opened
+
+            with mock.patch(
+                "services.win_safe_files._open_share_delete",
+                side_effect=mutating_open,
+            ):
+                with self.assertRaises((HTTPException, OSError)):
+                    helper("token")
+            self.assertTrue(mutated)
 
     def test_only_gallery_media_can_be_shared_and_lifecycle_mutations_revoke(self):
         self.assertIn("not in _GALLERY_MEDIA_EXTENSIONS", self.source)

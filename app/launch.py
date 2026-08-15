@@ -63167,7 +63167,11 @@ def _share_not_found() -> HTTPException:
     return HTTPException(status_code=404, detail="Shared output not found")
 
 
-def _resolve_shared_output(token: str) -> tuple[dict, str]:
+def _resolve_shared_output(
+    token: str,
+    *,
+    verify_revision: bool = True,
+) -> tuple[dict, str]:
     from services.win_safe_files import (
         is_safe_direct_basename,
         safe_direct_file_under,
@@ -63193,12 +63197,121 @@ def _resolve_shared_output(token: str) -> tuple[dict, str]:
     sidecar = load_media_sidecars(out_dir, {filename}).get(filename)
     if sidecar_path and os.path.isfile(sidecar_path) and sidecar is None:
         raise _share_not_found()
-    if not hmac.compare_digest(
-        str(record["revision"]),
-        _output_share_revision(filepath, out_dir, filename),
-    ):
-        raise _share_not_found()
+    if verify_revision:
+        if not hmac.compare_digest(
+            str(record["revision"]),
+            _output_share_revision(filepath, out_dir, filename),
+        ):
+            raise _share_not_found()
     return record, filepath
+
+
+def _materialize_output_share_snapshot(token: str):
+    """Return an immutable temporary copy of the authorized media revision.
+
+    A verified pathname or open inode is not immutable: an external process
+    can replace the name before open, and Windows deliberately shares writes
+    on gallery handles.  Hash the exact bytes copied into a private temporary
+    file and compare that digest with the bearer capability before any HTTP
+    headers are sent.  Sidecar bytes remain part of the capability identity,
+    but only media bytes are copied into the response snapshot.
+    """
+    import tempfile
+
+    from services.win_safe_files import (
+        _open_share_delete,
+        safe_direct_file_under,
+    )
+
+    snapshot = tempfile.TemporaryFile(mode="w+b")
+    try:
+        initial = _output_share_manager().resolve(token)
+        if initial is None:
+            raise _share_not_found()
+        workspace = initial["workspace"]
+        with _reserve_workspace_operations(workspace):
+            out_dir = _existing_workspace_dir(workspace)
+            with _output_lineage_mutation_guard(out_dir):
+                current, filepath = _resolve_shared_output(
+                    token, verify_revision=False,
+                )
+                if not hmac.compare_digest(
+                    str(initial["revision"]), str(current["revision"]),
+                ):
+                    raise _share_not_found()
+
+                filename = current["filename"]
+                metadata_name = os.path.splitext(filename)[0] + ".meta.json"
+                metadata_path = safe_direct_file_under(out_dir, metadata_name)
+                if metadata_path is None and os.path.lexists(
+                    os.path.join(out_dir, metadata_name)
+                ):
+                    raise _share_not_found()
+
+                digest = hashlib.sha256()
+
+                def copy_part(
+                    label: bytes,
+                    path: str | None,
+                    *,
+                    required: bool,
+                    media: bool = False,
+                ) -> int:
+                    digest.update(label)
+                    if path is None:
+                        if required:
+                            raise FileNotFoundError(filename)
+                        digest.update(b"missing\0")
+                        return 0
+                    try:
+                        source = _open_share_delete(path)
+                    except FileNotFoundError:
+                        if required:
+                            raise
+                        digest.update(b"missing\0")
+                        return 0
+                    with source:
+                        before = os.fstat(source.fileno())
+                        if not stat.S_ISREG(before.st_mode) or before.st_size < 0:
+                            raise OSError("shared output is not a regular file")
+                        size = int(before.st_size)
+                        digest.update(size.to_bytes(16, "big", signed=False))
+                        remaining = size
+                        while remaining:
+                            chunk = source.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise OSError("shared output changed while copying")
+                            digest.update(chunk)
+                            if media:
+                                snapshot.write(chunk)
+                            remaining -= len(chunk)
+                        if source.read(1):
+                            raise OSError("shared output changed while copying")
+                        after = os.fstat(source.fileno())
+                        before_identity = (
+                            before.st_dev, before.st_ino, before.st_size,
+                            before.st_mtime_ns, before.st_ctime_ns,
+                        )
+                        after_identity = (
+                            after.st_dev, after.st_ino, after.st_size,
+                            after.st_mtime_ns, after.st_ctime_ns,
+                        )
+                        if before_identity != after_identity:
+                            raise OSError("shared output changed while copying")
+                        return size
+
+                size = copy_part(b"media\0", filepath, required=True, media=True)
+                copy_part(b"sidecar\0", metadata_path, required=False)
+                revision = f"sha256:{digest.hexdigest()}"
+                if not hmac.compare_digest(
+                    str(current["revision"]), revision,
+                ):
+                    raise _share_not_found()
+        snapshot.seek(0)
+        return snapshot, size
+    except BaseException:
+        snapshot.close()
+        raise
 
 
 def _public_output_share_base(request: Request) -> str | None:
@@ -63296,13 +63409,7 @@ def serve_output_share_media(token: str):
 
 
 class _PinnedOutputShareResponse(Response):
-    """Stream the exact media inode whose capability revision was checked.
-
-    Output mutations use the same project reservation and lineage lock.  The
-    file is opened while those guards are held, then the pinned handle is
-    streamed after releasing them.  A concurrent rename/replacement therefore
-    cannot make a verified token serve the replacement bytes.
-    """
+    """Stream an immutable byte snapshot verified against the capability."""
 
     chunk_size = 64 * 1024
 
@@ -63314,29 +63421,29 @@ class _PinnedOutputShareResponse(Response):
         self.headers["X-Content-Type-Options"] = "nosniff"
         self.headers["Accept-Ranges"] = "bytes"
 
+    @staticmethod
+    def _close_late_snapshot(task: asyncio.Task) -> None:
+        try:
+            handle, _ = task.result()
+        except BaseException:
+            return
+        handle.close()
+
     async def __call__(self, scope, receive, send) -> None:
-        from services.win_safe_files import (
-            _RangeError,
-            _open_share_delete,
-            _parse_range,
-        )
+        from services.win_safe_files import _RangeError, _parse_range
 
         handle = None
+        snapshot_task = asyncio.create_task(asyncio.to_thread(
+            _materialize_output_share_snapshot, self.token,
+        ))
         try:
-            initial = _output_share_manager().resolve(self.token)
-            if initial is None:
-                raise _share_not_found()
-            workspace = initial["workspace"]
-            with _reserve_workspace_operations(workspace):
-                out_dir = _existing_workspace_dir(workspace)
-                with _output_lineage_mutation_guard(out_dir):
-                    current, filepath = _resolve_shared_output(self.token)
-                    if not hmac.compare_digest(
-                        str(initial["revision"]), str(current["revision"]),
-                    ):
-                        raise _share_not_found()
-                    handle = _open_share_delete(filepath)
-                    size = os.fstat(handle.fileno()).st_size
+            handle, size = await asyncio.shield(snapshot_task)
+        except asyncio.CancelledError:
+            # The filesystem copy runs in a worker thread and cannot be
+            # cancelled safely.  Close its unnamed temporary file as soon as
+            # the worker returns instead of orphaning it after a disconnect.
+            snapshot_task.add_done_callback(self._close_late_snapshot)
+            raise
         except (HTTPException, FileNotFoundError, OSError):
             if handle is not None:
                 handle.close()
@@ -63391,17 +63498,7 @@ class _PinnedOutputShareResponse(Response):
             while remaining > 0:
                 chunk = handle.read(min(self.chunk_size, remaining))
                 if not chunk:
-                    break
-                remaining -= len(chunk)
-                await send({
-                    "type": "http.response.body",
-                    "body": chunk,
-                    "more_body": remaining > 0,
-                })
-            # Satisfy the declared Content-Length if an out-of-process writer
-            # truncates an inode after it has been pinned.
-            while remaining > 0:
-                chunk = b"\0" * min(self.chunk_size, remaining)
+                    raise RuntimeError("immutable share snapshot truncated")
                 remaining -= len(chunk)
                 await send({
                     "type": "http.response.body",
