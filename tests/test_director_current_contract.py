@@ -8,7 +8,9 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import types
 import unittest
+import uuid
 from unittest.mock import patch
 
 
@@ -19,6 +21,8 @@ if str(APP_DIR) not in sys.path:
 
 from services import director_model_compat as compat  # noqa: E402
 from services import director_pipeline as pipeline  # noqa: E402
+from services import llm_operations  # noqa: E402
+from services.llm_cancellation import LlmCancellationHandle  # noqa: E402
 from services.director_video_strategy import (  # noqa: E402
     BOUNDED_START_END,
     ROLLING_WINDOW,
@@ -97,6 +101,7 @@ def _director_plan_namespace(fail_operation):
     namespace = {
         "Request": _Request,
         "HTTPException": _HTTPException,
+        "copy": copy,
         "_reject_client_director_image_role_internals": lambda body: None,
         "_authorize_director_media_inputs": lambda request, body: None,
         "_resolve_director_image_role_request": lambda request, body: "legacy",
@@ -231,6 +236,527 @@ class _CatalogRegistry(_Registry):
         return not bool(self.models[model_type].get("image_outputs"))
 
 
+class TestDirectorPreviewScopedOperationContract(unittest.TestCase):
+    @staticmethod
+    def _submission_namespace(events, manager, project_instance):
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(LAUNCH_PATH))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "director_v2_plan"
+        )
+        function = copy.deepcopy(function)
+        function.decorator_list = []
+
+        def authorize(_request, body):
+            events.append("authorize_media")
+            body["workspace"] = "project"
+            return "project"
+
+        public_status = _launch_functions_namespace(
+            ["_llm_route_public_status"],
+            Mapping=dict,
+            Any=object,
+        )["_llm_route_public_status"]
+
+        namespace = {
+            "Request": _Request,
+            "HTTPException": _HTTPException,
+            "JSONResponse": _JSONResponse,
+            "copy": copy,
+            "hmac": __import__("hmac"),
+            "wgp": types.SimpleNamespace(server_config={"services": {
+                "director_prompt_polish": "third_pass",
+            }}),
+            "_DIRECTOR_PREVIEW_MAX_MEDIA_BYTES": 1024,
+            "_DIRECTOR_PREVIEW_MAX_TOTAL_MEDIA_BYTES": 2048,
+            "_promote_external_llm_request": (
+                lambda _request: events.append("promote")
+            ),
+            "_request_project_workspace": (
+                lambda _request, value: events.append("workspace") or value
+            ),
+            "_require_project_access": (
+                lambda *_args, **_kwargs: events.append("authorize_project")
+            ),
+            "_llm_operation_scope": (
+                lambda *_args: ("owner", project_instance)
+            ),
+            "_normalize_llm_route_request_id": (
+                lambda value: uuid.UUID(value).hex
+            ),
+            "_reject_client_director_image_role_internals": (
+                lambda _body: events.append("reject_internals")
+            ),
+            "_authorize_director_media_inputs": authorize,
+            "_resolve_director_image_role_request": (
+                lambda *_args: events.append("resolve_roles") or "legacy"
+            ),
+            "_resolve_h3_style_workflow_request": (
+                lambda *_args, **_kwargs: events.append("workflow") or None
+            ),
+            "_explicit_llm_guidance_allowed": (
+                lambda _body: events.append("guidance") or False
+            ),
+            "_director_preview_media_paths": (
+                lambda _body: events.append("media_paths") or []
+            ),
+            "_seal_prompt_enhancement_images": (
+                lambda *_args, **_kwargs: events.append("seal") or []
+            ),
+            "_resolve_direct_llm_selection": (
+                lambda _request: events.append("selection") or {
+                    "model_id": "local/model", "provider": "local",
+                }
+            ),
+            "_director_preview_effective_digest": (
+                lambda *_args, **_kwargs: events.append("digest") or "digest"
+            ),
+            "_llm_route_public_status": public_status,
+            "_ScopedPromptEnhancementRequest": types.SimpleNamespace(
+                snapshot_authority=lambda _request: {"session_id": "owner"},
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[function], type_ignores=[],
+        )), str(LAUNCH_PATH), "exec"), namespace)
+        return namespace
+
+    def test_caller_uuid_and_project_instance_submit_one_scoped_operation(self):
+        events = []
+        captured = {}
+        project_instance = "a" * 64
+        request_id = str(uuid.uuid4())
+
+        class Manager:
+            @staticmethod
+            def submit(**kwargs):
+                events.append("submit")
+                captured.update(kwargs)
+                return {
+                    "request_id": kwargs["request_id"],
+                    "operation_kind": kwargs["operation_kind"],
+                    "status": "running",
+                }
+
+        namespace = self._submission_namespace(
+            events, Manager(), project_instance,
+        )
+        request = _Request({
+            "request_id": request_id,
+            "project_instance": project_instance,
+            "workspace": "project",
+            "skill_type": "music_video",
+            "director_flags": {},
+        })
+        request.state.maestro_session_id = "owner"
+        request.state.maestro_remote = False
+        with patch.object(
+            llm_operations, "llm_route_operation_manager", Manager(),
+        ):
+            response = asyncio.run(namespace["director_v2_plan"](request))
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(captured["request_id"], uuid.UUID(request_id).hex)
+        self.assertEqual(captured["project_instance_key"], project_instance)
+        self.assertEqual(captured["operation_kind"], "director_preview")
+        self.assertEqual(captured["effective_input_digest"], "digest")
+        self.assertTrue(callable(captured["execute"]))
+        self.assertLess(
+            events.index("media_paths"), events.index("authorize_media"),
+        )
+        self.assertLess(events.index("authorize_project"), events.index("seal"))
+        self.assertLess(events.index("seal"), events.index("selection"))
+        self.assertLess(events.index("digest"), events.index("submit"))
+
+    def test_coalesced_operation_status_is_returned_with_202(self):
+        project_instance = "a" * 64
+        request_id = str(uuid.uuid4())
+        existing = {
+            "request_id": uuid.UUID(request_id).hex,
+            "operation_kind": "director_preview",
+            "status": "running",
+            "progress": {"phase": "generating", "pass": 1},
+        }
+
+        class Manager:
+            @staticmethod
+            def submit(**_kwargs):
+                return dict(existing)
+
+        namespace = self._submission_namespace(
+            [], Manager(), project_instance,
+        )
+        request = _Request({
+            "request_id": request_id,
+            "project_instance": project_instance,
+            "workspace": "project",
+            "skill_type": "music_video",
+            "director_flags": {},
+        })
+        request.state.maestro_session_id = "owner"
+        request.state.maestro_remote = False
+        with patch.object(
+            llm_operations, "llm_route_operation_manager", Manager(),
+        ):
+            response = asyncio.run(namespace["director_v2_plan"](request))
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.content, existing)
+
+    def test_coalesced_failed_operation_is_projected_before_202(self):
+        project_instance = "a" * 64
+        request_id = str(uuid.uuid4())
+
+        class Manager:
+            @staticmethod
+            def submit(**kwargs):
+                return {
+                    "request_id": kwargs["request_id"],
+                    "operation_kind": "director_preview",
+                    "status": "failed",
+                    "error": {
+                        "code": "llm_operation_failed",
+                        "message": "provider key at /private/path",
+                        "retryable": True,
+                    },
+                }
+
+        namespace = self._submission_namespace(
+            [], Manager(), project_instance,
+        )
+        request = _Request({
+            "request_id": request_id,
+            "project_instance": project_instance,
+            "workspace": "project",
+            "skill_type": "music_video",
+            "director_flags": {},
+        })
+        request.state.maestro_session_id = "owner"
+        request.state.maestro_remote = False
+        with patch.object(
+            llm_operations, "llm_route_operation_manager", Manager(),
+        ):
+            response = asyncio.run(namespace["director_v2_plan"](request))
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.content["error"], {
+            "code": "director_preview_failed",
+            "message": "Director could not build this preview.",
+            "retryable": True,
+        })
+        self.assertNotIn("/private/path", json.dumps(response.content))
+
+    def test_manager_conflict_and_foreign_scope_miss_are_bounded(self):
+        project_instance = "a" * 64
+        request_body = {
+            "request_id": str(uuid.uuid4()),
+            "project_instance": project_instance,
+            "workspace": "project",
+            "skill_type": "music_video",
+            "director_flags": {},
+        }
+
+        class ConflictManager:
+            @staticmethod
+            def submit(**_kwargs):
+                raise llm_operations.LlmRouteOperationConflictError(
+                    "private digest mismatch",
+                )
+
+        class ForeignManager:
+            @staticmethod
+            def submit(**_kwargs):
+                return None
+
+        for manager, expected_status in (
+            (ConflictManager(), 409),
+            (ForeignManager(), 404),
+        ):
+            with self.subTest(expected_status=expected_status):
+                namespace = self._submission_namespace(
+                    [], manager, project_instance,
+                )
+                request = _Request(dict(request_body))
+                request.state.maestro_session_id = "owner"
+                request.state.maestro_remote = False
+                with patch.object(
+                    llm_operations, "llm_route_operation_manager", manager,
+                ), self.assertRaises(_HTTPException) as raised:
+                    asyncio.run(namespace["director_v2_plan"](request))
+                self.assertEqual(raised.exception.status_code, expected_status)
+                self.assertNotIn("private digest", str(raised.exception.detail))
+
+    def test_recreated_project_is_rejected_before_media_or_model_resolution(self):
+        events = []
+        namespace = self._submission_namespace(
+            events, object(), "b" * 64,
+        )
+        request = _Request({
+            "request_id": str(uuid.uuid4()),
+            "project_instance": "a" * 64,
+            "workspace": "project",
+        })
+        request.state.maestro_session_id = "owner"
+        request.state.maestro_remote = False
+        with self.assertRaises(_HTTPException) as raised:
+            asyncio.run(namespace["director_v2_plan"](request))
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertNotIn("authorize_media", events)
+        self.assertNotIn("seal", events)
+        self.assertNotIn("selection", events)
+
+    def test_media_shape_caps_preserve_bounded_nested_lists(self):
+        namespace = _launch_functions_namespace(
+            ["_director_preview_media_paths"],
+            Mapping=dict,
+            Any=object,
+            _DIRECTOR_PREVIEW_MEDIA_FIELDS=("character_ref_paths",),
+            _DIRECTOR_PREVIEW_MAX_MEDIA_ITEMS=4,
+            _DIRECTOR_PREVIEW_MAX_MEDIA_DEPTH=3,
+            _DIRECTOR_PREVIEW_MAX_MEDIA_SHAPE_ENTRIES=12,
+        )
+        flatten = namespace["_director_preview_media_paths"]
+        self.assertEqual(
+            flatten({
+                "character_ref_paths": [["one", ["two"]], "three"],
+            }),
+            ["one", "two", "three"],
+        )
+        with self.assertRaises(_HTTPException) as too_many:
+            flatten({
+                "character_ref_paths": ["one", "two", "three", "four", "five"],
+            })
+        self.assertEqual(too_many.exception.status_code, 400)
+        with self.assertRaises(_HTTPException) as too_deep:
+            flatten({"character_ref_paths": [[[['one']]]]})
+        self.assertEqual(too_deep.exception.status_code, 400)
+
+    def test_worker_source_fences_media_all_passes_and_snapshot_cleanup(self):
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(LAUNCH_PATH))
+        route = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "director_v2_plan"
+        )
+        route_source = ast.get_source_segment(source, route)
+        self.assertIn('operation_kind="director_preview"', route_source)
+        self.assertIn("_revalidate_prompt_enhancement_images", route_source)
+        self.assertIn("_materialize_prompt_enhancement_images", route_source)
+        self.assertIn("_remove_prompt_enhancement_snapshots", route_source)
+        self.assertIn("_run_authorized_llm_with_selection", route_source)
+        self.assertGreaterEqual(
+            route_source.count("operation_cancellation.checkpoint()"), 7,
+        )
+        third_pass = route_source[route_source.index(
+            "polish_prompts_third_pass("
+        ):]
+        for keyword in (
+            "response_assist=route_response_assist",
+            "progress_callback=route_progress",
+            "cancel_handle=operation_cancellation",
+        ):
+            self.assertIn(keyword, third_pass)
+
+    def test_progress_pass_limit_tracks_frozen_polish_mode(self):
+        from services.director import prompt_polish
+
+        class Plan:
+            @staticmethod
+            def to_dict():
+                return {"plan": True}
+
+        class DirectorOrchestrator:
+            def __init__(self, **_kwargs):
+                pass
+
+            @staticmethod
+            def plan(_skill_type, **_kwargs):
+                return Plan()
+
+            @staticmethod
+            def render_plan(plan, **_kwargs):
+                return plan
+
+            @staticmethod
+            def plan_to_clip_plans(_rendered):
+                return [{"video_prompt": "bounded prompt"}]
+
+        orchestrator_module = types.SimpleNamespace(
+            DirectorOrchestrator=DirectorOrchestrator,
+            DirectorFlags=types.SimpleNamespace(
+                from_dict=lambda _value: types.SimpleNamespace(),
+            ),
+        )
+        guidance_module = types.SimpleNamespace(
+            EXPLICIT_GUIDANCE_SNAPSHOT_KEY="_server_snapshot",
+        )
+
+        for polish_mode, expected in (
+            ("off", [("director_plan", 2), ("director_render", 2)]),
+            ("third_pass", [
+                ("director_plan", 3),
+                ("director_render", 3),
+                ("director_polish", 3),
+            ]),
+        ):
+            with self.subTest(polish_mode=polish_mode):
+                progress = []
+                namespace = _director_plan_namespace(
+                    lambda operation: operation(),
+                )
+                namespace.update({
+                    "wgp": types.SimpleNamespace(
+                        server_config={"services": {}},
+                    ),
+                    "_llm_route_progress_callback": (
+                        lambda _request: progress.append
+                    ),
+                    "_resolved_local_response_assist": (
+                        lambda *_args, **_kwargs: None
+                    ),
+                    "_with_llm_route_progress": (
+                        lambda operation, *_args, **_kwargs: operation
+                    ),
+                    "_apply_h3_style_workflow_to_director_clips": (
+                        lambda *_args: None
+                    ),
+                })
+                request = _Request({"skill_type": "music_video"})
+                request.state.maestro_director_preview_worker = True
+                request.state.maestro_director_preview_selection = {
+                    "provider": "local",
+                }
+                request.state.maestro_director_preview_assist = None
+                request.state.maestro_director_preview_guidance = False
+                request.state.maestro_director_preview_workflow = None
+                request.state.maestro_director_preview_polish_mode = polish_mode
+                request.state.maestro_llm_cancel_handle = (
+                    LlmCancellationHandle()
+                )
+                shielded_calls = []
+                with patch.dict(sys.modules, {
+                    "services.director.orchestrator": orchestrator_module,
+                    "services.director.nsfw_guidance": guidance_module,
+                }), patch(
+                    "services.llm_operations.run_blocking_shielded",
+                    new=_blocking_shield_stub(shielded_calls),
+                ), patch.object(
+                    prompt_polish,
+                    "polish_prompts_third_pass",
+                    side_effect=lambda clips, *_args, **_kwargs: clips,
+                ):
+                    result = asyncio.run(
+                        namespace["director_v2_plan"](request),
+                    )
+
+                self.assertEqual(result["production_plan"], {"plan": True})
+                observed = [
+                    (event["stage"], event["pass_limit"])
+                    for event in progress
+                ]
+                self.assertEqual(observed, expected)
+
+    def test_terminal_failure_projection_is_stable_and_redacted(self):
+        namespace = _launch_functions_namespace(
+            ["_llm_route_public_status"],
+            Mapping=dict,
+            Any=object,
+        )
+        private = {
+            "status": "failed",
+            "error": {
+                "code": "llm_operation_failed",
+                "message": "provider key at /private/path",
+                "retryable": True,
+            },
+        }
+        projected = namespace["_llm_route_public_status"](
+            "director_preview", private,
+        )
+        self.assertEqual(projected["error"], {
+            "code": "director_preview_failed",
+            "message": "Director could not build this preview.",
+            "retryable": True,
+        })
+        self.assertNotIn("/private/path", json.dumps(projected))
+        self.assertEqual(
+            namespace["_llm_route_public_status"]("enhance", private),
+            private,
+        )
+
+    def test_cancel_after_plan_prevents_render_polish_and_result(self):
+        cancellation = LlmCancellationHandle()
+        events = []
+
+        class Plan:
+            @staticmethod
+            def to_dict():
+                events.append("result")
+                return {"private": True}
+
+        class DirectorOrchestrator:
+            def __init__(self, **_kwargs):
+                pass
+
+            @staticmethod
+            def plan(_skill_type, **_kwargs):
+                events.append("plan")
+                cancellation.cancel()
+                return Plan()
+
+            @staticmethod
+            def render_plan(*_args, **_kwargs):
+                events.append("render")
+                raise AssertionError("render ran after cancellation")
+
+        namespace = _director_plan_namespace(lambda operation: operation())
+        namespace.update({
+            "wgp": types.SimpleNamespace(server_config={"services": {}}),
+            "_llm_route_progress_callback": lambda _request: None,
+            "_resolved_local_response_assist": (
+                lambda *_args, **_kwargs: None
+            ),
+            "_with_llm_route_progress": (
+                lambda operation, *_args, **_kwargs: operation
+            ),
+            "_apply_h3_style_workflow_to_director_clips": (
+                lambda *_args: events.append("workflow")
+            ),
+        })
+        request = _Request({"skill_type": "music_video"})
+        request.state.maestro_director_preview_worker = True
+        request.state.maestro_director_preview_selection = {"provider": "local"}
+        request.state.maestro_director_preview_assist = None
+        request.state.maestro_director_preview_guidance = False
+        request.state.maestro_director_preview_workflow = None
+        request.state.maestro_director_preview_polish_mode = "third_pass"
+        request.state.maestro_llm_cancel_handle = cancellation
+        orchestrator_module = types.SimpleNamespace(
+            DirectorOrchestrator=DirectorOrchestrator,
+            DirectorFlags=types.SimpleNamespace(
+                from_dict=lambda _value: types.SimpleNamespace(),
+            ),
+        )
+        guidance_module = types.SimpleNamespace(
+            EXPLICIT_GUIDANCE_SNAPSHOT_KEY="_server_snapshot",
+        )
+        shielded_calls = []
+        with patch.dict(sys.modules, {
+            "services.director.orchestrator": orchestrator_module,
+            "services.director.nsfw_guidance": guidance_module,
+        }), patch(
+            "services.llm_operations.run_blocking_shielded",
+            new=_blocking_shield_stub(shielded_calls),
+        ), self.assertRaises(Exception) as raised:
+            asyncio.run(namespace["director_v2_plan"](request))
+
+        self.assertEqual(type(raised.exception).__name__, "LlmRequestCancelled")
+        self.assertEqual(events, ["plan"])
+
+
 class TestDirectorPreviewFailureContract(unittest.TestCase):
     def test_local_director_has_no_maestro_content_refusal_layer(self):
         self.assertFalse(
@@ -273,6 +799,13 @@ class TestDirectorPreviewFailureContract(unittest.TestCase):
 
         namespace = _director_plan_namespace(fail)
         request = _Request()
+        request.state.maestro_director_preview_worker = True
+        request.state.maestro_director_preview_selection = {"provider": "local"}
+        request.state.maestro_director_preview_assist = None
+        request.state.maestro_director_preview_guidance = False
+        request.state.maestro_director_preview_workflow = None
+        request.state.maestro_director_preview_polish_mode = "off"
+        request.state.maestro_llm_cancel_handle = LlmCancellationHandle()
         with patch(
             "services.llm_operations.run_blocking_shielded",
             new=_blocking_shield_stub(shielded_calls),
@@ -280,15 +813,12 @@ class TestDirectorPreviewFailureContract(unittest.TestCase):
             with self.assertRaises(_HTTPException) as raised:
                 asyncio.run(namespace["director_v2_plan"](request))
 
-        self.assertEqual(len(shielded_calls), 2)
+        self.assertEqual(len(shielded_calls), 1)
         self.assertIs(
-            shielded_calls[0][0], namespace["_resolve_direct_llm_selection"],
-        )
-        self.assertIs(
-            shielded_calls[1][0],
+            shielded_calls[0][0],
             namespace["_run_authorized_llm_with_selection"],
         )
-        self.assertEqual(operations, [shielded_calls[1][1][2]])
+        self.assertEqual(operations, [shielded_calls[0][1][2]])
         self.assertEqual(operations[0].__name__, "run_director_plan")
         print_exc.assert_called_once_with()
         self.assertEqual(raised.exception.status_code, 500)
@@ -328,6 +858,13 @@ class TestDirectorPreviewFailureContract(unittest.TestCase):
 
         namespace = _director_plan_namespace(fail)
         request = _Request()
+        request.state.maestro_director_preview_worker = True
+        request.state.maestro_director_preview_selection = {"provider": "local"}
+        request.state.maestro_director_preview_assist = None
+        request.state.maestro_director_preview_guidance = False
+        request.state.maestro_director_preview_workflow = None
+        request.state.maestro_director_preview_polish_mode = "off"
+        request.state.maestro_llm_cancel_handle = LlmCancellationHandle()
         with patch(
             "services.llm_operations.run_blocking_shielded",
             new=_blocking_shield_stub(shielded_calls),
@@ -335,15 +872,12 @@ class TestDirectorPreviewFailureContract(unittest.TestCase):
             with self.assertRaises(_HTTPException) as raised:
                 asyncio.run(namespace["director_v2_plan"](request))
 
-        self.assertEqual(len(shielded_calls), 2)
+        self.assertEqual(len(shielded_calls), 1)
         self.assertIs(
-            shielded_calls[0][0], namespace["_resolve_direct_llm_selection"],
-        )
-        self.assertIs(
-            shielded_calls[1][0],
+            shielded_calls[0][0],
             namespace["_run_authorized_llm_with_selection"],
         )
-        self.assertEqual(operations, [shielded_calls[1][1][2]])
+        self.assertEqual(operations, [shielded_calls[0][1][2]])
         self.assertEqual(operations[0].__name__, "run_director_plan")
         print_exc.assert_called_once_with()
         self.assertEqual(raised.exception.status_code, 500)

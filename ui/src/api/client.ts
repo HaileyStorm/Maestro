@@ -4758,6 +4758,8 @@ export async function deletePipeline(pid: string, workspace: string): Promise<{ 
 // --- Director v2 ---
 
 export interface DirectorV2PlanRequest {
+  request_id: string
+  project_instance: string
   workspace: string
   skill_type: string
   video_model?: string
@@ -4869,26 +4871,339 @@ export interface DirectorV2PlanResponse {
   skill_type: string
 }
 
+export interface DirectorV2OperationScope {
+  requestId: string
+  workspace: string
+  projectInstance: string
+}
+
+export interface DirectorV2OperationStatus {
+  request_id: string
+  operation_kind: 'director_preview'
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  phase: string
+  stage: string
+  pass: number
+  pass_limit: number
+  attempt: number
+  attempt_limit: number
+  partial_text: string
+  generated_tokens_approx: number
+  elapsed_seconds: number
+  live_tps: number | null
+  average_tps: number | null
+  result_available: boolean
+  retryable: boolean
+  error?: { code: string; message: string; retryable: boolean } | null
+}
+
+export interface DirectorV2RequestOptions extends LlmRequestOptions {
+  projectInstance: string
+  onOperationStatus?: (status: DirectorV2OperationStatus) => void
+  onSubmissionAttempted?: () => void | Promise<void>
+  onAdmissionConfirmed?: (status: DirectorV2OperationStatus) => void | Promise<void>
+}
+
+export class DirectorV2WaitError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DirectorV2WaitError'
+  }
+}
+
+export class DirectorV2ScopeError extends Error {
+  constructor(message = 'The Director preview no longer matches this project') {
+    super(message)
+    this.name = 'DirectorV2ScopeError'
+  }
+}
+
+const DIRECTOR_V2_CANCEL_ADMISSION_WAIT_MS = 15_000
+
+function assertDirectorV2StatusScope(
+  status: DirectorV2OperationStatus,
+  scope: DirectorV2OperationScope,
+): void {
+  if (
+    canonicalLlmRequestId(status.request_id) !== canonicalLlmRequestId(scope.requestId)
+    || status.operation_kind !== 'director_preview'
+  ) {
+    throw new DirectorV2ScopeError()
+  }
+}
+
+async function assertDirectorV2ProjectScope(
+  scope: DirectorV2OperationScope,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal)
+  const current = await fetchLlmModels(scope.workspace, signal)
+  if (!current.project_instance || current.project_instance !== scope.projectInstance) {
+    throw new DirectorV2ScopeError()
+  }
+}
+
+async function submitDirectorV2Plan(
+  request: DirectorV2PlanRequest,
+  signal?: AbortSignal,
+): Promise<DirectorV2OperationStatus> {
+  const res = await fetch(`${BASE}/api/v1/director/v2/plan`, {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+    signal,
+  })
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok || res.status !== 202) {
+    const err = await res.json().catch(() => ({ detail: 'Plan failed' }))
+    throw new Error(err.detail || 'Director v2 plan failed')
+  }
+  return res.json()
+}
+
+export async function fetchDirectorV2Operation(
+  scope: DirectorV2OperationScope,
+  signal?: AbortSignal,
+): Promise<DirectorV2OperationStatus | null> {
+  throwIfAborted(signal)
+  const query = new URLSearchParams({ workspace: scope.workspace })
+  const res = await fetch(
+    `${BASE}/api/v1/llm/operations/director_preview/${encodeURIComponent(scope.requestId)}?${query}`,
+    { cache: 'no-store', signal },
+  )
+  if (res.status === 404) return null
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Director preview status is unavailable' }))
+    throw new Error(err.detail || 'Director preview status is unavailable')
+  }
+  const status = await res.json() as DirectorV2OperationStatus
+  assertDirectorV2StatusScope(status, scope)
+  return status
+}
+
+async function fetchDirectorV2Result(
+  scope: DirectorV2OperationScope,
+  signal?: AbortSignal,
+): Promise<DirectorV2PlanResponse> {
+  await assertDirectorV2ProjectScope(scope, signal)
+  const query = new URLSearchParams({ workspace: scope.workspace })
+  const res = await fetch(
+    `${BASE}/api/v1/llm/operations/director_preview/${encodeURIComponent(scope.requestId)}/result?${query}`,
+    { cache: 'no-store', signal },
+  )
+  if (res.status === 404) {
+    throw new DirectorV2WaitError('This Director preview result is no longer available.')
+  }
+  if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Director preview result is unavailable' }))
+    throw new Error(err.detail || 'Director preview result is unavailable')
+  }
+  const result = await res.json() as Partial<DirectorV2PlanResponse>
+  await assertDirectorV2ProjectScope(scope, signal)
+  if (
+    !Array.isArray(result.clip_plans)
+    || !result.clip_plans.every(plan => (
+      Boolean(plan)
+      && typeof plan === 'object'
+      && !Array.isArray(plan)
+      && (plan.video_prompt === undefined || typeof plan.video_prompt === 'string')
+      && (plan.image_prompt === undefined || typeof plan.image_prompt === 'string')
+    ))
+    || !result.production_plan
+    || typeof result.production_plan !== 'object'
+    || Array.isArray(result.production_plan)
+    || typeof result.skill_type !== 'string'
+  ) {
+    throw new DirectorV2ScopeError('The Director preview result did not match its request')
+  }
+  return result as DirectorV2PlanResponse
+}
+
+async function recoverDirectorV2Submission(
+  request: DirectorV2PlanRequest,
+  scope: DirectorV2OperationScope,
+  signal?: AbortSignal,
+): Promise<DirectorV2OperationStatus> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < LLM_PREPARATION_MAX_WAIT_MS) {
+    throwIfAborted(signal)
+    try {
+      const existing = await fetchDirectorV2Operation(scope, signal)
+      if (existing) return existing
+      await assertDirectorV2ProjectScope(scope, signal)
+      const submitted = await submitDirectorV2Plan(request, signal)
+      assertDirectorV2StatusScope(submitted, scope)
+      return submitted
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      await waitForPreparationPoll(signal)
+    }
+  }
+  throw new DirectorV2WaitError(
+    'Director preview status is still unavailable. Reload to resume waiting.',
+  )
+}
+
+export async function waitForDirectorV2Operation(
+  scope: DirectorV2OperationScope,
+  signal?: AbortSignal,
+  initial?: DirectorV2OperationStatus,
+  onStatus?: (status: DirectorV2OperationStatus) => void,
+): Promise<DirectorV2PlanResponse> {
+  const startedAt = Date.now()
+  let operation: DirectorV2OperationStatus | null | undefined = initial
+  while (!operation) {
+    if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
+      throw new DirectorV2WaitError(
+        'Director preview is still running. Reload to resume waiting.',
+      )
+    }
+    try {
+      operation = await fetchDirectorV2Operation(scope, signal)
+      if (!operation) {
+        throw new DirectorV2WaitError('This Director preview request is no longer available.')
+      }
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      await waitForPreparationPoll(signal)
+    }
+  }
+  assertDirectorV2StatusScope(operation, scope)
+  onStatus?.(operation)
+  while (operation.status === 'running') {
+    if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
+      throw new DirectorV2WaitError(
+        'Director preview is still running. Reload to resume waiting.',
+      )
+    }
+    await waitForPreparationPoll(signal)
+    try {
+      const next = await fetchDirectorV2Operation(scope, signal)
+      if (!next) {
+        throw new DirectorV2WaitError('This Director preview request is no longer available.')
+      }
+      operation = next
+      onStatus?.(operation)
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+    }
+  }
+  if (operation.status !== 'completed' || !operation.result_available) {
+    throw new Error(
+      operation.error?.message
+      || (operation.status === 'cancelled'
+        ? 'Director preview was cancelled'
+        : 'Director preview failed'),
+    )
+  }
+  while (Date.now() - startedAt < LLM_PREPARATION_MAX_WAIT_MS) {
+    try {
+      return await fetchDirectorV2Result(scope, signal)
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+      await waitForPreparationPoll(signal)
+    }
+  }
+  throw new DirectorV2WaitError(
+    'Director preview finished, but its result is still unreachable. Reload to resume waiting.',
+  )
+}
+
+export async function resumeDirectorV2Plan(
+  scope: DirectorV2OperationScope,
+  options?: Pick<DirectorV2RequestOptions, 'signal' | 'onOperationStatus'>,
+): Promise<DirectorV2PlanResponse> {
+  await assertDirectorV2ProjectScope(scope, options?.signal)
+  return waitForDirectorV2Operation(
+    scope,
+    options?.signal,
+    undefined,
+    options?.onOperationStatus,
+  )
+}
+
+export async function cancelDirectorV2Plan(
+  scope: DirectorV2OperationScope,
+  signal?: AbortSignal,
+): Promise<DirectorV2OperationStatus> {
+  await assertDirectorV2ProjectScope(scope, signal)
+  const query = new URLSearchParams({ workspace: scope.workspace })
+  const operationUrl = `${BASE}/api/v1/llm/operations/director_preview/${encodeURIComponent(scope.requestId)}?${query}`
+  const startedAt = Date.now()
+  while (true) {
+    throwIfAborted(signal)
+    const res = await fetch(operationUrl, {
+      method: 'DELETE', cache: 'no-store', signal,
+    })
+    if (res.status !== 404) {
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Director preview could not be cancelled' }))
+        throw new Error(err.detail || 'Director preview could not be cancelled')
+      }
+      const status = await res.json() as DirectorV2OperationStatus
+      assertDirectorV2StatusScope(status, scope)
+      return status
+    }
+    let admitted: DirectorV2OperationStatus | null = null
+    try {
+      admitted = await fetchDirectorV2Operation(scope, signal)
+    } catch (error) {
+      throwIfAborted(signal)
+      if (!isTransientRequestError(error)) throw error
+    }
+    if (admitted && admitted.status !== 'running') return admitted
+    if (Date.now() - startedAt >= DIRECTOR_V2_CANCEL_ADMISSION_WAIT_MS) {
+      throw new DirectorV2WaitError(
+        'Director preview cancellation is still confirming. Reload to resume or cancel again.',
+      )
+    }
+    await waitForLlmMutationRetry(signal)
+  }
+}
+
 export async function directorV2Plan(
   params: DirectorV2PlanRequest,
-  options?: LlmRequestOptions,
+  options: DirectorV2RequestOptions,
 ): Promise<DirectorV2PlanResponse> {
-  return withLlmPreparation(
+  const scope: DirectorV2OperationScope = {
+    requestId: params.request_id,
+    workspace: params.workspace,
+    projectInstance: params.project_instance,
+  }
+  if (options.projectInstance !== params.project_instance) {
+    throw new DirectorV2ScopeError('The Director preview project fence did not match its request')
+  }
+  await prepareLlmForRequest(
     { workspace: params.workspace, purpose: 'configured' },
     options,
-    async () => {
-      const res = await fetch(`${BASE}/api/v1/director/v2/plan`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-        signal: options?.signal,
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Plan failed' }))
-        throw new Error(err.detail || 'Director v2 plan failed')
-      }
-      return res.json()
-    },
+  )
+  await assertDirectorV2ProjectScope(scope, options.signal)
+  throwIfAborted(options.signal)
+  await options.onSubmissionAttempted?.()
+  throwIfAborted(options.signal)
+  let operation: DirectorV2OperationStatus
+  try {
+    operation = await submitDirectorV2Plan(params, options.signal)
+    assertDirectorV2StatusScope(operation, scope)
+  } catch (error) {
+    throwIfAborted(options.signal)
+    if (!isTransientRequestError(error)) throw error
+    operation = await recoverDirectorV2Submission(params, scope, options.signal)
+  }
+  await options.onAdmissionConfirmed?.(operation)
+  throwIfAborted(options.signal)
+  return waitForDirectorV2Operation(
+    scope,
+    options.signal,
+    operation,
+    options.onOperationStatus,
   )
 }
 

@@ -98,6 +98,15 @@ const ENHANCE_FINGERPRINT_TOKEN_BYTES = 32
 const ENHANCE_FINGERPRINT_LOCK_TIMEOUT_MS = 1_000
 const ENHANCE_LEDGER_LOCK_NAME = 'maestro-prompt-enhance-ledger-v2'
 const ENHANCE_LEDGER_LOCK_TIMEOUT_MS = 1_000
+const DIRECTOR_PREVIEW_OPERATION_STORAGE_KEY = 'maestro:director-preview-operations-v2'
+const DIRECTOR_PREVIEW_OPERATION_MAX_AGE_MS = 45 * 60 * 1000
+const DIRECTOR_PREVIEW_OPERATION_MAX_RECORDS = 8
+const DIRECTOR_PREVIEW_LEDGER_LOCK_NAME = 'maestro-director-preview-ledger-v2'
+const DIRECTOR_PREVIEW_LEDGER_LOCK_TIMEOUT_MS = 1_000
+const DIRECTOR_PREVIEW_FINGERPRINT_CLAIM_STORAGE_KEY = 'maestro:director-preview-fingerprint-claim-v1'
+const DIRECTOR_PREVIEW_FINGERPRINT_TOKEN_BYTES = 32
+const DIRECTOR_PREVIEW_FINGERPRINT_SALT_BYTES = 32
+const DIRECTOR_PREVIEW_FINGERPRINT_LOCK_TIMEOUT_MS = 1_000
 
 interface PersistedDirectorImageRoles {
   schema_version: 1
@@ -193,6 +202,18 @@ let _enhanceReloadRecoveryAvailable = false
 let _enhanceFingerprintClaimRotatedStored = false
 const _enhanceFingerprintLockRequests = new Set<Promise<unknown>>()
 let _directorLlmRequestToken: symbol | null = null
+let _directorPreviewRequestToken: symbol | null = null
+let _directorPreviewStopWaiting: (() => void) | null = null
+let _directorPreviewSubmissionAttemptedRequestId: string | null = null
+let _directorPreviewRecoveryToken: symbol | null = null
+let _directorPreviewFingerprintClaimPromise: Promise<Uint8Array> | null = null
+let _volatileDirectorPreviewFingerprintSalt: Uint8Array | null = null
+let _directorPreviewFingerprintClaimRecord: DirectorPreviewFingerprintClaimRecord | null = null
+let _directorPreviewReloadRecoveryAvailable = false
+const _directorPreviewFingerprintLockRequests = new Set<Promise<unknown>>()
+let _directorPreviewActiveOwnership: (api.DirectorV2OperationScope & {
+  claimToken: string
+}) | null = null
 let _directorPipelineLifecycleToken: symbol | null = null
 
 function _beginWorkspaceLlmRequest(
@@ -269,11 +290,54 @@ function _beginDirectorLlmRequest(workspace: string) {
   })
   return {
     signal: lifecycle.signal,
+    stopWaiting: lifecycle.stopWaiting,
     ownsWorkspace: () => (
       lifecycle.ownsWorkspace() && _directorLlmRequestToken === token
     ),
     dispose: () => {
       if (_directorLlmRequestToken === token) _directorLlmRequestToken = null
+      lifecycle.dispose()
+    },
+  }
+}
+
+function _beginDirectorPreviewRequest(workspace: string, recoveryToken?: symbol) {
+  // A same-project successor stops only the predecessor browser wait. The
+  // admitted server operation remains independently recoverable/cancellable.
+  _directorPreviewStopWaiting?.()
+  if (!recoveryToken || _directorPreviewRecoveryToken !== recoveryToken) {
+    _directorPreviewRecoveryToken = null
+  }
+  _directorPreviewActiveOwnership = null
+  const token = Symbol('director-preview-request')
+  _directorPreviewRequestToken = token
+  const lifecycle = _beginDirectorLlmRequest(workspace)
+  _directorPreviewStopWaiting = lifecycle.stopWaiting
+  const unsubscribe = useStore.subscribe(state => {
+    if (state.activeWorkspace === workspace || _directorPreviewRequestToken !== token) return
+    _directorPreviewRequestToken = null
+    _directorPreviewStopWaiting = null
+    _directorPreviewSubmissionAttemptedRequestId = null
+    _directorPreviewActiveOwnership = null
+    useStore.setState({
+      directorPreviewStatus: null,
+      directorPreviewRequestScope: null,
+    })
+  })
+  return {
+    signal: lifecycle.signal,
+    stopWaiting: lifecycle.stopWaiting,
+    ownsWorkspace: () => (
+      lifecycle.ownsWorkspace() && _directorPreviewRequestToken === token
+    ),
+    dispose: () => {
+      if (_directorPreviewRequestToken === token) _directorPreviewRequestToken = null
+      if (_directorPreviewStopWaiting === lifecycle.stopWaiting) _directorPreviewStopWaiting = null
+      if (_directorPreviewRequestToken === null) {
+        _directorPreviewSubmissionAttemptedRequestId = null
+        _directorPreviewActiveOwnership = null
+      }
+      unsubscribe()
       lifecycle.dispose()
     },
   }
@@ -327,6 +391,21 @@ type StoredEnhanceOperation = api.LlmEnhanceOperationScope & {
   claimToken: string
   settingsFingerprint: string
   storedAt: number
+}
+
+type StoredDirectorPreviewOperation = api.DirectorV2OperationScope & {
+  accountFingerprint: string
+  claimToken: string
+  settingsFingerprint: string
+  creativeFingerprint: string
+  admitted: boolean
+  storedAt: number
+}
+
+type DirectorPreviewFingerprintClaimRecord = {
+  schemaVersion: 1
+  token: string
+  salt: string
 }
 
 type EnhanceFingerprintClaimRecord = {
@@ -538,6 +617,288 @@ function _terminalEnhanceStatus(
     live_tps: null,
     average_tps: null,
   }
+}
+
+function _validStoredDirectorPreviewOperation(
+  value: unknown,
+): value is StoredDirectorPreviewOperation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const parsed = value as Record<string, unknown>
+  return (
+    Object.keys(parsed).length === 9
+    && Object.keys(parsed).every(key => [
+      'requestId', 'workspace', 'projectInstance', 'accountFingerprint',
+      'claimToken', 'settingsFingerprint', 'creativeFingerprint', 'admitted', 'storedAt',
+    ].includes(key))
+    && typeof parsed.requestId === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.requestId)
+    && typeof parsed.workspace === 'string'
+    && parsed.workspace.length > 0
+    && parsed.workspace.length <= 255
+    && typeof parsed.projectInstance === 'string'
+    && /^[0-9a-f]{64}$/i.test(parsed.projectInstance)
+    && typeof parsed.accountFingerprint === 'string'
+    && /^[0-9a-f]{16}$/i.test(parsed.accountFingerprint)
+    && typeof parsed.claimToken === 'string'
+    && /^[0-9a-f]{64}$/i.test(parsed.claimToken)
+    && typeof parsed.settingsFingerprint === 'string'
+    && /^[0-9a-f]{64}$/i.test(parsed.settingsFingerprint)
+    && typeof parsed.creativeFingerprint === 'string'
+    && /^[0-9a-f]{64}$/i.test(parsed.creativeFingerprint)
+    && typeof parsed.admitted === 'boolean'
+    && typeof parsed.storedAt === 'number'
+    && Number.isFinite(parsed.storedAt)
+    && parsed.storedAt >= Date.now() - DIRECTOR_PREVIEW_OPERATION_MAX_AGE_MS
+    && parsed.storedAt <= Date.now() + 60_000
+  )
+}
+
+function _loadStoredDirectorPreviewOperations(): StoredDirectorPreviewOperation[] {
+  try {
+    if (typeof localStorage === 'undefined') return []
+    const parsed = JSON.parse(
+      localStorage.getItem(DIRECTOR_PREVIEW_OPERATION_STORAGE_KEY) || 'null',
+    )
+    if (
+      !parsed
+      || typeof parsed !== 'object'
+      || Array.isArray(parsed)
+      || parsed.schemaVersion !== 3
+      || !Array.isArray(parsed.operations)
+      || parsed.operations.length > DIRECTOR_PREVIEW_OPERATION_MAX_RECORDS
+      || !parsed.operations.every(_validStoredDirectorPreviewOperation)
+    ) return []
+    return [...parsed.operations].sort((left, right) => right.storedAt - left.storedAt)
+  } catch {
+    return []
+  }
+}
+
+function _writeStoredDirectorPreviewOperations(
+  operations: StoredDirectorPreviewOperation[],
+): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return false
+    if (operations.length === 0) {
+      localStorage.removeItem(DIRECTOR_PREVIEW_OPERATION_STORAGE_KEY)
+      return localStorage.getItem(DIRECTOR_PREVIEW_OPERATION_STORAGE_KEY) === null
+    }
+    const encoded = JSON.stringify({
+      schemaVersion: 3,
+      operations: operations
+        .sort((left, right) => right.storedAt - left.storedAt)
+        .slice(0, DIRECTOR_PREVIEW_OPERATION_MAX_RECORDS),
+    })
+    localStorage.setItem(DIRECTOR_PREVIEW_OPERATION_STORAGE_KEY, encoded)
+    return localStorage.getItem(DIRECTOR_PREVIEW_OPERATION_STORAGE_KEY) === encoded
+  } catch {
+    return false
+  }
+}
+
+async function _runDirectorPreviewLedgerMutation(
+  mutation: () => boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const locks = globalThis.navigator?.locks
+  if (!locks?.request || signal?.aborted) return false
+  const controller = new AbortController()
+  const onAbort = () => controller.abort()
+  signal?.addEventListener('abort', onAbort, { once: true })
+  const timer = globalThis.setTimeout(
+    () => controller.abort(),
+    DIRECTOR_PREVIEW_LEDGER_LOCK_TIMEOUT_MS,
+  )
+  try {
+    return await locks.request(
+      DIRECTOR_PREVIEW_LEDGER_LOCK_NAME,
+      { mode: 'exclusive', signal: controller.signal },
+      lock => Boolean(lock) && mutation(),
+    )
+  } catch {
+    return false
+  } finally {
+    globalThis.clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+  }
+}
+
+function _ownedDirectorPreviewFingerprintClaimToken(): string | null {
+  if (!_directorPreviewReloadRecoveryAvailable) return null
+  return _directorPreviewFingerprintClaimRecord?.token ?? null
+}
+
+function _realmOwnsStoredDirectorPreviewOperation(
+  operation: StoredDirectorPreviewOperation,
+): boolean {
+  const claimToken = _ownedDirectorPreviewFingerprintClaimToken()
+  return claimToken !== null && operation.claimToken === claimToken
+}
+
+async function _storeDirectorPreviewOperation(
+  operation: Omit<StoredDirectorPreviewOperation, 'claimToken' | 'admitted'>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  // Only opaque bounded recovery fences are durable. Creative text, media,
+  // provider/runtime choices, results, and fingerprint key material stay out.
+  const claimToken = _ownedDirectorPreviewFingerprintClaimToken()
+  if (!claimToken) return false
+  return _runDirectorPreviewLedgerMutation(() => {
+    const existing = _loadStoredDirectorPreviewOperations()
+    const sameRequest = existing.find(item => item.requestId === operation.requestId)
+    if (sameRequest && (
+      sameRequest.claimToken !== claimToken
+      ||
+      sameRequest.workspace !== operation.workspace
+      || sameRequest.projectInstance !== operation.projectInstance
+      || sameRequest.accountFingerprint !== operation.accountFingerprint
+      || sameRequest.settingsFingerprint !== operation.settingsFingerprint
+      || sameRequest.creativeFingerprint !== operation.creativeFingerprint
+      || sameRequest.storedAt !== operation.storedAt
+    )) return false
+    if (sameRequest) return true
+    if (existing.length >= DIRECTOR_PREVIEW_OPERATION_MAX_RECORDS) {
+      return false
+    }
+    return _writeStoredDirectorPreviewOperations([
+      { ...operation, claimToken, admitted: false },
+      ...existing,
+    ])
+  }, signal)
+}
+
+async function _admitStoredDirectorPreviewOperation(
+  scope: api.DirectorV2OperationScope,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  return _runDirectorPreviewLedgerMutation(() => {
+    const stored = _loadStoredDirectorPreviewOperations()
+    const matching = stored.find(item => _sameDirectorPreviewScope(item, scope))
+    if (!matching || !_realmOwnsStoredDirectorPreviewOperation(matching)) return false
+    const admitted = { ...matching, admitted: true }
+    const retained = stored.filter(item => (
+      !_sameDirectorPreviewScope(item, scope)
+      && !(
+        _realmOwnsStoredDirectorPreviewOperation(item)
+        && item.workspace === matching.workspace
+        && item.accountFingerprint === matching.accountFingerprint
+        && item.storedAt <= matching.storedAt
+      )
+    ))
+    return _writeStoredDirectorPreviewOperations([admitted, ...retained])
+  }, signal)
+}
+
+async function _removeOwnedTentativeDirectorPreviewOperations(): Promise<boolean> {
+  return _runDirectorPreviewLedgerMutation(() => {
+    const stored = _loadStoredDirectorPreviewOperations()
+    const retained = stored.filter(item => (
+      item.admitted || !_realmOwnsStoredDirectorPreviewOperation(item)
+    ))
+    if (retained.length === stored.length) return true
+    return _writeStoredDirectorPreviewOperations(retained)
+  })
+}
+
+async function _removeStoredDirectorPreviewOperation(
+  scope: api.DirectorV2OperationScope,
+): Promise<boolean> {
+  return _runDirectorPreviewLedgerMutation(() => {
+    const stored = _loadStoredDirectorPreviewOperations()
+    const matching = stored.find(item => _sameDirectorPreviewScope(item, scope))
+    if (!matching || !_realmOwnsStoredDirectorPreviewOperation(matching)) return false
+    return _writeStoredDirectorPreviewOperations(stored.filter(item => item !== matching))
+  })
+}
+
+async function _removeStoredDirectorPreviewLineage(
+  completed: StoredDirectorPreviewOperation,
+): Promise<boolean> {
+  return _runDirectorPreviewLedgerMutation(() => {
+    const stored = _loadStoredDirectorPreviewOperations()
+    const retained = stored.filter(item => !(
+      _realmOwnsStoredDirectorPreviewOperation(item)
+      && item.workspace === completed.workspace
+      && item.accountFingerprint === completed.accountFingerprint
+      && item.storedAt <= completed.storedAt
+    ))
+    if (retained.length === stored.length) return false
+    return _writeStoredDirectorPreviewOperations(retained)
+  })
+}
+
+async function _clearStoredDirectorPreviewOperations(
+  accountFingerprint: string,
+): Promise<boolean> {
+  return _runDirectorPreviewLedgerMutation(() => {
+    const stored = _loadStoredDirectorPreviewOperations()
+    const retained = stored.filter(item => !(
+      item.accountFingerprint === accountFingerprint
+      && _realmOwnsStoredDirectorPreviewOperation(item)
+    ))
+    if (retained.length === stored.length) return false
+    return _writeStoredDirectorPreviewOperations(retained)
+  })
+}
+
+function _findStoredDirectorPreviewOperation(
+  workspace: string,
+  accountFingerprint: string,
+): StoredDirectorPreviewOperation | null {
+  const matches = _loadStoredDirectorPreviewOperations().filter(item => (
+    item.admitted
+    && item.workspace === workspace
+    && item.accountFingerprint === accountFingerprint
+  ))
+  return matches.find(_realmOwnsStoredDirectorPreviewOperation) ?? matches[0] ?? null
+}
+
+function _sameDirectorPreviewScope(
+  left: api.DirectorV2OperationScope | null,
+  right: api.DirectorV2OperationScope,
+): boolean {
+  return Boolean(
+    left
+    && left.requestId === right.requestId
+    && left.workspace === right.workspace
+    && left.projectInstance === right.projectInstance
+  )
+}
+
+function _sameStoredDirectorPreviewOperation(
+  left: StoredDirectorPreviewOperation | null,
+  right: StoredDirectorPreviewOperation,
+): boolean {
+  return Boolean(
+    left
+    && _sameDirectorPreviewScope(left, right)
+    && left.accountFingerprint === right.accountFingerprint
+    && left.claimToken === right.claimToken
+    && left.settingsFingerprint === right.settingsFingerprint
+    && left.creativeFingerprint === right.creativeFingerprint
+    && left.admitted === right.admitted
+    && left.storedAt === right.storedAt
+  )
+}
+
+function _terminalDirectorPreviewStatus(
+  status: api.DirectorV2OperationStatus,
+): api.DirectorV2OperationStatus {
+  if (status.status !== 'cancelled' && status.status !== 'failed') return status
+  return {
+    ...status,
+    partial_text: '',
+    generated_tokens_approx: 0,
+    elapsed_seconds: 0,
+    live_tps: null,
+    average_tps: null,
+  }
+}
+
+type SupportedDirectorPreviewSkill = Extract<DirectorSkill, 'music_video' | 'short_film'>
+
+function _supportedDirectorPreviewSkill(value: string): SupportedDirectorPreviewSkill | null {
+  return value === 'music_video' || value === 'short_film' ? value : null
 }
 
 function _loadStoredDirectorPreparation(): StoredDirectorPreparation | null {
@@ -2842,6 +3203,10 @@ interface AppState {
   directorLoadingMessage: string | null
   directorError: string | null
   directorComponentError: api.DirectorComponentFailure | null
+  directorPreviewStatus: api.LlmPreparationStatus | api.DirectorV2OperationStatus | null
+  directorPreviewRequestScope: api.DirectorV2OperationScope | null
+  resumeDirectorPreview: () => Promise<boolean>
+  cancelDirectorPreview: () => Promise<void>
   directorReferenceImage: File | null
   directorReferenceImagePath: string | null
   directorCharacterRefs: File[]
@@ -2947,7 +3312,10 @@ interface AppState {
   directorGenerate: () => void
   directorReset: () => void
   directorEditClipPlan: (index: number, field: 'video_prompt' | 'image_prompt', value: string) => void
-  _uploadDirectorRefs: (lifecycle?: { ownsWorkspace: () => boolean }) => Promise<{ refImagePath: string | null; charPaths: string[]; locPaths: string[] }>
+  _uploadDirectorRefs: (
+    lifecycle?: { ownsWorkspace: () => boolean },
+    requestFence?: DirectorPreviewRequestFence,
+  ) => Promise<{ refImagePath: string | null; charPaths: string[]; locPaths: string[] }>
 
   // Short Film Director
   shortFilmCharacters: ShortFilmCharacter[]
@@ -3341,6 +3709,7 @@ const _initialLegacyDirectorImageModel = _initialDirectorImageRoles === null
 async function _captureDirectorImageRoleRequest(
   getState: () => AppState,
   explicitOutput: boolean,
+  requestFence?: DirectorPreviewRequestFence,
 ): Promise<DirectorImageRoleRequestCapture> {
   // A fresh server snapshot binds automatic resolution to the current literal
   // Explicit choice and current remote authorization/catalog visibility.
@@ -3348,6 +3717,7 @@ async function _captureDirectorImageRoleRequest(
     explicitOutput,
     force: true,
   })
+  if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
   const state = getState()
   const creatorOverride = state.directorImageCreatorModelOverride.trim()
   const editorOverride = state.directorImageEditorModelOverride.trim()
@@ -3388,6 +3758,7 @@ async function _captureDirectorImageRoleRequest(
     let catalog: Awaited<ReturnType<typeof api.fetchLoraDetails>>
     try {
       catalog = await api.fetchLoraDetails(modelType)
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
     } catch {
       throw new api.DirectorRequestError(
         'director_role_lora_unavailable',
@@ -3599,6 +3970,145 @@ async function _enhanceHmacSha256(value: unknown): Promise<string> {
   return _enhanceBytesToHex(await globalThis.crypto.subtle.sign('HMAC', key, message))
 }
 
+function _readDirectorPreviewFingerprintClaim(): DirectorPreviewFingerprintClaimRecord | null {
+  try {
+    const parsed = JSON.parse(
+      sessionStorage.getItem(DIRECTOR_PREVIEW_FINGERPRINT_CLAIM_STORAGE_KEY) || 'null',
+    )
+    if (
+      !parsed
+      || typeof parsed !== 'object'
+      || Array.isArray(parsed)
+      || Object.keys(parsed).length !== 3
+      || parsed.schemaVersion !== 1
+      || typeof parsed.token !== 'string'
+      || !/^[0-9a-f]{64}$/i.test(parsed.token)
+      || typeof parsed.salt !== 'string'
+      || !/^[0-9a-f]{64}$/i.test(parsed.salt)
+    ) return null
+    return { schemaVersion: 1, token: parsed.token, salt: parsed.salt }
+  } catch {
+    return null
+  }
+}
+
+function _writeDirectorPreviewFingerprintClaim(
+  record: DirectorPreviewFingerprintClaimRecord,
+): void {
+  try {
+    sessionStorage.setItem(
+      DIRECTOR_PREVIEW_FINGERPRINT_CLAIM_STORAGE_KEY,
+      JSON.stringify(record),
+    )
+  } catch { /* same-realm ownership remains usable; reload recovery fails closed */ }
+}
+
+function _newDirectorPreviewFingerprintClaim(): DirectorPreviewFingerprintClaimRecord {
+  return {
+    schemaVersion: 1,
+    token: _enhanceBytesToHex(globalThis.crypto.getRandomValues(
+      new Uint8Array(DIRECTOR_PREVIEW_FINGERPRINT_TOKEN_BYTES),
+    )),
+    salt: _enhanceBytesToHex(globalThis.crypto.getRandomValues(
+      new Uint8Array(DIRECTOR_PREVIEW_FINGERPRINT_SALT_BYTES),
+    )),
+  }
+}
+
+async function _tryClaimDirectorPreviewFingerprintToken(token: string): Promise<boolean> {
+  const locks = globalThis.navigator?.locks
+  if (!locks?.request) return false
+  return new Promise(resolve => {
+    let decided = false
+    const holdForRealmLifetime = new Promise<void>(() => {})
+    const timer = globalThis.setTimeout(() => {
+      if (decided) return
+      decided = true
+      resolve(false)
+    }, DIRECTOR_PREVIEW_FINGERPRINT_LOCK_TIMEOUT_MS)
+    try {
+      const request = locks.request(
+        `maestro-director-preview-tab-${token}`,
+        { mode: 'exclusive', ifAvailable: true },
+        lock => {
+          if (decided) return undefined
+          decided = true
+          globalThis.clearTimeout(timer)
+          if (!lock) {
+            resolve(false)
+            return undefined
+          }
+          resolve(true)
+          return holdForRealmLifetime
+        },
+      )
+      const tracked = Promise.resolve(request).catch(() => {
+        if (decided) return
+        decided = true
+        globalThis.clearTimeout(timer)
+        resolve(false)
+      })
+      _directorPreviewFingerprintLockRequests.add(tracked)
+      void tracked.finally(() => _directorPreviewFingerprintLockRequests.delete(tracked))
+    } catch {
+      if (decided) return
+      decided = true
+      globalThis.clearTimeout(timer)
+      resolve(false)
+    }
+  })
+}
+
+async function _initializeDirectorPreviewFingerprintSalt(): Promise<Uint8Array> {
+  const stored = _readDirectorPreviewFingerprintClaim()
+  if (stored && await _tryClaimDirectorPreviewFingerprintToken(stored.token)) {
+    _directorPreviewFingerprintClaimRecord = stored
+    _directorPreviewReloadRecoveryAvailable = true
+    _volatileDirectorPreviewFingerprintSalt = Uint8Array.from(
+      stored.salt.match(/.{2}/g) ?? [], value => Number.parseInt(value, 16),
+    )
+    return _volatileDirectorPreviewFingerprintSalt
+  }
+
+  // A copied tab cannot own or mutate the source tab's operation. Rotate both
+  // values and disable reload adoption unless the new lifetime lock succeeds.
+  const replacement = _newDirectorPreviewFingerprintClaim()
+  const replacementClaimed = await _tryClaimDirectorPreviewFingerprintToken(replacement.token)
+  _directorPreviewFingerprintClaimRecord = replacement
+  _directorPreviewReloadRecoveryAvailable = replacementClaimed
+  _writeDirectorPreviewFingerprintClaim(replacement)
+  _volatileDirectorPreviewFingerprintSalt = Uint8Array.from(
+    replacement.salt.match(/.{2}/g) ?? [], value => Number.parseInt(value, 16),
+  )
+  return _volatileDirectorPreviewFingerprintSalt
+}
+
+async function _directorPreviewFingerprintSalt(): Promise<Uint8Array> {
+  if (!_directorPreviewFingerprintClaimPromise) {
+    _directorPreviewFingerprintClaimPromise = _initializeDirectorPreviewFingerprintSalt()
+  }
+  const salt = await _directorPreviewFingerprintClaimPromise
+  if (_directorPreviewFingerprintClaimRecord) {
+    _writeDirectorPreviewFingerprintClaim(_directorPreviewFingerprintClaimRecord)
+  }
+  return salt
+}
+
+async function _directorPreviewHmacSha256(value: unknown): Promise<string> {
+  if (!globalThis.crypto.subtle) {
+    throw new Error('Director preview recovery requires browser HMAC-SHA-256 support')
+  }
+  const salt = await _directorPreviewFingerprintSalt()
+  const keyBytes = new Uint8Array(salt.byteLength)
+  keyBytes.set(salt)
+  const key = await globalThis.crypto.subtle.importKey(
+    'raw', keyBytes,
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  )
+  const message = new TextEncoder().encode(_stableJson(value))
+  return _enhanceBytesToHex(await globalThis.crypto.subtle.sign('HMAC', key, message))
+}
+
 async function _enhanceFileIdentity(file: File | null): Promise<readonly unknown[] | null> {
   if (!file) return null
   return [
@@ -3641,6 +4151,438 @@ async function _enhanceSettingsFingerprint(state: AppState): Promise<string> {
   ])
 }
 
+function _directorPreviewSafeSettings(state: AppState): unknown {
+  return {
+    skill: state.directorSkill,
+    useDirectorV2: state.servicesConfig?.use_director_v2 ?? true,
+    videoModel: state.selectedModelPerMode.video,
+    creatorModel: state.directorImageCreatorModelOverride,
+    editorModel: state.directorImageEditorModelOverride,
+    creatorLoras: state.directorImageRoleLoras.creator.map(item => ({ ...item })),
+    editorLoras: state.directorImageRoleLoras.editor.map(item => ({ ...item })),
+    h3StyleWorkflow: state.h3StyleWorkflow,
+    explicitOutput: state.explicitOutput,
+    targetDuration: state.shortFilmTargetDuration,
+    narrative: state.shortFilmNarrative,
+    fps: state.modelOptions?.fps ?? null,
+    framesSteps: state.modelOptions?.frames_steps ?? null,
+    framesMinimum: state.modelOptions?.frames_minimum ?? null,
+  }
+}
+
+async function _directorPreviewSettingsFingerprint(state: AppState): Promise<string> {
+  return _directorPreviewHmacSha256(_directorPreviewSafeSettings(state))
+}
+
+function _directorPreviewCreativeInputs(state: AppState): unknown {
+  const plannedClips = state.directorPlannedClips
+  const storyPlanning = state.directorSkill === 'short_film' && plannedClips.length === 0
+  return {
+    skillType: state.directorSkill,
+    clips: plannedClips,
+    sceneDescription: state.directorSceneDescription,
+    storyDescription: storyPlanning ? state.directorSceneDescription : '',
+    visualStyle: state.directorVisualStyle === 'custom'
+      ? state.directorCustomVisualStyle.trim()
+      : state.directorVisualStyle,
+    lyrics: state.directorAnalysis?.lyrics ?? null,
+    bpm: state.directorSkill === 'music_video'
+      ? state.directorAnalysis?.bpm ?? 120
+      : null,
+    referencePath: state.directorReferenceImagePath,
+    characterPaths: state.directorCharacterRefPaths,
+    characterLabels: state.directorCharacterRefLabels,
+    locationPaths: state.directorLocationRefPaths,
+    locationLabels: state.directorLocationRefLabels,
+    speakerMappings: state.directorSpeakerMappings
+      .filter(mapping => mapping.name.trim())
+      .map(mapping => ({
+        speakerId: mapping.speakerId,
+        name: mapping.name,
+        role: mapping.role,
+      })),
+    characters: state.directorSkill === 'short_film' ? state.shortFilmCharacters : [],
+    targetDuration: storyPlanning ? state.shortFilmTargetDuration : null,
+    narrativeMode: storyPlanning ? state.shortFilmNarrative : null,
+    fps: storyPlanning ? state.modelOptions?.fps ?? 24 : null,
+    framesSteps: storyPlanning ? state.modelOptions?.frames_steps ?? 4 : null,
+    framesMinimum: storyPlanning ? state.modelOptions?.frames_minimum ?? 5 : null,
+    promptType: 'both',
+  }
+}
+
+let _directorPreviewReferenceObjectSequence = 0
+const _directorPreviewReferenceObjectIds = new WeakMap<object, number>()
+
+function _directorPreviewReferenceObjectId(value: object): number {
+  const existing = _directorPreviewReferenceObjectIds.get(value)
+  if (existing !== undefined) return existing
+  const created = ++_directorPreviewReferenceObjectSequence
+  _directorPreviewReferenceObjectIds.set(value, created)
+  return created
+}
+
+function _directorPreviewActionCreativeInputs(state: AppState): unknown {
+  const creative = _directorPreviewCreativeInputs(state) as Record<string, unknown>
+  const stableCreative = { ...creative }
+  delete stableCreative.referencePath
+  delete stableCreative.characterPaths
+  delete stableCreative.characterLabels
+  delete stableCreative.locationPaths
+  delete stableCreative.locationLabels
+  const reference = state.directorReferenceImage
+    ? { localObject: _directorPreviewReferenceObjectId(state.directorReferenceImage) }
+    : { path: state.directorReferenceImagePath }
+  const referenceRows = (
+    files: File[],
+    paths: string[],
+    labels: string[],
+  ) => Array.from(
+    { length: Math.max(files.length, paths.length, labels.length) },
+    (_, index) => ({
+      source: files[index]
+        ? { localObject: _directorPreviewReferenceObjectId(files[index]) }
+        : { path: paths[index] ?? null },
+      label: labels[index] ?? '',
+    }),
+  )
+  return {
+    ...stableCreative,
+    reference,
+    characterReferences: referenceRows(
+      state.directorCharacterRefs,
+      state.directorCharacterRefPaths,
+      state.directorCharacterRefLabels,
+    ),
+    locationReferences: referenceRows(
+      state.directorLocationRefs,
+      state.directorLocationRefPaths,
+      state.directorLocationRefLabels,
+    ),
+  }
+}
+
+type DirectorPreviewRequestFence = {
+  workspace: string
+  skillType: DirectorSkill
+  explicitOutput: boolean
+  isCurrent: () => boolean
+}
+
+function _captureDirectorPreviewRequestFence(
+  getState: () => AppState,
+  skillType: DirectorSkill,
+): DirectorPreviewRequestFence {
+  const state = getState()
+  const workspace = state.activeWorkspace
+  const accountIdentityEpoch = _accountIdentityEpoch
+  const accountFingerprint = _enhanceAccountFingerprint(state)
+  const inputFingerprint = _stableJson({
+    settings: _directorPreviewSafeSettings(state),
+    creative: _directorPreviewActionCreativeInputs(state),
+  })
+  return {
+    workspace,
+    skillType,
+    explicitOutput: state.explicitOutput,
+    isCurrent: () => {
+      const current = getState()
+      return (
+        _accountIdentityIsCurrent(accountIdentityEpoch)
+        && _enhanceAccountFingerprint(current) === accountFingerprint
+        && current.activeWorkspace === workspace
+        && current.directorSkill === skillType
+        && _stableJson({
+          settings: _directorPreviewSafeSettings(current),
+          creative: _directorPreviewActionCreativeInputs(current),
+        }) === inputFingerprint
+      )
+    },
+  }
+}
+
+function _requireCurrentDirectorPreviewRequestFence(
+  fence: DirectorPreviewRequestFence,
+): void {
+  if (!fence.isCurrent()) {
+    throw new DOMException('The browser stopped waiting', 'AbortError')
+  }
+}
+
+function _directorPreviewRequestCreativeInputs(request: DirectorV2PreviewRequest): unknown {
+  return {
+    skillType: request.skill_type,
+    clips: request.clips ?? [],
+    sceneDescription: request.scene_description ?? '',
+    storyDescription: request.story_description ?? '',
+    visualStyle: request.visual_style ?? '',
+    lyrics: request.lyrics ?? null,
+    bpm: request.skill_type === 'music_video' ? request.bpm ?? 120 : null,
+    referencePath: request.reference_image_path ?? null,
+    characterPaths: request.character_ref_paths ?? [],
+    characterLabels: request.character_ref_labels ?? [],
+    locationPaths: request.location_ref_paths ?? [],
+    locationLabels: request.location_ref_labels ?? [],
+    speakerMappings: request.speaker_mappings
+      ? Object.entries(request.speaker_mappings).map(([speakerId, value]) => ({
+          speakerId,
+          ...(value as Record<string, unknown>),
+        }))
+      : [],
+    characters: request.characters ?? [],
+    targetDuration: request.target_duration ?? null,
+    narrativeMode: request.narrative_mode ?? null,
+    fps: request.target_duration === undefined ? null : request.fps ?? 24,
+    framesSteps: request.target_duration === undefined ? null : request.frames_steps ?? 4,
+    framesMinimum: request.target_duration === undefined ? null : request.frames_minimum ?? 5,
+    promptType: request.prompt_type ?? '',
+  }
+}
+
+async function _directorPreviewCreativeFingerprint(state: AppState): Promise<string> {
+  return _directorPreviewHmacSha256(_directorPreviewCreativeInputs(state))
+}
+
+function _directorPreviewInputsReadyForRecovery(state: AppState): boolean {
+  const videoModel = state.selectedModelPerMode.video || ''
+  return Boolean(
+    state.activeWorkspace
+    && state.modelsLoaded
+    && state.servicesConfig?.use_director_v2 === true
+    && videoModel
+    && !state.modelOptionsLoading
+    && state.modelOptions?.model_type === videoModel
+    && !state.h3StyleWorkflowCatalogLoading
+    && state.h3StyleWorkflowCatalog !== null
+  )
+}
+
+function _directorPreviewLiveInputFingerprint(state: AppState): string {
+  return _stableJson({
+    workspace: state.activeWorkspace,
+    settings: _directorPreviewSafeSettings(state),
+    creative: _directorPreviewCreativeInputs(state),
+  })
+}
+
+type DirectorV2PreviewRequest = Omit<
+  api.DirectorV2PlanRequest,
+  'request_id' | 'project_instance'
+>
+
+async function _runDirectorV2Preview(
+  request: DirectorV2PreviewRequest,
+  lifecycle: {
+    signal: AbortSignal
+    stopWaiting: () => void
+    ownsWorkspace: () => boolean
+  },
+  requestFence: DirectorPreviewRequestFence,
+): Promise<api.DirectorV2PlanResponse> {
+  const accountIdentityEpoch = _accountIdentityEpoch
+  const initialState = useStore.getState()
+  const accountFingerprint = _enhanceAccountFingerprint(initialState)
+  const liveInputFingerprint = _directorPreviewLiveInputFingerprint(initialState)
+  const requestCreativeInputs = _stableJson(_directorPreviewRequestCreativeInputs(request))
+  const workspace = request.workspace
+  let scope: api.DirectorV2OperationScope | null = null
+  let storedOperation: Omit<StoredDirectorPreviewOperation, 'claimToken' | 'admitted'> | null = null
+  let submissionAttempted = false
+  let admissionConfirmed = false
+  let durableRecoveryStored = false
+
+  const ownsExactInput = () => {
+    const state = useStore.getState()
+    return lifecycle.ownsWorkspace()
+      && _accountIdentityIsCurrent(accountIdentityEpoch)
+      && _enhanceAccountFingerprint(state) === accountFingerprint
+      && state.activeWorkspace === workspace
+      && requestFence.isCurrent()
+      && _directorPreviewLiveInputFingerprint(state) === liveInputFingerprint
+  }
+  const stopOnSettingsChange = useStore.subscribe(state => {
+    if (_directorPreviewRequestToken === null) return
+    if (
+      state.activeWorkspace !== workspace
+      || !_accountIdentityIsCurrent(accountIdentityEpoch)
+      || _enhanceAccountFingerprint(state) !== accountFingerprint
+    ) {
+      // Navigation/account loss stops this browser only. The exact opaque
+      // record remains available for an authorized return to the project;
+      // account scrubbing removes it separately.
+      lifecycle.stopWaiting()
+      return
+    }
+    if (_directorPreviewLiveInputFingerprint(state) !== liveInputFingerprint) {
+      lifecycle.stopWaiting()
+      if (scope) {
+        void _removeStoredDirectorPreviewOperation(scope)
+        if (_sameDirectorPreviewScope(state.directorPreviewRequestScope, scope)) {
+          useStore.setState({
+            directorPreviewStatus: null,
+            directorPreviewRequestScope: null,
+          })
+        }
+      }
+    }
+  })
+
+  try {
+    if (
+      request.workspace !== requestFence.workspace
+      || request.skill_type !== requestFence.skillType
+      || request.explicit_output !== requestFence.explicitOutput
+    ) throw new DOMException('The browser stopped waiting', 'AbortError')
+    _requireCurrentDirectorPreviewRequestFence(requestFence)
+    const settingsFingerprint = await _directorPreviewSettingsFingerprint(initialState)
+    if (!ownsExactInput()) throw new DOMException('The browser stopped waiting', 'AbortError')
+    if (_stableJson(_directorPreviewCreativeInputs(useStore.getState())) !== requestCreativeInputs) {
+      throw new DOMException('The browser stopped waiting', 'AbortError')
+    }
+    const creativeFingerprint = await _directorPreviewCreativeFingerprint(initialState)
+    if (!ownsExactInput()) throw new DOMException('The browser stopped waiting', 'AbortError')
+    const catalog = await api.fetchLlmModels(workspace, lifecycle.signal)
+    if (!ownsExactInput()) throw new DOMException('The browser stopped waiting', 'AbortError')
+    if (!catalog.project_instance) {
+      throw new api.DirectorV2ScopeError('Could not open this project for Director preview')
+    }
+    scope = {
+      requestId: api.createLlmRequestId(),
+      workspace,
+      projectInstance: catalog.project_instance,
+    }
+    const exactScope = scope
+    storedOperation = {
+      ...exactScope,
+      accountFingerprint,
+      settingsFingerprint,
+      creativeFingerprint,
+      storedAt: Date.now(),
+    }
+    const claimToken = _directorPreviewFingerprintClaimRecord?.token ?? null
+    if (claimToken) {
+      _directorPreviewActiveOwnership = { ...exactScope, claimToken }
+    }
+    useStore.setState({
+      directorPreviewStatus: null,
+      directorPreviewRequestScope: exactScope,
+    })
+    const result = await api.directorV2Plan({
+      ...request,
+      request_id: exactScope.requestId,
+      project_instance: exactScope.projectInstance,
+    }, {
+      projectInstance: exactScope.projectInstance,
+      signal: lifecycle.signal,
+      onPreparationStatus: status => {
+        if (
+          ownsExactInput()
+          && _sameDirectorPreviewScope(
+            useStore.getState().directorPreviewRequestScope,
+            exactScope,
+          )
+        ) useStore.setState({ directorPreviewStatus: status })
+      },
+      onSubmissionAttempted: async () => {
+        if (
+          !ownsExactInput()
+          || !_sameDirectorPreviewScope(
+            useStore.getState().directorPreviewRequestScope,
+            exactScope,
+          )
+        ) return
+        const stored = await _storeDirectorPreviewOperation(
+          storedOperation as Omit<StoredDirectorPreviewOperation, 'claimToken' | 'admitted'>,
+          lifecycle.signal,
+        )
+        if (
+          !ownsExactInput()
+          || !_sameDirectorPreviewScope(
+            useStore.getState().directorPreviewRequestScope,
+            exactScope,
+          )
+        ) {
+          if (stored) await _removeStoredDirectorPreviewOperation(exactScope)
+          return
+        }
+        submissionAttempted = true
+        _directorPreviewSubmissionAttemptedRequestId = exactScope.requestId
+      },
+      onAdmissionConfirmed: async () => {
+        if (
+          !ownsExactInput()
+          || !_sameDirectorPreviewScope(
+            useStore.getState().directorPreviewRequestScope,
+            exactScope,
+          )
+        ) return
+        const admitted = await _admitStoredDirectorPreviewOperation(
+          exactScope,
+          lifecycle.signal,
+        )
+        if (!ownsExactInput()) return
+        admissionConfirmed = true
+        durableRecoveryStored = admitted
+      },
+      onOperationStatus: status => {
+        if (
+          ownsExactInput()
+          && _sameDirectorPreviewScope(
+            useStore.getState().directorPreviewRequestScope,
+            exactScope,
+          )
+        ) useStore.setState({
+          directorPreviewStatus: _terminalDirectorPreviewStatus(status),
+        })
+      },
+    })
+    if (
+      !ownsExactInput()
+      || !_sameDirectorPreviewScope(
+        useStore.getState().directorPreviewRequestScope,
+        exactScope,
+      )
+    ) {
+      await _removeStoredDirectorPreviewOperation(exactScope)
+      throw new DOMException('The browser stopped waiting', 'AbortError')
+    }
+    const completedStored = _findStoredDirectorPreviewOperation(workspace, accountFingerprint)
+    if (completedStored && _sameDirectorPreviewScope(completedStored, exactScope)) {
+      await _removeStoredDirectorPreviewLineage(completedStored)
+    }
+    return result
+  } catch (error) {
+    if (scope && (
+      !admissionConfirmed
+      || !(_isBrowserAbort(error) && submissionAttempted)
+        && !(error instanceof api.DirectorV2WaitError && durableRecoveryStored)
+    )) await _removeStoredDirectorPreviewOperation(scope)
+    if (
+      error instanceof api.DirectorV2WaitError
+      && submissionAttempted
+      && (!scope || !durableRecoveryStored)
+    ) {
+      throw new Error(
+        'Director preview stopped waiting. This browser could not reserve private reload recovery, so reloading will not resume this request. You can try planning again.',
+      )
+    }
+    throw error
+  } finally {
+    stopOnSettingsChange()
+    if (
+      scope
+      && lifecycle.ownsWorkspace()
+      && _sameDirectorPreviewScope(
+        useStore.getState().directorPreviewRequestScope,
+        scope,
+      )
+    ) useStore.setState({
+      directorPreviewStatus: null,
+      directorPreviewRequestScope: null,
+    })
+  }
+}
+
 function _advanceAccountIdentityEpoch(): void {
   _accountIdentityEpoch += 1
   _workspaceLoadSequence += 1
@@ -3678,12 +4620,24 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
   // Initial account hydration may legitimately recover a record for that
   // same account. A real scrub/logout always has a previous context and must
   // remove every prior-account recovery fence.
-  if (state.accountContext !== null) void _clearStoredEnhanceOperations()
+  if (state.accountContext !== null) {
+    void _clearStoredEnhanceOperations()
+    const priorAccountFingerprint = _enhanceAccountFingerprint(state)
+    void _directorPreviewFingerprintSalt()
+      .then(() => _clearStoredDirectorPreviewOperations(priorAccountFingerprint))
+      .catch(() => false)
+  }
   _enhanceStopWaiting?.()
   _enhanceLlmRequestToken = null
   _enhanceStopWaiting = null
   _enhanceWaitSignal = null
   _enhanceSubmissionAttemptedRequestId = null
+  _directorPreviewStopWaiting?.()
+  _directorPreviewRequestToken = null
+  _directorPreviewStopWaiting = null
+  _directorPreviewSubmissionAttemptedRequestId = null
+  _directorPreviewRecoveryToken = null
+  _directorPreviewActiveOwnership = null
   return {
     workspaces: [],
     activeWorkspace: '',
@@ -3702,6 +4656,8 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     isEnhancing: false,
     enhanceStatus: null,
     enhanceRequestScope: null,
+    directorPreviewStatus: null,
+    directorPreviewRequestScope: null,
     sampleCampaignPairs: [],
     params: { ...state.params, ...BLANK_VIDEO_INPUT_PARAMS },
     startImage: null,
@@ -4242,6 +5198,7 @@ export const useStore = create<AppState>((set, get) => ({
           ? null
           : 'Your saved H3 workflow is no longer in the server catalog and was cleared.',
       })
+      void get().resumeDirectorPreview()
     } catch {
       if (seq !== _h3StyleWorkflowCatalogSeq) return
       _storeH3StyleWorkflow('')
@@ -4251,6 +5208,7 @@ export const useStore = create<AppState>((set, get) => ({
         h3StyleWorkflow: '',
         h3StyleWorkflowCatalogError: 'The server H3 workflow catalog is unavailable. No workflow was selected.',
       })
+      void get().resumeDirectorPreview()
     }
   },
 
@@ -8738,6 +9696,7 @@ export const useStore = create<AppState>((set, get) => ({
           ...paramUpdates,
         },
       }))
+      void get().resumeDirectorPreview()
     } catch {
       // Same staleness rule as the success path — a superseded request's
       // failure must not null out the newer request's options.
@@ -9847,6 +10806,7 @@ export const useStore = create<AppState>((set, get) => ({
         servicesConfigLoading: false,
         servicesConfigError: null,
       })
+      void get().resumeDirectorPreview()
       void get().loadHostTerms()
     } catch (e) {
       console.error('Failed to load services config:', e)
@@ -10367,6 +11327,307 @@ export const useStore = create<AppState>((set, get) => ({
   directorLoadingMessage: null,
   directorError: null,
   directorComponentError: null,
+  directorPreviewStatus: null,
+  directorPreviewRequestScope: null,
+  resumeDirectorPreview: async () => {
+    if (!_directorPreviewInputsReadyForRecovery(get())) return false
+    const recoveryToken = Symbol('director-preview-recovery')
+    _directorPreviewRecoveryToken = recoveryToken
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const accountFingerprint = _enhanceAccountFingerprint(get())
+    const workspace = get().activeWorkspace
+    const initialStored = _findStoredDirectorPreviewOperation(
+      workspace,
+      accountFingerprint,
+    )
+    if (
+      !initialStored
+      || _directorPreviewRequestToken !== null
+      || get().directorPreviewRequestScope !== null
+    ) return false
+    try {
+      await _directorPreviewFingerprintSalt()
+    } catch {
+      set({
+        directorError: 'Director preview recovery could not reclaim this tab’s private recovery key. The prior result was left unchanged; try planning again in this tab.',
+      })
+      return false
+    }
+    if (
+      _directorPreviewRecoveryToken !== recoveryToken
+      || !_directorPreviewInputsReadyForRecovery(get())
+      || _directorPreviewRequestToken !== null
+      || get().directorPreviewRequestScope !== null
+    ) return false
+    await _removeOwnedTentativeDirectorPreviewOperations()
+    if (
+      _directorPreviewRecoveryToken !== recoveryToken
+      || !_directorPreviewInputsReadyForRecovery(get())
+    ) return false
+    const stored = _findStoredDirectorPreviewOperation(workspace, accountFingerprint)
+    if (!stored || !_realmOwnsStoredDirectorPreviewOperation(stored)) {
+      set({
+        directorError: 'Director preview recovery could not exclusively reclaim this tab’s private recovery key. The prior result was left unchanged; try planning again in this tab.',
+      })
+      return false
+    }
+    const liveInputFingerprint = _directorPreviewLiveInputFingerprint(get())
+    const currentStored = _findStoredDirectorPreviewOperation(workspace, accountFingerprint)
+    if (
+      _directorPreviewRecoveryToken !== recoveryToken
+      || !_accountIdentityIsCurrent(accountIdentityEpoch)
+      || _enhanceAccountFingerprint(get()) !== accountFingerprint
+      || get().activeWorkspace !== workspace
+      || !_directorPreviewInputsReadyForRecovery(get())
+      || _directorPreviewLiveInputFingerprint(get()) !== liveInputFingerprint
+      || !_sameStoredDirectorPreviewOperation(currentStored, stored)
+    ) return false
+    const scope: api.DirectorV2OperationScope = {
+      requestId: stored.requestId,
+      workspace: stored.workspace,
+      projectInstance: stored.projectInstance,
+    }
+    const lifecycle = _beginDirectorPreviewRequest(scope.workspace, recoveryToken)
+    _directorPreviewSubmissionAttemptedRequestId = scope.requestId
+    _directorPreviewActiveOwnership = { ...scope, claimToken: stored.claimToken }
+    set({
+      directorLoading: true,
+      directorLoadingMessage: 'Restoring Director preview…',
+      directorError: null,
+      directorPreviewStatus: null,
+      directorPreviewRequestScope: scope,
+    })
+    let inputsChanged = false
+    const stopOnInputsChange = useStore.subscribe(state => {
+      if (
+        state.activeWorkspace !== scope.workspace
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || _enhanceAccountFingerprint(state) !== accountFingerprint
+      ) {
+        lifecycle.stopWaiting()
+        return
+      }
+      if (_directorPreviewLiveInputFingerprint(state) !== liveInputFingerprint) {
+        inputsChanged = true
+        lifecycle.stopWaiting()
+        void _removeStoredDirectorPreviewOperation(scope)
+        if (_sameDirectorPreviewScope(state.directorPreviewRequestScope, scope)) {
+          set({ directorPreviewStatus: null, directorPreviewRequestScope: null })
+        }
+      }
+    })
+    try {
+      const result = await api.resumeDirectorV2Plan(scope, {
+        signal: lifecycle.signal,
+        onOperationStatus: status => {
+          if (
+            lifecycle.ownsWorkspace()
+            && _sameDirectorPreviewScope(get().directorPreviewRequestScope, scope)
+          ) set({ directorPreviewStatus: _terminalDirectorPreviewStatus(status) })
+        },
+      })
+      const recoveredStored = _findStoredDirectorPreviewOperation(
+        scope.workspace,
+        accountFingerprint,
+      )
+      if (
+        !lifecycle.ownsWorkspace()
+        || _directorPreviewRecoveryToken !== recoveryToken
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || _enhanceAccountFingerprint(get()) !== accountFingerprint
+        || get().activeWorkspace !== scope.workspace
+        || !_directorPreviewInputsReadyForRecovery(get())
+        || _directorPreviewLiveInputFingerprint(get()) !== liveInputFingerprint
+        || !_sameDirectorPreviewScope(get().directorPreviewRequestScope, scope)
+        || !_sameStoredDirectorPreviewOperation(recoveredStored, stored)
+      ) return false
+      if (
+        !lifecycle.ownsWorkspace()
+        || _directorPreviewRecoveryToken !== recoveryToken
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || _enhanceAccountFingerprint(get()) !== accountFingerprint
+        || get().activeWorkspace !== scope.workspace
+        || _directorPreviewLiveInputFingerprint(get()) !== liveInputFingerprint
+        || !_sameStoredDirectorPreviewOperation(
+          _findStoredDirectorPreviewOperation(scope.workspace, accountFingerprint),
+          stored,
+        )
+      ) {
+        if (inputsChanged) await _removeStoredDirectorPreviewOperation(scope)
+        return false
+      }
+      const recoveredSkill = _supportedDirectorPreviewSkill(result.skill_type)
+      if (!recoveredSkill) {
+        throw new api.DirectorV2ScopeError(
+          'The recovered Director preview used an unsupported workflow',
+        )
+      }
+      const plans = result.clip_plans.map(plan => ({
+        video_prompt: plan.video_prompt || '',
+        image_prompt: plan.image_prompt || '',
+      }))
+      let recoveredClips: PlannedClip[] | undefined
+      const shots = (result.production_plan as {
+        shots?: Array<{
+          duration_sec?: number
+          metadata?: { duration_frames?: number }
+          narrative_role?: string
+          scene_type?: string
+        }>
+      }).shots
+      if (get().directorPlannedClips.length === 0 && Array.isArray(shots)) {
+        let cumulative = 0
+        recoveredClips = shots.map(shot => {
+          const duration = shot.duration_sec || 15
+          const clip = {
+            start: cumulative,
+            end: cumulative + duration,
+            duration_frames: shot.metadata?.duration_frames
+              || Math.round(duration * (get().modelOptions?.fps ?? 24)),
+            label: shot.narrative_role || shot.scene_type || 'scene',
+            beat_count: 0,
+          }
+          cumulative += duration
+          return clip as unknown as PlannedClip
+        })
+      }
+      await _removeStoredDirectorPreviewLineage(stored)
+      if (
+        !lifecycle.ownsWorkspace()
+        || _directorPreviewRecoveryToken !== recoveryToken
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || _enhanceAccountFingerprint(get()) !== accountFingerprint
+        || get().activeWorkspace !== scope.workspace
+        || _directorPreviewLiveInputFingerprint(get()) !== liveInputFingerprint
+      ) return false
+      // The atomic recovery adoption intentionally changes the skill/form
+      // discriminator. Detach the edit watcher only after the final exact
+      // post-await fence so it cannot misclassify that trusted adoption as a
+      // user edit and restore the pre-recovery step.
+      stopOnInputsChange()
+      set({
+        directorSkill: recoveredSkill,
+        directorPlannedClips: recoveredClips || get().directorPlannedClips,
+        directorClipPlans: plans,
+        directorStep: 'review',
+        directorLoading: false,
+        directorLoadingMessage: null,
+        directorPreviewStatus: null,
+        directorPreviewRequestScope: null,
+      })
+      return true
+    } catch (error) {
+      if (_isBrowserAbort(error) || !lifecycle.ownsWorkspace()) {
+        if (inputsChanged) await _removeStoredDirectorPreviewOperation(scope)
+        return false
+      }
+      const recoverableWait = error instanceof api.DirectorV2WaitError
+        && !error.message.includes('no longer available')
+      if (!recoverableWait) await _removeStoredDirectorPreviewOperation(scope)
+      if (!(error instanceof api.DirectorV2ScopeError)) {
+        console.error('Failed to resume Director preview:', error)
+        set({ directorError: error instanceof Error ? error.message : 'Director preview failed' })
+      }
+      return false
+    } finally {
+      if (
+        lifecycle.ownsWorkspace()
+        && _sameDirectorPreviewScope(get().directorPreviewRequestScope, scope)
+      ) set({
+        directorLoading: false,
+        directorLoadingMessage: null,
+        directorPreviewStatus: null,
+        directorPreviewRequestScope: null,
+      })
+      stopOnInputsChange()
+      lifecycle.dispose()
+      if (_directorPreviewRecoveryToken === recoveryToken) {
+        _directorPreviewRecoveryToken = null
+      }
+    }
+  },
+  cancelDirectorPreview: async () => {
+    const accountFingerprint = _enhanceAccountFingerprint(get())
+    const stored = _findStoredDirectorPreviewOperation(
+      get().activeWorkspace,
+      accountFingerprint,
+    )
+    const currentScope = get().directorPreviewRequestScope
+    const currentOwned = Boolean(
+      currentScope
+      && _directorPreviewActiveOwnership
+      && _sameDirectorPreviewScope(_directorPreviewActiveOwnership, currentScope)
+      && _directorPreviewActiveOwnership.claimToken
+        === _directorPreviewFingerprintClaimRecord?.token,
+    )
+    const storedOwned = Boolean(stored && _realmOwnsStoredDirectorPreviewOperation(stored))
+    const scope = currentOwned && currentScope
+      ? currentScope
+      : storedOwned && stored
+        ? {
+            requestId: stored.requestId,
+            workspace: stored.workspace,
+            projectInstance: stored.projectInstance,
+          }
+        : null
+    if (!scope) {
+      if (_directorPreviewRequestToken !== null) {
+        _directorPreviewStopWaiting?.()
+        set({
+          directorLoading: false,
+          directorLoadingMessage: null,
+          directorPreviewStatus: null,
+          directorPreviewRequestScope: null,
+        })
+      }
+      return
+    }
+    if (scope.workspace !== get().activeWorkspace) return
+    if (
+      currentOwned
+      && _sameDirectorPreviewScope(get().directorPreviewRequestScope, scope)
+      && _directorPreviewSubmissionAttemptedRequestId !== scope.requestId
+    ) {
+      _directorPreviewStopWaiting?.()
+      await _removeStoredDirectorPreviewOperation(scope)
+      set({
+        directorLoading: false,
+        directorLoadingMessage: null,
+        directorPreviewStatus: null,
+        directorPreviewRequestScope: null,
+      })
+      return
+    }
+    try {
+      const status = await api.cancelDirectorV2Plan(
+        scope,
+        // Explicit user cancellation must outlive the browser wait signal that
+        // Reset immediately aborts while clearing the local Director form.
+        undefined,
+      )
+      if (_sameDirectorPreviewScope(get().directorPreviewRequestScope, scope)) {
+        set({ directorPreviewStatus: _terminalDirectorPreviewStatus(status) })
+      }
+    } catch (error) {
+      if (!(error instanceof api.DirectorV2ScopeError)) {
+        console.error('Failed to cancel Director preview:', error)
+        set({
+          directorError: error instanceof Error
+            ? error.message
+            : 'Director preview could not be cancelled',
+        })
+        return
+      }
+    }
+    await _removeStoredDirectorPreviewOperation(scope)
+    _directorPreviewStopWaiting?.()
+    set({
+      directorLoading: false,
+      directorLoadingMessage: null,
+      directorPreviewStatus: null,
+      directorPreviewRequestScope: null,
+    })
+  },
   directorReferenceImage: null,
   directorReferenceImagePath: null,
   directorCharacterRefs: [],
@@ -10477,6 +11738,7 @@ export const useStore = create<AppState>((set, get) => ({
   setDirectorShotImageGuidance: (v) => set({ directorShotImageGuidance: v }),
   setDirectorSkill: (skill) => {
     set({ directorSkill: skill })
+    void get().resumeDirectorPreview()
     // Music director default for image-to-video reference strength is
     // 0.7 (loosens the lock to the start frame so motion can develop
     // naturally) rather than 1.0 (rigid frame). Only initialize when
@@ -11151,12 +12413,13 @@ export const useStore = create<AppState>((set, get) => ({
   setDirectorCustomVisualStyle: (style) => set({ directorCustomVisualStyle: style }),
 
   // Helper: upload all Director reference images (main + characters + locations)
-  _uploadDirectorRefs: async (lifecycle) => {
+  _uploadDirectorRefs: async (lifecycle, requestFence) => {
     const s = get()
     const requireOwnership = () => {
       if (lifecycle && !lifecycle.ownsWorkspace()) {
         throw new DOMException('The browser stopped waiting', 'AbortError')
       }
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
     }
     requireOwnership()
     // Upload main reference
@@ -11195,13 +12458,26 @@ export const useStore = create<AppState>((set, get) => ({
   directorPlanPrompts: async () => {
     const { directorPlannedClips, directorSceneDescription, directorAnalysis, activeWorkspace } = get()
     if (!directorPlannedClips.length || !directorSceneDescription.trim()) return
-    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    // ?? not || — an explicit user-toggled `false` must be respected on the
+    // legacy v1 path; fall back only while servicesConfig is unavailable.
+    const useV2 = get().servicesConfig?.use_director_v2 ?? true
+    const lifecycle = useV2
+      ? _beginDirectorPreviewRequest(activeWorkspace)
+      : _beginDirectorLlmRequest(activeWorkspace)
     const requestExplicitOutput = get().explicitOutput
+    const requestFence = useV2
+      ? _captureDirectorPreviewRequestFence(get, 'music_video')
+      : null
     set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
       await _ensureSelectedH3StyleWorkflowReady(get)
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
       // Upload all reference images
-      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
+      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(
+        lifecycle,
+        requestFence ?? undefined,
+      )
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
       const extraRefs = {
         ...(charPaths.length > 0 ? { character_ref_paths: charPaths, character_ref_labels: charLabels } : {}),
@@ -11217,16 +12493,17 @@ export const useStore = create<AppState>((set, get) => ({
       }
 
       // Generate both image and video prompts
-      // ?? not || — an explicit user-toggled `false` must be respected
-      // (legacy v1 path); only fall back to true when servicesConfig
-      // hasn't loaded yet or the field is undefined.
-      const useV2 = get().servicesConfig?.use_director_v2 ?? true
       let plans: Array<{ video_prompt: string; image_prompt: string }>
 
       if (useV2) {
-        const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
+        const imageRoleRequest = await _captureDirectorImageRoleRequest(
+          get,
+          requestExplicitOutput,
+          requestFence as DirectorPreviewRequestFence,
+        )
+        _requireCurrentDirectorPreviewRequestFence(requestFence as DirectorPreviewRequestFence)
         // Director v2: structured planning → rendering → validation
-        const result = await api.directorV2Plan({
+        const result = await _runDirectorV2Preview({
           workspace: activeWorkspace,
           skill_type: 'music_video',
           video_model: get().selectedModelPerMode.video,
@@ -11248,7 +12525,7 @@ export const useStore = create<AppState>((set, get) => ({
           ...extraRefs,
           speaker_mappings: Object.keys(speakerMappings).length > 0 ? speakerMappings : undefined,
           prompt_type: 'both',
-        }, { signal: lifecycle.signal })
+        }, lifecycle, requestFence as DirectorPreviewRequestFence)
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
@@ -11777,6 +13054,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   directorReset: () => {
+    void get().cancelDirectorPreview()
     _stopDirectorPreparationPoll()
     _storeDirectorPreparation(null, null)
     _directorPipelineLifecycleToken = null
@@ -11966,13 +13244,26 @@ export const useStore = create<AppState>((set, get) => ({
     const { directorPlannedClips, directorSceneDescription, directorAnalysis,
             shortFilmCharacters, activeWorkspace } = get()
     if (!directorPlannedClips.length || !directorSceneDescription.trim()) return
-    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    // ?? not || — an explicit user-toggled `false` must be respected on the
+    // legacy v1 path; fall back only while servicesConfig is unavailable.
+    const useV2 = get().servicesConfig?.use_director_v2 ?? true
+    const lifecycle = useV2
+      ? _beginDirectorPreviewRequest(activeWorkspace)
+      : _beginDirectorLlmRequest(activeWorkspace)
     const requestExplicitOutput = get().explicitOutput
+    const requestFence = useV2
+      ? _captureDirectorPreviewRequestFence(get, 'short_film')
+      : null
     set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
       await _ensureSelectedH3StyleWorkflowReady(get)
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
       // Upload all reference images
-      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
+      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(
+        lifecycle,
+        requestFence ?? undefined,
+      )
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
       const extraRefs = {
         ...(charPaths.length > 0 ? { character_ref_paths: charPaths, character_ref_labels: charLabels } : {}),
@@ -11988,15 +13279,16 @@ export const useStore = create<AppState>((set, get) => ({
       }
 
       // Generate prompts
-      // ?? not || — an explicit user-toggled `false` must be respected
-      // (legacy v1 path); only fall back to true when servicesConfig
-      // hasn't loaded yet or the field is undefined.
-      const useV2 = get().servicesConfig?.use_director_v2 ?? true
       let plans: Array<{ video_prompt: string; image_prompt: string }>
 
       if (useV2) {
-        const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
-        const result = await api.directorV2Plan({
+        const imageRoleRequest = await _captureDirectorImageRoleRequest(
+          get,
+          requestExplicitOutput,
+          requestFence as DirectorPreviewRequestFence,
+        )
+        _requireCurrentDirectorPreviewRequestFence(requestFence as DirectorPreviewRequestFence)
+        const result = await _runDirectorV2Preview({
           workspace: activeWorkspace,
           skill_type: 'short_film',
           video_model: get().selectedModelPerMode.video,
@@ -12018,7 +13310,7 @@ export const useStore = create<AppState>((set, get) => ({
           speaker_mappings: Object.keys(speakerMappings).length > 0 ? speakerMappings : undefined,
           characters: shortFilmCharacters.length > 0 ? shortFilmCharacters : undefined,
           prompt_type: 'both',
-        }, { signal: lifecycle.signal })
+        }, lifecycle, requestFence as DirectorPreviewRequestFence)
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
@@ -12132,29 +13424,43 @@ export const useStore = create<AppState>((set, get) => ({
     const { directorSceneDescription,
             shortFilmCharacters, shortFilmTargetDuration, shortFilmNarrative, activeWorkspace } = get()
     if (!directorSceneDescription.trim()) return
-    const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
+    // ?? not || — an explicit user-toggled `false` must be respected on the
+    // legacy v1 path; fall back only while servicesConfig is unavailable.
+    const useV2 = get().servicesConfig?.use_director_v2 ?? true
+    const lifecycle = useV2
+      ? _beginDirectorPreviewRequest(activeWorkspace)
+      : _beginDirectorLlmRequest(activeWorkspace)
     const requestExplicitOutput = get().explicitOutput
+    const requestFence = useV2
+      ? _captureDirectorPreviewRequestFence(get, 'short_film')
+      : null
     set({ directorLoading: true, directorError: null, directorStep: 'plan' })
     try {
       await _ensureSelectedH3StyleWorkflowReady(get)
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
       // Upload all reference images
-      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(lifecycle)
+      const { refImagePath, charPaths, locPaths } = await get()._uploadDirectorRefs(
+        lifecycle,
+        requestFence ?? undefined,
+      )
+      if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
       const { directorCharacterRefLabels: charLabels, directorLocationRefLabels: locLabels } = get()
       const extraRefs = {
         ...(charPaths.length > 0 ? { character_ref_paths: charPaths, character_ref_labels: charLabels } : {}),
         ...(locPaths.length > 0 ? { location_ref_paths: locPaths, location_ref_labels: locLabels } : {}),
       }
 
-      // ?? not || — an explicit user-toggled `false` must be respected
-      // (legacy v1 path); only fall back to true when servicesConfig
-      // hasn't loaded yet or the field is undefined.
-      const useV2 = get().servicesConfig?.use_director_v2 ?? true
       let plans: Array<{ video_prompt: string; image_prompt: string }>
       let storyClips: PlannedClip[] | undefined
 
       if (useV2) {
-        const imageRoleRequest = await _captureDirectorImageRoleRequest(get, requestExplicitOutput)
-        const result = await api.directorV2Plan({
+        const imageRoleRequest = await _captureDirectorImageRoleRequest(
+          get,
+          requestExplicitOutput,
+          requestFence as DirectorPreviewRequestFence,
+        )
+        _requireCurrentDirectorPreviewRequestFence(requestFence as DirectorPreviewRequestFence)
+        const result = await _runDirectorV2Preview({
           workspace: activeWorkspace,
           skill_type: 'short_film',
           video_model: get().selectedModelPerMode.video,
@@ -12179,7 +13485,7 @@ export const useStore = create<AppState>((set, get) => ({
           frames_steps: get().modelOptions?.frames_steps ?? 4,
           frames_minimum: get().modelOptions?.frames_minimum ?? 5,
           prompt_type: 'both',
-        }, { signal: lifecycle.signal })
+        }, lifecycle, requestFence as DirectorPreviewRequestFence)
         plans = result.clip_plans.map(p => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
@@ -12433,9 +13739,10 @@ export const useStore = create<AppState>((set, get) => ({
         ...(projectChanged && previousActive ? [previousActive] : []),
         ...(previousAccessRevoked ? [previousActive] : []),
       ])) hidePrivatePreviewsForWorkspace(workspace)
-      // A reload keeps only the opaque Enhance request fence. Resume status
+      // Reload recovery retains only opaque request fences. Resume status
       // waiting after the authoritative active project has been restored.
       void get().resumeEnhancePrompt()
+      void get().resumeDirectorPreview()
       if (get().accessContext?.remote && data.active) {
         void get().loadOutputs()
       }

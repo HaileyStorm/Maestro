@@ -139,7 +139,10 @@ class LlmPrepareClientContracts(unittest.TestCase):
         ):
             with self.subTest(store_action=action):
                 block = store_action_block(action)
-                self.assertRegex(block, r"_begin(?:Workspace|Enhance|Director)LlmRequest\(")
+                self.assertRegex(
+                    block,
+                    r"_begin(?:WorkspaceLlm|EnhanceLlm|Director(?:Llm|Preview))Request\(",
+                )
                 self.assertRegex(block, r"\bworkspace(?:\s*:|\s*,)")
                 self.assertIn("lifecycle.signal", block)
                 self.assertIn("lifecycle.ownsWorkspace()", block)
@@ -163,7 +166,170 @@ class LlmPrepareClientContracts(unittest.TestCase):
             "shortFilmPlanFromStory",
         ):
             with self.subTest(action=action):
-                self.assertIn("_beginDirectorLlmRequest(", store_action_block(action))
+                self.assertRegex(
+                    store_action_block(action),
+                    r"_beginDirector(?:Llm|Preview)Request\(",
+                )
+
+    def test_director_v2_uses_scoped_async_operation_lifecycle(self):
+        client = source_block(
+            CLIENT,
+            "export interface DirectorV2PlanRequest",
+            "// --- Presets ---",
+        )
+        self.assertIn("request_id: string", client)
+        self.assertIn("project_instance: string", client)
+        self.assertIn("operation_kind: 'director_preview'", client)
+        self.assertIn("res.status !== 202", client)
+        self.assertIn("recoverDirectorV2Submission(", client)
+        recovery = source_block(
+            client,
+            "async function recoverDirectorV2Submission",
+            "export async function waitForDirectorV2Operation",
+        )
+        self.assertLess(
+            recovery.index("fetchDirectorV2Operation(scope"),
+            recovery.index("submitDirectorV2Plan(request"),
+        )
+        for suffix in ("?${query}`", "/result?${query}`"):
+            self.assertIn(suffix, client)
+        self.assertIn("method: 'DELETE', cache: 'no-store'", client)
+        self.assertIn("assertDirectorV2ProjectScope(scope", client)
+        self.assertIn("assertDirectorV2StatusScope(status, scope)", client)
+        self.assertIn("await options.onSubmissionAttempted?.()", client)
+        self.assertIn("await options.onAdmissionConfirmed?.(operation)", client)
+        self.assertLess(
+            client.index("await options.onSubmissionAttempted?.()"),
+            client.index("await options.onAdmissionConfirmed?.(operation)"),
+        )
+        self.assertNotIn("/api/v1/llm/stream", client)
+
+    def test_director_v2_store_has_bounded_content_free_recovery_and_fences(self):
+        ledger = source_block(
+            STORE,
+            "function _validStoredDirectorPreviewOperation",
+            "function _sameDirectorPreviewScope",
+        )
+        allowed = (
+            "requestId", "workspace", "projectInstance", "accountFingerprint",
+            "claimToken", "settingsFingerprint", "creativeFingerprint", "admitted",
+            "storedAt",
+        )
+        for field in allowed:
+            self.assertIn(field, ledger)
+        validation = source_block(
+            ledger,
+            "Object.keys(parsed).length === 9",
+            "&& typeof parsed.requestId",
+        )
+        for forbidden in (
+            "prompt", "sceneDescription", "story", "lyrics", "media",
+            "provider", "result", "salt",
+        ):
+            self.assertNotIn(forbidden, validation)
+        self.assertIn("DIRECTOR_PREVIEW_OPERATION_MAX_RECORDS", STORE)
+        self.assertIn("DIRECTOR_PREVIEW_OPERATION_MAX_AGE_MS", STORE)
+        self.assertIn("DIRECTOR_PREVIEW_LEDGER_LOCK_NAME", STORE)
+        self.assertIn("{ mode: 'exclusive', signal: controller.signal }", ledger)
+        self.assertIn("maestro-director-preview-tab-${token}", STORE)
+        self.assertIn("{ name: 'HMAC', hash: 'SHA-256' }", STORE)
+        self.assertIn("_realmOwnsStoredDirectorPreviewOperation", ledger)
+        self.assertIn("_directorPreviewLiveInputFingerprint", STORE)
+        self.assertIn("_accountIdentityIsCurrent(accountIdentityEpoch)", STORE)
+        self.assertIn("_sameDirectorPreviewScope(", STORE)
+        self.assertIn("_sameStoredDirectorPreviewOperation(", STORE)
+        self.assertIn("void get().resumeDirectorPreview()", STORE)
+        self.assertIn("api.resumeDirectorV2Plan(scope", STORE)
+        self.assertIn("api.cancelDirectorV2Plan(", STORE)
+        resume = source_block(
+            STORE,
+            "  resumeDirectorPreview: async () => {",
+            "  cancelDirectorPreview: async () => {",
+        )
+        self.assertNotIn("settingsFingerprint !== stored.settingsFingerprint", resume)
+        self.assertNotIn("creativeFingerprint !== stored.creativeFingerprint", resume)
+        self.assertIn("_directorPreviewInputsReadyForRecovery(get())", resume)
+        self.assertIn("_realmOwnsStoredDirectorPreviewOperation(stored)", resume)
+        self.assertIn("_removeOwnedTentativeDirectorPreviewOperations()", resume)
+        self.assertIn("stopOnInputsChange", resume)
+        self.assertIn("_supportedDirectorPreviewSkill(result.skill_type)", resume)
+        self.assertIn("directorSkill: recoveredSkill", resume)
+        self.assertLess(
+            resume.index("stopOnInputsChange()\n      set({\n        directorSkill: recoveredSkill"),
+            resume.index("directorSkill: recoveredSkill"),
+        )
+        self.assertLess(
+            resume.index("directorSkill: recoveredSkill"),
+            resume.index("directorStep: 'review'"),
+        )
+        creative = source_block(
+            STORE,
+            "function _directorPreviewCreativeInputs",
+            "function _directorPreviewRequestCreativeInputs",
+        )
+        for exact_input in (
+            "directorPlannedClips", "directorSceneDescription", "lyrics",
+            "directorReferenceImagePath", "directorCharacterRefPaths",
+            "directorCharacterRefLabels", "directorLocationRefPaths",
+            "directorLocationRefLabels", "directorSpeakerMappings",
+            "shortFilmCharacters",
+        ):
+            self.assertIn(exact_input, creative)
+        preview = source_block(
+            STORE,
+            "async function _runDirectorV2Preview",
+            "function _advanceAccountIdentityEpoch",
+        )
+        settings_change = source_block(
+            preview,
+            "if (_directorPreviewLiveInputFingerprint(state) !== liveInputFingerprint)",
+            "\n    }\n  })",
+        )
+        self.assertIn("lifecycle.stopWaiting()", settings_change)
+        self.assertIn("_removeStoredDirectorPreviewOperation(scope)", settings_change)
+        self.assertIn("directorPreviewRequestScope: null", settings_change)
+        self.assertIn("onAdmissionConfirmed", preview)
+        self.assertIn("_admitStoredDirectorPreviewOperation(", preview)
+        self.assertIn("if (scope && (\n      !admissionConfirmed", preview)
+        self.assertIn("could not reserve private reload recovery", preview)
+        scrub = source_block(
+            STORE,
+            "function _scrubAccountBoundProjectUi",
+            "function _invalidateAccountRequests",
+        )
+        self.assertIn(
+            "_clearStoredDirectorPreviewOperations(priorAccountFingerprint)",
+            scrub,
+        )
+        cancel = source_block(
+            STORE,
+            "  cancelDirectorPreview: async () => {",
+            "  directorReferenceImage:",
+        )
+        self.assertIn("currentOwned", cancel)
+        self.assertIn("storedOwned", cancel)
+        self.assertIn("_realmOwnsStoredDirectorPreviewOperation(stored)", cancel)
+        reset = source_block(
+            STORE,
+            "  directorReset: () => {",
+            "  shortFilmSetCharacters:",
+        )
+        self.assertIn("void get().cancelDirectorPreview()", reset)
+
+    def test_only_three_director_v2_call_sites_use_the_scoped_store_helper(self):
+        self.assertEqual(STORE.count("_runDirectorV2Preview({"), 3)
+        self.assertEqual(STORE.count("api.directorV2Plan({"), 1)
+        for action in (
+            "directorPlanPrompts", "shortFilmPlanPrompts", "shortFilmPlanFromStory",
+        ):
+            block = store_action_block(action)
+            self.assertIn("_beginDirectorPreviewRequest(", block)
+            self.assertIn("_captureDirectorPreviewRequestFence(", block)
+            self.assertIn("_requireCurrentDirectorPreviewRequestFence(", block)
+            self.assertIn("_runDirectorV2Preview({", block)
+            self.assertNotIn("api.directorV2Plan({", block)
+        for action in ("directorPlanVideoPrompts", "shortFilmPlanVideoPrompts"):
+            self.assertNotIn("_runDirectorV2Preview({", store_action_block(action))
 
     def test_prompt_enhance_uses_scoped_async_operation_lifecycle(self):
         client = source_block(
@@ -464,7 +630,7 @@ class LlmChatRecoveryContracts(unittest.TestCase):
     def test_director_reference_uploads_guard_project_ownership(self):
         helper = source_block(
             STORE,
-            "  _uploadDirectorRefs: async (lifecycle)",
+            "  _uploadDirectorRefs: async (lifecycle, requestFence)",
             "\n\n  directorPlanPrompts:",
         )
         self.assertGreaterEqual(helper.count("requireOwnership()"), 5)
@@ -473,7 +639,10 @@ class LlmChatRecoveryContracts(unittest.TestCase):
             "shortFilmPlanFromStory",
         ):
             with self.subTest(action=action):
-                self.assertIn("_uploadDirectorRefs(lifecycle)", store_action_block(action))
+                self.assertRegex(
+                    store_action_block(action),
+                    r"_uploadDirectorRefs\(\s*lifecycle,\s*requestFence \?\? undefined",
+                )
 
     def test_hidden_chat_suspends_catalog_refreshes(self):
         refresh = source_block(

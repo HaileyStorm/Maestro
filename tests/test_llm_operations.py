@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 from contextlib import contextmanager
 import sys
 import threading
@@ -21,6 +22,7 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from services import llm_operations
+from services.llm_cancellation import LlmCancellationHandle
 from services.llm_operations import (
     ChatRequestMismatchError,
     LlmChatOperationManager,
@@ -2304,6 +2306,7 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
         tree = ast.parse(source)
         wanted = {
             "_llm_route_operation_scope_or_404",
+            "_llm_route_public_status",
             "llm_route_operation_status",
             "llm_route_operation_result",
             "cancel_llm_route_operation",
@@ -2338,7 +2341,9 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
             "Request": object,
             "HTTPException": HTTPException,
             "JSONResponse": JSONResponse,
-            "_LLM_ROUTE_OPERATION_KINDS": frozenset({"enhance"}),
+            "_LLM_ROUTE_OPERATION_KINDS": frozenset({
+                "enhance", "director_preview",
+            }),
             "_promote_external_llm_request": lambda _request: None,
             "_request_project_workspace": lambda _request, value: value,
             "_require_project_access": lambda *_args, **_kwargs: None,
@@ -2485,6 +2490,7 @@ class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
         namespace = {
             "Request": object,
             "asyncio": asyncio,
+            "copy": copy,
             "HTTPException": HTTPException,
             "_gen_lock": threading.RLock(),
             "_WgpNativeGpuExecutionSlot": native_gpu_slot,
@@ -2509,7 +2515,7 @@ class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
         }
         exec(compile(module, str(APP / "launch.py"), "exec"), namespace)
 
-        def resolve_assist(_body, resolved_selection):
+        def resolve_assist(_body, resolved_selection, **_kwargs):
             assist_checks.append((
                 resident["model_id"], resolved_selection["model_id"],
             ))
@@ -2520,6 +2526,15 @@ class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
         class Request:
             state = types.SimpleNamespace(
                 maestro_llm_progress_callback=lambda _event: None,
+                maestro_llm_cancel_handle=LlmCancellationHandle(),
+                maestro_director_preview_worker=True,
+                maestro_director_preview_selection=dict(selection),
+                maestro_director_preview_assist=types.SimpleNamespace(
+                    revision=1,
+                ),
+                maestro_director_preview_guidance=True,
+                maestro_director_preview_workflow=None,
+                maestro_director_preview_polish_mode="off",
             )
 
             async def json(self):
@@ -2716,6 +2731,7 @@ class DirectRouteSecurityTests(unittest.TestCase):
             ("/api/v1/llm/enhance-prompt", 202),
             ("/api/v1/llm/operations/enhance/request-id", 200),
             ("/api/v1/llm/operations/enhance/request-id/result", 409),
+            ("/api/v1/director/v2/plan", 202),
         ):
             with self.subTest(path=path, code=code):
                 response = asyncio.run(exercise(path, code))

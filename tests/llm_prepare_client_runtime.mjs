@@ -508,6 +508,183 @@ try {
     error => error instanceof api.LlmEnhanceScopeError,
   )
 
+  const directorRequestId = '00000000-0000-4000-8000-000000000020'
+  const directorRequestIdHex = directorRequestId.replaceAll('-', '')
+  const directorProjectInstance = 'c'.repeat(64)
+  const directorScope = {
+    requestId: directorRequestId,
+    workspace: 'project-director',
+    projectInstance: directorProjectInstance,
+  }
+  const directorStatus = overrides => ({
+    request_id: directorRequestIdHex,
+    operation_kind: 'director_preview',
+    status: 'running', phase: 'planning', stage: 'director',
+    pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+    partial_text: '', generated_tokens_approx: 0, elapsed_seconds: 0.5,
+    live_tps: null, average_tps: null, result_available: false,
+    retryable: false,
+    ...overrides,
+  })
+  const directorResult = {
+    clip_plans: [{ video_prompt: 'planned video', image_prompt: 'planned image' }],
+    production_plan: { shots: [] },
+    skill_type: 'short_film',
+  }
+
+  // Director v2 persists its opaque caller UUID before POST, then polls only
+  // the generic scoped operation and reads the private result separately.
+  visibility = 'hidden'
+  const directorEvents = []
+  let directorChecks = 0
+  let directorPosts = 0
+  let legacyStreamCalls = 0
+  globalThis.fetch = async (url, init = {}) => {
+    const requestUrl = String(url)
+    if (requestUrl.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({
+        operation_id: 'prepare-director', status: 'ready', phase: 'ready', retryable: false,
+      }, 202)
+    }
+    if (requestUrl.includes('/api/v1/llm/models?')) {
+      assert.equal(init.cache, 'no-store')
+      return jsonResponse({ models: [], guides: [], project_instance: directorProjectInstance })
+    }
+    if (requestUrl.includes('/api/v1/llm/stream')) {
+      legacyStreamCalls += 1
+      throw new Error('legacy global stream must not be used')
+    }
+    if (requestUrl.endsWith('/api/v1/director/v2/plan')) {
+      directorPosts += 1
+      directorEvents.push('post')
+      const body = JSON.parse(init.body)
+      assert.equal(body.request_id, directorRequestId)
+      assert.equal(body.project_instance, directorProjectInstance)
+      assert.equal(body.scene_description, 'private story')
+      assert.equal(init.cache, 'no-store')
+      return jsonResponse(directorStatus({}), 202)
+    }
+    if (requestUrl.endsWith('/result?workspace=project-director')) {
+      assert.equal(init.cache, 'no-store')
+      return jsonResponse(directorResult)
+    }
+    if (requestUrl.includes('/api/v1/llm/operations/director_preview/')) {
+      directorChecks += 1
+      assert.equal(init.cache, 'no-store')
+      return jsonResponse(directorStatus({
+        status: 'completed', phase: 'completed', stage: 'completed',
+        result_available: true,
+      }))
+    }
+    throw new Error(`Unexpected Director URL: ${url}`)
+  }
+  const directorPreview = api.directorV2Plan({
+    request_id: directorRequestId,
+    project_instance: directorProjectInstance,
+    workspace: 'project-director',
+    skill_type: 'short_film',
+    scene_description: 'private story',
+  }, {
+    projectInstance: directorProjectInstance,
+    onSubmissionAttempted() { directorEvents.push('persist') },
+    onAdmissionConfirmed(status) {
+      assert.equal(status.request_id, directorRequestIdHex)
+      directorEvents.push('admitted')
+    },
+  })
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.deepEqual(directorEvents, ['persist', 'post', 'admitted'])
+  assert.equal(directorChecks, 0)
+  visibility = 'visible'
+  visibilityTarget.dispatchEvent(new Event('visibilitychange'))
+  assert.deepEqual(await directorPreview, directorResult)
+  assert.equal(directorChecks, 1)
+  assert.equal(directorPosts, 1)
+  assert.equal(legacyStreamCalls, 0)
+
+  // A lost 202 is recovered status-first under the same UUID. Reload recovery
+  // also performs status/result reads and never submits a duplicate planner.
+  let ambiguousDirectorPosts = 0
+  let ambiguousDirectorChecks = 0
+  globalThis.fetch = async (url, init = {}) => {
+    const requestUrl = String(url)
+    if (requestUrl.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({
+        operation_id: 'prepare-director-ambiguous', status: 'ready', phase: 'ready', retryable: false,
+      }, 202)
+    }
+    if (requestUrl.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: directorProjectInstance })
+    }
+    if (requestUrl.endsWith('/api/v1/director/v2/plan')) {
+      ambiguousDirectorPosts += 1
+      throw new TypeError('proxy disconnected after admitting Director preview')
+    }
+    if (requestUrl.endsWith('/result?workspace=project-director')) {
+      return jsonResponse(directorResult)
+    }
+    if (requestUrl.includes('/api/v1/llm/operations/director_preview/')) {
+      ambiguousDirectorChecks += 1
+      return jsonResponse(directorStatus({
+        status: 'completed', phase: 'completed', stage: 'completed',
+        result_available: true,
+      }))
+    }
+    throw new Error(`Unexpected ambiguous Director URL: ${url}`)
+  }
+  assert.deepEqual(await api.directorV2Plan({
+    request_id: directorRequestId,
+    project_instance: directorProjectInstance,
+    workspace: 'project-director',
+    skill_type: 'short_film',
+    scene_description: 'private story',
+  }, { projectInstance: directorProjectInstance }), directorResult)
+  assert.equal(ambiguousDirectorPosts, 1)
+  assert.equal(ambiguousDirectorChecks, 1)
+
+  ambiguousDirectorPosts = 0
+  ambiguousDirectorChecks = 0
+  assert.deepEqual(await api.resumeDirectorV2Plan(directorScope), directorResult)
+  assert.equal(ambiguousDirectorPosts, 0)
+  assert.equal(ambiguousDirectorChecks, 1)
+
+  // Browser abort is wait-only. The explicit cancel path alone sends DELETE,
+  // and a recreated same-name project fails before mutation.
+  visibility = 'hidden'
+  let directorDeletes = 0
+  globalThis.fetch = async (url, init = {}) => {
+    const requestUrl = String(url)
+    if (requestUrl.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: directorProjectInstance })
+    }
+    if (init.method === 'DELETE') {
+      directorDeletes += 1
+      return jsonResponse(directorStatus({
+        status: 'cancelled', phase: 'cancelled', stage: 'cancelled',
+      }))
+    }
+    if (requestUrl.includes('/api/v1/llm/operations/director_preview/')) {
+      return jsonResponse(directorStatus({}))
+    }
+    throw new Error(`Unexpected Director cancel URL: ${url}`)
+  }
+  const directorAbort = new AbortController()
+  const directorStoppedWait = api.waitForDirectorV2Operation(
+    directorScope,
+    directorAbort.signal,
+  )
+  await new Promise(resolve => setTimeout(resolve, 20))
+  directorAbort.abort()
+  await assert.rejects(directorStoppedWait, error => error?.name === 'AbortError')
+  assert.equal(directorDeletes, 0)
+  assert.equal((await api.cancelDirectorV2Plan(directorScope)).status, 'cancelled')
+  assert.equal(directorDeletes, 1)
+  await assert.rejects(
+    api.cancelDirectorV2Plan({ ...directorScope, projectInstance: 'd'.repeat(64) }),
+    error => error instanceof api.DirectorV2ScopeError,
+  )
+  assert.equal(directorDeletes, 1)
+
   // A visible timer is suspended if the tab becomes hidden before it fires.
   visibility = 'visible'
   let transitionChecks = 0

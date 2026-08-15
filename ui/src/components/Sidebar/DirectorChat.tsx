@@ -343,6 +343,87 @@ function LlmThinkingStream({ stage }: { stage: string }) {
   )
 }
 
+function DirectorPreviewTelemetry() {
+  const status = useStore(s => s.directorPreviewStatus)
+  const scope = useStore(s => s.directorPreviewRequestScope)
+  const cancel = useStore(s => s.cancelDirectorPreview)
+  const streamScrollRef = useRef<HTMLDivElement>(null)
+  const operation = status && 'operation_kind' in status ? status : null
+  const partialText = operation?.status === 'running'
+    ? operation.partial_text.slice(-2_000)
+    : ''
+
+  useEffect(() => {
+    const el = streamScrollRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [partialText])
+
+  if (!scope) return null
+
+  const phase = status?.phase.replaceAll('_', ' ') ?? 'starting'
+  const summary = operation
+    ? [
+        phase,
+        operation.pass_limit > 0 ? `pass ${operation.pass} of ${operation.pass_limit}` : null,
+        operation.attempt_limit > 0
+          ? `try ${operation.attempt} of ${operation.attempt_limit}`
+          : null,
+      ].filter(Boolean).join(' · ')
+    : status
+      ? `Preparing planner · ${phase}`
+      : 'Starting Director preview'
+  const metrics = operation
+    ? [
+        operation.generated_tokens_approx > 0
+          ? `~${operation.generated_tokens_approx} tokens`
+          : null,
+        operation.elapsed_seconds > 0 ? `${operation.elapsed_seconds.toFixed(1)}s` : null,
+        operation.status === 'running' && operation.live_tps != null
+          ? `${operation.live_tps.toFixed(1)} live tok/s`
+          : null,
+        operation.average_tps != null
+          ? `${operation.average_tps.toFixed(1)} average tok/s`
+          : null,
+      ].filter(Boolean).join(' · ')
+    : ''
+
+  return (
+    <SystemBubble>
+      <div aria-label="Current Director preview" className="space-y-1.5">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <p role="status" aria-live="polite" aria-atomic="true" className="text-[10px] text-text-secondary capitalize">
+              {summary}
+            </p>
+            {metrics && <p className="text-[9px] text-text-muted">{metrics}</p>}
+          </div>
+          <button
+            type="button"
+            onClick={() => void cancel()}
+            className="inline-flex min-h-8 shrink-0 items-center gap-1 rounded border border-border/60 px-2 text-[10px] text-text-secondary hover:border-red-400/50 hover:text-red-300"
+            aria-label="Cancel this Director preview"
+          >
+            <X size={11} />
+            Cancel
+          </button>
+        </div>
+        {partialText && (
+          <div
+            ref={streamScrollRef}
+            className="max-h-24 overflow-y-auto rounded border border-border/30 bg-bg-primary/50 p-2"
+            aria-label="Current Director preview draft"
+            aria-live="off"
+          >
+            <pre className="whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-text-muted">
+              {partialText}
+            </pre>
+          </div>
+        )}
+      </div>
+    </SystemBubble>
+  )
+}
+
 export function DirectorChat() {
   const step = useStore(s => s.directorStep)
   const loading = useStore(s => s.directorLoading)
@@ -473,6 +554,7 @@ export function DirectorChat() {
   const currentIndex = STEP_ORDER.indexOf(step)
   const pastStep = (s: DirectorStep) => currentIndex > STEP_ORDER.indexOf(s)
   const atStep = (s: DirectorStep) => step === s
+  const reviewReached = currentIndex >= STEP_ORDER.indexOf('review')
 
   const handleFile = useCallback((file: File) => {
     // Accept audio/* MIME OR video/* MIME (backend extracts the audio
@@ -565,7 +647,7 @@ export function DirectorChat() {
     ? 'Choose a skill above...'
     : mvGenerateSetup
     ? 'Describe your music video — subject, vibe, mood, setting…'
-    : isShortFilm && !shortFilmPath
+    : isShortFilm && !shortFilmPath && !reviewReached
     ? 'Choose a path above...'
     : step === 'upload' || step === 'analyze'
     ? isMvGenerate
@@ -685,7 +767,7 @@ export function DirectorChat() {
         )}
 
         {/* Short Film path chooser */}
-        {isShortFilm && skill && !shortFilmPath && (
+        {isShortFilm && skill && !shortFilmPath && !reviewReached && (
           <SystemBubble>
             <p className="text-xs text-text-secondary mb-2">How would you like to create your short film?</p>
             <PathChooser onSelect={(path: ShortFilmPath) => {
@@ -862,6 +944,10 @@ export function DirectorChat() {
             </div>
           </SystemBubble>
         )}
+
+        {/* Manual scoped planning telemetry is intentionally separate from
+            the durable Director pipeline's llm_progress snapshot below. */}
+        <DirectorPreviewTelemetry />
 
         {/* Exact-pipeline, process-memory-only LLM telemetry. This is the one
             live view for every Director pass and remains aggregate-only once

@@ -72,6 +72,44 @@ class TestDirectorLlmStreamUi(unittest.TestCase):
         self.assertNotIn("partialText", live_region.group(0))
         self.assertNotIn("metrics", live_region.group(0))
 
+    def test_manual_preview_telemetry_is_scoped_bounded_and_cancellable(self):
+        preview = source_slice(
+            CHAT,
+            "function DirectorPreviewTelemetry",
+            "export function DirectorChat",
+        )
+        self.assertIn("s.directorPreviewStatus", preview)
+        self.assertIn("s.directorPreviewRequestScope", preview)
+        self.assertIn("s.cancelDirectorPreview", preview)
+        self.assertIn("operation.partial_text.slice(-2_000)", preview)
+        for field in (
+            "status?.phase", "operation.pass", "operation.pass_limit",
+            "operation.attempt", "operation.attempt_limit",
+            "operation.live_tps", "operation.average_tps",
+        ):
+            self.assertIn(field, preview)
+        self.assertIn('aria-label="Cancel this Director preview"', preview)
+        self.assertIn("onClick={() => void cancel()}", preview)
+        self.assertIn('aria-live="polite"', preview)
+        self.assertIn('aria-live="off"', preview)
+        self.assertNotIn("pipelineStatus", preview)
+        self.assertNotIn("llm_progress", preview)
+
+        render = source_slice(
+            CHAT,
+            "{/* Manual scoped planning telemetry",
+            "{/* Exact-pipeline, process-memory-only LLM telemetry",
+        )
+        self.assertIn("<DirectorPreviewTelemetry />", render)
+
+    def test_recovered_review_does_not_render_pre_review_skill_path_setup(self):
+        self.assertIn("const reviewReached = currentIndex >= STEP_ORDER.indexOf('review')", CHAT)
+        self.assertIn("{!skill ? (", CHAT)
+        self.assertIn(
+            "{isShortFilm && skill && !shortFilmPath && !reviewReached && (",
+            CHAT,
+        )
+
     def test_poller_guards_pipeline_and_project_before_and_after_await(self):
         poller = source_slice(STORE, "pollPipelineStatus: () => {", "\n  },\n}))")
         self.assertIn("const workspace = get().activeWorkspace", poller)

@@ -28523,6 +28523,7 @@ async def _llm_operation_no_store(request: Request, call_next):
         or path == "/api/v1/llm/enhance-prompt"
         or path.startswith("/api/v1/llm/operations/")
         or path == "/api/v1/llm/refusal-literals"
+        or path == "/api/v1/director/v2/plan"
     ):
         response.headers["Cache-Control"] = "private, no-store"
         response.headers["Pragma"] = "no-cache"
@@ -29871,7 +29872,7 @@ def _llm_operation_scope(
     return owner_key, project_key
 
 
-_LLM_ROUTE_OPERATION_KINDS = frozenset({"enhance"})
+_LLM_ROUTE_OPERATION_KINDS = frozenset({"enhance", "director_preview"})
 
 
 def _normalize_llm_route_request_id(value) -> str:
@@ -29928,6 +29929,21 @@ def _llm_route_operation_scope_or_404(
     return selected_workspace, owner_key, project_key
 
 
+def _llm_route_public_status(
+    operation_kind: str,
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project operation-specific redacted failures onto generic telemetry."""
+    public = dict(status)
+    if operation_kind == "director_preview" and public.get("status") == "failed":
+        public["error"] = {
+            "code": "director_preview_failed",
+            "message": "Director could not build this preview.",
+            "retryable": True,
+        }
+    return public
+
+
 @api.get("/api/v1/llm/operations/{operation_kind}/{request_id}")
 def llm_route_operation_status(
     request: Request,
@@ -29949,7 +29965,7 @@ def llm_route_operation_status(
     )
     if status is None:
         raise HTTPException(status_code=404, detail="LLM operation not found")
-    return status
+    return _llm_route_public_status(operation_kind, status)
 
 
 @api.get("/api/v1/llm/operations/{operation_kind}/{request_id}/result")
@@ -29974,7 +29990,7 @@ def llm_route_operation_result(
     if status is None:
         raise HTTPException(status_code=404, detail="LLM operation not found")
     if status.get("status") != "completed":
-        return JSONResponse(status, status_code=(
+        return JSONResponse(_llm_route_public_status(operation_kind, status), status_code=(
             202 if status.get("status") == "running" else 409
         ))
     result = llm_route_operation_manager.result(
@@ -30009,7 +30025,7 @@ def cancel_llm_route_operation(
     )
     if status is None:
         raise HTTPException(status_code=404, detail="LLM operation not found")
-    return status
+    return _llm_route_public_status(operation_kind, status)
 
 
 def _llm_selection_key(purpose: str, selection: dict) -> str:
@@ -31192,9 +31208,10 @@ def _with_llm_route_progress(
     operation,
     progress_callback,
     response_assist=None,
+    cancel_handle=None,
 ):
     """Bind request options without reading the singleton stream buffer."""
-    if not callable(progress_callback) and not response_assist:
+    if not callable(progress_callback) and not response_assist and cancel_handle is None:
         return operation
 
     def run(*args, **kwargs):
@@ -31202,6 +31219,8 @@ def _with_llm_route_progress(
             kwargs.setdefault("progress_callback", progress_callback)
         if response_assist:
             kwargs.setdefault("response_assist", response_assist)
+        if cancel_handle is not None:
+            kwargs.setdefault("cancel_handle", cancel_handle)
         return operation(*args, **kwargs)
 
     return run
@@ -31238,6 +31257,10 @@ def _resolve_prompt_enhancement_images(
 def _seal_prompt_enhancement_images(
     image_paths: list[str],
     cancel_handle=None,
+    *,
+    max_file_bytes: int = _LLM_CHAT_MAX_IMAGE_BYTES,
+    max_total_bytes: int = _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES,
+    media_label: str = "Enhance image",
 ) -> list[dict[str, Any]]:
     """Bind authorized image paths to exact regular-file bytes."""
     admitted: list[tuple[str, tuple[int, int, int, int, int]]] = []
@@ -31249,16 +31272,26 @@ def _seal_prompt_enhancement_images(
             current = os.stat(image_path, follow_symlinks=False)
             if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
                 raise OSError("unsafe Enhance image")
-            if current.st_size > _LLM_CHAT_MAX_IMAGE_BYTES:
+            if current.st_size > max_file_bytes:
                 raise HTTPException(
                     status_code=413,
-                    detail="Enhance image is too large (max 32 MB)",
+                    detail=(
+                        "Enhance image is too large (max 32 MB)"
+                        if media_label == "Enhance image"
+                        and max_file_bytes == _LLM_CHAT_MAX_IMAGE_BYTES
+                        else f"{media_label} is too large"
+                    ),
                 )
             total_size += current.st_size
-            if total_size > _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES:
+            if total_size > max_total_bytes:
                 raise HTTPException(
                     status_code=413,
-                    detail="Enhance images are too large (max 64 MB total)",
+                    detail=(
+                        "Enhance images are too large (max 64 MB total)"
+                        if media_label == "Enhance image"
+                        and max_total_bytes == _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES
+                        else f"{media_label} selection is too large"
+                    ),
                 )
             admitted.append((image_path, (
                 current.st_dev,
@@ -31271,7 +31304,7 @@ def _seal_prompt_enhancement_images(
         raise
     except (OSError, TypeError, ValueError):
         raise HTTPException(
-            status_code=404, detail="Enhance image not found",
+            status_code=404, detail=f"{media_label} not found",
         ) from None
 
     seals: list[dict[str, Any]] = []
@@ -31339,7 +31372,7 @@ def _seal_prompt_enhancement_images(
             })
         except (OSError, TypeError, ValueError):
             raise HTTPException(
-                status_code=404, detail="Enhance image not found",
+                status_code=404, detail=f"{media_label} not found",
             ) from None
         finally:
             if descriptor >= 0:
@@ -31351,13 +31384,21 @@ def _revalidate_prompt_enhancement_images(
     image_paths: list[str],
     expected_seals: list[dict[str, Any]],
     cancel_handle=None,
+    *,
+    max_file_bytes: int = _LLM_CHAT_MAX_IMAGE_BYTES,
+    max_total_bytes: int = _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES,
+    media_label: str = "Enhance image",
 ) -> None:
     """Fail closed if a worker no longer sees the admitted image bytes."""
     current = _seal_prompt_enhancement_images(
-        image_paths, cancel_handle,
+        image_paths,
+        cancel_handle,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        media_label=media_label,
     )
     if len(current) != len(expected_seals):
-        raise HTTPException(status_code=404, detail="Enhance image not found")
+        raise HTTPException(status_code=404, detail=f"{media_label} not found")
     fields = (
         "path", "device", "inode", "size", "mtime_ns", "ctime_ns", "sha256",
     )
@@ -31365,7 +31406,7 @@ def _revalidate_prompt_enhancement_images(
         if not isinstance(expected, dict) or any(
             observed.get(field) != expected.get(field) for field in fields
         ):
-            raise HTTPException(status_code=404, detail="Enhance image not found")
+            raise HTTPException(status_code=404, detail=f"{media_label} not found")
 
 
 def _remove_prompt_enhancement_snapshots(snapshot_paths: list[str]) -> None:
@@ -31392,6 +31433,11 @@ def _remove_prompt_enhancement_snapshots(snapshot_paths: list[str]) -> None:
 def _materialize_prompt_enhancement_images(
     expected_seals: list[dict[str, Any]],
     cancel_handle=None,
+    *,
+    max_file_bytes: int = _LLM_CHAT_MAX_IMAGE_BYTES,
+    max_total_bytes: int = _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES,
+    media_label: str = "Enhance image",
+    snapshot_prefix: str = "maestro-enhance-",
 ) -> list[str]:
     """Copy exact admitted bytes to private worker-owned immutable paths."""
     import tempfile
@@ -31403,16 +31449,26 @@ def _materialize_prompt_enhancement_images(
             expected_size = expected.get("size")
             if type(expected_size) is not int or expected_size < 0:
                 raise OSError("invalid Enhance image seal")
-            if expected_size > _LLM_CHAT_MAX_IMAGE_BYTES:
+            if expected_size > max_file_bytes:
                 raise HTTPException(
                     status_code=413,
-                    detail="Enhance image is too large (max 32 MB)",
+                    detail=(
+                        "Enhance image is too large (max 32 MB)"
+                        if media_label == "Enhance image"
+                        and max_file_bytes == _LLM_CHAT_MAX_IMAGE_BYTES
+                        else f"{media_label} is too large"
+                    ),
                 )
             total_size += expected_size
-            if total_size > _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES:
+            if total_size > max_total_bytes:
                 raise HTTPException(
                     status_code=413,
-                    detail="Enhance images are too large (max 64 MB total)",
+                    detail=(
+                        "Enhance images are too large (max 64 MB total)"
+                        if media_label == "Enhance image"
+                        and max_total_bytes == _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES
+                        else f"{media_label} selection is too large"
+                    ),
                 )
         for expected in expected_seals:
             if cancel_handle is not None:
@@ -31451,7 +31507,7 @@ def _materialize_prompt_enhancement_images(
                     raise OSError("Enhance image identity changed")
                 suffix = os.path.splitext(source_path)[1].lower()
                 snapshot_descriptor, snapshot_path = tempfile.mkstemp(
-                    prefix="maestro-enhance-",
+                    prefix=snapshot_prefix,
                     suffix=suffix,
                 )
                 digest = hashlib.sha256()
@@ -31528,7 +31584,7 @@ def _materialize_prompt_enhancement_images(
     except (OSError, TypeError, ValueError):
         _remove_prompt_enhancement_snapshots(materialized)
         raise HTTPException(
-            status_code=404, detail="Enhance image not found",
+            status_code=404, detail=f"{media_label} not found",
         ) from None
     except Exception:
         _remove_prompt_enhancement_snapshots(materialized)
@@ -35165,21 +35221,256 @@ def delete_pipeline_endpoint(request: Request, pid: str, workspace: str = ""):
 
 # ── Director V2 Planning ─────────────────────────────────────────────────
 
+_DIRECTOR_PREVIEW_MEDIA_FIELDS = (
+    "reference_image_path",
+    "character_ref_paths",
+    "location_ref_paths",
+    "audio_path",
+    "voice_reference",
+    "voice_ref_paths",
+)
+_DIRECTOR_PREVIEW_MAX_MEDIA_BYTES = MAX_AUDIO_UPLOAD_BYTES
+_DIRECTOR_PREVIEW_MAX_TOTAL_MEDIA_BYTES = MAX_AUDIO_UPLOAD_BYTES
+_DIRECTOR_PREVIEW_MAX_MEDIA_ITEMS = 64
+_DIRECTOR_PREVIEW_MAX_MEDIA_DEPTH = 8
+_DIRECTOR_PREVIEW_MAX_MEDIA_SHAPE_ENTRIES = (
+    _DIRECTOR_PREVIEW_MAX_MEDIA_ITEMS * _DIRECTOR_PREVIEW_MAX_MEDIA_DEPTH
+)
+
+
+class _ScopedDirectorPreviewRequest:
+    """Detached request authority for one exact Director preview worker."""
+
+    def __init__(
+        self,
+        authority: Mapping[str, Any],
+        body: dict,
+        *,
+        progress_callback,
+        cancel_handle,
+        project_instance_key: str,
+    ) -> None:
+        from types import SimpleNamespace
+
+        self.headers = dict(authority.get("headers") or {})
+        self.base_url = str(authority.get("base_url") or "")
+        peer_host = str(authority.get("peer_host") or "")
+        self.client = SimpleNamespace(host=peer_host) if peer_host else None
+        self.method = "POST"
+        self.url = SimpleNamespace(path="/api/v1/director/v2/plan")
+        principal_id = str(authority.get("principal_id") or "")
+        principal = {"id": principal_id} if principal_id else None
+        self.state = SimpleNamespace(
+            maestro_session_id=str(authority.get("session_id") or ""),
+            maestro_remote=bool(authority.get("remote", False)),
+            maestro_account_principal=principal,
+            maestro_account_error=str(authority.get("account_error") or ""),
+            maestro_llm_progress_callback=progress_callback,
+            maestro_llm_cancel_handle=cancel_handle,
+            maestro_llm_expected_project_instance=project_instance_key,
+            maestro_generation_preparation=bool(
+                authority.get("generation_preparation", False)
+            ),
+            maestro_cpu_text_operation=str(
+                authority.get("cpu_text_operation") or ""
+            ),
+            maestro_cpu_text_text_only=bool(
+                authority.get("cpu_text_text_only", False)
+            ),
+        )
+        self._body = copy.deepcopy(body)
+
+    async def json(self) -> dict:
+        return copy.deepcopy(self._body)
+
+
+def _director_preview_media_paths(body: Mapping[str, Any]) -> list[str]:
+    """Bound and flatten compatible Director media shapes in wire order."""
+    paths: list[str] = []
+    media_items = 0
+    shape_entries = 0
+    for field in _DIRECTOR_PREVIEW_MEDIA_FIELDS:
+        pending = [(body.get(field), 0)]
+        while pending:
+            value, depth = pending.pop()
+            if isinstance(value, list):
+                next_depth = depth + 1
+                if next_depth > _DIRECTOR_PREVIEW_MAX_MEDIA_DEPTH:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Director preview media nesting is too deep",
+                    )
+                shape_entries += len(value)
+                if shape_entries > _DIRECTOR_PREVIEW_MAX_MEDIA_SHAPE_ENTRIES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Director preview has too many media entries",
+                    )
+                pending.extend(
+                    (item, next_depth) for item in reversed(value)
+                )
+                continue
+            if value is None or value == "":
+                continue
+            media_items += 1
+            if media_items > _DIRECTOR_PREVIEW_MAX_MEDIA_ITEMS:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Director preview has too many media items",
+                )
+            if isinstance(value, str):
+                paths.append(value)
+    return paths
+
+
+def _director_preview_materialized_body(
+    body: Mapping[str, Any],
+    media_paths: list[str],
+    materialized_paths: list[str],
+) -> dict:
+    """Replace only admitted media leaves in one private worker body copy."""
+    if len(media_paths) != len(materialized_paths):
+        raise ValueError("Director preview media snapshot mismatch")
+    replacements: dict[str, list[str]] = {}
+    for source, materialized in zip(media_paths, materialized_paths):
+        replacements.setdefault(source, []).append(materialized)
+
+    def replace(value):
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        if isinstance(value, str) and value in replacements:
+            candidates = replacements[value]
+            return candidates.pop(0) if candidates else value
+        return copy.deepcopy(value)
+
+    worker_body = copy.deepcopy(dict(body))
+    for field in _DIRECTOR_PREVIEW_MEDIA_FIELDS:
+        if field in worker_body:
+            worker_body[field] = replace(worker_body[field])
+    if any(candidates for candidates in replacements.values()):
+        raise ValueError("Director preview media snapshot mismatch")
+    return worker_body
+
+
+def _director_preview_effective_digest(
+    body: Mapping[str, Any],
+    *,
+    workspace: str,
+    media_seals: list[dict[str, Any]],
+    selection: Mapping[str, Any],
+    response_assist_snapshot,
+    explicit_guidance: bool,
+    workflow,
+    flags: Mapping[str, Any],
+    polish_mode: str,
+) -> str:
+    """Bind the caller UUID to every effective Director preview input."""
+    from services.llm_response_assist import SERVER_RESPONSE_ASSIST_IDENTITY
+
+    revision = getattr(response_assist_snapshot, "revision", 0)
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        revision = 0
+    request_body = {
+        key: copy.deepcopy(value)
+        for key, value in body.items()
+        if key not in {"request_id", "project_instance"}
+    }
+    request_body["workspace"] = workspace
+    request_body["director_flags"] = copy.deepcopy(dict(flags))
+    return _llm_route_effective_input_digest("director_preview", {
+        "request": request_body,
+        "media_content": [
+            {
+                "path": seal.get("path"),
+                "size": seal.get("size"),
+                "sha256": seal.get("sha256"),
+            }
+            for seal in media_seals
+        ],
+        "selection_key": _llm_selection_key(
+            "director_preview", dict(selection),
+        ),
+        "response_assist": dict(SERVER_RESPONSE_ASSIST_IDENTITY),
+        "response_assist_revision": revision,
+        "explicit_guidance": explicit_guidance is True,
+        "workflow": copy.deepcopy(workflow),
+        "flags": copy.deepcopy(dict(flags)),
+        "polish_mode": polish_mode,
+    })
+
+
 @api.post("/api/v1/director/v2/plan")
 async def director_v2_plan(request: Request):
     """Plan using the new Director v2 architecture (planners + renderers + validators).
 
     Returns structured ProductionPlan + rendered clip_plans.
     """
-    body = await request.json()
+    raw_body = await request.json()
+    if not isinstance(raw_body, dict):
+        raise HTTPException(status_code=400, detail="JSON object body is required")
+    try:
+        body = copy.deepcopy(raw_body)
+    except Exception as error:
+        raise HTTPException(
+            status_code=400, detail="Invalid Director preview request",
+        ) from error
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
     body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)
-    _reject_client_director_image_role_internals(body)
-    _authorize_director_media_inputs(request, body)
-    _resolve_director_image_role_request(request, body)
-    workflow = _resolve_h3_style_workflow_request(
-        body, model_field="video_model",
-    )
+    worker_mode = bool(getattr(
+        request.state, "maestro_director_preview_worker", False,
+    ))
+    if worker_mode:
+        workflow = getattr(
+            request.state, "maestro_director_preview_workflow", None,
+        )
+    else:
+        _promote_external_llm_request(request)
+        workspace = _request_project_workspace(request, body.get("workspace"))
+        _require_project_access(
+            request,
+            workspace,
+            existing_only=True,
+            permission="project.generate",
+        )
+        owner_key, project_instance_key = _llm_operation_scope(
+            request, workspace,
+        )
+        try:
+            request_id = _normalize_llm_route_request_id(
+                body.get("request_id"),
+            )
+            expected_project_instance = body.get("project_instance")
+            if (
+                not isinstance(expected_project_instance, str)
+                or len(expected_project_instance) != 64
+                or expected_project_instance
+                    != expected_project_instance.lower()
+                or bytes.fromhex(expected_project_instance).hex()
+                    != expected_project_instance
+            ):
+                raise ValueError("project_instance must be canonical")
+        except ValueError as error:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Director preview operation request",
+            ) from error
+        if not hmac.compare_digest(
+            expected_project_instance, project_instance_key,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Director preview request does not match",
+            )
+        body["workspace"] = workspace
+        _reject_client_director_image_role_internals(body)
+        # Bound caller-controlled compatible list shapes before media
+        # authorization performs any path or filesystem work.
+        _director_preview_media_paths(body)
+        _authorize_director_media_inputs(request, body)
+        _resolve_director_image_role_request(request, body)
+        workflow = _resolve_h3_style_workflow_request(
+            body, model_field="video_model",
+        )
     skill_type = body.get("skill_type", body.get("pipeline_type", "music_video"))
 
     # Map legacy pipeline_type to skill_type
@@ -35195,9 +35486,179 @@ async def director_v2_plan(request: Request):
     try:
         from services import llm_service
         from services.director.orchestrator import DirectorOrchestrator, DirectorFlags
-        from services.llm_operations import run_blocking_shielded
+        from services.llm_operations import (
+            LlmOperationCapacityError,
+            LlmRouteAdmissionError,
+            LlmRouteOperationConflictError,
+            llm_route_operation_manager,
+            run_blocking_shielded,
+        )
+        from services.llm_cancellation import LlmRequestCancelled
+        from services.llm_response_assist import response_assist_corpus_snapshot
 
         flags = DirectorFlags.from_dict(body.get("director_flags", {}))
+        if not worker_mode:
+            explicit_guidance = _explicit_llm_guidance_allowed(body)
+            media_paths = _director_preview_media_paths(body)
+            media_seals = await run_blocking_shielded(
+                _seal_prompt_enhancement_images,
+                media_paths,
+                max_file_bytes=_DIRECTOR_PREVIEW_MAX_MEDIA_BYTES,
+                max_total_bytes=_DIRECTOR_PREVIEW_MAX_TOTAL_MEDIA_BYTES,
+                media_label="Director preview media",
+            )
+            selection = await run_blocking_shielded(
+                _resolve_direct_llm_selection, request,
+            )
+            assist_snapshot = response_assist_corpus_snapshot()
+            services = wgp.server_config.get("services", {})
+            polish_mode = str(
+                services.get("director_prompt_polish", "third_pass")
+                or "third_pass"
+            )
+            effective_input_digest = _director_preview_effective_digest(
+                body,
+                workspace=workspace,
+                media_seals=media_seals,
+                selection=selection,
+                response_assist_snapshot=assist_snapshot,
+                explicit_guidance=explicit_guidance,
+                workflow=workflow,
+                flags=flags.to_dict(),
+                polish_mode=polish_mode,
+            )
+            worker_body = {
+                key: copy.deepcopy(value)
+                for key, value in body.items()
+                if key not in {"request_id", "project_instance"}
+            }
+            detached_authority = (
+                _ScopedPromptEnhancementRequest.snapshot_authority(request)
+            )
+
+            async def execute(progress_callback, operation_cancellation):
+                materialized_paths: list[str] = []
+                try:
+                    operation_cancellation.checkpoint()
+                    detached_request = _ScopedDirectorPreviewRequest(
+                        detached_authority,
+                        worker_body,
+                        progress_callback=progress_callback,
+                        cancel_handle=operation_cancellation,
+                        project_instance_key=project_instance_key,
+                    )
+                    _worker_owner, current_project_instance = (
+                        _llm_operation_scope(detached_request, workspace)
+                    )
+                    if not hmac.compare_digest(
+                        project_instance_key, current_project_instance,
+                    ):
+                        raise LlmRequestCancelled(
+                            "Director preview project changed",
+                        )
+                    await run_blocking_shielded(
+                        _revalidate_prompt_enhancement_images,
+                        media_paths,
+                        media_seals,
+                        operation_cancellation,
+                        max_file_bytes=_DIRECTOR_PREVIEW_MAX_MEDIA_BYTES,
+                        max_total_bytes=(
+                            _DIRECTOR_PREVIEW_MAX_TOTAL_MEDIA_BYTES
+                        ),
+                        media_label="Director preview media",
+                    )
+                    materialized_paths = await run_blocking_shielded(
+                        _materialize_prompt_enhancement_images,
+                        media_seals,
+                        operation_cancellation,
+                        max_file_bytes=_DIRECTOR_PREVIEW_MAX_MEDIA_BYTES,
+                        max_total_bytes=(
+                            _DIRECTOR_PREVIEW_MAX_TOTAL_MEDIA_BYTES
+                        ),
+                        media_label="Director preview media",
+                        snapshot_prefix="maestro-director-preview-",
+                    )
+                    materialized_body = _director_preview_materialized_body(
+                        worker_body, media_paths, materialized_paths,
+                    )
+                    detached_request = _ScopedDirectorPreviewRequest(
+                        detached_authority,
+                        materialized_body,
+                        progress_callback=progress_callback,
+                        cancel_handle=operation_cancellation,
+                        project_instance_key=project_instance_key,
+                    )
+                    detached_request.state.maestro_director_preview_worker = True
+                    detached_request.state.maestro_director_preview_selection = (
+                        copy.deepcopy(selection)
+                    )
+                    detached_request.state.maestro_director_preview_assist = (
+                        assist_snapshot
+                    )
+                    detached_request.state.maestro_director_preview_guidance = (
+                        explicit_guidance
+                    )
+                    detached_request.state.maestro_director_preview_workflow = (
+                        copy.deepcopy(workflow)
+                    )
+                    detached_request.state.maestro_director_preview_polish_mode = (
+                        polish_mode
+                    )
+                    return await director_v2_plan(detached_request)
+                finally:
+                    _remove_prompt_enhancement_snapshots(materialized_paths)
+
+            try:
+                status = llm_route_operation_manager.submit(
+                    request_id=request_id,
+                    owner_key=owner_key,
+                    project_instance_key=project_instance_key,
+                    operation_kind="director_preview",
+                    effective_input_digest=effective_input_digest,
+                    execute=execute,
+                )
+            except LlmRouteOperationConflictError as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Director preview request does not match",
+                ) from error
+            except LlmRouteAdmissionError as error:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Director preview is busy; retry shortly",
+                ) from error
+            except LlmOperationCapacityError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Director preview recovery is busy",
+                ) from error
+            if status is None:
+                raise HTTPException(
+                    status_code=404, detail="LLM operation not found",
+                )
+            return JSONResponse(
+                _llm_route_public_status("director_preview", status),
+                status_code=202,
+            )
+
+        selection = copy.deepcopy(getattr(
+            request.state, "maestro_director_preview_selection",
+        ))
+        assist_snapshot = getattr(
+            request.state, "maestro_director_preview_assist", None,
+        )
+        explicit_guidance = bool(getattr(
+            request.state, "maestro_director_preview_guidance", False,
+        ))
+        polish_mode = str(getattr(
+            request.state,
+            "maestro_director_preview_polish_mode",
+            "third_pass",
+        ) or "third_pass")
+        director_pass_limit = 3 if polish_mode == "third_pass" else 2
+        operation_cancellation = getattr(
+            request.state, "maestro_llm_cancel_handle", None,
+        )
         planner_kwargs_base = {}
         for key in ["clips", "scene_description", "story_description", "lyrics", "bpm",
                      "reference_image_path", "speaker_mappings", "characters",
@@ -35225,35 +35686,33 @@ async def director_v2_plan(request: Request):
             ]
         else:
             image_loras_activated = (body.get("image_loras") or {}).get("activated_loras", [])
-        selection = await run_blocking_shielded(
-            _resolve_direct_llm_selection, request,
-        )
-
         def run_director_plan():
             # Consent and provider locality are resolved only after the exact
             # selected-model lease is held. Concurrent enhancer/Qwen requests
             # cannot swap the singleton during any planning or polish pass.
             route_progress = _llm_route_progress_callback(request)
             route_response_assist = _resolved_local_response_assist(
-                body, selection,
+                body,
+                selection,
+                corpus_snapshot=assist_snapshot,
             )
             director = DirectorOrchestrator(
                 llm_generate=_with_llm_route_progress(
                     llm_service.generate,
                     route_progress,
                     route_response_assist,
+                    operation_cancellation,
                 ),
                 llm_generate_streaming=_with_llm_route_progress(
                     llm_service.generate_streaming,
                     route_progress,
                     route_response_assist,
+                    operation_cancellation,
                 ),
                 flags=flags,
             )
             planner_kwargs = dict(planner_kwargs_base)
-            planner_kwargs["nsfw"] = _explicit_llm_guidance_allowed(body)
-            services = wgp.server_config.get("services", {})
-            polish_mode = services.get("director_prompt_polish", "third_pass")
+            planner_kwargs["nsfw"] = explicit_guidance
             if polish_mode in ("full_guide", "light_guide"):
                 from services.director.prompt_polish import build_polish_block
                 guide_mode = (
@@ -35269,7 +35728,25 @@ async def director_v2_plan(request: Request):
                 if polish_block:
                     planner_kwargs["polish_block"] = polish_block
 
+            if operation_cancellation is not None:
+                operation_cancellation.checkpoint()
+            if callable(route_progress):
+                route_progress({
+                    "phase": "generating",
+                    "stage": "director_plan",
+                    "pass": 1,
+                    "pass_limit": director_pass_limit,
+                })
             plan = director.plan(skill_type, **planner_kwargs)
+            if operation_cancellation is not None:
+                operation_cancellation.checkpoint()
+            if callable(route_progress):
+                route_progress({
+                    "phase": "generating",
+                    "stage": "director_render",
+                    "pass": 2,
+                    "pass_limit": director_pass_limit,
+                })
             rendered = director.render_plan(
                 plan,
                 prompt_type=body.get("prompt_type", "both"),
@@ -35277,11 +35754,22 @@ async def director_v2_plan(request: Request):
                 video_model=video_model,
                 image_model=image_model,
             )
+            if operation_cancellation is not None:
+                operation_cancellation.checkpoint()
             clip_plans = director.plan_to_clip_plans(rendered)
+            if operation_cancellation is not None:
+                operation_cancellation.checkpoint()
             if polish_mode == "third_pass" and clip_plans:
                 from services.director.prompt_polish import (
                     polish_prompts_third_pass,
                 )
+                if callable(route_progress):
+                    route_progress({
+                        "phase": "generating",
+                        "stage": "director_polish",
+                        "pass": 3,
+                        "pass_limit": director_pass_limit,
+                    })
                 clip_plans = polish_prompts_third_pass(
                     clip_plans,
                     video_model,
@@ -35290,10 +35778,17 @@ async def director_v2_plan(request: Request):
                     video_loras=video_loras_activated,
                     image_loras=image_loras_activated,
                     characters=planner_kwargs.get("characters", []) or [],
+                    response_assist=route_response_assist,
+                    progress_callback=route_progress,
+                    cancel_handle=operation_cancellation,
                 )
+            if operation_cancellation is not None:
+                operation_cancellation.checkpoint()
             _apply_h3_style_workflow_to_director_clips(
                 clip_plans, workflow,
             )
+            if operation_cancellation is not None:
+                operation_cancellation.checkpoint()
             return {
                 "clip_plans": clip_plans,
                 "production_plan": plan.to_dict(),
@@ -35307,6 +35802,20 @@ async def director_v2_plan(request: Request):
             run_director_plan,
         )
 
+    except LlmRequestCancelled:
+        raise
+    except HTTPException:
+        if not worker_mode:
+            raise
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "director_preview_failed",
+                "message": "Director could not build this preview.",
+            },
+        )
     except Exception:
         import traceback
         traceback.print_exc()

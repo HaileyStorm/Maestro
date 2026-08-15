@@ -331,7 +331,28 @@ class EnhancerPropagationTests(unittest.TestCase):
         self.assertIn("nsfw=explicit_guidance", enhance)
         self.assertIn("_explicit_llm_guidance_allowed(body)", chat)
         self.assertIn("inject_content_guidance", chat)
-        self.assertIn('planner_kwargs["nsfw"] = _explicit_llm_guidance_allowed(body)', preview)
+        admission_snapshot = preview.index(
+            "explicit_guidance = _explicit_llm_guidance_allowed(body)"
+        )
+        digest = preview.index("_director_preview_effective_digest(")
+        submit = preview.index("llm_route_operation_manager.submit(")
+        self.assertLess(admission_snapshot, digest)
+        self.assertLess(digest, submit)
+        self.assertIn(
+            "explicit_guidance=explicit_guidance",
+            preview[admission_snapshot:submit],
+        )
+        self.assertIn(
+            "maestro_director_preview_guidance = (\n"
+            "                        explicit_guidance\n"
+            "                    )",
+            preview,
+        )
+        self.assertIn(
+            'request.state, "maestro_director_preview_guidance", False',
+            preview,
+        )
+        self.assertIn('planner_kwargs["nsfw"] = explicit_guidance', preview)
         self.assertIn("body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)", preview)
         self.assertIn("body.pop(EXPLICIT_GUIDANCE_SNAPSHOT_KEY, None)", start)
 

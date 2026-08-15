@@ -1466,6 +1466,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
             "mix_audio",
             "director_plan_prompts",
             "director_plan_angle_prompts",
+            "director_v2_plan",
             "plan_audio_structure",
             "director_classify_sections",
             "preview_generation_plan",

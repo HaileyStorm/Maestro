@@ -310,6 +310,8 @@ test('store catalog refresh is last-request-wins, clears stale IDs, and runs leg
 test('Generate, plan preview, Director v2, and pipeline start send ID only while preserving canonical prompt and visual style', async t => {
   const originalFetch = globalThis.fetch
   const calls = []
+  const directorRequestId = '00000000-0000-4000-8000-000000000701'
+  const projectInstance = '7'.repeat(64)
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input)
     const body = init.body ? JSON.parse(String(init.body)) : undefined
@@ -322,7 +324,18 @@ test('Generate, plan preview, Director v2, and pipeline start send ID only while
     }
     if (url.endsWith('/api/v1/generate')) return Response.json({ job_id: 'job-1', status: 'queued' })
     if (url.endsWith('/api/v1/generate/plan')) return Response.json({ requires_review: false, plan: null, effective_model_type: 'minimax_h3', requirements: {}, h3_estimate: null, segment_count_estimate: null })
-    if (url.endsWith('/api/v1/director/v2/plan')) return Response.json({ clip_plans: [], production_plan: {}, skill_type: 'music_video' })
+    if (url.includes('/api/v1/llm/models?')) return Response.json({ models: [], guides: [], project_instance: projectInstance })
+    if (url.endsWith('/api/v1/director/v2/plan')) return Response.json({
+      request_id: directorRequestId,
+      operation_kind: 'director_preview',
+      status: 'completed', phase: 'completed', stage: 'completed',
+      pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+      partial_text: '', generated_tokens_approx: 0, elapsed_seconds: 0,
+      live_tps: null, average_tps: null, result_available: true, retryable: false,
+    }, { status: 202 })
+    if (url.includes(`/api/v1/llm/operations/director_preview/${directorRequestId}/result?`)) {
+      return Response.json({ clip_plans: [], production_plan: {}, skill_type: 'music_video' })
+    }
     if (url.endsWith('/api/v1/director/pipeline/start')) return Response.json({ pipeline_id: 'pipeline-1' })
     throw new Error(`Unexpected request ${url}`)
   }
@@ -332,12 +345,14 @@ test('Generate, plan preview, Director v2, and pipeline start send ID only while
   await submitGeneration({ model_type: 'minimax_h3', prompt: canonicalPrompt, h3_style_workflow: workflow.id })
   await previewGenerationPlan({ model_type: 'minimax_h3', prompt: canonicalPrompt, h3_style_workflow: workflow.id })
   await directorV2Plan({
+    request_id: directorRequestId,
+    project_instance: projectInstance,
     workspace: 'project one',
     skill_type: 'music_video',
     video_model: 'minimax_h3',
     visual_style: 'hand-painted realism',
     h3_style_workflow: workflow.id,
-  })
+  }, { projectInstance })
   await startPipeline({
     workspace: 'project one',
     video_model: 'minimax_h3',
@@ -345,7 +360,9 @@ test('Generate, plan preview, Director v2, and pipeline start send ID only while
     h3_style_workflow: workflow.id,
   })
 
-  const bodies = calls.filter(call => !call.url.endsWith('/api/v1/llm/prepare')).map(call => call.body)
+  const bodies = calls.filter(call => (
+    call.body !== undefined && !call.url.endsWith('/api/v1/llm/prepare')
+  )).map(call => call.body)
   assert.equal(bodies.length, 4)
   for (const body of bodies) {
     assert.equal(body.h3_style_workflow, workflow.id)
@@ -355,6 +372,8 @@ test('Generate, plan preview, Director v2, and pipeline start send ID only while
   assert.equal(bodies[0].prompt, canonicalPrompt)
   assert.equal(bodies[1].prompt, canonicalPrompt)
   assert.equal(bodies[2].visual_style, 'hand-painted realism')
+  assert.equal(bodies[2].request_id, directorRequestId)
+  assert.equal(bodies[2].project_instance, projectInstance)
   assert.equal(bodies[3].visual_style, 'hand-painted realism')
 })
 
@@ -369,8 +388,8 @@ test('source removes client prefix authoring and wires catalog-gated requests on
   assert.match(promptInput, /H3StyleWorkflowField effectiveVideoModel=\{effectiveVideoModel\} surface="Generate"/)
   assert.match(director, /H3StyleWorkflowField effectiveVideoModel=\{effectiveVideoModel\} surface="Director"/)
   assert.match(client, /supported_model_types: string\[\]/)
-  assert.equal((store.match(/api\.directorV2Plan\(\{/g) || []).length, 3)
-  for (const match of store.matchAll(/api\.directorV2Plan\(\{([\s\S]*?)\}, \{ signal:/g)) {
+  assert.equal((store.match(/_runDirectorV2Preview\(\{/g) || []).length, 3)
+  for (const match of store.matchAll(/_runDirectorV2Preview\(\{([\s\S]*?)\}, lifecycle\)/g)) {
     assert.match(match[1], /h3_style_workflow: resolveH3StyleWorkflowRequest\(/)
     assert.match(match[1], /visual_style:/)
   }

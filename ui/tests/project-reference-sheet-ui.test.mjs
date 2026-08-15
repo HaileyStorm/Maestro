@@ -2648,9 +2648,9 @@ test('Reference and Director expose style, skill, flow, and truthful Blender cho
 
   assert.equal(client.match(/visual_style\?: string/g)?.length, 4)
   assert.equal(store.match(/visual_style:/g)?.length, 9)
-  assert.match(client, /skill_type: string\s+video_model\?: string\s+\/\*\* Null is the explicit new-role automatic-creator sentinel\. \*\/\s+image_creator_model\?: string \| null\s+image_editor_model\?: string\s+image_creator_loras\?: DirectorImageRoleLoraSelection\[\]\s+image_editor_loras\?: DirectorImageRoleLoraSelection\[\]/)
+  assert.match(client, /request_id: string\s+project_instance: string\s+workspace: string\s+skill_type: string\s+video_model\?: string\s+\/\*\* Null is the explicit new-role automatic-creator sentinel\. \*\/\s+image_creator_model\?: string \| null\s+image_editor_model\?: string\s+image_creator_loras\?: DirectorImageRoleLoraSelection\[\]\s+image_editor_loras\?: DirectorImageRoleLoraSelection\[\]/)
   assert.match(client, /Legacy combined image wire; never mix with the role fields above\. \*\/\s+image_model\?: string/)
-  const v2PlanBodies = [...store.matchAll(/api\.directorV2Plan\(\{([\s\S]*?)\}, \{ signal:/g)].map(match => match[1])
+  const v2PlanBodies = [...store.matchAll(/_runDirectorV2Preview\(\{([\s\S]*?)\}, lifecycle, requestFence as DirectorPreviewRequestFence\)/g)].map(match => match[1])
   assert.equal(v2PlanBodies.length, 3)
   for (const body of v2PlanBodies) {
     assert.match(body, /video_model: get\(\)\.selectedModelPerMode\.video/)
@@ -2703,6 +2703,8 @@ test('Director reference routing accepts only its currently supported semantic t
 test('Director v2 client sends selected model and authored style fields to the route', async () => {
   const originalFetch = globalThis.fetch
   const calls = []
+  const requestId = '00000000-0000-4000-8000-000000000702'
+  const projectInstance = '8'.repeat(64)
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input)
     calls.push({ url, init })
@@ -2712,23 +2714,35 @@ test('Director v2 client sends selected model and authored style fields to the r
         headers: { 'Content-Type': 'application/json' },
       })
     }
+    if (url.includes('/api/v1/llm/models?')) {
+      return Response.json({ models: [], guides: [], project_instance: projectInstance })
+    }
     if (url.endsWith('/api/v1/director/v2/plan')) {
-      return new Response(JSON.stringify({ clip_plans: [], production_plan: {}, skill_type: 'short_film' }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      })
+      return Response.json({
+        request_id: requestId,
+        operation_kind: 'director_preview',
+        status: 'completed', phase: 'completed', stage: 'completed',
+        pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+        partial_text: '', generated_tokens_approx: 0, elapsed_seconds: 0,
+        live_tps: null, average_tps: null, result_available: true, retryable: false,
+      }, { status: 202 })
+    }
+    if (url.includes(`/api/v1/llm/operations/director_preview/${requestId}/result?`)) {
+      return Response.json({ clip_plans: [], production_plan: {}, skill_type: 'short_film' })
     }
     throw new Error(`Unexpected request: ${url}`)
   }
 
   try {
     await directorV2Plan({
+      request_id: requestId,
+      project_instance: projectInstance,
       workspace: 'wire-project',
       skill_type: 'short_film',
       video_model: 'minimax_h3',
       image_model: 'flux2_klein_9b',
       visual_style: 'hand-painted stop motion',
-    })
+    }, { projectInstance })
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -2736,6 +2750,8 @@ test('Director v2 client sends selected model and authored style fields to the r
   const routeCall = calls.find(({ url }) => url.endsWith('/api/v1/director/v2/plan'))
   assert.ok(routeCall, 'Director v2 route must be called')
   assert.deepEqual(JSON.parse(routeCall.init.body), {
+    request_id: requestId,
+    project_instance: projectInstance,
     workspace: 'wire-project',
     skill_type: 'short_film',
     video_model: 'minimax_h3',

@@ -151,6 +151,14 @@ function deferred() {
   return { promise, reject, resolve }
 }
 
+async function waitForCondition(predicate, label) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
+  assert.fail(`Timed out waiting for ${label}`)
+}
+
 function asDataModule(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 }
@@ -161,7 +169,7 @@ function loadStoreHelper() {
   storeHelperPromise = readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8')
     .then(source => build({
       stdin: {
-        contents: `${source}\nexport { _captureDirectorImageRoleRequest, _refreshDirectorModelAdmissionCatalog, _resolveDirectorReferenceRows }\n`,
+        contents: `${source}\nexport { _admitStoredDirectorPreviewOperation, _captureDirectorImageRoleRequest, _clearStoredDirectorPreviewOperations, _directorPreviewCreativeFingerprint, _directorPreviewCreativeInputs, _directorPreviewFingerprintSalt, _directorPreviewRequestCreativeInputs, _directorPreviewSettingsFingerprint, _enhanceAccountFingerprint, _loadStoredDirectorPreviewOperations, _refreshDirectorModelAdmissionCatalog, _removeOwnedTentativeDirectorPreviewOperations, _removeStoredDirectorPreviewOperation, _resolveDirectorReferenceRows, _storeDirectorPreviewOperation }\n`,
         resolveDir: fileURLToPath(new URL('../src/stores/', import.meta.url)),
         loader: 'ts',
       },
@@ -180,7 +188,7 @@ async function loadFreshStoreHelper(tag) {
   const source = await readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8')
   const result = await build({
     stdin: {
-      contents: source,
+      contents: `${source}\nexport { _admitStoredDirectorPreviewOperation, _clearStoredDirectorPreviewOperations, _directorPreviewCreativeFingerprint, _directorPreviewCreativeInputs, _directorPreviewFingerprintSalt, _directorPreviewRequestCreativeInputs, _directorPreviewSettingsFingerprint, _enhanceAccountFingerprint, _loadStoredDirectorPreviewOperations, _removeOwnedTentativeDirectorPreviewOperations, _removeStoredDirectorPreviewOperation, _storeDirectorPreviewOperation }\n`,
       resolveDir: fileURLToPath(new URL('../src/stores/', import.meta.url)),
       loader: 'ts',
     },
@@ -498,6 +506,11 @@ test('store restore and requested-Explicit snapshots survive overlapping force l
     setItem(key, value) { stored.set(key, String(value)) },
     removeItem(key) { stored.delete(key) },
   }
+  globalThis.sessionStorage = {
+    getItem(key) { return stored.get(`session:${key}`) ?? null },
+    setItem(key, value) { stored.set(`session:${key}`, String(value)) },
+    removeItem(key) { stored.delete(`session:${key}`) },
+  }
   globalThis.window = Object.assign(new EventTarget(), { setTimeout, clearTimeout, setInterval, clearInterval, alert() {} })
   globalThis.document = Object.assign(new EventTarget(), { hidden: false })
   try {
@@ -656,6 +669,737 @@ test('store restore and requested-Explicit snapshots survive overlapping force l
     globalThis.localStorage = originalLocalStorage
     globalThis.window = originalWindow
     globalThis.document = originalDocument
+  }
+})
+
+test('Director action-start fence rejects an Explicit toggle during deferred capabilities', async () => {
+  const originalFetch = globalThis.fetch
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const stored = new Map()
+  globalThis.localStorage = {
+    getItem(key) { return stored.get(key) ?? null },
+    setItem(key, value) { stored.set(key, String(value)) },
+    removeItem(key) { stored.delete(key) },
+  }
+  globalThis.sessionStorage = {
+    getItem(key) { return stored.get(`session:${key}`) ?? null },
+    setItem(key, value) { stored.set(`session:${key}`, String(value)) },
+    removeItem(key) { stored.delete(`session:${key}`) },
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+  const capabilitiesRequest = deferred()
+  let staleSubmits = 0
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/director/capabilities?explicit_output=true')) {
+      return capabilitiesRequest.promise
+    }
+    if (url.endsWith('/api/v1/director/v2/plan') && init.method === 'POST') {
+      staleSubmits += 1
+      throw new Error('stale Director request must not be submitted')
+    }
+    throw new Error(`Unexpected fenced Director request: ${url}`)
+  }
+  try {
+    const { useStore } = await loadFreshStoreHelper('director-explicit-action-fence')
+    const base = useStore.getState()
+    useStore.setState({
+      activeWorkspace: 'fenced-project',
+      servicesConfig: { use_director_v2: true },
+      directorSkill: 'music_video',
+      directorPlannedClips: [{ start: 0, end: 5, duration_frames: 121, label: 'intro', beat_count: 0 }],
+      directorSceneDescription: 'Keep this exact scene',
+      directorVisualStyle: 'cinematic',
+      selectedModelPerMode: { ...base.selectedModelPerMode, video: 'video-model' },
+      explicitOutput: true,
+    })
+    const planning = useStore.getState().directorPlanPrompts()
+    await waitForCondition(
+      () => useStore.getState().directorCapabilitiesLoadingExplicitOutput === true,
+      'deferred Explicit capabilities request',
+    )
+    useStore.getState().setExplicitOutput(false)
+    capabilitiesRequest.resolve(Response.json(capabilities(true)))
+    await planning
+    assert.equal(staleSubmits, 0)
+    assert.deepEqual(useStore.getState().directorClipPlans, [])
+  } finally {
+    globalThis.fetch = originalFetch
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+  }
+})
+
+test('Director preview ledger preserves project requests, retires successors, and scrubs one account', async () => {
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const stored = new Map()
+  globalThis.localStorage = {
+    getItem(key) { return stored.get(key) ?? null },
+    setItem(key, value) { stored.set(key, String(value)) },
+    removeItem(key) { stored.delete(key) },
+  }
+  globalThis.sessionStorage = {
+    getItem(key) { return stored.get(`session:${key}`) ?? null },
+    setItem(key, value) { stored.set(`session:${key}`, String(value)) },
+    removeItem(key) { stored.delete(`session:${key}`) },
+  }
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      locks: {
+        async request(name, options, callback) {
+          assert.equal(options.mode, 'exclusive')
+          if (name === 'maestro-director-preview-ledger-v2') {
+            assert.equal(options.signal.aborted, false)
+          } else {
+            assert.match(name, /^maestro-director-preview-tab-[0-9a-f]{64}$/)
+            assert.equal(options.ifAvailable, true)
+          }
+          return callback({ name })
+        },
+      },
+    },
+  })
+  try {
+    const {
+      _admitStoredDirectorPreviewOperation,
+      _clearStoredDirectorPreviewOperations,
+      _directorPreviewFingerprintSalt,
+      _loadStoredDirectorPreviewOperations,
+      _removeOwnedTentativeDirectorPreviewOperations,
+      _removeStoredDirectorPreviewOperation,
+      _storeDirectorPreviewOperation,
+    } = await loadStoreHelper()
+    await _directorPreviewFingerprintSalt()
+    const now = Date.now()
+    const request = (requestId, workspace, accountFingerprint, storedAt) => ({
+      requestId,
+      workspace,
+      projectInstance: 'a'.repeat(64),
+      accountFingerprint,
+      settingsFingerprint: 'b'.repeat(64),
+      creativeFingerprint: 'c'.repeat(64),
+      storedAt,
+    })
+    const alphaFirst = request(
+      '00000000-0000-4000-8000-000000000001',
+      'alpha',
+      '1111111111111111',
+      now,
+    )
+    const beta = request(
+      '00000000-0000-4000-8000-000000000002',
+      'beta',
+      '1111111111111111',
+      now + 1,
+    )
+    const alphaSuccessor = request(
+      '00000000-0000-4000-8000-000000000003',
+      'alpha',
+      '1111111111111111',
+      now + 2,
+    )
+    const otherAccount = request(
+      '00000000-0000-4000-8000-000000000004',
+      'alpha',
+      '2222222222222222',
+      now + 3,
+    )
+
+    assert.equal(await _storeDirectorPreviewOperation(alphaFirst), true)
+    assert.equal(await _admitStoredDirectorPreviewOperation(alphaFirst), true)
+    assert.equal(await _storeDirectorPreviewOperation(beta), true)
+    assert.equal(await _admitStoredDirectorPreviewOperation(beta), true)
+    assert.deepEqual(
+      _loadStoredDirectorPreviewOperations().map(item => item.workspace).sort(),
+      ['alpha', 'beta'],
+      'switching projects must not erase another project recovery fence',
+    )
+    assert.equal(await _storeDirectorPreviewOperation(alphaSuccessor), true)
+    assert.deepEqual(
+      new Set(_loadStoredDirectorPreviewOperations().map(item => item.requestId)),
+      new Set([alphaFirst.requestId, beta.requestId, alphaSuccessor.requestId]),
+      'a tentative successor must not evict an admitted predecessor',
+    )
+    assert.equal(await _removeOwnedTentativeDirectorPreviewOperations(), true)
+    assert.ok(
+      _loadStoredDirectorPreviewOperations().some(item => item.requestId === alphaFirst.requestId),
+      'reload cleanup after a pre-admission crash preserves the admitted predecessor',
+    )
+    assert.equal(await _storeDirectorPreviewOperation(alphaSuccessor), true)
+    assert.equal(
+      await _removeStoredDirectorPreviewOperation(alphaSuccessor),
+      true,
+      'an unadmitted successor can be removed after abort',
+    )
+    assert.ok(
+      _loadStoredDirectorPreviewOperations().some(item => item.requestId === alphaFirst.requestId),
+      'removing an unadmitted successor must preserve its admitted predecessor',
+    )
+    assert.equal(await _storeDirectorPreviewOperation(alphaSuccessor), true)
+    assert.equal(await _removeStoredDirectorPreviewOperation(alphaSuccessor), true)
+    assert.ok(
+      _loadStoredDirectorPreviewOperations().some(item => item.requestId === alphaFirst.requestId),
+      'permanent pre-admission failure removes only its tentative successor',
+    )
+    assert.equal(await _storeDirectorPreviewOperation(alphaSuccessor), true)
+    assert.equal(await _admitStoredDirectorPreviewOperation(alphaSuccessor), true)
+    assert.equal(await _storeDirectorPreviewOperation(otherAccount), true)
+    assert.equal(await _admitStoredDirectorPreviewOperation(otherAccount), true)
+
+    let operations = _loadStoredDirectorPreviewOperations()
+    assert.deepEqual(
+      operations.map(item => item.requestId).sort(),
+      [beta.requestId, alphaSuccessor.requestId, otherAccount.requestId].sort(),
+      'the newest same-project request wins without touching other projects or accounts',
+    )
+    const persisted = JSON.parse(stored.get('maestro:director-preview-operations-v2'))
+    assert.equal(persisted.schemaVersion, 3)
+    assert.equal(persisted.operations.length, 3)
+    for (const operation of persisted.operations) {
+      assert.deepEqual(Object.keys(operation).sort(), [
+        'accountFingerprint',
+        'admitted',
+        'claimToken',
+        'creativeFingerprint',
+        'projectInstance',
+        'requestId',
+        'settingsFingerprint',
+        'storedAt',
+        'workspace',
+      ])
+      assert.doesNotMatch(JSON.stringify(operation), /prompt|media|provider|result|salt/i)
+    }
+
+    assert.equal(await _clearStoredDirectorPreviewOperations('1111111111111111'), true)
+    operations = _loadStoredDirectorPreviewOperations()
+    assert.deepEqual(operations.map(item => item.requestId), [otherAccount.requestId])
+  } finally {
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  }
+})
+
+test('Director preview ownership prevents copied tabs from replacing, deleting, or cancelling source work', async () => {
+  const originalFetch = globalThis.fetch
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  class ExclusiveLocksFake {
+    held = new Set()
+    request(name, options, callback) {
+      assert.equal(options.mode, 'exclusive')
+      if (name === 'maestro-director-preview-ledger-v2') {
+        assert.ok(options.signal instanceof AbortSignal)
+        return Promise.resolve(callback({ name }))
+      }
+      assert.equal(options.ifAvailable, true)
+      if (this.held.has(name)) return Promise.resolve(callback(null))
+      this.held.add(name)
+      return Promise.resolve(callback({ name }))
+    }
+  }
+  const local = new StorageFake()
+  const sourceSession = new StorageFake()
+  const locks = new ExclusiveLocksFake()
+  globalThis.localStorage = local
+  globalThis.sessionStorage = sourceSession
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks },
+  })
+  const projectInstance = 'd'.repeat(64)
+  const deletes = []
+  const status = requestId => ({
+    request_id: requestId.replaceAll('-', ''),
+    operation_kind: 'director_preview',
+    status: 'cancelled', phase: 'cancelled', stage: 'cancelled',
+    pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+    partial_text: '', generated_tokens_approx: 0, elapsed_seconds: 0,
+    live_tps: null, average_tps: null, result_available: false, retryable: false,
+  })
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return Response.json({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.includes('/api/v1/llm/operations/director_preview/') && init.method === 'DELETE') {
+      const requestId = decodeURIComponent(url.split('/director_preview/')[1].split('?')[0])
+      deletes.push(requestId)
+      return Response.json(status(requestId))
+    }
+    throw new Error(`Unexpected Director ownership request: ${url}`)
+  }
+  try {
+    const source = await loadFreshStoreHelper('director-owner-source')
+    await source._directorPreviewFingerprintSalt()
+    const accountFingerprint = source._enhanceAccountFingerprint(source.useStore.getState())
+    const sourceScope = {
+      requestId: '10000000-0000-4000-8000-000000000001',
+      workspace: 'owned-project',
+      projectInstance,
+    }
+    assert.equal(await source._storeDirectorPreviewOperation({
+      ...sourceScope,
+      accountFingerprint,
+      settingsFingerprint: '1'.repeat(64),
+      creativeFingerprint: '2'.repeat(64),
+      storedAt: Date.now(),
+    }), true)
+    assert.equal(await source._admitStoredDirectorPreviewOperation(sourceScope), true)
+    source.useStore.setState({ activeWorkspace: sourceScope.workspace })
+    const sourceSettingsFingerprint = await source._directorPreviewSettingsFingerprint(
+      source.useStore.getState(),
+    )
+    const sourceClaim = sourceSession.getItem('maestro:director-preview-fingerprint-claim-v1')
+    const sourceLedger = local.getItem('maestro:director-preview-operations-v2')
+    assert.ok(sourceClaim)
+    assert.ok(sourceLedger)
+
+    const copiedSession = new StorageFake()
+    copiedSession.setItem('maestro:director-preview-fingerprint-claim-v1', sourceClaim)
+    globalThis.sessionStorage = copiedSession
+    const copied = await loadFreshStoreHelper('director-owner-copy')
+    await copied._directorPreviewFingerprintSalt()
+    copied.useStore.setState({ activeWorkspace: sourceScope.workspace })
+    assert.notEqual(
+      await copied._directorPreviewSettingsFingerprint(copied.useStore.getState()),
+      sourceSettingsFingerprint,
+      'copied realms rotate the private HMAC key even for identical settings',
+    )
+    const copiedClaim = copiedSession.getItem('maestro:director-preview-fingerprint-claim-v1')
+    assert.notEqual(JSON.parse(copiedClaim).token, JSON.parse(sourceClaim).token)
+
+    await copied.useStore.getState().cancelDirectorPreview()
+    assert.equal(deletes.length, 0)
+    assert.equal(await copied._removeStoredDirectorPreviewOperation(sourceScope), false)
+    assert.equal(
+      await copied._clearStoredDirectorPreviewOperations(accountFingerprint),
+      false,
+    )
+    assert.equal(local.getItem('maestro:director-preview-operations-v2'), sourceLedger)
+
+    const copiedScope = {
+      requestId: '20000000-0000-4000-8000-000000000002',
+      workspace: sourceScope.workspace,
+      projectInstance,
+    }
+    assert.equal(await copied._storeDirectorPreviewOperation({
+      ...copiedScope,
+      accountFingerprint,
+      settingsFingerprint: '3'.repeat(64),
+      creativeFingerprint: '4'.repeat(64),
+      storedAt: Date.now() + 1,
+    }), true)
+    assert.deepEqual(
+      new Set(copied._loadStoredDirectorPreviewOperations().map(item => item.requestId)),
+      new Set([sourceScope.requestId, copiedScope.requestId]),
+      'a copied tab may add its own record but cannot replace the source record',
+    )
+    assert.equal(await copied._clearStoredDirectorPreviewOperations(accountFingerprint), true)
+    assert.deepEqual(
+      copied._loadStoredDirectorPreviewOperations().map(item => item.requestId),
+      [sourceScope.requestId],
+    )
+
+    await source.useStore.getState().cancelDirectorPreview()
+    assert.deepEqual(deletes, [sourceScope.requestId])
+    assert.equal(local.getItem('maestro:director-preview-operations-v2'), null)
+  } finally {
+    globalThis.fetch = originalFetch
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  }
+})
+
+test('Director cold reload uses opaque admitted scope and rejects new-realm mid-wait edits', async () => {
+  const originalFetch = globalThis.fetch
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  class ReloadLocksFake {
+    held = new Set()
+    request(name, options, callback) {
+      assert.equal(options.mode, 'exclusive')
+      if (name === 'maestro-director-preview-ledger-v2') {
+        return Promise.resolve(callback({ name }))
+      }
+      assert.equal(options.ifAvailable, true)
+      if (this.held.has(name)) return Promise.resolve(callback(null))
+      this.held.add(name)
+      return Promise.resolve(callback({ name }))
+    }
+    releaseRealm() {
+      for (const name of [...this.held]) {
+        if (name.startsWith('maestro-director-preview-tab-')) this.held.delete(name)
+      }
+    }
+  }
+  const local = new StorageFake()
+  const session = new StorageFake()
+  const locks = new ReloadLocksFake()
+  globalThis.localStorage = local
+  globalThis.sessionStorage = session
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks },
+  })
+  const projectInstance = 'e'.repeat(64)
+  const result = deferred()
+  let fetches = 0
+  let resultRequested = false
+  const operationStatus = requestId => ({
+    request_id: requestId.replaceAll('-', ''),
+    operation_kind: 'director_preview', status: 'completed',
+    phase: 'completed', stage: 'completed', pass: 1, pass_limit: 1,
+    attempt: 1, attempt_limit: 1, partial_text: '', generated_tokens_approx: 1,
+    elapsed_seconds: 1, live_tps: null, average_tps: 1,
+    result_available: true, retryable: false,
+  })
+  globalThis.fetch = async input => {
+    fetches += 1
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return Response.json({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.includes('/api/v1/llm/operations/director_preview/') && url.includes('/result?')) {
+      resultRequested = true
+      return result.promise
+    }
+    if (url.includes('/api/v1/llm/operations/director_preview/')) {
+      const requestId = decodeURIComponent(url.split('/director_preview/')[1].split('?')[0])
+      return Response.json(operationStatus(requestId))
+    }
+    throw new Error(`Unexpected Director reload request: ${url}`)
+  }
+  try {
+    const source = await loadFreshStoreHelper('director-reload-source')
+    const sourceBase = source.useStore.getState()
+    const modelOptions = {
+      model_type: 'video-model', fps: 24, frames_steps: 4, frames_minimum: 5,
+    }
+    const exactState = {
+      activeWorkspace: 'reload-project',
+      modelsLoaded: true,
+      servicesConfig: { use_director_v2: true },
+      selectedModelPerMode: { ...sourceBase.selectedModelPerMode, video: 'video-model' },
+      modelOptions,
+      modelOptionsLoading: false,
+      directorSkill: 'short_film',
+      directorSceneDescription: 'Private exact scene',
+      directorVisualStyle: 'cinematic',
+      directorCustomVisualStyle: '',
+      directorPlannedClips: [{ start: 0, end: 5, duration_frames: 121, label: 'intro', beat_count: 0 }],
+      directorAnalysis: { lyrics: ['Private exact lyric'], bpm: 90 },
+      directorReferenceImagePath: '/private/main.png',
+      directorCharacterRefPaths: ['/private/character.png'],
+      directorCharacterRefLabels: ['Private character'],
+      directorLocationRefPaths: ['/private/location.png'],
+      directorLocationRefLabels: ['Private location'],
+      directorSpeakerMappings: [{ speakerId: 'S1', name: 'Private speaker', role: 'speaking' }],
+      shortFilmCharacters: [{ name: 'Private hero', description: 'Private description' }],
+    }
+    source.useStore.setState(exactState)
+    assert.deepEqual(
+      source._directorPreviewCreativeInputs(source.useStore.getState()),
+      source._directorPreviewRequestCreativeInputs({
+        workspace: exactState.activeWorkspace,
+        skill_type: 'short_film',
+        clips: exactState.directorPlannedClips,
+        scene_description: exactState.directorSceneDescription,
+        visual_style: exactState.directorVisualStyle,
+        lyrics: exactState.directorAnalysis.lyrics,
+        reference_image_path: exactState.directorReferenceImagePath,
+        character_ref_paths: exactState.directorCharacterRefPaths,
+        character_ref_labels: exactState.directorCharacterRefLabels,
+        location_ref_paths: exactState.directorLocationRefPaths,
+        location_ref_labels: exactState.directorLocationRefLabels,
+        speaker_mappings: {
+          S1: { name: 'Private speaker', role: 'speaking' },
+        },
+        characters: exactState.shortFilmCharacters,
+        prompt_type: 'both',
+      }),
+      'the submitted and current creative-input fences must share one canonical shape',
+    )
+    await source._directorPreviewFingerprintSalt()
+    const baselineCreative = await source._directorPreviewCreativeFingerprint(source.useStore.getState())
+    const creativeEdits = [
+      { directorSceneDescription: 'Edited scene' },
+      { directorPlannedClips: [{ ...exactState.directorPlannedClips[0], end: 6 }] },
+      { directorAnalysis: { lyrics: ['Edited lyric'], bpm: 90 } },
+      { directorReferenceImagePath: '/private/edited-main.png' },
+      { directorCharacterRefPaths: ['/private/edited-character.png'] },
+      { directorCharacterRefLabels: ['Edited character'] },
+      { directorLocationRefPaths: ['/private/edited-location.png'] },
+      { directorLocationRefLabels: ['Edited location'] },
+      { directorSpeakerMappings: [{ speakerId: 'S1', name: 'Edited speaker', role: 'speaking' }] },
+      { shortFilmCharacters: [{ name: 'Edited hero', description: 'Edited description' }] },
+    ]
+    for (const edit of creativeEdits) {
+      source.useStore.setState(exactState)
+      source.useStore.setState(edit)
+      assert.notEqual(
+        await source._directorPreviewCreativeFingerprint(source.useStore.getState()),
+        baselineCreative,
+      )
+    }
+    source.useStore.setState(exactState)
+    const accountFingerprint = source._enhanceAccountFingerprint(source.useStore.getState())
+    const scope = {
+      requestId: '30000000-0000-4000-8000-000000000003',
+      workspace: exactState.activeWorkspace,
+      projectInstance,
+    }
+    assert.equal(await source._storeDirectorPreviewOperation({
+      ...scope,
+      accountFingerprint,
+      settingsFingerprint: await source._directorPreviewSettingsFingerprint(source.useStore.getState()),
+      creativeFingerprint: baselineCreative,
+      storedAt: Date.now(),
+    }), true)
+    assert.equal(await source._admitStoredDirectorPreviewOperation(scope), true)
+    const ledgerKey = 'maestro:director-preview-operations-v2'
+    const frozenLedger = local.getItem(ledgerKey)
+    assert.doesNotMatch(frozenLedger, /Private exact|private\//i)
+    assert.doesNotMatch(
+      session.getItem('maestro:director-preview-fingerprint-claim-v1'),
+      /Private exact|private\//i,
+    )
+
+    locks.releaseRealm()
+    const reload = await loadFreshStoreHelper('director-reload-authoritative')
+    reload.useStore.setState({ activeWorkspace: exactState.activeWorkspace })
+    assert.equal(await reload.useStore.getState().resumeDirectorPreview(), false)
+    assert.equal(fetches, 0, 'cold defaults must neither poll nor delete before hydration')
+    assert.equal(local.getItem(ledgerKey), frozenLedger)
+
+    const reloadBase = reload.useStore.getState()
+    reload.useStore.setState({
+      activeWorkspace: exactState.activeWorkspace,
+      modelsLoaded: true,
+      servicesConfig: { use_director_v2: true },
+      selectedModelPerMode: { ...reloadBase.selectedModelPerMode, video: 'video-model' },
+      modelOptions,
+      modelOptionsLoading: false,
+      h3StyleWorkflowCatalog: [],
+      h3StyleWorkflowCatalogLoading: false,
+    })
+    assert.equal(reload.useStore.getState().directorSkill, null)
+    assert.equal(reload.useStore.getState().directorSceneDescription, '')
+    const recovering = reload.useStore.getState().resumeDirectorPreview()
+    await waitForCondition(() => resultRequested, 'Director recovered result request')
+    assert.equal(
+      reload.useStore.getState().directorPreviewStatus?.operation_kind,
+      'director_preview',
+    )
+    assert.deepEqual(reload.useStore.getState().directorPreviewRequestScope, scope)
+    reload.useStore.setState({
+      directorSceneDescription: 'New-realm mid-wait edit',
+    })
+    result.resolve(Response.json({
+      clip_plans: [{ video_prompt: 'stale video', image_prompt: 'stale image' }],
+      production_plan: {},
+      skill_type: 'short_film',
+    }))
+    assert.equal(await recovering, false)
+    assert.deepEqual(reload.useStore.getState().directorClipPlans, [])
+    assert.equal(local.getItem(ledgerKey), null)
+  } finally {
+    globalThis.fetch = originalFetch
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  }
+})
+
+test('Director true-cold recovery restores supported review skills and rejects invalid skills', async () => {
+  const originalFetch = globalThis.fetch
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  class ReloadLocksFake {
+    held = new Set()
+    request(name, options, callback) {
+      assert.equal(options.mode, 'exclusive')
+      if (name === 'maestro-director-preview-ledger-v2') {
+        return Promise.resolve(callback({ name }))
+      }
+      assert.equal(options.ifAvailable, true)
+      if (this.held.has(name)) return Promise.resolve(callback(null))
+      this.held.add(name)
+      return Promise.resolve(callback({ name }))
+    }
+    releaseRealm() {
+      for (const name of [...this.held]) {
+        if (name.startsWith('maestro-director-preview-tab-')) this.held.delete(name)
+      }
+    }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+
+  const recover = async (resultSkill, tag) => {
+    const local = new StorageFake()
+    const session = new StorageFake()
+    const locks = new ReloadLocksFake()
+    globalThis.localStorage = local
+    globalThis.sessionStorage = session
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { locks },
+    })
+    const tagHex = ({ music_video: 'a', short_film: 'b', invalid: 'c', missing: 'd' })[tag]
+    const projectInstance = tagHex.repeat(64)
+    const requestId = `${tagHex.repeat(8)}-0000-4000-8000-000000000001`
+    const workspace = `cold-${tag}`
+    const source = await loadFreshStoreHelper(`director-skill-source-${tag}`)
+    await source._directorPreviewFingerprintSalt()
+    const scope = { requestId, workspace, projectInstance }
+    const accountFingerprint = source._enhanceAccountFingerprint(source.useStore.getState())
+    assert.equal(await source._storeDirectorPreviewOperation({
+      ...scope,
+      accountFingerprint,
+      settingsFingerprint: '7'.repeat(64),
+      creativeFingerprint: '8'.repeat(64),
+      storedAt: Date.now(),
+    }), true)
+    assert.equal(await source._admitStoredDirectorPreviewOperation(scope), true)
+    locks.releaseRealm()
+
+    const resultBody = {
+      clip_plans: [{ video_prompt: `${tag} video`, image_prompt: `${tag} image` }],
+      production_plan: {
+        shots: [{ duration_sec: 4, narrative_role: `${tag} opening` }],
+      },
+    }
+    if (resultSkill !== undefined) resultBody.skill_type = resultSkill
+    const operationStatus = {
+      request_id: requestId.replaceAll('-', ''),
+      operation_kind: 'director_preview', status: 'completed',
+      phase: 'completed', stage: 'completed', pass: 1, pass_limit: 1,
+      attempt: 1, attempt_limit: 1, partial_text: '', generated_tokens_approx: 1,
+      elapsed_seconds: 1, live_tps: null, average_tps: 1,
+      result_available: true, retryable: false,
+    }
+    globalThis.fetch = async input => {
+      const url = String(input)
+      if (url.includes('/api/v1/llm/models?')) {
+        return Response.json({ models: [], guides: [], project_instance: projectInstance })
+      }
+      if (url.includes('/result?')) return Response.json(resultBody)
+      if (url.includes('/api/v1/llm/operations/director_preview/')) {
+        return Response.json(operationStatus)
+      }
+      throw new Error(`Unexpected cold skill request: ${url}`)
+    }
+    const reload = await loadFreshStoreHelper(`director-skill-reload-${tag}`)
+    const base = reload.useStore.getState()
+    reload.useStore.setState({
+      activeWorkspace: workspace,
+      modelsLoaded: true,
+      servicesConfig: { use_director_v2: true },
+      selectedModelPerMode: { ...base.selectedModelPerMode, video: 'video-model' },
+      modelOptions: {
+        model_type: 'video-model', fps: 24, frames_steps: 4, frames_minimum: 5,
+      },
+      modelOptionsLoading: false,
+      h3StyleWorkflowCatalog: [],
+      h3StyleWorkflowCatalogLoading: false,
+    })
+    const recovered = await reload.useStore.getState().resumeDirectorPreview()
+    return { local, recovered, state: reload.useStore.getState() }
+  }
+
+  try {
+    for (const skill of ['music_video', 'short_film']) {
+      const { recovered, state } = await recover(skill, skill)
+      assert.equal(recovered, true)
+      assert.equal(state.directorSkill, skill)
+      assert.equal(state.directorStep, 'review')
+      assert.equal(state.directorClipPlans.length, 1)
+      assert.equal(state.directorPlannedClips.length, 1)
+      assert.equal(state.directorSceneDescription, '')
+      assert.equal(state.directorAnalysis, null)
+      assert.deepEqual(state.shortFilmCharacters, [])
+      if (skill === 'short_film') assert.equal(state.shortFilmPath, null)
+    }
+    for (const [skill, tag] of [['podcast', 'invalid'], [undefined, 'missing']]) {
+      const { local, recovered, state } = await recover(skill, tag)
+      assert.equal(recovered, false)
+      assert.equal(state.directorSkill, null)
+      assert.equal(state.directorStep, 'upload')
+      assert.deepEqual(state.directorClipPlans, [])
+      assert.equal(local.getItem('maestro:director-preview-operations-v2'), null)
+    }
+  } finally {
+    globalThis.fetch = originalFetch
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
   }
 })
 
