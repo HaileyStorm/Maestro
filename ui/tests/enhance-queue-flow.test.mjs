@@ -262,6 +262,90 @@ test('generation admission carries enhancement intent in the single durable requ
   assert.equal(requests[0].body.enhance_before_generate, true)
 })
 
+test('standalone Enhance sends exact count only for type-1 sliding prompts', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+
+  const enhancedRequests = []
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'enhance-ready', status: 'ready' })
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      const body = JSON.parse(String(init.body))
+      enhancedRequests.push(body)
+      return jsonResponse({ original: body.prompt, enhanced: `${body.prompt} enhanced` })
+    }
+    throw new Error(`unexpected enhance request ${url}`)
+  }
+
+  const { useStore } = await loadStoreModule()
+  const baseState = useStore.getState()
+  t.after(() => {
+    useStore.setState(baseState, true)
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+  })
+
+  const modelOptions = {
+    model_type: 'ltx_test', architecture: 'ltx_test', sliding_window: true,
+    fps: 16, latent_size: 4, frames_steps: 4, frames_minimum: 1,
+    sliding_window_defaults: { overlap_default: 5, discard_last_frames: 0 },
+  }
+  useStore.setState({
+    activeWorkspace: 'project one',
+    generationMode: 'video',
+    startImage: null,
+    imageRefs: [],
+    modelOptions,
+    durationSeconds: 10,
+    slidingWindowSeconds: 3,
+    slidingWindowOverlap: 5,
+    params: {
+      ...baseState.params,
+      prompt: 'Frames prompt',
+      model_type: 'ltx_test',
+      image_mode: 2,
+      multi_prompts_gen_type: 3,
+    },
+  })
+  assert.equal(await useStore.getState().enhancePrompt(), true)
+
+  useStore.setState(state => ({
+    params: {
+      ...state.params,
+      prompt: 'Sliding prompt',
+      image_mode: 0,
+      multi_prompts_gen_type: 1,
+    },
+  }))
+  assert.equal(await useStore.getState().enhancePrompt(), true)
+
+  assert.equal(enhancedRequests.length, 2)
+  assert.equal('window_count' in enhancedRequests[0], false)
+  assert.equal(enhancedRequests[1].window_count, 4)
+})
+
 test('account identity changes fence deferred generation submission and active-job discovery', async t => {
   const originalFetch = globalThis.fetch
   const originalWindow = globalThis.window

@@ -48,7 +48,7 @@ def _h3_align(value, *, minimum=124, maximum=345):
     return value
 
 
-class GlobalTimelineParserTests(unittest.TestCase):
+class _GlobalTimelineParserTestMixin:
     def test_supported_clock_seconds_and_point_syntax(self):
         prompt = "\n".join([
             "Cinematic natural light; keep the same protagonist.",
@@ -64,6 +64,340 @@ class GlobalTimelineParserTests(unittest.TestCase):
         )
         self.assertTrue(has_global_timeline(prompt))
 
+
+class EnhancedPromptCardinalityTests(unittest.TestCase):
+    @staticmethod
+    def _load_launch_helpers():
+        source_path = os.path.join(APP, "launch.py")
+        module = ast.parse(
+            Path(source_path).read_text(encoding="utf-8"),
+            filename=source_path,
+        )
+        names = {
+            "_generation_prompt_effective_fps",
+            "_project_enhanced_prompt_window_count",
+            "_seal_enhanced_prompt_cardinality",
+            "_generation_enhancement_request",
+            "_validate_standalone_enhanced_prompt_cardinality",
+        }
+        helpers = [
+            node for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+
+        class FakeWgp:
+            class prompt_parser:
+                has_global_timeline = staticmethod(has_global_timeline)
+
+            @staticmethod
+            def get_base_model_type(model_type):
+                return model_type
+
+            @staticmethod
+            def get_model_def(_model_type):
+                return {
+                    "fps": 16,
+                    "latent_size": 4,
+                    "sliding_window": True,
+                    "sliding_window_defaults": {"overlap_default": 5},
+                }
+
+            @staticmethod
+            def get_model_fps(_model_type):
+                return 16
+
+            @staticmethod
+            def get_computed_fps(force_fps, _model_type, video_guide, _video_source):
+                if force_fps == "control" and video_guide:
+                    return 25
+                if force_fps and force_fps.isdigit():
+                    return int(force_fps)
+                return 16
+
+            @staticmethod
+            def get_model_min_frames_and_step(_model_type):
+                return 1, 4, 4
+
+            @staticmethod
+            def align_model_frame_count(value, _model_def):
+                return (int(value) - 1) // 4 * 4 + 1
+
+            @staticmethod
+            def compute_sliding_window_no(total, window, discard, overlap):
+                import math
+                return 1 + math.ceil(
+                    (total - window + discard)
+                    / (window - discard - overlap)
+                )
+
+        namespace = {
+            "Any": __import__("typing").Any,
+            "Mapping": __import__("typing").Mapping,
+            "math": __import__("math"),
+            "wgp": FakeWgp,
+            "_H3_LONG_STUDIO_MODELS": {"minimax_h3"},
+            "_ENHANCED_PROMPT_CARDINALITY_KEY": (
+                "_maestro_enhanced_prompt_cardinality"
+            ),
+            "_ENHANCED_PROMPT_CARDINALITY_VERSION": 1,
+        }
+        namespace["wgp"]._validate_enhanced_prompt_cardinality = (
+            EnhancedPromptCardinalityTests._load_wgp_validator()
+        )
+        exec(
+            compile(
+                ast.Module(body=helpers, type_ignores=[]),
+                source_path,
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace
+
+    @staticmethod
+    def _load_wgp_validator():
+        source_path = os.path.join(APP, "wgp.py")
+        module = ast.parse(
+            Path(source_path).read_text(encoding="utf-8"),
+            filename=source_path,
+        )
+        helper = next(
+            node for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_validate_enhanced_prompt_cardinality"
+        )
+        namespace = {}
+        exec(
+            compile(
+                ast.Module(body=[helper], type_ignores=[]),
+                source_path,
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace["_validate_enhanced_prompt_cardinality"]
+
+    def test_projected_geometry_matches_quantized_backend_boundary(self):
+        project = self._load_launch_helpers()[
+            "_project_enhanced_prompt_window_count"
+        ]
+        body = {
+            "model_type": "ltx_test",
+            "generation_mode": "video",
+            "multi_prompts_gen_type": 1,
+            "video_length": 250,
+            "sliding_window_size": 78,
+            "sliding_window_overlap": 5,
+            "sliding_window_discard_last_frames": 0,
+        }
+        self.assertEqual(project(body), 4)
+
+    def test_control_fps_duration_fallback_projects_exact_geometry(self):
+        project = self._load_launch_helpers()[
+            "_project_enhanced_prompt_window_count"
+        ]
+        body = {
+            "model_type": "ltx_test",
+            "generation_mode": "video",
+            "multi_prompts_gen_type": 1,
+            "_duration_seconds": 10,
+            "force_fps": "control",
+            "video_guide": "guide.mp4",
+            "sliding_window_size": 78,
+            "sliding_window_overlap": 5,
+        }
+        self.assertEqual(project(body), 4)
+
+    def test_video_length_and_fps_fill_enhancer_duration(self):
+        request = self._load_launch_helpers()[
+            "_generation_enhancement_request"
+        ]
+        result = request({
+            "model_type": "ltx_test",
+            "generation_mode": "video",
+            "multi_prompts_gen_type": 1,
+            "video_length": 250,
+            "force_fps": "25",
+            "sliding_window_size": 78,
+            "sliding_window_overlap": 5,
+            "prompt": "one request",
+        }, "default")
+        self.assertEqual(result["duration_seconds"], 10)
+        self.assertEqual(result["window_count"], 4)
+
+    def test_marker_is_only_sealed_for_multi_window_projection(self):
+        seal = self._load_launch_helpers()[
+            "_seal_enhanced_prompt_cardinality"
+        ]
+        body = {
+            "model_type": "ltx_test",
+            "generation_mode": "video",
+            "multi_prompts_gen_type": 1,
+            "video_length": 250,
+            "sliding_window_size": 78,
+            "sliding_window_overlap": 5,
+        }
+        self.assertIsNone(seal(body, 1))
+        self.assertNotIn("_maestro_enhanced_prompt_cardinality", body)
+        marker = seal(body, 4)
+        self.assertEqual(marker, {"version": 1, "projected_windows": 4})
+        self.assertIs(body["_maestro_enhanced_prompt_cardinality"], marker)
+        h3_body = dict(body, model_type="minimax_h3")
+        self.assertIsNone(seal(h3_body, 4))
+        self.assertNotIn("_maestro_enhanced_prompt_cardinality", h3_body)
+        type3_body = dict(body, multi_prompts_gen_type=3)
+        self.assertIsNone(seal(type3_body, 4))
+        self.assertNotIn("_maestro_enhanced_prompt_cardinality", type3_body)
+        type2_body = dict(body, multi_prompts_gen_type=2)
+        self.assertIsNone(seal(type2_body, 4))
+        self.assertNotIn("_maestro_enhanced_prompt_cardinality", type2_body)
+
+    def test_standalone_enhance_validates_explicit_paragraph_count(self):
+        validate = self._load_launch_helpers()[
+            "_validate_standalone_enhanced_prompt_cardinality"
+        ]
+        body = {"mode": "video", "window_count": 3}
+        self.assertEqual(
+            validate(body, "ltx_test", "first\nsecond\nthird"),
+            "first\nsecond\nthird",
+        )
+        mapped = {
+            "original": "request",
+            "enhanced": "first\nsecond\nthird",
+        }
+        self.assertIs(validate(body, "ltx_test", mapped), mapped)
+        for prompt, detail in (
+            ("first\nsecond", "received 2"),
+            ("first\nsecond\nthird\nfourth", "received 4"),
+            ("first\n\nthird", "blank 1"),
+        ):
+            with self.subTest(detail=detail):
+                with self.assertRaisesRegex(ValueError, detail):
+                    validate(body, "ltx_test", prompt)
+
+        timeline = "\n".join((
+            "Keep the same subject and lighting.",
+            "[00:00-00:05] Establish the room.",
+            "[00:05-00:10] Move toward the window.",
+        ))
+        self.assertEqual(validate(body, "ltx_test", timeline), timeline)
+
+    def test_standalone_enhance_preserves_non_paragraph_contracts(self):
+        validate = self._load_launch_helpers()[
+            "_validate_standalone_enhanced_prompt_cardinality"
+        ]
+        one = "one result"
+        cases = (
+            ({"mode": "video", "window_count": 1}, "ltx_test"),
+            ({"mode": "image", "window_count": 3}, "ltx_test"),
+            ({
+                "mode": "video", "window_count": 3,
+                "preserve_global_timeline": True,
+            }, "ltx_test"),
+            ({"mode": "video", "window_count": 3}, "minimax_h3"),
+        )
+        for body, model_type in cases:
+            with self.subTest(body=body, model_type=model_type):
+                self.assertEqual(validate(body, model_type, one), one)
+
+    def test_standalone_route_validates_before_both_enhancer_returns(self):
+        launch = Path(APP, "launch.py").read_text(encoding="utf-8")
+        route = launch[
+            launch.index('async def llm_enhance_prompt(request: Request):'):
+            launch.index('async def _enhance_with_wangp(')
+        ]
+        self.assertIn("requires_standalone_cardinality", route)
+        self.assertGreaterEqual(
+            route.count("_validate_standalone_enhanced_prompt_cardinality("),
+            2,
+        )
+        self.assertIn("status_code=422, detail=str(error)", route)
+
+    def test_authoritative_validator_accepts_exact_nonblank_windows(self):
+        validate = self._load_wgp_validator()
+        marker = {"version": 1, "projected_windows": 3}
+        self.assertEqual(
+            validate("first\nsecond\nthird", marker, 3),
+            ["first", "second", "third"],
+        )
+
+    def test_authoritative_validator_rejects_under_over_and_blank(self):
+        validate = self._load_wgp_validator()
+        marker = {"version": 1, "projected_windows": 3}
+        cases = (
+            ("first\nsecond", "received 2"),
+            ("first\nsecond\nthird\nfourth", "received 4"),
+            ("first\n\nthird", "blank 1"),
+        )
+        for prompt, detail in cases:
+            with self.subTest(detail=detail):
+                with self.assertRaisesRegex(ValueError, detail):
+                    validate(prompt, marker, 3)
+
+    def test_runtime_contract_precedes_window_dispatch_and_has_no_fallback(self):
+        source = Path(APP, "wgp.py").read_text(encoding="utf-8")
+        boundary = source[
+            source.index("initial_total_windows = 0", 10000):
+            source.index("first_window_video_length", 10000)
+        ]
+        self.assertIn("_validate_enhanced_prompt_cardinality", boundary)
+        loop = source[
+            source.index("while not abort:", source.index(boundary)):
+            source.index("return_latent_slice = None", source.index(boundary))
+        ]
+        self.assertIn("prompts[window_no]", loop)
+        contract_branch = loop[
+            loop.index("_maestro_enhanced_prompt_cardinality is not None"):
+        ]
+        exact_branch = contract_branch.split("\n            else:\n", 1)[0]
+        self.assertIn("prompt = prompts[window_no]", exact_branch)
+        self.assertNotIn("prompts[-1]", exact_branch)
+
+    def test_timeline_transition_precedes_sealing_and_wangp_reenhance_is_skipped(self):
+        seal = self._load_launch_helpers()[
+            "_seal_enhanced_prompt_cardinality"
+        ]
+        transitioned = {
+            "model_type": "ltx_test",
+            "generation_mode": "video",
+            "multi_prompts_gen_type": 1,
+            "video_length": 250,
+            "sliding_window_size": 78,
+            "sliding_window_overlap": 5,
+            "prompt": "[00:00-00:05] Establish the room.",
+        }
+        if has_global_timeline(transitioned["prompt"]):
+            transitioned["multi_prompts_gen_type"] = 2
+        self.assertIsNone(seal(transitioned, 4))
+        self.assertEqual(transitioned["multi_prompts_gen_type"], 2)
+        self.assertNotIn("_maestro_enhanced_prompt_cardinality", transitioned)
+
+        launch = Path(APP, "launch.py").read_text(encoding="utf-8")
+        preparation = launch[
+            launch.index("def _run_generation_preparation("):
+            launch.index("def _require_sample_campaign_owner", launch.index(
+                "def _run_generation_preparation(",
+            ))
+        ]
+        self.assertLess(
+            preparation.index("_studio_prompt_parser.has_global_timeline"),
+            preparation.index("_seal_enhanced_prompt_cardinality"),
+        )
+        wgp_source = Path(APP, "wgp.py").read_text(encoding="utf-8")
+        condition_at = wgp_source.index(
+            "if not studio_global_timeline and prompt_enhancer_image_caption_model",
+        )
+        runtime = wgp_source[condition_at:condition_at + 900]
+        self.assertIn(
+            "if _maestro_enhanced_prompt_cardinality is None:",
+            runtime,
+        )
+        self.assertIn("process_prompt_enhancer", runtime)
+
+
+class GlobalTimelineParserTests(
+    _GlobalTimelineParserTestMixin, unittest.TestCase,
+):
     def test_malformed_or_reversed_ranges_are_preserved_as_global_direction(self):
         prompt = "[ten-20s] keep this literal\n[12-4s] reverse intentionally\n1-2 actors cross frame"
         global_lines, events = parse_global_timeline_prompt(prompt)

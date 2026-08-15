@@ -30769,6 +30769,41 @@ def _with_llm_route_progress(
     return run
 
 
+def _validate_standalone_enhanced_prompt_cardinality(
+    body: Mapping[str, Any], model_type: str, result: Any,
+) -> Any:
+    """Require exact paragraph cardinality for explicit non-H3 Enhance calls."""
+    try:
+        window_count = int(body.get("window_count") or 0)
+    except (TypeError, ValueError):
+        window_count = 0
+    if (
+        window_count <= 1
+        or str(model_type or "").lower().startswith("minimax_h3")
+        or str(body.get("mode") or "video") not in {"video", "avatar"}
+        or body.get("preserve_global_timeline") is True
+    ):
+        return result
+    enhanced_text = (
+        result.get("enhanced")
+        if isinstance(result, Mapping) else result
+    )
+    # A valid timeline is one structured type-2 prompt, not N type-1
+    # paragraphs. Match integrated preparation's parser transition before
+    # applying the paragraph-cardinality contract.
+    if wgp.prompt_parser.has_global_timeline(str(enhanced_text or "")):
+        return result
+    wgp._validate_enhanced_prompt_cardinality(
+        enhanced_text,
+        {
+            "version": _ENHANCED_PROMPT_CARDINALITY_VERSION,
+            "projected_windows": window_count,
+        },
+        window_count,
+    )
+    return result
+
+
 @api.post("/api/v1/llm/enhance-prompt")
 async def llm_enhance_prompt(request: Request):
     """Enhance a generation prompt. Routes to Wan2GP enhancer or local LLM based on config."""
@@ -30806,6 +30841,17 @@ async def llm_enhance_prompt(request: Request):
     durable_generation_preparation = bool(
         getattr(request.state, "maestro_generation_preparation", False)
     )
+    try:
+        standalone_window_count = int(body.get("window_count") or 0)
+    except (TypeError, ValueError):
+        standalone_window_count = 0
+    requires_standalone_cardinality = (
+        not durable_generation_preparation
+        and not needs_h3_context_ir
+        and generation_mode in {"video", "avatar"}
+        and body.get("preserve_global_timeline") is not True
+        and standalone_window_count > 1
+    )
     h3_style_workflow_present = bool(
         durable_generation_preparation
         and body.get("h3_style_workflow_present") is True
@@ -30828,12 +30874,17 @@ async def llm_enhance_prompt(request: Request):
     ):
         try:
             # Support both single image_path and array image_paths
-            return await _enhance_with_wangp(
+            wangp_result = await _enhance_with_wangp(
                 prompt,
                 generation_mode,
                 enhancer_enabled,
                 image_paths=authorized_image_paths,
             )
+            if requires_standalone_cardinality:
+                return _validate_standalone_enhanced_prompt_cardinality(
+                    body, model_type, wangp_result,
+                )
+            return wangp_result
         except Exception as e:
             print(f"[Enhance] Wan2GP enhancer failed, falling back to LLM: {e}")
             # Fall through to LLM
@@ -31038,6 +31089,15 @@ async def llm_enhance_prompt(request: Request):
             selection,
             run_enhancement,
         )
+        if requires_standalone_cardinality:
+            try:
+                result = _validate_standalone_enhanced_prompt_cardinality(
+                    body, model_type, result,
+                )
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=422, detail=str(error),
+                ) from None
         return {"original": prompt, "enhanced": result}
     except HTTPException:
         raise
@@ -35713,6 +35773,125 @@ def _schedule_plan_review_auto_approval(job: dict) -> None:
         raise
 
 
+_ENHANCED_PROMPT_CARDINALITY_KEY = "_maestro_enhanced_prompt_cardinality"
+_ENHANCED_PROMPT_CARDINALITY_VERSION = 1
+
+
+def _generation_prompt_effective_fps(body: Mapping[str, Any]) -> float | None:
+    """Resolve the best request-time FPS without inventing media facts."""
+    model_type = str(body.get("model_type") or "")
+    if not model_type:
+        return None
+    try:
+        base_model_type = wgp.get_base_model_type(model_type)
+    except Exception:
+        base_model_type = model_type
+    try:
+        fps = float(wgp.get_computed_fps(
+            str(body.get("force_fps") or ""),
+            base_model_type,
+            body.get("video_guide"),
+            body.get("video_source"),
+        ))
+    except Exception:
+        try:
+            fps = float(wgp.get_model_fps(base_model_type))
+        except Exception:
+            return None
+    return fps if math.isfinite(fps) and fps > 0 else None
+
+
+def _project_enhanced_prompt_window_count(
+    body: Mapping[str, Any],
+) -> int | None:
+    """Project exact non-H3 type-1 window geometry when request facts allow."""
+    model_type = str(body.get("model_type") or "")
+    try:
+        image_mode = int(body.get("image_mode") or 0)
+        prompt_mode = int(body.get("multi_prompts_gen_type") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not model_type
+        or model_type in _H3_LONG_STUDIO_MODELS
+        or str(body.get("generation_mode") or "video") == "image"
+        or image_mode == 2
+        or prompt_mode != 1
+    ):
+        return None
+    try:
+        model_def = wgp.get_model_def(model_type)
+        if not isinstance(model_def, Mapping) or not model_def.get(
+            "sliding_window", False,
+        ):
+            return None
+        _, _, latent_size = wgp.get_model_min_frames_and_step(model_type)
+        latent_size = int(latent_size)
+        window_size = int(body.get("sliding_window_size") or 0)
+        if latent_size <= 0 or window_size <= 0:
+            return None
+
+        total_frames = int(body.get("video_length") or 0)
+        if total_frames <= 0:
+            duration = float(
+                body.get("_duration_seconds")
+                or body.get("duration_seconds")
+                or 0
+            )
+            fps = _generation_prompt_effective_fps(body)
+            if duration <= 0 or fps is None:
+                return None
+            total_frames = int(round(duration * fps))
+        if total_frames <= 0:
+            return None
+
+        total_frames = int(wgp.align_model_frame_count(
+            total_frames, model_def,
+        ))
+        window_size = (window_size - 1) // latent_size * latent_size + 1
+        overlap = int(body.get("sliding_window_overlap") or 0)
+        defaults = model_def.get("sliding_window_defaults") or {}
+        if overlap and int(defaults.get("overlap_default") or 0) != overlap:
+            overlap = (overlap - 1) // latent_size * latent_size + 1
+        discard = int(
+            body.get("sliding_window_discard_last_frames") or 0
+        )
+        discard = discard // latent_size * latent_size
+        if body.get("video_source") is not None:
+            total_frames += overlap - 1
+        overlap = min(window_size - latent_size, overlap)
+        if total_frames <= window_size:
+            return None
+        stride = window_size - discard - overlap
+        if stride <= 0:
+            return None
+        return int(wgp.compute_sliding_window_no(
+            total_frames, window_size, discard, overlap,
+        ))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _seal_enhanced_prompt_cardinality(
+    body: dict, projected_windows: int | None,
+) -> dict | None:
+    """Seal only the explicit enhanced multi-window contract."""
+    body.pop(_ENHANCED_PROMPT_CARDINALITY_KEY, None)
+    enforced_windows = _project_enhanced_prompt_window_count(body)
+    if (
+        projected_windows is None
+        or projected_windows <= 1
+        or enforced_windows != projected_windows
+    ):
+        return None
+    marker = {
+        "version": _ENHANCED_PROMPT_CARDINALITY_VERSION,
+        "projected_windows": int(projected_windows),
+    }
+    body[_ENHANCED_PROMPT_CARDINALITY_KEY] = marker
+    return marker
+
+
 def _generation_enhancement_request(body: dict, workspace: str) -> dict:
     """Project generation parameters into the standalone enhancer contract."""
     mode = str(body.get("generation_mode") or "video")
@@ -35740,9 +35919,21 @@ def _generation_enhancement_request(body: dict, workspace: str) -> dict:
             validate_resolved_h3_style_workflow,
         )
         validate_resolved_h3_style_workflow(workflow)
-    window_count = None
-    if model_type in _H3_LONG_STUDIO_MODELS and duration > 0:
-        window_count = max(1, int(math.ceil(duration / 15.0)))
+    if model_type in _H3_LONG_STUDIO_MODELS:
+        window_count = (
+            max(1, int(math.ceil(duration / 15.0)))
+            if duration > 0 else 1
+        )
+    else:
+        window_count = _project_enhanced_prompt_window_count(body)
+    if duration <= 0 and model_type not in _H3_LONG_STUDIO_MODELS:
+        fps = _generation_prompt_effective_fps(body)
+        try:
+            video_length = int(body.get("video_length") or 0)
+        except (TypeError, ValueError):
+            video_length = 0
+        if fps is not None and video_length > 0:
+            duration = video_length / fps
     activated_loras = body.get("activated_loras")
     return {
         "workspace": workspace,
@@ -35823,6 +36014,7 @@ def _run_generation_preparation(
     request.state.maestro_cpu_text_text_only = True
     phase = "enhancing_prompt" if enhance else "planning_generation"
     sealed_pointer = None
+    enhance_window_count = None
     previous_pointer = dict(job.get("_recovery_manifest_pointer") or {})
     try:
         prepared_params = copy.deepcopy(dict(job.get("params") or {}))
@@ -35847,6 +36039,7 @@ def _run_generation_preparation(
                 enhancement_params,
                 str(job.get("workspace") or "default"),
             )
+            enhance_window_count = enhance_body.get("window_count")
             result = asyncio.run(
                 llm_enhance_prompt(request.with_body(enhance_body))
             )
@@ -35877,6 +36070,28 @@ def _run_generation_preparation(
                 prepared_params.get("prompt", "")
             ):
                 prepared_params["multi_prompts_gen_type"] = 2
+        if (
+            enhance
+            and str(prepared_params.get("model_type") or "")
+            not in _H3_LONG_STUDIO_MODELS
+            and str(prepared_params.get("generation_mode") or "video")
+            in {"video", "avatar"}
+            and int(prepared_params.get("multi_prompts_gen_type") or 0) == 1
+            and isinstance(enhance_window_count, int)
+            and enhance_window_count > 1
+        ):
+            # Enhancement may introduce a complete timestamped timeline. Its
+            # type-2 parser contract supersedes paragraph-per-window mode, so
+            # seal only after that authoritative mode transition.
+            cardinality_marker = _seal_enhanced_prompt_cardinality(
+                prepared_params, enhance_window_count,
+            )
+            if cardinality_marker is not None:
+                wgp._validate_enhanced_prompt_cardinality(
+                    prepared_params.get("prompt", ""),
+                    cardinality_marker,
+                    int(cardinality_marker["projected_windows"]),
+                )
         enhanced_source_params = copy.deepcopy(prepared_params)
         plan, estimate = _plan_generation_submission(
             prepared_params,
@@ -37189,6 +37404,11 @@ async def release_sample_campaign_arm(request: Request):
 async def generate(request: Request):
     """Submit a generation job. Returns immediately with a job_id."""
     body = await request.json()
+    if _ENHANCED_PROMPT_CARDINALITY_KEY in body:
+        raise HTTPException(
+            status_code=400,
+            detail="Enhanced prompt preparation state is server-owned",
+        )
     workspace = body.pop("workspace", None) or _get_active_workspace()
     enhance_before_generate = body.pop(
         "enhance_before_generate", False,

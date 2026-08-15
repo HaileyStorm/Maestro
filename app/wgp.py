@@ -741,6 +741,41 @@ def compute_sliding_window_no(current_video_length, sliding_window_size, discard
     return 1 + math.ceil(left_after_first_window / (sliding_window_size - discard_last_frames - reuse_frames))
 
 
+def _validate_enhanced_prompt_cardinality(
+    prompt, marker, authoritative_windows,
+):
+    """Validate one server-sealed enhanced prompt without exposing content."""
+    valid_marker = (
+        isinstance(marker, dict)
+        and set(marker) == {"version", "projected_windows"}
+        and marker.get("version") == 1
+        and type(marker.get("projected_windows")) is int
+        and marker["projected_windows"] > 1
+    )
+    if not valid_marker:
+        raise ValueError("Enhanced prompt window contract is invalid")
+    if type(authoritative_windows) is not int or authoritative_windows < 1:
+        raise ValueError("Enhanced prompt window geometry is invalid")
+
+    raw_lines = str(prompt or "").replace("\r\n", "\n").replace(
+        "\r", "\n",
+    ).split("\n")
+    blank_lines = sum(not line.strip() for line in raw_lines)
+    received_windows = len(raw_lines) - blank_lines
+    projected_windows = marker["projected_windows"]
+    if (
+        projected_windows != authoritative_windows
+        or received_windows != authoritative_windows
+        or blank_lines
+    ):
+        raise ValueError(
+            "Enhanced prompt window count mismatch: "
+            f"planned {projected_windows}, expected {authoritative_windows}, "
+            f"received {received_windows}, blank {blank_lines}"
+        )
+    return [line.strip() for line in raw_lines]
+
+
 def clean_image_list(gradio_list):
     if not isinstance(gradio_list, list): gradio_list = [gradio_list]
     gradio_list = [ tup[0] if isinstance(tup, tuple) else tup for tup in gradio_list ]        
@@ -9688,6 +9723,7 @@ def generate_video(
     _h3_source_audio_premux_recovery=None,
     after_repeat_output=None,
     after_segment_output=None,
+    _maestro_enhanced_prompt_cardinality=None,
 ):
 
     # API scheduling needs a model-safe boundary between independent outputs.
@@ -10952,6 +10988,19 @@ def generate_video(
     else:
         initial_total_windows = 1
 
+    if _maestro_enhanced_prompt_cardinality is not None:
+        if (
+            not sliding_window
+            or multi_prompts_gen_type != 1
+            or str(base_model_type).startswith("minimax_h3")
+        ):
+            raise ValueError("Enhanced prompt window contract is out of scope")
+        prompts = _validate_enhanced_prompt_cardinality(
+            prompt,
+            _maestro_enhanced_prompt_cardinality,
+            initial_total_windows,
+        )
+
     # Studio global-timeline prompts arrive as one structured prompt
     # (multi_prompts_gen_type=2). Only now do we know the backend's effective
     # FPS and quantized window/overlap/discard geometry, so this is the first
@@ -11114,24 +11163,54 @@ def generate_video(
         cached_video_video_start_frame = cached_video_video_end_frame = -1
         start_time = time.time()
         if not studio_global_timeline and prompt_enhancer_image_caption_model != None and prompt_enhancer !=None and len(prompt_enhancer)>0 and enhancer_mode == 0:
-            send_cmd("progress", [0, get_latest_status(state, "Enhancing Prompt")])
-            enhanced_prompts = process_prompt_enhancer(model_def, prompt_enhancer, original_prompts,  image_start if image_start is not None else image_end , original_image_refs, is_image, audio_only, seed )
-            unload_prompt_enhancer_runtime()
-            if enhanced_prompts is not None:
-                print(f"Enhanced prompts: {enhanced_prompts}" )
-                task["prompt"] = "\n".join(["!enhanced!"] + enhanced_prompts)
-                send_cmd("output")
-                prompts = enhanced_prompts            
-                abort = gen.get("abort", False)
+            # A sealed Maestro prompt has already passed its exact-cardinality
+            # enhancement contract; do not replace or disclose it here.
+            if _maestro_enhanced_prompt_cardinality is None:
+                send_cmd("progress", [0, get_latest_status(state, "Enhancing Prompt")])
+                enhanced_prompts = process_prompt_enhancer(model_def, prompt_enhancer, original_prompts,  image_start if image_start is not None else image_end , original_image_refs, is_image, audio_only, seed )
+                unload_prompt_enhancer_runtime()
+                if enhanced_prompts is not None:
+                    print(f"Enhanced prompts: {enhanced_prompts}" )
+                    task["prompt"] = "\n".join(["!enhanced!"] + enhanced_prompts)
+                    send_cmd("output")
+                    prompts = enhanced_prompts
+                    abort = gen.get("abort", False)
 
  
         while not abort:
             enable_RIFLEx = RIFLEx_setting == 0 and current_video_length > (6* get_model_fps(base_model_type)+1) or RIFLEx_setting == 1
-            prompt =  prompts[window_no] if window_no < len(prompts) else prompts[-1]
+            if (
+                _maestro_enhanced_prompt_cardinality is not None
+                and window_no >= initial_total_windows + extra_windows
+            ):
+                break
+            if _maestro_enhanced_prompt_cardinality is not None:
+                prompt = prompts[window_no]
+            else:
+                prompt = (
+                    prompts[window_no]
+                    if window_no < len(prompts) else prompts[-1]
+                )
             if len(prompts) > 1:
-                print(f"[Sliding Window] window_no={window_no}, prompt_idx={'same' if window_no >= len(prompts) else window_no}, prompt='{prompt[:80]}...'")
+                if _maestro_enhanced_prompt_cardinality is not None:
+                    print(
+                        "[Sliding Window] Enhanced prompt selected: "
+                        f"window={window_no + 1}/{len(prompts)}"
+                    )
+                else:
+                    print(f"[Sliding Window] window_no={window_no}, prompt_idx={'same' if window_no >= len(prompts) else window_no}, prompt='{prompt[:80]}...'")
             new_extra_windows = gen.get("extra_windows",0)
             gen["extra_windows"] = 0
+            if (
+                _maestro_enhanced_prompt_cardinality is not None
+                and new_extra_windows
+            ):
+                raise ValueError(
+                    "Enhanced prompt window count mismatch: "
+                    f"planned {len(prompts)}, expected "
+                    f"{initial_total_windows + extra_windows + new_extra_windows}, "
+                    f"received {len(prompts)}, blank 0"
+                )
             extra_windows += new_extra_windows
             requested_frames_to_generate +=  new_extra_windows * (sliding_window_size - discard_last_frames - reuse_frames)
             sliding_window = sliding_window  or extra_windows > 0
@@ -12064,6 +12143,7 @@ def generate_video(
                 # formatting, embedded metadata, saved settings, or sidecars.
                 inputs.pop("_h3_turbo_validation_authorized", None)
                 inputs.pop("_h3_native_boundary", None)
+                inputs.pop("_maestro_enhanced_prompt_cardinality", None)
                 inputs.pop("_recovery_output_directory", None)
                 inputs.pop("_recovery_output_prefix", None)
                 inputs.pop("_h3_source_audio_premux_recovery", None)

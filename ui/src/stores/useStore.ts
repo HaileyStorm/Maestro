@@ -9530,6 +9530,18 @@ export const useStore = create<AppState>((set, get) => ({
             },
           ).windowCount
         : 1
+      const promptMode = Number(state.params.multi_prompts_gen_type ?? 0)
+      const standaloneType1SlidingPrompt = (
+        generationMode === 'video'
+        && state.modelOptions?.sliding_window === true
+        && state.durationSeconds > state.slidingWindowSeconds
+        && windowCount > 1
+        && !state.params.model_type.startsWith('minimax_h3')
+        && !String(state.modelOptions?.architecture || '').startsWith('minimax_h3')
+        && state.params.image_mode !== 2
+        && (promptMode === 0 || promptMode === 1)
+        && !hasGlobalTimeline(params.prompt)
+      )
 
       // TTS dialogue needs more tokens for longer conversations
       const maxTokens = (generationMode === 'audio' && ttsMode) ? 2048 : undefined
@@ -9542,7 +9554,7 @@ export const useStore = create<AppState>((set, get) => ({
         max_new_tokens: maxTokens,
         image_paths: imagePaths.length > 0 ? imagePaths : undefined,
         duration_seconds: (generationMode === 'video' || generationMode === 'avatar') ? state.durationSeconds : undefined,
-        window_count: (generationMode === 'video' || generationMode === 'avatar') ? windowCount : undefined,
+        window_count: standaloneType1SlidingPrompt ? windowCount : undefined,
         window_size_seconds: (generationMode === 'video' || generationMode === 'avatar') ? state.slidingWindowSeconds : undefined,
         preserve_global_timeline: generationMode === 'video' && hasGlobalTimeline(params.prompt),
         activated_loras: params.activated_loras.length > 0 ? params.activated_loras : undefined,
