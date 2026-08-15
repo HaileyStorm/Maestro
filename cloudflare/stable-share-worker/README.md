@@ -77,7 +77,7 @@ Cloudflare references: [Quick Tunnel limitations](https://developers.cloudflare.
 [multiple `Set-Cookie` headers](https://developers.cloudflare.com/workers/runtime-apis/headers/),
 and [Workers limits](https://developers.cloudflare.com/workers/platform/limits/).
 
-## One-time provisioning
+## Staged provisioning and upgrades
 
 1. In the Cloudflare dashboard, confirm the account says **Workers Free**, has
    no paid Workers subscription, and has no payment method you intend this
@@ -87,21 +87,78 @@ and [Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
 2. Preferred: create a narrowly scoped Cloudflare API token for only this
    account's Workers Scripts, Workers KV Storage, and Account Settings read
    permissions. Put it and the account ID only in the ignored `ENVIRONMENT`.
-3. One-time OAuth fallback: if there is no API token, run `npx wrangler@4 login`
-   in this directory first. The provisioner uses `wrangler whoami` only to
-   confirm the authenticated account; it never reads or prints the OAuth token.
-4. Run `node provision.mjs`. When no update secret exists, the script generates
-   32 random bytes locally. It passes the secret to Wrangler only over stdin,
-   uses a mode-0600 temporary config, disables observability, creates one KV
-   namespace when needed, deploys, and uploads `UPDATE_TOKEN` as a Worker secret.
-5. The script atomically updates the ignored `ENVIRONMENT` (mode 0600) with the
-   update secret, account ID, KV ID, Worker name, and emitted
-   `https://<worker>.<subdomain>.workers.dev` origin. It never prints the secret.
-   A scoped API token is blanked from `ENVIRONMENT` after successful setup;
-   add a fresh token again only when intentionally reprovisioning.
-   In the OAuth lane it then runs `wrangler logout` and verifies `whoami` no
-   longer reports an account, removing the broad one-time credential. If that
-   cleanup cannot be verified, run `npx wrangler@4 logout` immediately.
+3. OAuth fallback: if there is no API token, run `npx wrangler@4 login`
+   in this directory before each stage or promotion command. The provisioner
+   uses `wrangler whoami` only to confirm the authenticated account; it never
+   reads or prints the OAuth token.
+4. This upgrade provisioner requires the named Worker to have an existing,
+   readable production deployment. It checks that state before creating KV or
+   uploading anything. For a genuinely fresh account, first use the Cloudflare
+   dashboard to create the exact configured Worker name from Cloudflare's
+   minimal starter on the Workers Free plan, with no custom domain, route, or
+   extra binding. Do not give Maestro that temporary URL. Once the dashboard
+   shows that starter deployment, return here immediately; the reviewed staging
+   flow below replaces it with the exact repository source, secret, and KV
+   binding before Maestro records a stable URL. This bounded prerequisite is
+   deliberately separate so an unavailable readback can never be mistaken for
+   permission to bootstrap over an existing Worker.
+5. Stage a candidate without sending production traffic to it:
+
+   ```sh
+   node provision.mjs --stage
+   ```
+
+   With no update secret, the script generates 32 random bytes locally. It puts
+   `UPDATE_TOKEN` in a mode-0600 temporary secrets file, passes only that file's
+   path to `wrangler versions upload --secrets-file`, and deletes the whole
+   temporary directory afterward. The secret is never placed in command
+   arguments, Wrangler config, candidate metadata, or output. The same temporary
+   directory holds the mode-0600 Wrangler config; observability stays disabled.
+   Staging creates the KV namespace only when needed and uploads one no-traffic
+   Worker version. It does **not** use `wrangler deploy` and does not change
+   `PINOKIO_STABLE_SHARE_URL`, so the current stable proxy remains live.
+   If the script must create KV, it atomically records the new namespace ID
+   before attempting the upload. A failed or unparseable upload can therefore
+   be retried without creating another namespace.
+6. The stage command prints the exact candidate Version ID and version-preview
+   URL. Inspect that preview and complete the relevant health and browser checks.
+   The ignored mode-0600 `ENVIRONMENT` records an opaque, non-secret candidate
+   value bound to the exact account, Worker name, KV namespace, Version ID,
+   preview/stable origins, Worker-source digest, generated-config digest, and a
+   one-way SHA-256 verifier for the stage-time `UPDATE_TOKEN`. Promotion fails
+   if the current secret differs; the raw secret is never stored in candidate
+   metadata. Every managed `ENVIRONMENT` key is rewritten exactly once so a
+   duplicate stale token or candidate cannot survive canonicalization.
+7. After accepting that exact preview, promote it deliberately:
+
+   ```sh
+   node provision.mjs --promote 12345678-1234-4abc-8def-123456789abc
+   ```
+
+   Promotion fails before cutover if the argument is not the recorded Version
+   ID or if the account, Worker, KV binding, source, or config has changed. The
+   script runs `wrangler versions deploy <id>@100% -y`; only after that succeeds
+   and a read-only `deployments status --json` confirms the exact
+   candidate at 100% does it atomically update `PINOKIO_STABLE_SHARE_URL` and
+   clear the candidate record. A nonzero deploy exit is treated as ambiguous,
+   not as proof that traffic stayed unchanged: the same production readback can
+   confirm and reconcile a successful remote cutover. The ignored `ENVIRONMENT`
+   remains mode 0600 and the secret is never printed. A scoped API token is
+   blanked only after confirmed promotion; add a fresh token again only when
+   intentionally staging another version. Candidate metadata and the update
+   secret are removed from every Wrangler child environment.
+
+In the OAuth lane, each stage or promotion invocation runs `wrangler logout`
+and verifies that `whoami` no longer reports an account. Log in again before the
+separate promotion command. If cleanup cannot be verified, run
+`npx wrangler@4 logout` immediately. A failed stage leaves production untouched;
+an unconfirmed promotion preserves both the previous
+`PINOKIO_STABLE_SHARE_URL` and candidate record but may already have changed
+remote traffic. Reauthenticate if needed, then rerun the exact same
+`node provision.mjs --promote <version-id>` command. Its initial read-only
+production check reconciles an already-active exact candidate without deploying
+again; otherwise it retries the exact recorded promotion. Do not stage another
+candidate until this state is reconciled.
 
 Starting Maestro remains the only runtime action. After Pinokio reports its
 Quick Tunnel, the local helper updates the Worker over the authenticated target
@@ -195,12 +252,20 @@ visit uses the Quick Tunnel hostname and may require unlocking the project again
 because stable-host cookies are not shared across hosts.
 
 Stable-host proxying is the default when `SHARE_MODE` is absent or `proxy`. To
-roll back, set `SHARE_MODE=redirect`. An unrecognized nonblank value fails safe
-to redirect mode. Redirect mode sends every ordinary path to the validated
-target while target registration, health checks, and the offline response remain
-unchanged. The example Wrangler config records the default explicitly. Changing
-a Worker variable creates a Cloudflare deployment; it does not require a paid
-plan.
+roll back behavior, set `SHARE_MODE=redirect` in the ignored `ENVIRONMENT`,
+stage that config/source as a new candidate, inspect its preview, and explicitly
+promote its recorded Version ID with the same two-phase commands above. The
+provisioner accepts only the exact values `proxy` and `redirect`; the Worker
+itself continues to fail safe to redirect mode if an unrecognized nonblank
+binding is applied outside this provisioner. Redirect mode sends every ordinary
+path to the validated target while target registration, health checks, and the
+offline response remain unchanged. The example Wrangler config records the
+default explicitly. Do not
+use direct `wrangler deploy` for rollback: it bypasses preview acceptance and
+immediately changes production traffic. For a source rollback, restore the
+intended reviewed source revision, run `node provision.mjs --stage`, accept the
+new preview, and promote that newly recorded exact Version ID. Neither rollback
+path requires a paid plan.
 
 The reserved authenticated endpoints are:
 

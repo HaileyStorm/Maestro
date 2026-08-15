@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -584,20 +585,180 @@ class RestartStatusClientTests(unittest.TestCase):
 
 
 class StableShareSourceContracts(unittest.TestCase):
+    def test_provision_helpers_parse_exact_stage_and_promotion_contract(self):
+        helper_url = (
+            ROOT / "cloudflare" / "stable-share-worker" / "provision_helpers.mjs"
+        ).as_uri()
+        script = f"""
+            import {{
+              candidateMatches,
+              canonicalizeManagedEnvironment,
+              encodeCandidateMetadata,
+              extractVersionUpload,
+              parseCandidateMetadata,
+              parseDeploymentReadback,
+              parseProvisionArgs,
+            }} from {json.dumps(helper_url)};
+            const versionId = "12345678-1234-4abc-8def-123456789abc";
+            const upload = extractVersionUpload(
+              `Uploaded maestro-stable-share (1 sec)\nWorker Version ID: ${{versionId}}\n` +
+              "Version Preview URL: https://12345678-maestro-stable-share.owner.workers.dev\\n",
+              "maestro-stable-share",
+            );
+            const candidate = {{
+              schemaVersion: 1,
+              accountId: "a".repeat(32),
+              workerName: "maestro-stable-share",
+              namespaceId: "b".repeat(32),
+              versionId,
+              previewUrl: upload.previewUrl,
+              stableUrl: upload.stableUrl,
+              sourceSha256: "c".repeat(64),
+              configSha256: "d".repeat(64),
+              updateTokenSha256: "e".repeat(64),
+            }};
+            const encoded = encodeCandidateMetadata(candidate);
+            const parsed = parseCandidateMetadata(encoded);
+            const invalidArgs = [];
+            for (const args of [["--promote"], ["--promote", "latest"], ["--stage", "extra"]]) {{
+              try {{ parseProvisionArgs(args); invalidArgs.push(false); }}
+              catch {{ invalidArgs.push(true); }}
+            }}
+            console.log(JSON.stringify({{
+              defaultAction: parseProvisionArgs([]),
+              stageAction: parseProvisionArgs(["--stage"]),
+              promoteAction: parseProvisionArgs(["--promote", versionId.toUpperCase()]),
+              upload,
+              parsed,
+              matches: candidateMatches(parsed, candidate),
+              rejectsDigestDrift: !candidateMatches(parsed, {{ ...candidate, sourceSha256: "f".repeat(64) }}),
+              rejectsChangedSecret: !candidateMatches(
+                parsed,
+                {{ ...candidate, updateTokenSha256: "a".repeat(64) }},
+              ),
+              activeReadback: parseDeploymentReadback(
+                JSON.stringify({{ versions: [{{ version_id: versionId, percentage: 100 }}] }}),
+                versionId,
+              ),
+              inactiveReadback: parseDeploymentReadback(
+                JSON.stringify({{ versions: [
+                  {{ version_id: versionId, percentage: 25 }},
+                  {{ version_id: "87654321-4321-4abc-8def-abcdef123456", percentage: 75 }},
+                ] }}),
+                versionId,
+              ),
+              invalidReadback: parseDeploymentReadback(
+                `{{"versions":[{{"version_id":"${{versionId}}","percentage":100}}],"versions":[]}}`,
+                versionId,
+              ),
+              canonicalEnvironment: canonicalizeManagedEnvironment(
+                "CLOUDFLARE_API_TOKEN=old\\nKEEP=value\\nCLOUDFLARE_API_TOKEN=leaked\\nPINOKIO_STABLE_SHARE_CANDIDATE=old\\nPINOKIO_STABLE_SHARE_CANDIDATE=stale\\n",
+                {{ CLOUDFLARE_API_TOKEN: "", PINOKIO_STABLE_SHARE_CANDIDATE: "new" }},
+                ["CLOUDFLARE_API_TOKEN", "PINOKIO_STABLE_SHARE_CANDIDATE"],
+              ),
+              rejectsBadPreview: extractVersionUpload(
+                `Worker Version ID: ${{versionId}}\nVersion Preview URL: https://other.workers.dev`,
+                "maestro-stable-share",
+              ) === null,
+              invalidArgs,
+            }}));
+        """
+        result = subprocess.run(
+            ["node", "--input-type=module", "--eval", script],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(result.stdout)
+        version_id = "12345678-1234-4abc-8def-123456789abc"
+        self.assertEqual(payload["defaultAction"], {"phase": "stage", "versionId": ""})
+        self.assertEqual(payload["stageAction"], {"phase": "stage", "versionId": ""})
+        self.assertEqual(
+            payload["promoteAction"],
+            {"phase": "promote", "versionId": version_id},
+        )
+        self.assertEqual(payload["upload"], {
+            "versionId": version_id,
+            "previewUrl": "https://12345678-maestro-stable-share.owner.workers.dev",
+            "stableUrl": "https://maestro-stable-share.owner.workers.dev",
+        })
+        self.assertEqual(payload["parsed"]["versionId"], version_id)
+        self.assertTrue(payload["matches"])
+        self.assertTrue(payload["rejectsDigestDrift"])
+        self.assertTrue(payload["rejectsChangedSecret"])
+        self.assertTrue(payload["rejectsBadPreview"])
+        self.assertTrue(payload["activeReadback"]["active"])
+        self.assertFalse(payload["inactiveReadback"]["active"])
+        self.assertIsNone(payload["invalidReadback"])
+        self.assertEqual(
+            payload["canonicalEnvironment"],
+            "KEEP=value\nCLOUDFLARE_API_TOKEN=\nPINOKIO_STABLE_SHARE_CANDIDATE=new\n",
+        )
+        self.assertEqual(payload["invalidArgs"], [True, True, True])
+
     def test_provisioner_keeps_secret_off_argv_and_temporary_wrangler_config(self):
         source = (
             ROOT / "cloudflare" / "stable-share-worker" / "provision.mjs"
         ).read_text(encoding="utf-8")
         self.assertIn("if (apiToken) childEnvironment.CLOUDFLARE_API_TOKEN = apiToken", source)
-        self.assertIn('{ input: `${updateSecret}\\n`', source)
+        self.assertIn("JSON.stringify({ UPDATE_TOKEN: updateSecret })", source)
+        self.assertIn('"--secrets-file", secretsPath', source)
         self.assertNotIn('"--var", updateSecret', source)
         self.assertNotIn("writeFileSync(configPath, updateSecret", source)
+        self.assertNotIn("updateSecret]", source)
         self.assertIn("observability: { enabled: false }", source)
+        self.assertIn('vars: { SHARE_MODE: shareMode }', source)
         self.assertIn("randomBytes(32).toString(\"hex\")", source)
         self.assertIn("CLOUDFLARE_WORKERS_FREE_CONFIRMED=true", source)
         self.assertIn("renameSync(temporaryEnvironment, environmentPath)", source)
         self.assertIn("chmodSync(environmentPath, 0o600)", source)
         self.assertNotIn("process.stdout.write(updateSecret", source)
+        self.assertIn("delete childEnvironment.PINOKIO_STABLE_SHARE_UPDATE_SECRET", source)
+        self.assertIn("delete childEnvironment.PINOKIO_STABLE_SHARE_CANDIDATE", source)
+        self.assertIn("delete childEnvironment.UPDATE_TOKEN", source)
+
+    def test_provisioner_stages_without_traffic_then_promotes_exact_candidate(self):
+        source = (
+            ROOT / "cloudflare" / "stable-share-worker" / "provision.mjs"
+        ).read_text(encoding="utf-8")
+        helpers = (
+            ROOT / "cloudflare" / "stable-share-worker" / "provision_helpers.mjs"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"versions", "upload", "--config", configPath', source)
+        self.assertIn('"versions", "deploy", `${candidate.versionId}@100%`', source)
+        self.assertIn('"--config", configPath, "-y"', source)
+        self.assertNotIn('wrangler(["deploy"', source)
+        self.assertNotIn('wrangler(["secret", "put"', source)
+        self.assertIn("extractVersionUpload(commandOutput(uploaded), workerName)", source)
+        self.assertIn("PINOKIO_STABLE_SHARE_CANDIDATE: encodeCandidateMetadata(candidate)", source)
+        self.assertIn("candidateMatches(candidate, expected)", source)
+        self.assertIn("sourceSha256", source)
+        self.assertIn("configSha256", source)
+        self.assertIn("updateTokenSha256", source)
+        self.assertIn("PINOKIO_STABLE_SHARE_URL: candidate.stableUrl", source)
+        self.assertLess(
+            source.index('"versions", "deploy", `${candidate.versionId}@100%`'),
+            source.index("PINOKIO_STABLE_SHARE_URL: candidate.stableUrl"),
+        )
+        stage_start = source.index('if (action.phase === "stage")')
+        promote_start = source.index("} else {", stage_start)
+        self.assertNotIn("PINOKIO_STABLE_SHARE_URL", source[stage_start:promote_start])
+        self.assertIn("CANDIDATE_KEYS", helpers)
+        self.assertNotIn("updateSecret", helpers)
+        self.assertIn("canonicalizeManagedEnvironment", source)
+        self.assertIn('"deployments", "status", "--json"', source)
+        self.assertNotIn('"versions", "deployments", "status"', source)
+        self.assertIn("parseDeploymentReadback(readbackResult.stdout", source)
+        self.assertIn("promotion outcome is ambiguous", source)
+
+        namespace_assignment = source.index(
+            "namespaceId = extractNamespaceId(commandOutput(created))",
+        )
+        namespace_persist = source.index("replaceEnvironmentValues({", namespace_assignment)
+        version_upload = source.index('"versions", "upload"')
+        self.assertLess(namespace_assignment, namespace_persist)
+        self.assertLess(namespace_persist, version_upload)
 
     def test_oauth_fallback_is_logged_out_and_verified(self):
         source = (
