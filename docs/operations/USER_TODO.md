@@ -5,7 +5,9 @@ are settled.
 
 ## Questions
 
-None right now.
+- May the shared-harness successor take over the unfinished old scanner
+  reservation without marking that old work complete? This preserves the files
+  and unblocks Maestro's launcher work.
 
 ## Needed now
 
