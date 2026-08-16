@@ -21,10 +21,14 @@ from services.minimax_music3_sglang_contract import (  # noqa: E402
     MAX_INSTRUCTIONS_BYTES,
     MAX_NEW_TOKENS,
     MAX_SEED,
+    HOSTED_SERVICE_AUTHORIZATION_SCOPE,
+    LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,
+    LOCAL_EXPERIMENT_REQUIRED_GATES,
     MUSIC3_HF_EXACT_REVISION,
     MUSIC3_HF_REVISION,
     MUSIC3_MODEL_ID,
-    REQUIRED_EXTERNAL_GATES,
+    SUPPORTED_AUTHORIZATION_SCOPES,
+    UNAPPROVED_AUTHORIZATION_SCOPES,
     UNSUPPORTED_REQUEST_FIELDS,
     Music3HealthEvidence,
     Music3ModelEvidence,
@@ -141,7 +145,41 @@ class SourceBindingTests(unittest.TestCase):
         })
         self.assertEqual(MUSIC3_HF_REVISION, "fbdf52fbaaca799592917417eb05f1899f1255ec")
         self.assertEqual(rendered["runtime_source_revision"], revision)
-        self.assertEqual(rendered["required_external_gates"], list(REQUIRED_EXTERNAL_GATES))
+        self.assertEqual(
+            rendered["authorization_scope"],
+            LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,
+        )
+        self.assertEqual(
+            rendered["required_local_experiment_gates"],
+            list(LOCAL_EXPERIMENT_REQUIRED_GATES),
+        )
+        self.assertEqual(
+            LOCAL_EXPERIMENT_REQUIRED_GATES,
+            (
+                "acceptable_use_approval",
+                "attribution_approval",
+                "license_approval",
+                "locality_approval",
+                "united_states_approval",
+                "local_experiment_approval",
+            ),
+        )
+        self.assertNotIn(
+            "hosted_service_approval",
+            LOCAL_EXPERIMENT_REQUIRED_GATES,
+        )
+        self.assertEqual(
+            rendered["unapproved_authorization_scopes"],
+            [HOSTED_SERVICE_AUTHORIZATION_SCOPE],
+        )
+        self.assertEqual(
+            SUPPORTED_AUTHORIZATION_SCOPES,
+            (LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,),
+        )
+        self.assertEqual(
+            UNAPPROVED_AUTHORIZATION_SCOPES,
+            (HOSTED_SERVICE_AUTHORIZATION_SCOPE,),
+        )
         self.assertIs(rendered["execution_authorized"], False)
 
     def test_runtime_revision_must_be_exact_content_address(self):
@@ -178,7 +216,7 @@ class SourceBindingTests(unittest.TestCase):
             Music3SglangSourceBinding(
                 good.model_identity,
                 good.runtime_source_revision,
-                required_external_gates=(),
+                required_local_experiment_gates=(),
             )
         with self.assertRaises(FrozenInstanceError):
             good.runtime_source_revision = "sha256:" + ("1" * 64)

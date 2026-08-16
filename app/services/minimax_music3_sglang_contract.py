@@ -64,14 +64,18 @@ UNSUPPORTED_REQUEST_FIELDS = frozenset({
     "top_k",
     "repetition_penalty",
 })
-REQUIRED_EXTERNAL_GATES = (
+LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE = "local_experiment"
+HOSTED_SERVICE_AUTHORIZATION_SCOPE = "hosted_service"
+LOCAL_EXPERIMENT_REQUIRED_GATES = (
     "acceptable_use_approval",
     "attribution_approval",
     "license_approval",
     "locality_approval",
     "united_states_approval",
-    "hosted_service_approval",
+    "local_experiment_approval",
 )
+SUPPORTED_AUTHORIZATION_SCOPES = (LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,)
+UNAPPROVED_AUTHORIZATION_SCOPES = (HOSTED_SERVICE_AUTHORIZATION_SCOPE,)
 _VALIDATED_RESPONSE_TOKEN = object()
 
 
@@ -120,7 +124,7 @@ class Music3SglangSourceBinding:
 
     model_identity: MusicModelIdentity
     runtime_source_revision: str
-    required_external_gates: tuple[str, ...] = REQUIRED_EXTERNAL_GATES
+    required_local_experiment_gates: tuple[str, ...] = LOCAL_EXPERIMENT_REQUIRED_GATES
 
     def __post_init__(self) -> None:
         if type(self.model_identity) is not MusicModelIdentity:
@@ -132,17 +136,29 @@ class Music3SglangSourceBinding:
         revision = _exact_content_address(self.runtime_source_revision)
         object.__setattr__(self, "runtime_source_revision", revision)
         if (
-            type(self.required_external_gates) is not tuple
-            or not all(type(gate) is str for gate in self.required_external_gates)
-            or self.required_external_gates != REQUIRED_EXTERNAL_GATES
+            type(self.required_local_experiment_gates) is not tuple
+            or not all(
+                type(gate) is str
+                for gate in self.required_local_experiment_gates
+            )
+            or self.required_local_experiment_gates
+            != LOCAL_EXPERIMENT_REQUIRED_GATES
         ):
-            raise MusicModelContractError("required external gates are immutable")
+            raise MusicModelContractError(
+                "required local-experiment gates are immutable"
+            )
 
     def to_mapping(self) -> dict[str, object]:
         return {
             "model_identity": self.model_identity.to_mapping(),
             "runtime_source_revision": self.runtime_source_revision,
-            "required_external_gates": list(self.required_external_gates),
+            "authorization_scope": LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,
+            "required_local_experiment_gates": list(
+                self.required_local_experiment_gates
+            ),
+            "unapproved_authorization_scopes": list(
+                UNAPPROVED_AUTHORIZATION_SCOPES
+            ),
             "execution_authorized": False,
         }
 

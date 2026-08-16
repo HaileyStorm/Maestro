@@ -2,14 +2,16 @@
 
 This module never discovers, downloads, launches, registers, or unloads a
 runtime.  Callers provide both an asynchronous transport and short-lived,
-server-authored external authorization evidence.  A request-disconnect event
-or task cancellation cancels only the exact in-flight transport task.
+server-authored authorization evidence for the owner's local experiment only.
+Hosted, LAN, and Cloudflare exposure remain outside this boundary.  A
+request-disconnect event or task cancellation cancels only the exact in-flight
+transport task.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, InitVar
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -18,6 +20,9 @@ import time
 from typing import Awaitable, Callable, Protocol
 from urllib.parse import urlsplit
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 from services.minimax_music3_sglang_contract import (
     MAX_WAV_BYTES,
     MAX_NEW_TOKENS,
@@ -25,7 +30,8 @@ from services.minimax_music3_sglang_contract import (
     MIN_NEW_TOKENS,
     MUSIC3_HF_EXACT_REVISION,
     MUSIC3_MODEL_ID,
-    REQUIRED_EXTERNAL_GATES,
+    LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,
+    LOCAL_EXPERIMENT_REQUIRED_GATES,
     Music3HealthEvidence,
     Music3ModelEvidence,
     Music3SglangSourceBinding,
@@ -43,9 +49,9 @@ from services.minimax_music3_sglang_contract import (
 HEALTH_PATH = "/health_generate"
 MODELS_PATH = "/v1/models"
 GENERATE_PATH = "/v1/audio/speech"
-AUTHORIZATION_SCHEMA = "maestro.music3.external-authorization.v1"
+AUTHORIZATION_SCHEMA = "maestro.music3.external-authorization.v2"
 AUTHORIZATION_AUDIENCE = "maestro.music3.sglang-omni"
-AUTHORIZATION_SCOPE = "local_loopback_inference"
+LOCAL_EXPERIMENT_EXECUTION_LOCALITY = "local_loopback_only"
 
 MAX_JSON_RESPONSE_BYTES = 256 * 1024
 MAX_AUTHORIZATION_BYTES = 16 * 1024
@@ -64,7 +70,9 @@ MAX_CANCELLATION_GRACE_SECONDS = 1.0
 _HEADER_NAME = re.compile(r"[a-z0-9!#$%&'*+.^_`|~-]{1,128}")
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _HEX_SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
-_VALIDATED_AUTHORIZATION_TOKEN = object()
+_ED25519_PUBLIC_KEY = re.compile(r"ed25519:[0-9a-f]{64}")
+_ED25519_SIGNATURE = re.compile(r"ed25519:[0-9a-f]{128}")
+AUTHORIZATION_SIGNATURE_HEADER = "x-maestro-authorization-ed25519"
 
 
 class Music3SglangClientError(RuntimeError):
@@ -336,36 +344,247 @@ class Music3AsyncTransport(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class Music3AuthorizationTrustBinding:
+    """Server-owned authorization endpoint, owner, and TLS trust anchor."""
+
+    authorization_url: str
+    owner_subject_id: str
+    peer_certificate_sha256: str
+    authorization_public_key_ed25519: str
+    binding_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        authorization_url = _https_resource_url(
+            self.authorization_url,
+            label="authorization trust URL",
+        )
+        if (
+            type(self.owner_subject_id) is not str
+            or _OPAQUE_ID.fullmatch(self.owner_subject_id) is None
+        ):
+            raise MusicModelContractError(
+                "authorization trust owner subject is invalid"
+            )
+        if (
+            type(self.peer_certificate_sha256) is not str
+            or _HEX_SHA256.fullmatch(self.peer_certificate_sha256) is None
+        ):
+            raise MusicModelContractError(
+                "authorization trust certificate digest is invalid"
+            )
+        if (
+            type(self.authorization_public_key_ed25519) is not str
+            or _ED25519_PUBLIC_KEY.fullmatch(
+                self.authorization_public_key_ed25519
+            ) is None
+        ):
+            raise MusicModelContractError(
+                "authorization trust public key is invalid"
+            )
+        material = json.dumps(
+            {
+                "authorization_url": authorization_url,
+                "owner_subject_id": self.owner_subject_id,
+                "peer_certificate_sha256": self.peer_certificate_sha256,
+                "authorization_public_key_ed25519": (
+                    self.authorization_public_key_ed25519
+                ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        object.__setattr__(
+            self,
+            "binding_sha256",
+            "sha256:" + hashlib.sha256(material).hexdigest(),
+        )
+
+
+def bind_music3_authorization_trust(
+    *,
+    authorization_url: object,
+    owner_subject_id: object,
+    peer_certificate_sha256: object,
+    authorization_public_key_ed25519: object,
+) -> Music3AuthorizationTrustBinding:
+    """Bind server configuration once; generation callers cannot replace it."""
+
+    return Music3AuthorizationTrustBinding(
+        authorization_url=authorization_url,
+        owner_subject_id=owner_subject_id,
+        peer_certificate_sha256=peer_certificate_sha256,
+        authorization_public_key_ed25519=authorization_public_key_ed25519,
+    )
+
+
+def _verify_authorization_signature(
+    *,
+    document_bytes: object,
+    signature_ed25519: object,
+    public_key_ed25519: object,
+) -> None:
+    if (
+        type(document_bytes) is not bytes
+        or not document_bytes
+        or len(document_bytes) > MAX_AUTHORIZATION_BYTES
+    ):
+        raise MusicModelContractError("authorization signed document is invalid")
+    if (
+        type(signature_ed25519) is not str
+        or _ED25519_SIGNATURE.fullmatch(signature_ed25519) is None
+        or type(public_key_ed25519) is not str
+        or _ED25519_PUBLIC_KEY.fullmatch(public_key_ed25519) is None
+    ):
+        raise MusicModelContractError("authorization signature is invalid")
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(
+            bytes.fromhex(public_key_ed25519.removeprefix("ed25519:"))
+        )
+        public_key.verify(
+            bytes.fromhex(signature_ed25519.removeprefix("ed25519:")),
+            document_bytes,
+        )
+    except (InvalidSignature, ValueError):
+        raise MusicModelContractError("authorization signature is invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
 class Music3ExternalAuthorizationEvidence:
-    """Validated, transport-authenticated, short-lived server evidence."""
+    """Validated, transport-authenticated local-experiment evidence."""
 
     issuer: str
     evidence_id: str
     subject_id: str
+    scope: str
+    approved_gates: tuple[str, ...]
+    model_id: str
+    model_revision: str
     base_url: str
+    authorization_url: str
     runtime_source_revision: str
+    authorization_trust_binding_sha256: str
+    authorization_public_key_ed25519: str
     issued_at_unix: int
     expires_at_unix: int
     document_sha256: str
     peer_certificate_sha256: str
-    _validation_token: InitVar[object] = None
+    signed_document_bytes: bytes = field(repr=False)
+    signature_ed25519: str = field(repr=False)
 
-    def __post_init__(self, _validation_token: object) -> None:
-        if _validation_token is not _VALIDATED_AUTHORIZATION_TOKEN:
+    def __post_init__(self) -> None:
+        _verify_authorization_signature(
+            document_bytes=self.signed_document_bytes,
+            signature_ed25519=self.signature_ed25519,
+            public_key_ed25519=self.authorization_public_key_ed25519,
+        )
+        if (
+            type(self.document_sha256) is not str
+            or _HEX_SHA256.fullmatch(self.document_sha256) is None
+            or self.document_sha256
+            != "sha256:" + hashlib.sha256(self.signed_document_bytes).hexdigest()
+        ):
             raise MusicModelContractError(
-                "external authorization must come from server-response validation"
+                "authorization signed document digest is invalid"
+            )
+        signed_document = _strict_json_object(
+            self.signed_document_bytes,
+            maximum_bytes=MAX_AUTHORIZATION_BYTES,
+        )
+        expected_document = {
+            "schema": AUTHORIZATION_SCHEMA,
+            "issuer": self.issuer,
+            "evidence_id": self.evidence_id,
+            "subject_id": self.subject_id,
+            "audience": AUTHORIZATION_AUDIENCE,
+            "model_id": self.model_id,
+            "model_revision": self.model_revision,
+            "runtime_source_revision": self.runtime_source_revision,
+            "base_url": self.base_url,
+            "authorization_url": self.authorization_url,
+            "authorization_trust_binding_sha256": (
+                self.authorization_trust_binding_sha256
+            ),
+            "peer_certificate_sha256": self.peer_certificate_sha256,
+            "scope": self.scope,
+            "approved_gates": list(self.approved_gates),
+            "issued_at_unix": self.issued_at_unix,
+            "expires_at_unix": self.expires_at_unix,
+        }
+        if (
+            type(signed_document.get("issued_at_unix")) is not int
+            or type(signed_document.get("expires_at_unix")) is not int
+            or signed_document != expected_document
+        ):
+            raise MusicModelContractError(
+                "authorization evidence does not match its signed document"
             )
         _https_origin(self.issuer, label="authorization issuer")
         if _OPAQUE_ID.fullmatch(self.evidence_id) is None:
             raise MusicModelContractError("authorization evidence_id is invalid")
         if _OPAQUE_ID.fullmatch(self.subject_id) is None:
             raise MusicModelContractError("authorization subject_id is invalid")
+        if (
+            type(self.scope) is not str
+            or self.scope != LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE
+        ):
+            raise MusicModelContractError(
+                "authorization scope is not the local experiment"
+            )
+        if (
+            type(self.approved_gates) is not tuple
+            or self.approved_gates != LOCAL_EXPERIMENT_REQUIRED_GATES
+            or not all(type(gate) is str for gate in self.approved_gates)
+        ):
+            raise MusicModelContractError(
+                "authorization local-experiment gates are incomplete"
+            )
+        if (
+            self.model_id != MUSIC3_MODEL_ID
+            or self.model_revision != MUSIC3_HF_EXACT_REVISION
+        ):
+            raise MusicModelContractError("authorization model binding is invalid")
         _canonical_loopback_base_url(self.base_url)
+        authorization_url = _https_resource_url(
+            self.authorization_url,
+            label="authorization evidence URL",
+        )
+        authorization_parts = urlsplit(authorization_url)
+        authorization_origin = _https_origin(
+            f"https://{authorization_parts.hostname}"
+            + (
+                f":{authorization_parts.port}"
+                if authorization_parts.port not in (None, 443)
+                else ""
+            ),
+            label="authorization evidence origin",
+        )
+        if self.issuer != authorization_origin:
+            raise MusicModelContractError(
+                "authorization evidence issuer does not match its URL"
+            )
         if (
             type(self.runtime_source_revision) is not str
             or not self.runtime_source_revision
         ):
             raise MusicModelContractError("authorization runtime revision is invalid")
+        if (
+            type(self.authorization_trust_binding_sha256) is not str
+            or _HEX_SHA256.fullmatch(
+                self.authorization_trust_binding_sha256
+            ) is None
+        ):
+            raise MusicModelContractError(
+                "authorization trust binding digest is invalid"
+            )
+        if (
+            type(self.authorization_public_key_ed25519) is not str
+            or _ED25519_PUBLIC_KEY.fullmatch(
+                self.authorization_public_key_ed25519
+            ) is None
+        ):
+            raise MusicModelContractError(
+                "authorization public key binding is invalid"
+            )
         if (
             type(self.issued_at_unix) is not int
             or type(self.expires_at_unix) is not int
@@ -388,6 +607,9 @@ class Music3GenerationProvenance:
     seed: int
     max_new_tokens: int
     speed: float | None
+    authorization_scope: str
+    execution_locality: str
+    hosted_service_authorized: bool
     authorization_document_sha256: str
     response: Music3WavEvidence
 
@@ -411,6 +633,27 @@ class Music3GenerationProvenance:
         ):
             raise MusicModelContractError("generation provenance speed is invalid")
         if (
+            type(self.authorization_scope) is not str
+            or self.authorization_scope != LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE
+        ):
+            raise MusicModelContractError(
+                "generation provenance authorization scope is invalid"
+            )
+        if (
+            type(self.execution_locality) is not str
+            or self.execution_locality != LOCAL_EXPERIMENT_EXECUTION_LOCALITY
+        ):
+            raise MusicModelContractError(
+                "generation provenance execution locality is invalid"
+            )
+        if (
+            type(self.hosted_service_authorized) is not bool
+            or self.hosted_service_authorized is not False
+        ):
+            raise MusicModelContractError(
+                "generation provenance cannot authorize hosted service"
+            )
+        if (
             type(self.authorization_document_sha256) is not str
             or re.fullmatch(r"[0-9a-f]{64}", self.authorization_document_sha256) is None
         ):
@@ -433,6 +676,9 @@ class Music3GenerationProvenance:
             "model_id": self.model_id,
             "model_revision": self.model_revision,
             "runtime_source_revision": self.runtime_source_revision,
+            "authorization_scope": self.authorization_scope,
+            "execution_locality": self.execution_locality,
+            "hosted_service_authorized": self.hosted_service_authorized,
             "request": request,
             "authorization_document_sha256": self.authorization_document_sha256,
             "response_sha256": self.response.sha256,
@@ -464,7 +710,7 @@ def validate_music3_external_authorization_response(
     headers: object,
     body: object,
     peer_certificate_sha256: object,
-    trusted_peer_certificate_sha256: object,
+    authorization_trust: Music3AuthorizationTrustBinding,
     source_binding: Music3SglangSourceBinding,
     base_url: object,
     now_unix: object,
@@ -479,12 +725,18 @@ def validate_music3_external_authorization_response(
 
     if type(source_binding) is not Music3SglangSourceBinding:
         raise MusicModelContractError("authorization source binding is invalid")
+    if type(authorization_trust) is not Music3AuthorizationTrustBinding:
+        raise MusicModelContractError("authorization trust binding is invalid")
     canonical_base_url = _canonical_loopback_base_url(base_url)
     requested_url = _https_resource_url(
         request_url,
         label="authorization request URL",
     )
     returned_url = _https_resource_url(final_url, label="authorization final URL")
+    if requested_url != authorization_trust.authorization_url:
+        raise MusicModelContractError(
+            "authorization request does not match server trust binding"
+        )
     if returned_url != requested_url:
         raise MusicModelContractError("authorization response redirected")
     if type(status_code) is not int or status_code != 200:
@@ -492,14 +744,14 @@ def validate_music3_external_authorization_response(
     header_map = _header_map(headers)
     if header_map.get("content-type") != "application/json":
         raise MusicModelContractError("authorization content type must be application/json")
+    signature_ed25519 = header_map.get(AUTHORIZATION_SIGNATURE_HEADER)
     if "location" in header_map:
         raise MusicModelContractError("authorization response must not contain a redirect")
     if (
         type(peer_certificate_sha256) is not str
         or _HEX_SHA256.fullmatch(peer_certificate_sha256) is None
-        or type(trusted_peer_certificate_sha256) is not str
-        or _HEX_SHA256.fullmatch(trusted_peer_certificate_sha256) is None
-        or peer_certificate_sha256 != trusted_peer_certificate_sha256
+        or peer_certificate_sha256
+        != authorization_trust.peer_certificate_sha256
     ):
         raise MusicModelContractError("authorization peer certificate digest is invalid")
     if "content-length" in header_map:
@@ -514,6 +766,13 @@ def validate_music3_external_authorization_response(
             raise MusicModelContractError("authorization content length is invalid")
     if type(now_unix) is not int or now_unix < 0:
         raise MusicModelContractError("authorization clock value is invalid")
+    _verify_authorization_signature(
+        document_bytes=body,
+        signature_ed25519=signature_ed25519,
+        public_key_ed25519=(
+            authorization_trust.authorization_public_key_ed25519
+        ),
+    )
 
     document = _strict_json_object(body, maximum_bytes=MAX_AUTHORIZATION_BYTES)
     expected_keys = {
@@ -526,6 +785,9 @@ def validate_music3_external_authorization_response(
         "model_revision",
         "runtime_source_revision",
         "base_url",
+        "authorization_url",
+        "authorization_trust_binding_sha256",
+        "peer_certificate_sha256",
         "scope",
         "approved_gates",
         "issued_at_unix",
@@ -546,6 +808,10 @@ def validate_music3_external_authorization_response(
     )
     if issuer != request_origin:
         raise MusicModelContractError("authorization issuer does not match server origin")
+    if document["subject_id"] != authorization_trust.owner_subject_id:
+        raise MusicModelContractError(
+            "authorization owner subject does not match server trust binding"
+        )
 
     exact_values = {
         "schema": AUTHORIZATION_SCHEMA,
@@ -554,17 +820,22 @@ def validate_music3_external_authorization_response(
         "model_revision": MUSIC3_HF_EXACT_REVISION,
         "runtime_source_revision": source_binding.runtime_source_revision,
         "base_url": canonical_base_url,
-        "scope": AUTHORIZATION_SCOPE,
+        "authorization_url": authorization_trust.authorization_url,
+        "authorization_trust_binding_sha256": authorization_trust.binding_sha256,
+        "peer_certificate_sha256": authorization_trust.peer_certificate_sha256,
+        "scope": LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,
     }
     for field, expected in exact_values.items():
         if type(document[field]) is not str or document[field] != expected:
             raise MusicModelContractError(f"authorization {field} is invalid")
     if (
         type(document["approved_gates"]) is not list
-        or document["approved_gates"] != list(REQUIRED_EXTERNAL_GATES)
+        or document["approved_gates"] != list(LOCAL_EXPERIMENT_REQUIRED_GATES)
         or not all(type(gate) is str for gate in document["approved_gates"])
     ):
-        raise MusicModelContractError("authorization external gates are incomplete")
+        raise MusicModelContractError(
+            "authorization local-experiment gates are incomplete"
+        )
     for field in ("evidence_id", "subject_id"):
         if type(document[field]) is not str or _OPAQUE_ID.fullmatch(document[field]) is None:
             raise MusicModelContractError(f"authorization {field} is invalid")
@@ -582,18 +853,29 @@ def validate_music3_external_authorization_response(
 
     document_bytes = body
     assert type(document_bytes) is bytes
-    return Music3ExternalAuthorizationEvidence(
+    evidence_fields = dict(
         issuer=issuer,
         evidence_id=document["evidence_id"],
         subject_id=document["subject_id"],
+        scope=LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,
+        approved_gates=LOCAL_EXPERIMENT_REQUIRED_GATES,
+        model_id=MUSIC3_MODEL_ID,
+        model_revision=MUSIC3_HF_EXACT_REVISION,
         base_url=canonical_base_url,
+        authorization_url=authorization_trust.authorization_url,
         runtime_source_revision=source_binding.runtime_source_revision,
+        authorization_trust_binding_sha256=authorization_trust.binding_sha256,
+        authorization_public_key_ed25519=(
+            authorization_trust.authorization_public_key_ed25519
+        ),
         issued_at_unix=issued,
         expires_at_unix=expires,
         document_sha256="sha256:" + hashlib.sha256(document_bytes).hexdigest(),
         peer_certificate_sha256=peer_certificate_sha256,
-        _validation_token=_VALIDATED_AUTHORIZATION_TOKEN,
+        signed_document_bytes=document_bytes,
+        signature_ed25519=signature_ed25519,
     )
+    return Music3ExternalAuthorizationEvidence(**evidence_fields)
 
 
 class Music3SglangClient:
@@ -604,6 +886,7 @@ class Music3SglangClient:
         *,
         base_url: object,
         source_binding: Music3SglangSourceBinding,
+        authorization_trust: Music3AuthorizationTrustBinding,
         transport: Music3AsyncTransport,
         probe_timeout_seconds: object = DEFAULT_PROBE_TIMEOUT_SECONDS,
         generation_timeout_seconds: object = DEFAULT_GENERATION_TIMEOUT_SECONDS,
@@ -613,11 +896,16 @@ class Music3SglangClient:
         self._base_url = _canonical_loopback_base_url(base_url)
         if type(source_binding) is not Music3SglangSourceBinding:
             raise MusicModelContractError("SGLang source binding is invalid")
+        if type(authorization_trust) is not Music3AuthorizationTrustBinding:
+            raise MusicModelContractError(
+                "SGLang authorization trust binding is invalid"
+            )
         if not callable(transport):
             raise MusicModelContractError("SGLang transport must be callable")
         if not callable(clock):
             raise MusicModelContractError("SGLang clock must be callable")
         self._source_binding = source_binding
+        self._authorization_trust = authorization_trust
         self._transport = transport
         self._probe_timeout = _bounded_timeout(
             probe_timeout_seconds,
@@ -660,10 +948,25 @@ class Music3SglangClient:
             raise MusicModelContractError(
                 "validated external authorization evidence is required"
             )
+        authorization.__post_init__()
         if (
             authorization.base_url != self._base_url
+            or authorization.authorization_url
+            != self._authorization_trust.authorization_url
             or authorization.runtime_source_revision
             != self._source_binding.runtime_source_revision
+            or authorization.model_id != MUSIC3_MODEL_ID
+            or authorization.model_revision != MUSIC3_HF_EXACT_REVISION
+            or authorization.authorization_trust_binding_sha256
+            != self._authorization_trust.binding_sha256
+            or authorization.authorization_public_key_ed25519
+            != self._authorization_trust.authorization_public_key_ed25519
+            or authorization.subject_id
+            != self._authorization_trust.owner_subject_id
+            or authorization.peer_certificate_sha256
+            != self._authorization_trust.peer_certificate_sha256
+            or authorization.scope != LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE
+            or authorization.approved_gates != LOCAL_EXPERIMENT_REQUIRED_GATES
         ):
             raise MusicModelContractError("external authorization binding does not match")
         now = self._clock()
@@ -879,6 +1182,9 @@ class Music3SglangClient:
             seed=validated.seed,
             max_new_tokens=validated.max_new_tokens,
             speed=validated.speed,
+            authorization_scope=authorization.scope,
+            execution_locality=LOCAL_EXPERIMENT_EXECUTION_LOCALITY,
+            hosted_service_authorized=False,
             authorization_document_sha256=authorization.document_sha256.removeprefix(
                 "sha256:"
             ),
