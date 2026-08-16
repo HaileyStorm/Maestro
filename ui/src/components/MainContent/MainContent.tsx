@@ -481,6 +481,8 @@ function WorkspaceSelector() {
   const accountProjectMigration = useStore(s => s.accountProjectMigration)
   const remote = accessContext?.remote === true
   const accountProjectAccessActive = api.isAccountProjectAccessActive(accessContext, accountProjectMigration)
+  const accountAuthenticated = accessContext?.accounts?.authenticated === true
+  const accountContentAvailable = !accountProjectAccessActive || accountAuthenticated
   const legacyProjectPasswordAccess = !accountProjectAccessActive
   const canCreateProject = accessContext?.account_project_creation_requires_account !== true
     || accessContext?.accounts?.authenticated === true
@@ -520,12 +522,16 @@ function WorkspaceSelector() {
       && (accountProjectAccessActive || workspace.unlocked !== false)
     ))
   )
-  const projectTriggerLabel = browsingUploads ? 'Uploads' : (activeWorkspace || 'Select project')
-  const projectTriggerAccessibleLabel = browsingUploads
-    ? `Browsing uploads. Current project: ${activeWorkspace || 'none'}. Open project selector`
-    : activeWorkspace
-      ? `Current project: ${activeWorkspace}. Open project selector`
-      : 'Select or create a project'
+  const projectTriggerLabel = !accountContentAvailable
+    ? 'Sign in'
+    : browsingUploads ? 'Uploads' : (activeWorkspace || 'Select project')
+  const projectTriggerAccessibleLabel = !accountContentAvailable
+    ? 'Sign in to view projects and uploads'
+    : browsingUploads
+      ? `Browsing uploads. Current project: ${activeWorkspace || 'none'}. Open project selector`
+      : activeWorkspace
+        ? `Current project: ${activeWorkspace}. Open project selector`
+        : 'Select or create a project'
   const unlockedProtectedCount = legacyProjectPasswordAccess ? workspaces.filter(workspace => (
     workspace.password_protected && workspace.unlocked
   )).length : 0
@@ -847,6 +853,7 @@ function WorkspaceSelector() {
     <div className="relative" ref={dropdownRef}>
       <button
         onClick={() => {
+          if (!accountContentAvailable) return
           if (requiredProject) {
             setOpen(true)
             return
@@ -863,6 +870,7 @@ function WorkspaceSelector() {
         aria-label={projectTriggerAccessibleLabel}
         aria-haspopup="dialog"
         aria-expanded={open}
+        disabled={!accountContentAvailable}
       >
         <FolderOpen size={12} />
         <span className="max-w-[120px] truncate md:hidden lg:inline">{projectTriggerLabel}</span>
@@ -1160,7 +1168,7 @@ function WorkspaceSelector() {
           )}
           {/* Virtual Uploads view — browse user-uploaded media (read-only;
               generations keep saving to the real active workspace). */}
-          {!requiredProject && <div className="border-t border-border">
+          {accountContentAvailable && !requiredProject && <div className="border-t border-border">
             <button
               onClick={() => { switchWorkspace('__uploads__'); setOpen(false) }}
               className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between hover:bg-bg-hover transition-colors ${

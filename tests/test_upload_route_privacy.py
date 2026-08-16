@@ -98,6 +98,7 @@ class AuthorizedMediaResolverTests(unittest.TestCase):
             "_get_active_workspace": lambda: "default",
             "_request_project_workspace": request_project_workspace,
             "_require_authorized_output": require_output,
+            "_require_upload_content_access": lambda _request: None,
         }
         exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
         return namespace["_resolve_authorized_request_media"]
@@ -343,6 +344,60 @@ class AuthorizedMediaResolverTests(unittest.TestCase):
 
 
 class UploadRouteSourceContractTests(unittest.TestCase):
+    def test_upload_content_requires_account_only_after_complete_cutover(self):
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "_require_upload_content_access"
+        )
+        node.decorator_list = []
+        calls = []
+        state = {"enforced": False}
+        namespace = {
+            "Request": object,
+            "_account_project_access_state": lambda: dict(state),
+            "_require_account_store": lambda _request: calls.append("store"),
+            "_require_account_principal": lambda _request: calls.append("principal"),
+        }
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), str(LAUNCH_PATH), "exec"),
+            namespace,
+        )
+        request = object()
+
+        namespace["_require_upload_content_access"](request)
+        self.assertEqual(calls, [])
+
+        state["enforced"] = True
+        namespace["_require_upload_content_access"](request)
+        self.assertEqual(calls, ["store", "principal"])
+
+    def test_every_upload_entry_point_uses_the_account_cutover_gate(self):
+        for name in (
+            "list_outputs",
+            "serve_file",
+            "_resolve_authorized_request_media",
+            "upload_image",
+            "upload_audio",
+            "reconcile_llm_chat_upload_request",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(
+                    "_require_upload_content_access(request)",
+                    _function_source(name),
+                )
+
+        no_store = _function_source("_recovery_response_requires_no_store")
+        for private_path in (
+            'path == "/api/v1/workspaces"',
+            'path == "/api/v1/outputs"',
+            'path.startswith("/api/v1/file/")',
+            'path.startswith("/api/v1/upload")',
+        ):
+            self.assertIn(private_path, no_store)
+
     def test_malformed_managed_output_is_hidden_after_project_authorization(self):
         source = LAUNCH_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)

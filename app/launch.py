@@ -1112,10 +1112,16 @@ def _reject_cross_origin_mutation(request: Request) -> JSONResponse | None:
 
 
 def _recovery_response_requires_no_store(path: str) -> bool:
-    """Match private control/status responses, never media routes."""
+    """Match private account, control, project, and media responses."""
     return (
         path == "/api/v1/account"
         or path.startswith("/api/v1/account/")
+        or path == "/api/v1/workspaces"
+        or path == "/api/v1/outputs"
+        or path.startswith("/api/v1/outputs/")
+        or path.startswith("/api/v1/file/")
+        or path.startswith("/api/v1/upload")
+        or path.startswith("/api/v1/llm/chat-upload")
         or path == "/api/v1/support"
         or path.startswith("/api/v1/support/")
         or path == "/api/v1/research"
@@ -4073,6 +4079,22 @@ def _account_project_list_identities(request: Request) -> dict[str, dict] | None
         }
     except ProjectMembershipError as error:
         _raise_project_setup_unavailable(error)
+
+
+def _require_upload_content_access(request: Request) -> None:
+    """Require a signed-in account for upload content after project cutover.
+
+    Browser-session upload ownership remains the compatibility authority while
+    account project access is disabled or still migrating. Once the complete
+    account-backed project inventory is active, that long-lived browser cookie
+    is no longer sufficient by itself: logout must immediately fence upload
+    listing, creation, reuse, and byte serving on every transport.
+    """
+    state = _account_project_access_state()
+    if not state["enforced"]:
+        return
+    _require_account_store(request)
+    _require_account_principal(request)
 
 
 def _queue_recovery_file_values(params: dict) -> list[tuple[str, str]]:
@@ -29166,6 +29188,7 @@ def reconcile_llm_chat_upload_request(
     from services.output_access import upload_access_sidecar_path
     from services.win_safe_files import safe_direct_file_under
 
+    _require_upload_content_access(request)
     if _llm_chat_request_is_external(request):
         request.state.maestro_remote = True
     try:
@@ -33550,6 +33573,7 @@ async def upload_audio(
     audio track; the source video is deleted afterwards. The response
     shape is identical regardless of input format — callers always
     receive a WAV path."""
+    _require_upload_content_access(request)
     from services.audio_upload_validation import (
         AudioUploadStorageError,
         WavUploadValidationError,
@@ -54272,6 +54296,8 @@ def _resolve_authorized_request_media(
     if not is_absolute and value != name:
         return None
 
+    _require_upload_content_access(request)
+
     def _matches(candidate: str) -> bool:
         if not is_absolute:
             return True
@@ -63817,6 +63843,7 @@ def list_outputs(
     missing, malformed, and foreign-session uploads are omitted.
     """
     if workspace == "__uploads__":
+        _require_upload_content_access(request)
         out_dir = os.path.join(os.getcwd(), "uploads")
         selected_workspace = "__uploads__"
     else:
@@ -64054,6 +64081,7 @@ def serve_file(request: Request, filename: str, workspace: str = ""):
         raise HTTPException(status_code=400, detail="Invalid output name")
     selected_workspace = _request_project_workspace(request, workspace)
     if selected_workspace == "__uploads__":
+        _require_upload_content_access(request)
         filepath = safe_direct_file_under(
             os.path.join(os.getcwd(), "uploads"), filename,
         )
@@ -65679,6 +65707,7 @@ async def upload_image(
     audio/video also flow through here when the frontend doesn't hit the
     dedicated /api/v1/upload-audio endpoint. Compressed audio formats get
     transcoded to wav so downstream libsndfile callers work."""
+    _require_upload_content_access(request)
     cl = request.headers.get("content-length")
     if cl and cl.isdigit() and int(cl) > MAX_IMAGE_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 500 MB)")

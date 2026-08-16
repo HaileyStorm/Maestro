@@ -121,6 +121,7 @@ def _launch_namespace(names: set[str], **overrides):
         "_llm_operation_scope": lambda *_args: ("owner", "project"),
         "_llm_project_instance_id": lambda *_args: "d" * 64,
         "_claim_llm_chat_uploads": lambda *_args, **_kwargs: None,
+        "_require_upload_content_access": lambda _request: None,
         "_session_secret": lambda: b"test-session-secret",
         "JSONResponse": __import__(
             "fastapi.responses", fromlist=["JSONResponse"],

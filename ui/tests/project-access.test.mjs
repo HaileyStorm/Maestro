@@ -497,6 +497,18 @@ test('account identity is established before the store-fenced startup project lo
   assert.match(store, /logoutAccount: async[\s\S]*_scrubAccountBoundProjectUi\(get\(\)\)[\s\S]*loadWorkspaces\(\)/)
 })
 
+test('signed-out account access hides the virtual Uploads content scope', async () => {
+  const main = await readFile(mainContentUrl, 'utf8')
+  const selector = main.slice(main.indexOf('function WorkspaceSelector()'), main.indexOf('function stripTimeSuffix'))
+
+  assert.match(selector, /const accountAuthenticated = accessContext\?\.accounts\?\.authenticated === true/)
+  assert.match(selector, /const accountContentAvailable = !accountProjectAccessActive \|\| accountAuthenticated/)
+  assert.match(selector, /if \(!accountContentAvailable\) return/)
+  assert.match(selector, /disabled=\{!accountContentAvailable\}/)
+  assert.match(selector, /accountContentAvailable && !requiredProject && <div[^>]*>[\s\S]*Uploads/)
+  assert.match(selector, /Sign in to view projects and uploads/)
+})
+
 test('project actions use exact per-project permissions without account-role inference', async () => {
   const main = await readFile(mainContentUrl, 'utf8')
   const permissionHelper = main.slice(

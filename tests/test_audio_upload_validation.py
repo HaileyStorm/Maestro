@@ -316,6 +316,7 @@ def _load_upload_route(sidecar_calls: list[tuple]):
         "os": os,
         "uuid": __import__("uuid"),
         "_probe_audio_duration": lambda _path: None,
+        "_require_upload_content_access": lambda _request: None,
         "write_upload_access_sidecar": (
             lambda *args, **kwargs: sidecar_calls.append((args, kwargs)) or {}
         ),
