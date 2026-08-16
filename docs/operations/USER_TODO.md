@@ -10,8 +10,8 @@ are settled.
 
 ## Needed now
 
-- Enter the six-digit Cloudflare authenticator code in the open tab. I will do
-  the staged Worker deployment and log Wrangler out afterward.
+- Tell me when you are ready to retry Cloudflare login. I will reopen the tab;
+  enter the six-digit authenticator code there.
 
 ## I will ask later, if needed
 
