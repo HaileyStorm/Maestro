@@ -29,6 +29,7 @@ from .account_auth import (
 from .entitlements import (
     DEVELOPMENT_COST_RECOVERY_CURRENCY,
     DEVELOPMENT_COST_RECOVERY_TARGET_MINOR,
+    DevelopmentCostRecoveryLockedError,
     FULFILLMENT_STATES,
     MANUAL_CONTRIBUTION_KINDS,
     MANUAL_CONTRIBUTION_SOURCES,
@@ -879,23 +880,29 @@ class SupportPortal:
             )
         ):
             raise SupportPortalError("Manual contribution is invalid")
-        self._ledger.record_manual_contribution(
-            subject_key=subject_key,
-            source=source,
-            kind=kind,
-            amount_minor=amount_minor,
-            currency=currency,
-            target_event_id=target_event_id,
-            source_event_key=opaque_key(
-                "manual_contribution_idempotency",
-                idempotency_key,
-                self._identity_key,
-            ),
-            actor_key=opaque_key(
-                "manual_contribution_actor", actor["id"], self._identity_key,
-            ),
-            occurred_at=datetime.now(timezone.utc),
-        )
+        try:
+            self._ledger.record_manual_contribution(
+                subject_key=subject_key,
+                source=source,
+                kind=kind,
+                amount_minor=amount_minor,
+                currency=currency,
+                target_event_id=target_event_id,
+                source_event_key=opaque_key(
+                    "manual_contribution_idempotency",
+                    idempotency_key,
+                    self._identity_key,
+                ),
+                actor_key=opaque_key(
+                    "manual_contribution_actor", actor["id"], self._identity_key,
+                ),
+                occurred_at=datetime.now(timezone.utc),
+            )
+        except DevelopmentCostRecoveryLockedError as error:
+            raise SupportAuthorizationError(
+                "Direct compute sponsorship is unavailable until "
+                "development costs are recovered"
+            ) from error
         return self._admin_projection_for_subject(
             subject_key, priority_eligible=target_role != "owner",
         )

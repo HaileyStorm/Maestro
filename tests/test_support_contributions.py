@@ -29,6 +29,7 @@ from services.entitlements import (  # noqa: E402
     ContributionLedger,
     DEVELOPMENT_COST_RECOVERY_CURRENCY,
     DEVELOPMENT_COST_RECOVERY_TARGET_MINOR,
+    DevelopmentCostRecoveryLockedError,
     EntitlementError,
     LedgerIntegrityError,
     ManualContributionConflict,
@@ -1022,6 +1023,12 @@ class ContributionLedgerTests(unittest.TestCase):
                 )
 
     def test_competing_manual_adjustments_serialize_remaining_net(self):
+        self.ledger.append(
+            self.draft(
+                "compute-recovery", "one_time_contribution", amount=100_000,
+            ),
+            received_at=NOW,
+        )
         common = {
             "subject_key": self.subject,
             "source": "direct_compute_sponsorship",
@@ -1061,7 +1068,152 @@ class ContributionLedgerTests(unittest.TestCase):
             thread.join(5)
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(sorted(outcomes), ["conflict", "ok"])
-        self.assertEqual(len(self.ledger.events()), 2)
+        self.assertEqual(len(self.ledger.events()), 3)
+
+    def test_direct_compute_exact_replay_survives_later_recovery_relock(self):
+        actor = keyed("manual_actor", "owner")
+        ordinary = self.ledger.record_manual_contribution(
+            subject_key=self.subject,
+            source="buy_me_a_coffee",
+            kind="one_time_contribution",
+            amount_minor=100_000,
+            currency="USD",
+            target_event_id=None,
+            source_event_key=keyed("manual_request", "recovery-funding"),
+            actor_key=actor,
+            occurred_at=NOW,
+            received_at=NOW,
+        )
+        direct_kwargs = {
+            "subject_key": self.subject,
+            "source": "direct_compute_sponsorship",
+            "kind": "one_time_contribution",
+            "amount_minor": 2_500,
+            "currency": "USD",
+            "target_event_id": None,
+            "source_event_key": keyed("manual_request", "direct-after-recovery"),
+            "actor_key": actor,
+            "occurred_at": NOW,
+            "received_at": NOW,
+        }
+        accepted = self.ledger.record_manual_contribution(**direct_kwargs)
+        self.ledger.record_manual_contribution(
+            subject_key=self.subject,
+            source="buy_me_a_coffee",
+            kind="refund",
+            amount_minor=1,
+            currency="USD",
+            target_event_id=ordinary.event_id,
+            source_event_key=keyed("manual_request", "recovery-refund"),
+            actor_key=actor,
+            occurred_at=NOW,
+            received_at=NOW,
+        )
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection()["state"],
+            "locked",
+        )
+        before = self.ledger.events()
+        self.assertEqual(
+            self.ledger.record_manual_contribution(**direct_kwargs),
+            accepted,
+        )
+        self.assertEqual(self.ledger.events(), before)
+
+    def test_concurrent_relock_precedes_and_blocks_new_direct_compute_append(self):
+        actor = keyed("manual_actor", "owner")
+        ordinary = self.ledger.record_manual_contribution(
+            subject_key=self.subject,
+            source="patreon",
+            kind="one_time_contribution",
+            amount_minor=100_000,
+            currency="USD",
+            target_event_id=None,
+            source_event_key=keyed("manual_request", "race-recovery"),
+            actor_key=actor,
+            occurred_at=NOW,
+            received_at=NOW,
+        )
+        other = ContributionLedger(
+            self.path, integrity_key=KEY, allow_test_path=True,
+        )
+        entered_write = threading.Event()
+        release_write = threading.Event()
+        direct_started = threading.Event()
+        original_write = other._write_unlocked
+        refund_errors: list[BaseException] = []
+        direct_errors: list[BaseException] = []
+
+        def blocking_write(events):
+            entered_write.set()
+            if not release_write.wait(2):
+                raise RuntimeError("refund write release timed out")
+            original_write(events)
+
+        def refund():
+            try:
+                other.record_manual_contribution(
+                    subject_key=self.subject,
+                    source="patreon",
+                    kind="refund",
+                    amount_minor=1,
+                    currency="USD",
+                    target_event_id=ordinary.event_id,
+                    source_event_key=keyed("manual_request", "race-refund"),
+                    actor_key=actor,
+                    occurred_at=NOW,
+                    received_at=NOW,
+                )
+            except BaseException as error:
+                refund_errors.append(error)
+
+        def direct():
+            direct_started.set()
+            try:
+                self.ledger.record_manual_contribution(
+                    subject_key=self.subject,
+                    source="direct_compute_sponsorship",
+                    kind="one_time_contribution",
+                    amount_minor=2_500,
+                    currency="USD",
+                    target_event_id=None,
+                    source_event_key=keyed("manual_request", "race-direct"),
+                    actor_key=actor,
+                    occurred_at=NOW,
+                    received_at=NOW,
+                )
+            except BaseException as error:
+                direct_errors.append(error)
+
+        with mock.patch.object(other, "_write_unlocked", blocking_write):
+            refund_thread = threading.Thread(target=refund)
+            direct_thread = threading.Thread(target=direct)
+            refund_thread.start()
+            self.assertTrue(entered_write.wait(2))
+            direct_thread.start()
+            self.assertTrue(direct_started.wait(2))
+            time.sleep(0.02)
+            self.assertTrue(direct_thread.is_alive())
+            release_write.set()
+            refund_thread.join(5)
+            direct_thread.join(5)
+
+        self.assertFalse(refund_thread.is_alive())
+        self.assertFalse(direct_thread.is_alive())
+        self.assertEqual(refund_errors, [])
+        self.assertEqual(len(direct_errors), 1)
+        self.assertIsInstance(
+            direct_errors[0], DevelopmentCostRecoveryLockedError,
+        )
+        events = self.ledger.events()
+        self.assertFalse(any(
+            event.provider == "manual_direct_compute_sponsorship"
+            for event in events
+        ))
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection()["state"],
+            "locked",
+        )
 
     def test_malformed_events_and_orphan_adjustments_are_bounded(self):
         with self.assertRaises(EntitlementError):
@@ -1161,18 +1313,29 @@ class ContributionLedgerTests(unittest.TestCase):
         self.ledger.append(self.draft(
             "excess-refund", "refund", amount=100_000, related="eligible",
         ), received_at=NOW)
-        self.ledger.record_manual_contribution(
-            subject_key=self.subject,
-            source="direct_compute_sponsorship",
-            kind="one_time_contribution",
-            amount_minor=100_000,
-            currency="USD",
-            target_event_id=None,
-            source_event_key=keyed("manual_request", "direct-compute"),
-            actor_key=keyed("manual_actor", "owner"),
-            occurred_at=NOW,
-            received_at=NOW,
-        )
+        before = self.ledger.events()
+        with mock.patch.object(
+            entitlements,
+            "_development_cost_recovery_projection",
+            return_value={
+                "target_minor": 100_000,
+                "currency": "USD",
+                "state": "locked",
+            },
+        ), self.assertRaises(DevelopmentCostRecoveryLockedError):
+            self.ledger.record_manual_contribution(
+                subject_key=self.subject,
+                source="direct_compute_sponsorship",
+                kind="one_time_contribution",
+                amount_minor=100_000,
+                currency="USD",
+                target_event_id=None,
+                source_event_key=keyed("manual_request", "direct-compute"),
+                actor_key=keyed("manual_actor", "owner"),
+                occurred_at=NOW,
+                received_at=NOW,
+            )
+        self.assertEqual(self.ledger.events(), before)
         projection = self.ledger.development_cost_recovery_projection(as_of=NOW)
         self.assertEqual(projection["state"], "locked")
         self.assertEqual(set(projection), {"target_minor", "currency", "state"})

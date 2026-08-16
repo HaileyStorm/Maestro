@@ -101,6 +101,10 @@ class LedgerIntegrityError(EntitlementError):
     pass
 
 
+class DevelopmentCostRecoveryLockedError(EntitlementError):
+    pass
+
+
 class ContributionConflict(EntitlementError):
     pass
 
@@ -1361,6 +1365,32 @@ class ContributionLedger:
                 raise ManualContributionConflict(
                     "manual contribution idempotency key conflicts"
                 )
+
+            if source == "direct_compute_sponsorship":
+                try:
+                    recovery = _development_cost_recovery_projection(
+                        events,
+                        as_of=datetime.now(timezone.utc),
+                    )
+                except Exception as error:
+                    raise DevelopmentCostRecoveryLockedError(
+                        "development cost recovery is not confirmed"
+                    ) from error
+                if (
+                    type(recovery) is not dict
+                    or set(recovery) != {"target_minor", "currency", "state"}
+                    or type(recovery.get("target_minor")) is not int
+                    or recovery["target_minor"]
+                    != DEVELOPMENT_COST_RECOVERY_TARGET_MINOR
+                    or type(recovery.get("currency")) is not str
+                    or recovery["currency"]
+                    != DEVELOPMENT_COST_RECOVERY_CURRENCY
+                    or type(recovery.get("state")) is not str
+                    or recovery["state"] != "recovered"
+                ):
+                    raise DevelopmentCostRecoveryLockedError(
+                        "development cost recovery is not confirmed"
+                    )
 
             initial = kind in {"one_time_contribution", "recurring_started"}
             if initial:

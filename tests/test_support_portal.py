@@ -26,6 +26,7 @@ from services.entitlements import (
     ContributionLedger,
     opaque_key,
 )
+from services import entitlements
 from services.responsible_use import (
     CURRENT_RESPONSIBLE_USE_CONTENT_SHA256,
     CURRENT_RESPONSIBLE_USE_VERSION,
@@ -994,6 +995,142 @@ class SupportPortalTests(unittest.TestCase):
         self.assertEqual(
             local["account_support"]["recorded"]["event_count"], 1,
         )
+
+    def test_direct_compute_action_is_locked_below_and_opens_at_exact_recovery(self):
+        portal = self.direct_compute_portal()
+        direct = {
+            "remote": True,
+            "target_account_id": self.user_id,
+            "source": "direct_compute_sponsorship",
+            "kind": "one_time_contribution",
+            "amount_minor": 2_500,
+            "currency": "USD",
+            "target_event_id": None,
+            "idempotency_key": opaque_key(
+                "manual_request", "direct-compute", IDENTITY_KEY,
+            ),
+        }
+        self.add_contribution(self.other_id, "recovery-below", amount=99_999)
+        before = self.ledger.events()
+
+        with self.assertRaises(SupportAuthorizationError):
+            portal.record_owner_contribution(self.owner_session, **direct)
+        self.assertEqual(self.ledger.events(), before)
+
+        self.add_contribution(self.other_id, "recovery-exact", amount=1)
+        projection = portal.record_owner_contribution(
+            self.owner_session, **direct,
+        )
+        self.assertEqual(
+            projection["development_cost_recovery"]["state"], "recovered",
+        )
+        events = self.ledger.events()
+        self.assertEqual(events[-1].provider, "manual_direct_compute_sponsorship")
+        self.assertEqual(events[-1].subject_key, self.subject(self.user_id))
+        replay = portal.record_owner_contribution(
+            self.owner_session, **direct,
+        )
+        self.assertEqual(replay, projection)
+        self.assertEqual(self.ledger.events(), events)
+
+        recovery_source = events[0]
+        self.ledger.append(ContributionEventDraft(
+            provider=recovery_source.provider,
+            source_event_key=opaque_key(
+                "event", "recovery-relock", IDENTITY_KEY,
+            ),
+            subject_key=recovery_source.subject_key,
+            kind="refund",
+            occurred_at="2026-08-11T11:01:00Z",
+            amount_minor=1,
+            currency=recovery_source.currency,
+            related_event_key=recovery_source.source_event_key,
+        ), received_at=NOW)
+        relocked_events = self.ledger.events()
+        replay_after_relock = portal.record_owner_contribution(
+            self.owner_session, **direct,
+        )
+        self.assertEqual(
+            replay_after_relock["development_cost_recovery"]["state"],
+            "locked",
+        )
+        self.assertEqual(self.ledger.events(), relocked_events)
+
+    def test_direct_compute_action_fails_closed_without_mutating_the_ledger(self):
+        portal = self.direct_compute_portal()
+        request = {
+            "remote": True,
+            "target_account_id": self.user_id,
+            "source": "direct_compute_sponsorship",
+            "kind": "one_time_contribution",
+            "amount_minor": 2_500,
+            "currency": "USD",
+            "target_event_id": None,
+            "idempotency_key": opaque_key(
+                "manual_request", "direct-fail-closed", IDENTITY_KEY,
+            ),
+        }
+        invalid = (
+            None,
+            {"target_minor": 100_000, "currency": "USD"},
+            {
+                "target_minor": 100_000,
+                "currency": "USD",
+                "state": "recovered",
+                "extra": True,
+            },
+            {"target_minor": 1, "currency": "USD", "state": "recovered"},
+        )
+        for value in invalid:
+            with self.subTest(value=value), mock.patch.object(
+                entitlements,
+                "_development_cost_recovery_projection",
+                return_value=value,
+            ), self.assertRaises(SupportAuthorizationError):
+                portal.record_owner_contribution(self.owner_session, **request)
+            self.assertEqual(self.ledger.events(), ())
+
+        with mock.patch.object(
+            entitlements,
+            "_development_cost_recovery_projection",
+            side_effect=OSError("synthetic recovery authority outage"),
+        ), self.assertRaises(SupportAuthorizationError):
+            portal.record_owner_contribution(self.owner_session, **request)
+        self.assertEqual(self.ledger.events(), ())
+
+    def test_ordinary_manual_source_stays_available_and_idempotent_while_locked(self):
+        request = {
+            "remote": True,
+            "target_account_id": self.user_id,
+            "source": "patreon",
+            "kind": "one_time_contribution",
+            "amount_minor": 100_000,
+            "currency": "USD",
+            "target_event_id": None,
+            "idempotency_key": opaque_key(
+                "manual_request", "ordinary-recovery", IDENTITY_KEY,
+            ),
+        }
+        with mock.patch.object(
+            self.ledger,
+            "development_cost_recovery_projection",
+            side_effect=OSError("synthetic recovery authority outage"),
+        ):
+            projection = self.portal.record_owner_contribution(
+                self.owner_session, **request,
+            )
+            self.assertEqual(
+                projection["development_cost_recovery"]["state"], "locked",
+            )
+        events = self.ledger.events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].provider, "manual_patreon")
+
+        replay = self.portal.record_owner_contribution(
+            self.owner_session, **request,
+        )
+        self.assertEqual(replay["development_cost_recovery"]["state"], "recovered")
+        self.assertEqual(self.ledger.events(), events)
 
     def test_responsible_use_acceptance_is_self_bound_and_restart_durable(self):
         before = self.portal.self_projection(
