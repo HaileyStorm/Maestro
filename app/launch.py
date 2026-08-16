@@ -1478,6 +1478,9 @@ from services.queue_recovery_runtime import (
     validate_protected_artifact_descriptor,
     write_sealed_request_manifest,
 )
+from services.queue_recovery_final_adoption import (
+    adopt_quarantined_final_groups as _adopt_quarantined_final_groups,
+)
 
 _queue_recovery_journal = QueueRecoveryJournal(
     os.path.join(_app_dir, "storage", "queue-recovery", "studio-queue.jsonl")
@@ -5810,6 +5813,86 @@ def _queue_recovery_existing_projects() -> dict[str, tuple[str, str]]:
     return projects
 
 
+_queue_recovery_final_adoption_jobs: dict[tuple[str, str], dict] = {}
+_queue_recovery_final_adoption_startup_summary = {
+    "adopted_groups": 0,
+    "missing_groups": 0,
+    "quarantined_groups": 0,
+    "failed_projects": 0,
+}
+
+
+def _queue_recovery_adopt_quarantined_finals(
+    projects: Mapping[str, tuple[str, str]],
+) -> dict:
+    """Adopt complete attested finals before cleanup/indexing, never jobs."""
+    global _queue_recovery_final_adoption_jobs
+    global _queue_recovery_final_adoption_startup_summary
+    jobs: dict[tuple[str, str], dict] = {}
+    aggregate = {
+        "adopted_groups": 0,
+        "missing_groups": 0,
+        "quarantined_groups": 0,
+        "failed_projects": 0,
+    }
+    for workspace, project in sorted(projects.items()):
+        try:
+            summary = _adopt_quarantined_final_groups(
+                project[0],
+                workspace=workspace,
+            )
+        except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
+            aggregate["failed_projects"] += 1
+            continue
+        for key in ("adopted_groups", "missing_groups", "quarantined_groups"):
+            value = summary.get(key)
+            if type(value) is int and value >= 0:
+                aggregate[key] += value
+        for item in summary.get("jobs") or []:
+            if not isinstance(item, dict):
+                continue
+            job_id = str(item.get("job_id") or "")
+            state = str(item.get("state") or "")
+            counts = {
+                key: item.get(key)
+                for key in ("declared", "adopted", "missing", "quarantined")
+            }
+            output_files = item.get("output_files")
+            if (
+                not job_id
+                or state not in {"adopted", "missing", "quarantined"}
+                or any(type(value) is not int or value < 0 for value in counts.values())
+                or not isinstance(output_files, list)
+                or any(
+                    not isinstance(name, str)
+                    or not name
+                    or os.path.basename(name) != name
+                    or name.startswith(".")
+                    for name in output_files
+                )
+                or (state == "adopted" and len(output_files) != counts["adopted"])
+                or (state != "adopted" and output_files)
+            ):
+                continue
+            jobs[(workspace, job_id)] = {
+                "state": state,
+                **counts,
+                "output_files": list(output_files),
+            }
+    _queue_recovery_final_adoption_jobs = jobs
+    _queue_recovery_final_adoption_startup_summary = aggregate
+    if any(aggregate.values()):
+        print(
+            "[Maestro] Final recovery: "
+            f"{aggregate['adopted_groups']} adopted, "
+            f"{aggregate['missing_groups']} missing, "
+            f"{aggregate['quarantined_groups']} retained, "
+            f"{aggregate['failed_projects']} project scans deferred.",
+            flush=True,
+        )
+    return dict(aggregate)
+
+
 def _valid_sample_campaign_recovery_groups(
     snapshots: Sequence[Mapping[str, Any]],
 ) -> tuple[tuple[dict, dict], ...]:
@@ -5974,10 +6057,20 @@ def _queue_recovery_materialize_job(
         "_recovery_project_digest": expected_project,
         "_recovery_manifest_pointer": dict(snapshot.get("request_manifest") or {}),
     })
+    final_adoption = globals().get(
+        "_queue_recovery_final_adoption_jobs", {}
+    ).get((workspace, job_id))
+    if isinstance(final_adoption, dict):
+        runtime["_recovery_final_adoption"] = dict(final_adoption)
     snapshot_cursor = snapshot.get("recovery_cursor")
     snapshot_units = (
         snapshot_cursor.get("completed_units")
         if isinstance(snapshot_cursor, dict) else None
+    )
+    had_h3_unit_evidence = any(
+        isinstance(unit, dict)
+        and str(unit.get("kind") or "").startswith("h3_")
+        for unit in (snapshot_units if isinstance(snapshot_units, list) else [])
     )
     had_h3_segment_evidence = any(
         isinstance(unit, dict) and unit.get("kind") == "h3_segment"
@@ -5989,16 +6082,21 @@ def _queue_recovery_materialize_job(
     project_reference_finalization = bool(
         callable(publication_recovery) and publication_recovery(snapshot)
     )
+    completed_final_adoption = bool(
+        isinstance(final_adoption, dict)
+        and final_adoption.get("state") == "adopted"
+        and str(snapshot.get("status") or "").casefold() == "completed"
+    )
     current = projects.get(workspace)
     blocked_reason = "Recovery project is missing or was recreated"
     blocked_code = "project_missing_or_recreated"
     manifest = None
     if current is not None and hmac.compare_digest(current[1], expected_project):
         runtime["out_dir"] = current[0]
-        if project_reference_finalization:
+        if project_reference_finalization or completed_final_adoption:
             # Completion-only recovery is authorized entirely by the sealed,
-            # content-free recovery unit and committed asset manifest. It must
-            # never reload private request inputs or rerun generation.
+            # content-free recovery unit/receipt and committed asset evidence.
+            # It must never reload private request inputs or rerun generation.
             blocked_reason = ""
             blocked_code = ""
         else:
@@ -6044,6 +6142,23 @@ def _queue_recovery_materialize_job(
             except QueueRecoveryRuntimeError:
                 blocked_reason = "Recovery request or input validation failed"
                 blocked_code = "input_missing_or_changed"
+
+    if not blocked_reason and isinstance(final_adoption, dict):
+        adopted_outputs = final_adoption.get("output_files")
+        if (
+            final_adoption.get("state") == "adopted"
+            and isinstance(adopted_outputs, list)
+            and len(adopted_outputs) == final_adoption.get("adopted")
+        ):
+            runtime["output_files"] = list(adopted_outputs)
+            artifacts = [
+                name for name in runtime.get("artifact_files") or []
+                if isinstance(name, str) and name
+            ]
+            for name in adopted_outputs:
+                if name not in artifacts:
+                    artifacts.append(name)
+            runtime["artifact_files"] = artifacts
 
     status = str(snapshot.get("status") or "queued").casefold()
     if snapshot.get("kind") == "sample_campaign_generation":
@@ -6124,6 +6239,41 @@ def _queue_recovery_materialize_job(
                     "h3_generation_recovery_authorization_required"
                 ),
                 "message": "Calibrated H3 recovery authorization is required",
+                "error": None,
+            })
+            return runtime, False
+    runtime_params = runtime.get("params")
+    h3_finality_required = bool(
+        had_h3_unit_evidence
+        or isinstance(final_adoption, dict)
+        or (
+            isinstance(runtime_params, dict)
+            and str(runtime_params.get("model_type") or "").startswith(
+                "minimax_h3"
+            )
+        )
+    )
+    if status == "completed" and h3_finality_required:
+        adopted_state = (
+            str(final_adoption.get("state") or "")
+            if isinstance(final_adoption, dict) else ""
+        )
+        verified_outputs = [
+            name for name in runtime.get("output_files") or []
+            if isinstance(name, str) and name
+        ]
+        if (
+            blocked_reason
+            or not verified_outputs
+            or adopted_state in {"missing", "quarantined"}
+        ):
+            runtime.update({
+                "status": "queued",
+                "queue_held": True,
+                "recovery_state": "blocked",
+                "reruns_denoise": False,
+                "_recovery_reason_code": "final_output_recovery_incomplete",
+                "message": "Final output recovery is incomplete",
                 "error": None,
             })
             return runtime, False
@@ -6771,6 +6921,9 @@ def _restore_queue_recovery_on_startup(
     if callable(credit_journal):
         credit_journal()
     projects = _queue_recovery_existing_projects()
+    final_adopter = globals().get("_queue_recovery_adopt_quarantined_finals")
+    if callable(final_adopter):
+        final_adopter(projects)
     credit_orphan_cleanup = globals().get(
         "_credit_reconcile_unregistered_cleanup_manifests"
     )
@@ -60011,6 +60164,9 @@ _BLOCKED_QUEUE_RECOVERY_STATES = frozenset({
 _QUEUE_RECOVERY_REASON_TEXT = {
     "attempt_limit_reached": "Recovery attempt limit reached",
     "input_missing_or_changed": "A required input is missing or changed",
+    "final_output_recovery_incomplete": (
+        "Verified final outputs are incomplete; generation will not be retried"
+    ),
     "owner_reauthentication_required": "Unlock this project to resume",
     "preparation_must_resubmit": "This preparation must be resubmitted",
     "project_missing_or_recreated": "The recovery project is missing or was recreated",
@@ -60179,7 +60335,7 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
             "director_role_admission_required",
         }:
             actions = ["retry"]
-    return {
+    public = {
         "recovery_state": state or None,
         "recovery_interrupted": state == "interrupted",
         "recovery_blocked": blocked,
@@ -60191,6 +60347,25 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
         "recovery_actionable": bool(actions),
         "recovery_actions": actions,
     }
+    finality = job.get("_recovery_final_adoption")
+    if isinstance(finality, dict):
+        finality_state = str(finality.get("state") or "")
+        counts = {
+            key: finality.get(key)
+            for key in ("declared", "adopted", "missing", "quarantined")
+        }
+        if (
+            finality_state in {"adopted", "missing", "quarantined"}
+            and all(type(value) is int and value >= 0 for value in counts.values())
+        ):
+            public["recovery_finality"] = {
+                "state": finality_state,
+                "declared_count": counts["declared"],
+                "adopted_count": counts["adopted"],
+                "missing_count": counts["missing"],
+                "quarantined_count": counts["quarantined"],
+            }
+    return public
 
 
 def _public_resource_metadata(job: dict) -> dict:

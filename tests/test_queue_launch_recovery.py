@@ -4910,6 +4910,149 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(corrupt_waiting["status"], "failed")
         self.assertEqual(corrupt_waiting["recovery_state"], "terminal")
 
+    def test_completed_h3_requires_exact_adopted_finals_before_terminal_state(self):
+        finality = {
+            ("project-a", "job-completed"): {
+                "state": "adopted",
+                "declared": 4,
+                "adopted": 4,
+                "missing": 0,
+                "quarantined": 0,
+                "output_files": [f"final-{index}.mp4" for index in range(4)],
+            },
+        }
+        namespace = _isolated_functions(
+            self.launch,
+            ("_queue_recovery_materialize_job",),
+            {
+                "hmac": hmac,
+                "math": __import__("math"),
+                "time": time,
+                "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_queue_recovery_final_adoption_jobs": finality,
+                "load_request_manifest": lambda *_args, **_kwargs: {
+                    "params": {}, "inputs": [],
+                },
+                "validate_manifest_inputs": lambda *_args: None,
+                "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
+                "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
+                "_queue_recovery_reconcile_cursor": lambda job, _path: job.update({
+                    "output_files": [],
+                }),
+            },
+        )
+        snapshot = {
+            "id": "job-completed",
+            "status": "completed",
+            "workspace": "project-a",
+            "owner_principal": "owner:v1:" + "a" * 64,
+            "project_instance": "project:v1:" + "b" * 64,
+            "request_manifest": {},
+            "recovery_cursor": {
+                "completed_units": [{"kind": "h3_segment"}],
+            },
+        }
+        projects = {"project-a": ("/project", snapshot["project_instance"])}
+        adopted, may_start = namespace["_queue_recovery_materialize_job"](
+            snapshot, projects,
+        )
+        self.assertFalse(may_start)
+        self.assertEqual(adopted["status"], "completed")
+        self.assertEqual(adopted["recovery_state"], "terminal")
+        self.assertEqual(adopted["output_files"], [
+            f"final-{index}.mp4" for index in range(4)
+        ])
+
+        finality[("project-a", "job-completed")] = {
+            "state": "quarantined",
+            "declared": 4,
+            "adopted": 0,
+            "missing": 1,
+            "quarantined": 3,
+            "output_files": [],
+        }
+        incomplete, may_start = namespace["_queue_recovery_materialize_job"](
+            snapshot, projects,
+        )
+        self.assertFalse(may_start)
+        self.assertEqual(incomplete["status"], "queued")
+        self.assertTrue(incomplete["queue_held"])
+        self.assertEqual(incomplete["recovery_state"], "blocked")
+        self.assertFalse(incomplete["reruns_denoise"])
+        self.assertEqual(
+            incomplete["_recovery_reason_code"],
+            "final_output_recovery_incomplete",
+        )
+        self.assertEqual(
+            incomplete["message"], "Final output recovery is incomplete",
+        )
+
+    def test_completed_final_only_and_cursor_loss_h3_never_hide_missing_finals(self):
+        manifest_params = {"value": {}}
+        namespace = _isolated_functions(
+            self.launch,
+            ("_queue_recovery_materialize_job",),
+            {
+                "hmac": hmac,
+                "math": __import__("math"),
+                "time": time,
+                "H3_OFFLOAD_PLAN_PARAM_KEY": "h3_offload_plan",
+                "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_queue_recovery_final_adoption_jobs": {},
+                "load_request_manifest": lambda *_args, **_kwargs: {
+                    "params": dict(manifest_params["value"]), "inputs": [],
+                },
+                "validate_manifest_inputs": lambda *_args: None,
+                "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
+                "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
+                "_queue_recovery_reconcile_cursor": lambda job, _path: job.update({
+                    "output_files": [],
+                }),
+            },
+        )
+        materialize = namespace["_queue_recovery_materialize_job"]
+        base = {
+            "id": "job-final-only",
+            "status": "completed",
+            "workspace": "project-a",
+            "owner_principal": "owner:v1:" + "a" * 64,
+            "project_instance": "project:v1:" + "b" * 64,
+            "request_manifest": {},
+        }
+        projects = {"project-a": ("/project", base["project_instance"])}
+
+        final_only = materialize({
+            **base,
+            "recovery_cursor": {
+                "completed_units": [{"kind": "h3_concat"}],
+            },
+        }, projects)[0]
+        self.assertEqual(final_only["status"], "queued")
+        self.assertEqual(
+            final_only["_recovery_reason_code"],
+            "final_output_recovery_incomplete",
+        )
+
+        manifest_params["value"] = {"model_type": "minimax_h3_8.5b_fast"}
+        cursor_lost = materialize({
+            **base,
+            "id": "job-cursor-lost",
+            "recovery_cursor": {"completed_units": []},
+        }, projects)[0]
+        self.assertEqual(cursor_lost["status"], "queued")
+        self.assertEqual(cursor_lost["recovery_state"], "blocked")
+
+        manifest_params["value"] = {"model_type": "flux"}
+        ordinary = materialize({
+            **base,
+            "id": "job-ordinary",
+            "recovery_cursor": {"completed_units": []},
+        }, projects)[0]
+        self.assertEqual(ordinary["status"], "completed")
+        self.assertEqual(ordinary["recovery_state"], "terminal")
+
     def test_waiting_plan_restore_does_not_increment_attempt_or_start_worker(self):
         namespace = _isolated_functions(
             self.launch,
@@ -8565,6 +8708,127 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertLess(lock, publish)
         self.assertGreaterEqual(worker.count("sample_safe_unit_current(abort_state)"), 7)
         self.assertNotIn("\n                        _queue_recovery_checkpoint_unit(", worker)
+
+    def test_final_adoption_runs_before_cleanup_index_and_workers(self):
+        restore = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_restore_queue_recovery_on_startup"),
+        )
+        projects = restore.index("projects = _queue_recovery_existing_projects()")
+        adoption = restore.index("final_adopter(projects)", projects)
+        cleanup = restore.index("cleanup_orphan_request_manifests(", adoption)
+        workers = restore.index("before_recovered_workers()", cleanup)
+        self.assertLess(projects, adoption)
+        self.assertLess(adoption, cleanup)
+        self.assertLess(cleanup, workers)
+
+    def test_final_adoption_startup_summary_keeps_job_ids_private(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_queue_recovery_adopt_quarantined_finals",),
+            {
+                "Mapping": dict,
+                "os": os,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_queue_recovery_final_adoption_jobs": {},
+                "_queue_recovery_final_adoption_startup_summary": {},
+                "_adopt_quarantined_final_groups": lambda *_args, **_kwargs: {
+                    "adopted_groups": 1,
+                    "missing_groups": 0,
+                    "quarantined_groups": 0,
+                    "jobs": [{
+                        "job_id": "private-job-id",
+                        "state": "adopted",
+                        "declared": 4,
+                        "adopted": 4,
+                        "missing": 0,
+                        "quarantined": 0,
+                        "output_files": [
+                            "final-0.mp4", "final-1.mp4",
+                            "final-2.mp4", "final-3.mp4",
+                        ],
+                    }],
+                },
+            },
+        )
+        summary = namespace["_queue_recovery_adopt_quarantined_finals"]({
+            "project": ("/private/project", "opaque-digest"),
+        })
+        self.assertEqual(summary, {
+            "adopted_groups": 1,
+            "missing_groups": 0,
+            "quarantined_groups": 0,
+            "failed_projects": 0,
+        })
+        self.assertNotIn("private-job-id", json.dumps(summary))
+        self.assertEqual(
+            namespace["_queue_recovery_final_adoption_jobs"]
+            [("project", "private-job-id")]["adopted"],
+            4,
+        )
+
+    def test_public_finality_projection_is_content_free_counts_only(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_public_queue_recovery_metadata",),
+            {
+                "MAX_RECOVERY_ATTEMPTS": 3,
+                "_QUEUE_RECOVERY_REASON_TEXT": {},
+                "_queue_recovery_attempt": lambda _job: 0,
+                "_queue_recovery_is_blocked": lambda _job: False,
+                "_queue_recovery_reason_code": lambda _job: None,
+                "_queue_recovery_worker": lambda _job: object(),
+            },
+        )
+        public = namespace["_public_queue_recovery_metadata"]({
+            "_recovery_final_adoption": {
+                "state": "quarantined",
+                "declared": 4,
+                "adopted": 0,
+                "missing": 1,
+                "quarantined": 3,
+                "job_id": "must-not-leak",
+                "path": "/must/not/leak",
+            },
+        })
+        self.assertEqual(public["recovery_finality"], {
+            "state": "quarantined",
+            "declared_count": 4,
+            "adopted_count": 0,
+            "missing_count": 1,
+            "quarantined_count": 3,
+        })
+        self.assertNotIn("must-not-leak", json.dumps(public))
+        self.assertNotIn("/must/not/leak", json.dumps(public))
+
+    def test_incomplete_finality_never_exposes_a_generation_retry(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_public_queue_recovery_metadata",),
+            {
+                "MAX_RECOVERY_ATTEMPTS": 3,
+                "_QUEUE_RECOVERY_REASON_TEXT": {
+                    "final_output_recovery_incomplete": "Finals are incomplete",
+                },
+                "_queue_recovery_attempt": lambda _job: 0,
+                "_queue_recovery_is_blocked": lambda _job: True,
+                "_queue_recovery_reason_code": lambda job: job.get(
+                    "_recovery_reason_code"
+                ),
+                "_queue_recovery_worker": lambda _job: object(),
+            },
+        )
+        public = namespace["_public_queue_recovery_metadata"]({
+            "recovery_state": "blocked",
+            "_recovery_reason_code": "final_output_recovery_incomplete",
+        })
+        self.assertFalse(public["recovery_actionable"])
+        self.assertEqual(public["recovery_actions"], [])
+        resume = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_resume_recovered_job"),
+        )
+        self.assertNotIn('"final_output_recovery_incomplete"', resume)
 
 
 if __name__ == "__main__":
