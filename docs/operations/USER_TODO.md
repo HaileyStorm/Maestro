@@ -1,16 +1,11 @@
 # Things I need from you
 
-Last updated: 2026-08-15. I will keep this list short and remove items when they
+Last updated: 2026-08-16. I will keep this list short and remove items when they
 are settled.
 
-## Question to answer now
+## Questions
 
-1. After reviewing the [MiniMax Music 3 license](https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/main/LICENSE),
-   are you okay with a local-only install and benchmark on this computer? I will
-   show the required `MiniMax-Music3` credit. LAN and Cloudflare access will stay
-   off for now.
-
-There is no Hugging Face button to click for Music 3; its repository is public.
+None right now.
 
 ## I will ask later, if needed
 
@@ -23,7 +18,8 @@ There is no Hugging Face button to click for Music 3; its repository is public.
 
 ## Already decided
 
-- Music 3 is required.
+- Music 3 is approved for a local-only install and benchmark. Show its required
+  credit; keep LAN and Cloudflare access off for now.
 - Character Sheets start from a FLUX anchor. Quad FLUX is the safe default;
   Krea choices are explicit, and Dynamic Krea stays experimental. A local VLM
   and Qwen Image Edit handle review and repair.
