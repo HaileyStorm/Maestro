@@ -38,6 +38,8 @@ LEDGER_SCHEMA_VERSION = 1
 MAX_LEDGER_BYTES = 8 * 1024 * 1024
 MAX_EVENTS = 50_000
 GENESIS_HMAC = "0" * 64
+DEVELOPMENT_COST_RECOVERY_TARGET_MINOR = 100_000
+DEVELOPMENT_COST_RECOVERY_CURRENCY = "USD"
 EVENT_KINDS = frozenset({
     "one_time_contribution",
     "recurring_started",
@@ -70,6 +72,9 @@ _MANUAL_PROVIDER_BY_SOURCE = MappingProxyType({
     source: f"manual_{source}" for source in MANUAL_CONTRIBUTION_SOURCES
 })
 _MANUAL_PROVIDERS = frozenset(_MANUAL_PROVIDER_BY_SOURCE.values())
+_DIRECT_COMPUTE_SPONSORSHIP_PROVIDER = _MANUAL_PROVIDER_BY_SOURCE[
+    "direct_compute_sponsorship"
+]
 LEGACY_FULFILLMENT_STATES = frozenset({"complete"})
 _FULFILLMENT_TRANSITIONS = MappingProxyType({
     None: frozenset({"pending"}),
@@ -837,6 +842,54 @@ def _recorded_allowance_projection(
     }
 
 
+def _development_cost_recovery_projection(
+    events: Sequence[ContributionEvent],
+    *,
+    as_of: datetime,
+) -> dict[str, Any]:
+    """Project the global USD recovery gate without exposing ledger identities."""
+
+    funding = {
+        (event.provider, event.source_event_key): event
+        for event in events
+        if event.kind in FUNDING_KINDS
+        and event.currency == DEVELOPMENT_COST_RECOVERY_CURRENCY
+        and event.provider != _DIRECT_COMPUTE_SPONSORSHIP_PROVIDER
+        and _as_utc(event.occurred_at) <= as_of
+    }
+    adjusted: dict[tuple[str, str], int] = defaultdict(int)
+    for event in sorted(events, key=lambda item: item.sequence):
+        if (
+            event.kind not in ADJUSTMENT_KINDS
+            or _as_utc(event.occurred_at) > as_of
+        ):
+            continue
+        target_key = (event.provider, event.related_event_key or "")
+        target = funding.get(target_key)
+        if (
+            target is None
+            or target.subject_key != event.subject_key
+            or target.currency != event.currency
+            or event.amount_minor > target.amount_minor - adjusted[target_key]
+        ):
+            continue
+        adjusted[target_key] += event.amount_minor
+
+    recovered_minor = sum(
+        event.amount_minor - adjusted[source_key]
+        for source_key, event in funding.items()
+    )
+    return {
+        "target_minor": DEVELOPMENT_COST_RECOVERY_TARGET_MINOR,
+        "currency": DEVELOPMENT_COST_RECOVERY_CURRENCY,
+        "state": (
+            "recovered"
+            if recovered_minor >= DEVELOPMENT_COST_RECOVERY_TARGET_MINOR
+            else "locked"
+        ),
+    }
+
+
 class ContributionLedger:
     """Integrity-sealed local event ledger with atomic append publication."""
 
@@ -918,8 +971,10 @@ class ContributionLedger:
         }:
             raise LedgerIntegrityError("contribution ledger shape is invalid")
         records = payload.get("events")
+        schema_version = payload.get("schema_version")
         if (
-            payload.get("schema_version") != LEDGER_SCHEMA_VERSION
+            type(schema_version) is not int
+            or schema_version != LEDGER_SCHEMA_VERSION
             or not isinstance(records, list)
             or len(records) > MAX_EVENTS
             or not isinstance(payload.get("ledger_hmac"), str)
@@ -1029,6 +1084,32 @@ class ContributionLedger:
     def events(self) -> tuple[ContributionEvent, ...]:
         with self._locked():
             return self._read_unlocked()
+
+    def development_cost_recovery_projection(
+        self,
+        *,
+        as_of: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        """Return the server-owned, privacy-bounded global recovery state.
+
+        The exact recovered amount remains private. An unreadable or tampered
+        ledger fails closed without turning integrity failure into an unlock.
+        """
+
+        projected_at = _as_utc(as_of or datetime.now(timezone.utc))
+        with self._locked():
+            try:
+                events = self._read_unlocked()
+            except LedgerIntegrityError:
+                return {
+                    "target_minor": DEVELOPMENT_COST_RECOVERY_TARGET_MINOR,
+                    "currency": DEVELOPMENT_COST_RECOVERY_CURRENCY,
+                    "state": "locked",
+                }
+            return _development_cost_recovery_projection(
+                events,
+                as_of=projected_at,
+            )
 
     def event_for_source(
         self, provider: str, source_event_key: str,

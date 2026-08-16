@@ -27,6 +27,8 @@ from services.entitlements import (  # noqa: E402
     ContributionConflict,
     ContributionEventDraft,
     ContributionLedger,
+    DEVELOPMENT_COST_RECOVERY_CURRENCY,
+    DEVELOPMENT_COST_RECOVERY_TARGET_MINOR,
     EntitlementError,
     LedgerIntegrityError,
     ManualContributionConflict,
@@ -1082,6 +1084,272 @@ class ContributionLedgerTests(unittest.TestCase):
         self.assertEqual(
             admin["unresolved"][0]["reason"],
             "unresolved_or_mismatched_adjustment",
+        )
+
+    def test_development_cost_recovery_has_exact_server_owned_boundary(self):
+        self.assertEqual(DEVELOPMENT_COST_RECOVERY_TARGET_MINOR, 100_000)
+        self.assertEqual(DEVELOPMENT_COST_RECOVERY_CURRENCY, "USD")
+        for amount_minor, expected_state in (
+            (99_999, "locked"),
+            (100_000, "recovered"),
+            (100_001, "recovered"),
+        ):
+            with self.subTest(amount_minor=amount_minor):
+                ledger = ContributionLedger(
+                    Path(self.temp.name) / f"boundary-{amount_minor}.json",
+                    integrity_key=KEY,
+                    allow_test_path=True,
+                )
+                ledger.append(
+                    self.draft(
+                        f"boundary-{amount_minor}",
+                        "one_time_contribution",
+                        amount=amount_minor,
+                    ),
+                    received_at=NOW,
+                )
+                self.assertEqual(
+                    ledger.development_cost_recovery_projection(as_of=NOW),
+                    {
+                        "target_minor": 100_000,
+                        "currency": "USD",
+                        "state": expected_state,
+                    },
+                )
+
+    def test_development_cost_recovery_counts_recurring_and_valid_refunds(self):
+        self.ledger.append(self.draft(
+            "gift", "one_time_contribution", amount=40_001,
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "membership-start", "recurring_started", amount=30_000,
+            contract="membership",
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "membership-renewal", "recurring_renewed", amount=30_000,
+            contract="membership",
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "membership-cancel", "recurring_canceled", contract="membership",
+        ), received_at=NOW)
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection(as_of=NOW)["state"],
+            "recovered",
+        )
+        self.ledger.append(self.draft(
+            "gift-refund", "refund", amount=2, related="gift",
+        ), received_at=NOW)
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection(as_of=NOW)["state"],
+            "locked",
+        )
+
+    def test_development_cost_recovery_excludes_ineligible_events(self):
+        self.ledger.append(self.draft(
+            "eligible", "one_time_contribution", amount=99_999,
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "future", "one_time_contribution", amount=100_000,
+            occurred_at="2026-08-12T08:00:00Z",
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "eur", "one_time_contribution", amount=100_000, currency="EUR",
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "orphan-refund", "refund", amount=50_000, related="missing",
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "excess-refund", "refund", amount=100_000, related="eligible",
+        ), received_at=NOW)
+        self.ledger.record_manual_contribution(
+            subject_key=self.subject,
+            source="direct_compute_sponsorship",
+            kind="one_time_contribution",
+            amount_minor=100_000,
+            currency="USD",
+            target_event_id=None,
+            source_event_key=keyed("manual_request", "direct-compute"),
+            actor_key=keyed("manual_actor", "owner"),
+            occurred_at=NOW,
+            received_at=NOW,
+        )
+        projection = self.ledger.development_cost_recovery_projection(as_of=NOW)
+        self.assertEqual(projection["state"], "locked")
+        self.assertEqual(set(projection), {"target_minor", "currency", "state"})
+        serialized = json.dumps(projection, sort_keys=True).lower()
+        for forbidden in ("subject", "event", "provider", "customer"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_development_cost_recovery_matches_adjustments_exactly(self):
+        self.ledger.append(self.draft(
+            "funding", "one_time_contribution", amount=100_001,
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "future-refund", "refund", amount=100_001, related="funding",
+            occurred_at="2026-08-12T08:00:00Z",
+        ), received_at=NOW)
+        self.ledger.append(replace(
+            self.draft(
+                "provider-mismatch", "refund", amount=100_001,
+                related="funding",
+            ),
+            provider="other_support",
+        ), received_at=NOW)
+        self.ledger.append(replace(
+            self.draft(
+                "subject-mismatch", "refund", amount=100_001,
+                related="funding",
+            ),
+            subject_key=keyed("test_subject", "other"),
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "currency-mismatch", "refund", amount=100_001,
+            related="funding", currency="EUR",
+        ), received_at=NOW)
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection(as_of=NOW)["state"],
+            "recovered",
+        )
+        self.ledger.append(self.draft(
+            "valid-refund", "refund", amount=1, related="funding",
+        ), received_at=NOW)
+        self.ledger.append(self.draft(
+            "excess-after-valid", "refund", amount=100_001,
+            related="funding",
+        ), received_at=NOW)
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection(as_of=NOW)["state"],
+            "recovered",
+        )
+        self.ledger.append(self.draft(
+            "valid-chargeback", "chargeback", amount=1, related="funding",
+        ), received_at=NOW)
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection(as_of=NOW)["state"],
+            "locked",
+        )
+
+    def test_development_cost_recovery_counts_ordinary_manual_sources_only(self):
+        common = {
+            "subject_key": self.subject,
+            "kind": "one_time_contribution",
+            "currency": "USD",
+            "target_event_id": None,
+            "actor_key": keyed("manual_actor", "owner"),
+            "occurred_at": NOW,
+            "received_at": NOW,
+        }
+        for source, amount_minor in (
+            ("buy_me_a_coffee", 40_000),
+            ("patreon", 60_000),
+            ("direct_compute_sponsorship", 100_000),
+        ):
+            self.ledger.record_manual_contribution(
+                **common,
+                source=source,
+                amount_minor=amount_minor,
+                source_event_key=keyed("manual_request", source),
+            )
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection(as_of=NOW)["state"],
+            "recovered",
+        )
+
+    def test_development_cost_recovery_ignores_bookkeeping_events(self):
+        funding = self.ledger.append(self.draft(
+            "bookkeeping-funding", "one_time_contribution", amount=100_000,
+        ), received_at=NOW)
+        self.ledger.transition_fulfillment(
+            subject_key=self.subject,
+            target_event_id=funding.event_id,
+            item="one_time_credit_grant",
+            status="pending",
+            source_event_key=keyed("fake_event", "bookkeeping-fulfillment"),
+            actor_key=keyed("admin_actor", "owner"),
+            occurred_at=NOW,
+            received_at=NOW,
+        )
+        self.ledger.append(self.draft(
+            "bookkeeping-link", "account_link_verified",
+            contract="bookkeeping-proof", related="provider-subject",
+        ), received_at=NOW)
+        self.assertEqual(
+            self.ledger.development_cost_recovery_projection(as_of=NOW)["state"],
+            "recovered",
+        )
+
+    def test_development_cost_recovery_replays_and_reprojects_from_ledger(self):
+        draft = self.draft(
+            "restart", "one_time_contribution", amount=100_000,
+        )
+        stored = self.ledger.append(draft, received_at=NOW)
+        self.assertEqual(self.ledger.append(draft, received_at=NOW), stored)
+        expected = self.ledger.development_cost_recovery_projection(as_of=NOW)
+        restarted = ContributionLedger(
+            self.path, integrity_key=KEY, allow_test_path=True,
+        )
+        self.assertEqual(
+            restarted.development_cost_recovery_projection(as_of=NOW),
+            expected,
+        )
+        restarted.append(self.draft(
+            "restart-refund", "refund", amount=1, related="restart",
+        ), received_at=NOW)
+        self.assertEqual(
+            restarted.development_cost_recovery_projection(as_of=NOW)["state"],
+            "locked",
+        )
+
+    def test_development_cost_recovery_integrity_and_overrides_fail_closed(self):
+        self.ledger.append(self.draft(
+            "tamper", "one_time_contribution", amount=100_000,
+        ), received_at=NOW)
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        payload["events"][0]["amount_minor"] = 100_001
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        with mock.patch.dict(
+            os.environ,
+            {"MAESTRO_DEVELOPMENT_COST_RECOVERY_TARGET_MINOR": "1"},
+        ):
+            self.assertEqual(
+                self.ledger.development_cost_recovery_projection(as_of=NOW),
+                {
+                    "target_minor": 100_000,
+                    "currency": "USD",
+                    "state": "locked",
+                },
+            )
+        with self.assertRaises(TypeError):
+            self.ledger.development_cost_recovery_projection(
+                as_of=NOW,
+                target_minor=1,
+            )
+
+        for label, invalid_value in (("boolean", True), ("float", 1.0)):
+            with self.subTest(schema_version=label):
+                path = Path(self.temp.name) / f"schema-{label}.json"
+                ledger = ContributionLedger(
+                    path, integrity_key=KEY, allow_test_path=True,
+                )
+                ledger.append(self.draft(
+                    f"schema-{label}", "one_time_contribution", amount=100_000,
+                ), received_at=NOW)
+                invalid = json.loads(path.read_text(encoding="utf-8"))
+                invalid["schema_version"] = invalid_value
+                path.write_text(json.dumps(invalid), encoding="utf-8")
+                self.assertEqual(
+                    ledger.development_cost_recovery_projection(as_of=NOW)["state"],
+                    "locked",
+                )
+
+        unreadable_path = Path(self.temp.name) / "unreadable.json"
+        unreadable_path.write_text("{", encoding="utf-8")
+        unreadable = ContributionLedger(
+            unreadable_path, integrity_key=KEY, allow_test_path=True,
+        )
+        self.assertEqual(
+            unreadable.development_cost_recovery_projection(as_of=NOW)["state"],
+            "locked",
         )
 
     def test_moody_exclusion_is_exact_server_identity_not_content_classification(self):
