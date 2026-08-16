@@ -737,7 +737,7 @@ export interface AccountAuthResult {
   recovery_codes?: string[]
 }
 
-export type SupportProviderState = 'disabled' | 'unconfigured' | 'available'
+export type SupportProviderState = 'disabled' | 'unconfigured' | 'locked' | 'available'
 
 export interface SupportProvider {
   provider_id: string
@@ -765,6 +765,33 @@ export interface SupportPriorityPolicy {
   notice: string
 }
 
+export interface DevelopmentCostRecoveryProjection {
+  target_minor: number
+  currency: 'USD'
+  state: 'locked' | 'recovered'
+}
+
+export function developmentCostRecoveryProjection(
+  value: unknown,
+): DevelopmentCostRecoveryProjection | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const keys = Object.keys(value).sort()
+  if (keys.join('\n') !== 'currency\nstate\ntarget_minor') return null
+  const recovery = value as Record<string, unknown>
+  if (
+    recovery.target_minor !== 100_000
+    || recovery.currency !== 'USD'
+    || (recovery.state !== 'locked' && recovery.state !== 'recovered')
+  ) return null
+  return {
+    target_minor: 100_000,
+    currency: 'USD',
+    state: recovery.state,
+  }
+}
+
 export interface SupportPublicProjection {
   schema_version: number
   provider_catalog: {
@@ -777,6 +804,7 @@ export interface SupportPublicProjection {
     effective_benefits: string[]
     state: string
   }
+  development_cost_recovery: DevelopmentCostRecoveryProjection | null
   support_priority: SupportPriorityPolicy
 }
 
@@ -938,6 +966,7 @@ export interface SupportAdminProjection {
   account: SupportAccountSummary
   audit: SupportAdminAudit
   responsible_use: ResponsibleUseStatus
+  development_cost_recovery: DevelopmentCostRecoveryProjection | null
   support_priority: SupportPriorityPolicy
 }
 

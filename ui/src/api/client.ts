@@ -49,6 +49,7 @@ import type {
   SupportPublicProjection,
   SupportSelfProjection,
 } from '../types'
+import { developmentCostRecoveryProjection } from '../types/index.ts'
 
 export type {
   ProjectReferenceAssetType,
@@ -2037,21 +2038,31 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
 }
 
 export async function fetchSupportCatalog(): Promise<SupportPublicProjection> {
-  return accountRequest<SupportPublicProjection>('/api/v1/support/catalog')
+  const raw = await accountRequest<RawSupportPublicProjection>('/api/v1/support/catalog')
+  return supportPublicProjection(raw)
+}
+
+type RawSupportPublicProjection = Omit<SupportPublicProjection, 'development_cost_recovery'> & {
+  development_cost_recovery?: unknown
+}
+
+function supportPublicProjection(raw: RawSupportPublicProjection): SupportPublicProjection {
+  return {
+    schema_version: raw.schema_version,
+    provider_catalog: raw.provider_catalog,
+    benefit_availability: raw.benefit_availability,
+    development_cost_recovery: developmentCostRecoveryProjection(raw.development_cost_recovery),
+    support_priority: raw.support_priority,
+  }
 }
 
 export async function fetchSupportSelf(): Promise<SupportSelfProjection> {
-  const raw = await accountRequest<SupportPublicProjection & {
+  const raw = await accountRequest<RawSupportPublicProjection & {
     account_support?: RawSupportAccountProjection
     responsible_use: ResponsibleUseProjection
   }>('/api/v1/support/self')
   return {
-    public: {
-      schema_version: raw.schema_version,
-      provider_catalog: raw.provider_catalog,
-      benefit_availability: raw.benefit_availability,
-      support_priority: raw.support_priority,
-    },
+    public: supportPublicProjection(raw),
     account: supportAccountSummary(raw.account_support),
     responsible_use: raw.responsible_use,
   }
@@ -2078,6 +2089,7 @@ export async function fetchAdminAccountSupport(accountId: string): Promise<Suppo
   const raw = await accountRequest<{
     account_support?: RawSupportAccountProjection
     responsible_use: ResponsibleUseStatus
+    development_cost_recovery?: unknown
     support_priority: SupportAdminProjection['support_priority']
   }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}`)
   return supportAdminProjection(raw)
@@ -2086,6 +2098,7 @@ export async function fetchAdminAccountSupport(accountId: string): Promise<Suppo
 function supportAdminProjection(raw: {
   account_support?: RawSupportAccountProjection
   responsible_use: ResponsibleUseStatus
+  development_cost_recovery?: unknown
   support_priority: SupportAdminProjection['support_priority']
 }): SupportAdminProjection {
   const recorded = raw.account_support?.recorded || {}
@@ -2093,6 +2106,7 @@ function supportAdminProjection(raw: {
     account: supportAccountSummary(raw.account_support),
     audit: supportAdminAudit(recorded),
     responsible_use: raw.responsible_use,
+    development_cost_recovery: developmentCostRecoveryProjection(raw.development_cost_recovery),
     support_priority: raw.support_priority,
   }
 }
@@ -2104,6 +2118,7 @@ export async function transitionAdminAccountFulfillment(
   const raw = await accountRequest<{
     account_support?: RawSupportAccountProjection
     responsible_use: ResponsibleUseStatus
+    development_cost_recovery?: unknown
     support_priority: SupportAdminProjection['support_priority']
   }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}/fulfillment`, {
     method: 'POST',
@@ -2119,6 +2134,7 @@ export async function recordAdminAccountContribution(
   const raw = await accountRequest<{
     account_support?: RawSupportAccountProjection
     responsible_use: ResponsibleUseStatus
+    development_cost_recovery?: unknown
     support_priority: SupportAdminProjection['support_priority']
   }>(`/api/v1/support/admin/accounts/${encodeURIComponent(accountId)}/contributions`, {
     method: 'POST',

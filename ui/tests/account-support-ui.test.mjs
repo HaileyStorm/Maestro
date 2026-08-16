@@ -33,6 +33,7 @@ import {
   affectedPriorityNotice,
   nextAccountSupportTab,
   responsibleUseIsAccepted,
+  verifiedDevelopmentCostRecovery,
   visibleSupportProviders,
 } from '../src/components/AccountSupport/supportPresentation.ts'
 
@@ -868,11 +869,14 @@ const publicSupport = {
     }, {
       provider_id: 'direct_compute_sponsorship', display_name: 'Direct compute sponsorship', funding_modes: ['one_time'],
       description: 'Sponsor Continuum compute directly.', enabled: false, configured: false,
-      state: 'disabled', support_url: null,
+      state: 'locked', support_url: null,
     }],
   },
   benefit_availability: {
     scheduler_enforcement_enabled: false, effective_benefits: [], state: 'recorded_not_enforced',
+  },
+  development_cost_recovery: {
+    target_minor: 100_000, currency: 'USD', state: 'locked',
   },
   support_priority: {
     scheduler_enforcement_enabled: false, effective_priority_boost: false, state: 'not_enabled',
@@ -1011,6 +1015,9 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
         },
       },
       responsible_use: responsibleUse.status,
+      development_cost_recovery: {
+        target_minor: 100_000, currency: 'USD', state: 'recovered',
+      },
       support_priority: publicSupport.support_priority,
       audit: [{ email: 'private@example.test', provider_secret: 'secret' }],
     })
@@ -1037,10 +1044,19 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
       idempotency_key: opaqueSupportKey('8'),
     })
     assert.equal(catalog.provider_catalog.provider_neutral, true)
+    assert.deepEqual(catalog.development_cost_recovery, {
+      target_minor: 100_000, currency: 'USD', state: 'locked',
+    })
+    assert.deepEqual(self.public.development_cost_recovery, catalog.development_cost_recovery)
     assert.equal(self.account.event_count, 2)
     assert.equal(notice.notice.version, 1)
     assert.equal(accepted.status.accepted, true)
     assert.equal(admin.account.event_count, 4)
+    assert.deepEqual(admin.development_cost_recovery, {
+      target_minor: 100_000, currency: 'USD', state: 'recovered',
+    })
+    assert.deepEqual(transitioned.development_cost_recovery, admin.development_cost_recovery)
+    assert.deepEqual(recorded.development_cost_recovery, admin.development_cost_recovery)
     assert.deepEqual(self.account.recorded_allowance, recordedAllowance)
     assert.deepEqual(admin.account.recorded_allowance, {
       ...recordedAllowance,
@@ -1126,6 +1142,48 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     idempotency_key: opaqueSupportKey('8'),
   })
   assert.equal(calls[0].init.body, undefined)
+})
+
+test('Support recovery projections reject malformed or privacy-bearing shapes without retaining them', async () => {
+  const privacyBearingRecovery = {
+    target_minor: 100_000,
+    currency: 'USD',
+    state: 'recovered',
+    recovered_minor: 100_000,
+    events: [{ amount_minor: 100_000 }],
+    subject: 'private-account',
+  }
+  await withFetchMock(async url => {
+    if (String(url).endsWith('/support/catalog')) return jsonResponse({
+      ...publicSupport,
+      development_cost_recovery: privacyBearingRecovery,
+      recovered_minor: 100_000,
+      subject: 'private-account',
+    })
+    if (String(url).endsWith('/support/self')) return jsonResponse({
+      ...publicSupport,
+      development_cost_recovery: privacyBearingRecovery,
+      responsible_use: responsibleUse,
+      account_support: {},
+    })
+    return jsonResponse({
+      account_support: {},
+      responsible_use: responsibleUse.status,
+      development_cost_recovery: privacyBearingRecovery,
+      support_priority: publicSupport.support_priority,
+    })
+  }, async () => {
+    const catalog = await fetchSupportCatalog()
+    const self = await fetchSupportSelf()
+    const admin = await fetchAdminAccountSupport('private-account')
+    assert.equal(catalog.development_cost_recovery, null)
+    assert.equal(self.public.development_cost_recovery, null)
+    assert.equal(admin.development_cost_recovery, null)
+    assert.doesNotMatch(
+      JSON.stringify([catalog, self.public, admin.development_cost_recovery]),
+      /recovered_minor|events|subject|private-account/,
+    )
+  })
 })
 
 test('Support self preserves a server-authored active hosted allowance', async () => {
@@ -1689,8 +1747,13 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
 
   const tree = expandElement(SupportPanel())
   const text = elementText(tree)
-  assert.match(text, /hundreds already spent on Codex while building Maestro/)
-  assert.match(text, /After support becomes sustainable, it will fund hosting Maestro Continuum with more compute/)
+  assert.match(text, /Support first helps cover \$1,000 in development costs/)
+  assert.match(text, /After that, it can help fund hosting Maestro Continuum with more compute/)
+  assert.match(text, /\$1,000 development-cost target/)
+  assert.match(text, /Direct compute sponsorship stays locked until that target is reached/)
+  assert.match(text, /checks net recorded USD support after refunds/)
+  assert.match(text, /running total and contribution history stay private/)
+  assert.match(text, /Locked until the \$1,000 development-cost target is reached/)
   assert.match(text, /offers no guarantees or perks/)
   assert.match(text, /Buy Me a Coffee/)
   assert.match(text, /Patreon/)
@@ -1780,6 +1843,31 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   }
   const legacyText = elementText(expandElement(SupportPanel()))
   assert.doesNotMatch(legacyText, /Recorded informational compute allowance|Allowance breakdown/)
+
+  const recoveredPublic = structuredClone(publicSupport)
+  recoveredPublic.development_cost_recovery.state = 'recovered'
+  recoveredPublic.provider_catalog.providers[2] = {
+    ...recoveredPublic.provider_catalog.providers[2],
+    enabled: true,
+    configured: true,
+    state: 'available',
+    support_url: 'https://support.operator.com/maestro',
+  }
+  globalThis.__supportStore.supportCatalog = recoveredPublic
+  globalThis.__supportStore.supportSelf = {
+    public: recoveredPublic,
+    account: { ...account, recorded_allowance: undefined },
+    responsible_use: responsibleUse,
+  }
+  const recoveredTree = expandElement(SupportPanel())
+  const recoveredText = elementText(recoveredTree)
+  assert.match(recoveredText, /Development costs recovered/)
+  assert.match(recoveredText, /The \$1,000 target has been reached/)
+  assert.match(recoveredText, /Direct compute sponsorship can be offered when it is configured/)
+  assert.equal(
+    findElements(recoveredTree, node => node.type === 'a' && node.props?.href === 'https://support.operator.com/maestro').length,
+    1,
+  )
 })
 
 test('Support panel renders a bounded owner audit with fulfillment controls, loading, empty, error, and stale-selection states', async t => {
@@ -1846,7 +1934,13 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     },
     accountUsers: [account], supportCatalog: publicSupport, supportCatalogLoading: false,
     supportCatalogUnavailable: false, supportSelf: null, responsibleUse: null,
-    supportAdmin: { account: summary, audit, responsible_use: responsibleUse.status, support_priority: publicSupport.support_priority },
+    supportAdmin: {
+      account: summary,
+      audit,
+      responsible_use: responsibleUse.status,
+      development_cost_recovery: publicSupport.development_cost_recovery,
+      support_priority: publicSupport.support_priority,
+    },
     supportAdminAccountId: account.id, supportDetailsLoading: false,
     loadSupportCatalog: async () => null, loadSupportSelf: async () => null,
     loadResponsibleUse: async () => null, acceptResponsibleUse: async () => null,
@@ -1879,6 +1973,100 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     ['buy_me_a_coffee', 'patreon', 'direct_compute_sponsorship'].filter(value => manualOptionValues.includes(value)),
     ['buy_me_a_coffee', 'patreon', 'direct_compute_sponsorship'],
   )
+  const directManualOption = findElements(
+    tree,
+    node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
+  )[0]
+  assert.equal(directManualOption.props.disabled, true)
+  assert.match(elementText(directManualOption), /locked until \$1,000 is recovered/)
+
+  globalThis.__supportStore.supportAdmin = {
+    ...globalThis.__supportStore.supportAdmin,
+    development_cost_recovery: {
+      target_minor: 100_000, currency: 'USD', state: 'recovered',
+    },
+  }
+  const recoveredOwnerTree = expandElement(SupportPanel())
+  const recoveredDirectOption = findElements(
+    recoveredOwnerTree,
+    node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
+  )[0]
+  assert.equal(recoveredDirectOption.props.disabled, false)
+  assert.doesNotMatch(elementText(recoveredDirectOption), /locked/)
+
+  globalThis.__supportStore.supportAdmin = {
+    ...globalThis.__supportStore.supportAdmin,
+    development_cost_recovery: {
+      target_minor: 100_000, currency: 'USD', state: 'locked',
+    },
+  }
+  const relockedOwnerTree = expandElement(SupportPanel())
+  assert.equal(findElements(
+    relockedOwnerTree,
+    node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
+  )[0].props.disabled, true)
+
+  const recoveredCatalog = structuredClone(publicSupport)
+  recoveredCatalog.development_cost_recovery.state = 'recovered'
+  recoveredCatalog.provider_catalog.providers[2] = {
+    ...recoveredCatalog.provider_catalog.providers[2],
+    enabled: true,
+    configured: true,
+    state: 'available',
+    support_url: 'https://support.operator.com/maestro',
+  }
+  globalThis.__supportStore.supportCatalog = recoveredCatalog
+  const freshRelockTree = expandElement(SupportPanel())
+  assert.equal(findElements(
+    freshRelockTree,
+    node => node.type === 'a' && node.props?.href === 'https://support.operator.com/maestro',
+  ).length, 0)
+  assert.doesNotMatch(elementText(freshRelockTree), /Development costs recovered/)
+
+  globalThis.__supportStore.supportAdmin = {
+    ...globalThis.__supportStore.supportAdmin,
+    development_cost_recovery: {
+      target_minor: 100_000, currency: 'USD', state: 'recovered',
+    },
+  }
+  const freshRecoveryTree = expandElement(SupportPanel())
+  assert.equal(findElements(
+    freshRecoveryTree,
+    node => node.type === 'a' && node.props?.href === 'https://support.operator.com/maestro',
+  ).length, 1)
+  assert.match(elementText(freshRecoveryTree), /Development costs recovered/)
+
+  globalThis.__supportStore.supportAdmin = {
+    ...globalThis.__supportStore.supportAdmin,
+    development_cost_recovery: {
+      target_minor: 100_000, currency: 'USD', state: 'recovered', recovered_minor: 100_000,
+    },
+  }
+  const malformedOwnerTree = expandElement(SupportPanel())
+  assert.equal(findElements(
+    malformedOwnerTree,
+    node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
+  )[0].props.disabled, true)
+  assert.equal(findElements(
+    malformedOwnerTree,
+    node => node.type === 'a' && node.props?.href === 'https://support.operator.com/maestro',
+  ).length, 0)
+  assert.doesNotMatch(elementText(malformedOwnerTree), /Development costs recovered/)
+
+  globalThis.__supportStore.supportAdmin = {
+    ...globalThis.__supportStore.supportAdmin,
+    development_cost_recovery: null,
+  }
+  const missingOwnerTree = expandElement(SupportPanel())
+  assert.equal(findElements(
+    missingOwnerTree,
+    node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
+  )[0].props.disabled, true)
+  assert.equal(findElements(
+    missingOwnerTree,
+    node => node.type === 'a' && node.props?.href === 'https://support.operator.com/maestro',
+  ).length, 0)
+  assert.doesNotMatch(elementText(missingOwnerTree), /Development costs recovered/)
   assert.deepEqual(
     ['one_time_contribution', 'recurring_started', 'recurring_renewed', 'recurring_canceled', 'refund', 'chargeback']
       .filter(value => manualOptionValues.includes(value)),
@@ -2318,6 +2506,41 @@ test('Support links require an available server HTTPS URL and priority copy requ
     ['buy_me_a_coffee', 'patreon'],
   )
 
+  const staleDirect = structuredClone(publicSupport)
+  staleDirect.provider_catalog.providers[2] = {
+    ...staleDirect.provider_catalog.providers[2],
+    state: 'available',
+    support_url: 'https://support.operator.com/maestro',
+  }
+  assert.equal(visibleSupportProviders(staleDirect)[2].support_url, null)
+  assert.deepEqual(verifiedDevelopmentCostRecovery(staleDirect), {
+    target_minor: 100_000, currency: 'USD', state: 'locked',
+  })
+
+  const malformedRecovery = structuredClone(staleDirect)
+  malformedRecovery.development_cost_recovery.target_minor = 1
+  assert.equal(verifiedDevelopmentCostRecovery(malformedRecovery), null)
+  assert.equal(visibleSupportProviders(malformedRecovery)[2].support_url, null)
+
+  const privacyBearingRecovery = structuredClone(staleDirect)
+  privacyBearingRecovery.development_cost_recovery.recovered_minor = 100_000
+  privacyBearingRecovery.development_cost_recovery.events = []
+  privacyBearingRecovery.development_cost_recovery.subject = 'private-account'
+  assert.equal(verifiedDevelopmentCostRecovery(privacyBearingRecovery), null)
+  assert.equal(visibleSupportProviders(privacyBearingRecovery)[2].support_url, null)
+
+  const missingRecovery = structuredClone(staleDirect)
+  delete missingRecovery.development_cost_recovery
+  assert.equal(verifiedDevelopmentCostRecovery(missingRecovery), null)
+  assert.equal(visibleSupportProviders(missingRecovery)[2].support_url, null)
+
+  const recovered = structuredClone(staleDirect)
+  recovered.development_cost_recovery.state = 'recovered'
+  assert.equal(
+    visibleSupportProviders(recovered)[2].support_url,
+    'https://support.operator.com/maestro',
+  )
+
   const policy = {
     ...publicSupport.support_priority,
     exclusions: [{
@@ -2383,6 +2606,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
   let deferSelf = false
   let deferAcceptance = false
   let catalogPayload = publicSupport
+  let adminRecoveryState = 'locked'
   let nextAccountContext = null
   let nextAccessAccounts = null
   const pendingSelf = []
@@ -2431,6 +2655,10 @@ test('Support store loads public catalog with accounts off and gates self and ad
       },
     },
     responsible_use: responsibleUse.status,
+    development_cost_recovery: {
+      ...publicSupport.development_cost_recovery,
+      state: adminRecoveryState,
+    },
     support_priority: publicSupport.support_priority,
   })
   const selfPayload = (eventCount, responsible = responsibleUse) => ({
@@ -2579,6 +2807,7 @@ test('Support store loads public catalog with accounts off and gates self and ad
   await useStore.getState().loadSupportAdmin(account.id)
   assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account')
   assert.equal(useStore.getState().supportAdmin.account.recorded_allowance.effective_allowance, 100)
+  assert.equal(useStore.getState().supportAdmin.development_cost_recovery.state, 'locked')
   const fulfillmentInput = {
     target_event_id: supportEventId('a'), item: 'one_time_credit_grant', status: 'pending',
     idempotency_key: opaqueSupportKey('9'), proof_reference: null,
@@ -2587,14 +2816,26 @@ test('Support store loads public catalog with accounts off and gates self and ad
   assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account/fulfillment')
   assert.deepEqual(JSON.parse(calls.at(-1).init.body), fulfillmentInput)
   assert.equal(useStore.getState().supportAdmin.account.event_count, 4)
+  adminRecoveryState = 'recovered'
   const contributionInput = {
-    source: 'patreon', kind: 'one_time_contribution', amount_minor: 2500,
+    source: 'direct_compute_sponsorship', kind: 'one_time_contribution', amount_minor: 2500,
     currency: 'USD', target_event_id: null, idempotency_key: opaqueSupportKey('7'),
   }
   await useStore.getState().recordSupportContribution(account.id, contributionInput)
   assert.equal(calls.at(-1).url, '/api/v1/support/admin/accounts/server-account/contributions')
   assert.deepEqual(JSON.parse(calls.at(-1).init.body), contributionInput)
   assert.equal(useStore.getState().supportAdmin.account.event_count, 5)
+  assert.equal(useStore.getState().supportAdmin.development_cost_recovery.state, 'recovered')
+
+  adminRecoveryState = 'locked'
+  await useStore.getState().recordSupportContribution(account.id, {
+    ...contributionInput,
+    source: 'buy_me_a_coffee',
+    kind: 'refund',
+    target_event_id: supportEventId('a'),
+    idempotency_key: opaqueSupportKey('5'),
+  })
+  assert.equal(useStore.getState().supportAdmin.development_cost_recovery.state, 'locked')
 
   deferContribution = true
   const staleContribution = useStore.getState().recordSupportContribution(account.id, {
@@ -2827,8 +3068,10 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(scrollRegion, /tabIndex=\{activeTab === 'support' \? 0 : -1\}/)
   assert.match(supportSource, /rel="noopener noreferrer"/)
   assert.match(supportSource, /Acknowledging this notice does not review, restrict, or approve what you create/)
-  assert.match(supportSource, /hundreds already spent on Codex while building Maestro/)
-  assert.match(supportSource, /After support becomes sustainable, it will fund hosting Maestro Continuum with more compute/)
+  assert.match(supportSource, /Support first helps cover \$1,000 in development costs/)
+  assert.match(supportSource, /After that, it can help fund hosting Maestro Continuum with more compute/)
+  assert.match(supportSource, /running total and contribution history stay private/)
+  assert.match(supportSource, /Direct compute sponsorship stays locked until that target is reached/)
   assert.match(supportSource, /offers no guarantees or perks/)
   assert.match(supportSource, /Support benefits are not active/)
   assert.match(supportSource, /not active on the current host and does not change generation, queueing, or retries/)

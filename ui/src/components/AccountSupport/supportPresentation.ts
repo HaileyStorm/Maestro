@@ -5,6 +5,10 @@ import type {
   SupportPublicProjection,
   ResponsibleUseProjection,
 } from '../../types'
+import {
+  developmentCostRecoveryProjection,
+  type DevelopmentCostRecoveryProjection,
+} from '../../types/index.ts'
 
 export type AccountSupportTab = 'support' | 'account'
 
@@ -46,11 +50,19 @@ export function responsibleUseIsAccepted(
     && projection.status.content_sha256 === projection.notice.content_sha256
 }
 
+export function verifiedDevelopmentCostRecovery(
+  projection: { development_cost_recovery?: unknown } | null,
+): DevelopmentCostRecoveryProjection | null {
+  return developmentCostRecoveryProjection(projection?.development_cost_recovery)
+}
+
 export function visibleSupportProviders(
   catalog: SupportPublicProjection | null,
 ): SupportProvider[] {
+  const directComputeUnlocked = verifiedDevelopmentCostRecovery(catalog)?.state === 'recovered'
   return (catalog?.provider_catalog.providers || []).map(provider => {
     const supportUrl = provider.state === 'available'
+      && (provider.provider_id !== 'direct_compute_sponsorship' || directComputeUnlocked)
       ? safeSupportUrl(provider.support_url)
       : null
     return {

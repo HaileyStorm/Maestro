@@ -16,6 +16,7 @@ import type {
 import {
   affectedPriorityNotice,
   responsibleUseIsAccepted,
+  verifiedDevelopmentCostRecovery,
   visibleSupportProviders,
 } from './supportPresentation'
 
@@ -319,10 +320,12 @@ export function manualContributionRetryIdentity(
 
 function AdminSupportAudit({
   audit,
+  directComputeUnlocked,
   onTransition,
   onRecordContribution,
 }: {
   audit: SupportAdminAudit
+  directComputeUnlocked: boolean
   onTransition: (input: SupportFulfillmentMutationInput) => Promise<void>
   onRecordContribution: (input: SupportManualContributionInput) => Promise<void>
 }) {
@@ -364,6 +367,8 @@ function AdminSupportAudit({
   const visibleFundingEvents = fundingEvents.slice(0, fundingEventLimit)
   const manualTargetRequired = manualKind !== 'one_time_contribution'
     && manualKind !== 'recurring_started'
+  const manualDirectComputeLocked = manualSource === 'direct_compute_sponsorship'
+    && !directComputeUnlocked
   const { matchingFundingEvents, remainingByTarget, activeRecurringTargets } = manualContributionTargetState(
     audit.events,
     manualSource,
@@ -383,6 +388,13 @@ function AdminSupportAudit({
 
   const recordManualContribution = async () => {
     if (manualBusy || manualInFlightRef.current) return
+    if (manualDirectComputeLocked) {
+      setManualNotice({
+        kind: 'error',
+        text: 'Direct compute sponsorship unlocks after the $1,000 development-cost target is reached.',
+      })
+      return
+    }
     const currency = manualCurrency.trim().toUpperCase()
     const amount = Number(manualAmount)
     const target = manualTargetEvents.some(event => event.event_id === manualTarget)
@@ -570,7 +582,16 @@ function AdminSupportAudit({
                 className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
               >
                 {manualContributionSources.map(source => (
-                  <option key={source} value={source}>{contributionSourceLabels[source]}</option>
+                  <option
+                    key={source}
+                    value={source}
+                    disabled={source === 'direct_compute_sponsorship' && !directComputeUnlocked}
+                  >
+                    {contributionSourceLabels[source]}
+                    {source === 'direct_compute_sponsorship' && !directComputeUnlocked
+                      ? ' — locked until $1,000 is recovered'
+                      : ''}
+                  </option>
                 ))}
               </select>
             </label>
@@ -650,7 +671,7 @@ function AdminSupportAudit({
           )}
           <button
             type="button"
-            disabled={manualBusy || (manualTargetRequired && manualTargetEvents.length === 0)}
+            disabled={manualBusy || manualDirectComputeLocked || (manualTargetRequired && manualTargetEvents.length === 0)}
             onClick={() => void recordManualContribution()}
             className="min-h-11 w-full rounded-md bg-accent-blue px-3 py-2 text-[10px] font-semibold text-white hover:opacity-90 disabled:opacity-50"
           >
@@ -1038,16 +1059,31 @@ export function SupportPanel() {
   const selectedAdminAccountId = selectedUserIndex === ''
     ? null
     : users[Number(selectedUserIndex)]?.id ?? null
-  const visibleProviders = useMemo(() => visibleSupportProviders(catalog), [catalog])
+  const supportProjection = catalog || self?.public || null
+  const selectedAdminProjection = adminAccountId !== null
+    && adminAccountId === selectedAdminAccountId
+    ? admin
+    : null
+  const recovery = selectedAdminProjection !== null
+    ? verifiedDevelopmentCostRecovery(selectedAdminProjection)
+    : verifiedDevelopmentCostRecovery(supportProjection)
+  const directComputeUnlocked = recovery?.state === 'recovered'
+  const effectiveSupportProjection = supportProjection && selectedAdminProjection !== null
+    ? { ...supportProjection, development_cost_recovery: recovery }
+    : supportProjection
+  const visibleProviders = useMemo(
+    () => visibleSupportProviders(effectiveSupportProjection),
+    [effectiveSupportProjection],
+  )
   const currentResponsibleUse = responsibleUse || self?.responsible_use || null
   const responsibleUseAccepted = responsibleUseIsAccepted(currentResponsibleUse)
   const selfPriorityNotice = affectedPriorityNotice(
     self?.account || null,
-    catalog?.support_priority || null,
+    supportProjection?.support_priority || null,
   )
   const adminPriorityNotice = affectedPriorityNotice(
     admin?.account || null,
-    catalog?.support_priority || null,
+    supportProjection?.support_priority || null,
   )
 
   useEffect(() => {
@@ -1190,13 +1226,32 @@ export function SupportPanel() {
           <div>
             <h3 className="text-sm font-semibold text-text-primary">Support Maestro</h3>
             <p className="mt-1 text-[10px] leading-relaxed text-text-secondary">
-              Support first helps recoup the hundreds already spent on Codex while building Maestro. After support becomes sustainable, it will fund hosting Maestro Continuum with more compute.
+              Support first helps cover $1,000 in development costs. After that, it can help fund hosting Maestro Continuum with more compute.
             </p>
             <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
               Support is optional and offers no guarantees or perks. It does not change access or anyone&apos;s responsibilities.
             </p>
           </div>
         </div>
+      </section>
+
+      <section aria-label="Development cost recovery" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
+        <div className="flex items-center gap-2">
+          <Check size={14} className={directComputeUnlocked ? 'text-indicator-success' : 'text-accent-blue'} aria-hidden="true" />
+          <h3 className="text-xs font-semibold text-text-primary">
+            {directComputeUnlocked ? 'Development costs recovered' : '$1,000 development-cost target'}
+          </h3>
+        </div>
+        <p className="mt-2 text-[10px] leading-relaxed text-text-secondary" role="status">
+          {directComputeUnlocked
+            ? 'The $1,000 target has been reached. Direct compute sponsorship can be offered when it is configured.'
+            : recovery
+              ? 'Support is still going toward the first $1,000 in development costs. Direct compute sponsorship stays locked until that target is reached.'
+              : 'Recovery status is unavailable, so direct compute sponsorship stays locked.'}
+        </p>
+        <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+          Maestro checks net recorded USD support after refunds. The running total and contribution history stay private.
+        </p>
       </section>
 
       <section aria-labelledby="support-options-heading" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
@@ -1215,7 +1270,11 @@ export function SupportPanel() {
                   </span>
                   <span className="mt-1 block text-[9px] leading-relaxed text-text-muted">{provider.description}</span>
                   {!provider.support_url && (
-                    <span className="mt-1 block text-[9px] font-medium text-text-muted">Not available in this session</span>
+                    <span className="mt-1 block text-[9px] font-medium text-text-muted">
+                      {provider.provider_id === 'direct_compute_sponsorship' && !directComputeUnlocked
+                        ? 'Locked until the $1,000 development-cost target is reached'
+                        : 'Not available in this session'}
+                    </span>
                   )}
                 </>
               )
@@ -1331,6 +1390,7 @@ export function SupportPanel() {
               <RecordedSupport summary={admin.account} />
               <AdminSupportAudit
                 audit={admin.audit}
+                directComputeUnlocked={directComputeUnlocked}
                 onTransition={recordFulfillment}
                 onRecordContribution={recordManualContribution}
               />
