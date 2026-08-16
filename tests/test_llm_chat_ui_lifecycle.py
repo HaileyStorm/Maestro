@@ -156,6 +156,13 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
         submit = self.source[submit_start:submit_end]
         optimistic = submit.index("setMessages(nextMessages)")
         submission = submit.index("pending.submissionAttempted = true")
+        acknowledgement = submit.index("pending.admissionAcknowledged = true")
+        self.assertLess(submission, acknowledgement)
+        self.assertIn(
+            "admissionAcknowledged: value.admissionAcknowledged === true",
+            self.source,
+        )
+        self.assertIn("reconcileLlmChatUploadRequest(", self.source)
         before_submission = submit[optimistic:submission]
         self.assertNotIn("persistMessages(", before_submission)
         after_submission = submit[submission:]

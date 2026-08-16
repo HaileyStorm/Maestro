@@ -24,6 +24,7 @@ if str(APP) not in sys.path:
 from services import llm_operations
 from services.llm_cancellation import LlmCancellationHandle
 from services.llm_operations import (
+    ChatAdmissionError,
     ChatRequestMismatchError,
     LlmChatOperationManager,
     LlmPreparationManager,
@@ -204,6 +205,67 @@ class PreparationOperationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_absent_reconciliation_is_atomic_against_duplicate_submit(self):
+        manager = LlmChatOperationManager(ttl_seconds=60)
+        cleanup_entered = threading.Event()
+        allow_cleanup = threading.Event()
+        cleaned = threading.Event()
+        submit_started = threading.Event()
+        submit_finished = threading.Event()
+        reconcile_result = []
+        submit_errors = []
+
+        def cleanup_absent():
+            cleanup_entered.set()
+            allow_cleanup.wait(timeout=2)
+            cleaned.set()
+            return "cleaned"
+
+        def reconcile():
+            reconcile_result.append(manager.status_or_reconcile_absent(
+                "a" * 32,
+                owner_key="owner",
+                project_key="project",
+                reconcile_absent=cleanup_absent,
+            ))
+
+        async def execute(_progress):
+            return {"text": "must not run", "model_id": "model"}
+
+        def duplicate_submit():
+            submit_started.set()
+            try:
+                manager.submit(
+                    request_id="a" * 32,
+                    owner_key="owner",
+                    project_key="project",
+                    request_digest="digest",
+                    execute=execute,
+                    admit=lambda: not cleaned.is_set(),
+                    release=lambda: None,
+                )
+            except Exception as error:
+                submit_errors.append(error)
+            finally:
+                submit_finished.set()
+
+        reconcile_thread = threading.Thread(target=reconcile)
+        reconcile_thread.start()
+        self.assertTrue(await asyncio.to_thread(cleanup_entered.wait, 1))
+        submit_thread = threading.Thread(target=duplicate_submit)
+        submit_thread.start()
+        self.assertTrue(await asyncio.to_thread(submit_started.wait, 1))
+        self.assertFalse(await asyncio.to_thread(submit_finished.wait, 0.05))
+        allow_cleanup.set()
+        await asyncio.to_thread(reconcile_thread.join, 1)
+        await asyncio.to_thread(submit_thread.join, 1)
+        self.assertEqual(reconcile_result, [(None, "cleaned")])
+        self.assertEqual(len(submit_errors), 1)
+        self.assertIsInstance(submit_errors[0], ChatAdmissionError)
+        self.assertIsNone(manager.status(
+            "a" * 32, owner_key="owner", project_key="project",
+        ))
+
     async def test_same_request_coalesces_and_result_is_owner_scoped(self):
         manager = LlmChatOperationManager(ttl_seconds=60)
         release = asyncio.Event()
@@ -2728,6 +2790,9 @@ class DirectRouteSecurityTests(unittest.TestCase):
             ("/api/v1/llm/prepare/missing", 404),
             ("/api/v1/llm/chat", 400),
             ("/api/v1/llm/chat/request-id", 200),
+            ("/api/v1/llm/chat-upload", 202),
+            ("/api/v1/llm/chat-upload/private-name", 404),
+            ("/api/v1/llm/chat-upload-request/request-id", 200),
             ("/api/v1/llm/enhance-prompt", 202),
             ("/api/v1/llm/operations/enhance/request-id", 200),
             ("/api/v1/llm/operations/enhance/request-id/result", 409),

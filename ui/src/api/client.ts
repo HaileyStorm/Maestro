@@ -6363,12 +6363,13 @@ export async function fetchLlmModels(workspace?: string, signal?: AbortSignal): 
 
 export async function uploadLlmChatImage(
   workspace: string,
+  requestId: string,
   file: File,
   signal?: AbortSignal,
 ): Promise<{ filename: string; url: string }> {
   const form = new FormData()
   form.append('file', file)
-  const query = new URLSearchParams({ workspace })
+  const query = new URLSearchParams({ workspace, request_id: requestId })
   const res = await fetch(`${BASE}/api/v1/llm/chat-upload?${query}`, {
     method: 'POST',
     body: form,
@@ -6379,6 +6380,40 @@ export async function uploadLlmChatImage(
     throw new Error(err.detail || 'Image upload failed')
   }
   return res.json()
+}
+
+export async function reconcileLlmChatUploadRequest(
+  workspace: string,
+  requestId: string,
+  projectInstance: string,
+  signal?: AbortSignal,
+): Promise<'claimed' | 'cleaned' | 'retry' | 'not_found'> {
+  const query = new URLSearchParams({
+    workspace,
+    project_instance: projectInstance,
+  })
+  const res = await fetch(
+    `${BASE}/api/v1/llm/chat-upload-request/${encodeURIComponent(requestId)}?${query}`,
+    { method: 'DELETE', cache: 'no-store', signal },
+  )
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Chat upload cleanup failed' }))
+    throw new Error(err.detail || 'Chat upload cleanup failed')
+  }
+  const data = await res.json()
+  if (
+    !data
+    || typeof data !== 'object'
+    || Array.isArray(data)
+    || Object.keys(data).sort().join(',') !== 'deleted,state'
+    || !['claimed', 'cleaned', 'retry', 'not_found'].includes(data.state)
+    || !Number.isInteger(data.deleted)
+    || data.deleted < 0
+    || data.deleted > 4096
+  ) {
+    throw new Error('Chat upload cleanup returned an invalid response')
+  }
+  return data.state as 'claimed' | 'cleaned' | 'retry' | 'not_found'
 }
 
 export async function deleteLlmChatImage(
@@ -6590,6 +6625,7 @@ export async function waitForLlmChatOperation(
   signal?: AbortSignal,
   initial?: LlmChatOperationStatus,
   onStatus?: (status: LlmChatOperationStatus) => void,
+  allowInitialMissing = false,
 ): Promise<LlmChatResult> {
   const startedAt = Date.now()
   let operation: LlmChatOperationStatus | null | undefined = initial
@@ -6600,6 +6636,10 @@ export async function waitForLlmChatOperation(
     try {
       operation = await fetchLlmChatOperation(requestId, workspace, signal)
       if (!operation) {
+        if (allowInitialMissing) {
+          await waitForPreparationPoll(signal)
+          continue
+        }
         throw new Error('This Chat result is no longer available. Retry the turn.')
       }
     } catch (error) {
@@ -6648,7 +6688,7 @@ export async function llmChat(params: {
   explicit_output?: boolean
   image_paths?: string[]
   max_new_tokens?: number
-}, signal?: AbortSignal, onPreparationStatus?: LlmRequestOptions['onPreparationStatus'], onOperationStatus?: (status: LlmChatOperationStatus) => void, onSubmissionAttempted?: () => void): Promise<LlmChatResult> {
+}, signal?: AbortSignal, onPreparationStatus?: LlmRequestOptions['onPreparationStatus'], onOperationStatus?: (status: LlmChatOperationStatus) => void, onSubmissionAttempted?: () => void, onAdmissionAcknowledged?: (status: LlmChatOperationStatus) => void): Promise<LlmChatResult> {
   const request = {
     ...params,
     // Attachment display metadata is browser-local. Only role/content and
@@ -6683,6 +6723,10 @@ export async function llmChat(params: {
       signal,
     )
   }
+  // A scoped operation status is the server acknowledgement: the one-use
+  // inputs were claimed before the operation became observable. This also
+  // covers a 202 that was lost and recovered through the status endpoint.
+  onAdmissionAcknowledged?.(operation)
   return waitForLlmChatOperation(
     params.request_id,
     params.workspace,

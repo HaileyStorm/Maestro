@@ -612,6 +612,33 @@ class LlmChatOperationManager:
                 return None
             return self._public(operation)
 
+    def status_or_reconcile_absent(
+        self,
+        request_id: str,
+        *,
+        owner_key: str,
+        project_key: str,
+        reconcile_absent: Callable[[], Any],
+        reconcile_terminal: Callable[[], Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, Any]:
+        """Read an exact operation or reconcile absence under admission CAS."""
+        now = self._clock()
+        with self._lock:
+            self._prune_locked(now)
+            operation = self._operations.get(request_id)
+            if operation is not None and (
+                hmac.compare_digest(operation.owner_key, owner_key)
+                and hmac.compare_digest(operation.project_key, project_key)
+            ):
+                reconciled = None
+                if operation.status != "running" and reconcile_terminal is not None:
+                    reconciled = reconcile_terminal()
+                return self._public(operation), reconciled
+            # Admission uses this same manager lock before taking any injected
+            # upload lock. Keeping the callback inside it makes absence +
+            # cleanup one CAS winner instead of a status-then-delete race.
+            return None, reconcile_absent()
+
 
 @dataclass
 class _RouteOperation:

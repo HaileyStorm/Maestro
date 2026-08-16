@@ -125,14 +125,20 @@ try {
     }
     throw new Error(`Unexpected URL: ${url}`)
   }
+  const lost202Events = []
   const result = await api.llmChat({
     workspace: 'project-a',
     request_id: '00000000-0000-4000-8000-000000000001',
     model_id: 'model',
     messages: [{ role: 'user', content: 'one turn' }],
     guide_ids: [],
+  }, undefined, undefined, undefined, () => {
+    lost202Events.push('attempted')
+  }, status => {
+    lost202Events.push(`ack:${status.status}`)
   })
   assert.equal(result.text, 'answer')
+  assert.deepEqual(lost202Events, ['attempted', 'ack:completed'])
   assert.equal(chatPosts, 1)
   assert.equal(calls.filter(call => call.url.includes('/api/v1/llm/chat/')).length, 1)
 
@@ -242,6 +248,53 @@ try {
   visibilityTarget.dispatchEvent(new Event('visibilitychange'))
   assert.equal((await resumed).text, 'resumed')
   assert.equal(resumeChecks, 2)
+
+  // Reload reconciliation is content-free: it sends only the opaque request
+  // id/workspace and can preserve a server-claimed operation without storing
+  // any upload filename in browser state.
+  calls.length = 0
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init })
+    return jsonResponse({ state: 'claimed', deleted: 0 })
+  }
+  assert.equal(await api.reconcileLlmChatUploadRequest(
+    'project-a',
+    '00000000-0000-4000-8000-000000000005',
+    'd'.repeat(64),
+  ), 'claimed')
+  assert.equal(calls[0].init.method, 'DELETE')
+  assert.match(calls[0].url, /chat-upload-request\/00000000-0000-4000-8000-000000000005/)
+  assert.match(calls[0].url, new RegExp(`project_instance=${'d'.repeat(64)}`))
+  assert.equal(calls[0].url.includes('upload.png'), false)
+
+  visibility = 'hidden'
+  let claimedResumeChecks = 0
+  globalThis.fetch = async url => {
+    if (!String(url).includes('/api/v1/llm/chat/')) {
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+    claimedResumeChecks += 1
+    if (claimedResumeChecks === 1) return jsonResponse({}, 404)
+    return jsonResponse({
+      request_id: '00000000-0000-4000-8000-000000000005',
+      status: 'completed', phase: 'completed', retryable: false,
+      result: { text: 'claimed resume', model_id: 'model', guide_ids: [] },
+    })
+  }
+  const claimedResume = api.waitForLlmChatOperation(
+    '00000000-0000-4000-8000-000000000005',
+    'project-a',
+    undefined,
+    undefined,
+    undefined,
+    true,
+  )
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(claimedResumeChecks, 1)
+  visibility = 'visible'
+  visibilityTarget.dispatchEvent(new Event('visibilitychange'))
+  assert.equal((await claimedResume).text, 'claimed resume')
+  assert.equal(claimedResumeChecks, 2)
 
   // If a ready preparation expires while the tab is hidden, visibility wakeup
   // revalidates it and a 404 starts a new content-free preparation before the

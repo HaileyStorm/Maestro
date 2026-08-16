@@ -28192,8 +28192,13 @@ _LLM_CHAT_IMAGE_EXTENSIONS = {
 }
 _LLM_CHAT_UPLOAD_MARKER_SUFFIX = ".llm-chat-upload.json"
 _LLM_CHAT_UPLOAD_TTL_SECONDS = 24 * 60 * 60
+_LLM_CHAT_UPLOAD_SERVER_EPOCH = uuid.uuid4().hex
 _llm_chat_upload_lock = threading.RLock()
 _llm_project_instance_lock = threading.Lock()
+
+
+class _LlmChatUploadClaimError(RuntimeError):
+    """One-use Chat input could not be claimed by this request."""
 
 
 def _llm_chat_upload_marker_path(upload_path: str) -> str:
@@ -28210,7 +28215,7 @@ def _read_llm_chat_upload_marker(upload_path: str) -> dict | None:
             marker = json.load(handle)
     except (OSError, TypeError, ValueError):
         return None
-    if not isinstance(marker, dict) or marker.get("version") != 1:
+    if not isinstance(marker, dict) or marker.get("version") not in {1, 2}:
         return None
     if marker.get("kind") != "llm_chat_upload":
         return None
@@ -28224,15 +28229,81 @@ def _read_llm_chat_upload_marker(upload_path: str) -> dict | None:
         or not isinstance(workspace, str)
         or not workspace
         or not isinstance(created_at, (int, float))
+        or isinstance(created_at, bool)
+        or not math.isfinite(float(created_at))
+        or float(created_at) < 0
     ):
         return None
+    if marker["version"] == 1:
+        if "claim" in marker or "project_instance" in marker or "pending_request_id" in marker:
+            return None
+    if marker["version"] == 2:
+        project_instance = marker.get("project_instance")
+        pending_request_id = marker.get("pending_request_id")
+        claim = marker.get("claim")
+        if (
+            not isinstance(project_instance, str)
+            or re.fullmatch(r"[0-9a-f]{64}", project_instance) is None
+            or re.fullmatch(
+                r"[0-9a-f]{32}", str(pending_request_id or ""),
+            ) is None
+            or claim is not None and (
+                not isinstance(claim, dict)
+                or set(claim) != {
+                    "request_id", "request_digest", "project_instance",
+                    "server_epoch", "claimed_at",
+                }
+                or re.fullmatch(
+                    r"[0-9a-f]{32}", str(claim.get("request_id") or ""),
+                ) is None
+                or claim.get("request_id") != pending_request_id
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", str(claim.get("request_digest") or ""),
+                ) is None
+                or claim.get("project_instance") != project_instance
+                or re.fullmatch(
+                    r"[0-9a-f]{32}", str(claim.get("server_epoch") or ""),
+                ) is None
+                or not isinstance(claim.get("claimed_at"), (int, float))
+                or isinstance(claim.get("claimed_at"), bool)
+                or not math.isfinite(float(claim["claimed_at"]))
+                or float(claim["claimed_at"]) < 0
+            )
+        ):
+            return None
     return marker
+
+
+def _write_llm_chat_upload_marker(marker_path: str, marker: dict) -> None:
+    """Create or atomically replace one private marker under the caller lock."""
+    temp_path = f"{marker_path}.{uuid.uuid4().hex[:8]}.tmp"
+    descriptor = None
+    try:
+        descriptor = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            json.dump(marker, handle, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, marker_path)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
 
 
 def _register_llm_chat_upload(
     request: Request,
     workspace: str,
     filename: str,
+    request_id: str,
 ) -> None:
     """Mark one direct, private upload as single-use Chat input."""
     from services.win_safe_files import safe_direct_file_under
@@ -28247,41 +28318,133 @@ def _register_llm_chat_upload(
     ):
         raise HTTPException(status_code=404, detail="Chat image not found")
     marker = {
-        "version": 1,
+        "version": 2,
         "kind": "llm_chat_upload",
         "owner_session_id": owner,
         "workspace": workspace,
+        "project_instance": _llm_project_instance_id(request, workspace),
+        "pending_request_id": request_id,
         "created_at": time.time(),
+        "claim": None,
     }
     marker_path = _llm_chat_upload_marker_path(upload_path)
-    temp_path = f"{marker_path}.{uuid.uuid4().hex[:8]}.tmp"
     with _llm_chat_upload_lock:
-        descriptor = None
-        try:
-            descriptor = os.open(
-                temp_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
+        _write_llm_chat_upload_marker(marker_path, marker)
+
+
+def _claim_llm_chat_uploads(
+    request: Request,
+    workspace: str,
+    image_paths: list[str],
+    *,
+    request_id: str,
+    request_digest: str,
+    project_instance: str,
+) -> None:
+    """Atomically fence one-use uploads before publishing an operation."""
+    from services.win_safe_files import safe_direct_file_under
+
+    root = os.path.join(os.getcwd(), "uploads")
+    owner = str(getattr(request.state, "maestro_session_id", "") or "")
+    candidates: list[tuple[str, str, dict]] = []
+    with _llm_chat_upload_lock:
+        for raw_path in image_paths:
+            upload_path = safe_direct_file_under(
+                root, os.path.basename(str(raw_path or "")),
             )
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                descriptor = None
-                json.dump(marker, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, marker_path)
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+            if (
+                upload_path is None
+                or not os.path.isabs(str(raw_path or ""))
+                or os.path.normcase(os.path.abspath(str(raw_path)))
+                != os.path.normcase(upload_path)
+            ):
+                continue
+            if (
+                not os.path.isfile(upload_path)
+                or not can_access_upload(upload_path, owner)
+            ):
+                # A concurrent client cleanup won. Do not publish an operation
+                # with a path that disappeared after request resolution.
+                raise _LlmChatUploadClaimError
+            marker = _read_llm_chat_upload_marker(upload_path)
+            if marker is None:
+                # Ordinary authorized uploads and project media are compatible,
+                # but a present malformed one-use marker fails closed.
+                if os.path.exists(_llm_chat_upload_marker_path(upload_path)):
+                    raise _LlmChatUploadClaimError
+                continue
+            if (
+                not hmac.compare_digest(marker["owner_session_id"], owner)
+                or marker["workspace"] != workspace
+            ):
+                raise _LlmChatUploadClaimError
+            # V1 markers have no immutable project identity and are retained
+            # only for bounded cleanup compatibility. They can never be
+            # promoted into a newly created same-name project.
+            if marker["version"] != 2:
+                raise _LlmChatUploadClaimError
+            if (
+                not hmac.compare_digest(
+                    marker["project_instance"], project_instance,
+                )
+                or not hmac.compare_digest(
+                    marker["pending_request_id"], request_id,
+                )
+            ):
+                raise _LlmChatUploadClaimError
+            claim = marker.get("claim")
+            if claim is not None and claim["server_epoch"] == _LLM_CHAT_UPLOAD_SERVER_EPOCH:
+                if not (
+                    hmac.compare_digest(claim["request_id"], request_id)
+                    and hmac.compare_digest(
+                        claim["request_digest"], request_digest,
+                    )
+                    and hmac.compare_digest(
+                        claim["project_instance"], project_instance,
+                    )
+                ):
+                    raise _LlmChatUploadClaimError
+                continue
+            candidates.append((
+                upload_path,
+                _llm_chat_upload_marker_path(upload_path),
+                marker,
+            ))
+
+        written: list[tuple[str, dict]] = []
+        try:
+            for _upload_path, marker_path, previous in candidates:
+                claimed = {
+                    **previous,
+                    "version": 2,
+                    "project_instance": project_instance,
+                    "claim": {
+                        "request_id": request_id,
+                        "request_digest": request_digest,
+                        "project_instance": project_instance,
+                        "server_epoch": _LLM_CHAT_UPLOAD_SERVER_EPOCH,
+                        "claimed_at": time.time(),
+                    },
+                }
+                _write_llm_chat_upload_marker(marker_path, claimed)
+                written.append((marker_path, previous))
+        except Exception:
+            for marker_path, previous in reversed(written):
+                try:
+                    _write_llm_chat_upload_marker(marker_path, previous)
+                except Exception:
+                    pass
+            raise
 
 
 def _cleanup_llm_chat_uploads(
     request: Request,
     workspace: str,
     image_paths: list[str],
+    *,
+    request_id: str | None = None,
+    request_digest: str | None = None,
+    project_instance: str | None = None,
 ) -> list[str]:
     """Delete only single-use Chat uploads owned by this project/session."""
     from services.output_access import upload_access_sidecar_path
@@ -28299,7 +28462,6 @@ def _cleanup_llm_chat_uploads(
                 or not os.path.isabs(str(raw_path or ""))
                 or os.path.normcase(os.path.abspath(str(raw_path)))
                 != os.path.normcase(upload_path)
-                or not os.path.isfile(upload_path)
             ):
                 continue
             marker = _read_llm_chat_upload_marker(upload_path)
@@ -28311,8 +28473,35 @@ def _cleanup_llm_chat_uploads(
                 or not can_access_upload(upload_path, owner)
             ):
                 continue
+            claim = marker.get("claim")
+            if claim is not None:
+                current_claim = (
+                    claim["server_epoch"] == _LLM_CHAT_UPLOAD_SERVER_EPOCH
+                )
+                exact_server_cleanup = (
+                    request_id is not None
+                    and request_digest is not None
+                    and project_instance is not None
+                    and hmac.compare_digest(claim["request_id"], request_id)
+                    and hmac.compare_digest(
+                        claim["request_digest"], request_digest,
+                    )
+                    and hmac.compare_digest(
+                        claim["project_instance"], project_instance,
+                    )
+                )
+                if current_claim and not exact_server_cleanup:
+                    continue
+            try:
+                os.remove(upload_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Keep the authorization sidecar and marker so a later cleanup
+                # or TTL prune can safely retry without creating an untracked
+                # private file.
+                continue
             for path in (
-                upload_path,
                 upload_access_sidecar_path(upload_path),
                 _llm_chat_upload_marker_path(upload_path),
             ):
@@ -28320,8 +28509,7 @@ def _cleanup_llm_chat_uploads(
                     os.remove(path)
                 except OSError:
                     pass
-            if not os.path.exists(upload_path):
-                deleted.append(filename)
+            deleted.append(filename)
     return deleted
 
 
@@ -28347,8 +28535,23 @@ def _prune_stale_llm_chat_uploads() -> None:
             marker = _read_llm_chat_upload_marker(upload_path)
             if marker is None or marker["created_at"] >= cutoff:
                 continue
+            claim = marker.get("claim")
+            if (
+                claim is not None
+                and claim["server_epoch"] == _LLM_CHAT_UPLOAD_SERVER_EPOCH
+                and max(
+                    float(marker["created_at"]),
+                    float(claim["claimed_at"]),
+                ) >= cutoff
+            ):
+                continue
+            try:
+                os.remove(upload_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
             for path in (
-                upload_path,
                 upload_access_sidecar_path(upload_path),
                 _llm_chat_upload_marker_path(upload_path),
             ):
@@ -28381,12 +28584,19 @@ def _llm_chat_image_signature(header: bytes) -> bool:
 async def llm_chat_upload(
     request: Request,
     workspace: str,
+    request_id: str,
     file: UploadFile = File(...),
 ):
     """Upload one private Chat image without exposing its server path."""
     if _llm_chat_request_is_external(request):
         request.state.maestro_remote = True
     _require_project_access(request, workspace)
+    try:
+        normalized_request_id = _normalize_llm_chat_request_id(request_id)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400, detail="Invalid Chat request id",
+        ) from error
     _prune_stale_llm_chat_uploads()
     content_type = str(file.content_type or "").casefold()
     if not content_type.startswith("image/"):
@@ -28422,7 +28632,12 @@ async def llm_chat_upload(
         )
     result = await upload_image(request, file, private=True)
     try:
-        _register_llm_chat_upload(request, workspace, result["filename"])
+        _register_llm_chat_upload(
+            request,
+            workspace,
+            result["filename"],
+            normalized_request_id,
+        )
     except Exception:
         from services.output_access import upload_access_sidecar_path
         from services.win_safe_files import safe_direct_file_under
@@ -28455,7 +28670,9 @@ def delete_llm_chat_upload(
     """Cancel one not-yet-consumed Chat upload owned by this session."""
     if _llm_chat_request_is_external(request):
         request.state.maestro_remote = True
-    _require_project_access(request, workspace)
+    # The session-owned marker is the authority for cancellation. Requiring a
+    # still-unlocked project here would strand a pre-admission upload precisely
+    # when project authorization changed between upload and Chat submission.
     resolved = _resolve_authorized_request_media(request, filename, workspace)
     deleted = (
         _cleanup_llm_chat_uploads(request, workspace, [resolved])
@@ -28464,6 +28681,132 @@ def delete_llm_chat_upload(
     if not deleted:
         raise HTTPException(status_code=404, detail="Chat image not found")
     return {"deleted": deleted[0]}
+
+
+@api.delete("/api/v1/llm/chat-upload-request/{request_id}")
+def reconcile_llm_chat_upload_request(
+    request: Request,
+    request_id: str,
+    workspace: str,
+    project_instance: str,
+):
+    """Resolve reload ambiguity without exposing or persisting upload names."""
+    from services.output_access import upload_access_sidecar_path
+    from services.win_safe_files import safe_direct_file_under
+
+    if _llm_chat_request_is_external(request):
+        request.state.maestro_remote = True
+    try:
+        normalized_request_id = _normalize_llm_chat_request_id(request_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="Chat request not found") from error
+    if re.fullmatch(r"[0-9a-f]{64}", str(project_instance or "")) is None:
+        raise HTTPException(status_code=404, detail="Chat request not found")
+    owner = str(getattr(request.state, "maestro_session_id", "") or "")
+    root = os.path.join(os.getcwd(), "uploads")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        names = []
+    matched = False
+    claimed_records: list[tuple[str, str, str]] = []
+    cleanup_failed = False
+    deleted = 0
+    with _llm_chat_upload_lock:
+        for marker_name in names[:4096]:
+            if not marker_name.endswith(_LLM_CHAT_UPLOAD_MARKER_SUFFIX):
+                continue
+            filename = marker_name[:-len(_LLM_CHAT_UPLOAD_MARKER_SUFFIX)]
+            upload_path = safe_direct_file_under(root, filename)
+            if upload_path is None:
+                continue
+            marker = _read_llm_chat_upload_marker(upload_path)
+            if (
+                marker is None
+                or marker["version"] != 2
+                or not hmac.compare_digest(marker["owner_session_id"], owner)
+                or marker["workspace"] != workspace
+                or not hmac.compare_digest(
+                    marker["project_instance"], project_instance,
+                )
+                or not hmac.compare_digest(
+                    marker["pending_request_id"], normalized_request_id,
+                )
+                or not can_access_upload(upload_path, owner)
+            ):
+                continue
+            matched = True
+            claim = marker.get("claim")
+            if (
+                claim is not None
+                and claim["server_epoch"] == _LLM_CHAT_UPLOAD_SERVER_EPOCH
+            ):
+                claimed_records.append((
+                    upload_path,
+                    claim["request_digest"],
+                    marker["project_instance"],
+                ))
+                continue
+            try:
+                os.remove(upload_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_failed = True
+                continue
+            for path in (
+                upload_access_sidecar_path(upload_path),
+                _llm_chat_upload_marker_path(upload_path),
+            ):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            deleted += 1
+    owner_key = hmac.new(
+        _session_secret(),
+        f"llm-operation-owner-v1\0{owner}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    from services.llm_operations import llm_chat_operation_manager
+
+    def cleanup_absent_claims():
+        removed_count = 0
+        failed = False
+        for upload_path, request_digest, _project in claimed_records:
+            removed = _cleanup_llm_chat_uploads(
+                request,
+                workspace,
+                [upload_path],
+                request_id=normalized_request_id,
+                request_digest=request_digest,
+                project_instance=project_instance,
+            )
+            removed_count += len(removed)
+            if not removed and os.path.exists(upload_path):
+                failed = True
+        return removed_count, failed
+
+    operation, reconciled = (
+        llm_chat_operation_manager.status_or_reconcile_absent(
+            normalized_request_id,
+            owner_key=owner_key,
+            project_key=project_instance,
+            reconcile_absent=cleanup_absent_claims,
+            reconcile_terminal=cleanup_absent_claims,
+        )
+    )
+    if reconciled is not None:
+        removed_count, failed = reconciled
+        deleted += removed_count
+        cleanup_failed = cleanup_failed or failed
+    if operation is not None:
+        return {"state": "claimed", "deleted": deleted}
+    if cleanup_failed:
+        return {"state": "retry", "deleted": deleted}
+    if matched:
+        return {"state": "cleaned", "deleted": deleted}
+    return {"state": "not_found", "deleted": 0}
 
 
 def _llm_chat_request_is_external(request: Request) -> bool:
@@ -28520,6 +28863,7 @@ async def _llm_operation_no_store(request: Request, call_next):
         or path.startswith("/api/v1/llm/prepare/")
         or path == "/api/v1/llm/chat"
         or path.startswith("/api/v1/llm/chat/")
+        or path.startswith("/api/v1/llm/chat-upload")
         or path == "/api/v1/llm/enhance-prompt"
         or path.startswith("/api/v1/llm/operations/")
         or path == "/api/v1/llm/refusal-literals"
@@ -30467,6 +30811,12 @@ async def llm_chat(request: Request):
         if "image_paths" in body else []
     )
     cleanup_chat_uploads = globals().get("_cleanup_llm_chat_uploads")
+    claim_chat_uploads = globals().get("_claim_llm_chat_uploads")
+    claim_error_type = globals().get("_LlmChatUploadClaimError")
+    if not isinstance(claim_error_type, type):
+        class _MissingLlmChatUploadClaimError(Exception):
+            pass
+        claim_error_type = _MissingLlmChatUploadClaimError
 
     from services.llm_operations import (
         ChatAdmissionError,
@@ -30510,10 +30860,35 @@ async def llm_chat(request: Request):
         raise HTTPException(status_code=400, detail=str(error)) from error
     owner_key, project_key = _llm_operation_scope(request, workspace)
 
+    def admit_async_chat() -> bool:
+        if not _llm_chat_admission.acquire(blocking=False):
+            return False
+        try:
+            if callable(claim_chat_uploads):
+                claim_chat_uploads(
+                    request,
+                    workspace,
+                    image_paths,
+                    request_id=request_id,
+                    request_digest=request_digest,
+                    project_instance=project_key,
+                )
+        except Exception:
+            _llm_chat_admission.release()
+            raise
+        return True
+
     def finish_async_chat() -> None:
         try:
             if callable(cleanup_chat_uploads):
-                cleanup_chat_uploads(request, workspace, image_paths)
+                cleanup_chat_uploads(
+                    request,
+                    workspace,
+                    image_paths,
+                    request_id=request_id,
+                    request_digest=request_digest,
+                    project_instance=project_key,
+                )
         finally:
             _llm_chat_admission.release()
 
@@ -30527,9 +30902,14 @@ async def llm_chat(request: Request):
                 request, body, image_paths, progress_callback, validated,
                 response_assist_snapshot,
             ),
-            admit=lambda: _llm_chat_admission.acquire(blocking=False),
+            admit=admit_async_chat,
             release=finish_async_chat,
         )
+    except claim_error_type as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Chat image is already attached to another request",
+        ) from error
     except ChatRequestMismatchError as error:
         # The original in-flight operation may still need these exact
         # single-use uploads. Its completion callback owns cleanup.

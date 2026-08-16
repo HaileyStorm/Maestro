@@ -599,6 +599,8 @@ class LlmChatRecoveryContracts(unittest.TestCase):
         self.assertIn("requestId: api.createLlmRequestId()", submit)
         self.assertIn("request_id: pending.requestId", submit)
         self.assertIn("pending.submissionAttempted = true", submit)
+        self.assertIn("pending.admissionAcknowledged = true", submit)
+        self.assertIn("pending.requestId,", submit)
         self.assertIn("persistPendingOperation(pending)", submit)
         self.assertIn("recoverLlmChatSubmission(", chat_client)
         self.assertIn("waitForLlmChatOperation(", chat_client)
@@ -610,6 +612,15 @@ class LlmChatRecoveryContracts(unittest.TestCase):
         self.assertIn("setDraft(pending.draft)", submit)
         self.assertIn("suspendedChatRequests.set(", submit)
         self.assertIn("waitForLlmChatOperation(", CHAT)
+        self.assertIn("reconcileLlmChatUploadRequest(", CHAT)
+        self.assertIn(
+            "admissionAcknowledged: value.admissionAcknowledged === true",
+            CHAT,
+        )
+        self.assertIn(
+            "admissionAcknowledged: pending.admissionAcknowledged",
+            CHAT,
+        )
         self.assertIn("Resume wait", CHAT)
         self.assertIn("while (!operation)", CLIENT)
         self.assertIn("export class LlmChatWaitError", CLIENT)
@@ -622,7 +633,8 @@ class LlmChatRecoveryContracts(unittest.TestCase):
         self.assertIn("operationRequestPhase(status.phase)", CHAT)
         self.assertNotIn("chatSubmitted", CHAT)
         self.assertIn("cleanupUnsubmittedUploads(pending)", CHAT)
-        self.assertIn("if (pending.submissionAttempted", CHAT)
+        self.assertIn("if (pending.admissionAcknowledged", CHAT)
+        self.assertIn("onAdmissionAcknowledged?.(operation)", CLIENT)
         self.assertIn("one-use upload references", CLIENT)
         self.assertNotIn("setError('Chat request failed')", CHAT)
         self.assertNotIn("Queued to prepare the selected LLM", CHAT)

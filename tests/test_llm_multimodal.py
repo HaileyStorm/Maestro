@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
@@ -41,6 +42,12 @@ class _HTTPException(Exception):
 
 
 def _launch_namespace(names: set[str], **overrides):
+    if names & {
+        "_register_llm_chat_upload", "_claim_llm_chat_uploads",
+    }:
+        names = {*names, "_write_llm_chat_upload_marker"}
+    if names & {"llm_chat_upload", "reconcile_llm_chat_upload_request"}:
+        names = {*names, "_normalize_llm_chat_request_id"}
     if "_execute_llm_chat" in names:
         names = {
             *names,
@@ -79,6 +86,7 @@ def _launch_namespace(names: set[str], **overrides):
         "hashlib": hashlib,
         "json": json,
         "math": math,
+        "re": re,
         "stat": stat,
         "time": time,
         "uuid": uuid,
@@ -94,6 +102,10 @@ def _launch_namespace(names: set[str], **overrides):
         },
         "_LLM_CHAT_UPLOAD_MARKER_SUFFIX": ".llm-chat-upload.json",
         "_LLM_CHAT_UPLOAD_TTL_SECONDS": 24 * 60 * 60,
+        "_LLM_CHAT_UPLOAD_SERVER_EPOCH": "e" * 32,
+        "_LlmChatUploadClaimError": type(
+            "_LlmChatUploadClaimError", (RuntimeError,), {},
+        ),
         "_DEFAULT_LLM_REPO": "MoonRide/gemma-4-31B-it-heretic-ara-GGUF",
         "_llm_chat_upload_lock": threading.RLock(),
         "_llm_project_instance_lock": threading.Lock(),
@@ -107,6 +119,8 @@ def _launch_namespace(names: set[str], **overrides):
             operation(*args, **kwargs)
         ),
         "_llm_operation_scope": lambda *_args: ("owner", "project"),
+        "_llm_project_instance_id": lambda *_args: "d" * 64,
+        "_claim_llm_chat_uploads": lambda *_args, **_kwargs: None,
         "_session_secret": lambda: b"test-session-secret",
         "JSONResponse": __import__(
             "fastapi.responses", fromlist=["JSONResponse"],
@@ -152,19 +166,24 @@ class MultimodalChatRouteTests(unittest.TestCase):
                 lambda *_args, **_kwargs: events.append(("authorize",))
             ),
             _prune_stale_llm_chat_uploads=lambda: events.append(("prune",)),
-            _register_llm_chat_upload=lambda _request, workspace, filename: (
-                events.append(("register", workspace, filename))
+            _register_llm_chat_upload=lambda _request, workspace, filename, request_id: (
+                events.append(("register", workspace, filename, request_id))
             ),
             upload_image=upload_image,
         )
         result = asyncio.run(namespace["llm_chat_upload"](
-            request, "project", file,
+            request, "project", "44444444-4444-4444-8444-444444444444", file,
         ))
         self.assertEqual(events, [
             ("authorize",),
             ("prune",),
             ("upload", True, True),
-            ("register", "project", "safe.png"),
+            (
+                "register",
+                "project",
+                "safe.png",
+                uuid.UUID("44444444-4444-4444-8444-444444444444").hex,
+            ),
         ])
         self.assertEqual(result, {
             "filename": "safe.png",
@@ -215,7 +234,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
 
         with self.assertRaises(_HTTPException) as oversized:
             asyncio.run(namespace["llm_chat_upload"](
-                request, "project", File(),
+                request, "project", "44444444-4444-4444-8444-444444444444", File(),
             ))
         self.assertEqual(oversized.exception.status_code, 413)
 
@@ -223,7 +242,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
         spoofed.size = 12
         with self.assertRaises(_HTTPException) as invalid:
             asyncio.run(namespace["llm_chat_upload"](
-                request, "project", spoofed,
+                request, "project", "44444444-4444-4444-8444-444444444444", spoofed,
             ))
         self.assertEqual(invalid.exception.status_code, 400)
 
@@ -297,7 +316,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
                 ))
 
                 namespace["_register_llm_chat_upload"](
-                    owner, "project", image.name,
+                    owner, "project", image.name, "4" * 32,
                 )
                 marker = Path(namespace["_llm_chat_upload_marker_path"](str(image)))
                 sidecar = Path(f"{image}.access.json")
@@ -325,6 +344,337 @@ class MultimodalChatRouteTests(unittest.TestCase):
                 self.assertFalse(image.exists())
                 self.assertFalse(sidecar.exists())
                 self.assertFalse(marker.exists())
+            finally:
+                os.chdir(previous)
+
+    def test_chat_upload_claim_fences_client_cleanup_until_exact_server_release(self):
+        namespace = _launch_namespace({
+            "_llm_chat_upload_marker_path",
+            "_read_llm_chat_upload_marker",
+            "_register_llm_chat_upload",
+            "_claim_llm_chat_uploads",
+            "_cleanup_llm_chat_uploads",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                uploads = Path(directory) / "uploads"
+                uploads.mkdir()
+                image = uploads / "claimed.png"
+                image.write_bytes(b"\x89PNG\r\n\x1a\n")
+                owner_id = "a" * 32
+                write_upload_access_sidecar(str(image), owner_id, private=True)
+                request = types.SimpleNamespace(state=types.SimpleNamespace(
+                    maestro_session_id=owner_id,
+                ))
+                project_instance = "d" * 64
+                request_id = "4" * 32
+                request_digest = "f" * 64
+
+                namespace["_register_llm_chat_upload"](
+                    request, "project", image.name, request_id,
+                )
+                with self.assertRaises(namespace["_LlmChatUploadClaimError"]):
+                    namespace["_claim_llm_chat_uploads"](
+                        request,
+                        "project",
+                        [str(image)],
+                        request_id=request_id,
+                        request_digest=request_digest,
+                        project_instance="e" * 64,
+                    )
+                namespace["_claim_llm_chat_uploads"](
+                    request,
+                    "project",
+                    [str(image)],
+                    request_id=request_id,
+                    request_digest=request_digest,
+                    project_instance=project_instance,
+                )
+                marker = namespace["_read_llm_chat_upload_marker"](str(image))
+                self.assertEqual(marker["claim"]["request_id"], request_id)
+                self.assertEqual(
+                    namespace["_cleanup_llm_chat_uploads"](
+                        request, "project", [str(image)],
+                    ),
+                    [],
+                )
+                self.assertTrue(image.is_file())
+
+                with self.assertRaises(namespace["_LlmChatUploadClaimError"]):
+                    namespace["_claim_llm_chat_uploads"](
+                        request,
+                        "project",
+                        [str(image)],
+                        request_id="5" * 32,
+                        request_digest=request_digest,
+                        project_instance=project_instance,
+                    )
+
+                self.assertEqual(
+                    namespace["_cleanup_llm_chat_uploads"](
+                        request,
+                        "project",
+                        [str(image)],
+                        request_id=request_id,
+                        request_digest=request_digest,
+                        project_instance=project_instance,
+                    ),
+                    [image.name],
+                )
+                self.assertFalse(image.exists())
+            finally:
+                os.chdir(previous)
+
+    def test_chat_upload_cleanup_preserves_marker_when_media_unlink_fails(self):
+        namespace = _launch_namespace({
+            "_llm_chat_upload_marker_path",
+            "_read_llm_chat_upload_marker",
+            "_register_llm_chat_upload",
+            "_cleanup_llm_chat_uploads",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                uploads = Path(directory) / "uploads"
+                uploads.mkdir()
+                image = uploads / "locked.png"
+                image.write_bytes(b"image")
+                owner_id = "a" * 32
+                write_upload_access_sidecar(str(image), owner_id, private=True)
+                request = types.SimpleNamespace(state=types.SimpleNamespace(
+                    maestro_session_id=owner_id,
+                ))
+                namespace["_register_llm_chat_upload"](
+                    request, "project", image.name, "4" * 32,
+                )
+                marker = Path(namespace["_llm_chat_upload_marker_path"](str(image)))
+                sidecar = Path(f"{image}.access.json")
+                real_remove = os.remove
+
+                def locked_remove(path):
+                    if os.path.abspath(path) == os.path.abspath(image):
+                        raise PermissionError("locked")
+                    return real_remove(path)
+
+                with mock.patch.object(namespace["os"], "remove", locked_remove):
+                    self.assertEqual(
+                        namespace["_cleanup_llm_chat_uploads"](
+                            request, "project", [str(image)],
+                        ),
+                        [],
+                    )
+                self.assertTrue(image.is_file())
+                self.assertTrue(sidecar.is_file())
+                self.assertTrue(marker.is_file())
+                self.assertEqual(
+                    namespace["_cleanup_llm_chat_uploads"](
+                        request, "project", [str(image)],
+                    ),
+                    [image.name],
+                )
+                self.assertFalse(image.exists())
+                self.assertFalse(sidecar.exists())
+                self.assertFalse(marker.exists())
+            finally:
+                os.chdir(previous)
+
+    def test_legacy_chat_upload_marker_is_cleanup_only_and_schema_strict(self):
+        namespace = _launch_namespace({
+            "_llm_chat_upload_marker_path",
+            "_read_llm_chat_upload_marker",
+            "_claim_llm_chat_uploads",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                uploads = Path(directory) / "uploads"
+                uploads.mkdir()
+                image = uploads / "legacy.png"
+                image.write_bytes(b"image")
+                owner_id = "a" * 32
+                write_upload_access_sidecar(str(image), owner_id, private=True)
+                request = types.SimpleNamespace(state=types.SimpleNamespace(
+                    maestro_session_id=owner_id,
+                ))
+                marker_path = Path(
+                    namespace["_llm_chat_upload_marker_path"](str(image)),
+                )
+                legacy = {
+                    "version": 1,
+                    "kind": "llm_chat_upload",
+                    "owner_session_id": owner_id,
+                    "workspace": "project",
+                    "created_at": time.time(),
+                }
+                marker_path.write_text(json.dumps(legacy), encoding="utf-8")
+                self.assertIsNotNone(
+                    namespace["_read_llm_chat_upload_marker"](str(image)),
+                )
+                with self.assertRaises(namespace["_LlmChatUploadClaimError"]):
+                    namespace["_claim_llm_chat_uploads"](
+                        request,
+                        "project",
+                        [str(image)],
+                        request_id="4" * 32,
+                        request_digest="f" * 64,
+                        project_instance="d" * 64,
+                    )
+                legacy["claim"] = {}
+                marker_path.write_text(json.dumps(legacy), encoding="utf-8")
+                self.assertIsNone(
+                    namespace["_read_llm_chat_upload_marker"](str(image)),
+                )
+            finally:
+                os.chdir(previous)
+
+    def test_reload_reconciliation_cleans_unclaimed_or_preserves_claimed_upload(self):
+        namespace = _launch_namespace(
+            {
+                "_llm_chat_upload_marker_path",
+                "_read_llm_chat_upload_marker",
+                "_register_llm_chat_upload",
+                "_claim_llm_chat_uploads",
+                "reconcile_llm_chat_upload_request",
+            },
+            _llm_chat_request_is_external=lambda _request: False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                uploads = Path(directory) / "uploads"
+                uploads.mkdir()
+                owner_id = "a" * 32
+                request = types.SimpleNamespace(state=types.SimpleNamespace(
+                    maestro_session_id=owner_id,
+                    maestro_remote=False,
+                ))
+                request_uuid = "44444444-4444-4444-8444-444444444444"
+                normalized_request_id = uuid.UUID(request_uuid).hex
+                for name in ("unclaimed.png", "claimed.png"):
+                    image = uploads / name
+                    image.write_bytes(b"image")
+                    write_upload_access_sidecar(str(image), owner_id, private=True)
+                    namespace["_register_llm_chat_upload"](
+                        request, "project", name, normalized_request_id,
+                    )
+                    if name == "unclaimed.png":
+                        result = namespace["reconcile_llm_chat_upload_request"](
+                            request, request_uuid, "project", "d" * 64,
+                        )
+                        self.assertEqual(result["state"], "cleaned")
+                        self.assertFalse(image.exists())
+                    else:
+                        namespace["_claim_llm_chat_uploads"](
+                            request,
+                            "project",
+                            [str(image)],
+                            request_id=normalized_request_id,
+                            request_digest="f" * 64,
+                            project_instance="d" * 64,
+                        )
+                        with mock.patch.object(
+                            llm_operations,
+                            "llm_chat_operation_manager",
+                            types.SimpleNamespace(
+                                status_or_reconcile_absent=(
+                                    lambda *_args, **_kwargs: (
+                                        {"status": "running"}, None,
+                                    )
+                                ),
+                            ),
+                        ):
+                            result = namespace["reconcile_llm_chat_upload_request"](
+                                request, request_uuid, "project", "d" * 64,
+                            )
+                        self.assertEqual(result["state"], "claimed")
+                        self.assertTrue(image.is_file())
+                with mock.patch.object(
+                    llm_operations,
+                    "llm_chat_operation_manager",
+                    types.SimpleNamespace(
+                        status_or_reconcile_absent=(
+                            lambda *_args, **_kwargs: (
+                                {"status": "running"}, None,
+                            )
+                        ),
+                    ),
+                ):
+                    result = namespace["reconcile_llm_chat_upload_request"](
+                        request,
+                        "55555555-5555-4555-8555-555555555555",
+                        "project",
+                        "d" * 64,
+                    )
+                self.assertEqual(result, {"state": "claimed", "deleted": 0})
+            finally:
+                os.chdir(previous)
+
+    def test_reload_reconciliation_repairs_failed_multi_upload_claim_rollback(self):
+        namespace = _launch_namespace(
+            {
+                "_llm_chat_upload_marker_path",
+                "_read_llm_chat_upload_marker",
+                "_register_llm_chat_upload",
+                "_claim_llm_chat_uploads",
+                "_cleanup_llm_chat_uploads",
+                "reconcile_llm_chat_upload_request",
+            },
+            _llm_chat_request_is_external=lambda _request: False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                uploads = Path(directory) / "uploads"
+                uploads.mkdir()
+                owner_id = "a" * 32
+                request = types.SimpleNamespace(state=types.SimpleNamespace(
+                    maestro_session_id=owner_id,
+                    maestro_remote=False,
+                ))
+                request_uuid = "44444444-4444-4444-8444-444444444444"
+                request_id = uuid.UUID(request_uuid).hex
+                images = []
+                for index in range(2):
+                    image = uploads / f"rollback-{index}.png"
+                    image.write_bytes(b"image")
+                    write_upload_access_sidecar(str(image), owner_id, private=True)
+                    namespace["_register_llm_chat_upload"](
+                        request, "project", image.name, request_id,
+                    )
+                    images.append(image)
+                real_write = namespace["_write_llm_chat_upload_marker"]
+                writes = 0
+
+                def fail_second_and_rollback(marker_path, marker):
+                    nonlocal writes
+                    writes += 1
+                    if writes >= 2:
+                        raise OSError("injected marker write failure")
+                    return real_write(marker_path, marker)
+
+                namespace["_write_llm_chat_upload_marker"] = fail_second_and_rollback
+                with self.assertRaises(OSError):
+                    namespace["_claim_llm_chat_uploads"](
+                        request,
+                        "project",
+                        [str(image) for image in images],
+                        request_id=request_id,
+                        request_digest="f" * 64,
+                        project_instance="d" * 64,
+                    )
+                namespace["_write_llm_chat_upload_marker"] = real_write
+                result = namespace["reconcile_llm_chat_upload_request"](
+                    request, request_uuid, "project", "d" * 64,
+                )
+                self.assertEqual(result["state"], "cleaned")
+                self.assertEqual(result["deleted"], 2)
+                self.assertTrue(all(not image.exists() for image in images))
             finally:
                 os.chdir(previous)
 
@@ -381,7 +731,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
             _llm_chat_request_is_external=lambda _request: False,
             _require_project_access=authorize,
             _resolve_authorized_request_media=resolve_media,
-            _cleanup_llm_chat_uploads=lambda _request, workspace, paths: (
+            _cleanup_llm_chat_uploads=lambda _request, workspace, paths, **_kwargs: (
                 events.append(("cleanup", workspace, paths)) or ["upload.png"]
             ),
             _resolve_llm_chat_model=lambda *_args: {
@@ -493,7 +843,9 @@ class MultimodalChatRouteTests(unittest.TestCase):
             _resolve_authorized_request_media=(
                 lambda *_args: "/authorized/uploads/upload.png"
             ),
-            _cleanup_llm_chat_uploads=lambda *_args: cleaned.append(True),
+            _cleanup_llm_chat_uploads=(
+                lambda *_args, **_kwargs: cleaned.append(True)
+            ),
             _execute_llm_chat=execute,
         )
         namespace["_validate_llm_chat_request"] = lambda *_args: {
