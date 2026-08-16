@@ -3311,6 +3311,8 @@ def _versioned_model_update_loop() -> None:
         if _gen_lock.acquire(blocking=False):
             try:
                 for model_type in list(wgp.displayed_model_types):
+                    if model_type == "minimax_music3":
+                        continue
                     model_def = wgp.get_model_def(model_type) or {}
                     if not (
                         isinstance(model_def.get("model_update"), dict)
@@ -10497,14 +10499,18 @@ def _remote_visible_model_ids(request: Request) -> frozenset[str] | None:
 
 
 def _require_remote_visible_models(request: Request, model_types) -> None:
-    allowed = _remote_visible_model_ids(request)
-    if allowed is None:
-        return
     requested = {
         str(model_type).strip()
         for model_type in (model_types or ())
         if str(model_type).strip()
     }
+    if "minimax_music3" in requested:
+        # Reserved for a non-executable virtual catalog entry.  Never let a
+        # registry/plugin collision grant generic WGP authority.
+        raise HTTPException(status_code=404, detail="Model not found")
+    allowed = _remote_visible_model_ids(request)
+    if allowed is None:
+        return
     if any(model_type not in allowed for model_type in requested):
         # Hidden and unknown identifiers are intentionally indistinguishable.
         raise HTTPException(status_code=404, detail="Model not found")
@@ -10604,13 +10610,6 @@ def _job_uses_registered_h3(job: dict) -> bool:
 
 def _require_remote_visible_job_models(job: dict) -> None:
     """Fail closed if a remote-origin job could load a hidden checkpoint."""
-    if not bool(job.get("source_remote")):
-        return
-    visibility = _model_visibility_response()
-    allowed = (
-        set(visibility.get("enabled_models") or ())
-        if visibility.get("configured") else set()
-    )
     params = job.get("params") if isinstance(job.get("params"), dict) else {}
     requested = {
         str(value).strip()
@@ -10628,6 +10627,15 @@ def _require_remote_visible_job_models(job: dict) -> None:
             value = segment.get("model_type") if isinstance(segment, dict) else segment
             if str(value or "").strip():
                 requested.add(str(value).strip())
+    if "minimax_music3" in requested:
+        raise HTTPException(status_code=404, detail="Model not found")
+    if not bool(job.get("source_remote")):
+        return
+    visibility = _model_visibility_response()
+    allowed = (
+        set(visibility.get("enabled_models") or ())
+        if visibility.get("configured") else set()
+    )
     if any(model_type not in allowed for model_type in requested):
         raise HTTPException(status_code=404, detail="Model not found")
 
@@ -10846,6 +10854,86 @@ def _require_model_download_available(
         )
 
 
+def _music3_virtual_catalog_model() -> dict:
+    """Describe the pinned local experiment without granting runtime authority."""
+    from services.minimax_music3_sglang_contract import (
+        LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,
+        LOCAL_EXPERIMENT_REQUIRED_GATES,
+    )
+    from services.music3_runtime import (
+        MUSIC3_MODEL_ID,
+        PINNED_MODEL_REVISION,
+        PINNED_SGLANG_SOURCE_REVISION,
+    )
+
+    return {
+        "model_type": "minimax_music3",
+        "name": "MiniMax Music 3",
+        "description": (
+            "MiniMaxAI's local-only Music 3 experiment. Attribution and "
+            "license approval are required, and it remains unavailable until "
+            "a separate read-only check attests the exact installed runtime."
+        ),
+        "selector_help": (
+            "Approved for local install and benchmarking only. Informational "
+            "only: this entry cannot be enabled, downloaded, selected, or run "
+            "by Maestro yet."
+        ),
+        "family": "tts",
+        "architecture": "sglang_omni",
+        "is_i2v": False,
+        "is_t2v": False,
+        "guidance_max_phases": 1,
+        "fps": 0,
+        "supports_end_frame": False,
+        "supports_audio": True,
+        "supports_audio_input": False,
+        "generates_audio": True,
+        "supports_ref_images": False,
+        "image_outputs": False,
+        "is_downloaded": False,
+        "downloadable": False,
+        "manual_installation_ready": False,
+        "availability_status": "local_runtime_attestation_required",
+        "execution_allowed": False,
+        "enabled": False,
+        "default": False,
+        "supported_operations": [],
+        "automatic_routing": False,
+        "verified": False,
+        "default_for_operations": [],
+        "revenue_eligible": False,
+        "fine_tuning_eligible": False,
+        "derivative_tooling": False,
+        "manual_checkpoint_verification_required": False,
+        "manual_checkpoint_verified": False,
+        "nsfw_only": False,
+        "update_status": "pinned",
+        "required_host_terms": [],
+        "attribution": {
+            "creator": "MiniMaxAI",
+            "model_id": MUSIC3_MODEL_ID,
+            "source_url": f"https://huggingface.co/{MUSIC3_MODEL_ID}",
+            "required": True,
+        },
+        "license": {
+            "status": "owner_approval_required",
+            "authorization_scope": LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE,
+            "required_approvals": list(LOCAL_EXPERIMENT_REQUIRED_GATES),
+        },
+        "local_experiment": {
+            "status": "approved_for_install_and_benchmark",
+            "local_only": True,
+            "lan": False,
+            "cloudflare": False,
+            "hosted_service": False,
+            "runtime_attested": False,
+            "model_revision": PINNED_MODEL_REVISION,
+            "runtime_source_revision": PINNED_SGLANG_SOURCE_REVISION,
+        },
+    }
+
+
 @api.get("/api/v1/models")
 def list_models(request: Request):
     """List available model families and model types."""
@@ -10861,6 +10949,10 @@ def list_models(request: Request):
     # Models
     models = []
     for mt in wgp.displayed_model_types:
+        # Reserved for the local-only informational projection below.  A
+        # registry/plugin collision must never turn it into a WGP checkpoint.
+        if mt == "minimax_music3":
+            continue
         if remote_visible is not None and mt not in remote_visible:
             continue
         md = wgp.get_model_def(mt)
@@ -10984,6 +11076,16 @@ def list_models(request: Request):
             ],
         })
 
+    # Music 3 is not a WGP checkpoint and has no execution path in this slice.
+    # Keep its server-owned informational projection strictly local even if a
+    # stale remote whitelist happens to contain the virtual identifier.
+    if remote_visible is None:
+        music3_catalog_factory = globals().get(
+            "_music3_virtual_catalog_model",
+        )
+        if callable(music3_catalog_factory):
+            models.append(music3_catalog_factory())
+
     visible_families = {model["family"] for model in models}
     families = []
     for fid, (order, label) in wgp.families_infos.items():
@@ -11011,6 +11113,10 @@ def _normalize_model_visibility_ids(values):
             raise ValueError("Model visibility entries must be strings.")
         model_type = value.strip()
         if not model_type or model_type in seen:
+            continue
+        # This virtual entry is informational only.  Filtering here removes
+        # both new writes and legacy persisted attempts to enable it.
+        if model_type == "minimax_music3":
             continue
         if len(model_type) > 200:
             raise ValueError("A model identifier is too long.")
@@ -11123,6 +11229,8 @@ async def update_model_visibility(request: Request):
 @api.get("/api/v1/models/{model_type}/debug")
 def debug_model(model_type: str):
     """Debug: show raw model definition and download check."""
+    if model_type == "minimax_music3":
+        return {"error": "Model not found"}
     md = wgp.get_model_def(model_type)
     if not md:
         return {"error": "Model not found"}
@@ -11148,6 +11256,8 @@ def debug_model(model_type: str):
 @api.delete("/api/v1/models/{model_type}")
 def delete_model(model_type: str):
     """Delete a model's checkpoint files from disk."""
+    if model_type == "minimax_music3":
+        return JSONResponse({"error": "Model not found"}, status_code=404)
     md = wgp.get_model_def(model_type)
     if not md:
         return JSONResponse({"error": "Model not found"}, status_code=404)
@@ -11203,6 +11313,8 @@ def verify_manual_checkpoint(model_type: str, request: Request):
             status_code=403,
             detail="Manual checkpoint verification is available locally only",
         )
+    if model_type == "minimax_music3":
+        raise HTTPException(status_code=404, detail="Model not found")
     model_def = wgp.get_model_def(model_type)
     if not isinstance(model_def, dict):
         raise HTTPException(status_code=404, detail="Model not found")
@@ -11248,6 +11360,10 @@ def _download_model_files(model_type: str):
     Mirrors the file-resolution block at the top of wgp.load_models()
     (wgp.py:4041-4143) — keep the two in sync.
     """
+    if model_type == "minimax_music3":
+        raise ModelDownloadUnavailableError(
+            "Music 3 is not a WGP checkpoint."
+        )
     # Recheck legal access in the worker before updater metadata, network
     # access, or any model file mutation.
     _require_h3_legal_execution([model_type])
@@ -13042,11 +13158,16 @@ def _director_recovery_runtime_admission(
     source_remote: bool = False,
 ) -> None:
     """Apply the same model/LoRA gates to startup and direct service recovery."""
-    _require_h3_legal_execution([
+    requested_models = [
         params.get("video_model"), params.get("model_type"),
         params.get("image_model"), params.get("image_creator_model"),
         params.get("image_editor_model"),
-    ])
+    ]
+    if "minimax_music3" in {
+        str(value or "").strip() for value in requested_models
+    }:
+        raise HTTPException(status_code=404, detail="Model not found")
+    _require_h3_legal_execution(requested_models)
     request = type("DirectorRecoveryRequest", (), {})()
     request.state = type(
         "DirectorRecoveryState", (), {"maestro_remote": bool(source_remote)},
@@ -13056,7 +13177,10 @@ def _director_recovery_runtime_admission(
 
 def _require_job_runtime_model_admission(job: dict) -> None:
     """Revalidate generic role snapshots and legacy terms before execution."""
-    _require_h3_legal_execution(_h3_job_model_types(job))
+    requested_models = _h3_job_model_types(job)
+    if "minimax_music3" in requested_models:
+        raise HTTPException(status_code=404, detail="Model not found")
+    _require_h3_legal_execution(requested_models)
     params = job.get("params")
     params = params if isinstance(params, dict) else {}
     if _director_image_role_wire_mode(params) == "roles":
@@ -15339,6 +15463,8 @@ def _is_def_bundled_lora(filename: str) -> bool:
     not abort the scan and fail the guard open for everything after it."""
     base = os.path.normcase(filename)
     for mt in wgp.displayed_model_types:
+        if mt == "minimax_music3":
+            continue
         try:
             for url in wgp.get_model_recursive_prop(mt, "loras", return_list=True) or []:
                 if isinstance(url, str) and os.path.normcase(url.split("/")[-1]) == base:
@@ -28260,6 +28386,8 @@ def storage_usage():
     global_seen = set()
     models_total_bytes = 0
     for mt in wgp.displayed_model_types:
+        if mt == "minimax_music3":
+            continue
         md = wgp.get_model_def(mt)
         if md is None:
             continue
@@ -31569,6 +31697,7 @@ async def director_generate_music(request: Request):
     lyrics = (body.get("lyrics") or "").strip()
     instrumental = bool(body.get("instrumental"))
     model_type = body.get("model_type") or "ace_step_v1_5_xl_sft_lm_4b"
+    _require_remote_visible_models(request, [model_type])
     duration_seconds = body.get("duration_seconds")
     seed = body.get("seed")
     workspace = _request_project_workspace(request, body.get("workspace"))
